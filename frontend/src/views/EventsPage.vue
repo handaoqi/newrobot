@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { fetchEvents, handleEvent } from '../services/api'
 
@@ -13,12 +13,59 @@ const filters = [
 const activeFilter = ref('')
 const events = ref([])
 const selectedEvent = ref(null)
+const loading = ref(true)
+
+const activeFilterIndex = computed(() => {
+  const index = filters.findIndex((filter) => filter.value === activeFilter.value)
+  return index === -1 ? 0 : index
+})
+
+const segmentStyle = computed(() => ({
+  width: `${100 / filters.length}%`,
+  transform: `translateX(${activeFilterIndex.value * 100}%)`,
+}))
+
+const hasEvents = computed(() => events.value.length > 0)
+
+function formatEventTime(value) {
+  if (!value) return '--'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function syncSelectedEvent() {
+  if (!events.value.length) {
+    selectedEvent.value = null
+    return
+  }
+
+  const matched = selectedEvent.value
+    ? events.value.find((event) => event.id === selectedEvent.value.id)
+    : null
+
+  selectedEvent.value = matched || events.value[0]
+}
 
 async function loadEvents() {
-  events.value = await fetchEvents(activeFilter.value)
-  if (!selectedEvent.value && events.value.length > 0) {
-    selectedEvent.value = events.value[0]
+  loading.value = true
+  try {
+    events.value = await fetchEvents(activeFilter.value)
+    syncSelectedEvent()
+  } finally {
+    loading.value = false
   }
+}
+
+function changeFilter(value) {
+  activeFilter.value = value
+  selectedEvent.value = null
+  loadEvents()
 }
 
 async function markResolved() {
@@ -38,24 +85,30 @@ onMounted(loadEvents)
     <div class="section-head">
       <div>
         <h3>事件中心</h3>
-        <p>查看告警记录、人工复核结果和事件闭环状态</p>
+        <p>集中查看告警记录、复核进度与事件闭环结果。</p>
       </div>
     </div>
 
     <div class="filter-row">
-      <button
-        v-for="filter in filters"
-        :key="filter.value || 'all'"
-        class="chip"
-        :class="{ active: activeFilter === filter.value }"
-        @click="activeFilter = filter.value; loadEvents()"
-      >
-        {{ filter.label }}
-      </button>
+      <div class="segmented-control" role="tablist" aria-label="事件状态筛选">
+        <div class="segmented-thumb" :style="segmentStyle"></div>
+        <button
+          v-for="filter in filters"
+          :key="filter.value || 'all'"
+          class="segment-btn"
+          :class="{ active: activeFilter === filter.value }"
+          :aria-pressed="activeFilter === filter.value"
+          @click="changeFilter(filter.value)"
+        >
+          {{ filter.label }}
+        </button>
+      </div>
     </div>
 
     <div class="data-grid">
       <section class="panel list-panel">
+        <div v-if="loading" class="empty-state">正在加载事件列表...</div>
+        <template v-else-if="hasEvents">
         <article
           v-for="event in events"
           :key="event.id"
@@ -63,15 +116,17 @@ onMounted(loadEvents)
           :class="{ selected: selectedEvent?.id === event.id }"
           @click="selectedEvent = event"
         >
-          <div>
+          <div class="table-main">
             <strong>{{ event.title }}</strong>
             <span>{{ event.location }}</span>
           </div>
           <div class="table-side">
             <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
-            <small>{{ event.detected_at }}</small>
+            <small>{{ formatEventTime(event.detected_at) }}</small>
           </div>
         </article>
+        </template>
+        <div v-else class="empty-state">当前筛选条件下暂无事件记录</div>
       </section>
 
       <section class="panel detail-panel" v-if="selectedEvent">
@@ -93,9 +148,21 @@ onMounted(loadEvents)
           </div>
           <div class="detail-card">
             <strong>处置备注</strong>
-            <p>{{ selectedEvent.handling_notes || '尚未填写' }}</p>
+            <p>{{ selectedEvent.handling_notes || '当前尚未填写处置说明' }}</p>
           </div>
-          <button class="primary-btn" @click="markResolved">标记为已完成</button>
+          <button class="primary-btn" @click="markResolved">完成复核并归档</button>
+        </div>
+      </section>
+
+      <section v-else class="panel detail-panel detail-empty">
+        <div class="panel-head">
+          <div>
+            <h3>事件详情</h3>
+            <p>当前筛选结果为空，暂未选中任何事件</p>
+          </div>
+        </div>
+        <div class="empty-state detail-empty-card">
+          请选择一个事件开始处理。
         </div>
       </section>
     </div>

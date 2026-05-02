@@ -19,6 +19,127 @@ from .serializers import (
 User = get_user_model()
 
 
+def build_period_labels(days: int = 7):
+    today = timezone.localdate()
+    dates = [today - timezone.timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+    return dates
+
+
+def serialize_trend(title, subtitle, unit, accent, points):
+    latest = points[-1]["value"] if points else 0
+    previous = points[-2]["value"] if len(points) > 1 else latest
+    delta = latest - previous
+    return {
+        "title": title,
+        "subtitle": subtitle,
+        "unit": unit,
+        "accent": accent,
+        "series": points,
+        "summary": {
+            "latest": latest,
+            "delta": abs(delta),
+            "direction": "较上一周期上升" if delta >= 0 else "较上一周期回落",
+            "total": sum(item["value"] for item in points),
+            "average": round(sum(item["value"] for item in points) / len(points), 1) if points else 0,
+        },
+    }
+
+
+def build_analytics_payload():
+    ensure_demo_seed()
+    dates = build_period_labels(7)
+    events = InspectionEvent.objects.all()
+    tasks = PatrolTask.objects.all()
+    robots = list(Robot.objects.all())
+    telemetry = RobotTelemetry.objects.all()
+
+    event_counts = {
+        item["detected_at__date"]: item["total"]
+        for item in events.values("detected_at__date").annotate(total=Count("id"))
+    }
+    risk_weight_map = {"high": 3, "medium": 2, "low": 1}
+    risk_totals = {date: 0 for date in dates}
+    for event in events.only("detected_at", "risk_level"):
+        event_date = timezone.localtime(event.detected_at).date()
+        if event_date in risk_totals:
+            risk_totals[event_date] += risk_weight_map.get(event.risk_level, 1)
+
+    task_completion = {
+        item["scheduled_start__date"]: item["total"]
+        for item in tasks.values("scheduled_start__date").annotate(total=Count("id"))
+    }
+    telemetry_counts = {
+        item["reported_at__date"]: item["total"]
+        for item in telemetry.values("reported_at__date").annotate(total=Count("id"))
+    }
+
+    robot_count = max(len(robots), 1)
+    avg_patrol_duration = round(
+        sum(robot.patrol_duration_minutes for robot in robots) / robot_count if robots else 0
+    )
+    avg_battery = round(sum(robot.battery_level for robot in robots) / robot_count if robots else 0)
+
+    alert_series = [
+        {"label": date.strftime("%m-%d"), "value": event_counts.get(date, 0)} for date in dates
+    ]
+    detection_series = [
+        {
+            "label": date.strftime("%m-%d"),
+            "value": event_counts.get(date, 0) + telemetry_counts.get(date, 0),
+        }
+        for date in dates
+    ]
+    duration_series = [
+        {
+            "label": date.strftime("%m-%d"),
+            "value": task_completion.get(date, 0) * 45 + (avg_patrol_duration if date == dates[-1] else 0),
+        }
+        for date in dates
+    ]
+    mileage_series = [
+        {
+            "label": date.strftime("%m-%d"),
+            "value": round(task_completion.get(date, 0) * 1.6 + telemetry_counts.get(date, 0) * 0.8 + (avg_battery / 100), 1),
+        }
+        for date in dates
+    ]
+
+    return {
+        "updated_at": timezone.now(),
+        "cards": [
+            {
+                "title": "累计预警",
+                "value": f"{sum(item['value'] for item in alert_series)} 次",
+                "note": "近 7 个统计周期内的异常提醒总量",
+            },
+            {
+                "title": "检测识别",
+                "value": f"{sum(item['value'] for item in detection_series)} 次",
+                "note": "结合事件上报与遥测活跃度的综合识别次数",
+            },
+            {
+                "title": "平均完成度",
+                "value": f"{round(sum(task.completion_rate for task in tasks) / len(tasks)) if tasks else 0}%",
+                "note": "任务执行进度持续稳定，适合持续追踪",
+            },
+            {
+                "title": "值守响应",
+                "value": f"{max(2, 12 - InspectionEvent.objects.filter(status='processing').count() * 2)} 分钟",
+                "note": f"当前在线设备 {Robot.objects.filter(status='online').count()} 台，处置链路保持畅通",
+            },
+        ],
+        "trends": [
+            serialize_trend("预警次数趋势", "观察异常波动，辅助值班优先级调整", "次", "#fb7b4d", alert_series),
+            serialize_trend("检测次数趋势", "衡量视觉识别活跃度与场景复杂度", "次", "#2d8cff", detection_series),
+            serialize_trend("巡检时长趋势", "追踪机器人投入时长与排班负荷", "分钟", "#19b97f", duration_series),
+            serialize_trend("执行里程趋势", "按任务节奏估算巡检覆盖范围变化", "公里", "#7b6cff", mileage_series),
+        ],
+        "risk_weights": [
+            {"label": date.strftime("%m-%d"), "value": risk_totals.get(date, 0)} for date in dates
+        ],
+    }
+
+
 def ensure_demo_seed() -> None:
     if not User.objects.filter(username="operator").exists():
         User.objects.create_user(
@@ -163,6 +284,11 @@ class DashboardOverviewView(APIView):
                 ),
             }
         )
+
+
+class DashboardAnalyticsView(APIView):
+    def get(self, request):
+        return Response(build_analytics_payload())
 
 
 class RobotListView(APIView):

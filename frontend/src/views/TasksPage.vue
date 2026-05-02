@@ -15,7 +15,7 @@ onMounted(async () => {
     <div class="section-head">
       <div>
         <h3>巡检任务</h3>
-        <p>补充任务管理页面，承接路线配置、排班与执行追踪</p>
+        <p>统一查看任务编排、执行进度与路线覆盖情况。</p>
       </div>
     </div>
 

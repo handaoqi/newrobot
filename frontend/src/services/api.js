@@ -35,6 +35,10 @@ export async function fetchOverview() {
   return request('/dashboard/overview/')
 }
 
+export async function fetchAnalytics() {
+  return request('/dashboard/analytics/')
+}
+
 export async function fetchEvents(status = '') {
   const query = status ? `?status=${status}` : ''
   return request(`/events/${query}`)

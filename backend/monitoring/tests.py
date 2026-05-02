@@ -25,6 +25,13 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("summary", response.data)
 
+    def test_dashboard_analytics(self):
+        self.authenticate()
+        response = self.client.get("/api/dashboard/analytics/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["trends"]), 4)
+        self.assertEqual(len(response.data["trends"][0]["series"]), 7)
+
     def test_telemetry_ingest(self):
         robot = Robot.objects.first()
         before_count = InspectionEvent.objects.count()

@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import DashboardLayout from '../views/DashboardLayout.vue'
+import AnalyticsPage from '../views/AnalyticsPage.vue'
 import DashboardOverview from '../views/DashboardOverview.vue'
 import EventsPage from '../views/EventsPage.vue'
 import LoginPage from '../views/LoginPage.vue'
@@ -16,6 +17,7 @@ const routes = [
     meta: { requiresAuth: true },
     children: [
       { path: 'overview', name: 'overview', meta: { title: '实时监测中心' }, component: DashboardOverview },
+      { path: 'analytics', name: 'analytics', meta: { title: '统计分析中心' }, component: AnalyticsPage },
       { path: 'events', name: 'events', meta: { title: '事件中心' }, component: EventsPage },
       { path: 'robots', name: 'robots', meta: { title: '机器人管理' }, component: RobotsPage },
       { path: 'tasks', name: 'tasks', meta: { title: '巡检任务' }, component: TasksPage },

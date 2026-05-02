@@ -23,7 +23,7 @@ onMounted(async () => {
     <div class="section-head">
       <div>
         <h3>机器人管理</h3>
-        <p>查看设备在线状态、健康信息和近期事件</p>
+        <p>查看设备在线状态、健康指标与近期事件记录。</p>
       </div>
     </div>
 
@@ -76,12 +76,12 @@ onMounted(async () => {
         </div>
 
         <div class="detail-card">
-          <strong>当前任务</strong>
+          <strong>当前执行任务</strong>
           <p>{{ selectedRobot.current_task_name || '暂无任务' }}</p>
         </div>
 
         <div class="detail-card">
-          <strong>近期事件</strong>
+          <strong>近期识别事件</strong>
           <ul class="simple-list">
             <li v-for="event in selectedRobot.recent_events" :key="event.id">
               {{ event.title }} - {{ event.status_label }}

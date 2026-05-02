@@ -24,13 +24,34 @@ const stageRef = ref(null)
 const { toastMessage, visible, showToast } = useToast()
 
 const quickTexts = [
-  '您好，这里为智能巡检提醒，请勿在园区主通道违停。',
-  '您好，请将自行车停放至指定区域，保持通道畅通。',
-  '您好，当前区域存在安全隐患，请注意避让并听从现场引导。',
+  {
+    label: '重点路段',
+    text: '您好，当前区域为巡检重点路段，请勿长时间占道停留。',
+  },
+  {
+    label: '驶离提醒',
+    text: '您好，请将车辆停放至指定区域，共同保持通道顺畅。',
+  },
+  {
+    label: '注意避让',
+    text: '您好，系统检测到现场存在安全风险，请注意避让并配合引导。',
+  },
 ]
 
 const latestRobot = computed(() => overview.value?.latest_robot || null)
 const liveEvent = computed(() => overview.value?.live_event || null)
+
+function formatEventTime(value) {
+  if (!value) return '--'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
 
 function setSpeakerText(text) {
   speakerText.value = text
@@ -211,7 +232,7 @@ onBeforeUnmount(() => {
           <div class="panel-head">
             <div>
               <h3>设备列表</h3>
-              <p>补充你 demo 里缺失的多设备切换能力</p>
+              <p>支持值班员在多台机器人之间快速切换与查看状态</p>
             </div>
           </div>
           <div class="robot-list">
@@ -235,15 +256,21 @@ onBeforeUnmount(() => {
         <div class="panel-head">
           <div>
             <h3>远程控制台</h3>
-            <p>保留 demo 中的喊话能力，并补充状态信息</p>
+            <p>支持快速切换播报模板，并同步查看现场联动状态</p>
           </div>
           <span class="panel-badge">Control</span>
         </div>
         <div class="speaker-box">
           <textarea v-model="speakerText"></textarea>
           <div class="quick-actions">
-            <button v-for="text in quickTexts" :key="text" class="chip" @click="setSpeakerText(text)">
-              {{ text.slice(0, 6) }}
+            <button
+              v-for="item in quickTexts"
+              :key="item.label"
+              class="chip"
+              :class="{ active: speakerText === item.text }"
+              @click="setSpeakerText(item.text)"
+            >
+              {{ item.label }}
             </button>
           </div>
           <div class="action-row">
@@ -252,7 +279,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="mini-row">
             <div class="mini-card">当前音量 {{ latestRobot?.speaker_volume }}%</div>
-            <div class="mini-card">外放设备 正常</div>
+            <div class="mini-card">喊话链路状态 正常</div>
           </div>
         </div>
       </section>
@@ -261,7 +288,7 @@ onBeforeUnmount(() => {
         <div class="panel-head">
           <div>
             <h3>历史事件识别</h3>
-            <p>保留事件流，后续可接详情抽屉</p>
+            <p>按时间回看识别结果，辅助值班员快速完成复核</p>
           </div>
           <span class="panel-badge">History</span>
         </div>
@@ -271,11 +298,11 @@ onBeforeUnmount(() => {
             <div class="event-main">
               <strong>{{ event.title }}</strong>
               <span>{{ event.location }}</span>
-              <small>{{ event.detected_at }}</small>
+              <small>{{ formatEventTime(event.detected_at) }}</small>
             </div>
             <div class="event-side">
               <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
-              <span>{{ event.risk_label }}风险</span>
+              <span class="risk-text">{{ event.risk_label }}风险</span>
             </div>
           </article>
         </div>
