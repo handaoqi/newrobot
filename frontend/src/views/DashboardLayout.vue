@@ -67,7 +67,6 @@ function logout() {
           <button class="theme-btn" @click="toggleTheme">{{ toggleLabel }}</button>
           <div class="header-user">
             <strong>{{ user.display_name || '值班员' }}</strong>
-            <span>{{ user.username || 'operator' }} · 在线值守</span>
           </div>
           <button class="ghost-btn" @click="logout">退出登录</button>
         </div>

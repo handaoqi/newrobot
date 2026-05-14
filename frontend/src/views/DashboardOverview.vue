@@ -38,8 +38,15 @@ const quickTexts = [
   },
 ]
 
+const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => overview.value?.latest_robot || null)
 const liveEvent = computed(() => overview.value?.live_event || null)
+
+function eventThumbStyle(index) {
+  return {
+    backgroundImage: `linear-gradient(rgba(6, 16, 28, 0.08), rgba(6, 16, 28, 0.18)), url(${eventImages[index % eventImages.length]})`,
+  }
+}
 
 function formatEventTime(value) {
   if (!value) return '--'
@@ -71,13 +78,19 @@ function emergencyStop() {
 }
 
 function pointerDown(event) {
+  const stage = stageRef.value
+  if (!stage) return
+  const bounds = stage.getBoundingClientRect()
+
+  event.preventDefault()
   dragState.dragging = true
-  dragState.offsetX = event.clientX - box.left
-  dragState.offsetY = event.clientY - box.top
+  dragState.offsetX = event.clientX - bounds.left - box.left
+  dragState.offsetY = event.clientY - bounds.top - box.top
 }
 
 function resizeDown(event) {
   event.stopPropagation()
+  event.preventDefault()
   dragState.resizing = true
   dragState.startX = event.clientX
   dragState.startY = event.clientY
@@ -137,7 +150,6 @@ onBeforeUnmount(() => {
           <span class="dot"></span>
           设备在线 {{ overview.header.device_code }}
         </article>
-        <article class="status-pill">当前模式 {{ overview.header.current_mode }}</article>
         <article class="status-pill warning">今日告警 {{ overview.header.today_alerts }} 条</article>
         <article class="status-pill">当前区域 {{ overview.header.current_location }}</article>
       </section>
@@ -152,13 +164,13 @@ onBeforeUnmount(() => {
         </div>
 
         <div ref="stageRef" class="video-stage">
-          <div class="stage-hud"></div>
+          <img class="video-source" src="/images/live-feed.jpg" alt="实时视频画面" />
           <div
             class="detection-box"
             :style="{ left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px` }"
             @pointerdown="pointerDown"
           >
-            <span class="box-label">{{ liveEvent?.title || '目标识别' }} {{ liveEvent?.confidence || '92.0' }}%</span>
+            <span class="box-label">{{ liveEvent?.title || '自行车违停识别' }}</span>
             <span class="resize-handle" @pointerdown="resizeDown"></span>
           </div>
 
@@ -166,10 +178,6 @@ onBeforeUnmount(() => {
             <div class="overlay-card">
               <strong>巡检位置</strong>
               <span>{{ latestRobot?.location }}</span>
-            </div>
-            <div class="overlay-card">
-              <strong>风险等级</strong>
-              <span>{{ liveEvent?.risk_label || '中' }}级告警</span>
             </div>
           </div>
 
@@ -232,7 +240,7 @@ onBeforeUnmount(() => {
           <div class="panel-head">
             <div>
               <h3>设备列表</h3>
-              <p>支持值班员在多台机器人之间快速切换与查看状态</p>
+              <p>支持在多台机器人之间快速切换与查看状态</p>
             </div>
           </div>
           <div class="robot-list">
@@ -288,13 +296,12 @@ onBeforeUnmount(() => {
         <div class="panel-head">
           <div>
             <h3>历史事件识别</h3>
-            <p>按时间回看识别结果，辅助值班员快速完成复核</p>
           </div>
           <span class="panel-badge">History</span>
         </div>
         <div class="event-list">
-          <article v-for="event in latestRobot?.recent_events || []" :key="event.id" class="event-card">
-            <div class="event-thumb"></div>
+          <article v-for="(event, index) in latestRobot?.recent_events || []" :key="event.id" class="event-card">
+            <div class="event-thumb" :style="eventThumbStyle(index)"></div>
             <div class="event-main">
               <strong>{{ event.title }}</strong>
               <span>{{ event.location }}</span>

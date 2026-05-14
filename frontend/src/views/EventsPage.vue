@@ -14,6 +14,7 @@ const activeFilter = ref('')
 const events = ref([])
 const selectedEvent = ref(null)
 const loading = ref(true)
+const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 
 const activeFilterIndex = computed(() => {
   const index = filters.findIndex((filter) => filter.value === activeFilter.value)
@@ -26,6 +27,17 @@ const segmentStyle = computed(() => ({
 }))
 
 const hasEvents = computed(() => events.value.length > 0)
+
+function getEventImage(event) {
+  const index = events.value.findIndex((item) => item.id === event?.id)
+  return eventImages[(index === -1 ? 0 : index) % eventImages.length]
+}
+
+function eventThumbStyle(event) {
+  return {
+    backgroundImage: `linear-gradient(rgba(6, 16, 28, 0.08), rgba(6, 16, 28, 0.18)), url(${getEventImage(event)})`,
+  }
+}
 
 function formatEventTime(value) {
   if (!value) return '--'
@@ -116,6 +128,7 @@ onMounted(loadEvents)
           :class="{ selected: selectedEvent?.id === event.id }"
           @click="selectedEvent = event"
         >
+          <div class="event-thumb table-thumb" :style="eventThumbStyle(event)"></div>
           <div class="table-main">
             <strong>{{ event.title }}</strong>
             <span>{{ event.location }}</span>
@@ -138,10 +151,7 @@ onMounted(loadEvents)
           <span class="panel-badge">{{ selectedEvent.risk_label }}风险</span>
         </div>
         <div class="detail-stack">
-          <div class="detail-card">
-            <strong>事件描述</strong>
-            <p>{{ selectedEvent.description || '暂无补充描述' }}</p>
-          </div>
+          <img class="event-detail-image" :src="getEventImage(selectedEvent)" :alt="selectedEvent.title" />
           <div class="detail-card">
             <strong>识别置信度</strong>
             <p>{{ selectedEvent.confidence }}%</p>

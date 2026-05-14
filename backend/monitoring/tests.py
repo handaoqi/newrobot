@@ -31,6 +31,12 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data["trends"]), 4)
         self.assertEqual(len(response.data["trends"][0]["series"]), 7)
+        self.assertEqual(response.data["cards"][0]["value"], "13 次")
+        self.assertEqual(response.data["cards"][1]["value"], "41 次")
+        self.assertEqual(response.data["cards"][3]["value"], "30 分钟")
+        self.assertEqual(response.data["trends"][2]["summary"]["latest"], 30)
+        self.assertEqual(response.data["trends"][3]["summary"]["latest"], 1.3)
+        self.assertEqual(response.data["trends"][3]["summary"]["total"], 1.3)
 
     def test_telemetry_ingest(self):
         robot = Robot.objects.first()

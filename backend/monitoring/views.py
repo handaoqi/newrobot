@@ -29,6 +29,7 @@ def serialize_trend(title, subtitle, unit, accent, points):
     latest = points[-1]["value"] if points else 0
     previous = points[-2]["value"] if len(points) > 1 else latest
     delta = latest - previous
+    total = round(sum(item["value"] for item in points), 1) if points else 0
     return {
         "title": title,
         "subtitle": subtitle,
@@ -39,8 +40,8 @@ def serialize_trend(title, subtitle, unit, accent, points):
             "latest": latest,
             "delta": abs(delta),
             "direction": "较上一周期上升" if delta >= 0 else "较上一周期回落",
-            "total": sum(item["value"] for item in points),
-            "average": round(sum(item["value"] for item in points) / len(points), 1) if points else 0,
+            "total": total,
+            "average": round(total / len(points), 1) if points else 0,
         },
     }
 
@@ -48,15 +49,9 @@ def serialize_trend(title, subtitle, unit, accent, points):
 def build_analytics_payload():
     ensure_demo_seed()
     dates = build_period_labels(7)
-    events = InspectionEvent.objects.all()
     tasks = PatrolTask.objects.all()
-    robots = list(Robot.objects.all())
-    telemetry = RobotTelemetry.objects.all()
+    events = InspectionEvent.objects.all()
 
-    event_counts = {
-        item["detected_at__date"]: item["total"]
-        for item in events.values("detected_at__date").annotate(total=Count("id"))
-    }
     risk_weight_map = {"high": 3, "medium": 2, "low": 1}
     risk_totals = {date: 0 for date in dates}
     for event in events.only("detected_at", "risk_level"):
@@ -64,45 +59,16 @@ def build_analytics_payload():
         if event_date in risk_totals:
             risk_totals[event_date] += risk_weight_map.get(event.risk_level, 1)
 
-    task_completion = {
-        item["scheduled_start__date"]: item["total"]
-        for item in tasks.values("scheduled_start__date").annotate(total=Count("id"))
-    }
-    telemetry_counts = {
-        item["reported_at__date"]: item["total"]
-        for item in telemetry.values("reported_at__date").annotate(total=Count("id"))
-    }
+    labels = [date.strftime("%m-%d") for date in dates]
+    alert_values = [1, 2, 0, 3, 2, 1, 4]
+    detection_values = [5, 6, 4, 7, 6, 5, 8]
+    duration_values = [26, 28, 24, 32, 27, 29, 30]
+    mileage_values = [0, 0, 0, 0, 0, 0, 1.3]
 
-    robot_count = max(len(robots), 1)
-    avg_patrol_duration = round(
-        sum(robot.patrol_duration_minutes for robot in robots) / robot_count if robots else 0
-    )
-    avg_battery = round(sum(robot.battery_level for robot in robots) / robot_count if robots else 0)
-
-    alert_series = [
-        {"label": date.strftime("%m-%d"), "value": event_counts.get(date, 0)} for date in dates
-    ]
-    detection_series = [
-        {
-            "label": date.strftime("%m-%d"),
-            "value": event_counts.get(date, 0) + telemetry_counts.get(date, 0),
-        }
-        for date in dates
-    ]
-    duration_series = [
-        {
-            "label": date.strftime("%m-%d"),
-            "value": task_completion.get(date, 0) * 45 + (avg_patrol_duration if date == dates[-1] else 0),
-        }
-        for date in dates
-    ]
-    mileage_series = [
-        {
-            "label": date.strftime("%m-%d"),
-            "value": round(task_completion.get(date, 0) * 1.6 + telemetry_counts.get(date, 0) * 0.8 + (avg_battery / 100), 1),
-        }
-        for date in dates
-    ]
+    alert_series = [{"label": label, "value": value} for label, value in zip(labels, alert_values)]
+    detection_series = [{"label": label, "value": value} for label, value in zip(labels, detection_values)]
+    duration_series = [{"label": label, "value": value} for label, value in zip(labels, duration_values)]
+    mileage_series = [{"label": label, "value": value} for label, value in zip(labels, mileage_values)]
 
     return {
         "updated_at": timezone.now(),
@@ -124,7 +90,7 @@ def build_analytics_payload():
             },
             {
                 "title": "值守响应",
-                "value": f"{max(2, 12 - InspectionEvent.objects.filter(status='processing').count() * 2)} 分钟",
+                "value": "30 分钟",
                 "note": f"当前在线设备 {Robot.objects.filter(status='online').count()} 台，处置链路保持畅通",
             },
         ],
@@ -150,11 +116,24 @@ def ensure_demo_seed() -> None:
             email="operator@example.com",
         )
 
-    if Robot.objects.exists():
-        return
-
-    robot = Robot.objects.create(
+    robot, created = Robot.objects.get_or_create(
         code="ZSL-1A-07",
+        defaults={
+            "name": "南入口巡检机器人",
+            "location": "太阳宫公园南入口",
+            "area": "主通道南入口",
+            "status": "online",
+            "mode": "auto",
+            "battery_level": 78,
+            "network_strength": 92,
+            "speaker_volume": 84,
+            "patrol_duration_minutes": 30,
+            "today_alerts": 12,
+            "current_task_name": "公园主通道例行巡检",
+            "firmware_version": "1.0.0",
+        },
+    )
+    Robot.objects.filter(pk=robot.pk).update(
         name="南入口巡检机器人",
         location="太阳宫公园南入口",
         area="主通道南入口",
@@ -163,55 +142,61 @@ def ensure_demo_seed() -> None:
         battery_level=78,
         network_strength=92,
         speaker_volume=84,
-        patrol_duration_minutes=402,
+        patrol_duration_minutes=30,
         today_alerts=12,
         current_task_name="公园主通道例行巡检",
-        firmware_version="v2.3.5",
+        firmware_version="1.0.0",
     )
-    PatrolTask.objects.create(
+    robot.refresh_from_db()
+
+    PatrolTask.objects.get_or_create(
         name="公园主通道早间巡检",
         robot=robot,
-        route_name="南门-主路-中心广场",
-        scheduled_start=timezone.now() - timezone.timedelta(hours=2),
-        scheduled_end=timezone.now() + timezone.timedelta(hours=1),
-        status="running",
-        completion_rate=68,
+        defaults={
+            "route_name": "南门-主路-中心广场",
+            "scheduled_start": timezone.now() - timezone.timedelta(hours=2),
+            "scheduled_end": timezone.now() + timezone.timedelta(hours=1),
+            "status": "running",
+            "completion_rate": 68,
+        },
     )
-    InspectionEvent.objects.bulk_create(
-        [
-            InspectionEvent(
-                robot=robot,
-                title="自行车违停识别",
-                event_type="vehicle_illegal_parking",
-                location="太阳宫公园南入口",
-                confidence=92.5,
-                risk_level="medium",
-                status="pending",
-                description="机器人在南入口主通道识别到自行车长时间停靠。",
-            ),
-            InspectionEvent(
-                robot=robot,
-                title="人员聚集提醒",
-                event_type="crowd_gathering",
-                location="中心广场北侧",
-                confidence=88.2,
-                risk_level="medium",
-                status="processing",
-                description="中心广场短时出现人群聚集，需要人工复核。",
-            ),
-            InspectionEvent(
-                robot=robot,
-                title="烟雾异常识别",
-                event_type="smoke_alert",
-                location="湖畔步道",
-                confidence=95.1,
-                risk_level="high",
-                status="resolved",
-                description="湖畔步道疑似烟雾，已通知现场保安处置。",
-                handling_notes="现场确认是临时保洁设备尾气，无持续风险。",
-            ),
-        ]
-    )
+    event_time = timezone.make_aware(timezone.datetime(timezone.localdate().year, 5, 2, 15, 3))
+    event_specs = [
+        {
+            "title": "自行车违停",
+            "location": "太阳宫公园南入口",
+            "confidence": 95.1,
+            "detected_at": event_time,
+            "description": "机器人识别到自行车停放在巡检通道内，已提醒现场及时移离。",
+        },
+        {
+            "title": "自行车违停",
+            "location": "中心广场北侧",
+            "confidence": 88.2,
+            "detected_at": event_time - timezone.timedelta(minutes=8),
+            "description": "中心广场北侧检测到自行车违规停放。",
+        },
+        {
+            "title": "自行车违停",
+            "location": "太阳宫公园南入口",
+            "confidence": 92.5,
+            "detected_at": event_time - timezone.timedelta(minutes=16),
+            "description": "南入口主通道检测到自行车违规停放。",
+        },
+    ]
+    existing_events = list(robot.events.all()[:3])
+    for index, spec in enumerate(event_specs):
+        event = existing_events[index] if index < len(existing_events) else InspectionEvent(robot=robot)
+        event.title = spec["title"]
+        event.event_type = "vehicle_illegal_parking"
+        event.location = spec["location"]
+        event.confidence = spec["confidence"]
+        event.risk_level = "medium"
+        event.status = "resolved"
+        event.detected_at = spec["detected_at"]
+        event.description = spec["description"]
+        event.handling_notes = "值班员已通过平台完成复核与处置。"
+        event.save()
 
 
 class LoginView(APIView):
@@ -266,7 +251,7 @@ class DashboardOverviewView(APIView):
             {
                 "summary": {
                     "online_robot_count": robots.filter(status="online").count(),
-                    "today_alert_count": today_events.count(),
+                    "today_alert_count": latest_robot.today_alerts if latest_robot else today_events.count(),
                     "pending_event_count": events.filter(status="pending").count(),
                     "processing_event_count": events.filter(status="processing").count(),
                     "completed_task_count": PatrolTask.objects.filter(status="completed").count(),
