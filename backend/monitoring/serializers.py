@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import InspectionEvent, PatrolTask, Robot
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot
 
 
 class RobotSerializer(serializers.ModelSerializer):
@@ -25,6 +25,9 @@ class RobotSerializer(serializers.ModelSerializer):
             "today_alerts",
             "current_task_name",
             "last_heartbeat_at",
+            "camera_id",
+            "stream_id",
+            "play_urls",
         ]
 
 
@@ -52,6 +55,17 @@ class EventSerializer(serializers.ModelSerializer):
             "handling_notes",
             "robot_code",
             "robot_name",
+            "camera_id",
+            "stream_id",
+            "object_class",
+            "track_id",
+            "bbox_x",
+            "bbox_y",
+            "bbox_width",
+            "bbox_height",
+            "frame_width",
+            "frame_height",
+            "raw_detection",
         ]
 
 
@@ -127,4 +141,34 @@ class TelemetryIngestSerializer(serializers.Serializer):
     power = PowerSerializer()
     network = NetworkSerializer()
     runtime = RuntimeSerializer()
+    video = serializers.DictField(required=False, default=dict)
     detections = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+
+class MediaUploadSerializer(serializers.Serializer):
+    robot_code = serializers.CharField(max_length=32)
+    camera_id = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    media_type = serializers.ChoiceField(choices=["snapshot", "clip"])
+    event_time = serializers.DateTimeField(required=False)
+    sequence_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    sha256 = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    file = serializers.FileField()
+
+
+class MediaAssetSerializer(serializers.ModelSerializer):
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+
+    class Meta:
+        model = MediaAsset
+        fields = [
+            "id",
+            "robot_code",
+            "media_type",
+            "camera_id",
+            "sequence_id",
+            "event_time",
+            "url",
+            "sha256",
+            "file_size",
+            "created_at",
+        ]

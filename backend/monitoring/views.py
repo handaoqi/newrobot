@@ -1,3 +1,6 @@
+import hashlib
+
+from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.db.models import Count
 from django.utils import timezone
@@ -7,9 +10,11 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import InspectionEvent, PatrolTask, Robot, RobotTelemetry
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotTelemetry
 from .serializers import (
     EventSerializer,
+    MediaAssetSerializer,
+    MediaUploadSerializer,
     PatrolTaskSerializer,
     RobotDetailSerializer,
     RobotSerializer,
@@ -131,6 +136,12 @@ def ensure_demo_seed() -> None:
             "today_alerts": 12,
             "current_task_name": "公园主通道例行巡检",
             "firmware_version": "1.0.0",
+            "camera_id": "front",
+            "stream_id": "dog_ZSL-1A-07_front",
+            "play_urls": {
+                "flv": "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv",
+                "hls": "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8",
+            },
         },
     )
     Robot.objects.filter(pk=robot.pk).update(
@@ -146,6 +157,12 @@ def ensure_demo_seed() -> None:
         today_alerts=12,
         current_task_name="公园主通道例行巡检",
         firmware_version="1.0.0",
+        camera_id="front",
+        stream_id="dog_ZSL-1A-07_front",
+        play_urls={
+            "flv": "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv",
+            "hls": "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8",
+        },
     )
     robot.refresh_from_db()
 
@@ -332,15 +349,34 @@ class TelemetryIngestView(APIView):
         serializer = TelemetryIngestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payload = serializer.validated_data
+        existing_telemetry = RobotTelemetry.objects.filter(sequence_id=payload["sequence_id"]).first()
+        if existing_telemetry:
+            return Response(
+                {
+                    "detail": "重复上报已忽略",
+                    "robot_id": existing_telemetry.robot_id,
+                    "telemetry_id": existing_telemetry.id,
+                    "duplicate": True,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        video = payload.get("video") or {}
+        camera_id = video.get("camera_id", "front")
+        stream_id = video.get("stream_id") or f"dog_{payload['robot_code']}_{camera_id}"
         robot, _ = Robot.objects.get_or_create(
             code=payload["robot_code"],
             defaults={
                 "name": payload.get("robot_name") or payload["robot_code"],
                 "location": payload["position"]["name"],
                 "area": payload["position"]["name"],
+                "camera_id": camera_id,
+                "stream_id": stream_id,
             },
         )
 
+        if payload.get("robot_name"):
+            robot.name = payload["robot_name"]
         robot.location = payload["position"]["name"]
         robot.area = payload["position"]["name"]
         robot.battery_level = payload["power"]["battery_level"]
@@ -348,10 +384,13 @@ class TelemetryIngestView(APIView):
         robot.mode = payload["runtime"]["mode"]
         robot.status = payload["runtime"]["status"]
         robot.last_heartbeat_at = payload["reported_at"]
+        robot.camera_id = camera_id
+        robot.stream_id = stream_id
+        robot.play_urls = video.get("play_urls") or robot.play_urls
         robot.today_alerts += len(payload.get("detections", []))
         robot.save()
 
-        RobotTelemetry.objects.create(
+        telemetry = RobotTelemetry.objects.create(
             robot=robot,
             sequence_id=payload["sequence_id"],
             position_name=payload["position"]["name"],
@@ -361,11 +400,15 @@ class TelemetryIngestView(APIView):
             speed=payload["motion"].get("speed"),
             battery_level=payload["power"]["battery_level"],
             network_strength=payload["network"]["signal_strength"],
+            video=video,
             raw_payload=request.data,
             reported_at=payload["reported_at"],
         )
 
+        frame_width = video.get("frame_width")
+        frame_height = video.get("frame_height")
         for detection in payload.get("detections", []):
+            bbox = detection.get("bbox") or {}
             InspectionEvent.objects.create(
                 robot=robot,
                 title=detection.get("label") or detection.get("type") or "AI识别事件",
@@ -379,9 +422,67 @@ class TelemetryIngestView(APIView):
                 status="pending",
                 snapshot_url=detection.get("snapshot_url", ""),
                 description=f"板端识别上报: {detection.get('label') or detection.get('type')}",
+                camera_id=detection.get("camera_id") or camera_id,
+                stream_id=detection.get("stream_id") or stream_id,
+                object_class=detection.get("object_class", ""),
+                track_id=detection.get("track_id", ""),
+                bbox_x=bbox.get("x"),
+                bbox_y=bbox.get("y"),
+                bbox_width=bbox.get("width"),
+                bbox_height=bbox.get("height"),
+                frame_width=frame_width,
+                frame_height=frame_height,
+                raw_detection=detection,
             )
 
-        return Response({"detail": "上报成功", "robot_id": robot.id}, status=status.HTTP_201_CREATED)
+        return Response(
+            {"detail": "上报成功", "robot_id": robot.id, "telemetry_id": telemetry.id, "duplicate": False},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class MediaUploadView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = MediaUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        robot, _ = Robot.objects.get_or_create(
+            code=payload["robot_code"],
+            defaults={
+                "name": payload["robot_code"],
+                "location": "未知区域",
+                "area": "未知区域",
+            },
+        )
+
+        uploaded_file = payload["file"]
+        expected_sha256 = payload.get("sha256") or ""
+        if expected_sha256:
+            digest = hashlib.sha256()
+            for chunk in uploaded_file.chunks():
+                digest.update(chunk)
+            uploaded_file.seek(0)
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256.lower() != expected_sha256.lower():
+                return Response({"detail": "文件 sha256 校验失败"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            actual_sha256 = ""
+
+        asset = MediaAsset.objects.create(
+            robot=robot,
+            media_type=payload["media_type"],
+            camera_id=payload.get("camera_id", ""),
+            sequence_id=payload.get("sequence_id", ""),
+            event_time=payload.get("event_time"),
+            file=uploaded_file,
+            sha256=actual_sha256,
+            file_size=uploaded_file.size,
+        )
+        asset.url = request.build_absolute_uri(settings.MEDIA_URL + asset.file.name)
+        asset.save(update_fields=["url", "updated_at"])
+        return Response({"url": asset.url, "asset": MediaAssetSerializer(asset).data}, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])

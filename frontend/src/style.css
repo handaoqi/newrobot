@@ -222,6 +222,7 @@ a { color: inherit; }
   object-fit: cover;
 }
 .detection-box { position: absolute; z-index: 2; cursor: move; touch-action: none; user-select: none; border: 2px solid #ff8b6c; border-radius: 12px; background: rgba(255, 93, 93, 0.08); box-shadow: 0 0 0 1px rgba(255, 120, 70, 0.3), 0 0 24px rgba(255, 93, 93, 0.14); }
+.detection-box.locked { cursor: default; }
 .box-label { position: absolute; top: -34px; left: 0; padding: 6px 10px; border-radius: 10px; background: rgba(255, 93, 93, 0.9); color: #fff; }
 .resize-handle { position: absolute; right: -8px; bottom: -8px; width: 22px; height: 22px; border-radius: 50%; background: transparent; cursor: nwse-resize; opacity: 0; }
 .video-overlay, .timeline-card { position: absolute; z-index: 3; left: 20px; right: 20px; }

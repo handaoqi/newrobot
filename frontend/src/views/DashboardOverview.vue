@@ -41,10 +41,26 @@ const quickTexts = [
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => overview.value?.latest_robot || null)
 const liveEvent = computed(() => overview.value?.live_event || null)
+const liveImage = computed(() => liveEvent.value?.snapshot_url || '/images/live-feed.jpg')
+const detectionBoxStyle = computed(() => {
+  const event = liveEvent.value
+  if (!event?.bbox_width || !event?.bbox_height || !event?.frame_width || !event?.frame_height) {
+    return { left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px` }
+  }
+
+  return {
+    left: `${(event.bbox_x / event.frame_width) * 100}%`,
+    top: `${(event.bbox_y / event.frame_height) * 100}%`,
+    width: `${(event.bbox_width / event.frame_width) * 100}%`,
+    height: `${(event.bbox_height / event.frame_height) * 100}%`,
+  }
+})
 
 function eventThumbStyle(index) {
+  const event = latestRobot.value?.recent_events?.[index]
+  const image = event?.snapshot_url || eventImages[index % eventImages.length]
   return {
-    backgroundImage: `linear-gradient(rgba(6, 16, 28, 0.08), rgba(6, 16, 28, 0.18)), url(${eventImages[index % eventImages.length]})`,
+    backgroundImage: `linear-gradient(rgba(6, 16, 28, 0.08), rgba(6, 16, 28, 0.18)), url(${image})`,
   }
 }
 
@@ -78,6 +94,7 @@ function emergencyStop() {
 }
 
 function pointerDown(event) {
+  if (liveEvent.value?.bbox_width) return
   const stage = stageRef.value
   if (!stage) return
   const bounds = stage.getBoundingClientRect()
@@ -89,6 +106,7 @@ function pointerDown(event) {
 }
 
 function resizeDown(event) {
+  if (liveEvent.value?.bbox_width) return
   event.stopPropagation()
   event.preventDefault()
   dragState.resizing = true
@@ -164,10 +182,11 @@ onBeforeUnmount(() => {
         </div>
 
         <div ref="stageRef" class="video-stage">
-          <img class="video-source" src="/images/live-feed.jpg" alt="实时视频画面" />
+          <img class="video-source" :src="liveImage" alt="实时视频画面" />
           <div
             class="detection-box"
-            :style="{ left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px` }"
+            :class="{ locked: liveEvent?.bbox_width }"
+            :style="detectionBoxStyle"
             @pointerdown="pointerDown"
           >
             <span class="box-label">{{ liveEvent?.title || '自行车违停识别' }}</span>
@@ -179,14 +198,18 @@ onBeforeUnmount(() => {
               <strong>巡检位置</strong>
               <span>{{ latestRobot?.location }}</span>
             </div>
+            <div class="overlay-card" v-if="latestRobot?.stream_id">
+              <strong>视频流</strong>
+              <span>{{ latestRobot.stream_id }}</span>
+            </div>
           </div>
 
           <div class="timeline-card">
             <strong>事件时间轴</strong>
             <div class="timeline-row">
-              <span>16:20:15</span>
+              <span>{{ formatEventTime(liveEvent?.detected_at) }}</span>
               <div class="timeline-bar"></div>
-              <span>16:21:08</span>
+              <span>{{ liveEvent?.status_label || '实时监测' }}</span>
             </div>
           </div>
         </div>

@@ -1,0 +1,72 @@
+robot:
+  code: "ZSL-1A-07"
+  name: "南入口巡检机器人"
+
+location:
+  name: "太阳宫公园南入口"
+  latitude: 39.983521
+  longitude: 116.447153
+
+video:
+  source: "rtsp://192.168.133.1:8554/test"
+  width: 1280
+  height: 720
+  camera_id: "front"
+  stream_id: "dog_ZSL-1A-07_front"
+  play_urls:
+    flv: "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv"
+    hls: "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8"
+  rtsp_transport: "tcp"
+  open_timeout_seconds: 8
+  read_timeout_seconds: 8
+  reconnect_interval_seconds: 3
+
+model:
+  path: "models/bike.pt"
+  confidence: 0.55
+  image_size: 960
+  device: ""
+  classes:
+    - "bicycle"
+    - "bike"
+    - "自行车"
+
+detection:
+  event_type: "vehicle_illegal_parking"
+  event_label: "自行车违停"
+  risk_level: "medium"
+  event_cooldown_seconds: 10
+  min_box_area: 4000
+
+telemetry:
+  endpoint: "http://127.0.0.1:8000/api/telemetry/ingest/"
+  media_upload_endpoint: "http://127.0.0.1:8000/api/device/media/upload/"
+  timeout_seconds: 5
+  verify_tls: false
+  device_key: ""
+  heartbeat_interval_seconds: 5
+  status_interval_seconds: 2
+
+snapshot:
+  directory: "snapshots"
+  public_base_url: "http://127.0.0.1:8000/static/snapshots"
+  jpeg_quality: 90
+
+display:
+  enable: true
+  window_name: "Bike Bot Detection"
+  show_fps: true
+  max_width: 1280
+
+storage:
+  telemetry_log_path: "data/telemetry/telemetry.jsonl"
+
+runtime:
+  mode: "auto"
+  status: "online"
+  battery_level: 78
+  charging: false
+  signal_strength: 92
+  network_type: "5G"
+  speed: 1.26
+  heading: 83.50

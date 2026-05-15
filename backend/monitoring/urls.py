@@ -8,6 +8,7 @@ from .views import (
     EventListView,
     LoginView,
     LogoutView,
+    MediaUploadView,
     ProfileView,
     RobotDetailView,
     RobotListView,
@@ -30,4 +31,5 @@ urlpatterns = [
     path("events/<int:event_id>/handle/", EventHandleView.as_view()),
     path("tasks/", TaskListView.as_view()),
     path("telemetry/ingest/", TelemetryIngestView.as_view()),
+    path("device/media/upload/", MediaUploadView.as_view()),
 ]

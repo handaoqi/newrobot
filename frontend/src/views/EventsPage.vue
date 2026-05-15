@@ -29,6 +29,7 @@ const segmentStyle = computed(() => ({
 const hasEvents = computed(() => events.value.length > 0)
 
 function getEventImage(event) {
+  if (event?.snapshot_url) return event.snapshot_url
   const index = events.value.findIndex((item) => item.id === event?.id)
   return eventImages[(index === -1 ? 0 : index) % eventImages.length]
 }
@@ -155,6 +156,19 @@ onMounted(loadEvents)
           <div class="detail-card">
             <strong>识别置信度</strong>
             <p>{{ selectedEvent.confidence }}%</p>
+          </div>
+          <div class="detail-card" v-if="selectedEvent.stream_id">
+            <strong>关联视频流</strong>
+            <p>{{ selectedEvent.stream_id }} / {{ selectedEvent.camera_id || 'front' }}</p>
+          </div>
+          <div class="detail-card" v-if="selectedEvent.bbox_width">
+            <strong>检测框</strong>
+            <p>
+              x={{ selectedEvent.bbox_x }},
+              y={{ selectedEvent.bbox_y }},
+              w={{ selectedEvent.bbox_width }},
+              h={{ selectedEvent.bbox_height }}
+            </p>
           </div>
           <div class="detail-card">
             <strong>处置备注</strong>
