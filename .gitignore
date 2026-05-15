@@ -1,1 +1,20 @@
 .venv
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local backend runtime state
+backend/db.sqlite3
+backend/media/
+backend/*.log
+backend/runserver.*.log
+
+# Frontend dependencies/build output
+frontend/node_modules/
+frontend/dist/
+
+# Bot runtime artifacts
+bot-version/venv/
+bot-version/data/telemetry/
+bot-version/snapshots/
