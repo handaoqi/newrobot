@@ -144,28 +144,6 @@ def ensure_demo_seed() -> None:
             },
         },
     )
-    Robot.objects.filter(pk=robot.pk).update(
-        name="南入口巡检机器人",
-        location="太阳宫公园南入口",
-        area="主通道南入口",
-        status="online",
-        mode="auto",
-        battery_level=78,
-        network_strength=92,
-        speaker_volume=84,
-        patrol_duration_minutes=30,
-        today_alerts=12,
-        current_task_name="公园主通道例行巡检",
-        firmware_version="1.0.0",
-        camera_id="front",
-        stream_id="dog_ZSL-1A-07_front",
-        play_urls={
-            "flv": "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv",
-            "hls": "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8",
-        },
-    )
-    robot.refresh_from_db()
-
     PatrolTask.objects.get_or_create(
         name="公园主通道早间巡检",
         robot=robot,
@@ -177,43 +155,6 @@ def ensure_demo_seed() -> None:
             "completion_rate": 68,
         },
     )
-    event_time = timezone.make_aware(timezone.datetime(timezone.localdate().year, 5, 2, 15, 3))
-    event_specs = [
-        {
-            "title": "自行车违停",
-            "location": "太阳宫公园南入口",
-            "confidence": 95.1,
-            "detected_at": event_time,
-            "description": "机器人识别到自行车停放在巡检通道内，已提醒现场及时移离。",
-        },
-        {
-            "title": "自行车违停",
-            "location": "中心广场北侧",
-            "confidence": 88.2,
-            "detected_at": event_time - timezone.timedelta(minutes=8),
-            "description": "中心广场北侧检测到自行车违规停放。",
-        },
-        {
-            "title": "自行车违停",
-            "location": "太阳宫公园南入口",
-            "confidence": 92.5,
-            "detected_at": event_time - timezone.timedelta(minutes=16),
-            "description": "南入口主通道检测到自行车违规停放。",
-        },
-    ]
-    existing_events = list(robot.events.all()[:3])
-    for index, spec in enumerate(event_specs):
-        event = existing_events[index] if index < len(existing_events) else InspectionEvent(robot=robot)
-        event.title = spec["title"]
-        event.event_type = "vehicle_illegal_parking"
-        event.location = spec["location"]
-        event.confidence = spec["confidence"]
-        event.risk_level = "medium"
-        event.status = "resolved"
-        event.detected_at = spec["detected_at"]
-        event.description = spec["description"]
-        event.handling_notes = "值班员已通过平台完成复核与处置。"
-        event.save()
 
 
 class LoginView(APIView):

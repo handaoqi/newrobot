@@ -95,8 +95,6 @@ class TelemetryClient:
             return
 
         for detection in detections:
-            if detection.snapshot_url and detection.snapshot_url.startswith(("http://", "https://")):
-                continue
             if not detection.local_snapshot_path:
                 continue
 
