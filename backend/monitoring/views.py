@@ -139,11 +139,19 @@ def ensure_demo_seed() -> None:
             "camera_id": "front",
             "stream_id": "dog_ZSL-1A-07_front",
             "play_urls": {
-                "flv": "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv",
-                "hls": "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8",
+                "flv": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front.live.flv",
+                "hls": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front/hls.m3u8",
             },
         },
     )
+    if not robot.stream_id:
+        robot.stream_id = "dog_ZSL-1A-07_front"
+    if not robot.play_urls:
+        robot.play_urls = {
+            "flv": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front.live.flv",
+            "hls": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front/hls.m3u8",
+        }
+    robot.save(update_fields=["stream_id", "play_urls", "updated_at"])
     PatrolTask.objects.get_or_create(
         name="公园主通道早间巡检",
         robot=robot,

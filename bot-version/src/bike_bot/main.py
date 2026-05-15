@@ -11,6 +11,7 @@ import cv2
 from .config import AppConfig
 from .detector import YoloDetector
 from .runtime import RuntimeState
+from .stream import StreamPusher
 from .telemetry import TelemetryClient
 
 LOGGER = logging.getLogger(__name__)
@@ -112,6 +113,14 @@ def detection_worker(
             cv2.destroyAllWindows()
 
 
+def stream_worker(stop_event: threading.Event, pusher: StreamPusher, error_queue: Queue[BaseException]) -> None:
+    try:
+        pusher.run_forever(stop_event)
+    except BaseException as exc:
+        LOGGER.exception("stream worker crashed")
+        error_queue.put(exc)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime bicycle detection edge client.")
     parser.add_argument("--config", default="config.yaml", help="path to yaml config")
@@ -127,6 +136,7 @@ def main() -> None:
     runtime_state = RuntimeState(config)
     detector = YoloDetector(config)
     client = TelemetryClient(config, runtime_state)
+    pusher = StreamPusher(config)
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()
 
@@ -150,6 +160,15 @@ def main() -> None:
             name="detection-worker",
         ),
     ]
+    if config.stream.enable:
+        threads.append(
+            threading.Thread(
+                target=stream_worker,
+                args=(stop_event, pusher, error_queue),
+                daemon=False,
+                name="zlm-stream-worker",
+            )
+        )
 
     for thread in threads:
         thread.start()

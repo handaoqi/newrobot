@@ -1,5 +1,7 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import Hls from 'hls.js'
+import mpegts from 'mpegts.js'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
@@ -9,18 +11,9 @@ const overview = ref(null)
 const robots = ref([])
 const loading = ref(true)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
-const box = reactive({ left: 76, top: 84, width: 148, height: 228 })
-const dragState = reactive({
-  dragging: false,
-  resizing: false,
-  offsetX: 0,
-  offsetY: 0,
-  startX: 0,
-  startY: 0,
-  startWidth: 0,
-  startHeight: 0,
-})
-const stageRef = ref(null)
+const videoRef = ref(null)
+let flvPlayer = null
+let hlsPlayer = null
 const { toastMessage, visible, showToast } = useToast()
 
 const quickTexts = [
@@ -42,19 +35,8 @@ const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/even
 const latestRobot = computed(() => overview.value?.latest_robot || null)
 const liveEvent = computed(() => overview.value?.live_event || null)
 const liveImage = computed(() => liveEvent.value?.snapshot_url || '/images/live-feed.jpg')
-const detectionBoxStyle = computed(() => {
-  const event = liveEvent.value
-  if (!event?.bbox_width || !event?.bbox_height || !event?.frame_width || !event?.frame_height) {
-    return { left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px` }
-  }
-
-  return {
-    left: `${(event.bbox_x / event.frame_width) * 100}%`,
-    top: `${(event.bbox_y / event.frame_height) * 100}%`,
-    width: `${(event.bbox_width / event.frame_width) * 100}%`,
-    height: `${(event.bbox_height / event.frame_height) * 100}%`,
-  }
-})
+const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
+const hasLiveStream = computed(() => Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 
 function eventThumbStyle(index) {
   const event = latestRobot.value?.recent_events?.[index]
@@ -93,52 +75,50 @@ function emergencyStop() {
   showToast('演示状态：已触发紧急停止指令')
 }
 
-function pointerDown(event) {
-  if (liveEvent.value?.bbox_width) return
-  const stage = stageRef.value
-  if (!stage) return
-  const bounds = stage.getBoundingClientRect()
-
-  event.preventDefault()
-  dragState.dragging = true
-  dragState.offsetX = event.clientX - bounds.left - box.left
-  dragState.offsetY = event.clientY - bounds.top - box.top
-}
-
-function resizeDown(event) {
-  if (liveEvent.value?.bbox_width) return
-  event.stopPropagation()
-  event.preventDefault()
-  dragState.resizing = true
-  dragState.startX = event.clientX
-  dragState.startY = event.clientY
-  dragState.startWidth = box.width
-  dragState.startHeight = box.height
-}
-
-function onPointerMove(event) {
-  const stage = stageRef.value
-  if (!stage) return
-  const bounds = stage.getBoundingClientRect()
-
-  if (dragState.dragging) {
-    const maxLeft = bounds.width - box.width
-    const maxTop = bounds.height - box.height
-    box.left = Math.min(Math.max(event.clientX - bounds.left - dragState.offsetX, 0), maxLeft)
-    box.top = Math.min(Math.max(event.clientY - bounds.top - dragState.offsetY, 0), maxTop)
+function destroyVideoPlayers() {
+  if (flvPlayer) {
+    flvPlayer.destroy()
+    flvPlayer = null
   }
-
-  if (dragState.resizing) {
-    const nextWidth = dragState.startWidth + (event.clientX - dragState.startX)
-    const nextHeight = dragState.startHeight + (event.clientY - dragState.startY)
-    box.width = Math.min(Math.max(nextWidth, 70), bounds.width - box.left)
-    box.height = Math.min(Math.max(nextHeight, 120), bounds.height - box.top)
+  if (hlsPlayer) {
+    hlsPlayer.destroy()
+    hlsPlayer = null
   }
 }
 
-function stopPointer() {
-  dragState.dragging = false
-  dragState.resizing = false
+async function setupLivePlayer() {
+  await nextTick()
+  destroyVideoPlayers()
+  const element = videoRef.value
+  if (!element || !hasLiveStream.value) return
+
+  const { flv, hls } = livePlayUrls.value
+  if (flv && mpegts.getFeatureList().mseLivePlayback) {
+    flvPlayer = mpegts.createPlayer({
+      type: 'flv',
+      isLive: true,
+      url: flv,
+    })
+    flvPlayer.attachMediaElement(element)
+    flvPlayer.load()
+    flvPlayer.play().catch(() => {})
+    return
+  }
+
+  if (hls && Hls.isSupported()) {
+    hlsPlayer = new Hls({ lowLatencyMode: true })
+    hlsPlayer.loadSource(hls)
+    hlsPlayer.attachMedia(element)
+    hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+      element.play().catch(() => {})
+    })
+    return
+  }
+
+  if (hls) {
+    element.src = hls
+    element.play().catch(() => {})
+  }
 }
 
 onMounted(async () => {
@@ -150,14 +130,14 @@ onMounted(async () => {
     loading.value = false
   }
 
-  window.addEventListener('pointermove', onPointerMove)
-  window.addEventListener('pointerup', stopPointer)
+  setupLivePlayer()
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('pointermove', onPointerMove)
-  window.removeEventListener('pointerup', stopPointer)
+  destroyVideoPlayers()
 })
+
+watch(livePlayUrls, setupLivePlayer)
 </script>
 
 <template>
@@ -181,17 +161,17 @@ onBeforeUnmount(() => {
           <span class="panel-badge">Live Stream</span>
         </div>
 
-        <div ref="stageRef" class="video-stage">
-          <img class="video-source" :src="liveImage" alt="实时视频画面" />
-          <div
-            class="detection-box"
-            :class="{ locked: liveEvent?.bbox_width }"
-            :style="detectionBoxStyle"
-            @pointerdown="pointerDown"
-          >
-            <span class="box-label">{{ liveEvent?.title || '自行车违停识别' }}</span>
-            <span class="resize-handle" @pointerdown="resizeDown"></span>
-          </div>
+        <div class="video-stage">
+          <video
+            v-if="hasLiveStream"
+            ref="videoRef"
+            class="video-source"
+            muted
+            playsinline
+            autoplay
+            controls
+          ></video>
+          <img v-else class="video-source" :src="liveImage" alt="实时视频画面" />
 
           <div class="video-overlay">
             <div class="overlay-card">
@@ -204,14 +184,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div class="timeline-card">
-            <strong>事件时间轴</strong>
-            <div class="timeline-row">
-              <span>{{ formatEventTime(liveEvent?.detected_at) }}</span>
-              <div class="timeline-bar"></div>
-              <span>{{ liveEvent?.status_label || '实时监测' }}</span>
-            </div>
-          </div>
         </div>
 
         <div class="video-footer">

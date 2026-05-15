@@ -35,6 +35,17 @@ class VideoConfig:
 
 
 @dataclass
+class StreamConfig:
+    enable: bool = False
+    ffmpeg_path: str = "ffmpeg"
+    rtmp_url: str = ""
+    reconnect_interval_seconds: int = 5
+    video_codec: str = "copy"
+    audio_enabled: bool = False
+    extra_args: list[str] | None = None
+
+
+@dataclass
 class ModelConfig:
     path: str
     confidence: float = 0.55
@@ -100,6 +111,7 @@ class AppConfig:
     robot: RobotConfig
     location: LocationConfig
     video: VideoConfig
+    stream: StreamConfig
     model: ModelConfig
     detection: DetectionConfig
     telemetry: TelemetryConfig
@@ -119,6 +131,7 @@ class AppConfig:
             robot=RobotConfig(**data["robot"]),
             location=LocationConfig(**data["location"]),
             video=VideoConfig(source=video_source, **{k: v for k, v in data["video"].items() if k != "source"}),
+            stream=StreamConfig(**data.get("stream", {})),
             model=ModelConfig(**data["model"]),
             detection=DetectionConfig(**data["detection"]),
             telemetry=TelemetryConfig(**data["telemetry"]),

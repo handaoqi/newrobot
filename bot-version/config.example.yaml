@@ -21,6 +21,15 @@ video:
   read_timeout_seconds: 8
   reconnect_interval_seconds: 3
 
+stream:
+  enable: true
+  ffmpeg_path: "ffmpeg"
+  rtmp_url: "rtmp://<cloud-server-ip>/live/dog_ZSL-1A-07_front"
+  reconnect_interval_seconds: 5
+  video_codec: "copy"
+  audio_enabled: false
+  extra_args: []
+
 model:
   path: "models/bike.pt"
   confidence: 0.55

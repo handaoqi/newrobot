@@ -243,15 +243,10 @@ a { color: inherit; }
   height: 100%;
   object-fit: cover;
 }
-.detection-box { position: absolute; z-index: 2; cursor: move; touch-action: none; user-select: none; border: 2px solid #ff8b6c; border-radius: 12px; background: rgba(255, 93, 93, 0.08); box-shadow: 0 0 0 1px rgba(255, 120, 70, 0.3), 0 0 24px rgba(255, 93, 93, 0.14); }
-.detection-box.locked { cursor: default; }
-.box-label { position: absolute; top: -34px; left: 0; padding: 6px 10px; border-radius: 10px; background: rgba(255, 93, 93, 0.9); color: #fff; }
-.resize-handle { position: absolute; right: -8px; bottom: -8px; width: 22px; height: 22px; border-radius: 50%; background: transparent; cursor: nwse-resize; opacity: 0; }
-.video-overlay, .timeline-card { position: absolute; z-index: 3; left: 20px; right: 20px; }
+.video-overlay { position: absolute; z-index: 3; left: 20px; right: 20px; }
 .video-overlay { top: 20px; display: flex; gap: 12px; }
-.overlay-card, .timeline-card { background: var(--overlay-bg); border: 1px solid rgba(146, 197, 255, 0.16); border-radius: 18px; padding: 14px 16px; }
-.overlay-card strong, .timeline-card strong, .footer-card strong, .detail-card strong { display: block; color: var(--overlay-strong); margin-bottom: 6px; }
-.timeline-card { bottom: 20px; }
+.overlay-card { background: var(--overlay-bg); border: 1px solid rgba(146, 197, 255, 0.16); border-radius: 18px; padding: 14px 16px; }
+.overlay-card strong, .footer-card strong, .detail-card strong { display: block; color: var(--overlay-strong); margin-bottom: 6px; }
 .timeline-bar { flex: 1; height: 8px; border-radius: 999px; background: linear-gradient(90deg, rgba(67, 213, 255, 0.2), rgba(67, 213, 255, 0.95)); }
 .video-footer { margin-top: 18px; }
 .footer-card, .metric-card, .detail-card, .mini-card { border-radius: 18px; padding: 16px; background: var(--panel-soft); min-width: 0; }
@@ -490,7 +485,7 @@ a { color: inherit; }
   .header-actions { width: 100%; justify-content: flex-start; }
   .header-user { text-align: left; }
   .video-stage { min-height: 360px; }
-  .video-overlay, .timeline-card { left: 14px; right: 14px; }
+  .video-overlay { left: 14px; right: 14px; }
   .video-footer { display: grid; grid-template-columns: 1fr 1fr; }
   .footer-card.wide { grid-column: 1 / -1; }
   .action-row { width: 100%; }
@@ -561,7 +556,6 @@ a { color: inherit; }
   .event-main small {
     white-space: normal;
   }
-  .box-label { max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .login-artboard {
     background-position: 20% center;
   }
