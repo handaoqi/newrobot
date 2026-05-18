@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>机器狗巡检 MVP</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">ZSL-1A Patrol MVP</p>
+          <h1>机器狗巡检控制台</h1>
+        </div>
+        <button id="refreshBtn" class="primary">刷新状态</button>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>远程通道</h2>
+            <span id="remoteModePill" class="pill">局域网</span>
+          </div>
+          <div class="panel-actions">
+            <button id="remoteRefreshBtn" class="small">检查通道</button>
+            <button id="remoteConnectBtn" class="primary small">连接云端</button>
+            <button id="remoteDisconnectBtn" class="small">断开云端</button>
+          </div>
+          <pre id="remoteOutput">这里会显示当前是局域网直连还是云端中转。</pre>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>系统状态</h2>
+            <span id="statusPill" class="pill">等待刷新</span>
+          </div>
+          <div id="statusSummary" class="status-summary">
+            <div class="summary-card">
+              <span class="summary-label">机器狗</span>
+              <strong id="robotStateText">等待刷新</strong>
+              <p id="robotStateHint">这里会用人话描述系统是否在线。</p>
+            </div>
+            <div class="summary-card">
+              <span class="summary-label">导航</span>
+              <strong id="navStateText">等待刷新</strong>
+              <p id="navStateHint">这里会说明当前是否正在执行导航。</p>
+            </div>
+            <div class="summary-card">
+              <span class="summary-label">运动</span>
+              <strong id="motionStateText">等待刷新</strong>
+              <p id="motionStateHint">这里会说明底盘是否允许速度控制。</p>
+            </div>
+            <div class="summary-card">
+              <span class="summary-label">定位</span>
+              <strong id="locStateText">等待刷新</strong>
+              <p id="locStateHint">这里会说明地图和定位是否准备好。</p>
+            </div>
+            <div class="summary-card">
+              <span class="summary-label">建图</span>
+              <strong id="slamStateText">等待刷新</strong>
+              <p id="slamStateHint">这里会说明当前是不是在建图或已保存。</p>
+            </div>
+          </div>
+          <div id="timeoutInfo" class="timeout-info">超时配置读取中...</div>
+          <pre id="statusOutput">点击“刷新状态”读取 Orin、导航、定位与 SLAM 状态。</pre>
+        </article>
+
+        <article class="panel actions">
+          <h2>建图</h2>
+          <p>开始建图后，请用安全方式缓慢牵引或遥控机器狗走一圈，最后回到起点附近再保存地图。</p>
+          <button id="startMappingBtn">开始建图</button>
+          <button id="saveMapBtn">保存地图</button>
+          <button id="resetMappingBtn">重置建图状态</button>
+          <button id="stopBtn" class="danger">停止速度指令</button>
+          <div id="actionOutput" class="result">操作结果会显示在这里。</div>
+        </article>
+
+        <article class="panel motion-panel">
+          <div class="panel-head">
+            <h2>运动测试</h2>
+            <span id="motionBadge" class="pill">按住移动</span>
+          </div>
+          <div class="motion-settings">
+            <label>
+              <span>线速度 m/s</span>
+              <input id="motionLinear" type="number" min="0.03" max="0.25" step="0.01" value="0.12" />
+            </label>
+            <label>
+              <span>角速度 rad/s</span>
+              <input id="motionAngular" type="number" min="0.1" max="0.8" step="0.05" value="0.35" />
+            </label>
+            <label>
+              <span>持续秒</span>
+              <input id="motionDuration" type="number" min="0.1" max="2" step="0.1" value="0.6" />
+            </label>
+          </div>
+          <div class="motion-pad">
+            <button id="standUpBtn" class="primary">起立</button>
+            <button id="enableMotionBtn">进入速度模式</button>
+            <button id="turnLeftBtn">左转</button>
+            <button id="forwardBtn">前进</button>
+            <button id="turnRightBtn">右转</button>
+            <button id="backwardBtn">后退</button>
+            <button id="motionStopBtn" class="danger">立即停止</button>
+          </div>
+          <pre id="motionOutput">按住方向按钮持续移动，松开会立刻发送停止。</pre>
+        </article>
+
+        <article class="panel map-panel">
+          <div class="panel-head">
+            <h2>地图查看</h2>
+            <div class="panel-actions">
+              <button id="refreshMapsBtn" class="small">刷新列表</button>
+              <button id="loadMapBtn" class="small">读取地图</button>
+            </div>
+          </div>
+          <div id="mapList" class="map-list">正在读取地图列表...</div>
+          <canvas id="mapCanvas" width="1" height="1"></canvas>
+          <pre id="mapInfo">保存地图后，这里会显示 /home/jszr/.jszr/map/map.pgm。</pre>
+        </article>
+
+        <article class="panel nav-panel">
+          <div class="panel-head">
+            <h2>单点导航</h2>
+            <span id="goalBadge" class="pill">未选点</span>
+          </div>
+          <div class="nav-readout">
+            <div>
+              <span class="summary-label">目标点</span>
+              <strong id="goalText">请在地图上点击目标位置</strong>
+            </div>
+            <label>
+              <span>速度 m/s</span>
+              <input id="navSpeed" type="number" min="0.05" max="0.5" step="0.05" value="0.25" />
+            </label>
+            <label>
+              <span>到点容差 m</span>
+              <input id="navTolerance" type="number" min="0.1" max="1" step="0.05" value="0.35" />
+            </label>
+          </div>
+          <div class="localization-tools">
+            <label>
+              <span>初始朝向 rad</span>
+              <input id="initYaw" type="number" min="-3.14" max="3.14" step="0.1" value="0" />
+            </label>
+            <button id="initPoseBtn">将选点设为机器狗当前位置</button>
+          </div>
+          <button id="loadNavMapBtn">加载地图到定位</button>
+          <button id="sendGoalBtn">发送目标点</button>
+          <button id="cancelNavBtn" class="danger">取消导航 / 停止</button>
+          <pre id="navOutput">先读取地图，在地图上点一个目标点，再发送导航。</pre>
+        </article>
+
+        <article class="panel video-panel">
+          <div class="panel-head">
+            <h2>视频预览</h2>
+            <button id="snapshotBtn" class="small">刷新画面</button>
+          </div>
+          <div class="video-frame">
+            <img id="cameraImage" alt="机器狗前视画面" />
+          </div>
+          <div class="video-actions">
+            <button id="liveBtn">开始预览</button>
+            <button id="videoInfoBtn">视频状态</button>
+          </div>
+          <pre id="videoInfo">RTSP 地址：rtsp://192.168.234.1:8554</pre>
+        </article>
+
+        <article class="panel">
+          <h2>MVP 目标</h2>
+          <ol>
+            <li>确认传感器和导航栈在线。</li>
+            <li>完成一张可用地图。</li>
+            <li>加载地图并记录固定巡检点。</li>
+            <li>通过平台触发固定路线巡检。</li>
+          </ol>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
