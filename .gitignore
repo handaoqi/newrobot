@@ -59,6 +59,13 @@ _snapshot_test.jpg
 *.pcd
 *.bin
 *.pgm
+*.gif
+robot_ws/_archives/
+robot_ws/**/build/
+robot_ws/**/install/
+robot_ws/**/log/
+robot_ws/**/.colcon/
+genisom_l1_sdk/
 
 # OS/editor files
 .DS_Store
