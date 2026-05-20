@@ -61,6 +61,7 @@ _snapshot_test.jpg
 *.pgm
 *.gif
 robot_ws/_archives/
+robot_ws/vendor/
 robot_ws/**/build/
 robot_ws/**/install/
 robot_ws/**/log/

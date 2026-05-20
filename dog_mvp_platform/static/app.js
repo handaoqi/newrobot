@@ -33,6 +33,7 @@ const forwardBtn = document.querySelector("#forwardBtn");
 const turnRightBtn = document.querySelector("#turnRightBtn");
 const backwardBtn = document.querySelector("#backwardBtn");
 const motionStopBtn = document.querySelector("#motionStopBtn");
+const releaseSdkBtn = document.querySelector("#releaseSdkBtn");
 const motionOutput = document.querySelector("#motionOutput");
 const loadMapBtn = document.querySelector("#loadMapBtn");
 const refreshMapsBtn = document.querySelector("#refreshMapsBtn");
@@ -49,6 +50,12 @@ const loadNavMapBtn = document.querySelector("#loadNavMapBtn");
 const sendGoalBtn = document.querySelector("#sendGoalBtn");
 const cancelNavBtn = document.querySelector("#cancelNavBtn");
 const navOutput = document.querySelector("#navOutput");
+const patrolBadge = document.querySelector("#patrolBadge");
+const addPatrolPointBtn = document.querySelector("#addPatrolPointBtn");
+const clearPatrolBtn = document.querySelector("#clearPatrolBtn");
+const startPatrolBtn = document.querySelector("#startPatrolBtn");
+const patrolList = document.querySelector("#patrolList");
+const patrolOutput = document.querySelector("#patrolOutput");
 const snapshotBtn = document.querySelector("#snapshotBtn");
 const liveBtn = document.querySelector("#liveBtn");
 const videoInfoBtn = document.querySelector("#videoInfoBtn");
@@ -59,12 +66,14 @@ let actionInFlight = false;
 let selectedMapDir = "";
 let currentMap = null;
 let selectedGoal = null;
+let patrolPoints = [];
 let latestSummary = {};
 let navPollTimer = null;
 let motionHold = {
   active: false,
   timer: null,
   direction: "",
+  inFlight: false,
 };
 
 function setRemotePill(label, state = "") {
@@ -372,15 +381,16 @@ function startHoldMotion(direction) {
   setMotionBusy(true, "运动中");
   motionOutput.textContent = "按住中，正在连续发送低速指令...";
   sendHoldTick();
-  motionHold.timer = setInterval(sendHoldTick, 260);
+  motionHold.timer = setInterval(sendHoldTick, 700);
 }
 
 async function sendHoldTick() {
-  if (!motionHold.active) {
+  if (!motionHold.active || motionHold.inFlight) {
     return;
   }
+  motionHold.inFlight = true;
   const payload = motionValues(motionHold.direction);
-  payload.duration = 0.35;
+  payload.duration = Math.min(Number(motionDuration.value || 0.45), 0.45);
   try {
     const data = await postJson("/api/motion/stream", payload);
     if (!data.ok) {
@@ -388,6 +398,8 @@ async function sendHoldTick() {
     }
   } catch (error) {
     motionOutput.textContent = String(error);
+  } finally {
+    motionHold.inFlight = false;
   }
 }
 
@@ -397,6 +409,7 @@ async function stopHoldMotion() {
   }
   motionHold.active = false;
   motionHold.direction = "";
+  motionHold.inFlight = false;
   if (motionHold.timer) {
     clearInterval(motionHold.timer);
     motionHold.timer = null;
@@ -416,6 +429,23 @@ async function stopMotionNow() {
     motionOutput.textContent = String(error);
   } finally {
     motionStopBtn.disabled = false;
+  }
+}
+
+async function releaseSdkControl() {
+  if (!confirm("确认释放遥控器？页面会停止 SDK 接管，遥控器应恢复控制。")) {
+    return;
+  }
+  releaseSdkBtn.disabled = true;
+  motionOutput.textContent = "正在释放遥控器控制权...";
+  try {
+    const data = await callApi("/api/motion/release", { method: "POST" });
+    motionOutput.textContent = formatResult(data);
+    await refreshStatus();
+  } catch (error) {
+    motionOutput.textContent = String(error);
+  } finally {
+    releaseSdkBtn.disabled = false;
   }
 }
 
@@ -884,6 +914,7 @@ bindHoldMotion(forwardBtn, "forward");
 bindHoldMotion(turnRightBtn, "right");
 bindHoldMotion(backwardBtn, "backward");
 motionStopBtn.addEventListener("click", stopMotionNow);
+releaseSdkBtn.addEventListener("click", releaseSdkControl);
 loadMapBtn.addEventListener("click", loadMap);
 refreshMapsBtn.addEventListener("click", loadMaps);
 mapCanvas.addEventListener("click", selectGoalFromEvent);

@@ -103,6 +103,7 @@
             <button id="turnRightBtn">右转</button>
             <button id="backwardBtn">后退</button>
             <button id="motionStopBtn" class="danger">立即停止</button>
+            <button id="releaseSdkBtn">释放遥控器</button>
           </div>
           <pre id="motionOutput">按住方向按钮持续移动，松开会立刻发送停止。</pre>
         </article>
@@ -150,6 +151,19 @@
           <button id="sendGoalBtn">发送目标点</button>
           <button id="cancelNavBtn" class="danger">取消导航 / 停止</button>
           <pre id="navOutput">先读取地图，在地图上点一个目标点，再发送导航。</pre>
+          <div class="patrol-tools">
+            <div class="panel-head compact">
+              <h3>巡检路线</h3>
+              <span id="patrolBadge" class="pill">0 个点</span>
+            </div>
+            <div class="patrol-actions">
+              <button id="addPatrolPointBtn">加入巡检点</button>
+              <button id="clearPatrolBtn">清空路线</button>
+              <button id="startPatrolBtn" class="primary">开始巡检</button>
+            </div>
+            <ol id="patrolList" class="patrol-list"></ol>
+            <pre id="patrolOutput">在地图上选点后加入巡检路线，可以按顺序导航。</pre>
+          </div>
         </article>
 
         <article class="panel video-panel">

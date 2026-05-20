@@ -28,7 +28,7 @@ REMOTE_SERVER_KEY = Path(
 LOCAL_RK_PORT = int(os.environ.get("DOG_REMOTE_LOCAL_RK_PORT", "2201"))
 LOCAL_ORIN_PORT = int(os.environ.get("DOG_REMOTE_LOCAL_ORIN_PORT", "2202"))
 TIMEOUTS = {
-    "status": 10,
+    "status": 18,
     "slam_start": 30,
     "slam_save": 90,
     "slam_reset": 25,
@@ -44,7 +44,32 @@ TIMEOUTS = {
     "motion": 16,
     "motion_stream": 16,
     "motion_mode": 8,
+    "sdk_status": 12,
+    "sdk_motion": 20,
+    "sdk_stop": 10,
+    "sdk_release": 10,
+    "sdk_navigate": 90,
+    "nav_bridge": 18,
+    "patrol": 180,
 }
+
+SDK_REMOTE_ROOT = os.environ.get("DOG_SDK_REMOTE_ROOT", "/home/firefly/genisom_l1_sdk")
+SDK_LOCAL_IP = os.environ.get("DOG_SDK_LOCAL_IP", "192.168.234.1")
+SDK_LOCAL_PORT = int(os.environ.get("DOG_SDK_LOCAL_PORT", "43988"))
+SDK_DOG_IP = os.environ.get("DOG_SDK_DOG_IP", "192.168.234.1")
+SDK_BRIDGE_PORT = int(os.environ.get("DOG_SDK_BRIDGE_PORT", "9095"))
+SDK_BRIDGE_LOCAL = ROOT / "scripts" / "dog_sdk_bridge.py"
+SDK_BRIDGE_REMOTE = os.environ.get("DOG_SDK_BRIDGE_REMOTE", "/home/firefly/.dog_mvp/dog_sdk_bridge.py")
+NAV_CMDVEL_BRIDGE_LOCAL = ROOT / "scripts" / "nav_cmdvel_sdk_bridge.py"
+NAV_CMDVEL_BRIDGE_REMOTE = os.environ.get(
+    "DOG_NAV_CMDVEL_BRIDGE_REMOTE",
+    "/home/jszr/.dog_mvp/nav_cmdvel_sdk_bridge.py",
+)
+NAV_CMDVEL_STATUS_REMOTE = os.environ.get(
+    "DOG_NAV_CMDVEL_STATUS_REMOTE",
+    "/tmp/dog_nav_cmdvel_sdk_bridge.status.json",
+)
+NAV_CMDVEL_TOPIC = os.environ.get("DOG_NAV_CMDVEL_TOPIC", "/cmd_vel")
 
 def _ssh_target(user_env, default_user, host_env, default_host, port_env, default_port):
     user = os.environ.get(user_env, default_user)
@@ -462,12 +487,505 @@ def run_remote_script(script, timeout=30):
             pass
 
 
+def run_rk_script(script, timeout=30):
+    env = ssh_env()
+    remote_script = script.replace("\r\n", "\n").replace("\r", "\n")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".sh", delete=False) as handle:
+        handle.write(remote_script)
+        script_path = handle.name
+    try:
+        with open(script_path, "rb") as handle:
+            completed = subprocess.run(
+                RK_SSH_BASE + ["bash -s"],
+                stdin=handle,
+                text=False,
+                capture_output=True,
+                timeout=timeout,
+                env=env,
+            )
+        return {
+            "ok": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": _as_text(completed.stdout).strip(),
+            "stderr": _as_text(completed.stderr).strip(),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": _as_text(exc.stdout).strip(),
+            "stderr": f"rk script timed out after {timeout}s",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": -2,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+def deploy_sdk_bridge():
+    try:
+        payload = base64.b64encode(SDK_BRIDGE_LOCAL.read_bytes()).decode("ascii")
+    except OSError as exc:
+        return {"ok": False, "stdout": "", "stderr": f"missing local SDK bridge: {exc}"}
+    remote_dir = str(Path(SDK_BRIDGE_REMOTE).parent).replace("\\", "/")
+    script = f"""
+set -e
+mkdir -p {json.dumps(remote_dir)}
+python3 - <<'PY'
+import base64
+from pathlib import Path
+
+target = Path({json.dumps(SDK_BRIDGE_REMOTE)})
+target.write_bytes(base64.b64decode({json.dumps(payload)}))
+target.chmod(0o755)
+print("deployed", target)
+PY
+"""
+    return run_rk_script(script, timeout=12)
+
+
+def sdk_bridge_request(path, method="GET", payload=None, timeout=10, ensure=True):
+    if ensure:
+        ready = ensure_sdk_bridge()
+        if not ready.get("ok"):
+            return ready
+    body = json.dumps(payload or {})
+    script = f"""
+python3 - <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+url = {json.dumps(f"http://127.0.0.1:{SDK_BRIDGE_PORT}{path}")}
+method = {json.dumps(method)}
+raw = {json.dumps(body)}
+data = raw.encode("utf-8") if method != "GET" else None
+req = urllib.request.Request(url, data=data, method=method, headers={{"Content-Type": "application/json"}})
+try:
+    with urllib.request.urlopen(req, timeout=4) as response:
+        print(response.read().decode("utf-8"))
+except Exception as exc:
+    print(json.dumps({{"ok": False, "error": str(exc)}}))
+    sys.exit(1)
+PY
+"""
+    result = run_rk_script(script, timeout=timeout)
+    parsed, error = parse_last_json_line(result, "SDK bridge")
+    if parsed is not None:
+        result["bridge"] = parsed
+        result["ok"] = bool(parsed.get("ok")) and result.get("ok", False)
+        if "sdk" in parsed:
+            result["sdk"] = parsed["sdk"]
+    elif error:
+        result["bridge_parse_error"] = error
+    return result
+
+
+def ensure_sdk_bridge():
+    deploy = deploy_sdk_bridge()
+    if not deploy.get("ok"):
+        return deploy
+
+    status = sdk_bridge_request("/status", method="GET", timeout=8, ensure=False)
+    if status.get("ok"):
+        return status
+
+    sdk_lib = f"{SDK_REMOTE_ROOT}/lib/zsl-1/aarch64"
+    script = f"""
+set -e
+python3 - <<'PY'
+import os
+import signal
+from pathlib import Path
+
+needle = {json.dumps(SDK_BRIDGE_REMOTE)}
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    if pid == os.getpid():
+        continue
+    try:
+        cmd = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\\x00", " ")
+    except OSError:
+        continue
+    if needle in cmd:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+PY
+sleep 0.3
+SDK_LIB={json.dumps(sdk_lib)}
+export LD_LIBRARY_PATH="$SDK_LIB:$LD_LIBRARY_PATH"
+nohup python3 {json.dumps(SDK_BRIDGE_REMOTE)} \\
+  --sdk-lib "$SDK_LIB" \\
+  --local-ip {json.dumps(SDK_LOCAL_IP)} \\
+  --local-port {SDK_LOCAL_PORT} \\
+  --dog-ip {json.dumps(SDK_DOG_IP)} \\
+  --host 0.0.0.0 \\
+  --port {SDK_BRIDGE_PORT} \\
+  >/tmp/dog_sdk_bridge.log 2>&1 &
+python3 - <<'PY'
+import sys
+import time
+import urllib.request
+
+url = {json.dumps(f"http://127.0.0.1:{SDK_BRIDGE_PORT}/status")}
+for _ in range(40):
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            print(response.read().decode("utf-8"))
+            sys.exit(0)
+    except Exception:
+        time.sleep(0.15)
+print("bridge did not become ready")
+sys.exit(1)
+PY
+"""
+    started = run_rk_script(script, timeout=14)
+    parsed, error = parse_last_json_line(started, "SDK bridge start")
+    if parsed is not None:
+        started["bridge"] = parsed
+        started["ok"] = bool(parsed.get("ok")) and started.get("ok", False)
+        if "sdk" in parsed:
+            started["sdk"] = parsed["sdk"]
+    elif error:
+        started["bridge_parse_error"] = error
+    return started
+
+
+def release_sdk_bridge():
+    stop_result = sdk_bridge_request("/stop", method="POST", timeout=TIMEOUTS["sdk_stop"], ensure=False)
+    script = f"""
+python3 - <<'PY'
+import json
+import os
+import signal
+import time
+from pathlib import Path
+
+needle = {json.dumps(SDK_BRIDGE_REMOTE)}
+killed = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    if pid == os.getpid():
+        continue
+    try:
+        cmd = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\\x00", " ")
+    except OSError:
+        continue
+    if needle in cmd:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            pass
+
+time.sleep(0.3)
+still_running = []
+for pid in killed:
+    if Path(f"/proc/{{pid}}").exists():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        still_running.append(pid)
+
+print(json.dumps({{"released": True, "killed": killed, "force_killed": still_running}}, ensure_ascii=False))
+PY
+"""
+    result = run_rk_script(script, timeout=TIMEOUTS["sdk_release"])
+    parsed, error = parse_last_json_line(result, "SDK release")
+    if parsed is not None:
+        result["release"] = parsed
+    elif error:
+        result["release_parse_error"] = error
+    result["stop_before_release"] = stop_result
+    result["ok"] = result.get("ok", False)
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + "Plain: SDK bridge was stopped so the handheld remote can regain control."
+    return result
+
+
+def deploy_nav_cmdvel_bridge():
+    try:
+        payload = base64.b64encode(NAV_CMDVEL_BRIDGE_LOCAL.read_bytes()).decode("ascii")
+    except OSError as exc:
+        return {"ok": False, "stdout": "", "stderr": f"missing nav bridge: {exc}"}
+    remote_dir = str(Path(NAV_CMDVEL_BRIDGE_REMOTE).parent).replace("\\", "/")
+    script = f"""
+set -e
+mkdir -p {json.dumps(remote_dir)}
+python3 - <<'PY'
+import base64
+from pathlib import Path
+
+target = Path({json.dumps(NAV_CMDVEL_BRIDGE_REMOTE)})
+target.write_bytes(base64.b64decode({json.dumps(payload)}))
+target.chmod(0o755)
+print("deployed", target)
+PY
+"""
+    return run_remote_script(script, timeout=TIMEOUTS["nav_bridge"])
+
+
+def _nav_cmdvel_bridge_status():
+    script = f"""
+python3 - <<'PY'
+import json
+import time
+from pathlib import Path
+
+status_path = Path({json.dumps(NAV_CMDVEL_STATUS_REMOTE)})
+needle = {json.dumps(NAV_CMDVEL_BRIDGE_REMOTE)}
+running = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        cmd = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\\x00", " ")
+    except OSError:
+        continue
+    if needle in cmd:
+        running.append(int(proc.name))
+
+status = {{"running": running, "status": None}}
+if status_path.exists():
+    try:
+        status["status"] = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        status["status_error"] = str(exc)
+print(json.dumps(status, ensure_ascii=False))
+PY
+"""
+    result = run_remote_script(script, timeout=TIMEOUTS["nav_bridge"])
+    payload, error = parse_last_json_line(result, "nav cmdvel bridge status")
+    if payload is not None:
+        result["bridge"] = payload
+        result["ok"] = result.get("ok", False)
+    elif error:
+        result["bridge_parse_error"] = error
+    return result
+
+
+def stop_nav_cmdvel_bridge(stop_sdk=True):
+    script = f"""
+python3 - <<'PY'
+import json
+import os
+import signal
+import time
+from pathlib import Path
+
+needle = {json.dumps(NAV_CMDVEL_BRIDGE_REMOTE)}
+killed = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    if pid == os.getpid():
+        continue
+    try:
+        cmd = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\\x00", " ")
+    except OSError:
+        continue
+    if needle in cmd:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            pass
+time.sleep(0.4)
+force_killed = []
+for pid in killed:
+    if Path(f"/proc/{{pid}}").exists():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            force_killed.append(pid)
+        except OSError:
+            pass
+print(json.dumps({{"stopped": True, "killed": killed, "force_killed": force_killed}}, ensure_ascii=False))
+PY
+"""
+    result = run_remote_script(script, timeout=TIMEOUTS["nav_bridge"])
+    payload, error = parse_last_json_line(result, "nav cmdvel bridge stop")
+    if payload is not None:
+        result["bridge"] = payload
+    elif error:
+        result["bridge_parse_error"] = error
+    if stop_sdk:
+        result["sdk_release"] = release_sdk_bridge()
+    return result
+
+
+def ensure_nav_cmdvel_bridge(cmd_topic=NAV_CMDVEL_TOPIC):
+    sdk_ready = ensure_sdk_bridge()
+    if not sdk_ready.get("ok"):
+        return {
+            "ok": False,
+            "stdout": sdk_ready.get("stdout", ""),
+            "stderr": "SDK bridge is not ready.",
+            "sdk": sdk_ready,
+        }
+
+    deploy = deploy_nav_cmdvel_bridge()
+    if not deploy.get("ok"):
+        deploy["sdk"] = sdk_ready
+        return deploy
+
+    stop_nav_cmdvel_bridge(stop_sdk=False)
+    script = f"""
+set -e
+nohup python3 {json.dumps(NAV_CMDVEL_BRIDGE_REMOTE)} \\
+  --sdk-bridge {json.dumps(f"http://192.168.234.1:{SDK_BRIDGE_PORT}")} \\
+  --cmd-topic {json.dumps(cmd_topic)} \\
+  --status-file {json.dumps(NAV_CMDVEL_STATUS_REMOTE)} \\
+  >/tmp/dog_nav_cmdvel_sdk_bridge.log 2>&1 &
+sleep 0.6
+python3 - <<'PY'
+import json
+import time
+from pathlib import Path
+
+status_path = Path({json.dumps(NAV_CMDVEL_STATUS_REMOTE)})
+needle = {json.dumps(NAV_CMDVEL_BRIDGE_REMOTE)}
+running = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        cmd = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\\x00", " ")
+    except OSError:
+        continue
+    if needle in cmd:
+        running.append(int(proc.name))
+status = None
+if status_path.exists():
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        status = {{"error": str(exc)}}
+print(json.dumps({{"running": running, "status": status}}, ensure_ascii=False))
+raise SystemExit(0 if running else 1)
+PY
+"""
+    result = run_remote_script(script, timeout=TIMEOUTS["nav_bridge"])
+    payload, error = parse_last_json_line(result, "nav cmdvel bridge start")
+    if payload is not None:
+        result["bridge"] = payload
+        result["ok"] = bool(payload.get("running")) and result.get("ok", False)
+    elif error:
+        result["bridge_parse_error"] = error
+    result["sdk"] = sdk_ready
+    return result
+
+
+def run_sdk_python(body, timeout=30):
+    sdk_lib = f"{SDK_REMOTE_ROOT}/lib/zsl-1/aarch64"
+    script = f"""
+set -e
+SDK_LIB={json.dumps(sdk_lib)}
+export LD_LIBRARY_PATH="$SDK_LIB:$LD_LIBRARY_PATH"
+python3 - <<'PY'
+import json
+import sys
+import time
+
+sys.path.insert(0, {json.dumps(sdk_lib)})
+from mc_sdk_zsl_1_py import HighLevel
+
+LOCAL_IP = {json.dumps(SDK_LOCAL_IP)}
+LOCAL_PORT = {SDK_LOCAL_PORT}
+DOG_IP = {json.dumps(SDK_DOG_IP)}
+
+app = HighLevel()
+app.initRobot(LOCAL_IP, LOCAL_PORT, DOG_IP)
+deadline = time.time() + 3.0
+while time.time() < deadline:
+    if app.checkConnect():
+        break
+    time.sleep(0.1)
+else:
+    raise RuntimeError("SDK did not connect within 3s")
+
+{body}
+PY
+"""
+    return run_rk_script(script, timeout=timeout)
+
+
+def sdk_status():
+    result = sdk_bridge_request("/status", timeout=TIMEOUTS["sdk_status"])
+    data = result.get("sdk") or {}
+    if data:
+        stand_ready_in = float(data.get("stand_ready_in") or 0.0)
+        result["stdout"] = (
+            result.get("stdout", "")
+            + f"\n\nPlain: SDK bridge connected={data.get('connected')}, battery={data.get('battery')}%, "
+            f"mode={data.get('mode')}, standing={data.get('standing')}, stand_ready_in={stand_ready_in:.1f}s."
+        ).strip()
+    return result
+
+
+def sdk_stop():
+    result = sdk_bridge_request("/stop", method="POST", timeout=TIMEOUTS["sdk_stop"])
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + "Plain: SDK bridge set velocity to zero and keeps the SDK session alive."
+    return result
+
+
+def sdk_stand_up():
+    result = sdk_bridge_request("/stand", method="POST", timeout=TIMEOUTS["sdk_motion"])
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + "Plain: SDK bridge requested standUp and will keep the SDK session alive."
+    return result
+
+
+def sdk_move(linear=0.0, angular=0.0, duration=0.6, max_duration=2.0):
+    try:
+        linear = max(-0.20, min(float(linear), 0.20))
+        angular = max(-0.60, min(float(angular), 0.60))
+        duration = max(0.1, min(float(duration), max_duration))
+    except (TypeError, ValueError):
+        return {"ok": False, "stdout": "", "stderr": "motion parameters are invalid"}
+
+    result = sdk_bridge_request(
+        "/move",
+        method="POST",
+        payload={"linear": linear, "angular": angular, "duration": duration},
+        timeout=TIMEOUTS["sdk_motion"],
+    )
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + f"Plain: SDK bridge accepted move linear={linear:.2f}, angular={angular:.2f}, duration={duration:.1f}s."
+    return result
+
+
 def status_payload():
     command = r"""
 echo '== nodes =='
 timeout 5 ros2 node list | sort | grep -E 'bt_navigator|controller_server|planner_server|map_server|waypoint_follower|robot_slam|localization|livox_lidar_publisher' || true
 echo '== topics =='
 timeout 3 ros2 topic list | grep -E '/front_camera/image_compressed|/image_raw/compressed_h264|/navigation_state|/localization_state|/arc/slam_state|/arc/mc_state' || true
+echo '== localization_state =='
+timeout 5 ros2 topic echo --once /localization_state 2>/dev/null || true
+echo '== current_pose =='
+timeout 5 ros2 topic echo --once /odom/current_pose 2>/dev/null | sed -n '1,45p' || true
 """
     result = run_remote(command, timeout=TIMEOUTS["status"])
     result["timeout_info"] = TIMEOUTS
@@ -511,6 +1029,8 @@ def slam_call(data):
 
 
 def zero_velocity():
+    return sdk_stop()
+
     command = """
 python3 - <<'PY'
 import time
@@ -545,6 +1065,8 @@ PY
 
 
 def motion_pulse(linear=0.0, angular=0.0, duration=0.6):
+    return sdk_move(linear, angular, duration, max_duration=2.0)
+
     try:
         linear = max(-0.25, min(float(linear), 0.25))
         angular = max(-0.8, min(float(angular), 0.8))
@@ -596,6 +1118,8 @@ PY
 
 
 def motion_stream(linear=0.0, angular=0.0, duration=0.35):
+    return sdk_move(linear, angular, duration, max_duration=0.6)
+
     try:
         linear = max(-0.25, min(float(linear), 0.25))
         angular = max(-0.8, min(float(angular), 0.8))
@@ -630,6 +1154,8 @@ PY
 
 
 def stand_up():
+    return sdk_stand_up()
+
     command = """
 python3 - <<'PY'
 import time
@@ -663,6 +1189,12 @@ PY
 
 
 def set_motion_mode(mode=1):
+    result = sdk_status()
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + "Plain: SDK velocity control does not need the old ROS mode switch; SDK connection is ready if connected=True."
+    return result
+
     try:
         mode = int(mode)
     except (TypeError, ValueError):
@@ -1226,7 +1758,324 @@ def navigate_to_pose(x, y, yaw=0.0, speed=0.25, tolerance=0.35):
     return result
 
 
+def sdk_navigate_to_pose(x, y, yaw=0.0, speed=0.18, tolerance=0.35):
+    try:
+        x = float(x)
+        y = float(y)
+        speed = max(0.05, min(float(speed), 0.25))
+        tolerance = max(0.15, min(float(tolerance), 0.8))
+    except (TypeError, ValueError):
+        return {"ok": False, "stdout": "", "stderr": "导航目标坐标格式不对。"}
+
+    loc = localization_status()
+    if not loc.get("ok") or not loc.get("ready"):
+        return {
+            "ok": False,
+            "stdout": loc.get("stdout", ""),
+            "stderr": (
+                "定位还没准备好，先不要自动走。请先加载地图，并在地图上设置机器狗当前大概位置。"
+            ),
+            "localization": loc,
+        }
+
+    release_sdk_bridge()
+    ready = ensure_sdk_bridge()
+    if not ready.get("ok"):
+        return {
+            "ok": False,
+            "stdout": ready.get("stdout", ""),
+            "stderr": "SDK 桥接启动失败，先不要自动走。",
+            "bridge": ready,
+        }
+
+    command = f"""
+python3 - <<'PY'
+import json
+import math
+import sys
+import time
+import urllib.request
+
+import rclpy
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+
+GOAL_X = {x:.9f}
+GOAL_Y = {y:.9f}
+SPEED = {speed:.9f}
+TOL = {tolerance:.9f}
+BRIDGE = 'http://192.168.234.1:{SDK_BRIDGE_PORT}'
+MAX_TIME = 75.0
+FRONT_STOP = 0.45
+
+def post(path, payload=None, timeout=2.0):
+    data = json.dumps(payload or {{}}).encode('utf-8')
+    req = urllib.request.Request(
+        BRIDGE + path,
+        data=data,
+        method='POST',
+        headers={{'Content-Type': 'application/json'}},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+def yaw_from_quat(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+def wrap(angle):
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+def clamp(value, lo, hi):
+    return max(lo, min(value, hi))
+
+rclpy.init()
+node = rclpy.create_node('mvp_sdk_point_nav')
+state = {{'odom': None, 'scan': None}}
+
+def odom_cb(msg):
+    state['odom'] = msg
+
+def scan_cb(msg):
+    state['scan'] = msg
+
+node.create_subscription(Odometry, '/odom/current_pose', odom_cb, 10)
+node.create_subscription(LaserScan, '/laser_scan', scan_cb, 10)
+
+post('/stand')
+start = time.time()
+while time.time() - start < 2.0:
+    rclpy.spin_once(node, timeout_sec=0.05)
+    time.sleep(0.02)
+
+samples = []
+reached = False
+aborted = ''
+last_command_at = 0.0
+deadline = time.time() + MAX_TIME
+
+try:
+    while time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        odom = state['odom']
+        if odom is None:
+            time.sleep(0.05)
+            continue
+
+        pose = odom.pose.pose
+        px = pose.position.x
+        py = pose.position.y
+        robot_yaw = yaw_from_quat(pose.orientation)
+        dx = GOAL_X - px
+        dy = GOAL_Y - py
+        dist = math.hypot(dx, dy)
+        heading = math.atan2(dy, dx)
+        yaw_error = wrap(heading - robot_yaw)
+
+        front_min = None
+        scan = state['scan']
+        if scan is not None:
+            values = []
+            angle = scan.angle_min
+            for value in scan.ranges:
+                if abs(angle) < 0.35 and math.isfinite(value):
+                    values.append(value)
+                angle += scan.angle_increment
+            if values:
+                front_min = min(values)
+                if front_min < FRONT_STOP:
+                    aborted = f'front obstacle too close: {{front_min:.2f}}m'
+                    break
+
+        samples.append({{
+            'x': round(px, 3),
+            'y': round(py, 3),
+            'dist': round(dist, 3),
+            'yaw_error': round(yaw_error, 3),
+            'front_min': round(front_min, 3) if front_min is not None else None,
+        }})
+        samples = samples[-8:]
+
+        if dist <= TOL:
+            reached = True
+            break
+
+        if abs(yaw_error) > 0.55:
+            linear = 0.0
+        else:
+            linear = clamp(0.55 * dist, 0.05, SPEED)
+        angular = clamp(1.2 * yaw_error, -0.45, 0.45)
+
+        now = time.time()
+        if now - last_command_at >= 0.18:
+            post('/move', {{'linear': linear, 'angular': angular, 'duration': 0.35}})
+            last_command_at = now
+        time.sleep(0.03)
+finally:
+    try:
+        post('/stop')
+    except Exception:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+result = {{
+    'ok': reached,
+    'reached': reached,
+    'aborted': aborted,
+    'goal': {{'x': GOAL_X, 'y': GOAL_Y}},
+    'tolerance': TOL,
+    'samples': samples,
+}}
+print(json.dumps(result, ensure_ascii=False))
+sys.exit(0 if reached else 2)
+PY
+"""
+    result = run_remote_script(command, timeout=TIMEOUTS["sdk_navigate"])
+    payload, _ = parse_last_json_line(result, "SDK 导航")
+    if payload:
+        result["sdk_navigation"] = payload
+        result["ok"] = bool(payload.get("reached"))
+        if payload.get("aborted"):
+            result["stderr"] = f"SDK 导航中止：{payload.get('aborted')}"
+        elif not payload.get("reached"):
+            result["stderr"] = "SDK 导航没有在限定时间内到达目标点。"
+    if result.get("stdout"):
+        result["stdout"] = (
+            result["stdout"]
+            + f"\n\n人话解释：SDK 导航 MVP 已运行，目标 x={x:.3f}, y={y:.3f}。"
+            "这是直线低速控制版本，会用前方激光做近距离急停，但还不是完整路径规划避障。"
+        ).strip()
+    return result
+
+
+def nav2_sdk_navigate_to_pose(x, y, yaw=0.0, speed=0.20, tolerance=0.35, keep_sdk=False):
+    try:
+        x = float(x)
+        y = float(y)
+        yaw = float(yaw)
+        speed = max(0.05, min(float(speed), 0.25))
+        tolerance = max(0.15, min(float(tolerance), 0.8))
+    except (TypeError, ValueError):
+        return {"ok": False, "stdout": "", "stderr": "invalid navigation goal"}
+
+    loc = localization_status()
+    if not loc.get("ok") or not loc.get("ready"):
+        return {
+            "ok": False,
+            "stdout": loc.get("stdout", ""),
+            "stderr": "Localization is not ready. Load a map and recover localization first.",
+            "localization": loc,
+        }
+
+    bridge = ensure_nav_cmdvel_bridge(NAV_CMDVEL_TOPIC)
+    if not bridge.get("ok"):
+        return {
+            "ok": False,
+            "stdout": bridge.get("stdout", ""),
+            "stderr": "Navigation velocity bridge failed to start.",
+            "bridge": bridge,
+        }
+
+    import math
+
+    qz = math.sin(yaw / 2.0)
+    qw = math.cos(yaw / 2.0)
+    goal = {
+        "pose": {
+            "header": {"frame_id": "map"},
+            "pose": {
+                "position": {"x": x, "y": y, "z": 0.0},
+                "orientation": {"x": 0.0, "y": 0.0, "z": qz, "w": qw},
+            },
+        },
+        "desired_velocity": {"x": speed, "y": 0.0, "z": 0.0},
+        "goal_tolerance": {"x": tolerance, "y": tolerance, "theta": 0.5},
+        "behavior_tree": "",
+    }
+    goal_text = json.dumps(goal)
+    command = (
+        "ros2 action send_goal /navigate_to_pose robots_dog_msgs/action/NavigateToPose "
+        + json.dumps(goal_text)
+    )
+    result = run_remote(command, timeout=TIMEOUTS["sdk_navigate"])
+    result["nav_bridge"] = bridge
+    result["nav_bridge_status"] = _nav_cmdvel_bridge_status()
+
+    text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+    if "Goal finished with status: SUCCEEDED" in text:
+        result["ok"] = True
+    elif "Goal finished with status:" in text:
+        result["ok"] = False
+
+    result["nav_bridge_stop"] = stop_nav_cmdvel_bridge(stop_sdk=False)
+    result["sdk_stop"] = sdk_stop()
+    if not keep_sdk:
+        result["sdk_release"] = release_sdk_bridge()
+
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + (
+        f"Plain: open-source navigation goal was sent to x={x:.3f}, y={y:.3f}. "
+        "The /cmd_vel output was bridged into the SDK while the goal was active."
+    )
+    return result
+
+
+def patrol_route_goals(goals, speed=0.18, tolerance=0.45):
+    if not isinstance(goals, list) or not goals:
+        return {"ok": False, "stdout": "", "stderr": "patrol route is empty"}
+    if len(goals) > 12:
+        return {"ok": False, "stdout": "", "stderr": "too many patrol points for MVP"}
+
+    results = []
+    ok = True
+    for index, goal in enumerate(goals, start=1):
+        result = nav2_sdk_navigate_to_pose(
+            goal.get("x"),
+            goal.get("y"),
+            goal.get("yaw", 0.0),
+            speed=speed,
+            tolerance=tolerance,
+            keep_sdk=True,
+        )
+        results.append({
+            "index": index,
+            "goal": {"x": goal.get("x"), "y": goal.get("y"), "yaw": goal.get("yaw", 0.0)},
+            "ok": bool(result.get("ok")),
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "bridge_status": result.get("nav_bridge_status", {}).get("bridge"),
+        })
+        if not result.get("ok"):
+            ok = False
+            break
+    release = release_sdk_bridge()
+    return {
+        "ok": ok,
+        "results": results,
+        "release": release,
+        "stdout": f"Plain: patrol route attempted {len(results)} point(s).",
+        "stderr": "" if ok else "patrol stopped before completing all points",
+    }
+
+
 def cancel_navigation():
+    result = run_remote(
+        'ros2 service call /navigate_to_pose/_action/cancel_goal action_msgs/srv/CancelGoal '
+        + '"{goal_info: {goal_id: {uuid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, stamp: {sec: 0, nanosec: 0}}}"',
+        timeout=TIMEOUTS["cancel_nav"],
+    )
+    result["nav_bridge_stop"] = stop_nav_cmdvel_bridge(stop_sdk=False)
+    result["sdk_release"] = release_sdk_bridge()
+    result["stdout"] = (
+        (result.get("stdout", "") + "\n\n") if result.get("stdout") else ""
+    ) + "Plain: requested navigation cancel, stopped the cmd_vel bridge, and released SDK control."
+    return result
+
     command = """
 ros2 service call /navigate_to_pose/_action/cancel_goal action_msgs/srv/CancelGoal "{goal_info: {goal_id: {uuid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, stamp: {sec: 0, nanosec: 0}}}"
 python3 - <<'PY'
@@ -1522,12 +2371,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/nav/goal":
                 body = read_json_body(self)
-                self.send_json(navigate_to_pose(
+                self.send_json(nav2_sdk_navigate_to_pose(
                     body.get("x"),
                     body.get("y"),
                     body.get("yaw", 0.0),
                     body.get("speed", 0.25),
                     body.get("tolerance", 0.35),
+                ))
+                return
+            if path == "/api/patrol/start":
+                body = read_json_body(self)
+                self.send_json(patrol_route_goals(
+                    body.get("goals", []),
+                    body.get("speed", 0.18),
+                    body.get("tolerance", 0.45),
                 ))
                 return
             if path == "/api/nav/cancel":
@@ -1555,6 +2412,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/motion/mode":
                 body = read_json_body(self)
                 self.send_json(set_motion_mode(body.get("mode", 1)))
+                return
+            if path == "/api/motion/release":
+                self.send_json(release_sdk_bridge())
                 return
             if path == "/api/stop":
                 self.send_json(zero_velocity())
