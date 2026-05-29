@@ -228,8 +228,12 @@ class DashboardOverviewView(APIView):
                     "current_location": latest_robot.location if latest_robot else "--",
                     "today_alerts": latest_robot.today_alerts if latest_robot else 0,
                 },
-                "live_event": EventSerializer(latest_event).data if latest_event else None,
-                "latest_robot": RobotDetailSerializer(latest_robot).data if latest_robot else None,
+                "live_event": EventSerializer(latest_event, context={"request": request}).data
+                if latest_event
+                else None,
+                "latest_robot": RobotDetailSerializer(latest_robot, context={"request": request}).data
+                if latest_robot
+                else None,
                 "event_distribution": list(
                     events.values("status").annotate(total=Count("id")).order_by("status")
                 ),
@@ -252,7 +256,7 @@ class RobotDetailView(APIView):
     def get(self, request, robot_id):
         ensure_demo_seed()
         robot = Robot.objects.get(id=robot_id)
-        return Response(RobotDetailSerializer(robot).data)
+        return Response(RobotDetailSerializer(robot, context={"request": request}).data)
 
 
 class EventListView(APIView):
@@ -301,7 +305,7 @@ class EventListView(APIView):
         total = queryset.count()
         start = (page - 1) * page_size
         end = start + page_size
-        results = EventSerializer(queryset[start:end], many=True).data
+        results = EventSerializer(queryset[start:end], many=True, context={"request": request}).data
         return Response(
             {
                 "count": total,
@@ -317,7 +321,7 @@ class EventDetailView(APIView):
     def get(self, request, event_id):
         ensure_demo_seed()
         event = InspectionEvent.objects.select_related("robot").get(id=event_id)
-        return Response(EventSerializer(event).data)
+        return Response(EventSerializer(event, context={"request": request}).data)
 
 
 class EventHandleView(APIView):
@@ -335,7 +339,7 @@ class EventHandleView(APIView):
         event.handling_notes = notes
         event.review_result = review_result
         event.save(update_fields=["status", "handling_notes", "review_result", "updated_at"])
-        return Response(EventSerializer(event).data)
+        return Response(EventSerializer(event, context={"request": request}).data)
 
 
 class TaskListView(APIView):

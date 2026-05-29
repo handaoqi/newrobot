@@ -182,10 +182,14 @@ class EventSerializer(serializers.ModelSerializer):
 
     def get_annotated_snapshot_url(self, obj):
         annotated_url = build_annotated_snapshot(obj)
+        request = self.context.get("request")
         if annotated_url.startswith("http"):
+            parsed = urlparse(annotated_url)
+            media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+            if request and parsed.path.startswith(media_url):
+                return request.build_absolute_uri(parsed.path)
             return annotated_url
 
-        request = self.context.get("request")
         if request:
             return request.build_absolute_uri(annotated_url)
 
@@ -225,7 +229,7 @@ class RobotDetailSerializer(RobotSerializer):
         ]
 
     def get_recent_events(self, obj):
-        return EventSerializer(obj.events.all()[:5], many=True).data
+        return EventSerializer(obj.events.all()[:5], many=True, context=self.context).data
 
     def get_tasks(self, obj):
         return PatrolTaskSerializer(obj.tasks.all()[:5], many=True).data

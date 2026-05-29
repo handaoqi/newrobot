@@ -11,6 +11,8 @@
 
 ## 1. 安装
 
+板端默认使用 ONNX + OpenCV DNN 推理，不需要安装 PyTorch。
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
@@ -37,7 +39,8 @@ copy config.example.yaml config.yaml
 - `video.rtsp_transport`: `tcp` 或 `udp`
 - `video.open_timeout_seconds`: RTSP 建连超时时间
 - `video.read_timeout_seconds`: RTSP 读帧超时时间
-- `model.path`: 你的 YOLO 模型路径，例如 `models/bike.pt`
+- `model.path`: 你的 ONNX 模型路径，例如 `models/bike.onnx`
+- `model.backend`: 板端使用 `opencv_dnn`，开发机也可设为 `ultralytics` 直接加载 `.pt`
 - `detection.tracking_enabled`: 是否启用同车跟踪去重
 - `detection.track_ttl_seconds`: 目标离开画面多久后释放跟踪 ID
 - `detection.duplicate_alert_seconds`: 同一跟踪 ID 两次告警的最小间隔
@@ -59,28 +62,60 @@ python run_edge.py --config config.yaml
 python -m bike_bot.main --config config.yaml
 ```
 
-## 4. 运行效果
+## 4. 免安装部署包
+
+如果机器狗运行时不方便安装 Python、pip 或 PyTorch，可以在同架构 Linux 环境构建免安装包。
+
+重要限制：
+
+- 构建环境必须和机器狗系统架构一致，例如 `aarch64` 板端要在 `aarch64 Linux` 上构建
+- 免安装包仍依赖机器狗系统的基础运行环境，例如 glibc、网络和摄像头驱动
+- 如果 `stream.enable: true`，需要把对应架构的 `ffmpeg` 放到 `packaging/bin/ffmpeg`，并在配置里使用 `stream.ffmpeg_path: "bin/ffmpeg"`；否则关闭推流
+
+构建：
+
+```bash
+chmod +x scripts/build_edge_bundle.sh
+./scripts/build_edge_bundle.sh
+```
+
+产物：
+
+```text
+dist/bike-bot-edge-<arch>.tar.gz
+```
+
+机器狗上只需解压并运行：
+
+```bash
+tar -xzf bike-bot-edge-aarch64.tar.gz
+cd bike-bot-edge-bundle
+./start.sh
+```
+
+## 5. 运行效果
 
 - 程序启动后会弹出实时预览窗口，显示检测框、置信度、目标数量和 FPS
 - 按 `q` 或 `Esc` 可关闭预览并停止程序
 - 每次向服务器发送的数据都会追加写入 `data/telemetry/telemetry.jsonl`
 
-## 5. 上报策略
+## 6. 上报策略
 
 - 状态遥测：默认每 `2s` 上报一次
 - 心跳：默认每 `5s` 上报一次
 - 告警事件：检测命中后按目标跟踪 ID 去重，同一辆车默认 300 秒内只上报一次
 - 抓拍：默认保存至 `snapshots/`，并拼接 `snapshot_url`
 
-## 6. 部署建议
+## 7. 部署建议
 
-- 开发阶段先使用 `*.pt` 通过 `ultralytics` 跑通
-- 上板后建议导出为 ONNX / TensorRT 以降低延迟
+- 开发机如需从 `.pt` 导出 ONNX，安装 `pip install -r requirements-dev.txt`
+- 板端使用 `models/bike.onnx` + `model.backend: opencv_dnn`，避免安装 PyTorch
+- 如果板端有专用 NPU/GPU，再考虑继续转换为 RKNN / TensorRT
 - 使用板端硬件解码摄像头流，避免 CPU 成为瓶颈
 - 告警尽量做冷却时间控制，避免同一目标连续刷屏
 - 生产环境建议补充 `X-Device-Key`、请求签名或双向证书
 
-## 7. 目录
+## 8. 目录
 
 ```text
 src/bike_bot/

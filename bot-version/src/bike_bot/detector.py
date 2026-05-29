@@ -8,13 +8,35 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-from ultralytics import YOLO
 
 from .config import AppConfig
 from .models import BoundingBox, DetectionPayload, now_iso
 from .tracking import IoUTracker, TrackingDetection
 
 LOGGER = logging.getLogger(__name__)
+
+
+def letterbox(frame, image_size: int) -> tuple[Any, float, int, int]:
+    height, width = frame.shape[:2]
+    scale = min(image_size / width, image_size / height)
+    resized_width = int(round(width * scale))
+    resized_height = int(round(height * scale))
+    resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+
+    pad_x = (image_size - resized_width) // 2
+    pad_y = (image_size - resized_height) // 2
+    right = image_size - resized_width - pad_x
+    bottom = image_size - resized_height - pad_y
+    padded = cv2.copyMakeBorder(
+        resized,
+        pad_y,
+        bottom,
+        pad_x,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=(114, 114, 114),
+    )
+    return padded, scale, pad_x, pad_y
 
 
 @dataclass
@@ -28,6 +50,13 @@ class DetectionResult:
     events: list[FrameEvent]
     preview_frame: Any
     target_count: int = 0
+
+
+@dataclass
+class RawDetection:
+    label: str
+    bbox: tuple[int, int, int, int]
+    confidence: float
 
 
 class SnapshotManager:
@@ -51,9 +80,11 @@ class SnapshotManager:
 class YoloDetector:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.model = YOLO(config.model.path)
         classes = config.model.classes or ["bicycle"]
         self.target_labels = {item.lower() for item in classes}
+        self.class_names = [item.lower() for item in classes]
+        self.model_backend = self._resolve_backend(config.model.backend, config.model.path)
+        self.model = self._load_model()
         self.snapshot_manager = SnapshotManager(
             config.snapshot.directory,
             config.snapshot.public_base_url,
@@ -65,6 +96,31 @@ class YoloDetector:
             duplicate_alert_seconds=config.detection.duplicate_alert_seconds,
         )
         self._last_event_at = 0.0
+
+    def _resolve_backend(self, backend: str, model_path: str) -> str:
+        normalized = backend.lower()
+        if normalized != "auto":
+            return normalized
+        suffix = Path(model_path).suffix.lower()
+        if suffix == ".onnx":
+            return "opencv_dnn"
+        return "ultralytics"
+
+    def _load_model(self) -> Any:
+        if self.model_backend == "opencv_dnn":
+            net = cv2.dnn.readNetFromONNX(self.config.model.path)
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            LOGGER.info("loaded ONNX model with OpenCV DNN: %s", self.config.model.path)
+            return net
+
+        if self.model_backend == "ultralytics":
+            from ultralytics import YOLO
+
+            LOGGER.info("loaded Ultralytics model: %s", self.config.model.path)
+            return YOLO(self.config.model.path)
+
+        raise ValueError(f"unsupported model backend: {self.model_backend}")
 
     def open_capture(self) -> cv2.VideoCapture:
         source = self.config.video.source
@@ -100,35 +156,22 @@ class YoloDetector:
         return True
 
     def detect(self, frame) -> DetectionResult:
-        results = self.model.predict(
-            frame,
-            conf=self.config.model.confidence,
-            imgsz=self.config.model.image_size,
-            device=self.config.model.device or None,
-            verbose=False,
-        )
-        if not results:
-            return DetectionResult(events=[], preview_frame=frame)
-
-        result = results[0]
-        names = result.names
+        raw_detections = self._predict(frame)
         events: list[FrameEvent] = []
         preview_frame = frame.copy()
         target_detections: list[TrackingDetection] = []
-        for box in result.boxes:
-            class_id = int(box.cls[0].item())
-            label = str(names[class_id]).lower()
-            x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
-            width = max(0, x2 - x1)
-            height = max(0, y2 - y1)
-            confidence = float(box.conf[0].item())
 
+        for raw in raw_detections:
+            label = raw.label.lower()
+            x1, y1, width, height = raw.bbox
+            x2 = x1 + width
+            y2 = y1 + height
             is_target = label in self.target_labels and width * height >= self.config.detection.min_box_area
             color = (0, 220, 0) if is_target else (160, 160, 160)
             cv2.rectangle(preview_frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 preview_frame,
-                f"{label} {confidence:.2f}",
+                f"{label} {raw.confidence:.2f}",
                 (x1, max(25, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -142,9 +185,9 @@ class YoloDetector:
 
             target_detections.append(
                 TrackingDetection(
-                    bbox=(x1, y1, width, height),
+                    bbox=raw.bbox,
                     label=label,
-                    confidence=confidence,
+                    confidence=raw.confidence,
                 )
             )
 
@@ -201,6 +244,120 @@ class YoloDetector:
             )
             events.append(FrameEvent(frame=frame.copy(), detection=detection))
         return DetectionResult(events=events, preview_frame=preview_frame, target_count=len(tracked_targets))
+
+    def _predict(self, frame) -> list[RawDetection]:
+        if self.model_backend == "opencv_dnn":
+            return self._predict_opencv_dnn(frame)
+        return self._predict_ultralytics(frame)
+
+    def _predict_ultralytics(self, frame) -> list[RawDetection]:
+        results = self.model.predict(
+            frame,
+            conf=self.config.model.confidence,
+            imgsz=self.config.model.image_size,
+            device=self.config.model.device or None,
+            verbose=False,
+        )
+        if not results:
+            return []
+
+        result = results[0]
+        names = result.names
+        raw_detections: list[RawDetection] = []
+        for box in result.boxes:
+            class_id = int(box.cls[0].item())
+            label = str(names[class_id]).lower()
+            x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
+            width = max(0, x2 - x1)
+            height = max(0, y2 - y1)
+            confidence = float(box.conf[0].item())
+            raw_detections.append(
+                RawDetection(label=label, bbox=(x1, y1, width, height), confidence=confidence)
+            )
+        return raw_detections
+
+    def _predict_opencv_dnn(self, frame) -> list[RawDetection]:
+        input_image, scale, pad_x, pad_y = letterbox(frame, self.config.model.image_size)
+        blob = cv2.dnn.blobFromImage(
+            input_image,
+            1 / 255.0,
+            (self.config.model.image_size, self.config.model.image_size),
+            swapRB=True,
+            crop=False,
+        )
+        self.model.setInput(blob)
+        outputs = self.model.forward()
+        predictions = outputs[0] if isinstance(outputs, tuple) else outputs
+        predictions = predictions.squeeze()
+        if predictions.ndim != 2:
+            return []
+        if predictions.shape[0] < predictions.shape[1] and predictions.shape[0] <= 256:
+            predictions = predictions.transpose()
+
+        frame_h, frame_w = frame.shape[:2]
+        boxes: list[list[int]] = []
+        scores: list[float] = []
+        class_ids: list[int] = []
+        class_count = max(1, predictions.shape[1] - 4)
+
+        for prediction in predictions:
+            values = prediction.tolist()
+            if len(values) < 5:
+                continue
+            cx, cy, box_w, box_h = values[:4]
+            class_scores = values[4:]
+            if class_count == 1:
+                class_id = 0
+                confidence = float(class_scores[0])
+            else:
+                class_id = max(range(len(class_scores)), key=lambda index: class_scores[index])
+                confidence = float(class_scores[class_id])
+            if confidence < self.config.model.confidence:
+                continue
+
+            x1 = int(round((cx - box_w / 2 - pad_x) / scale))
+            y1 = int(round((cy - box_h / 2 - pad_y) / scale))
+            width = int(round(box_w / scale))
+            height = int(round(box_h / scale))
+            x1 = max(0, min(frame_w - 1, x1))
+            y1 = max(0, min(frame_h - 1, y1))
+            width = max(0, min(frame_w - x1, width))
+            height = max(0, min(frame_h - y1, height))
+            if width <= 0 or height <= 0:
+                continue
+            boxes.append([x1, y1, width, height])
+            scores.append(confidence)
+            class_ids.append(class_id)
+
+        keep = cv2.dnn.NMSBoxes(
+            boxes,
+            scores,
+            self.config.model.confidence,
+            self.config.model.nms_iou_threshold,
+        )
+        if len(keep) == 0:
+            return []
+
+        keep_indices = []
+        for item in keep:
+            if isinstance(item, (list, tuple)):
+                item = item[0]
+            elif hasattr(item, "item"):
+                item = item.item()
+            keep_indices.append(int(item))
+
+        raw_detections: list[RawDetection] = []
+        for index in keep_indices:
+            class_id = class_ids[index]
+            label = self.class_names[class_id] if class_id < len(self.class_names) else str(class_id)
+            raw_detections.append(
+                RawDetection(
+                    label=label,
+                    bbox=tuple(boxes[index]),
+                    confidence=scores[index],
+                )
+            )
+        return raw_detections
 
     def enrich_with_snapshot(self, event: FrameEvent) -> FrameEvent:
         snapshot = self.snapshot_manager.save(event.frame)

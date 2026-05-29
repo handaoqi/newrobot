@@ -13,8 +13,14 @@
 
 - `backend/`：Django 后端
 - `frontend/`：Vue 前端
+- `bot-version/`：机器人板端识别、上报与推流程序
 - `docs/robot-payload-standard.md`：机器人上报协议说明
+- `docs/project-docs-index.md`：项目详细文档入口
 - `platform-demo.html`：参考 demo 页面
+
+## 项目文档
+
+详细文档请从 [docs/project-docs-index.md](docs/project-docs-index.md) 开始阅读，包含项目整体架构、环境配置、前后端接口、数据传输格式、数据存储、网站功能、板端识别与视频链路、运维排障等内容。
 
 ## 后端启动
 

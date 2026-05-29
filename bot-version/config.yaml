@@ -31,8 +31,10 @@ stream:
   extra_args: []
 
 model:
-  path: "models/bike.pt"
+  path: "models/bike.onnx"
+  backend: "opencv_dnn"
   confidence: 0.55
+  nms_iou_threshold: 0.45
   image_size: 960
   device: ""
   classes:
@@ -66,7 +68,7 @@ snapshot:
   jpeg_quality: 90
 
 display:
-  enable: true
+  enable: false
   window_name: "Bike Bot Detection"
   show_fps: true
   max_width: 1280
