@@ -262,7 +262,25 @@ class EventListView(APIView):
         status_value = request.query_params.get("status")
         if status_value:
             queryset = queryset.filter(status=status_value)
-        return Response(EventSerializer(queryset, many=True).data)
+        try:
+            page = max(int(request.query_params.get("page", 1)), 1)
+            page_size = min(max(int(request.query_params.get("page_size", 10)), 1), 50)
+        except ValueError:
+            return Response({"detail": "分页参数无效"}, status=status.HTTP_400_BAD_REQUEST)
+
+        total = queryset.count()
+        start = (page - 1) * page_size
+        end = start + page_size
+        results = EventSerializer(queryset[start:end], many=True).data
+        return Response(
+            {
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "has_next": end < total,
+                "results": results,
+            }
+        )
 
 
 class EventDetailView(APIView):

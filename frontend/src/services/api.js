@@ -39,8 +39,13 @@ export async function fetchAnalytics() {
   return request('/dashboard/analytics/')
 }
 
-export async function fetchEvents(status = '') {
-  const query = status ? `?status=${status}` : ''
+export async function fetchEvents({ status = '', page = 1, pageSize = 10 } = {}) {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  })
+  if (status) params.set('status', status)
+  const query = `?${params.toString()}`
   return request(`/events/${query}`)
 }
 

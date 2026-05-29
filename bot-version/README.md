@@ -38,6 +38,9 @@ copy config.example.yaml config.yaml
 - `video.open_timeout_seconds`: RTSP 建连超时时间
 - `video.read_timeout_seconds`: RTSP 读帧超时时间
 - `model.path`: 你的 YOLO 模型路径，例如 `models/bike.pt`
+- `detection.tracking_enabled`: 是否启用同车跟踪去重
+- `detection.track_ttl_seconds`: 目标离开画面多久后释放跟踪 ID
+- `detection.duplicate_alert_seconds`: 同一跟踪 ID 两次告警的最小间隔
 - `telemetry.endpoint`: 远程服务地址，例如 `http://10.0.0.8:8000/api/telemetry/ingest/`
 - `telemetry.device_key`: 如服务端启用 `X-Device-Key`，这里填写
 - `snapshot.public_base_url`: 若抓拍图片经 nginx/对象存储暴露，这里填写访问前缀
@@ -66,7 +69,7 @@ python -m bike_bot.main --config config.yaml
 
 - 状态遥测：默认每 `2s` 上报一次
 - 心跳：默认每 `5s` 上报一次
-- 告警事件：检测命中后实时上报
+- 告警事件：检测命中后按目标跟踪 ID 去重，同一辆车默认 300 秒内只上报一次
 - 抓拍：默认保存至 `snapshots/`，并拼接 `snapshot_url`
 
 ## 6. 部署建议

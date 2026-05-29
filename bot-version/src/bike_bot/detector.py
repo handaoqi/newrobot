@@ -12,6 +12,7 @@ from ultralytics import YOLO
 
 from .config import AppConfig
 from .models import BoundingBox, DetectionPayload, now_iso
+from .tracking import IoUTracker, TrackingDetection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class FrameEvent:
 class DetectionResult:
     events: list[FrameEvent]
     preview_frame: Any
+    target_count: int = 0
 
 
 class SnapshotManager:
@@ -56,6 +58,11 @@ class YoloDetector:
             config.snapshot.directory,
             config.snapshot.public_base_url,
             config.snapshot.jpeg_quality,
+        )
+        self.tracker = IoUTracker(
+            iou_threshold=config.detection.tracker_iou_threshold,
+            track_ttl_seconds=config.detection.track_ttl_seconds,
+            duplicate_alert_seconds=config.detection.duplicate_alert_seconds,
         )
         self._last_event_at = 0.0
 
@@ -107,6 +114,7 @@ class YoloDetector:
         names = result.names
         events: list[FrameEvent] = []
         preview_frame = frame.copy()
+        target_detections: list[TrackingDetection] = []
         for box in result.boxes:
             class_id = int(box.cls[0].item())
             label = str(names[class_id]).lower()
@@ -132,18 +140,67 @@ class YoloDetector:
             if not is_target:
                 continue
 
+            target_detections.append(
+                TrackingDetection(
+                    bbox=(x1, y1, width, height),
+                    label=label,
+                    confidence=confidence,
+                )
+            )
+
+        if not self.config.detection.tracking_enabled:
+            for target in target_detections:
+                if not self.should_emit_event():
+                    continue
+                x1, y1, width, height = target.bbox
+                bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
+                detection = DetectionPayload(
+                    type=self.config.detection.event_type,
+                    label=self.config.detection.event_label,
+                    confidence=round(target.confidence, 4),
+                    risk_level=self.config.detection.risk_level,
+                    object_class=target.label,
+                    bbox=bbox,
+                    event_time=now_iso(),
+                )
+                events.append(FrameEvent(frame=frame.copy(), detection=detection))
+            return DetectionResult(
+                events=events,
+                preview_frame=preview_frame,
+                target_count=len(target_detections),
+            )
+
+        tracked_targets = self.tracker.update(target_detections)
+        for track in tracked_targets:
+            x1, y1, width, height = track.bbox
+            y2 = y1 + height
+            cv2.putText(
+                preview_frame,
+                track.track_id,
+                (x1, min(preview_frame.shape[0] - 10, y2 + 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 220, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            if not self.tracker.should_alert(track.track_id):
+                continue
+
             bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
             detection = DetectionPayload(
                 type=self.config.detection.event_type,
                 label=self.config.detection.event_label,
-                confidence=round(confidence, 4),
+                confidence=round(track.confidence, 4),
                 risk_level=self.config.detection.risk_level,
-                object_class=label,
+                object_class=track.label,
+                track_id=track.track_id,
                 bbox=bbox,
                 event_time=now_iso(),
             )
             events.append(FrameEvent(frame=frame.copy(), detection=detection))
-        return DetectionResult(events=events, preview_frame=preview_frame)
+        return DetectionResult(events=events, preview_frame=preview_frame, target_count=len(tracked_targets))
 
     def enrich_with_snapshot(self, event: FrameEvent) -> FrameEvent:
         snapshot = self.snapshot_manager.save(event.frame)

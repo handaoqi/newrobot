@@ -85,4 +85,48 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(InspectionEvent.objects.count(), before_count + 1)
 
+    def test_event_list_pagination_and_status_filter(self):
+        self.authenticate()
+        robot = Robot.objects.first()
+        for index in range(12):
+            InspectionEvent.objects.create(
+                robot=robot,
+                title=f"测试事件 {index}",
+                event_type="vehicle_illegal_parking",
+                location=robot.location,
+                status="pending" if index < 11 else "resolved",
+            )
+
+        response = self.client.get("/api/events/?status=pending&page=1&page_size=5")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 11)
+        self.assertEqual(len(response.data["results"]), 5)
+        self.assertTrue(response.data["has_next"])
+
+        second_page = self.client.get("/api/events/?status=pending&page=3&page_size=5")
+        self.assertEqual(second_page.status_code, 200)
+        self.assertEqual(len(second_page.data["results"]), 1)
+        self.assertFalse(second_page.data["has_next"])
+
+    def test_event_handle_saves_archive_notes(self):
+        self.authenticate()
+        robot = Robot.objects.first()
+        event = InspectionEvent.objects.create(
+            robot=robot,
+            title="自行车违停",
+            event_type="vehicle_illegal_parking",
+            location=robot.location,
+            status="pending",
+        )
+
+        response = self.client.post(
+            f"/api/events/{event.id}/handle/",
+            {"status": "resolved", "handling_notes": "现场复核无新增风险，已归档。"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        event.refresh_from_db()
+        self.assertEqual(event.status, "resolved")
+        self.assertEqual(event.handling_notes, "现场复核无新增风险，已归档。")
+
 # Create your tests here.

@@ -10,10 +10,16 @@ const filters = [
   { label: '已完成', value: 'resolved' },
 ]
 
-const activeFilter = ref('')
+const activeFilter = ref('pending')
 const events = ref([])
 const selectedEvent = ref(null)
 const loading = ref(true)
+const loadingMore = ref(false)
+const archiving = ref(false)
+const page = ref(1)
+const hasNextPage = ref(false)
+const archiveNotes = ref('')
+const pageSize = 8
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 
 const activeFilterIndex = computed(() => {
@@ -27,8 +33,10 @@ const segmentStyle = computed(() => ({
 }))
 
 const hasEvents = computed(() => events.value.length > 0)
+const canArchiveSelectedEvent = computed(() => ['pending', 'processing'].includes(selectedEvent.value?.status))
 
 function getEventImage(event) {
+  if (event?.annotated_snapshot_url) return event.annotated_snapshot_url
   if (event?.snapshot_url) return event.snapshot_url
   const index = events.value.findIndex((item) => item.id === event?.id)
   return eventImages[(index === -1 ? 0 : index) % eventImages.length]
@@ -68,26 +76,72 @@ function syncSelectedEvent() {
 async function loadEvents() {
   loading.value = true
   try {
-    events.value = await fetchEvents(activeFilter.value)
+    page.value = 1
+    const payload = await fetchEvents({
+      status: activeFilter.value,
+      page: page.value,
+      pageSize,
+    })
+    events.value = payload.results || payload
+    hasNextPage.value = Boolean(payload.has_next)
     syncSelectedEvent()
   } finally {
     loading.value = false
   }
 }
 
+async function loadMoreEvents() {
+  if (loading.value || loadingMore.value || !hasNextPage.value) return
+  loadingMore.value = true
+  try {
+    const nextPage = page.value + 1
+    const payload = await fetchEvents({
+      status: activeFilter.value,
+      page: nextPage,
+      pageSize,
+    })
+    events.value = [...events.value, ...(payload.results || payload)]
+    hasNextPage.value = Boolean(payload.has_next)
+    page.value = nextPage
+    syncSelectedEvent()
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+function handleListScroll(event) {
+  const { scrollTop, clientHeight, scrollHeight } = event.target
+  if (scrollTop + clientHeight >= scrollHeight - 24) {
+    loadMoreEvents()
+  }
+}
+
 function changeFilter(value) {
   activeFilter.value = value
   selectedEvent.value = null
+  archiveNotes.value = ''
   loadEvents()
 }
 
+function selectEvent(event) {
+  selectedEvent.value = event
+  archiveNotes.value = ''
+}
+
 async function markResolved() {
-  if (!selectedEvent.value) return
-  selectedEvent.value = await handleEvent(selectedEvent.value.id, {
-    status: 'resolved',
-    handling_notes: '值班员已通过平台完成复核与处置。',
-  })
-  await loadEvents()
+  if (!selectedEvent.value || archiving.value) return
+  archiving.value = true
+  const notes = archiveNotes.value.trim() || '值班员已通过平台完成复核与处置。'
+  try {
+    selectedEvent.value = await handleEvent(selectedEvent.value.id, {
+      status: 'resolved',
+      handling_notes: notes,
+    })
+    archiveNotes.value = ''
+    await loadEvents()
+  } finally {
+    archiving.value = false
+  }
 }
 
 onMounted(loadEvents)
@@ -119,26 +173,30 @@ onMounted(loadEvents)
     </div>
 
     <div class="data-grid">
-      <section class="panel list-panel">
+      <section class="panel list-panel" @scroll.passive="handleListScroll">
         <div v-if="loading" class="empty-state">正在加载事件列表...</div>
         <template v-else-if="hasEvents">
-        <article
-          v-for="event in events"
-          :key="event.id"
-          class="table-card"
-          :class="{ selected: selectedEvent?.id === event.id }"
-          @click="selectedEvent = event"
-        >
-          <div class="event-thumb table-thumb" :style="eventThumbStyle(event)"></div>
-          <div class="table-main">
-            <strong>{{ event.title }}</strong>
-            <span>{{ event.location }}</span>
-          </div>
-          <div class="table-side">
-            <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
-            <small>{{ formatEventTime(event.detected_at) }}</small>
-          </div>
-        </article>
+          <article
+            v-for="event in events"
+            :key="event.id"
+            class="table-card"
+            :class="{ selected: selectedEvent?.id === event.id }"
+            @click="selectEvent(event)"
+          >
+            <div class="event-thumb table-thumb" :style="eventThumbStyle(event)"></div>
+            <div class="table-main">
+              <strong>{{ event.title }}</strong>
+              <span>{{ event.location }}</span>
+            </div>
+            <div class="table-side">
+              <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
+              <small>{{ formatEventTime(event.detected_at) }}</small>
+            </div>
+          </article>
+          <button v-if="hasNextPage" class="load-more-btn" type="button" :disabled="loadingMore" @click="loadMoreEvents">
+            {{ loadingMore ? '正在加载更多...' : '加载更多事件' }}
+          </button>
+          <div v-else class="list-end">已显示当前筛选下全部事件</div>
         </template>
         <div v-else class="empty-state">当前筛选条件下暂无事件记录</div>
       </section>
@@ -152,7 +210,9 @@ onMounted(loadEvents)
           <span class="panel-badge">{{ selectedEvent.risk_label }}风险</span>
         </div>
         <div class="detail-stack">
-          <img class="event-detail-image" :src="getEventImage(selectedEvent)" :alt="selectedEvent.title" />
+          <div class="event-image-frame">
+            <img class="event-detail-image" :src="getEventImage(selectedEvent)" :alt="selectedEvent.title" />
+          </div>
           <div class="detail-card">
             <strong>识别置信度</strong>
             <p>{{ selectedEvent.confidence }}%</p>
@@ -174,7 +234,17 @@ onMounted(loadEvents)
             <strong>处置备注</strong>
             <p>{{ selectedEvent.handling_notes || '当前尚未填写处置说明' }}</p>
           </div>
-          <button class="primary-btn" @click="markResolved">完成复核并归档</button>
+          <label v-if="canArchiveSelectedEvent" class="archive-field">
+            <span>归档评论</span>
+            <textarea v-model="archiveNotes" placeholder="请输入复核意见或现场处置说明"></textarea>
+          </label>
+          <button
+            class="primary-btn"
+            :disabled="!canArchiveSelectedEvent || archiving"
+            @click="markResolved"
+          >
+            {{ archiving ? '正在归档...' : canArchiveSelectedEvent ? '完成复核并归档' : '已归档' }}
+          </button>
         </div>
       </section>
 

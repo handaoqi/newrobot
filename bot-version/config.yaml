@@ -46,6 +46,10 @@ detection:
   risk_level: "medium"
   event_cooldown_seconds: 10
   min_box_area: 4000
+  tracking_enabled: true
+  tracker_iou_threshold: 0.3
+  track_ttl_seconds: 30
+  duplicate_alert_seconds: 300
 
 telemetry:
   endpoint: "http://127.0.0.1:8000/api/telemetry/ingest/"

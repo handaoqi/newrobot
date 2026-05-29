@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+from datetime import datetime
 from itertools import count
 from pathlib import Path
 from threading import Lock
+from uuid import uuid4
 
 import requests
 
@@ -17,22 +19,23 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SequenceGenerator:
-    def __init__(self) -> None:
+    def __init__(self, robot_code: str) -> None:
+        self.robot_code = robot_code
         self._counter = count(1)
         self._lock = Lock()
 
     def next(self) -> str:
         with self._lock:
             current = next(self._counter)
-        date_part = now_iso()[0:10].replace("-", "")
-        return f"telemetry-{date_part}-{current:06d}"
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
+        return f"{self.robot_code}-{timestamp}-{current:06d}-{uuid4().hex[:8]}"
 
 
 class TelemetryClient:
     def __init__(self, config: AppConfig, runtime_state: RuntimeState) -> None:
         self.config = config
         self.runtime_state = runtime_state
-        self.sequence = SequenceGenerator()
+        self.sequence = SequenceGenerator(config.robot.code)
         self._log_lock = Lock()
         self._log_path = Path(config.storage.telemetry_log_path)
 

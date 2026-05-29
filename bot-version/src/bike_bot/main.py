@@ -85,7 +85,7 @@ def detection_worker(
             last_frame_at = now
 
             result = detector.detect(frame)
-            target_count = len(result.events)
+            target_count = result.target_count
             preview_frame = detector.annotate_status(result.preview_frame, fps=fps, target_count=target_count)
             should_continue = detector.show_preview(preview_frame)
             if not should_continue:
@@ -98,8 +98,6 @@ def detection_worker(
 
             runtime_state.update_status(runtime_status="warning")
             for event in result.events:
-                if not detector.should_emit_event():
-                    continue
                 event = detector.enrich_with_snapshot(event)
                 client.send(detections=[event.detection])
             runtime_state.update_status(runtime_status="online")

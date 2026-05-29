@@ -61,6 +61,10 @@ class DetectionConfig:
     risk_level: str = "medium"
     event_cooldown_seconds: int = 10
     min_box_area: int = 4000
+    tracking_enabled: bool = True
+    tracker_iou_threshold: float = 0.3
+    track_ttl_seconds: int = 30
+    duplicate_alert_seconds: int = 300
 
 
 @dataclass
