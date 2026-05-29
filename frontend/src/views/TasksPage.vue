@@ -12,13 +12,6 @@ onMounted(async () => {
 
 <template>
   <section class="page-section">
-    <div class="section-head">
-      <div>
-        <h3>巡检任务</h3>
-        <p>统一查看任务编排、执行进度与路线覆盖情况。</p>
-      </div>
-    </div>
-
     <section class="panel detail-panel">
       <div class="task-list">
         <article v-for="task in tasks" :key="task.id" class="task-card">

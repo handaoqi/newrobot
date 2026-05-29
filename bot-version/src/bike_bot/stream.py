@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import time
 
@@ -13,6 +14,21 @@ class StreamPusher:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
+    def resolve_ffmpeg_path(self) -> str:
+        ffmpeg_path = self.config.stream.ffmpeg_path
+        if shutil.which(ffmpeg_path):
+            return ffmpeg_path
+
+        try:
+            import imageio_ffmpeg
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"ffmpeg executable not found: {ffmpeg_path}. "
+                "Install ffmpeg or install imageio-ffmpeg in the current Python environment."
+            ) from exc
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+
     def build_command(self) -> list[str]:
         stream = self.config.stream
         video = self.config.video
@@ -20,7 +36,7 @@ class StreamPusher:
             raise ValueError("stream.rtmp_url is required when stream.enable is true")
 
         command = [
-            stream.ffmpeg_path,
+            self.resolve_ffmpeg_path(),
             "-hide_banner",
             "-loglevel",
             "warning",

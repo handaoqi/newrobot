@@ -75,8 +75,11 @@ class PatrolTask(BaseTimestampModel):
 class InspectionEvent(BaseTimestampModel):
     STATUS_CHOICES = [
         ("pending", "待处理"),
-        ("processing", "处理中"),
-        ("resolved", "已完成"),
+        ("resolved", "已处理"),
+    ]
+    REVIEW_RESULT_CHOICES = [
+        ("confirmed", "确认违规"),
+        ("suspected", "怀疑"),
         ("false_alarm", "误报"),
     ]
     RISK_CHOICES = [
@@ -93,6 +96,7 @@ class InspectionEvent(BaseTimestampModel):
     confidence = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     risk_level = models.CharField(max_length=16, choices=RISK_CHOICES, default="medium")
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="pending")
+    review_result = models.CharField(max_length=16, choices=REVIEW_RESULT_CHOICES, default="confirmed")
     snapshot_url = models.URLField(blank=True)
     description = models.TextField(blank=True)
     handling_notes = models.TextField(blank=True)

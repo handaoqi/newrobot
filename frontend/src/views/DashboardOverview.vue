@@ -221,8 +221,8 @@ watch(livePlayUrls, setupLivePlayer)
               <span>待处理事件</span>
             </div>
             <div class="metric-card">
-              <strong>{{ overview.summary.processing_event_count }}</strong>
-              <span>处理中事件</span>
+              <strong>{{ overview.summary.resolved_event_count }}</strong>
+              <span>已处理事件</span>
             </div>
             <div class="metric-card">
               <strong>{{ overview.summary.today_alert_count }}</strong>
@@ -303,8 +303,9 @@ watch(livePlayUrls, setupLivePlayer)
               <small>{{ formatEventTime(event.detected_at) }}</small>
             </div>
             <div class="event-side">
-              <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
-              <span class="risk-text">{{ event.risk_label }}风险</span>
+              <span :class="['risk-chip', event.status === 'pending' ? event.status : 'review-chip']">
+                {{ event.status === 'pending' ? event.status_label : event.review_result_label || '确认违规' }}
+              </span>
             </div>
           </article>
         </div>

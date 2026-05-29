@@ -12,9 +12,9 @@ class RobotAdmin(admin.ModelAdmin):
 
 @admin.register(InspectionEvent)
 class InspectionEventAdmin(admin.ModelAdmin):
-    list_display = ("title", "robot", "event_type", "risk_level", "status", "detected_at")
+    list_display = ("title", "robot", "event_type", "risk_level", "status", "review_result", "detected_at")
     search_fields = ("title", "event_type", "location")
-    list_filter = ("status", "risk_level", "event_type")
+    list_filter = ("status", "review_result", "risk_level", "event_type")
 
 
 @admin.register(PatrolTask)

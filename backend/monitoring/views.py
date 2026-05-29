@@ -2,7 +2,7 @@ import hashlib
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
-from django.db.models import Count
+from django.db.models import Case, Count, IntegerField, Q, When
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.authtoken.models import Token
@@ -219,7 +219,7 @@ class DashboardOverviewView(APIView):
                     "online_robot_count": robots.filter(status="online").count(),
                     "today_alert_count": latest_robot.today_alerts if latest_robot else today_events.count(),
                     "pending_event_count": events.filter(status="pending").count(),
-                    "processing_event_count": events.filter(status="processing").count(),
+                    "resolved_event_count": events.filter(status="resolved").count(),
                     "completed_task_count": PatrolTask.objects.filter(status="completed").count(),
                 },
                 "header": {
@@ -262,6 +262,36 @@ class EventListView(APIView):
         status_value = request.query_params.get("status")
         if status_value:
             queryset = queryset.filter(status=status_value)
+        search_value = request.query_params.get("search", "").strip()
+        if search_value:
+            queryset = queryset.filter(
+                Q(title__icontains=search_value)
+                | Q(location__icontains=search_value)
+                | Q(event_type__icontains=search_value)
+                | Q(description__icontains=search_value)
+                | Q(handling_notes__icontains=search_value)
+                | Q(robot__name__icontains=search_value)
+                | Q(robot__code__icontains=search_value)
+            )
+        ordering_value = request.query_params.get("ordering", "detected_desc")
+        if ordering_value == "risk_desc":
+            queryset = queryset.annotate(
+                risk_rank=Case(
+                    When(risk_level="high", then=3),
+                    When(risk_level="medium", then=2),
+                    When(risk_level="low", then=1),
+                    default=0,
+                    output_field=IntegerField(),
+                )
+            ).order_by("-risk_rank", "-detected_at")
+        else:
+            ordering_map = {
+                "detected_desc": "-detected_at",
+                "detected_asc": "detected_at",
+                "confidence_desc": "-confidence",
+            }
+            ordering = ordering_map.get(ordering_value, "-detected_at")
+            queryset = queryset.order_by(ordering, "-detected_at")
         try:
             page = max(int(request.query_params.get("page", 1)), 1)
             page_size = min(max(int(request.query_params.get("page_size", 10)), 1), 50)
@@ -296,9 +326,15 @@ class EventHandleView(APIView):
         event = InspectionEvent.objects.get(id=event_id)
         next_status = request.data.get("status", event.status)
         notes = request.data.get("handling_notes", "")
+        review_result = request.data.get("review_result", event.review_result)
+        if next_status not in dict(InspectionEvent.STATUS_CHOICES):
+            return Response({"detail": "事件状态无效"}, status=status.HTTP_400_BAD_REQUEST)
+        if review_result not in dict(InspectionEvent.REVIEW_RESULT_CHOICES):
+            return Response({"detail": "复核结论无效"}, status=status.HTTP_400_BAD_REQUEST)
         event.status = next_status
         event.handling_notes = notes
-        event.save(update_fields=["status", "handling_notes", "updated_at"])
+        event.review_result = review_result
+        event.save(update_fields=["status", "handling_notes", "review_result", "updated_at"])
         return Response(EventSerializer(event).data)
 
 

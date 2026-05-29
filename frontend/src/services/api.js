@@ -39,12 +39,14 @@ export async function fetchAnalytics() {
   return request('/dashboard/analytics/')
 }
 
-export async function fetchEvents({ status = '', page = 1, pageSize = 10 } = {}) {
+export async function fetchEvents({ status = '', page = 1, pageSize = 10, search = '', ordering = 'detected_desc' } = {}) {
   const params = new URLSearchParams({
     page: String(page),
     page_size: String(pageSize),
   })
   if (status) params.set('status', status)
+  if (search.trim()) params.set('search', search.trim())
+  if (ordering) params.set('ordering', ordering)
   const query = `?${params.toString()}`
   return request(`/events/${query}`)
 }

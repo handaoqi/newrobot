@@ -20,13 +20,6 @@ onMounted(async () => {
 
 <template>
   <section class="page-section">
-    <div class="section-head">
-      <div>
-        <h3>机器人管理</h3>
-        <p>查看设备在线状态、健康指标与近期事件记录。</p>
-      </div>
-    </div>
-
     <div class="data-grid">
       <section class="panel list-panel">
         <article

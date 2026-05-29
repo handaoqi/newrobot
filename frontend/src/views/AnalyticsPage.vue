@@ -24,14 +24,6 @@ onMounted(async () => {
 
 <template>
   <section class="page-section">
-    <div class="section-head">
-      <div>
-        <h3>统计分析</h3>
-        <p>从预警、检测、巡检时长与执行里程等维度，快速判断平台运行趋势。</p>
-      </div>
-      <span class="panel-badge">Analytics</span>
-    </div>
-
     <template v-if="!loading">
       <section class="analytics-summary">
         <article v-for="card in summaryCards" :key="card.title" class="metric-card analytics-card">

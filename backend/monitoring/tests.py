@@ -121,12 +121,17 @@ class MonitoringApiTests(TestCase):
 
         response = self.client.post(
             f"/api/events/{event.id}/handle/",
-            {"status": "resolved", "handling_notes": "现场复核无新增风险，已归档。"},
+            {
+                "status": "resolved",
+                "handling_notes": "现场复核无新增风险，已归档。",
+                "review_result": "false_alarm",
+            },
             format="json",
         )
         self.assertEqual(response.status_code, 200)
         event.refresh_from_db()
         self.assertEqual(event.status, "resolved")
+        self.assertEqual(event.review_result, "false_alarm")
         self.assertEqual(event.handling_notes, "现场复核无新增风险，已归档。")
 
 # Create your tests here.

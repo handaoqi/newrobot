@@ -6,8 +6,20 @@ import { fetchEvents, handleEvent } from '../services/api'
 const filters = [
   { label: '全部记录', value: '' },
   { label: '待处理', value: 'pending' },
-  { label: '处理中', value: 'processing' },
-  { label: '已完成', value: 'resolved' },
+  { label: '已处理', value: 'resolved' },
+]
+
+const reviewOptions = [
+  { label: '确认违规', value: 'confirmed' },
+  { label: '怀疑', value: 'suspected' },
+  { label: '误报', value: 'false_alarm' },
+]
+
+const sortOptions = [
+  { label: '最新优先', value: 'detected_desc' },
+  { label: '最早优先', value: 'detected_asc' },
+  { label: '高风险优先', value: 'risk_desc' },
+  { label: '置信度优先', value: 'confidence_desc' },
 ]
 
 const activeFilter = ref('pending')
@@ -19,6 +31,10 @@ const archiving = ref(false)
 const page = ref(1)
 const hasNextPage = ref(false)
 const archiveNotes = ref('')
+const reviewResult = ref('confirmed')
+const searchDraft = ref('')
+const searchKeyword = ref('')
+const ordering = ref('detected_desc')
 const pageSize = 8
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 
@@ -32,8 +48,18 @@ const segmentStyle = computed(() => ({
   transform: `translateX(${activeFilterIndex.value * 100}%)`,
 }))
 
+const reviewResultIndex = computed(() => {
+  const index = reviewOptions.findIndex((option) => option.value === reviewResult.value)
+  return index === -1 ? 0 : index
+})
+
+const reviewSliderStyle = computed(() => ({
+  width: `${100 / reviewOptions.length}%`,
+  transform: `translateX(${reviewResultIndex.value * 100}%)`,
+}))
+
 const hasEvents = computed(() => events.value.length > 0)
-const canArchiveSelectedEvent = computed(() => ['pending', 'processing'].includes(selectedEvent.value?.status))
+const canArchiveSelectedEvent = computed(() => selectedEvent.value?.status === 'pending')
 
 function getEventImage(event) {
   if (event?.annotated_snapshot_url) return event.annotated_snapshot_url
@@ -81,6 +107,8 @@ async function loadEvents() {
       status: activeFilter.value,
       page: page.value,
       pageSize,
+      search: searchKeyword.value,
+      ordering: ordering.value,
     })
     events.value = payload.results || payload
     hasNextPage.value = Boolean(payload.has_next)
@@ -99,6 +127,8 @@ async function loadMoreEvents() {
       status: activeFilter.value,
       page: nextPage,
       pageSize,
+      search: searchKeyword.value,
+      ordering: ordering.value,
     })
     events.value = [...events.value, ...(payload.results || payload)]
     hasNextPage.value = Boolean(payload.has_next)
@@ -120,12 +150,32 @@ function changeFilter(value) {
   activeFilter.value = value
   selectedEvent.value = null
   archiveNotes.value = ''
+  reviewResult.value = 'confirmed'
+  loadEvents()
+}
+
+function changeSearch() {
+  searchKeyword.value = searchDraft.value.trim()
+  selectedEvent.value = null
+  loadEvents()
+}
+
+function handleSearchInput() {
+  if (searchDraft.value.trim() || !searchKeyword.value) return
+  searchKeyword.value = ''
+  selectedEvent.value = null
+  loadEvents()
+}
+
+function changeOrdering() {
+  selectedEvent.value = null
   loadEvents()
 }
 
 function selectEvent(event) {
   selectedEvent.value = event
   archiveNotes.value = ''
+  reviewResult.value = event.review_result || 'confirmed'
 }
 
 async function markResolved() {
@@ -136,6 +186,7 @@ async function markResolved() {
     selectedEvent.value = await handleEvent(selectedEvent.value.id, {
       status: 'resolved',
       handling_notes: notes,
+      review_result: reviewResult.value,
     })
     archiveNotes.value = ''
     await loadEvents()
@@ -149,13 +200,6 @@ onMounted(loadEvents)
 
 <template>
   <section class="page-section">
-    <div class="section-head">
-      <div>
-        <h3>事件中心</h3>
-        <p>集中查看告警记录、复核进度与事件闭环结果。</p>
-      </div>
-    </div>
-
     <div class="filter-row">
       <div class="segmented-control" role="tablist" aria-label="事件状态筛选">
         <div class="segmented-thumb" :style="segmentStyle"></div>
@@ -170,6 +214,28 @@ onMounted(loadEvents)
           {{ filter.label }}
         </button>
       </div>
+    </div>
+
+    <div class="event-tools" aria-label="事件搜索与排序">
+      <div class="event-search">
+        <span>搜索</span>
+        <input
+          v-model="searchDraft"
+          type="search"
+          placeholder="标题、地点、机器人"
+          @input="handleSearchInput"
+          @keyup.enter="changeSearch"
+        />
+        <button type="button" class="event-search-btn" @click="changeSearch">查询</button>
+      </div>
+      <label class="event-sort">
+        <span>排序</span>
+        <select v-model="ordering" @change="changeOrdering">
+          <option v-for="option in sortOptions" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
+        </select>
+      </label>
     </div>
 
     <div class="data-grid">
@@ -189,7 +255,9 @@ onMounted(loadEvents)
               <span>{{ event.location }}</span>
             </div>
             <div class="table-side">
-              <span :class="['risk-chip', event.status]">{{ event.status_label }}</span>
+              <span :class="['risk-chip', event.status === 'pending' ? event.status : 'review-chip']">
+                {{ event.status === 'pending' ? event.status_label : event.review_result_label || '确认违规' }}
+              </span>
               <small>{{ formatEventTime(event.detected_at) }}</small>
             </div>
           </article>
@@ -234,7 +302,26 @@ onMounted(loadEvents)
             <strong>处置备注</strong>
             <p>{{ selectedEvent.handling_notes || '当前尚未填写处置说明' }}</p>
           </div>
+          <div class="detail-card" v-if="selectedEvent.review_result_label && !canArchiveSelectedEvent">
+            <strong>复核结论</strong>
+            <p>{{ selectedEvent.review_result_label }}</p>
+          </div>
           <label v-if="canArchiveSelectedEvent" class="archive-field">
+            <span>复核结论</span>
+            <div class="review-slider" role="radiogroup" aria-label="复核结论">
+              <div class="review-slider-thumb" :style="reviewSliderStyle"></div>
+              <button
+                v-for="option in reviewOptions"
+                :key="option.value"
+                type="button"
+                class="review-option"
+                :class="{ active: reviewResult === option.value }"
+                :aria-pressed="reviewResult === option.value"
+                @click="reviewResult = option.value"
+              >
+                {{ option.label }}
+              </button>
+            </div>
             <span>归档评论</span>
             <textarea v-model="archiveNotes" placeholder="请输入复核意见或现场处置说明"></textarea>
           </label>
@@ -243,7 +330,7 @@ onMounted(loadEvents)
             :disabled="!canArchiveSelectedEvent || archiving"
             @click="markResolved"
           >
-            {{ archiving ? '正在归档...' : canArchiveSelectedEvent ? '完成复核并归档' : '已归档' }}
+            {{ archiving ? '正在归档...' : canArchiveSelectedEvent ? '完成复核并归档' : '已处理' }}
           </button>
         </div>
       </section>

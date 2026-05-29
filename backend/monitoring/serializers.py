@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -141,6 +143,7 @@ class EventSerializer(serializers.ModelSerializer):
     robot_name = serializers.CharField(source="robot.name", read_only=True)
     risk_label = serializers.CharField(source="get_risk_level_display", read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    review_result_label = serializers.CharField(source="get_review_result_display", read_only=True)
     annotated_snapshot_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -156,6 +159,8 @@ class EventSerializer(serializers.ModelSerializer):
             "risk_label",
             "status",
             "status_label",
+            "review_result",
+            "review_result_label",
             "snapshot_url",
             "annotated_snapshot_url",
             "description",
