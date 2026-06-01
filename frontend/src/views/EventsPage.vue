@@ -35,6 +35,13 @@ const reviewResult = ref('confirmed')
 const searchDraft = ref('')
 const searchKeyword = ref('')
 const ordering = ref('detected_desc')
+const dateDraft = ref('')
+const startTimeDraft = ref('00:00')
+const endTimeDraft = ref('23:59')
+const detectedFrom = ref('')
+const detectedTo = ref('')
+const timeFilterError = ref('')
+const calendarMonth = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
 const pageSize = 8
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 
@@ -60,6 +67,52 @@ const reviewSliderStyle = computed(() => ({
 
 const hasEvents = computed(() => events.value.length > 0)
 const canArchiveSelectedEvent = computed(() => selectedEvent.value?.status === 'pending')
+const hasTimeFilter = computed(() => Boolean(detectedFrom.value || detectedTo.value))
+const hasSecondaryFilter = computed(() => Boolean(hasTimeFilter.value || searchKeyword.value || searchDraft.value.trim()))
+const timeRangeInvalid = computed(() => {
+  if (!dateDraft.value || !startTimeDraft.value || !endTimeDraft.value) return false
+  return startTimeDraft.value > endTimeDraft.value
+})
+const timeFilterLabel = computed(() => {
+  if (!hasTimeFilter.value) return '未限定时间'
+  const start = startTimeDraft.value || '00:00'
+  const end = endTimeDraft.value || '23:59'
+  return `${dateDraft.value} ${start}-${end}`
+})
+const filterSummary = computed(() => {
+  const parts = []
+  const statusLabel = filters.find((filter) => filter.value === activeFilter.value)?.label || '全部记录'
+  parts.push(statusLabel)
+  if (searchKeyword.value) parts.push(`关键词: ${searchKeyword.value}`)
+  if (hasTimeFilter.value) parts.push(timeFilterLabel.value)
+  return parts.join(' / ')
+})
+const calendarMonthTitle = computed(() => {
+  const year = calendarMonth.value.getFullYear()
+  const month = calendarMonth.value.getMonth() + 1
+  return `${year}年${String(month).padStart(2, '0')}月`
+})
+const calendarDays = computed(() => {
+  const year = calendarMonth.value.getFullYear()
+  const month = calendarMonth.value.getMonth()
+  const firstDay = new Date(year, month, 1)
+  const startOffset = firstDay.getDay()
+  const gridStart = new Date(year, month, 1 - startOffset)
+  const todayValue = formatDateValue(new Date())
+
+  return Array.from({ length: 42 }, (_, index) => {
+    const day = new Date(gridStart)
+    day.setDate(gridStart.getDate() + index)
+    const value = formatDateValue(day)
+    return {
+      value,
+      label: day.getDate(),
+      inMonth: day.getMonth() === month,
+      selected: value === dateDraft.value,
+      today: value === todayValue,
+    }
+  })
+})
 
 function getEventImage(event) {
   if (event?.annotated_snapshot_url) return event.annotated_snapshot_url
@@ -86,6 +139,46 @@ function formatEventTime(value) {
   })
 }
 
+function formatDateValue(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function toLocalIso(dateValue, timeValue, fallbackTime, includeFullMinute = false) {
+  if (!dateValue) return ''
+  const [year, month, day] = dateValue.split('-').map(Number)
+  const [hour, minute] = (timeValue || fallbackTime).split(':').map(Number)
+  const date = new Date(year, month - 1, day, hour, minute, includeFullMinute ? 59 : 0, includeFullMinute ? 999 : 0)
+  return date.toISOString()
+}
+
+function shiftCalendarMonth(offset) {
+  calendarMonth.value = new Date(
+    calendarMonth.value.getFullYear(),
+    calendarMonth.value.getMonth() + offset,
+    1,
+  )
+}
+
+function selectCalendarDate(value) {
+  dateDraft.value = value
+  timeFilterError.value = ''
+}
+
+function eventQueryParams(pageValue) {
+  return {
+    status: activeFilter.value,
+    page: pageValue,
+    pageSize,
+    search: searchKeyword.value,
+    ordering: ordering.value,
+    detectedFrom: detectedFrom.value,
+    detectedTo: detectedTo.value,
+  }
+}
+
 function syncSelectedEvent() {
   if (!events.value.length) {
     selectedEvent.value = null
@@ -103,13 +196,7 @@ async function loadEvents() {
   loading.value = true
   try {
     page.value = 1
-    const payload = await fetchEvents({
-      status: activeFilter.value,
-      page: page.value,
-      pageSize,
-      search: searchKeyword.value,
-      ordering: ordering.value,
-    })
+    const payload = await fetchEvents(eventQueryParams(page.value))
     events.value = payload.results || payload
     hasNextPage.value = Boolean(payload.has_next)
     syncSelectedEvent()
@@ -123,13 +210,7 @@ async function loadMoreEvents() {
   loadingMore.value = true
   try {
     const nextPage = page.value + 1
-    const payload = await fetchEvents({
-      status: activeFilter.value,
-      page: nextPage,
-      pageSize,
-      search: searchKeyword.value,
-      ordering: ordering.value,
-    })
+    const payload = await fetchEvents(eventQueryParams(nextPage))
     events.value = [...events.value, ...(payload.results || payload)]
     hasNextPage.value = Boolean(payload.has_next)
     page.value = nextPage
@@ -154,8 +235,18 @@ function changeFilter(value) {
   loadEvents()
 }
 
-function changeSearch() {
+function applyFilters() {
+  timeFilterError.value = ''
+  if (dateDraft.value && timeRangeInvalid.value) {
+    timeFilterError.value = '结束时间不能早于开始时间'
+    return
+  }
+
   searchKeyword.value = searchDraft.value.trim()
+  if (dateDraft.value) {
+    detectedFrom.value = toLocalIso(dateDraft.value, startTimeDraft.value, '00:00')
+    detectedTo.value = toLocalIso(dateDraft.value, endTimeDraft.value, '23:59', true)
+  }
   selectedEvent.value = null
   loadEvents()
 }
@@ -168,6 +259,23 @@ function handleSearchInput() {
 }
 
 function changeOrdering() {
+  selectedEvent.value = null
+  loadEvents()
+}
+
+function applyTimeFilter() {
+  applyFilters()
+}
+
+function clearTimeFilter() {
+  dateDraft.value = ''
+  startTimeDraft.value = '00:00'
+  endTimeDraft.value = '23:59'
+  detectedFrom.value = ''
+  detectedTo.value = ''
+  searchDraft.value = ''
+  searchKeyword.value = ''
+  timeFilterError.value = ''
   selectedEvent.value = null
   loadEvents()
 }
@@ -216,26 +324,89 @@ onMounted(loadEvents)
       </div>
     </div>
 
-    <div class="event-tools" aria-label="事件搜索与排序">
-      <div class="event-search">
-        <span>搜索</span>
-        <input
-          v-model="searchDraft"
-          type="search"
-          placeholder="标题、地点、机器人"
-          @input="handleSearchInput"
-          @keyup.enter="changeSearch"
-        />
-        <button type="button" class="event-search-btn" @click="changeSearch">查询</button>
+    <div class="event-time-filter" aria-label="事件时间筛选">
+      <div class="time-filter-title">
+        <span>时间筛选</span>
+        <small :class="{ error: timeFilterError }">{{ timeFilterError || timeFilterLabel }}</small>
       </div>
-      <label class="event-sort">
-        <span>排序</span>
-        <select v-model="ordering" @change="changeOrdering">
-          <option v-for="option in sortOptions" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
-      </label>
+      <div class="time-filter-controls">
+        <div class="calendar-filter">
+          <div class="calendar-head">
+            <button type="button" aria-label="上个月" @click="shiftCalendarMonth(-1)">‹</button>
+            <strong>{{ calendarMonthTitle }}</strong>
+            <button type="button" aria-label="下个月" @click="shiftCalendarMonth(1)">›</button>
+          </div>
+          <div class="calendar-weekdays" aria-hidden="true">
+            <span>日</span>
+            <span>一</span>
+            <span>二</span>
+            <span>三</span>
+            <span>四</span>
+            <span>五</span>
+            <span>六</span>
+          </div>
+          <div class="calendar-grid">
+            <button
+              v-for="day in calendarDays"
+              :key="day.value"
+              type="button"
+              class="calendar-day"
+              :class="{ muted: !day.inMonth, selected: day.selected, today: day.today }"
+              @click="selectCalendarDate(day.value)"
+            >
+              {{ day.label }}
+            </button>
+          </div>
+        </div>
+        <div class="time-range-panel">
+          <div class="selected-date-label">
+            <span>当前日期</span>
+            <strong>{{ dateDraft || '请选择日期' }}</strong>
+          </div>
+          <div class="time-range-fields">
+            <label>
+              <span>开始</span>
+              <input v-model="startTimeDraft" type="time" @change="timeFilterError = ''" />
+            </label>
+            <label>
+              <span>结束</span>
+              <input v-model="endTimeDraft" type="time" @change="timeFilterError = ''" />
+            </label>
+          </div>
+          <div class="filter-search-row" aria-label="事件搜索与排序">
+            <label class="event-search">
+              <span>关键词</span>
+              <input
+                v-model="searchDraft"
+                type="search"
+                placeholder="标题、地点、机器人"
+                @input="handleSearchInput"
+                @keyup.enter="applyFilters"
+              />
+            </label>
+            <label class="event-sort">
+              <span>排序</span>
+              <select v-model="ordering" @change="changeOrdering">
+                <option v-for="option in sortOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+            <div class="filter-summary">
+              <span>范围</span>
+              <strong>{{ filterSummary }}</strong>
+            </div>
+          </div>
+          <div class="time-filter-actions">
+            <button type="button" class="event-search-btn" :disabled="timeRangeInvalid" @click="applyTimeFilter">
+              筛选
+            </button>
+            <button type="button" class="event-clear-btn" :disabled="!hasSecondaryFilter" @click="clearTimeFilter">
+              清除
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="data-grid">

@@ -25,15 +25,16 @@ onMounted(async () => {
         <article
           v-for="robot in robots"
           :key="robot.id"
-          class="table-card"
+          class="table-card robot-table-card"
           :class="{ selected: selectedRobot?.id === robot.id }"
           @click="chooseRobot(robot.id)"
         >
-          <div>
+          <div class="robot-card-main">
             <strong>{{ robot.name }}</strong>
-            <span>{{ robot.code }} / {{ robot.location }}</span>
+            <span>{{ robot.code }}</span>
+            <small>{{ robot.location }}</small>
           </div>
-          <div class="table-side">
+          <div class="table-side robot-card-side">
             <span :class="['robot-status', robot.status]">{{ robot.status_label }}</span>
             <small>{{ robot.battery_level }}%</small>
           </div>

@@ -12,6 +12,7 @@ const robots = ref([])
 const loading = ref(true)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const videoRef = ref(null)
+const streamUnavailable = ref(false)
 let flvPlayer = null
 let hlsPlayer = null
 const { toastMessage, visible, showToast } = useToast()
@@ -34,13 +35,15 @@ const quickTexts = [
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => overview.value?.latest_robot || null)
 const liveEvent = computed(() => overview.value?.live_event || null)
-const liveImage = computed(() => liveEvent.value?.snapshot_url || '/images/live-feed.jpg')
+const liveImage = computed(
+  () => liveEvent.value?.annotated_snapshot_url || liveEvent.value?.snapshot_url || '/images/live-feed.jpg',
+)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
-const hasLiveStream = computed(() => Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 
 function eventThumbStyle(index) {
   const event = latestRobot.value?.recent_events?.[index]
-  const image = event?.snapshot_url || eventImages[index % eventImages.length]
+  const image = event?.annotated_snapshot_url || event?.snapshot_url || eventImages[index % eventImages.length]
   return {
     backgroundImage: `linear-gradient(rgba(6, 16, 28, 0.08), rgba(6, 16, 28, 0.18)), url(${image})`,
   }
@@ -84,6 +87,34 @@ function destroyVideoPlayers() {
     hlsPlayer.destroy()
     hlsPlayer = null
   }
+  if (videoRef.value) {
+    videoRef.value.removeAttribute('src')
+    videoRef.value.load()
+  }
+}
+
+function fallbackToSnapshot() {
+  streamUnavailable.value = true
+  destroyVideoPlayers()
+}
+
+async function canReachStream(url) {
+  if (!url) return false
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 1800)
+  try {
+    await fetch(url, {
+      method: 'GET',
+      mode: 'no-cors',
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+    return true
+  } catch {
+    return false
+  } finally {
+    window.clearTimeout(timeout)
+  }
 }
 
 async function setupLivePlayer() {
@@ -93,31 +124,47 @@ async function setupLivePlayer() {
   if (!element || !hasLiveStream.value) return
 
   const { flv, hls } = livePlayUrls.value
-  if (flv && mpegts.getFeatureList().mseLivePlayback) {
+  const playableFlv = flv && mpegts.getFeatureList().mseLivePlayback && (await canReachStream(flv))
+  const playableHls = hls && (await canReachStream(hls))
+
+  if (!playableFlv && !playableHls) {
+    fallbackToSnapshot()
+    return
+  }
+
+  try {
+    element.addEventListener('error', fallbackToSnapshot, { once: true })
+  } catch {}
+
+  if (playableFlv) {
     flvPlayer = mpegts.createPlayer({
       type: 'flv',
       isLive: true,
       url: flv,
     })
+    flvPlayer.on(mpegts.Events.ERROR, fallbackToSnapshot)
     flvPlayer.attachMediaElement(element)
     flvPlayer.load()
-    flvPlayer.play().catch(() => {})
+    flvPlayer.play().catch(fallbackToSnapshot)
     return
   }
 
-  if (hls && Hls.isSupported()) {
+  if (playableHls && Hls.isSupported()) {
     hlsPlayer = new Hls({ lowLatencyMode: true })
     hlsPlayer.loadSource(hls)
     hlsPlayer.attachMedia(element)
+    hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
+      if (data?.fatal) fallbackToSnapshot()
+    })
     hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
-      element.play().catch(() => {})
+      element.play().catch(fallbackToSnapshot)
     })
     return
   }
 
-  if (hls) {
+  if (playableHls) {
     element.src = hls
-    element.play().catch(() => {})
+    element.play().catch(fallbackToSnapshot)
   }
 }
 
@@ -137,7 +184,10 @@ onBeforeUnmount(() => {
   destroyVideoPlayers()
 })
 
-watch(livePlayUrls, setupLivePlayer)
+watch(livePlayUrls, () => {
+  streamUnavailable.value = false
+  setupLivePlayer()
+})
 </script>
 
 <template>

@@ -3,6 +3,7 @@ import hashlib
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.db.models import Case, Count, IntegerField, Q, When
+from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.authtoken.models import Token
@@ -266,6 +267,22 @@ class EventListView(APIView):
         status_value = request.query_params.get("status")
         if status_value:
             queryset = queryset.filter(status=status_value)
+        detected_from = request.query_params.get("detected_from", "").strip()
+        detected_to = request.query_params.get("detected_to", "").strip()
+        if detected_from:
+            detected_from_value = parse_datetime(detected_from)
+            if not detected_from_value:
+                return Response({"detail": "开始时间参数无效"}, status=status.HTTP_400_BAD_REQUEST)
+            if timezone.is_naive(detected_from_value):
+                detected_from_value = timezone.make_aware(detected_from_value, timezone.get_current_timezone())
+            queryset = queryset.filter(detected_at__gte=detected_from_value)
+        if detected_to:
+            detected_to_value = parse_datetime(detected_to)
+            if not detected_to_value:
+                return Response({"detail": "结束时间参数无效"}, status=status.HTTP_400_BAD_REQUEST)
+            if timezone.is_naive(detected_to_value):
+                detected_to_value = timezone.make_aware(detected_to_value, timezone.get_current_timezone())
+            queryset = queryset.filter(detected_at__lte=detected_to_value)
         search_value = request.query_params.get("search", "").strip()
         if search_value:
             queryset = queryset.filter(

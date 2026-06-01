@@ -1,4 +1,7 @@
+from datetime import datetime
+
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .models import InspectionEvent, Robot
@@ -107,6 +110,49 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(second_page.status_code, 200)
         self.assertEqual(len(second_page.data["results"]), 1)
         self.assertFalse(second_page.data["has_next"])
+
+    def test_event_list_filters_by_detected_time_range(self):
+        self.authenticate()
+        robot = Robot.objects.first()
+        current_timezone = timezone.get_current_timezone()
+        morning = datetime(2026, 5, 2, 8, 30, tzinfo=current_timezone)
+        noon = datetime(2026, 5, 2, 12, 15, tzinfo=current_timezone)
+        evening = datetime(2026, 5, 2, 18, 45, tzinfo=current_timezone)
+        InspectionEvent.objects.create(
+            robot=robot,
+            title="早间事件",
+            event_type="vehicle_illegal_parking",
+            location=robot.location,
+            detected_at=morning,
+        )
+        matched_event = InspectionEvent.objects.create(
+            robot=robot,
+            title="午间事件",
+            event_type="vehicle_illegal_parking",
+            location=robot.location,
+            detected_at=noon,
+        )
+        InspectionEvent.objects.create(
+            robot=robot,
+            title="晚间事件",
+            event_type="vehicle_illegal_parking",
+            location=robot.location,
+            detected_at=evening,
+        )
+
+        response = self.client.get(
+            "/api/events/?detected_from=2026-05-02T12:00:00%2B08:00&detected_to=2026-05-02T13:00:00%2B08:00"
+        )
+        self.assertEqual(response.status_code, 200)
+        result_ids = [event["id"] for event in response.data["results"]]
+        self.assertIn(matched_event.id, result_ids)
+        self.assertNotIn("早间事件", [event["title"] for event in response.data["results"]])
+        self.assertNotIn("晚间事件", [event["title"] for event in response.data["results"]])
+
+    def test_event_list_rejects_invalid_detected_time(self):
+        self.authenticate()
+        response = self.client.get("/api/events/?detected_from=not-a-time")
+        self.assertEqual(response.status_code, 400)
 
     def test_event_handle_saves_archive_notes(self):
         self.authenticate()
