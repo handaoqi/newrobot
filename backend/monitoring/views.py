@@ -147,23 +147,17 @@ def ensure_demo_seed() -> None:
     )
     if not robot.stream_id:
         robot.stream_id = "dog_ZSL-1A-07_front"
-    if not robot.play_urls:
-        robot.play_urls = {
-            "flv": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front.live.flv",
-            "hls": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front/hls.m3u8",
-        }
     robot.save(update_fields=["stream_id", "play_urls", "updated_at"])
-    PatrolTask.objects.get_or_create(
-        name="公园主通道早间巡检",
-        robot=robot,
-        defaults={
-            "route_name": "南门-主路-中心广场",
-            "scheduled_start": timezone.now() - timezone.timedelta(hours=2),
-            "scheduled_end": timezone.now() + timezone.timedelta(hours=1),
-            "status": "running",
-            "completion_rate": 68,
-        },
-    )
+    if not PatrolTask.objects.filter(name="公园主通道早间巡检", robot=robot).exists():
+        PatrolTask.objects.create(
+            name="公园主通道早间巡检",
+            robot=robot,
+            route_name="南门-主路-中心广场",
+            scheduled_start=timezone.now() - timezone.timedelta(hours=2),
+            scheduled_end=timezone.now() + timezone.timedelta(hours=1),
+            status="running",
+            completion_rate=68,
+        )
 
 
 class LoginView(APIView):

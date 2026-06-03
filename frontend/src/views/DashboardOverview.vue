@@ -5,11 +5,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { fetchOverview, fetchRobots } from '../services/api'
+import { fetchOverview, fetchRobotDetail, fetchRobots } from '../services/api'
 
 const overview = ref(null)
 const robots = ref([])
+const selectedRobot = ref(null)
 const loading = ref(true)
+const switchingRobot = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const videoRef = ref(null)
 const streamUnavailable = ref(false)
@@ -33,11 +35,8 @@ const quickTexts = [
 ]
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
-const latestRobot = computed(() => overview.value?.latest_robot || null)
-const liveEvent = computed(() => overview.value?.live_event || null)
-const liveImage = computed(
-  () => liveEvent.value?.annotated_snapshot_url || liveEvent.value?.snapshot_url || '/images/live-feed.jpg',
-)
+const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
+const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 
@@ -90,6 +89,18 @@ function destroyVideoPlayers() {
   if (videoRef.value) {
     videoRef.value.removeAttribute('src')
     videoRef.value.load()
+  }
+}
+
+async function chooseRobot(robotId, announce = true) {
+  if (!robotId || switchingRobot.value || selectedRobot.value?.id === robotId) return
+  switchingRobot.value = true
+  try {
+    selectedRobot.value = await fetchRobotDetail(robotId)
+    streamUnavailable.value = false
+    if (announce) showToast(`已切换至 ${selectedRobot.value.name}`)
+  } finally {
+    switchingRobot.value = false
   }
 }
 
@@ -173,6 +184,10 @@ onMounted(async () => {
     const [overviewData, robotData] = await Promise.all([fetchOverview(), fetchRobots()])
     overview.value = overviewData
     robots.value = robotData
+    const initialRobotId = overviewData.latest_robot?.id || robotData[0]?.id
+    if (initialRobotId) {
+      await chooseRobot(initialRobotId, false)
+    }
   } finally {
     loading.value = false
   }
@@ -196,10 +211,10 @@ watch(livePlayUrls, () => {
       <section class="top-summary">
         <article class="status-pill online">
           <span class="dot"></span>
-          设备在线 {{ overview.header.device_code }}
+          设备在线 {{ latestRobot?.code || overview.header.device_code }}
         </article>
         <article class="status-pill warning">今日告警 {{ overview.header.today_alerts }} 条</article>
-        <article class="status-pill">当前区域 {{ overview.header.current_location }}</article>
+        <article class="status-pill">当前区域 {{ latestRobot?.location || overview.header.current_location }}</article>
       </section>
 
       <section class="panel video-panel">
@@ -221,7 +236,10 @@ watch(livePlayUrls, () => {
             autoplay
             controls
           ></video>
-          <img v-else class="video-source" :src="liveImage" alt="实时视频画面" />
+          <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
+            <strong>无信号</strong>
+            <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
+          </div>
 
           <div class="video-overlay">
             <div class="overlay-card">
@@ -285,20 +303,29 @@ watch(livePlayUrls, () => {
           <div class="panel-head">
             <div>
               <h3>设备列表</h3>
-              <p>支持在多台机器人之间快速切换与查看状态</p>
+              <p>{{ switchingRobot ? '正在切换设备...' : '点击设备后同步切换监控画面、控制台与历史事件' }}</p>
             </div>
           </div>
           <div class="robot-list">
-            <div v-for="robot in robots" :key="robot.id" class="robot-item">
-              <div>
+            <button
+              v-for="robot in robots"
+              :key="robot.id"
+              type="button"
+              class="robot-item"
+              :class="{ selected: latestRobot?.id === robot.id }"
+              :disabled="switchingRobot"
+              @click="chooseRobot(robot.id)"
+            >
+              <div class="robot-main">
+                <span class="robot-code">{{ robot.code }}</span>
                 <strong>{{ robot.name }}</strong>
                 <span>{{ robot.location }}</span>
               </div>
               <div class="robot-side">
                 <span :class="['robot-status', robot.status]">{{ robot.status_label }}</span>
-                <span>{{ robot.battery_level }}%</span>
+                <span class="robot-battery">{{ robot.battery_level }}%</span>
               </div>
-            </div>
+            </button>
           </div>
         </article>
       </section>

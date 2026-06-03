@@ -41,6 +41,14 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(response.data["trends"][3]["summary"]["latest"], 1.3)
         self.assertEqual(response.data["trends"][3]["summary"]["total"], 1.3)
 
+    def test_robot_list_uses_seeded_primary_device_only(self):
+        self.authenticate()
+        response = self.client.get("/api/robots/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        robot_codes = {robot["code"] for robot in response.data}
+        self.assertIn("ZSL-1A-07", robot_codes)
+
     def test_telemetry_ingest(self):
         robot = Robot.objects.first()
         before_count = InspectionEvent.objects.count()
@@ -100,13 +108,13 @@ class MonitoringApiTests(TestCase):
                 status="pending" if index < 11 else "resolved",
             )
 
-        response = self.client.get("/api/events/?status=pending&page=1&page_size=5")
+        response = self.client.get("/api/events/?status=pending&search=测试事件&page=1&page_size=5")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 11)
         self.assertEqual(len(response.data["results"]), 5)
         self.assertTrue(response.data["has_next"])
 
-        second_page = self.client.get("/api/events/?status=pending&page=3&page_size=5")
+        second_page = self.client.get("/api/events/?status=pending&search=测试事件&page=3&page_size=5")
         self.assertEqual(second_page.status_code, 200)
         self.assertEqual(len(second_page.data["results"]), 1)
         self.assertFalse(second_page.data["has_next"])
