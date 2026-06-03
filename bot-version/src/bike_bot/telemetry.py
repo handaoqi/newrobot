@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import time
 from datetime import datetime
 from itertools import count
 from pathlib import Path
@@ -12,10 +13,15 @@ from uuid import uuid4
 import requests
 
 from .config import AppConfig
+from .logging_utils import rotate_file_if_needed
 from .models import DetectionPayload, TelemetryPayload, VideoInfo, now_iso
 from .runtime import RuntimeState
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _milliseconds(seconds: float) -> float:
+    return round(seconds * 1000, 1)
 
 
 class SequenceGenerator:
@@ -38,10 +44,23 @@ class TelemetryClient:
         self.sequence = SequenceGenerator(config.robot.code)
         self._log_lock = Lock()
         self._log_path = Path(config.storage.telemetry_log_path)
+        self._video_lock = Lock()
+        self._actual_frame_width: int | None = None
+        self._actual_frame_height: int | None = None
+
+    def update_frame_size(self, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        with self._video_lock:
+            self._actual_frame_width = width
+            self._actual_frame_height = height
 
     def build_payload(self, detections: list[DetectionPayload] | None = None) -> TelemetryPayload:
         snapshot = self.runtime_state.snapshot()
         stream_id = self.config.video.stream_id or f"dog_{self.config.robot.code}_{self.config.video.camera_id}"
+        with self._video_lock:
+            frame_width = self._actual_frame_width or self.config.video.width
+            frame_height = self._actual_frame_height or self.config.video.height
         return TelemetryPayload(
             sequence_id=self.sequence.next(),
             robot_code=self.config.robot.code,
@@ -55,16 +74,20 @@ class TelemetryClient:
             video=VideoInfo(
                 stream_id=stream_id,
                 camera_id=self.config.video.camera_id,
-                frame_width=self.config.video.width,
-                frame_height=self.config.video.height,
+                frame_width=frame_width,
+                frame_height=frame_height,
                 play_urls=self.config.video.play_urls,
             ),
             detections=detections or [],
         )
 
     def send(self, detections: list[DetectionPayload] | None = None) -> bool:
+        total_started_at = time.perf_counter()
         payload = self.build_payload(detections=detections)
-        self._upload_detection_media(payload.sequence_id, payload.detections)
+        upload_count, media_prepare_seconds, upload_seconds = self._upload_detection_media(
+            payload.sequence_id,
+            payload.detections,
+        )
         payload_dict = payload.to_dict()
         headers = {
             "Content-Type": "application/json",
@@ -75,6 +98,7 @@ class TelemetryClient:
             headers["X-Device-Key"] = self.config.telemetry.device_key
 
         try:
+            post_started_at = time.perf_counter()
             response = requests.post(
                 self.config.telemetry.endpoint,
                 json=payload_dict,
@@ -82,21 +106,59 @@ class TelemetryClient:
                 timeout=self.config.telemetry.timeout_seconds,
                 verify=self.config.telemetry.verify_tls,
             )
+            post_seconds = time.perf_counter() - post_started_at
             response.raise_for_status()
             self._write_log(payload_dict, True, response.status_code, None)
+            total_seconds = time.perf_counter() - total_started_at
+            if payload.detections:
+                LOGGER.info(
+                    "edge_perf telemetry_sent sequence_id=%s detections=%d upload_count=%d "
+                    "media_prepare_ms=%.1f upload_ms=%.1f post_ms=%.1f total_ms=%.1f status_code=%s",
+                    payload.sequence_id,
+                    len(payload.detections),
+                    upload_count,
+                    _milliseconds(media_prepare_seconds),
+                    _milliseconds(upload_seconds),
+                    _milliseconds(post_seconds),
+                    _milliseconds(total_seconds),
+                    response.status_code,
+                )
+            elif total_seconds >= 1.0:
+                LOGGER.warning(
+                    "edge_perf telemetry_slow_no_detection sequence_id=%s post_ms=%.1f total_ms=%.1f status_code=%s",
+                    payload.sequence_id,
+                    _milliseconds(post_seconds),
+                    _milliseconds(total_seconds),
+                    response.status_code,
+                )
             LOGGER.info("telemetry sent sequence_id=%s detections=%d", payload.sequence_id, len(payload.detections))
             return True
         except requests.RequestException as exc:
+            total_seconds = time.perf_counter() - total_started_at
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             self._write_log(payload_dict, False, status_code, str(exc))
-            LOGGER.warning("telemetry send failed: %s", exc)
+            LOGGER.warning(
+                "edge_perf telemetry_failed sequence_id=%s detections=%d upload_count=%d upload_ms=%.1f "
+                "media_prepare_ms=%.1f total_ms=%.1f status_code=%s error=%s",
+                payload.sequence_id,
+                len(payload.detections),
+                upload_count,
+                _milliseconds(upload_seconds),
+                _milliseconds(media_prepare_seconds),
+                _milliseconds(total_seconds),
+                status_code,
+                exc,
+            )
             return False
 
-    def _upload_detection_media(self, sequence_id: str, detections: list[DetectionPayload]) -> None:
+    def _upload_detection_media(self, sequence_id: str, detections: list[DetectionPayload]) -> tuple[int, float, float]:
         endpoint = self.config.telemetry.media_upload_endpoint
         if not endpoint:
-            return
+            return 0, 0.0, 0.0
 
+        upload_count = 0
+        media_prepare_seconds = 0.0
+        upload_seconds = 0.0
         for detection in detections:
             if not detection.local_snapshot_path:
                 continue
@@ -106,6 +168,7 @@ class TelemetryClient:
                 LOGGER.warning("snapshot not found, skip upload: %s", snapshot_path)
                 continue
 
+            prepare_started_at = time.perf_counter()
             sha256 = self._sha256_file(snapshot_path)
             mime_type = mimetypes.guess_type(snapshot_path.name)[0] or "image/jpeg"
             headers = {
@@ -123,6 +186,9 @@ class TelemetryClient:
                 "sequence_id": sequence_id,
                 "sha256": sha256,
             }
+            prepare_elapsed = time.perf_counter() - prepare_started_at
+            media_prepare_seconds += prepare_elapsed
+            upload_started_at = time.perf_counter()
             try:
                 with snapshot_path.open("rb") as handle:
                     response = requests.post(
@@ -133,10 +199,25 @@ class TelemetryClient:
                         timeout=self.config.telemetry.timeout_seconds,
                         verify=self.config.telemetry.verify_tls,
                     )
+                elapsed = time.perf_counter() - upload_started_at
+                upload_seconds += elapsed
                 response.raise_for_status()
                 detection.snapshot_url = response.json().get("url") or detection.snapshot_url
+                upload_count += 1
+                LOGGER.info(
+                    "edge_perf snapshot_uploaded sequence_id=%s path=%s media_prepare_ms=%.1f "
+                    "upload_ms=%.1f status_code=%s",
+                    sequence_id,
+                    snapshot_path,
+                    _milliseconds(prepare_elapsed),
+                    _milliseconds(elapsed),
+                    response.status_code,
+                )
             except requests.RequestException as exc:
+                elapsed = time.perf_counter() - upload_started_at
+                upload_seconds += elapsed
                 LOGGER.warning("snapshot upload failed path=%s error=%s", snapshot_path, exc)
+        return upload_count, media_prepare_seconds, upload_seconds
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -163,5 +244,10 @@ class TelemetryClient:
             "payload": payload,
         }
         with self._log_lock:
+            rotate_file_if_needed(
+                self._log_path,
+                self.config.storage.telemetry_log_max_bytes,
+                self.config.storage.telemetry_log_backup_count,
+            )
             with self._log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(entry, ensure_ascii=False) + "\n")

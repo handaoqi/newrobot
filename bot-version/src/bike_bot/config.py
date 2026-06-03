@@ -85,6 +85,8 @@ class SnapshotConfig:
     directory: str = "snapshots"
     public_base_url: str = ""
     jpeg_quality: int = 90
+    max_files: int = 500
+    max_total_bytes: int = 1024 * 1024 * 1024
 
 
 @dataclass
@@ -98,6 +100,13 @@ class DisplayConfig:
 @dataclass
 class StorageConfig:
     telemetry_log_path: str = "data/telemetry/telemetry.jsonl"
+    telemetry_log_max_bytes: int = 20 * 1024 * 1024
+    telemetry_log_backup_count: int = 5
+    app_log_path: str = "data/logs/bike_bot.log"
+    stream_log_path: str = "data/logs/ffmpeg-stream.log"
+    run_stream_log_path: str = "data/logs/run_stream.log"
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backup_count: int = 5
 
 
 @dataclass
@@ -150,3 +159,6 @@ class AppConfig:
     def ensure_directories(self) -> None:
         Path(self.snapshot.directory).mkdir(parents=True, exist_ok=True)
         Path(self.storage.telemetry_log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.storage.app_log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.storage.stream_log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.storage.run_stream_log_path).parent.mkdir(parents=True, exist_ok=True)

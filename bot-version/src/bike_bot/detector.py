@@ -4,8 +4,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import cv2
 
@@ -60,21 +62,69 @@ class RawDetection:
 
 
 class SnapshotManager:
-    def __init__(self, directory: str, public_base_url: str, jpeg_quality: int) -> None:
+    def __init__(
+        self,
+        directory: str,
+        public_base_url: str,
+        jpeg_quality: int,
+        max_files: int,
+        max_total_bytes: int,
+    ) -> None:
         self.directory = Path(directory)
         self.public_base_url = public_base_url.rstrip("/")
         self.jpeg_quality = jpeg_quality
+        self.max_files = max_files
+        self.max_total_bytes = max_total_bytes
 
     def save(self, frame) -> tuple[str, str | None] | None:
-        timestamp = now_iso().replace(":", "").replace("+", "_")
-        file_name = f"event-{timestamp}.jpg"
+        timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
+        file_name = f"event-{timestamp}-{uuid4().hex[:8]}.jpg"
         path = self.directory / file_name
         ok = cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
         if not ok:
             return None
+        self.cleanup()
         if self.public_base_url:
             return str(path.resolve()), f"{self.public_base_url}/{file_name}"
         return str(path.resolve()), None
+
+    def cleanup(self) -> None:
+        try:
+            snapshots = sorted(
+                (
+                    item
+                    for item in self.directory.glob("event-*.jpg")
+                    if item.is_file()
+                ),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError as exc:
+            LOGGER.warning("snapshot cleanup skipped: %s", exc)
+            return
+
+        total_bytes = 0
+        to_remove: list[Path] = []
+        for index, snapshot in enumerate(snapshots):
+            try:
+                size = snapshot.stat().st_size
+            except OSError:
+                continue
+            if index == 0:
+                total_bytes += size
+                continue
+            keep_by_count = self.max_files <= 0 or index < self.max_files
+            keep_by_size = self.max_total_bytes <= 0 or total_bytes + size <= self.max_total_bytes
+            if keep_by_count and keep_by_size:
+                total_bytes += size
+                continue
+            to_remove.append(snapshot)
+
+        for snapshot in to_remove:
+            try:
+                snapshot.unlink()
+            except OSError as exc:
+                LOGGER.warning("failed to remove old snapshot path=%s error=%s", snapshot, exc)
 
 
 class YoloDetector:
@@ -89,6 +139,8 @@ class YoloDetector:
             config.snapshot.directory,
             config.snapshot.public_base_url,
             config.snapshot.jpeg_quality,
+            config.snapshot.max_files,
+            config.snapshot.max_total_bytes,
         )
         self.tracker = IoUTracker(
             iou_threshold=config.detection.tracker_iou_threshold,

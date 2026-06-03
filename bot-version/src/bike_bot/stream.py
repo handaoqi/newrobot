@@ -4,10 +4,16 @@ import logging
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 from .config import AppConfig
+from .logging_utils import rotate_file_if_needed
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _milliseconds(seconds: float) -> float:
+    return round(seconds * 1000, 1)
 
 
 class StreamPusher:
@@ -61,20 +67,41 @@ class StreamPusher:
         while not stop_event.is_set():
             command = self.build_command()
             LOGGER.info("starting zlm stream push: %s", " ".join(command))
-            process = subprocess.Popen(command)
-            while process.poll() is None:
-                if stop_event.wait(1):
-                    LOGGER.info("stopping zlm stream push")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    return
+            started_at = time.perf_counter()
+            log_path = Path(self.config.storage.stream_log_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            rotate_file_if_needed(
+                log_path,
+                self.config.storage.log_max_bytes,
+                self.config.storage.log_backup_count,
+            )
+            with log_path.open("a", encoding="utf-8") as stream_log:
+                process = subprocess.Popen(
+                    command,
+                    stdout=stream_log,
+                    stderr=subprocess.STDOUT,
+                )
+                LOGGER.info(
+                    "edge_perf stream_process_started pid=%s rtmp_url=%s ffmpeg_log=%s",
+                    process.pid,
+                    self.config.stream.rtmp_url,
+                    log_path,
+                )
+                while process.poll() is None:
+                    if stop_event.wait(1):
+                        LOGGER.info("stopping zlm stream push")
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        return
 
+            runtime_seconds = time.perf_counter() - started_at
             LOGGER.warning(
-                "zlm stream push exited code=%s, retrying in %ss",
+                "edge_perf stream_process_exited code=%s runtime_ms=%.1f retrying_in_s=%s",
                 process.returncode,
+                _milliseconds(runtime_seconds),
                 self.config.stream.reconnect_interval_seconds,
             )
             stop_event.wait(self.config.stream.reconnect_interval_seconds)

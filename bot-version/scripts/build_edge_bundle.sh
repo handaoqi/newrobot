@@ -31,7 +31,7 @@ rm -rf "${DIST_DIR:?}/${APP_NAME}" "${BUNDLE_DIR}" "${PACKAGE_PATH}"
 
 mkdir -p "${BUNDLE_DIR}"
 cp -a "${DIST_DIR}/${APP_NAME}/." "${BUNDLE_DIR}/"
-mkdir -p "${BUNDLE_DIR}/models" "${BUNDLE_DIR}/snapshots" "${BUNDLE_DIR}/data/telemetry" "${BUNDLE_DIR}/bin"
+mkdir -p "${BUNDLE_DIR}/models" "${BUNDLE_DIR}/snapshots" "${BUNDLE_DIR}/data/telemetry" "${BUNDLE_DIR}/data/logs" "${BUNDLE_DIR}/bin"
 cp "models/bike.onnx" "${BUNDLE_DIR}/models/bike.onnx"
 cp "config.yaml" "${BUNDLE_DIR}/config.yaml"
 

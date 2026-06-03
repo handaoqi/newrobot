@@ -33,24 +33,6 @@ def _media_public_url(relative_path: str) -> str:
     return f"{media_url}{relative_path}"
 
 
-def _pink_region_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
-    rgb_image = image.convert("RGB")
-    width, height = rgb_image.size
-    xs: list[int] = []
-    ys: list[int] = []
-
-    for y in range(height):
-        for x, (red, green, blue) in enumerate(rgb_image.crop((0, y, width, y + 1)).getdata()):
-            if red > 125 and blue > 115 and green < 135 and red > green * 1.15 and blue > green * 1.05:
-                xs.append(x)
-                ys.append(y)
-
-    if not xs:
-        return None
-
-    return min(xs), min(ys), max(xs), max(ys)
-
-
 def _stored_bbox(event: InspectionEvent, image: Image.Image) -> tuple[int, int, int, int] | None:
     values = [event.bbox_x, event.bbox_y, event.bbox_width, event.bbox_height]
     if any(value is None for value in values):
@@ -93,7 +75,7 @@ def build_annotated_snapshot(event: InspectionEvent) -> str:
 
     with Image.open(source_path) as image:
         image = image.convert("RGB")
-        bbox = _pink_region_bbox(image) or _stored_bbox(event, image)
+        bbox = _stored_bbox(event, image)
         if not bbox:
             return event.snapshot_url
 

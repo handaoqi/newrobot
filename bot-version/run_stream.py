@@ -17,15 +17,23 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from bike_bot.config import AppConfig
+from bike_bot.logging_utils import rotating_file_handler
 from bike_bot.stream import StreamPusher
 
 LOGGER = logging.getLogger(__name__)
 
 
-def configure_logging() -> None:
+def configure_logging(
+    log_path: str = "data/logs/run_stream.log",
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 5,
+) -> None:
+    file_handler = rotating_file_handler(log_path, max_bytes, backup_count)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        handlers=[file_handler],
+        force=True,
     )
 
 
@@ -84,8 +92,14 @@ def single_instance_lock(config: AppConfig):
 
 def main() -> None:
     args = parse_args()
-    configure_logging()
     config = AppConfig.from_file(args.config)
+    config.ensure_directories()
+    configure_logging(
+        config.storage.run_stream_log_path,
+        config.storage.log_max_bytes,
+        config.storage.log_backup_count,
+    )
+    LOGGER.info("logging to data file: %s", config.storage.run_stream_log_path)
     stop_event = threading.Event()
 
     def request_stop(_signum=None, _frame=None) -> None:
