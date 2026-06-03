@@ -14,8 +14,8 @@ video:
   camera_id: "front"
   stream_id: "dog_ZSL-1A-07_front"
   play_urls:
-    flv: "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front.live.flv"
-    hls: "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front/hls.m3u8"
+    flv: "http://192.168.234.14:8080/live/dog_ZSL-1A-07_front.live.flv"
+    hls: "http://192.168.234.14:8080/live/dog_ZSL-1A-07_front/hls.m3u8"
   rtsp_transport: "tcp"
   open_timeout_seconds: 8
   read_timeout_seconds: 8
@@ -24,7 +24,7 @@ video:
 stream:
   enable: true
   ffmpeg_path: "ffmpeg"
-  rtmp_url: "rtmp://127.0.0.1/live/dog_ZSL-1A-07_front"
+  rtmp_url: "rtmp://192.168.234.14/live/dog_ZSL-1A-07_front"
   reconnect_interval_seconds: 5
   video_codec: "copy"
   audio_enabled: false
@@ -54,13 +54,24 @@ detection:
   duplicate_alert_seconds: 300
 
 telemetry:
-  endpoint: "http://127.0.0.1:8000/api/telemetry/ingest/"
-  media_upload_endpoint: "http://127.0.0.1:8000/api/device/media/upload/"
+  endpoint: "http://192.168.234.14:8000/api/telemetry/ingest/"
+  media_upload_endpoint: "http://192.168.234.14:8000/api/device/media/upload/"
   timeout_seconds: 5
   verify_tls: false
   device_key: ""
   heartbeat_interval_seconds: 5
   status_interval_seconds: 2
+
+control:
+  enable: true
+  host: "0.0.0.0"
+  port: 9100
+  dry_run: true
+  sdk_enabled: true
+  sdk_lib_path: ""
+  local_ip: "192.168.234.14"
+  local_port: 43988
+  robot_ip: "192.168.234.1"
 
 snapshot:
   directory: "snapshots"

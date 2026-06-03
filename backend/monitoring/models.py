@@ -162,4 +162,33 @@ class MediaAsset(BaseTimestampModel):
     def __str__(self) -> str:
         return f"{self.robot.code} {self.media_type} {self.sequence_id}"
 
+
+class RobotCommand(BaseTimestampModel):
+    ACTION_CHOICES = [
+        ("shake_hand", "握手"),
+        ("stand_up", "站立"),
+        ("lie_down", "趴下"),
+        ("move_stop", "停止移动"),
+        ("passive", "软急停"),
+    ]
+    STATUS_CHOICES = [
+        ("queued", "待发送"),
+        ("sent", "已发送"),
+        ("failed", "发送失败"),
+    ]
+
+    robot = models.ForeignKey(Robot, related_name="commands", on_delete=models.CASCADE)
+    action = models.CharField(max_length=32, choices=ACTION_CHOICES)
+    payload = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="queued")
+    response_payload = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.robot.code} {self.action} {self.status}"
+
 # Create your models here.

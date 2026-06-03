@@ -6,6 +6,7 @@
 - 调用 YOLO 模型实时识别自行车
 - 实时显示识别框、置信度和 FPS 预览
 - 按约定 JSON 结构上报遥测、状态和告警事件
+- 接收后端下发的远程控制指令，并映射到机器狗 SDK 动作
 - 将每次发往服务器的 JSON 保存到本地日志文件
 - 保存抓拍图，并可回传可访问 URL
 
@@ -46,6 +47,10 @@ copy config.example.yaml config.yaml
 - `detection.duplicate_alert_seconds`: 同一跟踪 ID 两次告警的最小间隔
 - `telemetry.endpoint`: 远程服务地址，例如 `http://10.0.0.8:8000/api/telemetry/ingest/`
 - `telemetry.device_key`: 如服务端启用 `X-Device-Key`，这里填写
+- `control.port`: 板端控制服务端口，默认 `9100`
+- `control.dry_run`: 开发联调时保持 `true`；上板真实执行 SDK 动作时改为 `false`
+- `control.sdk_lib_path`: GENISOM L1 SDK Python `.so` 所在目录，例如 `.../lib/zsl-1/aarch64`
+- `control.local_ip` / `control.local_port` / `control.robot_ip`: 对应官方 SDK `initRobot()` 参数
 - `snapshot.public_base_url`: 若抓拍图片经 nginx/对象存储暴露，这里填写访问前缀
 - `display.enable`: 是否弹出实时识别预览窗口
 - `storage.telemetry_log_path`: 本地保存上报 JSON 的日志文件
@@ -61,6 +66,14 @@ python run_edge.py --config config.yaml
 ```bash
 python -m bike_bot.main --config config.yaml
 ```
+
+如果只验证“后端下发控制指令 -> 板端接收 -> SDK 动作映射”，可不启动检测和推流，单独运行：
+
+```bash
+python run_control_server.py --config config.yaml
+```
+
+当前 demo 中，前端“紧急停止”按钮会通过后端下发 `shake_hand`，板端收到后调用 GENISOM L1 SDK 的 `shakeHand()`；生产环境应把真正急停映射到 `passive` 或 `move_stop`。
 
 ## 4. 免安装部署包
 
@@ -124,6 +137,7 @@ src/bike_bot/
   detector.py
   runtime.py
   telemetry.py
+  control.py
   models.py
 config.example.yaml
 ```

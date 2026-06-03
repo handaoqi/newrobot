@@ -4,7 +4,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = "django-insecure-demo-inspection-platform-key"
 DEBUG = True
-ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver", "192.168.234.8", "192.168.234.12"]
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver", "192.168.234.8", "192.168.234.12", "192.168.234.14"]
+
+DEFAULT_ROBOT_CONTROL_ENDPOINT = ""
+ROBOT_CONTROL_ENDPOINTS = {
+    "ZSL-1A-07": "http://192.168.234.1:9100/commands",
+}
 
 INSTALLED_APPS = [
     "django.contrib.admin",

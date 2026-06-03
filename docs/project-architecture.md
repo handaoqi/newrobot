@@ -12,6 +12,8 @@
 flowchart LR
   Camera["摄像头或 RTSP 源"] --> Edge["bot-version 板端程序"]
   Edge -->|JSON 遥测/检测事件| API["Django REST API"]
+  Web -->|控制指令| API
+  API -->|HTTP POST /commands| Edge
   Edge -->|抓拍文件 multipart| Media["Django media 文件存储"]
   Edge -->|RTMP 推流| ZLM["ZLMediaKit"]
   ZLM -->|HTTP-FLV/HLS| Web["Vue 前端"]
@@ -145,6 +147,29 @@ sequenceDiagram
 ```text
 RTSP 摄像头 -> ffmpeg -> RTMP -> ZLMediaKit -> HTTP-FLV/HLS -> Vue video 播放器
 ```
+
+### 7.4 远程控制链路
+
+当前 demo 采用后端主动访问板端控制服务：
+
+```mermaid
+sequenceDiagram
+  participant User as 用户
+  participant Web as Vue 前端
+  participant API as Django API
+  participant Edge as bot-version 板端
+  participant SDK as GENISOM L1 SDK
+
+  User->>Web: 点击“紧急停止”
+  Web->>API: POST /api/robots/<id>/commands/ action=shake_hand
+  API->>API: 写入 RobotCommand
+  API->>Edge: POST <control_endpoint>/commands
+  Edge->>SDK: HighLevel.shakeHand()
+  Edge-->>API: command accepted
+  API-->>Web: 返回命令状态
+```
+
+这种方式要求后端能访问机器人的 `control_endpoint`。如果云端后端无法直接访问内网机器人，建议改为板端长轮询、MQTT 或 WebSocket 反向连接。
 
 前端优先使用 `Robot.play_urls.flv`，若浏览器环境不支持或无 FLV，则回退到 HLS；如果没有实时流，则显示事件图或默认图片。
 

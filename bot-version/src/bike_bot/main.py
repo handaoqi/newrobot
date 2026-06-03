@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 
 from .config import AppConfig
+from .control import CommandServer
 from .detector import YoloDetector
 from .logging_utils import rotating_file_handler
 from .runtime import RuntimeState
@@ -471,6 +472,20 @@ def stream_worker(stop_event: threading.Event, pusher: StreamPusher, error_queue
         error_queue.put(exc)
 
 
+def command_worker(stop_event: threading.Event, server: CommandServer, error_queue: Queue[BaseException]) -> None:
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True, name="command-http-server")
+    try:
+        server_thread.start()
+        while not stop_event.is_set():
+            stop_event.wait(0.5)
+    except BaseException as exc:
+        LOGGER.exception("command worker crashed")
+        error_queue.put(exc)
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=2)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime bicycle detection edge client.")
     parser.add_argument("--config", default="config.yaml", help="path to yaml config")
@@ -492,6 +507,7 @@ def main() -> None:
     detector = YoloDetector(config)
     client = TelemetryClient(config, runtime_state)
     pusher = StreamPusher(config)
+    command_server = CommandServer(config) if config.control.enable else None
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()
 
@@ -522,6 +538,15 @@ def main() -> None:
                 args=(stop_event, pusher, error_queue),
                 daemon=False,
                 name="zlm-stream-worker",
+            )
+        )
+    if command_server:
+        threads.append(
+            threading.Thread(
+                target=command_worker,
+                args=(stop_event, command_server, error_queue),
+                daemon=False,
+                name="command-worker",
             )
         )
 

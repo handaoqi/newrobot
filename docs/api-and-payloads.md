@@ -55,6 +55,7 @@ localStorage.inspection_user
 | `GET` | `/api/dashboard/analytics/` | 统计分析数据 | `fetchAnalytics()` |
 | `GET` | `/api/robots/` | 机器人列表 | `fetchRobots()` |
 | `GET` | `/api/robots/<robot_id>/` | 机器人详情 | `fetchRobotDetail()` |
+| `POST` | `/api/robots/<robot_id>/commands/` | 下发机器人控制指令 | `sendRobotCommand()` |
 | `GET` | `/api/events/` | 事件列表，支持筛选/搜索/排序/分页 | `fetchEvents()` |
 | `GET` | `/api/events/<event_id>/` | 事件详情 | 预留 |
 | `POST` | `/api/events/<event_id>/handle/` | 事件处置/归档 | `handleEvent()` |
@@ -214,6 +215,7 @@ GET /api/robots/
 | `camera_id` | string | 摄像头 ID |
 | `stream_id` | string | 视频流 ID |
 | `play_urls` | object | 播放地址，通常包含 `flv`、`hls` |
+| `control_endpoint` | string | 后端下发控制指令时访问的板端 HTTP 地址 |
 
 ### 7.2 机器人详情
 
@@ -231,6 +233,68 @@ GET /api/robots/<robot_id>/
 | `firmware_version` | 固件版本 |
 | `recent_events` | 最近 5 条事件 |
 | `tasks` | 最近 5 条任务 |
+
+### 7.3 机器人控制指令
+
+请求：
+
+```http
+POST /api/robots/<robot_id>/commands/
+Content-Type: application/json
+Authorization: Token <token>
+```
+
+```json
+{
+  "action": "shake_hand",
+  "payload": {
+    "source": "emergency_stop_demo"
+  }
+}
+```
+
+当前支持动作：
+
+| action | 说明 | 板端 SDK 映射 |
+| --- | --- | --- |
+| `shake_hand` | 握手，当前紧急停止按钮 demo 使用 | `HighLevel.shakeHand()` |
+| `stand_up` | 站立 | `HighLevel.standUp()` |
+| `lie_down` | 趴下 | `HighLevel.lieDown()` |
+| `move_stop` | 停止移动 | `HighLevel.move(0.0, 0.0, 0.0)` |
+| `passive` | 软急停 | `HighLevel.passive()` |
+
+后端处理流程：
+
+1. 创建 `RobotCommand` 记录。
+2. 按机器人 `control_endpoint` 发送 JSON 到板端 `/commands`。
+3. 根据板端响应更新命令状态为 `sent` 或 `failed`。
+
+成功响应：
+
+```json
+{
+  "id": 1,
+  "robot_code": "ZSL-1A-07",
+  "action": "shake_hand",
+  "action_label": "握手",
+  "payload": {
+    "source": "emergency_stop_demo"
+  },
+  "status": "sent",
+  "status_label": "已发送",
+  "response_payload": {
+    "detail": "command accepted",
+    "command_id": 1,
+    "robot_code": "ZSL-1A-07",
+    "ok": true,
+    "action": "shake_hand",
+    "dry_run": true
+  },
+  "error_message": "",
+  "sent_at": "2026-06-03T21:00:00+08:00",
+  "created_at": "2026-06-03T21:00:00+08:00"
+}
+```
 
 ## 8. 事件接口
 

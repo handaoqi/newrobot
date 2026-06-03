@@ -5,13 +5,14 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { fetchOverview, fetchRobotDetail, fetchRobots } from '../services/api'
+import { fetchOverview, fetchRobotDetail, fetchRobots, sendRobotCommand } from '../services/api'
 
 const overview = ref(null)
 const robots = ref([])
 const selectedRobot = ref(null)
 const loading = ref(true)
 const switchingRobot = ref(false)
+const commandSending = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const videoRef = ref(null)
 const streamUnavailable = ref(false)
@@ -73,8 +74,24 @@ function previewVoice() {
   showToast('演示状态：语音预览已生成')
 }
 
-function emergencyStop() {
-  showToast('演示状态：已触发紧急停止指令')
+async function emergencyStop() {
+  const robot = latestRobot.value
+  if (!robot?.id || commandSending.value) return
+  commandSending.value = true
+  try {
+    await sendRobotCommand(robot.id, {
+      action: 'shake_hand',
+      payload: {
+        source: 'emergency_stop_demo',
+        note: 'Demo: emergency stop button triggers shakeHand.',
+      },
+    })
+    showToast('已下发 Demo 指令：机器狗握手')
+  } catch (error) {
+    showToast(error.message || '控制指令下发失败')
+  } finally {
+    commandSending.value = false
+  }
 }
 
 function destroyVideoPlayers() {
@@ -267,7 +284,9 @@ watch(livePlayUrls, () => {
             <strong>设备电量</strong>
             <span>{{ latestRobot?.battery_level }}%</span>
           </div>
-          <button class="danger-btn" @click="emergencyStop">紧急停止</button>
+          <button class="danger-btn" :disabled="commandSending" @click="emergencyStop">
+            {{ commandSending ? '下发中...' : '紧急停止' }}
+          </button>
         </div>
       </section>
 

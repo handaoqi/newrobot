@@ -7,7 +7,7 @@ from django.conf import settings
 from rest_framework import serializers
 from PIL import Image, ImageDraw
 
-from .models import InspectionEvent, MediaAsset, PatrolTask, Robot
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand
 
 
 def _snapshot_path(snapshot_url: str) -> Path | None:
@@ -282,5 +282,32 @@ class MediaAssetSerializer(serializers.ModelSerializer):
             "url",
             "sha256",
             "file_size",
+            "created_at",
+        ]
+
+
+class RobotCommandCreateSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=[choice[0] for choice in RobotCommand.ACTION_CHOICES])
+    payload = serializers.DictField(required=False, default=dict)
+
+
+class RobotCommandSerializer(serializers.ModelSerializer):
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = RobotCommand
+        fields = [
+            "id",
+            "robot_code",
+            "action",
+            "action_label",
+            "payload",
+            "status",
+            "status_label",
+            "response_payload",
+            "error_message",
+            "sent_at",
             "created_at",
         ]

@@ -69,6 +69,13 @@ export async function fetchRobotDetail(robotId) {
   return request(`/robots/${robotId}/`)
 }
 
+export async function sendRobotCommand(robotId, payload) {
+  return request(`/robots/${robotId}/commands/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function fetchTasks() {
   return request('/tasks/')
 }

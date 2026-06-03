@@ -62,6 +62,17 @@ telemetry:
   heartbeat_interval_seconds: 5
   status_interval_seconds: 2
 
+control:
+  enable: true
+  host: "0.0.0.0"
+  port: 9100
+  dry_run: true
+  sdk_enabled: true
+  sdk_lib_path: ""
+  local_ip: "127.0.0.1"
+  local_port: 43988
+  robot_ip: "127.0.0.1"
+
 snapshot:
   directory: "snapshots"
   public_base_url: ""

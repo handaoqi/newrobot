@@ -1,4 +1,7 @@
 import hashlib
+import json
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
@@ -11,12 +14,14 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotTelemetry
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand, RobotTelemetry
 from .serializers import (
     EventSerializer,
     MediaAssetSerializer,
     MediaUploadSerializer,
     PatrolTaskSerializer,
+    RobotCommandCreateSerializer,
+    RobotCommandSerializer,
     RobotDetailSerializer,
     RobotSerializer,
     TelemetryIngestSerializer,
@@ -252,6 +257,61 @@ class RobotDetailView(APIView):
         ensure_demo_seed()
         robot = Robot.objects.get(id=robot_id)
         return Response(RobotDetailSerializer(robot, context={"request": request}).data)
+
+
+def dispatch_robot_command(command: RobotCommand) -> tuple[dict, str]:
+    endpoint = settings.ROBOT_CONTROL_ENDPOINTS.get(
+        command.robot.code,
+        settings.DEFAULT_ROBOT_CONTROL_ENDPOINT,
+    )
+    if not endpoint:
+        return {}, "机器人未配置控制端点"
+
+    payload = {
+        "command_id": command.id,
+        "robot_code": command.robot.code,
+        "action": command.action,
+        "payload": command.payload,
+    }
+    request = Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            body = response.read().decode("utf-8")
+            response_payload = json.loads(body) if body else {}
+            return response_payload, ""
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {}, f"板端返回 HTTP {exc.code}: {body}"
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {}, str(exc)
+
+
+class RobotCommandView(APIView):
+    def post(self, request, robot_id):
+        ensure_demo_seed()
+        robot = Robot.objects.get(id=robot_id)
+        serializer = RobotCommandCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action=serializer.validated_data["action"],
+            payload=serializer.validated_data.get("payload") or {},
+        )
+
+        response_payload, error_message = dispatch_robot_command(command)
+        command.sent_at = timezone.now()
+        command.response_payload = response_payload
+        command.error_message = error_message
+        command.status = "failed" if error_message else "sent"
+        command.save(update_fields=["sent_at", "response_payload", "error_message", "status", "updated_at"])
+
+        response_status = status.HTTP_201_CREATED if command.status == "sent" else status.HTTP_502_BAD_GATEWAY
+        return Response(RobotCommandSerializer(command).data, status=response_status)
 
 
 class EventListView(APIView):

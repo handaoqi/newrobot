@@ -130,7 +130,7 @@ a { color: inherit; }
   border: none; border-radius: 999px; padding: 12px 18px; white-space: nowrap; min-height: 46px; flex-shrink: 0;
 }
 .primary-btn { color: #061120; background: linear-gradient(135deg, #74f6ff, #8bc1ff); font-weight: 700; }
-.primary-btn:disabled, .load-more-btn:disabled { cursor: not-allowed; opacity: 0.62; }
+.primary-btn:disabled, .danger-btn:disabled, .load-more-btn:disabled { cursor: not-allowed; opacity: 0.62; }
 .ghost-btn { color: var(--text); background: var(--ghost-bg); }
 .danger-btn { color: #fff; background: linear-gradient(135deg, #ff6d6d, #d12b54); }
 .chip { color: var(--text); background: var(--chip-bg); border: 1px solid var(--chip-border); padding: 10px 14px; }

@@ -81,6 +81,19 @@ class TelemetryConfig:
 
 
 @dataclass
+class ControlConfig:
+    enable: bool = True
+    host: str = "0.0.0.0"
+    port: int = 9100
+    dry_run: bool = True
+    sdk_enabled: bool = True
+    sdk_lib_path: str = ""
+    local_ip: str = "127.0.0.1"
+    local_port: int = 43988
+    robot_ip: str = "127.0.0.1"
+
+
+@dataclass
 class SnapshotConfig:
     directory: str = "snapshots"
     public_base_url: str = ""
@@ -130,6 +143,7 @@ class AppConfig:
     model: ModelConfig
     detection: DetectionConfig
     telemetry: TelemetryConfig
+    control: ControlConfig
     snapshot: SnapshotConfig
     display: DisplayConfig
     storage: StorageConfig
@@ -150,6 +164,7 @@ class AppConfig:
             model=ModelConfig(**data["model"]),
             detection=DetectionConfig(**data["detection"]),
             telemetry=TelemetryConfig(**data["telemetry"]),
+            control=ControlConfig(**data.get("control", {})),
             snapshot=SnapshotConfig(**data["snapshot"]),
             display=DisplayConfig(**data.get("display", {})),
             storage=StorageConfig(**data.get("storage", {})),
