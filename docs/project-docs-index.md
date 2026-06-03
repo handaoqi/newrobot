@@ -12,6 +12,7 @@
 | [数据存储说明](./data-storage.md)                       | SQLite 数据表、字段含义、文件存储、数据写入路径                |
 | [网站功能说明](./website-features.md)                   | 登录、监测中心、统计分析、事件中心、机器人管理、巡检任务       |
 | [板端识别与视频链路](./edge-and-video-pipeline.md)      | `bot-version` 模块、YOLO 检测、抓拍、遥测、RTSP/RTMP/FLV/HLS |
+| [bot-version 项目结构与实现分析](./bot_version_eval.md) | `bot-version` 目录结构、功能介绍、核心实现、风险与改进建议     |
 | [运维、测试与排障](./operations-and-troubleshooting.md) | 健康检查、常见问题、验证步骤、生产化建议                       |
 
 ## 项目一句话说明

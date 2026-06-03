@@ -19,3 +19,7 @@ bot-version/venv/
 bot-version/data/telemetry/
 bot-version/snapshots/
 bot-version/*.log
+bot-version/model/
+
+# test
+test_video/
