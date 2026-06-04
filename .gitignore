@@ -2,6 +2,9 @@
 
 # Python runtime artifacts
 __pycache__/
+backend/config/__pycache__/
+backend/monitoring/__pycache__/
+backend/monitoring/migrations/__pycache__/
 *.py[cod]
 
 # Local backend runtime state
