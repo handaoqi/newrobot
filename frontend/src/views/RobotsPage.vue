@@ -1,19 +1,32 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { fetchRobotDetail, fetchRobots } from '../services/api'
 
 const robots = ref([])
 const selectedRobot = ref(null)
+let refreshTimer = null
 
 async function chooseRobot(robotId) {
   selectedRobot.value = await fetchRobotDetail(robotId)
 }
 
-onMounted(async () => {
+async function refreshRobots() {
   robots.value = await fetchRobots()
-  if (robots.value.length > 0) {
-    await chooseRobot(robots.value[0].id)
+  const selectedRobotId = selectedRobot.value?.id || robots.value[0]?.id
+  if (selectedRobotId) {
+    await chooseRobot(selectedRobotId)
+  }
+}
+
+onMounted(async () => {
+  await refreshRobots()
+  refreshTimer = window.setInterval(refreshRobots, 5000)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer) {
+    window.clearInterval(refreshTimer)
   }
 })
 </script>

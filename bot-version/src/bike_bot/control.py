@@ -3,22 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from .config import AppConfig
+from .sdk import RobotSdkClient
 
 LOGGER = logging.getLogger(__name__)
 
 
 class RobotActionController:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, sdk_client: RobotSdkClient | None = None) -> None:
         self.config = config
         self._lock = Lock()
-        self._sdk_app: Any | None = None
+        self.sdk_client = sdk_client or RobotSdkClient(config)
 
     def execute(self, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if action not in self._action_map():
@@ -28,34 +27,11 @@ class RobotActionController:
             LOGGER.info("dry-run robot action action=%s payload=%s", action, payload or {})
             return {"ok": True, "action": action, "dry_run": True}
 
-        app = self._get_sdk_app()
         sdk_method = self._action_map()[action]
         with self._lock:
-            result = sdk_method(app, payload or {})
+            result = self.sdk_client.execute(lambda app: sdk_method(app, payload or {}))
         LOGGER.info("robot action executed action=%s result=%s", action, result)
         return {"ok": True, "action": action, "dry_run": False, "sdk_result": result}
-
-    def _get_sdk_app(self):
-        if self._sdk_app is not None:
-            return self._sdk_app
-        if not self.config.control.sdk_enabled:
-            raise RuntimeError("robot SDK is disabled")
-
-        if self.config.control.sdk_lib_path:
-            sdk_path = str(Path(self.config.control.sdk_lib_path).resolve())
-            if sdk_path not in sys.path:
-                sys.path.insert(0, sdk_path)
-
-        import mc_sdk_zsl_1_py  # type: ignore
-
-        app = mc_sdk_zsl_1_py.HighLevel()
-        app.initRobot(
-            self.config.control.local_ip,
-            self.config.control.local_port,
-            self.config.control.robot_ip,
-        )
-        self._sdk_app = app
-        return app
 
     @staticmethod
     def _action_map():
@@ -144,9 +120,9 @@ class CommandRequestHandler(BaseHTTPRequestHandler):
 
 
 class CommandServer:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, sdk_client: RobotSdkClient | None = None) -> None:
         self.config = config
-        self.controller = RobotActionController(config)
+        self.controller = RobotActionController(config, sdk_client)
         self.httpd = ThreadingHTTPServer((config.control.host, config.control.port), CommandRequestHandler)
         self.httpd.config = config
         self.httpd.controller = self.controller

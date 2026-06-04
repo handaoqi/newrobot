@@ -15,6 +15,7 @@ from .control import CommandServer
 from .detector import YoloDetector
 from .logging_utils import rotating_file_handler
 from .runtime import RuntimeState
+from .sdk import RobotSdkClient
 from .stream import StreamPusher
 from .telemetry import TelemetryClient
 
@@ -504,10 +505,11 @@ def main() -> None:
     )
     LOGGER.info("logging to data file: %s", config.storage.app_log_path)
     runtime_state = RuntimeState(config)
+    sdk_client = RobotSdkClient(config)
     detector = YoloDetector(config)
-    client = TelemetryClient(config, runtime_state)
+    client = TelemetryClient(config, runtime_state, sdk_client)
     pusher = StreamPusher(config)
-    command_server = CommandServer(config) if config.control.enable else None
+    command_server = CommandServer(config, sdk_client) if config.control.enable else None
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()
 

@@ -16,6 +16,7 @@ from .config import AppConfig
 from .logging_utils import rotate_file_if_needed
 from .models import DetectionPayload, TelemetryPayload, VideoInfo, now_iso
 from .runtime import RuntimeState
+from .sdk import RobotSdkClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,9 +39,15 @@ class SequenceGenerator:
 
 
 class TelemetryClient:
-    def __init__(self, config: AppConfig, runtime_state: RuntimeState) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        runtime_state: RuntimeState,
+        sdk_client: RobotSdkClient | None = None,
+    ) -> None:
         self.config = config
         self.runtime_state = runtime_state
+        self.sdk_client = sdk_client
         self.sequence = SequenceGenerator(config.robot.code)
         self._log_lock = Lock()
         self._log_path = Path(config.storage.telemetry_log_path)
@@ -56,6 +63,7 @@ class TelemetryClient:
             self._actual_frame_height = height
 
     def build_payload(self, detections: list[DetectionPayload] | None = None) -> TelemetryPayload:
+        self._refresh_sdk_status()
         snapshot = self.runtime_state.snapshot()
         stream_id = self.config.video.stream_id or f"dog_{self.config.robot.code}_{self.config.video.camera_id}"
         with self._video_lock:
@@ -79,6 +87,18 @@ class TelemetryClient:
                 play_urls=self.config.video.play_urls,
             ),
             detections=detections or [],
+        )
+
+    def _refresh_sdk_status(self) -> None:
+        if self.sdk_client is None:
+            return
+
+        sample = self.sdk_client.sample_status()
+        self.runtime_state.update_status(
+            battery_level=sample.battery_level,
+            signal_strength=sample.signal_strength,
+            runtime_status="online" if sample.connected else "offline",
+            network_type="SDK",
         )
 
     def send(self, detections: list[DetectionPayload] | None = None) -> bool:
