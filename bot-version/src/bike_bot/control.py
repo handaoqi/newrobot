@@ -20,18 +20,59 @@ class RobotActionController:
         self.sdk_client = sdk_client or RobotSdkClient(config)
 
     def execute(self, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        if action == "takeover_enter":
+            return self._enter_takeover(payload)
+        if action == "takeover_exit":
+            return self._exit_takeover(payload)
+
         if action not in self._action_map():
             raise ValueError(f"unsupported action: {action}")
+        if not self.config.control.dry_run and not self.sdk_client.is_remote_takeover_active:
+            raise ValueError("remote takeover is not active; click takeover before sending SDK actions")
 
         if self.config.control.dry_run:
-            LOGGER.info("dry-run robot action action=%s payload=%s", action, payload or {})
+            LOGGER.info("dry-run robot action action=%s payload=%s", action, payload)
             return {"ok": True, "action": action, "dry_run": True}
 
         sdk_method = self._action_map()[action]
         with self._lock:
-            result = self.sdk_client.execute(lambda app: sdk_method(app, payload or {}))
+            result = self.sdk_client.execute(lambda app: sdk_method(app, payload))
         LOGGER.info("robot action executed action=%s result=%s", action, result)
         return {"ok": True, "action": action, "dry_run": False, "sdk_result": result}
+
+    def _enter_takeover(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.config.control.dry_run:
+            LOGGER.info("dry-run remote takeover enter payload=%s", payload)
+            return {"ok": True, "action": "takeover_enter", "dry_run": True, "control_mode": "remote_takeover"}
+
+        with self._lock:
+            self.sdk_client.begin_remote_takeover()
+            result = self.sdk_client.execute(lambda app: app.move(0.0, 0.0, 0.0) if hasattr(app, "move") else None)
+        LOGGER.info("remote takeover entered result=%s", result)
+        return {
+            "ok": True,
+            "action": "takeover_enter",
+            "dry_run": False,
+            "control_mode": "remote_takeover",
+            "sdk_result": result,
+        }
+
+    def _exit_takeover(self, payload: dict[str, Any]) -> dict[str, Any]:
+        passive = bool(payload.get("passive", True))
+        if self.config.control.dry_run:
+            LOGGER.info("dry-run remote takeover exit payload=%s", payload)
+            return {"ok": True, "action": "takeover_exit", "dry_run": True, "control_mode": "handheld"}
+
+        with self._lock:
+            self.sdk_client.end_remote_takeover(passive=passive)
+        LOGGER.info("remote takeover exited passive=%s", passive)
+        return {
+            "ok": True,
+            "action": "takeover_exit",
+            "dry_run": False,
+            "control_mode": "handheld",
+        }
 
     @staticmethod
     def _action_map():

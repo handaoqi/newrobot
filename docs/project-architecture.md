@@ -160,16 +160,21 @@ sequenceDiagram
   participant Edge as bot-version 板端
   participant SDK as GENISOM L1 SDK
 
-  User->>Web: 点击“紧急停止”
-  Web->>API: POST /api/robots/<id>/commands/ action=shake_hand
+  User->>Web: 点击“接管”
+  Web->>API: POST /api/robots/<id>/commands/ action=takeover_enter
   API->>API: 写入 RobotCommand
   API->>Edge: POST <control_endpoint>/commands
-  Edge->>SDK: HighLevel.shakeHand()
+  Edge->>SDK: initRobot() + move(0,0,0)
   Edge-->>API: command accepted
-  API-->>Web: 返回命令状态
+  API-->>Web: 返回接管状态
+  User->>Web: 点击“退出”
+  Web->>API: POST /api/robots/<id>/commands/ action=takeover_exit
+  API->>Edge: POST <control_endpoint>/commands
+  Edge->>SDK: passive() 或 move(0,0,0)，然后释放 SDK
 ```
 
 这种方式要求后端能访问机器人的 `control_endpoint`。如果云端后端无法直接访问内网机器人，建议改为板端长轮询、MQTT 或 WebSocket 反向连接。
+板端默认保持手柄模式，不初始化 SDK，也不采样 SDK 状态；只有接管成功后才执行普通远程动作。
 
 前端优先使用 `Robot.play_urls.flv`，若浏览器环境不支持或无 FLV，则回退到 HLS；如果没有实时流，则显示事件图或默认图片。
 

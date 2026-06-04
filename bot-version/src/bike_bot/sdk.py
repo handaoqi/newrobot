@@ -26,16 +26,24 @@ class RobotSdkClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self._lock = Lock()
+        self._mode_lock = Lock()
         self._sdk_app: Any | None = None
+        self._remote_takeover_active = False
         self._recent_checks: deque[tuple[bool, float | None]] = deque(maxlen=10)
 
     def execute(self, handler: Callable[[Any], Any]) -> Any:
+        if not self.is_remote_takeover_active:
+            raise RuntimeError("remote takeover is not active")
         app = self._get_sdk_app()
         with self._lock:
             return handler(app)
 
     def sample_status(self) -> RobotSdkSample:
-        if self.config.control.dry_run or not self.config.control.sdk_enabled:
+        if (
+            self.config.control.dry_run
+            or not self.config.control.sdk_enabled
+            or not self.is_remote_takeover_active
+        ):
             return RobotSdkSample(
                 connected=True,
                 battery_level=None,
@@ -65,6 +73,41 @@ class RobotSdkClient:
             latency_ms=latency_ms,
         )
 
+    @property
+    def is_remote_takeover_active(self) -> bool:
+        with self._mode_lock:
+            return self._remote_takeover_active
+
+    def begin_remote_takeover(self) -> None:
+        if self.config.control.dry_run:
+            with self._mode_lock:
+                self._remote_takeover_active = True
+            return
+        try:
+            self._get_sdk_app()
+        except Exception:
+            with self._mode_lock:
+                self._remote_takeover_active = False
+            raise
+        with self._mode_lock:
+            self._remote_takeover_active = True
+
+    def end_remote_takeover(self, *, passive: bool = True) -> None:
+        app = self._sdk_app
+        if app is not None:
+            with self._lock:
+                try:
+                    if passive and hasattr(app, "passive"):
+                        app.passive()
+                    elif hasattr(app, "move"):
+                        app.move(0.0, 0.0, 0.0)
+                except Exception:
+                    LOGGER.exception("robot sdk takeover release stop command failed")
+                self._release_sdk_app(app)
+        with self._mode_lock:
+            self._remote_takeover_active = False
+        self._recent_checks.clear()
+
     def _get_sdk_app(self):
         if self._sdk_app is not None:
             return self._sdk_app
@@ -86,6 +129,28 @@ class RobotSdkClient:
         )
         self._sdk_app = app
         return app
+
+    def _release_sdk_app(self, app: Any) -> None:
+        release_method_names = (
+            "release",
+            "close",
+            "disconnect",
+            "deinitRobot",
+            "deInitRobot",
+            "destroy",
+        )
+        for method_name in release_method_names:
+            method = getattr(app, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    LOGGER.info("robot sdk released via %s", method_name)
+                except Exception:
+                    LOGGER.exception("robot sdk release method failed method=%s", method_name)
+                break
+        else:
+            LOGGER.info("robot sdk has no known release method; cleared local SDK reference")
+        self._sdk_app = None
 
     def _estimate_signal_strength(self) -> int:
         if not self._recent_checks:

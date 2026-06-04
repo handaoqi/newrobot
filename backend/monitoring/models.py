@@ -174,6 +174,8 @@ class RobotCommand(BaseTimestampModel):
         ("move_right", "右移"),
         ("turn_left", "左转"),
         ("turn_right", "右转"),
+        ("takeover_enter", "进入远程接管"),
+        ("takeover_exit", "退出远程接管"),
         ("move_stop", "停止移动"),
         ("passive", "软急停"),
         ("jump", "原地跳"),

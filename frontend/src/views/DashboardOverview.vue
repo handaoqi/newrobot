@@ -28,6 +28,7 @@ let holdPointerId = null
 let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
+let takeoverExitInFlight = false
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
 const { toastMessage, toastVariant, visible, showToast } = useToast()
@@ -107,16 +108,20 @@ function previewVoice() {
 async function emergencyStop() {
   const robot = latestRobot.value
   if (!robot?.id || commandSending.value) return
+  if (!takeoverActive.value) {
+    showToast('手柄模式下未初始化远程控制，请先接管后再执行远程急停')
+    return
+  }
   commandSending.value = true
   try {
     await sendRobotCommand(robot.id, {
-      action: 'shake_hand',
+      action: 'passive',
       payload: {
-        source: 'emergency_stop_demo',
-        note: 'Demo: emergency stop button triggers shakeHand.',
+        source: 'emergency_stop',
+        note: 'Remote takeover emergency stop.',
       },
     })
-    showToast('已下发 Demo 指令：机器狗握手')
+    showToast('已下发急停指令')
   } catch (error) {
     showToast(error.message || '控制指令下发失败')
   } finally {
@@ -315,10 +320,10 @@ async function enterTakeover() {
   commandSending.value = true
   try {
     await sendRobotCommand(robot.id, {
-      action: 'move_stop',
+      action: 'takeover_enter',
       payload: {
         source: 'manual_takeover_enter',
-        note: 'Enter manual takeover mode and stop robot motion before showing fullscreen controls.',
+        note: 'Enter remote takeover mode before showing fullscreen controls.',
       },
     })
     takeoverActive.value = true
@@ -327,7 +332,7 @@ async function enterTakeover() {
     try {
       await videoStageRef.value?.requestFullscreen?.()
     } catch {}
-    showToast('已接管：机器狗停止移动')
+    showToast('已切换至远程接管模式')
   } catch (error) {
     showToast(error.message || '接管指令下发失败')
   } finally {
@@ -335,11 +340,31 @@ async function enterTakeover() {
   }
 }
 
-function exitTakeover() {
-  stopHoldAction()
-  takeoverActive.value = false
-  stopLiveGuard()
-  if (document.fullscreenElement) {
+async function exitTakeover(options = {}) {
+  if (takeoverExitInFlight) return
+  takeoverExitInFlight = true
+  try {
+    await stopHoldAction()
+    const robot = latestRobot.value
+    if (robot?.id) {
+      await sendRobotCommand(robot.id, {
+        action: 'takeover_exit',
+        payload: {
+          source: options.source || 'manual_takeover_exit',
+          passive: true,
+          note: 'Exit remote takeover mode and release SDK control.',
+        },
+      })
+      showToast('已切回手柄模式')
+    }
+  } catch (error) {
+    showToast(error.message || '退出接管失败')
+  } finally {
+    takeoverActive.value = false
+    stopLiveGuard()
+    takeoverExitInFlight = false
+  }
+  if (!options.skipFullscreen && document.fullscreenElement) {
     document.exitFullscreen?.().catch(() => {})
   }
 }
@@ -358,7 +383,7 @@ function destroyVideoPlayers() {
     videoRef.value.load()
   }
   takeoverActive.value = false
-  stopHoldAction()
+  void stopHoldAction()
   stopLiveGuard()
   if (document.fullscreenElement === videoStageRef.value) {
     document.exitFullscreen?.().catch(() => {})
@@ -473,6 +498,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (takeoverActive.value) {
+    void exitTakeover({ skipFullscreen: true, source: 'component_unmount' })
+  }
   destroyVideoPlayers()
   closeAlertStream()
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
@@ -487,9 +515,7 @@ watch(livePlayUrls, () => {
 
 function handleFullscreenChange() {
   if (takeoverActive.value && !document.fullscreenElement) {
-    takeoverActive.value = false
-    stopHoldAction()
-    stopLiveGuard()
+    void exitTakeover({ skipFullscreen: true, source: 'fullscreen_exit' })
   }
 }
 

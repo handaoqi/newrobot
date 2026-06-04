@@ -246,9 +246,9 @@ Authorization: Token <token>
 
 ```json
 {
-  "action": "shake_hand",
+  "action": "takeover_enter",
   "payload": {
-    "source": "emergency_stop_demo"
+    "source": "manual_takeover_enter"
   }
 }
 ```
@@ -257,7 +257,9 @@ Authorization: Token <token>
 
 | action | 说明 | 板端 SDK 映射 |
 | --- | --- | --- |
-| `shake_hand` | 握手，当前紧急停止按钮 demo 使用 | `HighLevel.shakeHand()` |
+| `takeover_enter` | 进入远程接管，成功后才允许普通 SDK 动作 | 初始化 SDK，并下发 `move(0.0, 0.0, 0.0)` |
+| `takeover_exit` | 退出远程接管并切回手柄模式 | 优先 `passive()`，否则 `move(0.0, 0.0, 0.0)`，然后尽量释放 SDK |
+| `shake_hand` | 握手 | `HighLevel.shakeHand()` |
 | `stand_up` | 站立 | `HighLevel.standUp()` |
 | `lie_down` | 趴下 | `HighLevel.lieDown()` |
 | `move_stop` | 停止移动 | `HighLevel.move(0.0, 0.0, 0.0)` |
@@ -268,6 +270,8 @@ Authorization: Token <token>
 1. 创建 `RobotCommand` 记录。
 2. 按机器人 `control_endpoint` 发送 JSON 到板端 `/commands`。
 3. 根据板端响应更新命令状态为 `sent` 或 `failed`。
+
+板端默认处于手柄模式，不初始化 SDK，也不采样 SDK 状态。除 `takeover_enter` 外，真实 SDK 动作只有在远程接管模式下才会执行。
 
 成功响应：
 

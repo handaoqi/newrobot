@@ -92,6 +92,8 @@ class TelemetryClient:
     def _refresh_sdk_status(self) -> None:
         if self.sdk_client is None:
             return
+        if not self.sdk_client.is_remote_takeover_active:
+            return
 
         sample = self.sdk_client.sample_status()
         self.runtime_state.update_status(
