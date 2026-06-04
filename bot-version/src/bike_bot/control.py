@@ -31,7 +31,7 @@ class RobotActionController:
         app = self._get_sdk_app()
         sdk_method = self._action_map()[action]
         with self._lock:
-            result = sdk_method(app)
+            result = sdk_method(app, payload or {})
         LOGGER.info("robot action executed action=%s result=%s", action, result)
         return {"ok": True, "action": action, "dry_run": False, "sdk_result": result}
 
@@ -60,11 +60,31 @@ class RobotActionController:
     @staticmethod
     def _action_map():
         return {
-            "shake_hand": lambda app: app.shakeHand(),
-            "stand_up": lambda app: app.standUp(),
-            "lie_down": lambda app: app.lieDown(),
-            "move_stop": lambda app: app.move(0.0, 0.0, 0.0),
-            "passive": lambda app: app.passive(),
+            "shake_hand": lambda app, _payload: app.shakeHand(),
+            "stand_up": lambda app, _payload: app.standUp(),
+            "lie_down": lambda app, _payload: app.lieDown(),
+            "passive": lambda app, _payload: app.passive(),
+            "move_forward": lambda app, payload: app.move(float(payload.get("vx", 0.35)), 0.0, 0.0),
+            "move_backward": lambda app, payload: app.move(float(payload.get("vx", -0.35)), 0.0, 0.0),
+            "move_left": lambda app, payload: app.move(0.0, float(payload.get("vy", 0.25)), 0.0),
+            "move_right": lambda app, payload: app.move(0.0, float(payload.get("vy", -0.25)), 0.0),
+            "turn_left": lambda app, payload: app.move(0.0, 0.0, float(payload.get("yaw_rate", 0.45))),
+            "turn_right": lambda app, payload: app.move(0.0, 0.0, float(payload.get("yaw_rate", -0.45))),
+            "move_stop": lambda app, _payload: app.move(0.0, 0.0, 0.0),
+            "jump": lambda app, _payload: app.jump(),
+            "front_jump": lambda app, _payload: app.frontJump(),
+            "backflip": lambda app, _payload: app.backflip(),
+            "two_leg_stand": lambda app, payload: app.twoLegStand(
+                float(payload.get("vx", 0.0)),
+                float(payload.get("yaw_rate", 0.0)),
+            ),
+            "cancel_two_leg_stand": lambda app, _payload: app.cancelTwoLegStand(),
+            "attitude_control": lambda app, payload: app.attitudeControl(
+                float(payload.get("roll_vel", 0.0)),
+                float(payload.get("pitch_vel", 0.0)),
+                float(payload.get("yaw_vel", 0.0)),
+                float(payload.get("height_vel", 0.0)),
+            ),
         }
 
 

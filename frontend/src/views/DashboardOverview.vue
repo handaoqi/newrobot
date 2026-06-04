@@ -13,11 +13,21 @@ const selectedRobot = ref(null)
 const loading = ref(true)
 const switchingRobot = ref(false)
 const commandSending = ref(false)
+const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const videoRef = ref(null)
+const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
 let flvPlayer = null
 let hlsPlayer = null
+let liveGuardTimer = null
+let holdTimer = null
+let holdAction = null
+let holdPointerId = null
+let holdTarget = null
+let holdInFlight = false
+let holdPromise = null
+const HOLD_REPEAT_MS = 300
 const { toastMessage, visible, showToast } = useToast()
 
 const quickTexts = [
@@ -40,6 +50,24 @@ const latestRobot = computed(() => selectedRobot.value || overview.value?.latest
 const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const activeHoldAction = ref('')
+const motionActions = [
+  { action: 'move_forward', label: '前进', arrow: '↑', position: 'up', payload: { vx: 0.35 }, hold: true },
+  { action: 'move_left', label: '左移', arrow: '←', position: 'left', payload: { vy: 0.25 }, hold: true },
+  { action: 'move_right', label: '右移', arrow: '→', position: 'right', payload: { vy: -0.25 }, hold: true },
+  { action: 'move_backward', label: '后退', arrow: '↓', position: 'down', payload: { vx: -0.35 }, hold: true },
+]
+const turnActions = [
+  { action: 'turn_left', label: '左转', arrow: '↶', position: 'left', payload: { yaw_rate: 0.45 }, hold: true },
+  { action: 'turn_right', label: '右转', arrow: '↷', position: 'right', payload: { yaw_rate: -0.45 }, hold: true },
+]
+const skillActions = [
+  { action: 'stand_up', label: '站立' },
+  { action: 'move_stop', label: '停止', primary: true },
+  { action: 'lie_down', label: '趴下' },
+  { action: 'shake_hand', label: '握手' },
+]
+const allControlActions = [...motionActions, ...turnActions, ...skillActions]
 
 function eventThumbStyle(index) {
   const event = latestRobot.value?.recent_events?.[index]
@@ -94,6 +122,167 @@ async function emergencyStop() {
   }
 }
 
+async function dispatchRobotAction(action, payload = {}, source = 'dashboard_control') {
+  const robot = latestRobot.value
+  if (!robot?.id) return false
+  await sendRobotCommand(robot.id, {
+    action,
+    payload: {
+      source,
+      ...payload,
+    },
+  })
+  return true
+}
+
+async function sendControlAction(action, payload = {}) {
+  if (commandSending.value || activeHoldAction.value) return
+  commandSending.value = true
+  try {
+    await dispatchRobotAction(action, payload, takeoverActive.value ? 'manual_takeover' : 'dashboard_control')
+    const label = allControlActions.find((item) => item.action === action)?.label || action
+    showToast(`已下发指令：${label}`)
+  } catch (error) {
+    showToast(error.message || '控制指令下发失败')
+  } finally {
+    commandSending.value = false
+  }
+}
+
+async function sendHeldAction() {
+  if (!holdAction || holdInFlight) return
+  holdInFlight = true
+  try {
+    holdPromise = dispatchRobotAction(holdAction.action, holdAction.payload || {}, 'manual_takeover_hold')
+    await holdPromise
+  } catch (error) {
+    stopHoldAction()
+    showToast(error.message || '运动控制指令下发失败')
+  } finally {
+    holdPromise = null
+    holdInFlight = false
+  }
+}
+
+function startHoldAction(item, event) {
+  if (!takeoverActive.value || commandSending.value) return
+  if (holdAction?.action === item.action) return
+  if (holdAction) return
+
+  holdAction = item
+  holdPointerId = event?.pointerId ?? null
+  holdTarget = event?.currentTarget ?? null
+  activeHoldAction.value = item.action
+  try {
+    holdTarget?.setPointerCapture?.(holdPointerId)
+  } catch {}
+
+  sendHeldAction()
+  holdTimer = window.setInterval(sendHeldAction, HOLD_REPEAT_MS)
+}
+
+async function stopHoldAction(event) {
+  if (!holdAction) return
+  if (event?.pointerId != null && holdPointerId != null && event.pointerId !== holdPointerId) return
+
+  const previousTarget = holdTarget
+  const previousPointerId = holdPointerId
+  const pendingHoldPromise = holdPromise
+  window.clearInterval(holdTimer)
+  holdTimer = null
+  holdAction = null
+  holdPointerId = null
+  holdTarget = null
+  activeHoldAction.value = ''
+  try {
+    previousTarget?.releasePointerCapture?.(previousPointerId)
+  } catch {}
+
+  try {
+    await pendingHoldPromise?.catch(() => {})
+    await dispatchRobotAction('move_stop', {}, 'manual_takeover_hold_release')
+  } catch (error) {
+    showToast(error.message || '停止指令下发失败')
+  }
+}
+
+function seekLatestFrame() {
+  const element = videoRef.value
+  if (!element) return
+  const ranges = element.buffered
+  if (ranges?.length) {
+    const liveEnd = ranges.end(ranges.length - 1)
+    if (Number.isFinite(liveEnd) && liveEnd - element.currentTime > 0.8) {
+      element.currentTime = Math.max(0, liveEnd - 0.12)
+    }
+  } else if (Number.isFinite(element.duration) && element.duration > 0 && element.duration - element.currentTime > 0.8) {
+    element.currentTime = Math.max(0, element.duration - 0.12)
+  }
+}
+
+function keepLivePlaying() {
+  const element = videoRef.value
+  if (!element || !takeoverActive.value) return
+  element.muted = true
+  element.controls = false
+  seekLatestFrame()
+  if (element.paused) {
+    element.play().catch(() => {})
+  }
+}
+
+function startLiveGuard() {
+  stopLiveGuard()
+  keepLivePlaying()
+  liveGuardTimer = window.setInterval(keepLivePlaying, 800)
+}
+
+function stopLiveGuard() {
+  if (liveGuardTimer) {
+    window.clearInterval(liveGuardTimer)
+    liveGuardTimer = null
+  }
+}
+
+async function enterTakeover() {
+  const robot = latestRobot.value
+  if (!robot?.id || commandSending.value) return
+  if (!hasLiveStream.value) {
+    showToast('当前设备暂无可用视频流')
+    return
+  }
+  commandSending.value = true
+  try {
+    await sendRobotCommand(robot.id, {
+      action: 'move_stop',
+      payload: {
+        source: 'manual_takeover_enter',
+        note: 'Enter manual takeover mode and stop robot motion before showing fullscreen controls.',
+      },
+    })
+    takeoverActive.value = true
+    await nextTick()
+    startLiveGuard()
+    try {
+      await videoStageRef.value?.requestFullscreen?.()
+    } catch {}
+    showToast('已接管：机器狗停止移动')
+  } catch (error) {
+    showToast(error.message || '接管指令下发失败')
+  } finally {
+    commandSending.value = false
+  }
+}
+
+function exitTakeover() {
+  stopHoldAction()
+  takeoverActive.value = false
+  stopLiveGuard()
+  if (document.fullscreenElement) {
+    document.exitFullscreen?.().catch(() => {})
+  }
+}
+
 function destroyVideoPlayers() {
   if (flvPlayer) {
     flvPlayer.destroy()
@@ -106,6 +295,12 @@ function destroyVideoPlayers() {
   if (videoRef.value) {
     videoRef.value.removeAttribute('src')
     videoRef.value.load()
+  }
+  takeoverActive.value = false
+  stopHoldAction()
+  stopLiveGuard()
+  if (document.fullscreenElement === videoStageRef.value) {
+    document.exitFullscreen?.().catch(() => {})
   }
 }
 
@@ -197,6 +392,9 @@ async function setupLivePlayer() {
 }
 
 onMounted(async () => {
+  document.addEventListener('fullscreenchange', handleFullscreenChange)
+  window.addEventListener('blur', stopHoldAction)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   try {
     const [overviewData, robotData] = await Promise.all([fetchOverview(), fetchRobots()])
     overview.value = overviewData
@@ -214,12 +412,29 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   destroyVideoPlayers()
+  document.removeEventListener('fullscreenchange', handleFullscreenChange)
+  window.removeEventListener('blur', stopHoldAction)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 
 watch(livePlayUrls, () => {
   streamUnavailable.value = false
   setupLivePlayer()
 })
+
+function handleFullscreenChange() {
+  if (takeoverActive.value && !document.fullscreenElement) {
+    takeoverActive.value = false
+    stopHoldAction()
+    stopLiveGuard()
+  }
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopHoldAction()
+  }
+}
 </script>
 
 <template>
@@ -234,7 +449,7 @@ watch(livePlayUrls, () => {
         <article class="status-pill">当前区域 {{ latestRobot?.location || overview.header.current_location }}</article>
       </section>
 
-      <section class="panel video-panel">
+      <section class="panel video-panel" :class="{ 'takeover-active': takeoverActive }">
         <div class="panel-head">
           <div>
             <h3>实时视频流监控</h3>
@@ -243,7 +458,7 @@ watch(livePlayUrls, () => {
           <span class="panel-badge">Live Stream</span>
         </div>
 
-        <div class="video-stage">
+        <div ref="videoStageRef" class="video-stage">
           <video
             v-if="hasLiveStream"
             ref="videoRef"
@@ -251,7 +466,8 @@ watch(livePlayUrls, () => {
             muted
             playsinline
             autoplay
-            controls
+            :controls="!takeoverActive"
+            @pause="keepLivePlaying"
           ></video>
           <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
             <strong>无信号</strong>
@@ -269,6 +485,79 @@ watch(livePlayUrls, () => {
             </div>
           </div>
 
+          <div v-if="takeoverActive" class="takeover-layer">
+            <div class="takeover-status">
+              <strong>人工接管</strong>
+              <span>{{ latestRobot?.code }} · {{ latestRobot?.location }}</span>
+            </div>
+            <button class="takeover-exit" type="button" @click="exitTakeover">退出</button>
+            <div class="takeover-controls" aria-label="机器狗控制动作">
+              <div class="motion-pad" aria-label="移动控制">
+                <button
+                  v-for="item in motionActions"
+                  :key="item.action"
+                  type="button"
+                  :class="['gamepad-btn', item.position, { active: activeHoldAction === item.action }]"
+                  :aria-label="item.label"
+                  :disabled="commandSending"
+                  @pointerdown.prevent="startHoldAction(item, $event)"
+                  @pointerup.prevent="stopHoldAction($event)"
+                  @pointercancel.prevent="stopHoldAction($event)"
+                  @lostpointercapture="stopHoldAction($event)"
+                  @contextmenu.prevent
+                >
+                  {{ item.arrow }}
+                </button>
+              </div>
+              <div class="skill-strip" aria-label="动作控制">
+                <button
+                  v-for="item in skillActions"
+                  :key="item.action"
+                  type="button"
+                  :class="['skill-btn', { primary: item.primary }]"
+                  :disabled="commandSending || Boolean(activeHoldAction)"
+                  @click="sendControlAction(item.action)"
+                >
+                  {{ item.label }}
+                </button>
+              </div>
+              <div class="turn-pad" aria-label="转向控制">
+                <button
+                  v-for="item in turnActions"
+                  :key="item.action"
+                  type="button"
+                  :class="['gamepad-btn', item.position, { active: activeHoldAction === item.action }]"
+                  :aria-label="item.label"
+                  :disabled="commandSending"
+                  @pointerdown.prevent="startHoldAction(item, $event)"
+                  @pointerup.prevent="stopHoldAction($event)"
+                  @pointercancel.prevent="stopHoldAction($event)"
+                  @lostpointercapture="stopHoldAction($event)"
+                  @contextmenu.prevent
+                >
+                  {{ item.arrow }}
+                </button>
+              </div>
+            </div>
+            <div class="takeover-mobile-actions" aria-label="全部动作">
+              <button
+                v-for="item in allControlActions"
+                :key="item.action"
+                type="button"
+                :class="['skill-btn', { primary: item.primary, active: activeHoldAction === item.action }]"
+                :disabled="commandSending || (!item.hold && Boolean(activeHoldAction))"
+                @pointerdown.prevent="item.hold && startHoldAction(item, $event)"
+                @pointerup.prevent="item.hold && stopHoldAction($event)"
+                @pointercancel.prevent="item.hold && stopHoldAction($event)"
+                @lostpointercapture="item.hold && stopHoldAction($event)"
+                @click="!item.hold && sendControlAction(item.action, item.payload)"
+                @contextmenu.prevent
+              >
+                {{ item.arrow || item.label }}
+              </button>
+            </div>
+          </div>
+
         </div>
 
         <div class="video-footer">
@@ -276,10 +565,13 @@ watch(livePlayUrls, () => {
             <strong>今日巡检时长</strong>
             <span>{{ latestRobot?.patrol_duration_minutes || 0 }} 分钟</span>
           </div>
-          <div class="footer-card wide">
+          <div class="footer-card area-card">
             <strong>当前巡检区域</strong>
             <span>{{ latestRobot?.area }}</span>
           </div>
+          <button class="takeover-btn" :disabled="!hasLiveStream || commandSending" @click="enterTakeover">
+            {{ commandSending ? '下发中...' : '接管' }}
+          </button>
           <div class="footer-card">
             <strong>设备电量</strong>
             <span>{{ latestRobot?.battery_level }}%</span>
