@@ -1141,9 +1141,31 @@ a { color: inherit; }
 .form-error { margin: 0; }
 .app-toast {
   position: fixed; right: 24px; bottom: 24px; padding: 14px 18px; border-radius: 16px; border: 1px solid rgba(67, 213, 255, 0.24); background: var(--toast-bg); box-shadow: var(--shadow);
+  z-index: 2200;
+}
+.app-toast-alert {
+  top: 24px;
+  left: 50%;
+  right: auto;
+  bottom: auto;
+  transform: translateX(-50%);
+  max-width: min(360px, calc(100vw - 32px));
+  border-color: rgba(255, 93, 93, 0.36);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(255, 241, 241, 0.96));
+  color: #9f2138;
+  font-weight: 900;
+  box-shadow: 0 18px 46px rgba(188, 47, 72, 0.2);
+}
+[data-theme="dark"] .app-toast-alert {
+  background: linear-gradient(135deg, rgba(58, 16, 30, 0.96), rgba(32, 12, 22, 0.96));
+  color: #ffd7df;
 }
 .toast-fade-enter-active, .toast-fade-leave-active { transition: opacity 0.2s ease, transform 0.2s ease; }
 .toast-fade-enter-from, .toast-fade-leave-to { opacity: 0; transform: translateY(8px); }
+.app-toast-alert.toast-fade-enter-from,
+.app-toast-alert.toast-fade-leave-to {
+  transform: translate(-50%, -8px);
+}
 
 @media (min-width: 1201px) {
   .dashboard-shell {

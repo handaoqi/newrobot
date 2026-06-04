@@ -5,7 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { fetchOverview, fetchRobotDetail, fetchRobots, sendRobotCommand } from '../services/api'
+import { API_BASE, fetchOverview, fetchRobotDetail, fetchRobots, sendRobotCommand } from '../services/api'
 
 const overview = ref(null)
 const robots = ref([])
@@ -21,14 +21,16 @@ const streamUnavailable = ref(false)
 let flvPlayer = null
 let hlsPlayer = null
 let liveGuardTimer = null
+let alertEventSource = null
 let holdTimer = null
 let holdAction = null
 let holdPointerId = null
 let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
+const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
-const { toastMessage, visible, showToast } = useToast()
+const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const quickTexts = [
   {
@@ -244,6 +246,65 @@ function stopLiveGuard() {
   }
 }
 
+function setupAlertStream() {
+  closeAlertStream()
+  const token = localStorage.getItem('inspection_token')
+  if (!token || typeof EventSource === 'undefined') return
+
+  const url = `${API_BASE}/events/stream/?token=${encodeURIComponent(token)}`
+  alertEventSource = new EventSource(url)
+  alertEventSource.addEventListener('inspection_event_created', (message) => {
+    let payload = {}
+    try {
+      payload = JSON.parse(message.data || '{}')
+    } catch {}
+    addRealtimeEvent(payload.event)
+    showToast('新告警：自行车违停', {
+      variant: 'alert',
+      duration: 5200,
+    })
+  })
+}
+
+function addRealtimeEvent(event) {
+  if (!event?.id) return
+  if (realtimeEventIds.has(event.id)) return
+  const alreadyVisible = [selectedRobot.value, overview.value?.latest_robot].some((robot) =>
+    robot?.recent_events?.some((item) => item.id === event.id),
+  )
+  if (alreadyVisible) {
+    realtimeEventIds.add(event.id)
+    return
+  }
+  realtimeEventIds.add(event.id)
+
+  const updateRobotEvents = (robot) => {
+    if (!robot?.recent_events) return
+    if (robot.id && event.robot_code && robot.code !== event.robot_code) return
+    robot.recent_events = [event, ...robot.recent_events].slice(0, 5)
+  }
+
+  updateRobotEvents(selectedRobot.value)
+  updateRobotEvents(overview.value?.latest_robot)
+
+  if (overview.value?.summary) {
+    overview.value.summary.today_alert_count = (overview.value.summary.today_alert_count || 0) + 1
+  }
+  if (overview.value?.header) {
+    overview.value.header.today_alerts = (overview.value.header.today_alerts || 0) + 1
+  }
+  if (selectedRobot.value && selectedRobot.value.code === event.robot_code) {
+    selectedRobot.value.today_alerts = (selectedRobot.value.today_alerts || 0) + 1
+  }
+}
+
+function closeAlertStream() {
+  if (alertEventSource) {
+    alertEventSource.close()
+    alertEventSource = null
+  }
+}
+
 async function enterTakeover() {
   const robot = latestRobot.value
   if (!robot?.id || commandSending.value) return
@@ -395,6 +456,7 @@ onMounted(async () => {
   document.addEventListener('fullscreenchange', handleFullscreenChange)
   window.addEventListener('blur', stopHoldAction)
   document.addEventListener('visibilitychange', handleVisibilityChange)
+  setupAlertStream()
   try {
     const [overviewData, robotData] = await Promise.all([fetchOverview(), fetchRobots()])
     overview.value = overviewData
@@ -412,6 +474,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   destroyVideoPlayers()
+  closeAlertStream()
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   window.removeEventListener('blur', stopHoldAction)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -700,6 +763,6 @@ function handleVisibilityChange() {
       </section>
     </aside>
 
-    <AppToast :show="visible" :message="toastMessage" />
+    <AppToast :show="visible" :message="toastMessage" :variant="toastVariant" />
   </section>
 </template>

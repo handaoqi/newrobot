@@ -15,6 +15,7 @@ from .views import (
     RobotListView,
     TaskListView,
     TelemetryIngestView,
+    event_stream,
     health_check,
 )
 
@@ -29,6 +30,7 @@ urlpatterns = [
     path("robots/<int:robot_id>/", RobotDetailView.as_view()),
     path("robots/<int:robot_id>/commands/", RobotCommandView.as_view()),
     path("events/", EventListView.as_view()),
+    path("events/stream/", event_stream),
     path("events/<int:event_id>/", EventDetailView.as_view()),
     path("events/<int:event_id>/handle/", EventHandleView.as_view()),
     path("tasks/", TaskListView.as_view()),

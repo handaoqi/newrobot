@@ -5,6 +5,7 @@ from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
+from django.http import HttpResponseForbidden, StreamingHttpResponse
 from django.db.models import Case, Count, IntegerField, Q, When
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
@@ -15,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand, RobotTelemetry
+from .realtime import event_broker, sse_stream
 from .serializers import (
     EventSerializer,
     MediaAssetSerializer,
@@ -388,6 +390,25 @@ class EventListView(APIView):
         )
 
 
+def event_stream(request):
+    token = request.GET.get("token", "")
+    if not token or not Token.objects.filter(key=token).exists():
+        return HttpResponseForbidden("invalid token")
+
+    subscriber = event_broker.subscribe()
+
+    def stream():
+        try:
+            yield from sse_stream(subscriber)
+        finally:
+            event_broker.unsubscribe(subscriber)
+
+    response = StreamingHttpResponse(stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+
 class EventDetailView(APIView):
     def get(self, request, event_id):
         ensure_demo_seed()
@@ -487,7 +508,7 @@ class TelemetryIngestView(APIView):
         frame_height = video.get("frame_height")
         for detection in payload.get("detections", []):
             bbox = detection.get("bbox") or {}
-            InspectionEvent.objects.create(
+            event = InspectionEvent.objects.create(
                 robot=robot,
                 title=detection.get("label") or detection.get("type") or "AI识别事件",
                 event_type=detection.get("type", "generic_detection"),
@@ -511,6 +532,17 @@ class TelemetryIngestView(APIView):
                 frame_width=frame_width,
                 frame_height=frame_height,
                 raw_detection=detection,
+            )
+            event_broker.publish(
+                "inspection_event_created",
+                {
+                    "event": EventSerializer(event).data,
+                    "robot": {
+                        "id": robot.id,
+                        "code": robot.code,
+                        "name": robot.name,
+                    },
+                },
             )
 
         return Response(

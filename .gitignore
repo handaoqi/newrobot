@@ -1,4 +1,8 @@
 .venv
+.vscode
+.codex
+.claude
+.agent
 
 # Python runtime artifacts
 __pycache__/

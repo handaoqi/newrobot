@@ -8,11 +8,15 @@ defineProps({
     type: String,
     default: '',
   },
+  variant: {
+    type: String,
+    default: 'default',
+  },
 })
 </script>
 
 <template>
   <transition name="toast-fade">
-    <div v-if="show" class="app-toast">{{ message }}</div>
+    <div v-if="show" :class="['app-toast', `app-toast-${variant}`]">{{ message }}</div>
   </transition>
 </template>

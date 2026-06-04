@@ -48,3 +48,17 @@ npm run dev
 - 密码：`admin123456`
 
 首次登录时，后端会自动补充演示用户与基础演示数据。
+
+## 模拟告警事件
+
+后端和前端启动后，可用脚本模拟机器狗上报告警，用于验证前端 SSE toast 与“历史事件识别”实时更新：
+
+```powershell
+python scripts/simulate_robot_event.py
+```
+
+如需同时上传抓拍图：
+
+```powershell
+python scripts/simulate_robot_event.py --image 违规1.jpg
+```
