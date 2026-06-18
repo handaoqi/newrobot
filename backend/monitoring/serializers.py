@@ -7,7 +7,7 @@ from django.conf import settings
 from rest_framework import serializers
 from PIL import Image, ImageDraw
 
-from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand, MapData, PatrolRoute, Zone, Track
 
 
 def _snapshot_path(snapshot_url: str) -> Path | None:
@@ -310,4 +310,138 @@ class RobotCommandSerializer(serializers.ModelSerializer):
             "error_message",
             "sent_at",
             "created_at",
+        ]
+
+
+class MapDataSerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True, allow_null=True)
+    robot_code = serializers.CharField(source="robot.code", read_only=True, allow_null=True)
+    pgm_url = serializers.SerializerMethodField()
+    yaml_url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+    file_size = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MapData
+        fields = [
+            "id",
+            "name",
+            "robot",
+            "robot_name",
+            "robot_code",
+            "pgm_file",
+            "yaml_file",
+            "thumbnail",
+            "pgm_url",
+            "yaml_url",
+            "thumbnail_url",
+            "resolution",
+            "width",
+            "height",
+            "origin",
+            "active",
+            "description",
+            "file_size",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_pgm_url(self, obj):
+        if obj.pgm_file:
+            return obj.pgm_file.url
+        return None
+
+    def get_yaml_url(self, obj):
+        if obj.yaml_file:
+            return obj.yaml_file.url
+        return None
+
+    def get_thumbnail_url(self, obj):
+        # 返回预览API的URL，优先使用已有缩略图，否则从PGM生成
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(f"/api/maps/{obj.id}/preview/")
+        return f"/api/maps/{obj.id}/preview/"
+
+    def get_file_size(self, obj):
+        size = 0
+        if obj.pgm_file and hasattr(obj.pgm_file, 'size'):
+            size += obj.pgm_file.size
+        if obj.yaml_file and hasattr(obj.yaml_file, 'size'):
+            size += obj.yaml_file.size
+        return size
+
+
+class PatrolRouteSerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True)
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+    map_name = serializers.CharField(source="map_data.name", read_only=True)
+
+    class Meta:
+        model = PatrolRoute
+        fields = [
+            "id",
+            "name",
+            "map_data",
+            "map_name",
+            "robot",
+            "robot_name",
+            "robot_code",
+            "waypoints",
+            "waypoint_names",
+            "description",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class ZoneSerializer(serializers.ModelSerializer):
+    map_name = serializers.CharField(source="map_data.name", read_only=True)
+    zone_type_label = serializers.CharField(source="get_zone_type_display", read_only=True)
+
+    class Meta:
+        model = Zone
+        fields = [
+            "id",
+            "name",
+            "map_data",
+            "map_name",
+            "zone_type",
+            "zone_type_label",
+            "polygon",
+            "description",
+            "active",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class TrackSerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True)
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+    map_name = serializers.CharField(source="map_data.name", read_only=True, allow_null=True)
+    route_name = serializers.CharField(source="route.name", read_only=True, allow_null=True)
+    task_name = serializers.CharField(source="task.name", read_only=True, allow_null=True)
+
+    class Meta:
+        model = Track
+        fields = [
+            "id",
+            "robot",
+            "robot_name",
+            "robot_code",
+            "map_data",
+            "map_name",
+            "route",
+            "route_name",
+            "task",
+            "task_name",
+            "path",
+            "start_time",
+            "end_time",
+            "distance",
+            "duration",
+            "description",
+            "created_at",
+            "updated_at",
         ]

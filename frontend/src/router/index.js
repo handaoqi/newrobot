@@ -7,6 +7,10 @@ import EventsPage from '../views/EventsPage.vue'
 import LoginPage from '../views/LoginPage.vue'
 import RobotsPage from '../views/RobotsPage.vue'
 import TasksPage from '../views/TasksPage.vue'
+import MapsPage from '../views/MapsPage.vue'
+import RoutePlannerPage from '../views/RoutePlannerPage.vue'
+import ZoneManagerPage from '../views/ZoneManagerPage.vue'
+import TrackPlaybackPage from '../views/TrackPlaybackPage.vue'
 
 const routes = [
   { path: '/', redirect: '/dashboard/overview' },
@@ -21,6 +25,10 @@ const routes = [
       { path: 'events', name: 'events', meta: { title: '事件中心' }, component: EventsPage },
       { path: 'robots', name: 'robots', meta: { title: '机器人管理' }, component: RobotsPage },
       { path: 'tasks', name: 'tasks', meta: { title: '巡检任务' }, component: TasksPage },
+      { path: 'tasks/maps', name: 'maps', meta: { title: '地图管理' }, component: MapsPage },
+      { path: 'tasks/routes', name: 'routes', meta: { title: '路径规划' }, component: RoutePlannerPage },
+      { path: 'tasks/zones', name: 'zones', meta: { title: '禁区管理' }, component: ZoneManagerPage },
+      { path: 'tasks/tracks', name: 'tracks', meta: { title: '轨迹回放' }, component: TrackPlaybackPage },
     ],
   },
 ]

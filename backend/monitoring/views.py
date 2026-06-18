@@ -1,11 +1,12 @@
 import hashlib
+import io
 import json
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
-from django.http import HttpResponseForbidden, StreamingHttpResponse
+from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db.models import Case, Count, IntegerField, Q, When
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
@@ -15,7 +16,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand, RobotTelemetry
+from .models import InspectionEvent, MediaAsset, PatrolTask, Robot, RobotCommand, RobotTelemetry, MapData, PatrolRoute, Zone, Track
 from .realtime import event_broker, sse_stream
 from .serializers import (
     EventSerializer,
@@ -27,6 +28,10 @@ from .serializers import (
     RobotDetailSerializer,
     RobotSerializer,
     TelemetryIngestSerializer,
+    MapDataSerializer,
+    PatrolRouteSerializer,
+    ZoneSerializer,
+    TrackSerializer,
 )
 
 User = get_user_model()
@@ -600,4 +605,597 @@ class MediaUploadView(APIView):
 def health_check(_request):
     return Response({"status": "ok", "timestamp": timezone.now()})
 
-# Create your views here.
+
+class MapDataListView(APIView):
+    """地图列表视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        maps = MapData.objects.all()
+        serializer = MapDataSerializer(maps, many=True, context={"request": request})
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = MapDataSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class MapDataDetailView(APIView):
+    """地图详情视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            serializer = MapDataSerializer(map_data, context={"request": request})
+            return Response(serializer.data)
+        except MapData.DoesNotExist:
+            return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def put(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            serializer = MapDataSerializer(map_data, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+        except MapData.DoesNotExist:
+            return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def delete(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            map_data.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except MapData.DoesNotExist:
+            return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class MapDataDownloadView(APIView):
+    """地图下载视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            import io
+            import zipfile
+            from django.http import HttpResponse
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                if map_data.pgm_file:
+                    zip_file.write(map_data.pgm_file.path, 'map.pgm')
+                if map_data.yaml_file:
+                    zip_file.write(map_data.yaml_file.path, 'map.yaml')
+                if map_data.thumbnail:
+                    zip_file.write(map_data.thumbnail.path, 'preview.png')
+
+            zip_buffer.seek(0)
+            response = HttpResponse(zip_buffer, content_type='application/zip')
+            response['Content-Disposition'] = f'attachment; filename={map_data.name}.zip'
+            return response
+        except MapData.DoesNotExist:
+            return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class MapDataSetActiveView(APIView):
+    """设为活动地图视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            MapData.objects.filter(active=True).update(active=False)
+            map_data.active = True
+            map_data.save()
+            serializer = MapDataSerializer(map_data, context={"request": request})
+            return Response(serializer.data)
+        except MapData.DoesNotExist:
+            return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class MapDataPreviewView(APIView):
+    """PGM地图预览视图 - 将PGM文件转换为可预览的PNG图像"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            map_data = MapData.objects.get(pk=pk)
+            
+            if map_data.thumbnail:
+                with open(map_data.thumbnail.path, 'rb') as f:
+                    content = f.read()
+                return HttpResponse(content, content_type='image/png')
+            
+            if not map_data.pgm_file:
+                return HttpResponse(self._generate_placeholder_image(), content_type='image/png')
+            
+            pgm_path = map_data.pgm_file.path
+            png_data = self._pgm_to_png(pgm_path)
+            
+            return HttpResponse(png_data, content_type='image/png')
+            
+        except MapData.DoesNotExist:
+            return HttpResponse(self._generate_placeholder_image(), content_type='image/png')
+        except Exception as e:
+            print(f"Error generating preview: {e}")
+            return HttpResponse(self._generate_placeholder_image(), content_type='image/png')
+
+    def _pgm_to_png(self, pgm_path):
+        """将PGM文件转换为PNG格式"""
+        with open(pgm_path, 'rb') as f:
+            header = f.readline().decode('ascii').strip()
+            
+            while True:
+                line = f.readline().decode('ascii').strip()
+                if not line.startswith('#'):
+                    break
+            
+            dims = line.split()
+            width, height = int(dims[0]), int(dims[1])
+            
+            max_val = int(f.readline().decode('ascii').strip())
+            
+            if header == 'P5':
+                raw_data = f.read()
+            elif header == 'P2':
+                raw_data = bytearray()
+                for line in f:
+                    for val in line.decode('ascii').split():
+                        raw_data.append(int(val))
+            else:
+                return self._generate_placeholder_image()
+        
+        max_size = 300
+        scale = min(max_size / width, max_size / height, 1.0)
+        scaled_width = int(width * scale)
+        scaled_height = int(height * scale)
+        
+        return self._create_png(scaled_width, scaled_height, raw_data, width, max_val)
+
+    def _create_png(self, width, height, raw_data, original_width, max_val):
+        """创建PNG图像"""
+        import zlib
+        
+        signature = b'\x89PNG\r\n\x1a\n'
+        
+        ihdr_data = (
+            width.to_bytes(4, 'big') +
+            height.to_bytes(4, 'big') +
+            b'\x08' +
+            b'\x00' +
+            b'\x00' +
+            b'\x00' +
+            b'\x00' +
+            b'\x00'
+        )
+        ihdr = self._create_chunk(b'IHDR', ihdr_data)
+        
+        scale = width / original_width
+        filtered_data = bytearray()
+        
+        for y in range(height):
+            filtered_data.append(0)
+            
+            for x in range(width):
+                orig_x = int(x / scale)
+                orig_y = int(y / scale)
+                orig_idx = orig_y * original_width + orig_x
+                
+                if orig_idx < len(raw_data):
+                    gray = raw_data[orig_idx]
+                    # 直接转换，不反转颜色
+                    pixel = int((gray / max_val) * 255)
+                else:
+                    pixel = 255
+                
+                filtered_data.append(pixel)
+        
+        compressed = zlib.compress(filtered_data)
+        idat = self._create_chunk(b'IDAT', compressed)
+        
+        iend = self._create_chunk(b'IEND', b'')
+        
+        return signature + ihdr + idat + iend
+
+    def _create_chunk(self, type_bytes, data):
+        """创建PNG chunk"""
+        length = len(data).to_bytes(4, 'big')
+        crc_data = type_bytes + data
+        crc = self._crc32(crc_data).to_bytes(4, 'big')
+        return length + type_bytes + data + crc
+
+    def _crc32(self, data):
+        """计算CRC32"""
+        crc = 0xffffffff
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0xedb88320 if (crc & 1) else 0)
+        return crc ^ 0xffffffff
+
+    def _generate_placeholder_image(self):
+        """生成占位符图像"""
+        import zlib
+        
+        signature = b'\x89PNG\r\n\x1a\n'
+        
+        ihdr_data = b'\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00'
+        ihdr = self._create_chunk(b'IHDR', ihdr_data)
+        
+        filtered_data = b'\x00\x80'
+        compressed = zlib.compress(filtered_data)
+        idat = self._create_chunk(b'IDAT', compressed)
+        
+        iend = self._create_chunk(b'IEND', b'')
+        
+        return signature + ihdr + idat + iend
+
+
+class PatrolRouteListView(APIView):
+    """巡逻路线列表视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        routes = PatrolRoute.objects.all()
+        serializer = PatrolRouteSerializer(routes, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = PatrolRouteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class PatrolRouteDetailView(APIView):
+    """巡逻路线详情视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            route = PatrolRoute.objects.get(pk=pk)
+            serializer = PatrolRouteSerializer(route)
+            return Response(serializer.data)
+        except PatrolRoute.DoesNotExist:
+            return Response({"detail": "路线不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def put(self, request, pk):
+        try:
+            route = PatrolRoute.objects.get(pk=pk)
+            serializer = PatrolRouteSerializer(route, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+        except PatrolRoute.DoesNotExist:
+            return Response({"detail": "路线不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def delete(self, request, pk):
+        try:
+            route = PatrolRoute.objects.get(pk=pk)
+            route.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except PatrolRoute.DoesNotExist:
+            return Response({"detail": "路线不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class ZoneListView(APIView):
+    """禁区列表视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        zones = Zone.objects.all()
+        serializer = ZoneSerializer(zones, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = ZoneSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class ZoneDetailView(APIView):
+    """禁区详情视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            zone = Zone.objects.get(pk=pk)
+            serializer = ZoneSerializer(zone)
+            return Response(serializer.data)
+        except Zone.DoesNotExist:
+            return Response({"detail": "禁区不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def put(self, request, pk):
+        try:
+            zone = Zone.objects.get(pk=pk)
+            serializer = ZoneSerializer(zone, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+        except Zone.DoesNotExist:
+            return Response({"detail": "禁区不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def delete(self, request, pk):
+        try:
+            zone = Zone.objects.get(pk=pk)
+            zone.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Zone.DoesNotExist:
+            return Response({"detail": "禁区不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class TrackListView(APIView):
+    """轨迹记录列表视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        tracks = Track.objects.all()
+        serializer = TrackSerializer(tracks, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = TrackSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class TrackDetailView(APIView):
+    """轨迹记录详情视图"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        try:
+            track = Track.objects.get(pk=pk)
+            serializer = TrackSerializer(track)
+            return Response(serializer.data)
+        except Track.DoesNotExist:
+            return Response({"detail": "轨迹不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+    def delete(self, request, pk):
+        try:
+            track = Track.objects.get(pk=pk)
+            track.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Track.DoesNotExist:
+            return Response({"detail": "轨迹不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class RobotConnectionView(APIView):
+    """机器狗连接视图 - 连接机器狗并获取地图"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """连接机器狗"""
+        try:
+            import paramiko
+            from pathlib import Path
+            import os
+
+            ip = request.data.get('ip')
+            username = request.data.get('username')
+            password = request.data.get('password')
+
+            if not all([ip, username, password]):
+                return Response(
+                    {"error": "请提供完整的连接信息"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 创建SSH连接
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ip, username=username, password=password, timeout=10)
+
+            # 获取地图目录列表
+            stdin, stdout, stderr = ssh.exec_command(
+                'find ~/.jszr/map -maxdepth 1 -type d | sort'
+            )
+            output = stdout.read().decode('utf-8')
+            directories = [line.strip() for line in output.strip().split('\n') if line.strip()]
+
+            # 获取每个目录的地图信息
+            maps = []
+            for dir_path in directories:
+                if not dir_path or dir_path.endswith('.jszr/map'):
+                    continue
+
+                map_name = os.path.basename(dir_path)
+                map_info = {
+                    'name': map_name,
+                    'path': dir_path,
+                    'files': []
+                }
+
+                # 列出目录中的文件
+                stdin, stdout, stderr = ssh.exec_command(f'ls -lh "{dir_path}"')
+                output = stdout.read().decode('utf-8')
+                for line in output.strip().split('\n'):
+                    if line:
+                        parts = line.split()
+                        if len(parts) >= 9:
+                            size = parts[4]
+                            filename = ' '.join(parts[8:])
+                            map_info['files'].append({
+                                'name': filename,
+                                'size': size
+                            })
+
+                maps.append(map_info)
+
+            ssh.close()
+
+            return Response({
+                'connected': True,
+                'robot_ip': ip,
+                'maps': maps,
+                'total': len(maps)
+            })
+
+        except paramiko.AuthenticationException:
+            return Response(
+                {"error": "认证失败，请检查用户名和密码"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        except paramiko.SSHException as e:
+            return Response(
+                {"error": f"SSH连接失败: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"连接失败: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class RobotMapDownloadView(APIView):
+    """从机器狗下载地图"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """下载地图文件"""
+        try:
+            import paramiko
+            from pathlib import Path
+            import os
+            import shutil
+            from datetime import datetime
+
+            ip = request.data.get('ip')
+            username = request.data.get('username')
+            password = request.data.get('password')
+            map_path = request.data.get('map_path')  # 狗上的地图路径
+            map_name = request.data.get('map_name')  # 地图名称
+
+            if not all([ip, username, password, map_path, map_name]):
+                return Response(
+                    {"error": "缺少必要参数"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 创建SSH连接
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ip, username=username, password=password, timeout=30)
+
+            # 创建本地地图存储目录
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_map_dir = Path(settings.MEDIA_ROOT) / 'maps' / map_name
+            local_map_dir.mkdir(parents=True, exist_ok=True)
+
+            # 获取SFTP连接
+            sftp = ssh.open_sftp()
+
+            # 下载地图文件（跳过大的pcd文件）
+            downloaded_files = []
+            skipped_files = []
+
+            # 先列出所有文件
+            stdin, stdout, stderr = ssh.exec_command(f'ls "{map_path}"')
+            files = stdout.read().decode('utf-8').strip().split('\n')
+
+            for filename in files:
+                if not filename:
+                    continue
+
+                remote_path = f'{map_path}/{filename}'
+                local_file_path = local_map_dir / filename
+
+                try:
+                    # 跳过大的pcd文件
+                    if filename.endswith('.pcd'):
+                        stdin, stdout, stderr = ssh.exec_command(f'stat -c%s "{remote_path}"')
+                        file_size = int(stdout.read().decode('utf-8').strip())
+
+                        if file_size > 50 * 1024 * 1024:  # 大于50MB的文件跳过
+                            skipped_files.append(filename)
+                            continue
+
+                    # 下载文件
+                    sftp.get(remote_path, str(local_file_path))
+                    downloaded_files.append(filename)
+
+                except Exception as e:
+                    print(f'下载文件失败 {filename}: {e}')
+                    continue
+
+            sftp.close()
+            ssh.close()
+
+            # 保存到数据库
+            from .models import MapData
+
+            # 检查是否已存在
+            if MapData.objects.filter(name=map_name).exists():
+                map_data = MapData.objects.get(name=map_name)
+            else:
+                # 获取yaml配置
+                yaml_path = local_map_dir / 'map.yaml'
+                resolution = 0.05
+                if yaml_path.exists():
+                    try:
+                        with open(yaml_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            for line in content.split('\n'):
+                                if 'resolution:' in line:
+                                    resolution = float(line.split(':')[1].strip())
+                    except:
+                        pass
+
+                map_data = MapData.objects.create(
+                    name=map_name,
+                    resolution=resolution,
+                    description=f'从机器狗 {ip} 下载的地图'
+                )
+
+            # 更新文件路径
+            pgm_file = local_map_dir / 'map.pgm'
+            yaml_file = local_map_dir / 'map.yaml'
+
+            if pgm_file.exists():
+                map_data.pgm_file.name = f'maps/{map_name}/map.pgm'
+            if yaml_file.exists():
+                map_data.yaml_file.name = f'maps/{map_name}/map.yaml'
+
+            map_data.save()
+
+            # 计算文件大小
+            total_size = sum(
+                f.stat().st_size
+                for f in local_map_dir.iterdir()
+                if f.is_file()
+            )
+
+            return Response({
+                'success': True,
+                'message': f'地图下载完成',
+                'map': {
+                    'id': map_data.id,
+                    'name': map_data.name,
+                    'downloaded_files': downloaded_files,
+                    'skipped_files': skipped_files,
+                    'total_size': f'{total_size / (1024 * 1024):.2f} MB'
+                }
+            })
+
+        except paramiko.AuthenticationException:
+            return Response(
+                {"error": "认证失败"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        except paramiko.SSHException as e:
+            return Response(
+                {"error": f"SSH连接失败: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"下载失败: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

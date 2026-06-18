@@ -86,3 +86,144 @@ export async function handleEvent(eventId, payload) {
     body: JSON.stringify(payload),
   })
 }
+
+export async function fetchMaps() {
+  return request('/maps/')
+}
+
+export async function fetchMapDetail(mapId) {
+  return request(`/maps/${mapId}/`)
+}
+
+export async function createMap(payload) {
+  const formData = new FormData()
+  Object.keys(payload).forEach(key => {
+    if (payload[key] !== null && payload[key] !== undefined) {
+      formData.append(key, payload[key])
+    }
+  })
+  return request('/maps/', {
+    method: 'POST',
+    body: formData,
+    headers: {},
+  })
+}
+
+export async function updateMap(mapId, payload) {
+  return request(`/maps/${mapId}/`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteMap(mapId) {
+  return request(`/maps/${mapId}/`, {
+    method: 'DELETE',
+  })
+}
+
+export async function downloadMap(mapId) {
+  const token = localStorage.getItem('inspection_token')
+  const headers = {}
+  if (token) {
+    headers.Authorization = `Token ${token}`
+  }
+  const response = await fetch(`${API_BASE}/maps/${mapId}/download/`, {
+    headers,
+  })
+  if (!response.ok) {
+    throw new Error('下载失败')
+  }
+  return response.blob()
+}
+
+export async function setActiveMap(mapId) {
+  return request(`/maps/${mapId}/set_active/`, {
+    method: 'POST',
+  })
+}
+
+export async function fetchRoutes() {
+  return request('/routes/')
+}
+
+export async function fetchRouteDetail(routeId) {
+  return request(`/routes/${routeId}/`)
+}
+
+export async function createRoute(payload) {
+  return request('/routes/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateRoute(routeId, payload) {
+  return request(`/routes/${routeId}/`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteRoute(routeId) {
+  return request(`/routes/${routeId}/`, {
+    method: 'DELETE',
+  })
+}
+
+export async function fetchZones() {
+  return request('/zones/')
+}
+
+export async function fetchZoneDetail(zoneId) {
+  return request(`/zones/${zoneId}/`)
+}
+
+export async function createZone(payload) {
+  return request('/zones/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateZone(zoneId, payload) {
+  return request(`/zones/${zoneId}/`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteZone(zoneId) {
+  return request(`/zones/${zoneId}/`, {
+    method: 'DELETE',
+  })
+}
+
+export async function fetchTracks() {
+  return request('/tracks/')
+}
+
+export async function fetchTrackDetail(trackId) {
+  return request(`/tracks/${trackId}/`)
+}
+
+export async function deleteTrack(trackId) {
+  return request(`/tracks/${trackId}/`, {
+    method: 'DELETE',
+  })
+}
+
+// 机器狗连接
+export async function connectRobot(payload) {
+  return request('/maps/robot/connect/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function downloadFromRobot(payload) {
+  return request('/maps/robot/download/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}

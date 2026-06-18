@@ -2,3 +2,4 @@ django==6.0.4
 djangorestframework==3.17.1
 django-cors-headers==4.9.0
 Pillow==12.2.0
+paramiko==3.5.0

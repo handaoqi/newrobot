@@ -205,4 +205,92 @@ class RobotCommand(BaseTimestampModel):
     def __str__(self) -> str:
         return f"{self.robot.code} {self.action} {self.status}"
 
+
+class MapData(BaseTimestampModel):
+    """地图数据模型"""
+    name = models.CharField(max_length=128, verbose_name="地图名称")
+    robot = models.ForeignKey(Robot, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联机器人", related_name="maps")
+    pgm_file = models.FileField(upload_to='maps/', verbose_name="PGM地图文件", null=True, blank=True)
+    yaml_file = models.FileField(upload_to='maps/', verbose_name="YAML配置文件", null=True, blank=True)
+    thumbnail = models.ImageField(upload_to='maps/thumbnails/', null=True, blank=True, verbose_name="缩略图")
+    resolution = models.FloatField(default=0.05, verbose_name="分辨率(m/像素)")
+    width = models.IntegerField(default=0, verbose_name="宽度(像素)")
+    height = models.IntegerField(default=0, verbose_name="高度(像素)")
+    origin = models.JSONField(default=list, verbose_name="原点坐标 [x, y, theta]")
+    active = models.BooleanField(default=False, verbose_name="是否为活动地图")
+    description = models.TextField(blank=True, verbose_name="地图描述")
+
+    class Meta:
+        verbose_name = "地图数据"
+        verbose_name_plural = "地图数据"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class PatrolRoute(BaseTimestampModel):
+    """巡逻路线模型"""
+    name = models.CharField(max_length=128, verbose_name="路线名称")
+    map_data = models.ForeignKey(MapData, on_delete=models.CASCADE, verbose_name="关联地图", related_name="routes")
+    robot = models.ForeignKey(Robot, on_delete=models.CASCADE, verbose_name="关联机器人", related_name="routes")
+    waypoints = models.JSONField(default=list, verbose_name="途经点坐标数组")  # [[x1,y1],[x2,y2],...]
+    waypoint_names = models.JSONField(default=list, verbose_name="途经点名称数组")
+    description = models.TextField(blank=True, verbose_name="路线描述")
+
+    class Meta:
+        verbose_name = "巡逻路线"
+        verbose_name_plural = "巡逻路线"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Zone(BaseTimestampModel):
+    """禁区模型"""
+    ZONE_TYPE_CHOICES = [
+        ("forbidden", "禁入区"),
+        ("warning", "警告区"),
+        ("restricted", "限行区"),
+    ]
+
+    name = models.CharField(max_length=128, verbose_name="禁区名称")
+    map_data = models.ForeignKey(MapData, on_delete=models.CASCADE, verbose_name="关联地图", related_name="zones")
+    zone_type = models.CharField(max_length=16, choices=ZONE_TYPE_CHOICES, default="forbidden", verbose_name="禁区类型")
+    polygon = models.JSONField(default=list, verbose_name="多边形坐标点 [[x1,y1],[x2,y2],...]")
+    description = models.TextField(blank=True, verbose_name="禁区描述")
+    active = models.BooleanField(default=True, verbose_name="是否启用")
+
+    class Meta:
+        verbose_name = "禁区"
+        verbose_name_plural = "禁区"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Track(BaseTimestampModel):
+    """轨迹记录模型"""
+    robot = models.ForeignKey(Robot, on_delete=models.CASCADE, verbose_name="关联机器人", related_name="tracks")
+    map_data = models.ForeignKey(MapData, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联地图", related_name="tracks")
+    route = models.ForeignKey(PatrolRoute, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联路线", related_name="tracks")
+    task = models.ForeignKey(PatrolTask, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联任务", related_name="tracks")
+    path = models.JSONField(default=list, verbose_name="轨迹路径 [[x1,y1,timestamp1],[x2,y2,timestamp2],...]")
+    start_time = models.DateTimeField(verbose_name="开始时间")
+    end_time = models.DateTimeField(null=True, blank=True, verbose_name="结束时间")
+    distance = models.FloatField(default=0, verbose_name="行驶距离(米)")
+    duration = models.IntegerField(default=0, verbose_name="持续时间(秒)")
+    description = models.TextField(blank=True, verbose_name="轨迹描述")
+
+    class Meta:
+        verbose_name = "轨迹记录"
+        verbose_name_plural = "轨迹记录"
+        ordering = ["-start_time"]
+
+    def __str__(self) -> str:
+        return f"{self.robot.code} - {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+
 # Create your models here.
