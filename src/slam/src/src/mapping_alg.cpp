@@ -816,20 +816,33 @@ namespace robot::slam
     {
         if (pcl_wait_pub->size() > 0)
         {
-            string         file_name = data_path_ + string("/map.pcd");
-            pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to /data/" << file_name << endl;
-            pcd_writer.writeBinary(file_name, *pcl_wait_pub);
+            // 按时间戳创建子目录，避免覆盖旧地图
+            auto now = std::chrono::system_clock::now();
+            auto now_t = std::chrono::system_clock::to_time_t(now);
+            std::ostringstream timestamp_ss;
+            timestamp_ss << std::put_time(std::localtime(&now_t), "%Y%m%d_%H%M%S");
+            string map_subdir = data_path_ + "/" + timestamp_ss.str();
 
-            string pcd2grid_dir = data_path_ + "/" + pcd2pgm_options_.file_name;
+            if (!checkDirExist(map_subdir))
+            {
+                RCLCPP_ERROR(get_logger(), "Failed to create map subdirectory: %s", map_subdir.c_str());
+                return;
+            }
+
+            string pcd_file = map_subdir + "/map.pcd";
+            pcl::PCDWriter pcd_writer;
+            cout << "current scan saved to " << pcd_file << endl;
+            pcd_writer.writeBinary(pcd_file, *pcl_wait_pub);
+
+            string pcd2grid_dir = map_subdir + "/map";
             pcd2grid_ptr_->run(pcl_wait_pub, pcd2grid_dir);
 
             std::ofstream ofs;
-            std::string   path_flie = data_path_ + "/map.txt";
-            ofs.open(path_flie, std::ios::out | std::ios::trunc);
+            std::string   path_file = map_subdir + "/map.txt";
+            ofs.open(path_file, std::ios::out | std::ios::trunc);
             if (!ofs.is_open())
             {
-                std::cout << "Failed to open traj_file: " << path_flie << std::endl;
+                std::cout << "Failed to open traj_file: " << path_file << std::endl;
                 return;
             }
 
@@ -842,7 +855,7 @@ namespace robot::slam
             }
             ofs.close();
 
-            RCLCPP_INFO(get_logger(), "Save Map Success.");
+            RCLCPP_INFO(get_logger(), "Save Map Success to %s", map_subdir.c_str());
         }
     }
 }  // namespace robot::slam

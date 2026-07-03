@@ -143,13 +143,14 @@ namespace robot::slam
         }
         cv::flip(image, image, 0); // resolve image mirroring issues
         std::string pgm_file = name + ".pgm";
+        std::string pgm_abs_path = pgm_file;  // 使用绝对路径，避免导航找不到文件
         cv::imwrite(pgm_file, image);
         RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Saved PGM file: %s", pgm_file.c_str());
 
         // Save YAML
         std::string yaml_file = name + ".yaml";
         std::ofstream yaml_output(yaml_file);
-        yaml_output << "image: " << options_.file_name << ".pgm" << std::endl;
+        yaml_output << "image: " << pgm_abs_path << std::endl;
         yaml_output << "resolution: " << msg.info.resolution << std::endl;
         yaml_output << "origin: [" << msg.info.origin.position.x << ", "
                     << msg.info.origin.position.y << ", "

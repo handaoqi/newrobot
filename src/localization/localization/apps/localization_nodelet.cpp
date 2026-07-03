@@ -48,12 +48,14 @@ public:
 
   HdlLocalizationNode(const rclcpp::NodeOptions& options) : Node("localization", options) {
     tf_buffer      = std::make_unique<tf2_ros::Buffer>(get_clock());
-    // tf_listener    = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+    tf_buffer->setUsingDedicatedThread(true);
+    tf_listener    = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
     tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
     robot_odom_frame_id              = declare_parameter<std::string>("robot_odom_frame_id", "map");
     odom_child_frame_id              = declare_parameter<std::string>("odom_child_frame_id", "livox_frame");
     send_tf_transforms               = declare_parameter<bool>("send_tf_transforms", false);
+    tf_use_current_time              = declare_parameter<bool>("tf_use_current_time", true);
     cool_time_duration               = declare_parameter<double>("cool_time_duration", 0.5);
     reg_method                       = declare_parameter<std::string>("reg_method", "NDT_OMP");
     ndt_neighbor_search_method       = declare_parameter<std::string>("ndt_neighbor_search_method", "DIRECT7");
@@ -465,7 +467,7 @@ private:
       geometry_msgs::msg::TransformStamped odom_delta;
       if (tf_buffer->canTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id, rclcpp::Duration(std::chrono::milliseconds(100)))) {
         odom_delta =
-          tf_buffer->lookupTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id, rclcpp::Duration(std::chrono::milliseconds(0)));
+          tf_buffer->lookupTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id);
       } else if (tf_buffer->canTransform(
                    odom_child_frame_id,
                    last_correction_time,
@@ -478,8 +480,7 @@ private:
           last_correction_time,
           odom_child_frame_id,
           rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-          robot_odom_frame_id,
-          rclcpp::Duration(std::chrono::milliseconds(0)));
+          robot_odom_frame_id);
       }
       if (odom_delta.header.stamp == rclcpp::Time((int64_t)0, get_clock()->get_clock_type())) {
         RCLCPP_WARN_STREAM(get_logger(), "failed to look up transform between " << cloud->header.frame_id << " and " << robot_odom_frame_id);
@@ -583,10 +584,12 @@ private:
   }
 
   void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose) {
-    RCLCPP_INFO(
+    const rclcpp::Time tf_stamp = tf_use_current_time ? get_clock()->now() : stamp;
+    RCLCPP_DEBUG(
       get_logger(),
-      "[publish_odometry] stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
+      "[publish_odometry] stamp_ns=%ld tf_stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
       static_cast<long>(stamp.nanoseconds()),
+      static_cast<long>(tf_stamp.nanoseconds()),
       static_cast<long>(get_clock()->now().nanoseconds()),
       send_tf_transforms ? "true" : "false",
       robot_odom_frame_id.c_str(),
@@ -594,20 +597,19 @@ private:
       pose(0, 3), pose(1, 3), pose(2, 3));
     if (send_tf_transforms) {
       if (tf_buffer->canTransform(robot_odom_frame_id, odom_child_frame_id, rclcpp::Time((int64_t)0, get_clock()->get_clock_type()))) {
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(),
           "[publish_odometry] canTransform(%s <- %s) = true",
           robot_odom_frame_id.c_str(), odom_child_frame_id.c_str());
         geometry_msgs::msg::TransformStamped map_wrt_frame = tf2::eigenToTransform(Eigen::Isometry3d(pose.inverse().cast<double>()));
-        map_wrt_frame.header.stamp = stamp;
+        map_wrt_frame.header.stamp = tf_stamp;
         map_wrt_frame.header.frame_id = odom_child_frame_id;
         map_wrt_frame.child_frame_id = "map";
 
         geometry_msgs::msg::TransformStamped frame_wrt_odom = tf_buffer->lookupTransform(
           robot_odom_frame_id,
           odom_child_frame_id,
-          rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-          rclcpp::Duration(std::chrono::milliseconds(100)));
+          rclcpp::Time((int64_t)0, get_clock()->get_clock_type()));
         Eigen::Matrix4f frame2odom = tf2::transformToEigen(frame_wrt_odom).cast<float>().matrix();
 
         geometry_msgs::msg::TransformStamped map_wrt_odom;
@@ -619,29 +621,29 @@ private:
 
         geometry_msgs::msg::TransformStamped odom_trans;
         odom_trans.transform = tf2::toMsg(odom_wrt_map);
-        odom_trans.header.stamp = stamp;
+        odom_trans.header.stamp = tf_stamp;
         odom_trans.header.frame_id = "map";
         odom_trans.child_frame_id = robot_odom_frame_id;
 
         tf_broadcaster->sendTransform(odom_trans);
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(),
           "[publish_odometry] broadcast TF map -> %s at stamp_ns=%ld",
-          robot_odom_frame_id.c_str(), static_cast<long>(stamp.nanoseconds()));
+          robot_odom_frame_id.c_str(), static_cast<long>(tf_stamp.nanoseconds()));
       } else {
-        RCLCPP_WARN(
+        RCLCPP_DEBUG(
           get_logger(),
           "[publish_odometry] canTransform(%s <- %s) = false, fallback broadcast map -> %s directly",
           robot_odom_frame_id.c_str(), odom_child_frame_id.c_str(), odom_child_frame_id.c_str());
         geometry_msgs::msg::TransformStamped odom_trans = tf2::eigenToTransform(Eigen::Isometry3d(pose.cast<double>()));
-        odom_trans.header.stamp = stamp;
+        odom_trans.header.stamp = tf_stamp;
         odom_trans.header.frame_id = "map";
         odom_trans.child_frame_id = odom_child_frame_id;
         tf_broadcaster->sendTransform(odom_trans);
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(),
           "[publish_odometry] broadcast fallback TF map -> %s at stamp_ns=%ld",
-          odom_child_frame_id.c_str(), static_cast<long>(stamp.nanoseconds()));
+          odom_child_frame_id.c_str(), static_cast<long>(tf_stamp.nanoseconds()));
       }
     }
     // publish the transform
@@ -657,7 +659,7 @@ private:
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
     pose_pub->publish(odom);
-    RCLCPP_INFO(
+    RCLCPP_DEBUG(
       get_logger(),
       "[publish_odometry] published odom header_ns=%ld frame_id=%s child_frame_id=%s",
       static_cast<long>(static_cast<long long>(odom.header.stamp.sec) * 1000000000LL + odom.header.stamp.nanosec),
@@ -1380,6 +1382,7 @@ private:
   std::string odom_child_frame_id;
   std::string localization_odom_frame_id;
   bool send_tf_transforms;
+  bool tf_use_current_time;
 
   bool use_imu;
   bool invert_acc;
@@ -1399,6 +1402,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         global_map_pub_;
 
   std::unique_ptr<tf2_ros::Buffer>               tf_buffer;
+  std::shared_ptr<tf2_ros::TransformListener>    tf_listener;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
 
   // imu input buffer

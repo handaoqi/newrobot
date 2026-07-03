@@ -1,0 +1,54 @@
+robot:
+  id: "rx-001"
+  agent_version: "0.1.0"
+  current_map_id: "site-a-main"
+  current_map_version: "v1"
+
+mqtt:
+  host: "center.example.com"
+  port: 8883
+  username: "rx-001"
+  password: ""
+  ca_file: "/etc/roamerx/ca.crt"
+  cert_file: "/etc/roamerx/rx-001.crt"
+  key_file: "/etc/roamerx/rx-001.key"
+  keepalive_seconds: 20
+  session_expiry_seconds: 86400
+
+ros:
+  localization_topic: "/localization_info"
+  odometry_topic: "/odom/localization_odom"
+  battery_topic: ""
+  follow_waypoints_action: "/follow_waypoints"
+
+telemetry:
+  status_interval_seconds: 2
+  heartbeat_interval_seconds: 10
+  trajectory_flush_seconds: 5
+  trajectory_batch_size: 20
+
+safety:
+  stop_speed_threshold_mps: 0.03
+  stop_confirmation_seconds: 1.0
+  low_battery_percent: 20
+
+storage:
+  sqlite_path: "/var/lib/roamerx-edge/edge.db"
+
+media:
+  upload_url: "https://center.example.com/api/device/media/upload/"
+  map_upload_url: "https://center.example.com/api/device/maps/upload/"
+  device_id: "rx-001"
+  device_key: ""
+
+mapping:
+  map_dir: "/home/robot/.jszr/map"
+  ros_setup: "/opt/ros/humble/setup.bash"
+  workspace_setup: "~/genisom_roamerx_open/install/setup.bash"
+  slam_command: "ros2 run robot_slam mapping --ros-args -p config:=$HOME/genisom_roamerx_open/install/robot_slam/share/robot_slam/config/config.yaml"
+  service_name: "/slam_state_service"
+  service_type: "robots_dog_msgs/srv/MapState"
+  start_data: 3
+  save_data: 5
+  command_timeout_seconds: 15
+  save_wait_seconds: 8

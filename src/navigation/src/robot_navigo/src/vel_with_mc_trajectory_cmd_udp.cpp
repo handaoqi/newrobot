@@ -33,7 +33,7 @@ class VelWithMcTrajecotryCmdUdpPublisher : public rclcpp::Node {
 
     // Platform reflection table
     const std::unordered_map<std::string, std::pair<std::string, std::string>>
-        platform_map = {{"NX_XG3588", {"192.168.3.120", "192.168.3.100"}},
+        platform_map = {{"NX_XG3588", {"192.168.234.1", "192.168.234.234"}},
                         {"XG3588", {"127.0.0.1", "127.0.0.1"}}};
 
     auto it = platform_map.find(platform_);

@@ -1,0 +1,21 @@
+[Unit]
+Description=RoamerX Edge Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+WorkingDirectory=/opt/roamerx/edge_agent
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_DOMAIN_ID=24
+Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
+ExecStart=/usr/bin/python3 /opt/roamerx/edge_agent/run_edge_agent.py --config /etc/roamerx/edge-agent.yaml
+Restart=always
+RestartSec=5
+StateDirectory=roamerx-edge
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

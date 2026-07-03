@@ -43,6 +43,7 @@ find_package(yaml-cpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(lcm REQUIRED)
 find_package(navigo_behavior_tree REQUIRED)
 find_package(navigo_bt_navigator REQUIRED)
@@ -61,6 +62,21 @@ add_subdirectory(lcm-types/cpp)
 # udp interface lib
 #############################################################################
 add_subdirectory(udp) 
+
+set(GENISOM_L1_SDK_ROOT "/home/robot/genisom_l1_sdk_old" CACHE PATH "GENISOM L1 SDK root")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(GENISOM_L1_SDK_ARCH "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(GENISOM_L1_SDK_ARCH "aarch64")
+else()
+    message(FATAL_ERROR "Unsupported SDK architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+find_library(GENISOM_L1_SDK_LIB
+    NAMES mc_sdk_zsl_1_${GENISOM_L1_SDK_ARCH}
+    PATHS ${GENISOM_L1_SDK_ROOT}/lib/zsl-1/${GENISOM_L1_SDK_ARCH}
+    NO_DEFAULT_PATH
+    REQUIRED
+)
 
 #############################################################################
 # some exe lib
@@ -152,6 +168,7 @@ add_executable(vel_cmd_lcm_pub
 )
 ament_target_dependencies(vel_cmd_lcm_pub
         geometry_msgs
+        std_msgs
         rclcpp)
 target_link_libraries(vel_cmd_lcm_pub
         lcm_msg
@@ -164,15 +181,14 @@ add_executable(vel_cmd_udp_pub
 )
 ament_target_dependencies(vel_cmd_udp_pub
         geometry_msgs
-        tf2_ros
-        tf2
+        std_msgs
         rclcpp)
 target_link_libraries(vel_cmd_udp_pub
-        udp
+        ${GENISOM_L1_SDK_LIB}
 )
 target_include_directories(vel_cmd_udp_pub
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/udp/include 
+    ${GENISOM_L1_SDK_ROOT}/include
 )
 
 #==========================>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

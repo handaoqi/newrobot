@@ -1,9 +1,9 @@
 bt_navigator:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     global_frame: map
     robot_base_frame: base_link
-    odom_topic: /odom/mujoco_odom
+    odom_topic: /odom/mc_odom
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -71,11 +71,11 @@ bt_navigator:
 
 bt_navigator_navigate_through_poses_rclcpp_node:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
 
 bt_navigator_navigate_to_pose_rclcpp_node:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
 
 behavior_server:
   ros__parameters:
@@ -96,7 +96,7 @@ behavior_server:
     global_frame: odom
     robot_base_frame: base_link
     transform_tolerance: 0.1
-    use_sim_time: true
+    use_sim_time: false
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.4
@@ -109,12 +109,12 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
-      use_sim_time: True
+      use_sim_time: False
       rolling_window: true
       width: 8
       height: 8
       resolution: 0.05
-      footprint: "[[0.30,0.15],[0.30,-0.15],[-0.30,-0.15],[-0.30,0.15]]"
+      footprint: "[[0.35,0.25],[0.35,-0.25],[-0.35,-0.25],[-0.35,0.25]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "navigo_costmap_2d::InflationLayer"
@@ -136,7 +136,7 @@ local_costmap:
           raytrace_max_range: 8.0
           raytrace_min_range: 0.0
           obstacle_max_range: 8.5
-          obstacle_min_range: 0.5
+          obstacle_min_range: 0.15
       always_send_full_costmap: True
   local_costmap_client:
     ros__parameters:
@@ -152,8 +152,8 @@ global_costmap:
       publish_frequency: 10.0
       global_frame: map
       robot_base_frame: base_link
-      use_sim_time: True
-      footprint: "[[0.30,0.15],[0.30,-0.15],[-0.30,-0.15],[-0.30,0.15]]"
+      use_sim_time: False
+      footprint: "[[0.35,0.25],[0.35,-0.25],[-0.35,-0.25],[-0.35,0.25]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "inflation_layer"]
@@ -184,8 +184,8 @@ map_saver:
 planner_server:
   ros__parameters:
     expected_planner_frequency: 20.0
-    odom_topic: /odom/mujoco_odom
-    use_sim_time: True
+    odom_topic: /odom/mc_odom
+    use_sim_time: False
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "navigo_navfn_planner/NavfnPlanner"
@@ -195,8 +195,8 @@ planner_server:
 
 controller_server:
   ros__parameters:
-    controller_frequency: 30.0
-    odom_topic: "/odom/mujoco_odom"
+    controller_frequency: 20.0
+    odom_topic: "/odom/mc_odom"
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
     controller_plugins: ["FollowPath"]
@@ -223,7 +223,7 @@ controller_server:
       visualize: true
       time_steps: 56
       model_dt: 0.05
-      batch_size: 2000
+      batch_size: 1000
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
@@ -271,7 +271,7 @@ controller_server:
       CostCritic:
         enabled: true
         cost_power: 2
-        cost_weight: 3.81
+        cost_weight: 8.0
         critical_cost: 300.0
         consider_footprint: true
         collision_cost: 1000000.0
@@ -315,8 +315,8 @@ smoother_server:
 
 waypoint_follower:
   ros__parameters:
-    use_sim_time: True
-    odom_topic: /odom/mujoco_odom
+    use_sim_time: False
+    odom_topic: /odom/mc_odom
     loop_rate: 20
     stop_on_failure: false
     waypoint_task_executor_plugin: "wait_at_waypoint"
@@ -336,7 +336,7 @@ velocity_optimizer:
     velocity_timeout: 1.0
     max_accel: [1.5, 1.0, 1.5]
     max_decel: [-1.5, -1.0, -1.5]
-    odom_topic: "/odom/mujoco_odom"
+    odom_topic: "/odom/mc_odom"
     odom_duration: 0.1
     use_realtime_priority: false
     enable_stamped_cmd_vel: false

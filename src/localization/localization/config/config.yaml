@@ -1,9 +1,13 @@
 localization:
   ros__parameters:
     # basic parameters
-    points_topic: "/livox/lidar"
-    imu_topic: "/livox/imu"
+    points_topic: "/front_lidar"      # 真机: firefly 转发来的 livox 点云
+    imu_topic: "/front_lidar/imu"     # 真机: 雷达内置 IMU
     localization_odom_frame_id: "base_link"
+    robot_odom_frame_id: "odom"
+    odom_child_frame_id: "base_link"
+    send_tf_transforms: true
+    tf_use_current_time: true
     
     # topic name
     odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom 
@@ -12,7 +16,7 @@ localization:
     global_map_points_topic: "/global_map_points"
 
     # IMU parameters
-    use_imu: true
+    use_imu: false
     invert_acc: false
     invert_gyro: false
     
@@ -51,7 +55,7 @@ localization:
 
     # initial pose initialization parameters 
     init_match_count_threshold: 2         
-    init_match_score_threshold: 0.15      
+    init_match_score_threshold: 0.45      
 
     # Global localization parameters
     use_global_localization_init: true

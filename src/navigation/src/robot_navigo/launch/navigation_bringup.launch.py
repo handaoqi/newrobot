@@ -211,11 +211,17 @@ def generate_launch_description():
     #     output='screen'
     # )
 
-    # odom_tf_publisher_node = Node(
-    #     package='robot_navigo',
-    #     executable='odom_to_tf_broadcaster',
-    #     output='screen'
-    # )
+    odom_tf_publisher_node = Node(
+        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('platform'), "' == 'NX_XG3588'"])),
+        package='robot_navigo',
+        executable='odom_to_tf_broadcaster',
+        parameters=[{
+            'input_odom_topic': '/odom/mc_odom',
+            'publish_map_to_odom': False,
+            'use_current_time': True,
+        }],
+        output='screen'
+    )
 
     # cmd_cel_lcm_publisher_node = Node(
     #     package='robot_navigo',
@@ -327,7 +333,7 @@ def generate_launch_description():
 
     # ld.add_action(odom_communication_node)
     # ld.add_action(custom_odom_baselink_node)
-    # ld.add_action(odom_tf_publisher_node)
+    ld.add_action(odom_tf_publisher_node)
     # ld.add_action(cmd_cel_lcm_publisher_node)
     ld.add_action(load_vel_cmd_pub_node)
     ld.add_action(mode_status_pub_node)

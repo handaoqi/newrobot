@@ -14,8 +14,8 @@ const std::string CLIENT_IP   = "127.0.0.1";  // local IP address
 #else
 constexpr int     CLIENT_PORT = 43909;            // local port
 constexpr int     SERVER_PORT = 43998;            // target port
-const std::string SERVER_IP   = "192.168.1.120";  // target IP address
-const std::string CLIENT_IP   = "192.168.1.100";  // local IP address
+const std::string SERVER_IP   = "192.168.234.1";  // target IP address (firefly)
+const std::string CLIENT_IP   = "192.168.234.234";  // local IP address (NX)
 #endif
 
 
