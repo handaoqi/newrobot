@@ -1,0 +1,33 @@
+{
+  "protocol_version": "1.0",
+  "message_id": "11111111-1111-4111-8111-111111111111",
+  "message_type": "task.start",
+  "robot_id": "rx-001",
+  "session_id": "center",
+  "sent_at": "2026-06-22T10:30:00.000+08:00",
+  "trace_id": "22222222-2222-4222-8222-222222222222",
+  "payload": {
+    "command_id": "33333333-3333-4333-8333-333333333333",
+    "issued_at": "2026-06-22T10:30:00.000+08:00",
+    "expires_at": "2099-06-22T10:30:30.000+08:00",
+    "operator_id": "42",
+    "task_execution_id": "44444444-4444-4444-8444-444444444444",
+    "expected_robot_state_version": 0,
+    "command": {
+      "task_id": "1",
+      "task_name": "三航点巡检",
+      "map": {"map_id": "site-a-main", "map_version": "v1", "sha256": null},
+      "route_snapshot": {
+        "route_id": "1",
+        "route_name": "三航点路线",
+        "frame_id": "map",
+        "waypoints": [
+          {"waypoint_id": "wp-1", "sequence": 0, "name": "A", "x": 1.0, "y": 2.0, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+          {"waypoint_id": "wp-2", "sequence": 1, "name": "B", "x": 2.0, "y": 3.0, "yaw": 0.5, "dwell_seconds": 0, "actions": []},
+          {"waypoint_id": "wp-3", "sequence": 2, "name": "C", "x": 3.0, "y": 4.0, "yaw": 1.0, "dwell_seconds": 0, "actions": []}
+        ]
+      },
+      "policy": {"on_waypoint_failure": "abort", "max_duration_seconds": 1800, "continue_on_disconnect": true}
+    }
+  }
+}

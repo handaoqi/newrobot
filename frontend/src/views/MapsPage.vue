@@ -1,0 +1,803 @@
+<script setup>
+import { onBeforeUnmount, onMounted, ref, computed } from 'vue'
+import {
+  fetchMaps,
+  fetchRobots,
+  deleteMap,
+  downloadMap,
+  setActiveMap,
+  createMap,
+  fetchRobotMappingStatus,
+  startRobotMapping,
+  saveRobotMapping,
+  cancelRobotMapping,
+  syncRobotMapping,
+} from '../services/api'
+
+const maps = ref([])
+const robots = ref([])
+const loading = ref(false)
+const uploading = ref(false)
+const showUploadDialog = ref(false)
+const mappingBusy = ref(false)
+const mappingStatus = ref(null)
+const selectedMapId = ref(null)
+const mapImageError = ref({})
+const syncing = ref(false)
+
+const mappingForm = ref({
+  robot: '',
+  map_name: '太阳宫园区 V1',
+  route_hint: '南门 → 主步道 → 牡丹园 → 活动广场',
+})
+let statusTimer = null
+
+const uploadForm = ref({
+  name: '',
+  pgm_file: null,
+  yaml_file: null,
+  thumbnail: null,
+  resolution: 0.05,
+  description: '',
+})
+
+onMounted(async () => {
+  await loadMaps()
+  await loadRobots()
+  if (mappingForm.value.robot) await refreshMappingStatus()
+  statusTimer = setInterval(() => {
+    if (mappingForm.value.robot) refreshMappingStatus()
+  }, 3000)
+})
+
+onBeforeUnmount(() => {
+  if (statusTimer) clearInterval(statusTimer)
+})
+
+// 预览 URL（用绝对 URL 避免相对路径问题）
+const fullPreviewUrl = (relativeUrl) => {
+  if (!relativeUrl) return ''
+  if (relativeUrl.startsWith('http')) return relativeUrl
+  return window.location.origin + relativeUrl
+}
+
+const selectedRobot = computed(() => {
+  const robot = robots.value.find(item => String(item.id) === String(mappingForm.value.robot))
+  if (robot) return robot
+  if (!mappingForm.value.robot) return null
+  return {
+    id: mappingForm.value.robot,
+    name: mappingStatus.value?.robot_code || selectedMap.value?.robot_name || '机器狗',
+    code: mappingStatus.value?.robot_code || selectedMap.value?.robot_code || `#${mappingForm.value.robot}`,
+  }
+})
+const selectedMap = computed(() => maps.value.find(m => m.id === selectedMapId.value))
+
+// 连接状态
+const connectionStatus = computed(() => mappingStatus.value?.connection_status || 'unknown')
+const connectionLabel = computed(() => {
+  const labels = { online: '已连接', offline: '已断线', unknown: '未知' }
+  return labels[connectionStatus.value] || connectionStatus.value
+})
+const connectionClass = computed(() => {
+  if (connectionStatus.value === 'online') return 'status-online'
+  if (connectionStatus.value === 'offline') return 'status-offline'
+  return 'status-unknown'
+})
+
+// 建图状态机
+const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle')
+const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
+
+const stateSteps = [
+  { key: 'idle', label: '空闲' },
+  { key: 'command_created', label: '已创建' },
+  { key: 'command_published', label: '已下发' },
+  { key: 'command_accepted', label: 'Edge确认' },
+  { key: 'starting', label: '启动中' },
+  { key: 'mapping', label: '建图中' },
+  { key: 'saving', label: '保存中' },
+  { key: 'packaging', label: '打包中' },
+  { key: 'uploading', label: '上传中' },
+  { key: 'completed', label: '已完成' },
+]
+
+const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected', 'cancelled', 'completed']
+const isTerminal = computed(() => terminalStates.includes(mappingState.value))
+const isError = computed(() => ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value))
+const isActiveMapping = computed(() => ['starting', 'mapping', 'saving', 'packaging', 'uploading'].includes(mappingState.value))
+
+const activeStepIndex = computed(() => {
+  if (
+    mappingStatus.value?.command_type === 'mapping.save' &&
+    ['command_created', 'command_published', 'command_accepted', 'command_failed', 'command_timed_out', 'command_rejected'].includes(mappingState.value)
+  ) {
+    return stateSteps.findIndex(s => s.key === 'saving')
+  }
+  const idx = stateSteps.findIndex(s => s.key === mappingState.value)
+  return idx >= 0 ? idx : -1
+})
+
+const isPastStep = (stepIdx) => {
+  if (activeStepIndex.value < 0) return false
+  if (isTerminal.value && !isError.value && stepIdx <= stateSteps.length - 1) return true
+  if (isError.value) return stepIdx < activeStepIndex.value
+  return stepIdx < activeStepIndex.value
+}
+
+const isCurrentStep = (stepIdx) => stepIdx === activeStepIndex.value && activeStepIndex.value >= 0
+
+const errorLabel = computed(() => {
+  const labels = {
+    command_timed_out: '命令超时',
+    command_failed: '命令失败',
+    command_rejected: '命令被拒',
+    cancelled: '已取消',
+  }
+  return labels[mappingState.value] || '错误'
+})
+
+const mappingStateLabel = computed(() => {
+  const step = stateSteps.find(s => s.key === mappingState.value)
+  if (step) return step.label
+  if (mappingState.value === 'command_issued') return '等待Edge'
+  return mappingState.value
+})
+
+async function loadRobots() {
+  try {
+    robots.value = await fetchRobots()
+    if (!mappingForm.value.robot && robots.value.length) {
+      mappingForm.value.robot = robots.value[0].id
+    }
+  } catch (error) {
+    console.error('加载机器人失败:', error)
+    seedRobotsFromMaps()
+  }
+}
+
+async function loadMaps() {
+  loading.value = true
+  try {
+    maps.value = await fetchMaps()
+    if (maps.value.length && !selectedMapId.value) {
+      selectedMapId.value = maps.value[0].id
+    }
+    seedRobotsFromMaps()
+  } catch (error) {
+    console.error('加载地图失败:', error)
+  } finally {
+    loading.value = false
+  }
+}
+
+function seedRobotsFromMaps() {
+  if (!maps.value.length) return
+  const known = new Map(robots.value.map(robot => [String(robot.id), robot]))
+  for (const map of maps.value) {
+    if (!map.robot || known.has(String(map.robot))) continue
+    known.set(String(map.robot), {
+      id: map.robot,
+      name: map.robot_name || map.robot_code || `机器狗 ${map.robot}`,
+      code: map.robot_code || String(map.robot),
+    })
+  }
+  robots.value = Array.from(known.values())
+  if (!mappingForm.value.robot && robots.value.length) {
+    const activeMap = maps.value.find(map => map.active && map.robot) || maps.value.find(map => map.robot)
+    mappingForm.value.robot = activeMap?.robot || robots.value[0].id
+  }
+}
+
+async function refreshMappingStatus() {
+  if (!mappingForm.value.robot) return
+  try {
+    mappingStatus.value = await fetchRobotMappingStatus(mappingForm.value.robot)
+  } catch (error) {
+    console.error('获取建图状态失败:', error)
+  }
+}
+
+async function handleStartMapping() {
+  if (!mappingForm.value.robot) {
+    alert('请先选择机器狗')
+    return
+  }
+  if (connectionStatus.value !== 'online') {
+    alert('机器狗 Edge Agent 未连接，请先启动 NX 板 edge_agent')
+    return
+  }
+  mappingBusy.value = true
+  try {
+    await startRobotMapping(mappingForm.value.robot, {
+      map_name: mappingForm.value.map_name,
+      route_hint: mappingForm.value.route_hint,
+    })
+    await refreshMappingStatus()
+  } catch (error) {
+    alert(`开始建图失败: ${error.message}`)
+  } finally {
+    mappingBusy.value = false
+  }
+}
+
+async function handleSaveMapping() {
+  if (!mappingForm.value.robot) return
+  mappingBusy.value = true
+  try {
+    await saveRobotMapping(mappingForm.value.robot, {
+      map_name: mappingForm.value.map_name,
+    })
+    await refreshMappingStatus()
+    await loadMaps()
+  } catch (error) {
+    alert(`停止并保存失败: ${error.message}`)
+  } finally {
+    mappingBusy.value = false
+  }
+}
+
+async function handleCancelMapping() {
+  if (!mappingForm.value.robot) return
+  if (!confirm('确定要取消本次建图吗？')) return
+  mappingBusy.value = true
+  try {
+    await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel' })
+    await refreshMappingStatus()
+  } catch (error) {
+    alert(`取消建图失败: ${error.message}`)
+  } finally {
+    mappingBusy.value = false
+  }
+}
+
+async function handleSyncMaps() {
+  if (!mappingForm.value.robot) {
+    alert('请先选择机器狗')
+    return
+  }
+  if (connectionStatus.value !== 'online') {
+    alert('机器狗 Edge Agent 未连接')
+    return
+  }
+  syncing.value = true
+  try {
+    const result = await syncRobotMapping(mappingForm.value.robot, {
+      map_name: mappingForm.value.map_name + ' (同步)',
+    })
+    await refreshMappingStatus()
+    await loadMaps()
+    alert('同步命令已下发，请等待 Edge Agent 处理完成')
+  } catch (error) {
+    alert(`同步失败: ${error.message}`)
+  } finally {
+    syncing.value = false
+  }
+}
+
+function handleImageError(event, map) {
+  console.warn('地图预览加载失败:', map.name, map.thumbnail_url)
+  mapImageError.value = { ...mapImageError.value, [map.id]: true }
+}
+
+function formatSize(bytes) {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+async function handleDownload(map) {
+  try {
+    const blob = await downloadMap(map.id)
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${map.name}.zip`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+  } catch (error) {
+    console.error('下载失败:', error)
+    alert('下载失败')
+  }
+}
+
+async function handleSetActive(map) {
+  try {
+    const result = await setActiveMap(map.id)
+    await loadMaps()
+    const command = result.activation_command
+    alert(command ? '已设为活动地图，并已向机器狗下发地图切换命令。' : '已设为活动地图。')
+  } catch (error) {
+    console.error('设置活动地图失败:', error)
+    alert(error.message || '设置失败')
+  }
+}
+
+async function handleDelete(map) {
+  if (!confirm(`确定要删除地图 "${map.name}" 吗？`)) return
+  try {
+    await deleteMap(map.id)
+    if (selectedMapId.value === map.id) selectedMapId.value = null
+    await loadMaps()
+  } catch (error) {
+    console.error('删除失败:', error)
+    const refs = formatReferences(error.payload?.references)
+    if (confirm(`${error.message || '删除失败'}${refs ? `\n\n关联数据：${refs}` : ''}\n\n是否强制删除地图及全部关联数据？`)) {
+      await handleForceDelete(map)
+    }
+  }
+}
+
+async function handleForceDelete(map) {
+  const message = `强制删除会同时删除地图 "${map.name}" 关联的路线、禁区、巡检任务、日历计划、执行记录、轨迹和告警事件，且不可恢复。确定继续吗？`
+  if (!confirm(message)) return
+  try {
+    await deleteMap(map.id, { force: true })
+    if (selectedMapId.value === map.id) selectedMapId.value = null
+    await loadMaps()
+  } catch (error) {
+    console.error('强制删除失败:', error)
+    alert(error.message || '强制删除失败')
+  }
+}
+
+function formatReferences(references = {}) {
+  return Object.entries(references)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([name, count]) => `${name} ${count} 个`)
+    .join('，')
+}
+
+function handleFileChange(event, field) {
+  uploadForm.value[field] = event.target.files[0]
+}
+
+async function handleUpload() {
+  uploading.value = true
+  try {
+    await createMap(uploadForm.value)
+    showUploadDialog.value = false
+    uploadForm.value = {
+      name: '',
+      pgm_file: null,
+      yaml_file: null,
+      thumbnail: null,
+      resolution: 0.05,
+      description: '',
+    }
+    await loadMaps()
+  } catch (error) {
+    console.error('上传失败:', error)
+    alert('上传失败')
+  } finally {
+    uploading.value = false
+  }
+}
+
+function parseDescription(desc) {
+  try {
+    if (desc && (desc.startsWith('{') || desc.startsWith('['))) {
+      return JSON.parse(desc)
+    }
+  } catch {}
+  return { raw: desc || '' }
+}
+</script>
+
+<template>
+  <section class="page-section">
+    <section class="panel detail-panel">
+      <div class="panel-header">
+        <h2>地图管理</h2>
+        <div class="header-actions">
+          <button class="btn btn-primary" @click="handleSyncMaps" :disabled="syncing || !mappingForm.robot || connectionStatus !== 'online'">
+            {{ syncing ? '同步中...' : '从机器人同步' }}
+          </button>
+          <button class="btn btn-primary" @click="showUploadDialog = true">
+            上传地图
+          </button>
+        </div>
+      </div>
+
+      <!-- 地图选择器 + 大图预览 -->
+      <div class="map-full-preview">
+        <div class="map-selector-row">
+          <label>
+            <span>选择地图</span>
+            <select v-model="selectedMapId" @change="mapImageError = {}">
+              <option v-for="map in maps" :key="map.id" :value="map.id">
+                {{ map.name }} ({{ map.robot_name || map.robot_code }})
+              </option>
+            </select>
+          </label>
+        </div>
+
+        <div v-if="selectedMap" class="map-preview-content">
+          <div class="map-preview-image">
+            <div v-if="!selectedMap.thumbnail_url" class="no-preview">
+              该地图无预览数据，请从机器人建图后同步
+            </div>
+            <div v-else-if="mapImageError[selectedMap.id]" class="no-preview">
+              预览加载失败
+            </div>
+            <img
+              v-else
+              :src="fullPreviewUrl(selectedMap.thumbnail_url)"
+              :alt="selectedMap.name"
+              @error="handleImageError($event, selectedMap)"
+            />
+          </div>
+          <div class="map-preview-info">
+            <h3>{{ selectedMap.name }}</h3>
+            <div class="map-details">
+              <div><strong>机器人:</strong> {{ selectedMap.robot_name }} ({{ selectedMap.robot_code }})</div>
+              <div><strong>分辨率:</strong> {{ selectedMap.resolution }} m/像素</div>
+              <div><strong>大小:</strong> {{ formatSize(selectedMap.file_size) }}</div>
+              <div v-if="selectedMap.width"><strong>尺寸:</strong> {{ selectedMap.width }} × {{ selectedMap.height }}</div>
+            </div>
+            <div v-if="selectedMap.description" class="map-description">
+              <template v-if="parseDescription(selectedMap.description).source">
+                <div><strong>来源:</strong> {{ parseDescription(selectedMap.description).source === 'edge_mapping' ? 'Edge Agent 建图' : parseDescription(selectedMap.description).source }}</div>
+                <div v-if="parseDescription(selectedMap.description).map_version"><strong>版本:</strong> {{ parseDescription(selectedMap.description).map_version }}</div>
+              </template>
+              <template v-else>
+                {{ selectedMap.description }}
+              </template>
+            </div>
+            <div class="map-preview-actions">
+              <span v-if="selectedMap.active" class="badge badge-success">活动地图</span>
+              <button class="btn btn-sm" @click="handleDownload(selectedMap)">下载</button>
+              <button v-if="!selectedMap.active" class="btn btn-sm" @click="handleSetActive(selectedMap)">设为活动</button>
+              <button class="btn btn-sm btn-danger" @click="handleDelete(selectedMap)">删除</button>
+              <button class="btn btn-sm btn-danger" @click="handleForceDelete(selectedMap)">强制删除</button>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="maps.length === 0 && !loading" class="no-preview">
+          暂无地图，请通过建图或上传添加
+        </div>
+      </div>
+
+      <!-- 地图列表 -->
+      <div v-if="loading" class="loading">加载中...</div>
+      <div v-else class="map-list-section">
+        <h3 class="section-subtitle">所有地图 ({{ maps.length }})</h3>
+        <div v-if="maps.length > 0" class="map-list">
+          <article
+            v-for="map in maps"
+            :key="map.id"
+            class="map-card"
+            :class="{ 'map-card-selected': map.id === selectedMapId }"
+            @click="selectedMapId = map.id; mapImageError = {}"
+          >
+            <div class="map-thumbnail">
+              <template v-if="map.thumbnail_url && !mapImageError[map.id]">
+                <img
+                  :src="fullPreviewUrl(map.thumbnail_url)"
+                  :alt="map.name"
+                  @error.stop="handleImageError($event, map)"
+                />
+              </template>
+              <div v-else class="no-thumbnail">无预览</div>
+            </div>
+            <div class="map-card-info">
+              <h4>{{ map.name }}</h4>
+              <span class="map-card-size">{{ formatSize(map.file_size) }}</span>
+            </div>
+            <span v-if="map.active" class="badge badge-success badge-sm">活动</span>
+          </article>
+        </div>
+        <div v-else class="empty-state">
+          暂无地图，点击"上传地图"或"从机器人同步"
+        </div>
+      </div>
+
+      <!-- 建图面板 -->
+      <div class="mapping-card">
+        <div class="mapping-head">
+          <div>
+            <h3>现场建图</h3>
+            <p>通过云端远程控制 NX 板 Edge Agent 执行建图</p>
+          </div>
+        </div>
+
+        <!-- 连接状态栏 -->
+        <div class="connection-bar">
+          <div class="connection-row">
+            <span class="connection-dot" :class="connectionClass"></span>
+            <span class="connection-text">
+              Edge Agent: <strong>{{ connectionLabel }}</strong>
+            </span>
+            <span v-if="mappingStatus?.robot_code" class="connection-detail">
+              | {{ mappingStatus.robot_code }}
+              <template v-if="mappingStatus?.agent_version">v{{ mappingStatus.agent_version }}</template>
+            </span>
+          </div>
+          <div v-if="connectionStatus !== 'online'" class="connection-hint">
+            请确保 NX 板 edge_agent 已启动并连接到 MQTT Broker
+          </div>
+        </div>
+
+        <!-- 建图状态机 -->
+        <div class="state-machine">
+          <div class="state-header">
+            <span class="state-label">建图状态机</span>
+            <span v-if="isError" class="state-badge badge-error">{{ errorLabel }}</span>
+            <span v-else-if="isActiveMapping" class="state-badge badge-active">进行中</span>
+            <span v-else class="state-badge">{{ mappingStateLabel }}</span>
+          </div>
+          <div class="state-steps">
+            <div
+              v-for="(step, index) in stateSteps"
+              :key="step.key"
+              class="state-step"
+              :class="{
+                'step-past': isPastStep(index),
+                'step-current': isCurrentStep(index) && !isError,
+                'step-error': isCurrentStep(index) && isError,
+                'step-future': !isPastStep(index) && !isCurrentStep(index),
+              }"
+            >
+              <div class="step-dot">
+                <span v-if="isError && isCurrentStep(index)" class="dot-icon">✕</span>
+                <span v-else-if="isPastStep(index)" class="dot-icon">✓</span>
+                <span v-else-if="isActiveMapping && isCurrentStep(index)" class="dot-icon dot-spin">◌</span>
+                <span v-else>{{ index + 1 }}</span>
+              </div>
+              <span class="step-label">{{ step.label }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mapping-grid">
+          <label>
+            <span>机器狗</span>
+            <select v-model="mappingForm.robot" @change="refreshMappingStatus">
+              <option v-for="robot in robots" :key="robot.id" :value="robot.id">
+                {{ robot.name }} / {{ robot.code }}
+              </option>
+            </select>
+          </label>
+          <label>
+            <span>地图名称</span>
+            <input v-model="mappingForm.map_name" type="text" placeholder="太阳宫园区 V1" />
+          </label>
+          <label class="mapping-route">
+            <span>演示路线</span>
+            <input v-model="mappingForm.route_hint" type="text" />
+          </label>
+        </div>
+
+        <div class="mapping-actions">
+          <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || connectionStatus !== 'online'" @click="handleStartMapping">
+            开始建图
+          </button>
+          <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !isActiveMapping" @click="handleSaveMapping">
+            停止并保存地图
+          </button>
+          <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot || !isActiveMapping" @click="handleCancelMapping">
+            取消建图
+          </button>
+          <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot" @click="refreshMappingStatus">
+            刷新状态
+          </button>
+        </div>
+
+        <div v-if="mappingStatus?.error_message" class="mapping-error">
+          错误: {{ mappingStatus.error_message }}
+        </div>
+
+        <div class="mapping-guide">
+          <strong>操作步骤：</strong>
+          <span>1. 确保 NX 板 edge_agent 已启动（连接状态显示"已连接"）</span>
+          <span>2. 点击"开始建图" → Edge Agent 自动启动 ROS2 SLAM 进程</span>
+          <span>3. 用 Orche APP / 遥控器 操控机器狗走场建图</span>
+          <span>4. 回到平台点击"停止并保存地图" → 自动打包上传</span>
+          <span>5. 上传完成后可在上方"选择地图"查看预览</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 上传对话框 -->
+    <div v-if="showUploadDialog" class="modal-overlay" @click.self="showUploadDialog = false">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>上传地图</h3>
+          <button class="btn-close" @click="showUploadDialog = false">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>地图名称</label>
+            <input v-model="uploadForm.name" type="text" placeholder="输入地图名称" />
+          </div>
+          <div class="form-group">
+            <label>PGM文件</label>
+            <input type="file" accept=".pgm" @change="handleFileChange($event, 'pgm_file')" />
+          </div>
+          <div class="form-group">
+            <label>YAML文件</label>
+            <input type="file" accept=".yaml,.yml" @change="handleFileChange($event, 'yaml_file')" />
+          </div>
+          <div class="form-group">
+            <label>缩略图（可选）</label>
+            <input type="file" accept="image/*" @change="handleFileChange($event, 'thumbnail')" />
+          </div>
+          <div class="form-group">
+            <label>分辨率（m/像素）</label>
+            <input v-model.number="uploadForm.resolution" type="number" step="0.01" />
+          </div>
+          <div class="form-group">
+            <label>描述</label>
+            <textarea v-model="uploadForm.description" rows="3" placeholder="输入地图描述"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" @click="showUploadDialog = false">取消</button>
+          <button class="btn btn-primary" @click="handleUpload" :disabled="uploading">
+            {{ uploading ? '上传中...' : '上传' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+</template>
+
+<style scoped>
+.map-full-preview {
+  background: #f9f9f9;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+  border: 1px solid #e0e0e0;
+}
+
+.map-selector-row {
+  margin-bottom: 1rem;
+}
+
+.map-selector-row label {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.map-selector-row span {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.map-selector-row select {
+  flex: 1;
+  padding: 0.5rem;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  max-width: 400px;
+}
+
+.map-preview-content {
+  display: flex;
+  gap: 1.5rem;
+  min-height: 200px;
+}
+
+.map-preview-image {
+  flex: 0 0 320px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-height: 220px;
+}
+
+.map-preview-image img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.no-preview {
+  color: #999;
+  text-align: center;
+  padding: 2rem;
+  font-size: 0.875rem;
+}
+
+.preview-debug {
+  margin-top: 0.5rem;
+  font-size: 0.7rem;
+  color: #ccc;
+  word-break: break-all;
+}
+
+.map-preview-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.map-preview-info h3 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.map-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.875rem;
+  color: #555;
+}
+
+.map-description {
+  background: #fff;
+  padding: 0.75rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: #666;
+  border: 1px solid #eee;
+}
+
+.map-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: auto;
+  padding-top: 0.75rem;
+}
+
+.section-subtitle {
+  font-size: 0.95rem;
+  color: #666;
+  margin: 0 0 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #eee;
+}
+
+.map-list-section {
+  margin-bottom: 1.5rem;
+}
+
+.map-card {
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.map-card:hover {
+  border-color: #90caf9;
+}
+
+.map-card-selected {
+  border-color: #1976d2 !important;
+  background: #e3f2fd !important;
+}
+
+.map-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.map-card-info h4 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.map-card-size {
+  font-size: 0.75rem;
+  color: #999;
+}
+
+.badge-sm {
+  padding: 0.15rem 0.35rem;
+  font-size: 0.65rem;
+}
+</style>
