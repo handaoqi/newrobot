@@ -14,6 +14,8 @@
 | [板端识别与视频链路](./edge-and-video-pipeline.md)      | `bot-version` 模块、YOLO 检测、抓拍、遥测、RTSP/RTMP/FLV/HLS |
 | [bot-version 项目结构与实现分析](./bot_version_eval.md) | `bot-version` 目录结构、功能介绍、核心实现、风险与改进建议     |
 | [运维、测试与排障](./operations-and-troubleshooting.md) | 健康检查、常见问题、验证步骤、生产化建议                       |
+| [当前进度文档](./current-progress-report.md)            | 云环境、风险回溯、语音视频、远程控制和跟随能力阶段总结         |
+| [监测网站使用指南](./monitoring-website-user-guide.md)  | 面向值班人员的网站登录、查看、处置、喊话和控制操作说明         |
 
 ## 项目一句话说明
 

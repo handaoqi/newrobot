@@ -1,10 +1,18 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "django-insecure-demo-inspection-platform-key"
-DEBUG = True
-ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver", "192.168.234.8", "192.168.234.12", "192.168.234.14"]
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-demo-inspection-platform-key")
+DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() in {"1", "true", "yes", "on"}
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "DJANGO_ALLOWED_HOSTS",
+        "127.0.0.1,localhost,testserver,192.168.234.8,192.168.234.12,192.168.234.14",
+    ).split(",")
+    if host.strip()
+]
 
 DEFAULT_ROBOT_CONTROL_ENDPOINT = ""
 ROBOT_CONTROL_ENDPOINTS = {
@@ -59,7 +67,7 @@ ASGI_APPLICATION = "config.asgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": os.getenv("SQLITE_DB_PATH", BASE_DIR / "db.sqlite3"),
     }
 }
 
@@ -70,12 +78,12 @@ TIME_ZONE = "Asia/Shanghai"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = "static/"
-MEDIA_URL = "media/"
+STATIC_URL = "/static/"
+MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = os.getenv("CORS_ALLOW_ALL_ORIGINS", "True").lower() in {"1", "true", "yes", "on"}
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

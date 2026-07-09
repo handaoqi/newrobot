@@ -122,7 +122,7 @@ a { color: inherit; }
 .card-head h2, .panel-head h3 { margin: 0; }
 .login-form { margin-top: 28px; display: grid; gap: 18px; }
 .login-form label { display: grid; gap: 10px; }
-.login-form input, .speaker-box textarea {
+.login-form input, .speaker-box textarea, .speaker-box select, .speaker-box .audio-url-input {
   width: 100%; min-width: 0; border-radius: 16px; border: 1px solid var(--line); background: var(--input-bg); color: var(--text); padding: 14px 16px; outline: none;
 }
 .speaker-box textarea { min-height: 124px; resize: vertical; }
@@ -961,6 +961,42 @@ a { color: inherit; }
 }
 .speaker-box .mini-row {
   gap: 12px;
+}
+.audio-picker {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.audio-url-input {
+  min-height: 46px;
+}
+.recording-box {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel-soft);
+}
+.recording-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.recording-status.active span {
+  color: #d12b54;
+  font-weight: 700;
+}
+.recording-status strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.recording-preview {
+  width: 100%;
 }
 .list-panel .table-card {
   position: relative;

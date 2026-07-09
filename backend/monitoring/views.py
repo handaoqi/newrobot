@@ -1,11 +1,13 @@
 import hashlib
 import io
 import json
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
+from django.core.files.storage import default_storage
 from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db.models import Case, Count, IntegerField, Q, When
 from django.utils.dateparse import parse_datetime
@@ -152,8 +154,8 @@ def ensure_demo_seed() -> None:
             "camera_id": "front",
             "stream_id": "dog_ZSL-1A-07_front",
             "play_urls": {
-                "flv": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front.live.flv",
-                "hls": "http://127.0.0.1:8080/live/dog_ZSL-1A-07_front/hls.m3u8",
+                "flv": "/live/dog_ZSL-1A-07_front.live.flv",
+                "hls": "/live/dog_ZSL-1A-07_front/hls.m3u8",
             },
         },
     )
@@ -304,11 +306,20 @@ class RobotCommandView(APIView):
         robot = Robot.objects.get(id=robot_id)
         serializer = RobotCommandCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        action = serializer.validated_data["action"]
+        payload = serializer.validated_data.get("payload") or {}
+        if action == "play_audio":
+            audio_url = str(payload.get("audio_url", "")).strip()
+            if not audio_url.startswith(("http://", "https://")):
+                return Response({"detail": "audio_url 必须是可下载的 HTTP(S) 地址"}, status=status.HTTP_400_BAD_REQUEST)
+
         command = RobotCommand.objects.create(
             robot=robot,
-            action=serializer.validated_data["action"],
-            payload=serializer.validated_data.get("payload") or {},
+            action=action,
+            payload=payload,
         )
+        if command.action == "play_audio":
+            return Response(RobotCommandSerializer(command).data, status=status.HTTP_201_CREATED)
 
         response_payload, error_message = dispatch_robot_command(command)
         command.sent_at = timezone.now()
@@ -319,6 +330,115 @@ class RobotCommandView(APIView):
 
         response_status = status.HTTP_201_CREATED if command.status == "sent" else status.HTTP_502_BAD_GATEWAY
         return Response(RobotCommandSerializer(command).data, status=response_status)
+
+
+class RobotAudioRecordingCommandView(APIView):
+    def post(self, request, robot_id):
+        ensure_demo_seed()
+        robot = Robot.objects.get(id=robot_id)
+        uploaded_file = request.FILES.get("file")
+        if uploaded_file is None:
+            return Response({"detail": "录音文件不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if uploaded_file.size <= 0:
+            return Response({"detail": "录音文件为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if uploaded_file.size > 10 * 1024 * 1024:
+            return Response({"detail": "录音文件不能超过 10MB"}, status=status.HTTP_400_BAD_REQUEST)
+
+        content_type = (uploaded_file.content_type or "").lower()
+        extension_by_type = {
+            "audio/webm": ".webm",
+            "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mp4": ".m4a",
+        }
+        extension = extension_by_type.get(content_type)
+        if extension is None:
+            original_name = uploaded_file.name or ""
+            extension = "." + original_name.rsplit(".", 1)[-1].lower() if "." in original_name else ".webm"
+        if extension not in {".webm", ".ogg", ".mp3", ".wav", ".m4a", ".aac"}:
+            return Response({"detail": "不支持的录音格式"}, status=status.HTTP_400_BAD_REQUEST)
+
+        relative_path = timezone.now().strftime("command-audio/%Y/%m/%d/")
+        file_name = f"{uuid4().hex}{extension}"
+        saved_path = default_storage.save(relative_path + file_name, uploaded_file)
+        audio_url = request.build_absolute_uri(settings.MEDIA_URL + saved_path)
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action="play_audio",
+            payload={
+                "audio_url": audio_url,
+                "audio_name": request.data.get("audio_name") or "现场录音",
+                "source": "dashboard_recording",
+                "content_type": content_type,
+                "file_size": uploaded_file.size,
+            },
+        )
+        return Response(
+            {"audio_url": audio_url, "command": RobotCommandSerializer(command).data},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class DeviceCommandPollView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        robot_code = (
+            request.query_params.get("robot_code")
+            or request.headers.get("X-Device-Code")
+            or ""
+        ).strip()
+        if not robot_code:
+            return Response({"detail": "robot_code is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            robot = Robot.objects.get(code=robot_code)
+        except Robot.DoesNotExist:
+            return Response({"detail": "robot not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        command = (
+            RobotCommand.objects.filter(robot=robot, action="play_audio", status="queued")
+            .order_by("created_at")
+            .first()
+        )
+        if command is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        command.status = "sent"
+        command.sent_at = timezone.now()
+        command.save(update_fields=["status", "sent_at", "updated_at"])
+        return Response(RobotCommandSerializer(command).data)
+
+
+class DeviceCommandReportView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, command_id):
+        status_value = str(request.data.get("status", "")).strip()
+        if status_value not in {"running", "finished", "failed"}:
+            return Response({"detail": "status must be running, finished, or failed"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            command = RobotCommand.objects.select_related("robot").get(id=command_id, action="play_audio")
+        except RobotCommand.DoesNotExist:
+            return Response({"detail": "command not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        device_code = (request.headers.get("X-Device-Code") or request.data.get("robot_code") or "").strip()
+        if device_code and device_code != command.robot.code:
+            return Response({"detail": "robot_code mismatch"}, status=status.HTTP_403_FORBIDDEN)
+
+        response_payload = request.data.get("response_payload") or {}
+        if not isinstance(response_payload, dict):
+            return Response({"detail": "response_payload must be an object"}, status=status.HTTP_400_BAD_REQUEST)
+
+        command.status = status_value
+        command.response_payload = response_payload
+        command.error_message = str(request.data.get("error_message") or "")
+        command.save(update_fields=["status", "response_payload", "error_message", "updated_at"])
+        return Response(RobotCommandSerializer(command).data)
 
 
 class EventListView(APIView):
@@ -595,7 +715,7 @@ class MediaUploadView(APIView):
             sha256=actual_sha256,
             file_size=uploaded_file.size,
         )
-        asset.url = request.build_absolute_uri(settings.MEDIA_URL + asset.file.name)
+        asset.url = settings.MEDIA_URL + asset.file.name
         asset.save(update_fields=["url", "updated_at"])
         return Response({"url": asset.url, "asset": MediaAssetSerializer(asset).data}, status=status.HTTP_201_CREATED)
 

@@ -1,9 +1,19 @@
-export const API_BASE = 'http://127.0.0.1:8000/api'
+export const API_BASE = import.meta.env.VITE_API_BASE || '/api'
+
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
 
 async function request(path, options = {}) {
   const token = localStorage.getItem('inspection_token')
+  const isFormData = options.body instanceof FormData
   const headers = {
-    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
     ...(options.headers || {}),
   }
 
@@ -18,7 +28,14 @@ async function request(path, options = {}) {
 
   if (!response.ok) {
     const errorPayload = await response.json().catch(() => ({ detail: '请求失败' }))
-    throw new Error(errorPayload.detail || '请求失败')
+    if (response.status === 401) {
+      localStorage.removeItem('inspection_token')
+      localStorage.removeItem('inspection_user')
+      if (!window.location.pathname.startsWith('/login')) {
+        window.location.assign('/login')
+      }
+    }
+    throw new ApiError(errorPayload.detail || '请求失败', response.status)
   }
 
   return response.json()
@@ -73,6 +90,16 @@ export async function sendRobotCommand(robotId, payload) {
   return request(`/robots/${robotId}/commands/`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export async function sendRecordedAudioCommand(robotId, file, audioName = '现场录音') {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('audio_name', audioName)
+  return request(`/robots/${robotId}/commands/audio-recording/`, {
+    method: 'POST',
+    body: formData,
   })
 }
 
