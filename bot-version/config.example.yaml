@@ -59,6 +59,8 @@ telemetry:
   timeout_seconds: 5
   verify_tls: false
   device_key: ""
+  heartbeat_enabled: true
+  status_enabled: true
   heartbeat_interval_seconds: 5
   status_interval_seconds: 2
 

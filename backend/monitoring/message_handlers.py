@@ -221,6 +221,19 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
     command.error_message = payload.get("error_message") or ""
     command.result_payload = payload.get("result") or {}
     command.save()
+    if command.command_type == "map.activate" and terminal_status == "succeeded":
+        current_map = command.result_payload.get("current_map") or command.result_payload
+        robot.current_map_id = str(current_map.get("map_id") or "")
+        robot.current_map_version = str(current_map.get("map_version") or "")
+        robot.last_seen_at = timezone.now()
+        robot.last_heartbeat_at = timezone.now()
+        robot.save(update_fields=[
+            "current_map_id",
+            "current_map_version",
+            "last_seen_at",
+            "last_heartbeat_at",
+            "updated_at",
+        ])
     CommandEvent.objects.get_or_create(
         message_id=envelope.message_id,
         defaults={

@@ -114,6 +114,7 @@ class TelemetryClient:
         headers = {
             "Content-Type": "application/json",
             "X-Device-Code": self.config.robot.code,
+            "X-Device-Id": self.config.robot.code,
             "X-Timestamp": payload.reported_at,
         }
         if self.config.telemetry.device_key:
@@ -195,6 +196,7 @@ class TelemetryClient:
             mime_type = mimetypes.guess_type(snapshot_path.name)[0] or "image/jpeg"
             headers = {
                 "X-Device-Code": self.config.robot.code,
+                "X-Device-Id": self.config.robot.code,
                 "X-Timestamp": now_iso(),
             }
             if self.config.telemetry.device_key:

@@ -22,11 +22,15 @@ class Command(BaseCommand):
         stop_event = threading.Event()
 
         def housekeeping():
-            while not stop_event.wait(2):
+            next_slow_check = timezone.now()
+            while not stop_event.wait(0.15):
                 try:
                     client.publish_pending_commands()
-                    self._expire_commands()
-                    self._mark_offline_robots()
+                    now = timezone.now()
+                    if now >= next_slow_check:
+                        self._expire_commands()
+                        self._mark_offline_robots()
+                        next_slow_check = now + timezone.timedelta(seconds=2)
                 except Exception:
                     LOGGER.exception("device worker housekeeping failed")
 

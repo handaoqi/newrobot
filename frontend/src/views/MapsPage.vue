@@ -24,6 +24,7 @@ const mappingStatus = ref(null)
 const selectedMapId = ref(null)
 const mapImageError = ref({})
 const syncing = ref(false)
+const activatingMapId = ref(null)
 
 const mappingForm = ref({
   robot: '',
@@ -72,6 +73,23 @@ const selectedRobot = computed(() => {
   }
 })
 const selectedMap = computed(() => maps.value.find(m => m.id === selectedMapId.value))
+const robotCurrentMap = computed(() => mappingStatus.value?.current_map || {})
+const robotCurrentMapId = computed(() => String(robotCurrentMap.value.map_id || mappingStatus.value?.current_map_id || ''))
+const robotCurrentMapVersion = computed(() => String(robotCurrentMap.value.map_version || mappingStatus.value?.current_map_version || ''))
+const selectedMapVersion = computed(() => selectedMap.value ? `legacy-mapdata-${selectedMap.value.id}` : '')
+const activeMapSync = computed(() => {
+  if (!selectedMap.value) return { state: 'unknown', label: '未选择地图', className: 'status-unknown' }
+  if (!selectedMap.value.robot) return { state: 'unbound', label: '未绑定机器狗', className: 'status-unknown' }
+  if (connectionStatus.value !== 'online') return { state: 'offline', label: '机器狗离线', className: 'status-offline' }
+  const localState = robotCurrentMap.value.local_state
+  if (localState && localState !== 'applied') {
+    return { state: 'error', label: robotCurrentMap.value.last_activation_error || localState, className: 'status-offline' }
+  }
+  if (robotCurrentMapId.value === String(selectedMap.value.id) && robotCurrentMapVersion.value === selectedMapVersion.value) {
+    return { state: 'synced', label: '机器狗端已应用', className: 'status-online' }
+  }
+  return { state: 'mismatch', label: '平台与机器狗端不一致', className: 'status-offline' }
+})
 
 // 连接状态
 const connectionStatus = computed(() => mappingStatus.value?.connection_status || 'unknown')
@@ -198,6 +216,15 @@ async function refreshMappingStatus() {
   }
 }
 
+async function selectMap(map) {
+  selectedMapId.value = map.id
+  mapImageError.value = {}
+  if (map.robot && String(mappingForm.value.robot) !== String(map.robot)) {
+    mappingForm.value.robot = map.robot
+  }
+  await refreshMappingStatus()
+}
+
 async function handleStartMapping() {
   if (!mappingForm.value.robot) {
     alert('请先选择机器狗')
@@ -306,13 +333,18 @@ async function handleDownload(map) {
 
 async function handleSetActive(map) {
   try {
+    activatingMapId.value = map.id
+    if (map.robot) mappingForm.value.robot = map.robot
     const result = await setActiveMap(map.id)
     await loadMaps()
+    await refreshMappingStatus()
     const command = result.activation_command
-    alert(command ? '已设为活动地图，并已向机器狗下发地图切换命令。' : '已设为活动地图。')
+    alert(command ? '已设为平台活动地图，已下发机器狗端切换命令，请等待状态变为“机器狗端已应用”。' : '已设为活动地图。')
   } catch (error) {
     console.error('设置活动地图失败:', error)
     alert(error.message || '设置失败')
+  } finally {
+    activatingMapId.value = null
   }
 }
 
@@ -438,6 +470,24 @@ function parseDescription(desc) {
               <div><strong>大小:</strong> {{ formatSize(selectedMap.file_size) }}</div>
               <div v-if="selectedMap.width"><strong>尺寸:</strong> {{ selectedMap.width }} × {{ selectedMap.height }}</div>
             </div>
+            <div class="map-sync-panel">
+              <div class="sync-row">
+                <span>平台活动地图</span>
+                <strong>{{ selectedMap.active ? `${selectedMap.id} / ${selectedMapVersion}` : '非活动' }}</strong>
+              </div>
+              <div class="sync-row">
+                <span>机器狗端地图</span>
+                <strong>{{ robotCurrentMapId || '—' }} / {{ robotCurrentMapVersion || '—' }}</strong>
+              </div>
+              <div class="sync-row">
+                <span>本地目录</span>
+                <strong>{{ robotCurrentMap.source_dir || robotCurrentMap.local_map_dir || '—' }}</strong>
+              </div>
+              <div class="sync-row">
+                <span>同步状态</span>
+                <strong class="sync-status" :class="activeMapSync.className">{{ activeMapSync.label }}</strong>
+              </div>
+            </div>
             <div v-if="selectedMap.description" class="map-description">
               <template v-if="parseDescription(selectedMap.description).source">
                 <div><strong>来源:</strong> {{ parseDescription(selectedMap.description).source === 'edge_mapping' ? 'Edge Agent 建图' : parseDescription(selectedMap.description).source }}</div>
@@ -450,7 +500,14 @@ function parseDescription(desc) {
             <div class="map-preview-actions">
               <span v-if="selectedMap.active" class="badge badge-success">活动地图</span>
               <button class="btn btn-sm" @click="handleDownload(selectedMap)">下载</button>
-              <button v-if="!selectedMap.active" class="btn btn-sm" @click="handleSetActive(selectedMap)">设为活动</button>
+              <button
+                v-if="!selectedMap.active || activeMapSync.state !== 'synced'"
+                class="btn btn-sm"
+                :disabled="activatingMapId === selectedMap.id"
+                @click="handleSetActive(selectedMap)"
+              >
+                {{ activatingMapId === selectedMap.id ? '切换中...' : (selectedMap.active ? '重新下发到机器狗' : '设为活动') }}
+              </button>
               <button class="btn btn-sm btn-danger" @click="handleDelete(selectedMap)">删除</button>
               <button class="btn btn-sm btn-danger" @click="handleForceDelete(selectedMap)">强制删除</button>
             </div>
@@ -471,7 +528,7 @@ function parseDescription(desc) {
             :key="map.id"
             class="map-card"
             :class="{ 'map-card-selected': map.id === selectedMapId }"
-            @click="selectedMapId = map.id; mapImageError = {}"
+            @click="selectMap(map)"
           >
             <div class="map-thumbnail">
               <template v-if="map.thumbnail_url && !mapImageError[map.id]">
@@ -734,6 +791,45 @@ function parseDescription(desc) {
   gap: 0.35rem;
   font-size: 0.875rem;
   color: #555;
+}
+
+.map-sync-panel {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.75rem;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+
+.sync-row {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.sync-row span {
+  color: #667085;
+}
+
+.sync-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #1f2937;
+}
+
+.sync-status.status-online {
+  color: #137333;
+}
+
+.sync-status.status-offline {
+  color: #b42318;
+}
+
+.sync-status.status-unknown {
+  color: #667085;
 }
 
 .map-description {

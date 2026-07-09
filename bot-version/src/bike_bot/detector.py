@@ -160,11 +160,35 @@ class YoloDetector:
 
     def _load_model(self) -> Any:
         if self.model_backend == "opencv_dnn":
-            net = cv2.dnn.readNetFromONNX(self.config.model.path)
-            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-            LOGGER.info("loaded ONNX model with OpenCV DNN: %s", self.config.model.path)
-            return net
+            try:
+                net = cv2.dnn.readNetFromONNX(self.config.model.path)
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                LOGGER.info("loaded ONNX model with OpenCV DNN: %s", self.config.model.path)
+                return net
+            except cv2.error as exc:
+                LOGGER.warning("OpenCV DNN failed to load ONNX, falling back to onnxruntime: %s", exc)
+                self.model_backend = "onnxruntime"
+
+        if self.model_backend == "onnxruntime":
+            import onnxruntime as ort
+
+            session_options = ort.SessionOptions()
+            session_options.intra_op_num_threads = 2
+            session_options.inter_op_num_threads = 1
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            session = ort.InferenceSession(
+                self.config.model.path,
+                sess_options=session_options,
+                providers=providers,
+            )
+            LOGGER.info(
+                "loaded ONNX model with onnxruntime: %s providers=%s",
+                self.config.model.path,
+                session.get_providers(),
+            )
+            return session
 
         if self.model_backend == "ultralytics":
             from ultralytics import YOLO
@@ -179,9 +203,8 @@ class YoloDetector:
         if isinstance(source, str) and source.startswith("rtsp://"):
             transport = self.config.video.rtsp_transport
             open_timeout_us = self.config.video.open_timeout_seconds * 1_000_000
-            read_timeout_us = self.config.video.read_timeout_seconds * 1_000_000
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"rtsp_transport;{transport}|stimeout;{open_timeout_us}|timeout;{read_timeout_us}"
+                f"rtsp_transport;{transport}|stimeout;{open_timeout_us}"
             )
             LOGGER.info(
                 "using ffmpeg rtsp options transport=%s open_timeout=%ss read_timeout=%ss",
@@ -300,6 +323,8 @@ class YoloDetector:
     def _predict(self, frame) -> list[RawDetection]:
         if self.model_backend == "opencv_dnn":
             return self._predict_opencv_dnn(frame)
+        if self.model_backend == "onnxruntime":
+            return self._predict_onnxruntime(frame)
         return self._predict_ultralytics(frame)
 
     def _predict_ultralytics(self, frame) -> list[RawDetection]:
@@ -340,6 +365,23 @@ class YoloDetector:
         self.model.setInput(blob)
         outputs = self.model.forward()
         predictions = outputs[0] if isinstance(outputs, tuple) else outputs
+        return self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+
+    def _predict_onnxruntime(self, frame) -> list[RawDetection]:
+        input_image, scale, pad_x, pad_y = letterbox(frame, self.config.model.image_size)
+        blob = cv2.dnn.blobFromImage(
+            input_image,
+            1 / 255.0,
+            (self.config.model.image_size, self.config.model.image_size),
+            swapRB=True,
+            crop=False,
+        )
+        input_name = self.model.get_inputs()[0].name
+        output_name = self.model.get_outputs()[0].name
+        predictions = self.model.run([output_name], {input_name: blob})[0]
+        return self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+
+    def _parse_yolo_predictions(self, predictions, frame, scale: float, pad_x: int, pad_y: int) -> list[RawDetection]:
         predictions = predictions.squeeze()
         if predictions.ndim != 2:
             return []

@@ -76,6 +76,8 @@ class TelemetryConfig:
     timeout_seconds: int = 5
     verify_tls: bool = False
     device_key: str = ""
+    heartbeat_enabled: bool = True
+    status_enabled: bool = True
     heartbeat_interval_seconds: int = 5
     status_interval_seconds: int = 2
 

@@ -54,6 +54,18 @@ def _media_public_url(relative_path: str) -> str:
     return f"{media_url}{relative_path}"
 
 
+def _absolute_media_url(path: str) -> str:
+    public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
+    if public_base_url:
+        if path.startswith("http"):
+            parsed = urlparse(path)
+            path = parsed.path
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return f"{public_base_url}{path}"
+    return path
+
+
 def _stored_bbox(event: InspectionEvent, image: Image.Image) -> tuple[int, int, int, int] | None:
     values = [event.bbox_x, event.bbox_y, event.bbox_width, event.bbox_height]
     if any(value is None for value in values):
@@ -217,9 +229,15 @@ class EventSerializer(serializers.ModelSerializer):
         if annotated_url.startswith("http"):
             parsed = urlparse(annotated_url)
             media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+            if parsed.path.startswith(media_url):
+                return _absolute_media_url(parsed.path)
             if request and parsed.path.startswith(media_url):
                 return request.build_absolute_uri(parsed.path)
             return annotated_url
+
+        media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+        if annotated_url.startswith(media_url):
+            return _absolute_media_url(annotated_url)
 
         if request:
             return request.build_absolute_uri(annotated_url)
@@ -710,10 +728,17 @@ class RobotSessionSerializer(serializers.ModelSerializer):
 class RobotStatusSerializer(serializers.ModelSerializer):
     task_execution_id = serializers.UUIDField(source="task_execution.id", read_only=True, allow_null=True)
     localization_quality = serializers.SerializerMethodField()
+    current_map = serializers.SerializerMethodField()
 
     def get_localization_quality(self, obj):
         raw_quality = (obj.raw_payload or {}).get("localization", {}).get("quality")
         return raw_quality or obj.localization_quality or {}
+
+    def get_current_map(self, obj):
+        return (obj.raw_payload or {}).get("current_map") or {
+            "map_id": obj.map_id,
+            "map_version": obj.map_version,
+        }
 
     class Meta:
         model = RobotStatusLatest
@@ -724,6 +749,7 @@ class RobotStatusSerializer(serializers.ModelSerializer):
             "frame_id",
             "map_id",
             "map_version",
+            "current_map",
             "x",
             "y",
             "z",

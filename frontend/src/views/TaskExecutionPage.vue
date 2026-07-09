@@ -26,6 +26,12 @@ const actions = computed(() => executionActions(execution.value?.state))
 const waypoints = computed(() => execution.value?.route_snapshot?.waypoints || [])
 const currentIndex = computed(() => execution.value?.current_waypoint_index ?? 0)
 const currentTarget = computed(() => waypoints.value[currentIndex.value] || waypoints.value[0] || null)
+const latestCommand = computed(() => {
+  const commands = execution.value?.commands || []
+  return commands[commands.length - 1] || null
+})
+const failureInfo = computed(() => buildFailureInfo())
+const failedWaypointIndexes = computed(() => failureInfo.value.waypointIndexes)
 const progress = computed(() => {
   if (!execution.value?.total_waypoints) return 0
   return Math.round(execution.value.completed_waypoints / execution.value.total_waypoints * 100)
@@ -112,7 +118,7 @@ function polylinePoints(points) {
 
 function robotPoint() {
   const status = robotStatus.value?.status
-  if (!status || status.x === null || status.y === null) return null
+  if (!robotPoseUsable() || !status || status.x === null || status.y === null) return null
   return { x: Number(status.x), y: Number(status.y), yaw: Number(status.yaw || 0) }
 }
 
@@ -121,10 +127,134 @@ function robotDisplayPosition() {
 }
 
 function robotHeadingStyle() {
-  return { transform: `translate(-50%, -50%) rotate(${Number(robotPoint()?.yaw || 0)}rad)` }
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(robotPoint()?.yaw || 0)}rad)` }
+}
+
+function sampleIsStale(value, thresholdMs = 10000) {
+  if (!value) return false
+  const sampledTime = new Date(value).getTime()
+  if (Number.isNaN(sampledTime)) return false
+  return Date.now() - sampledTime > thresholdMs
+}
+
+function ndtQualityValid(quality) {
+  if (!quality) return false
+  const error = Number(quality.matching_error)
+  const inlier = Number(quality.inlier_fraction)
+  const translation = Number(quality.relative_translation_m)
+  return Number.isFinite(error)
+    && error < 100
+    && (!Number.isFinite(inlier) || inlier >= 0.05)
+    && (!Number.isFinite(translation) || translation < 20)
+}
+
+function commandResult(command = latestCommand.value) {
+  const raw = command?.result
+  if (!raw) return {}
+  if (typeof raw === 'object') return raw
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return {}
+  }
+}
+
+function parseWaypointIndexes(text = '') {
+  const match = String(text).match(/\[([^\]]+)\]/)
+  if (!match) return []
+  return match[1]
+    .split(',')
+    .map(item => Number.parseInt(item.trim(), 10))
+    .filter(Number.isFinite)
+}
+
+function lastTrajectoryPoint() {
+  return trajectory.value.length ? trajectory.value[trajectory.value.length - 1] : null
+}
+
+function distanceText(pointA, pointB) {
+  if (!pointA || !pointB) return '—'
+  const distance = Math.hypot(Number(pointA.x) - Number(pointB.x), Number(pointA.y) - Number(pointB.y))
+  return Number.isFinite(distance) ? `${distance.toFixed(2)} m` : '—'
+}
+
+function buildFailureInfo() {
+  const command = latestCommand.value
+  const code = command?.error_code || ''
+  const message = command?.error_message || ''
+  const result = commandResult(command)
+  const indexes = code === 'NAVIGATION_MISSED_WAYPOINTS'
+    ? parseWaypointIndexes(message)
+    : []
+
+  if (code === 'NAVIGATION_MISSED_WAYPOINTS') {
+    return {
+      severity: 'bad',
+      title: '有航点未到达',
+      summary: `${indexes.map(index => `第 ${index + 1} 个点`).join('、') || '部分航点'} 没有完成。通常是目标点在障碍区、膨胀区，或到目标点的路径被实时障碍堵住。`,
+      detail: message || 'Nav2 reported missed waypoints',
+      waypointIndexes: indexes,
+      suggestion: '检查失败点是否落在可通行区域，观察地图上失败点、机器人最终位置和绿色轨迹之间的距离。',
+    }
+  }
+
+  if (code === 'FINAL_POSE_OUT_OF_TOLERANCE') {
+    return {
+      severity: 'bad',
+      title: '最终位置未到最后点',
+      summary: '导航返回结束后，机器人最终位置仍离最后一个点过远。',
+      detail: message,
+      waypointIndexes: waypoints.value.length ? [waypoints.value.length - 1] : [],
+      suggestion: '保留这个报错，不应简单放大容差。应继续查 Nav2 到点阈值、控制器是否提前判到点，以及最终点附近是否被障碍物影响。',
+    }
+  }
+
+  if (code) {
+    return {
+      severity: 'warn',
+      title: '命令执行失败',
+      summary: code,
+      detail: message || result.final_task_state || '',
+      waypointIndexes: [],
+      suggestion: '查看命令生命周期和地图上的最终位置，确认是平台命令失败还是导航栈失败。',
+    }
+  }
+
+  if (execution.value?.state === 'completed') {
+    return {
+      severity: 'ok',
+      title: '任务完成',
+      summary: '所有航点已完成。',
+      detail: '',
+      waypointIndexes: [],
+      suggestion: '',
+    }
+  }
+
+  return {
+    severity: 'idle',
+    title: '任务执行中',
+    summary: '地图会持续刷新机器人位置、目标点和轨迹。',
+    detail: '',
+    waypointIndexes: [],
+    suggestion: '',
+  }
+}
+
+function robotPoseUsable() {
+  const status = robotStatus.value?.status
+  const quality = status?.localization_quality
+  if (!status) return false
+  if (status.localization_status !== 'normal') return false
+  if (sampleIsStale(status.sampled_at)) return false
+  if (quality?.sampled_at && sampleIsStale(quality.sampled_at)) return false
+  if (!ndtQualityValid(quality)) return false
+  if (mapData.value?.id && status.map_id && String(mapData.value.id) !== String(status.map_id)) return false
+  return true
 }
 
 function waypointClass(index) {
+  if (failedWaypointIndexes.value.includes(index)) return 'failed'
   if (index < currentIndex.value) return 'done'
   if (index === currentIndex.value && isActive.value) return 'current'
   return ''
@@ -139,6 +269,21 @@ function statusText() {
 function targetText() {
   if (!currentTarget.value) return '暂无目标点'
   return `${currentTarget.value.name || `点${currentIndex.value + 1}`} (${Number(currentTarget.value.x).toFixed(2)}, ${Number(currentTarget.value.y).toFixed(2)})`
+}
+
+function localizationDebugItems() {
+  const status = robotStatus.value?.status || {}
+  const quality = status.localization_quality || {}
+  const mapMatch = mapData.value?.id && status.map_id
+    ? String(mapData.value.id) === String(status.map_id)
+    : true
+  return [
+    ['地图一致', mapMatch ? '是' : `否：页面 ${mapData.value?.id || '—'} / 机器人 ${status.map_id || '—'}`, mapMatch ? 'ok' : 'bad'],
+    ['定位状态', status.localization_status || 'unknown', status.localization_status === 'normal' ? 'ok' : 'bad'],
+    ['NDT分数', Number.isFinite(Number(quality.matching_error)) ? Number(quality.matching_error).toFixed(3) : '—', ndtQualityValid(quality) ? 'ok' : 'warn'],
+    ['内点率', Number.isFinite(Number(quality.inlier_fraction)) ? Number(quality.inlier_fraction).toFixed(3) : '—', ndtQualityValid(quality) ? 'ok' : 'warn'],
+    ['最终点距离', distanceText(lastTrajectoryPoint() || robotPoint(), waypoints.value[waypoints.value.length - 1]), execution.value?.state === 'failed' ? 'warn' : 'idle'],
+  ]
 }
 
 onMounted(async () => {
@@ -174,6 +319,18 @@ onBeforeUnmount(() => {
           <p>{{ targetText() }}</p>
           <small>{{ statusText() }}</small>
         </div>
+        <div class="failure-card" :class="failureInfo.severity">
+          <strong>{{ failureInfo.title }}</strong>
+          <p>{{ failureInfo.summary }}</p>
+          <small v-if="failureInfo.detail">{{ failureInfo.detail }}</small>
+          <small v-if="failureInfo.suggestion">{{ failureInfo.suggestion }}</small>
+        </div>
+        <div class="debug-list">
+          <div v-for="[label, value, state] in localizationDebugItems()" :key="label" class="debug-row" :class="state">
+            <span>{{ label }}</span>
+            <strong>{{ value }}</strong>
+          </div>
+        </div>
         <div class="action-row">
           <button class="ghost-btn" :disabled="!actions.pause" @click="act('pause')">暂停</button>
           <button class="primary-btn" :disabled="!actions.resume" @click="act('resume')">继续</button>
@@ -200,6 +357,7 @@ onBeforeUnmount(() => {
         <article v-for="command in execution.commands" :key="command.id" class="task-card">
           <strong>{{ command.command_type }}</strong>
           <span>{{ command.status }} · {{ command.error_code || command.ack_reason_code || 'OK' }}</span>
+          <small v-if="command.error_message">{{ command.error_message }}</small>
         </article>
       </div>
     </section>
@@ -232,6 +390,7 @@ onBeforeUnmount(() => {
               {{ index + 1 }}
             </div>
             <div v-if="currentTarget" class="execution-marker target" :style="displayPosition(currentTarget)">目标</div>
+            <div v-if="lastTrajectoryPoint()" class="execution-marker final" :style="displayPosition(lastTrajectoryPoint())">终点</div>
             <div v-if="robotDisplayPosition()" class="execution-robot" :style="robotDisplayPosition()">
               <span :style="robotHeadingStyle()"></span>
             </div>
@@ -341,6 +500,11 @@ onBeforeUnmount(() => {
   background: #f59e0b;
 }
 
+.execution-marker.waypoint.failed {
+  background: #dc2626;
+  outline: 3px solid rgba(220, 38, 38, 0.28);
+}
+
 .execution-marker.target {
   min-width: 42px;
   height: 24px;
@@ -349,6 +513,17 @@ onBeforeUnmount(() => {
   background: #ef4444;
   color: #fff;
   transform: translate(-50%, calc(-100% - 18px));
+  font-size: 12px;
+}
+
+.execution-marker.final {
+  min-width: 42px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #111827;
+  color: #fff;
+  transform: translate(-50%, 18px);
   font-size: 12px;
 }
 
@@ -420,9 +595,92 @@ onBeforeUnmount(() => {
   background: #f59e0b;
 }
 
+.execution-waypoint.failed {
+  border-color: rgba(220, 38, 38, 0.45);
+  background: rgba(220, 38, 38, 0.08);
+}
+
+.execution-waypoint.failed > span {
+  background: #dc2626;
+}
+
 .execution-waypoint strong,
 .execution-waypoint small {
   display: block;
+}
+
+.failure-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--table-bg);
+}
+
+.failure-card strong,
+.failure-card p,
+.failure-card small {
+  margin: 0;
+}
+
+.failure-card small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.failure-card.bad {
+  border-color: rgba(220, 38, 38, 0.45);
+  background: rgba(220, 38, 38, 0.08);
+}
+
+.failure-card.warn {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.10);
+}
+
+.failure-card.ok {
+  border-color: rgba(16, 185, 129, 0.45);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.debug-list {
+  display: grid;
+  gap: 6px;
+}
+
+.debug-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--table-bg);
+  font-size: 13px;
+}
+
+.debug-row span {
+  color: var(--muted);
+}
+
+.debug-row strong {
+  text-align: right;
+}
+
+.debug-row.bad strong {
+  color: #dc2626;
+}
+
+.debug-row.warn strong {
+  color: #b45309;
+}
+
+.task-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .map-placeholder {

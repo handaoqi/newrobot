@@ -517,20 +517,25 @@ def main() -> None:
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()
 
-    threads = [
-        threading.Thread(
-            target=heartbeat_worker,
-            args=(stop_event, client, config.telemetry.heartbeat_interval_seconds),
-            daemon=False,
-            name="heartbeat-worker",
-        ),
-        threading.Thread(
-            target=status_worker,
-            args=(stop_event, client, config.telemetry.status_interval_seconds),
-            daemon=False,
-            name="status-worker",
-        ),
-    ]
+    threads = []
+    if config.telemetry.heartbeat_enabled:
+        threads.append(
+            threading.Thread(
+                target=heartbeat_worker,
+                args=(stop_event, client, config.telemetry.heartbeat_interval_seconds),
+                daemon=False,
+                name="heartbeat-worker",
+            )
+        )
+    if config.telemetry.status_enabled:
+        threads.append(
+            threading.Thread(
+                target=status_worker,
+                args=(stop_event, client, config.telemetry.status_interval_seconds),
+                daemon=False,
+                name="status-worker",
+            )
+        )
     if detector is not None:
         threads.append(
             threading.Thread(

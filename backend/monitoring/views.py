@@ -572,15 +572,48 @@ def dispatch_robot_command(command: RobotCommand) -> tuple[dict, str]:
 
 
 class RobotCommandView(APIView):
+    ACTION_TO_COMMAND_TYPE = {
+        "takeover_enter": "teleop.takeover_enter",
+        "takeover_exit": "teleop.takeover_exit",
+        "stand_up": "teleop.stand_up",
+        "lie_down": "teleop.lie_down",
+        "move_forward": "teleop.move_forward",
+        "move_backward": "teleop.move_backward",
+        "move_left": "teleop.move_left",
+        "move_right": "teleop.move_right",
+        "turn_left": "teleop.turn_left",
+        "turn_right": "teleop.turn_right",
+        "move_stop": "teleop.move_stop",
+        "passive": "teleop.passive",
+    }
+
     def post(self, request, robot_id):
         ensure_demo_seed()
         robot = Robot.objects.get(id=robot_id)
         serializer = RobotCommandCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        action = serializer.validated_data["action"]
+        payload = serializer.validated_data.get("payload") or {}
+        command_type = self.ACTION_TO_COMMAND_TYPE.get(action)
+        if command_type:
+            if robot.effective_connection_status() != "online":
+                return Response(
+                    {"detail": "机器狗 Edge Agent 当前离线，无法远程控制。"},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            command = CommandService.create_robot_command(
+                robot=robot,
+                command_type=command_type,
+                payload=payload,
+                operator=request.user if request.user.is_authenticated else None,
+                expiry_seconds=5,
+            )
+            return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
+
         command = RobotCommand.objects.create(
             robot=robot,
-            action=serializer.validated_data["action"],
-            payload=serializer.validated_data.get("payload") or {},
+            action=action,
+            payload=payload,
         )
 
         response_payload, error_message = dispatch_robot_command(command)
@@ -886,7 +919,10 @@ class MediaUploadView(APIView):
             task_execution_id=payload.get("task_execution_id"),
             content_type=getattr(uploaded_file, "content_type", "") or "",
         )
-        asset.url = request.build_absolute_uri(settings.MEDIA_URL + asset.file.name)
+        media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+        media_path = f"{media_url.rstrip('/')}/{asset.file.name}"
+        public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
+        asset.url = f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
         asset.save(update_fields=["url", "updated_at"])
         return Response(
             {"media_id": str(asset.media_id), "url": asset.url, "asset": MediaAssetSerializer(asset).data},
@@ -1215,6 +1251,15 @@ class RobotMappingStatusView(APIView):
             mapping_state = status_map.get(command.status, command.status)
 
         latest_map = MapData.objects.filter(robot=robot).order_by("-created_at").first()
+        latest_status = RobotStatusLatest.objects.filter(robot=robot).first()
+        robot_current_map = {}
+        if latest_status and latest_status.raw_payload:
+            robot_current_map = latest_status.raw_payload.get("current_map") or {}
+        if not robot_current_map:
+            robot_current_map = {
+                "map_id": robot.current_map_id,
+                "map_version": robot.current_map_version,
+            }
         return Response(
             {
                 "robot_id": robot.id,
@@ -1223,6 +1268,9 @@ class RobotMappingStatusView(APIView):
                 "raw_connection_status": robot.connection_status,
                 "robot_status": robot.status,
                 "agent_version": robot.agent_version or "",
+                "current_map": robot_current_map,
+                "current_map_id": robot.current_map_id,
+                "current_map_version": robot.current_map_version,
                 "command_type": command.command_type if command else None,
                 "mapping_state": mapping_state,
                 "command_status": command.status if command else "idle",
@@ -1477,26 +1525,49 @@ class DeviceMapUploadView(APIView):
             "source": "edge_mapping",
             "map_version": metadata.get("map_version", ""),
             "mapping_session_id": metadata.get("mapping_session_id", ""),
+            "source_map_dir": metadata.get("source_map_dir", ""),
+            "dynamic_filter": metadata.get("dynamic_filter", {}),
             "route_hint": metadata.get("route_hint", ""),
             "files": metadata.get("files", []),
             "image": yaml_metadata.get("image", ""),
         }
-        map_data = MapData.objects.create(
-            name=map_name,
-            robot=robot,
-            resolution=float(yaml_metadata.get("resolution") or metadata.get("resolution") or 0.05),
-            width=width,
-            height=height,
-            origin=yaml_metadata.get("origin") or metadata.get("origin") or [],
-            description=json.dumps(description, ensure_ascii=False),
+        auto_activate = bool(metadata.get("auto_activate", False))
+        with transaction.atomic():
+            map_data = MapData.objects.create(
+                name=map_name,
+                robot=robot,
+                resolution=float(yaml_metadata.get("resolution") or metadata.get("resolution") or 0.05),
+                width=width,
+                height=height,
+                origin=yaml_metadata.get("origin") or metadata.get("origin") or [],
+                description=json.dumps(description, ensure_ascii=False),
+            )
+            map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
+            map_data.pgm_file.save(f"{map_data.id}_map.pgm", ContentFile(extracted["map.pgm"]), save=False)
+            preview = extracted.get("map_preview.png") or extracted.get("preview.png")
+            if preview:
+                map_data.thumbnail.save(f"{map_data.id}_preview.png", ContentFile(preview), save=False)
+            map_data.save()
+            command = None
+            if auto_activate:
+                MapData.objects.filter(robot=robot, active=True).exclude(pk=map_data.pk).update(active=False)
+                map_data.active = True
+                map_data.save(update_fields=["active", "updated_at"])
+                command = CommandService.create_robot_command(
+                    robot=robot,
+                    command_type="map.activate",
+                    payload=_map_activation_payload(map_data, request),
+                    operator=None,
+                    expiry_seconds=120,
+                )
+        data = MapDataSerializer(map_data, context={"request": request}).data
+        data["activation_command"] = RemoteCommandSerializer(command).data if command else None
+        data["detail"] = (
+            "地图已上传、设为活动地图，并已向机器狗下发地图切换命令。"
+            if command
+            else "地图已上传。"
         )
-        map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
-        map_data.pgm_file.save(f"{map_data.id}_map.pgm", ContentFile(extracted["map.pgm"]), save=False)
-        preview = extracted.get("map_preview.png") or extracted.get("preview.png")
-        if preview:
-            map_data.thumbnail.save(f"{map_data.id}_preview.png", ContentFile(preview), save=False)
-        map_data.save()
-        return Response(MapDataSerializer(map_data, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        return Response(data, status=status.HTTP_201_CREATED)
 
 
 class PatrolRouteListView(APIView):

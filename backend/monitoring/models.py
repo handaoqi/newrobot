@@ -711,6 +711,18 @@ class RemoteCommand(BaseTimestampModel):
         ("nav.stop", "停止导航栈"),
         ("nav.initial_pose", "设置初始定位"),
         ("map.activate", "切换活动地图"),
+        ("teleop.takeover_enter", "进入远程接管"),
+        ("teleop.takeover_exit", "退出远程接管"),
+        ("teleop.stand_up", "站立"),
+        ("teleop.lie_down", "趴下"),
+        ("teleop.move_forward", "前进"),
+        ("teleop.move_backward", "后退"),
+        ("teleop.move_left", "左移"),
+        ("teleop.move_right", "右移"),
+        ("teleop.turn_left", "左转"),
+        ("teleop.turn_right", "右转"),
+        ("teleop.move_stop", "停止移动"),
+        ("teleop.passive", "软急停"),
     ]
     STATUS_CHOICES = [
         ("created", "已创建"),

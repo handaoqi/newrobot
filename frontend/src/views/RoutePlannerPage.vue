@@ -38,6 +38,10 @@ const routeExecuteBusy = ref(false)
 const lastExecution = ref(null)
 const initialPoseMode = ref(false)
 const manualInitialPose = ref(null)
+const initialPoseStep = ref('position')
+const initialPoseHeadingTarget = ref(null)
+const localizationInitState = ref('idle')
+const localizationInitMessage = ref('')
 const poseHistory = ref([])
 const showPoseTrail = ref(true)
 const lastPoseSampleKey = ref('')
@@ -137,7 +141,26 @@ function handleMapClick(event) {
 
   const imagePoint = displayToImagePoint(displayX, displayY, geometry)
   if (initialPoseMode.value) {
-    manualInitialPose.value = imagePointToWaypoint(imagePoint, geometry, Number(manualInitialPose.value?.yaw || 0))
+    const clickedPose = imagePointToWaypoint(imagePoint, geometry, Number(manualInitialPose.value?.yaw || 0))
+    if (initialPoseStep.value === 'position' || !manualInitialPose.value) {
+      manualInitialPose.value = clickedPose
+      initialPoseHeadingTarget.value = null
+      initialPoseStep.value = 'heading'
+      navError.value = '已设置初始位置，请再点击狗头朝向'
+      return
+    }
+    const dx = clickedPose.x - manualInitialPose.value.x
+    const dy = clickedPose.y - manualInitialPose.value.y
+    if (Math.hypot(dx, dy) < 0.05) {
+      navError.value = '朝向点离初始位置太近，请点远一点'
+      return
+    }
+    manualInitialPose.value = {
+      ...manualInitialPose.value,
+      yaw: Number(Math.atan2(dy, dx).toFixed(4)),
+    }
+    initialPoseHeadingTarget.value = clickedPose
+    navError.value = '已设置初始朝向，可以下发初始定位'
     return
   }
   waypoints.value.push(imagePointToWaypoint(imagePoint, geometry))
@@ -308,6 +331,16 @@ function poseTrailPoints() {
     .join(' ')
 }
 
+function initialPoseHeadingLinePoints() {
+  imageReadyTick.value
+  const geometry = getMapGeometry()
+  if (!geometry || !manualInitialPose.value || !initialPoseHeadingTarget.value) return ''
+  const start = pointDisplayPositionFromMap(manualInitialPose.value.x, manualInitialPose.value.y, geometry)
+  const end = pointDisplayPositionFromMap(initialPoseHeadingTarget.value.x, initialPoseHeadingTarget.value.y, geometry)
+  if (!start || !end) return ''
+  return `${start.x},${start.y} ${end.x},${end.y}`
+}
+
 function clearPoseHistory() {
   poseHistory.value = []
   lastPoseSampleKey.value = ''
@@ -386,6 +419,68 @@ async function sendNavigationCommand(action) {
   }
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function initializeLocalization() {
+  const robotId = selectedRobot.value?.id || selectedMap.value?.robot
+  if (!robotId) {
+    navError.value = '未选择机器人'
+    return
+  }
+  if (navStatus.value?.connection_status !== 'online') {
+    navError.value = '机器人未在线'
+    return
+  }
+
+  navCommandBusy.value = 'localization-init'
+  localizationInitState.value = 'restarting'
+  localizationInitMessage.value = '正在重启导航/定位栈'
+  navError.value = ''
+  try {
+    await sendRobotNavigationCommand(robotId, 'restart', {
+      map_id: selectedMap.value?.id,
+      map_version: selectedMap.value?.description || '',
+    })
+    await sleep(2500)
+    await refreshNavigationStatus()
+
+    if (!manualInitialPose.value) {
+      initialPoseMode.value = true
+      initialPoseStep.value = 'position'
+      localizationInitState.value = 'waiting_pose'
+      localizationInitMessage.value = '请在地图点击机器狗真实位置，再点击狗头朝向'
+      navError.value = localizationInitMessage.value
+      return
+    }
+
+    localizationInitState.value = 'sending_pose'
+    localizationInitMessage.value = '正在下发初始定位'
+    await publishInitialPose(false, false)
+    localizationInitState.value = 'waiting_convergence'
+    localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
+    for (let index = 0; index < 6; index += 1) {
+      await sleep(2000)
+      await refreshNavigationStatus()
+      if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
+        localizationInitState.value = 'done'
+        localizationInitMessage.value = '定位初始化完成'
+        return
+      }
+    }
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = '未看到新的定位/NDT上报，请检查定位节点是否启动'
+    navError.value = localizationInitMessage.value
+  } catch (error) {
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = error.message || '定位初始化失败'
+    navError.value = localizationInitMessage.value
+  } finally {
+    navCommandBusy.value = ''
+  }
+}
+
 async function handleExecuteRoute() {
   if (!selectedRoute.value?.id) {
     navError.value = '请先保存并选择一条路线'
@@ -414,22 +509,35 @@ async function handleExecuteRoute() {
 
 function toggleInitialPoseMode() {
   initialPoseMode.value = !initialPoseMode.value
-  if (initialPoseMode.value && !manualInitialPose.value) {
-    const status = navStatus.value?.status
-    if (status && status.x !== null && status.y !== null && robotMapMatches()) {
-      const geometry = getMapGeometry()
-      manualInitialPose.value = {
-        frame_id: 'map',
-        x: Number(status.x),
-        y: Number(status.y),
-        yaw: Number(status.yaw || 0),
-        ...mapPointToImagePoint(Number(status.x), Number(status.y), geometry),
-      }
-    }
+  if (initialPoseMode.value) {
+    initialPoseStep.value = manualInitialPose.value ? 'heading' : 'position'
+    navError.value = manualInitialPose.value ? '请点击狗头朝向，或重新选择位置' : '请点击机器狗真实位置'
+  } else {
+    navError.value = ''
+  }
+}
+
+function resetInitialPosePosition() {
+  manualInitialPose.value = null
+  initialPoseHeadingTarget.value = null
+  initialPoseStep.value = 'position'
+  initialPoseMode.value = true
+  navError.value = '请点击机器狗真实位置'
+}
+
+function adjustInitialPoseYaw(delta) {
+  if (!manualInitialPose.value) return
+  manualInitialPose.value = {
+    ...manualInitialPose.value,
+    yaw: Number((Number(manualInitialPose.value.yaw || 0) + delta).toFixed(4)),
   }
 }
 
 async function sendInitialPose() {
+  await publishInitialPose(true, true)
+}
+
+async function publishInitialPose(confirmRequired = true, manageBusy = true) {
   const robotId = selectedRobot.value?.id || selectedMap.value?.robot
   if (!robotId) {
     navError.value = '未选择机器人'
@@ -439,8 +547,8 @@ async function sendInitialPose() {
     navError.value = '请先在地图上点击机器狗真实位置'
     return
   }
-  if (!confirm(`确认把初始定位设置为 ${waypointDisplayText(manualInitialPose.value)} / yaw ${Number(manualInitialPose.value.yaw || 0).toFixed(2)}？`)) return
-  navCommandBusy.value = 'initial-pose'
+  if (confirmRequired && !confirm(`确认把初始定位设置为 ${waypointDisplayText(manualInitialPose.value)} / yaw ${Number(manualInitialPose.value.yaw || 0).toFixed(2)}？`)) return
+  if (manageBusy) navCommandBusy.value = 'initial-pose'
   navError.value = ''
   try {
     await sendRobotNavigationCommand(robotId, 'initial-pose', {
@@ -456,7 +564,7 @@ async function sendInitialPose() {
   } catch (error) {
     navError.value = error.message || '初始定位下发失败'
   } finally {
-    navCommandBusy.value = ''
+    if (manageBusy && navCommandBusy.value === 'initial-pose') navCommandBusy.value = ''
   }
 }
 
@@ -470,7 +578,7 @@ function robotDisplayPosition() {
   imageReadyTick.value
   const status = navStatus.value?.status
   const geometry = getMapGeometry()
-  if (!status || !geometry || status.x === null || status.y === null || !robotMapMatches()) return null
+  if (!robotPoseUsable() || !status || !geometry || status.x === null || status.y === null || !robotMapMatches()) return null
   const point = mapPointToImagePoint(Number(status.x), Number(status.y), geometry)
   return {
     left: `${point.imageX * (geometry.rect.width / geometry.mapWidth)}px`,
@@ -480,7 +588,12 @@ function robotDisplayPosition() {
 
 function robotHeadingStyle() {
   const yaw = Number(navStatus.value?.status?.yaw || 0)
-  return { transform: `translate(-50%, -50%) rotate(${yaw}rad)` }
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - yaw}rad)` }
+}
+
+function initialPoseHeadingStyle() {
+  const yaw = Number(manualInitialPose.value?.yaw || 0)
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - yaw}rad)` }
 }
 
 function navReadyLabel() {
@@ -522,12 +635,20 @@ function formatDateTimeWithAge(value) {
   return `${date.toLocaleTimeString()} / ${Math.floor(ageSeconds / 60)}分钟前`
 }
 
-function localizationSampleStale() {
-  const sampledAt = navStatus.value?.status?.sampled_at
-  if (!sampledAt) return false
-  const sampledTime = new Date(sampledAt).getTime()
+function sampleIsStale(value, thresholdMs = 10000) {
+  if (!value) return false
+  const sampledTime = new Date(value).getTime()
   if (Number.isNaN(sampledTime)) return false
-  return Date.now() - sampledTime > 10000
+  return Date.now() - sampledTime > thresholdMs
+}
+
+function localizationSampleStale() {
+  return sampleIsStale(navStatus.value?.status?.sampled_at)
+}
+
+function localizationQualityStale(quality = localizationQuality()) {
+  if (!quality?.sampled_at) return localizationSampleStale()
+  return sampleIsStale(quality.sampled_at)
 }
 
 function localizationRefreshLabel() {
@@ -554,10 +675,41 @@ function localizationQuality() {
 
 function ndtQualityLabel(quality = localizationQuality()) {
   if (!quality) return '无数据'
+  if (localizationQualityStale(quality)) return '已过期'
+  if (!ndtQualityValid(quality)) return '无效'
   const error = Number(quality.matching_error)
   if (!Number.isFinite(error)) return '无分数'
   if (error <= 0.5 && quality.has_converged !== false) return '正常'
   return '偏差大'
+}
+
+function ndtQualityValid(quality = localizationQuality()) {
+  if (!quality) return false
+  const error = Number(quality.matching_error)
+  const inlier = Number(quality.inlier_fraction)
+  const translation = Number(quality.relative_translation_m)
+  return Number.isFinite(error)
+    && error < 100
+    && (!Number.isFinite(inlier) || inlier >= 0.05)
+    && (!Number.isFinite(translation) || translation < 20)
+}
+
+function ndtConvergedText(quality = localizationQuality()) {
+  if (!quality) return '—'
+  if (localizationQualityStale(quality)) return '已过期'
+  return quality.has_converged && ndtQualityValid(quality) ? '是' : '否'
+}
+
+function robotPoseUsable() {
+  const status = navStatus.value?.status
+  if (!status) return false
+  const localizationStatus = status.localization_status || navStatus.value?.localization_status
+  return localizationStatus === 'normal'
+    && !localizationSampleStale()
+    && robotMapMatches()
+    && Boolean(localizationQuality())
+    && !localizationQualityStale()
+    && ndtQualityValid()
 }
 
 function predictionErrorText(quality = localizationQuality()) {
@@ -572,6 +724,7 @@ function localizationDebugRows() {
   const status = navStatus.value?.status || {}
   const command = navStatus.value?.command
   const quality = localizationQuality()
+  const qualityFresh = quality && !localizationQualityStale(quality)
   return [
     ['页面地图', selectedMap.value ? `${selectedMap.value.id} / ${selectedMap.value.name}` : '—'],
     ['机器人地图', `${status.map_id || navStatus.value?.current_map_id || '—'} / ${status.map_version || navStatus.value?.current_map_version || '—'}`],
@@ -579,12 +732,13 @@ function localizationDebugRows() {
     ['定位状态', status.localization_status || navStatus.value?.localization_status || 'unknown'],
     ['定位源状态', status.localization_source_status ?? '—'],
     ['NDT质量', ndtQualityLabel(quality)],
-    ['NDT分数', quality ? formatNumber(quality.matching_error, 3) : '—'],
-    ['NDT收敛', quality ? (quality.has_converged ? '是' : '否') : '—'],
-    ['内点率', quality ? formatNumber(quality.inlier_fraction, 3) : '—'],
-    ['匹配位移', quality ? `${formatNumber(quality.relative_translation_m, 3)} m` : '—'],
-    ['预测误差', predictionErrorText(quality)],
+    ['NDT分数', qualityFresh ? formatNumber(quality.matching_error, 3) : (quality ? `已过期 ${formatNumber(quality.matching_error, 3)}` : '—')],
+    ['NDT收敛', qualityFresh ? ndtConvergedText(quality) : (quality ? '已过期' : '—')],
+    ['内点率', qualityFresh ? formatNumber(quality.inlier_fraction, 3) : (quality ? `已过期 ${formatNumber(quality.inlier_fraction, 3)}` : '—')],
+    ['匹配位移', qualityFresh ? `${formatNumber(quality.relative_translation_m, 3)} m` : '—'],
+    ['预测误差', qualityFresh ? predictionErrorText(quality) : '—'],
     ['质量时间', quality ? formatDateTimeWithAge(quality.sampled_at) : '—'],
+    ['初始化状态', localizationInitMessage.value || localizationInitState.value],
     ['导航栈', status.nav_ready ? 'ready' : 'not ready'],
     ['ROS', status.ros_ready ? 'ready' : 'not ready'],
     ['连接', navStatus.value?.connection_status || 'unknown'],
@@ -615,7 +769,8 @@ function stateMachineSteps() {
   const taskId = status.task_execution_id
   const ndtError = Number(quality?.matching_error)
   const inlier = Number(quality?.inlier_fraction)
-  const goodNdt = Number.isFinite(ndtError) && ndtError <= 0.5 && (!Number.isFinite(inlier) || inlier >= 0.65)
+  const qualityStale = localizationQualityStale(quality)
+  const goodNdt = !qualityStale && ndtQualityValid(quality) && Number.isFinite(ndtError) && ndtError <= 0.5 && (!Number.isFinite(inlier) || inlier >= 0.65)
 
   return [
     {
@@ -640,11 +795,18 @@ function stateMachineSteps() {
       state: localizationStatus === 'normal' ? 'ok' : localizationStatus === 'lost' ? 'bad' : 'warn',
     },
     {
+      key: 'localization-init',
+      title: '定位初始化',
+      value: localizationInitState.value,
+      detail: localizationInitMessage.value || '可点击初始化定位重启栈并下发初始位',
+      state: localizationInitState.value === 'done' ? 'ok' : localizationInitState.value === 'failed' ? 'bad' : localizationInitState.value === 'idle' ? 'idle' : 'warn',
+    },
+    {
       key: 'ndt',
       title: 'NDT匹配',
       value: ndtQualityLabel(quality),
-      detail: `score ${quality ? formatNumber(quality.matching_error, 3) : '—'} · inlier ${quality ? formatNumber(quality.inlier_fraction, 3) : '—'}`,
-      state: goodNdt ? 'ok' : quality ? 'bad' : 'warn',
+      detail: quality ? `score ${formatNumber(quality.matching_error, 3)} · inlier ${formatNumber(quality.inlier_fraction, 3)} · ${formatDateTimeWithAge(quality.sampled_at)}` : '未收到 /status 质量上报',
+      state: goodNdt ? 'ok' : qualityStale ? 'warn' : quality ? 'bad' : 'warn',
     },
     {
       key: 'ros',
@@ -674,7 +836,7 @@ function sensorStateRows() {
   const status = navStatus.value?.status || {}
   const quality = localizationQuality()
   const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
-  const qualityFresh = quality?.sampled_at && !localizationSampleStale()
+  const qualityFresh = quality?.sampled_at && !localizationQualityStale(quality)
   const hasPose = status.x !== null && status.x !== undefined && status.y !== null && status.y !== undefined
   const navReady = Boolean(status.nav_ready)
 
@@ -908,6 +1070,9 @@ async function handleDeleteRoute(route) {
               <button class="btn btn-sm" :class="{ 'btn-primary': initialPoseMode }" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="toggleInitialPoseMode">
                 {{ initialPoseMode ? '正在选初始位' : '设初始定位' }}
               </button>
+              <button class="btn btn-sm btn-primary" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="initializeLocalization">
+                {{ navCommandBusy === 'localization-init' ? '初始化中...' : '初始化定位' }}
+              </button>
               <button class="btn btn-sm btn-primary" :disabled="routeExecuteBusy || !selectedRoute?.id || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready" @click="handleExecuteRoute">
                 {{ routeExecuteBusy ? '执行中...' : '执行当前路线' }}
               </button>
@@ -917,12 +1082,17 @@ async function handleDeleteRoute(route) {
               <button class="btn btn-sm" :disabled="poseHistory.length === 0" @click="clearPoseHistory">清空尾迹</button>
             </div>
             <div v-if="initialPoseMode || manualInitialPose" class="initial-pose-panel">
+              <div class="initial-pose-guide">
+                <span>初始定位</span>
+                <strong>{{ initialPoseStep === 'position' ? '第1步：点击机器狗位置' : '第2步：点击狗头朝向' }}</strong>
+                <small>分数越低越好，NDT 大于阈值时不会完成初始化。</small>
+              </div>
               <div>
                 <span>初始位</span>
                 <strong>{{ manualInitialPose ? waypointDisplayText(manualInitialPose) : '点击地图选择' }}</strong>
               </div>
               <label>
-                yaw
+                朝向
                 <input
                   v-if="manualInitialPose"
                   v-model.number="manualInitialPose.yaw"
@@ -931,6 +1101,12 @@ async function handleDeleteRoute(route) {
                 />
                 <input v-else type="number" step="0.1" disabled />
               </label>
+              <div v-if="manualInitialPose" class="yaw-actions">
+                <button class="btn btn-sm" @click="adjustInitialPoseYaw(Math.PI / 12)">左转15°</button>
+                <button class="btn btn-sm" @click="adjustInitialPoseYaw(-Math.PI / 12)">右转15°</button>
+                <button class="btn btn-sm" @click="resetInitialPosePosition">重选位置</button>
+                <span>{{ Math.round(Number(manualInitialPose.yaw || 0) * 180 / Math.PI) }}°</span>
+              </div>
               <button class="btn btn-sm btn-primary" :disabled="!manualInitialPose || !!navCommandBusy" @click="sendInitialPose">下发初始定位</button>
             </div>
             <small v-if="navStatus?.command" class="command-note">
@@ -938,6 +1114,9 @@ async function handleDeleteRoute(route) {
             </small>
             <small v-if="lastExecution" class="command-note">
               最近执行 {{ lastExecution.id }} · {{ lastExecution.state }}
+            </small>
+            <small v-if="localizationInitMessage" class="command-note">
+              定位初始化 {{ localizationInitState }} · {{ localizationInitMessage }}
             </small>
             <div class="state-machine-panel">
               <div class="debug-header">
@@ -972,7 +1151,7 @@ async function handleDeleteRoute(route) {
               <div class="debug-grid">
                 <div v-for="[label, value] in localizationDebugRows()" :key="label" class="debug-row">
                   <span>{{ label }}</span>
-                  <strong :class="{ danger: (label === '地图一致' && value === '不一致') || (label === '采样时间' && localizationSampleStale()) || (label === 'NDT质量' && value === '偏差大') || (label === 'NDT收敛' && value === '否') }">{{ value }}</strong>
+                  <strong :class="{ danger: (label === '地图一致' && value === '不一致') || (label === '采样时间' && localizationSampleStale()) || (label === '质量时间' && localizationQualityStale()) || (label === 'NDT质量' && ['偏差大', '已过期', '无效'].includes(value)) || (label === 'NDT收敛' && ['否', '已过期'].includes(value)) || (label === 'NDT分数' && String(value).startsWith('已过期')) || (label === '内点率' && String(value).startsWith('已过期')) }">{{ value }}</strong>
                 </div>
               </div>
             </div>
@@ -1002,9 +1181,13 @@ async function handleDeleteRoute(route) {
                   <span :style="robotHeadingStyle()"></span>
                 </div>
                 <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
-                  +
+                  <span :style="initialPoseHeadingStyle()"></span>
                 </div>
               </div>
+
+              <svg v-if="initialPoseHeadingLinePoints()" class="initial-pose-heading-line">
+                <polyline :points="initialPoseHeadingLinePoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" />
+              </svg>
 
               <!-- 路径连线 -->
               <svg v-if="waypoints.length > 1" class="path-lines">
@@ -1015,7 +1198,7 @@ async function handleDeleteRoute(route) {
           </div>
 
           <div class="map-hint" v-if="selectedMap">
-            💡 点击地图添加途经点；如果地图超出区域，可在地图框内滚动查看
+            点击地图添加途经点；设初始定位时先点机器狗位置，再点狗头朝向。
           </div>
         </div>
       </div>
@@ -1330,6 +1513,30 @@ async function handleDeleteRoute(route) {
   color: #667085;
 }
 
+.initial-pose-panel .initial-pose-guide {
+  grid-template-columns: 60px 1fr;
+  align-items: start;
+}
+
+.initial-pose-guide small {
+  grid-column: 2;
+  color: #667085;
+  line-height: 1.35;
+}
+
+.initial-pose-panel .yaw-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.yaw-actions span {
+  color: #475467;
+  font-weight: 700;
+  font-size: 0.75rem;
+}
+
 .initial-pose-panel input {
   width: 100%;
   padding: 0.35rem 0.45rem;
@@ -1509,8 +1716,21 @@ async function handleDeleteRoute(route) {
   z-index: 6;
 }
 
+.initial-pose-marker span {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 18px solid #c2410c;
+  transform-origin: 50% 72%;
+}
+
 .pose-trail-lines,
-.path-lines {
+.path-lines,
+.initial-pose-heading-line {
   position: absolute;
   top: 0;
   left: 0;
@@ -1525,6 +1745,10 @@ async function handleDeleteRoute(route) {
 
 .path-lines {
   z-index: 3;
+}
+
+.initial-pose-heading-line {
+  z-index: 5;
 }
 
 .map-hint {
