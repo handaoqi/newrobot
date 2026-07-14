@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   fetchMaps,
+  fetchMapSets,
   fetchRobotNavigationStatus,
   fetchRobotStatus,
   fetchRobots,
@@ -15,6 +16,7 @@ import {
 import { API_BASE } from '../services/api'
 
 const maps = ref([])
+const mapSets = ref([])
 const robots = ref([])
 
 const getFullUrl = (relativeUrl) => {
@@ -50,6 +52,7 @@ let navTimer = null
 const routeForm = ref({
   name: '',
   map_data: null,
+  map_set: null,
   robot: null,
   description: '',
 })
@@ -69,9 +72,11 @@ onBeforeUnmount(() => {
 async function loadData() {
   loading.value = true
   try {
-    const [mapsResult, routesResult, robotsResult] = await Promise.allSettled([fetchMaps(), fetchRoutes(), fetchRobots()])
+    const [mapsResult, mapSetsResult, routesResult, robotsResult] = await Promise.allSettled([fetchMaps(), fetchMapSets(), fetchRoutes(), fetchRobots()])
     if (mapsResult.status === 'fulfilled') maps.value = mapsResult.value
     else console.error('加载地图失败:', mapsResult.reason)
+    if (mapSetsResult.status === 'fulfilled') mapSets.value = mapSetsResult.value
+    else console.error('加载地图集失败:', mapSetsResult.reason)
     if (routesResult.status === 'fulfilled') routes.value = routesResult.value
     else console.error('加载路线失败:', routesResult.reason)
     if (robotsResult.status === 'fulfilled') robots.value = robotsResult.value
@@ -121,6 +126,7 @@ function handleMapSelect(map) {
   routeForm.value = {
     name: '',
     map_data: map?.id || null,
+    map_set: null,
     robot: map?.robot || 1,
     description: '',
   }
@@ -190,6 +196,7 @@ async function handleSaveRoute() {
   const payload = {
     name: routeForm.value.name || `路线-${new Date().toLocaleString()}`,
     map_data: selectedMap.value.id,
+    map_set: routeForm.value.map_set || null,
     robot: routeForm.value.robot || selectedMap.value.robot || 1,
     waypoints: withWaypointYaw(waypoints.value),
     waypoint_names: waypointNames.value,
@@ -224,6 +231,7 @@ async function handleLoadRoute(route) {
   routeForm.value.description = route.description
   routeForm.value.robot = route.robot
   routeForm.value.map_data = route.map_data
+  routeForm.value.map_set = route.map_set || null
   await nextTick()
   refreshImageGeometry()
   refreshNavigationStatus()
@@ -992,6 +1000,15 @@ async function handleDeleteRoute(route) {
 
           <div class="panel-section">
             <h3>2. 路线信息</h3>
+            <div class="form-group" v-if="mapSets.length">
+              <label>跨图地图集</label>
+              <select v-model="routeForm.map_set">
+                <option :value="null">单地图路线</option>
+                <option v-for="mapSet in mapSets" :key="mapSet.id" :value="mapSet.id">
+                  {{ mapSet.name }} ({{ mapSet.members.length }} 子图)
+                </option>
+              </select>
+            </div>
             <div class="form-group">
               <label>路线名称</label>
               <input v-model="routeForm.name" type="text" placeholder="输入路线名称" />

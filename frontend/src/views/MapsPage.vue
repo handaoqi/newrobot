@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
 import {
   fetchMaps,
+  fetchMapSets,
   fetchRobots,
   deleteMap,
   downloadMap,
@@ -15,6 +16,7 @@ import {
 } from '../services/api'
 
 const maps = ref([])
+const mapSets = ref([])
 const robots = ref([])
 const loading = ref(false)
 const uploading = ref(false)
@@ -250,7 +252,9 @@ async function loadRobots() {
 async function loadMaps() {
   loading.value = true
   try {
-    maps.value = await fetchMaps()
+    const [loadedMaps, loadedMapSets] = await Promise.all([fetchMaps(), fetchMapSets()])
+    maps.value = loadedMaps
+    mapSets.value = loadedMapSets
     if (maps.value.length && !selectedMapId.value) {
       selectedMapId.value = maps.value[0].id
     }
@@ -593,6 +597,18 @@ function parseDescription(desc) {
       </div>
 
       <!-- 地图列表 -->
+      <div v-if="mapSets.length" class="map-set-list">
+        <h3 class="section-subtitle">跑道地图集</h3>
+        <article v-for="mapSet in mapSets" :key="mapSet.id" class="map-set-card">
+          <div>
+            <h4>{{ mapSet.name }}</h4>
+            <span>{{ mapSet.members.length }} 个子图 · {{ mapSet.manifest?.total_distance_m || '—' }} m · 重叠 {{ mapSet.manifest?.overlap_m || '—' }} m</span>
+          </div>
+          <div class="map-set-members">
+            <span v-for="member in mapSet.members" :key="member.submap_id" class="badge badge-sm">{{ member.submap_id }}</span>
+          </div>
+        </article>
+      </div>
       <div v-if="loading" class="loading">加载中...</div>
       <div v-else class="map-list-section">
         <div class="map-list-heading">
@@ -809,6 +825,25 @@ function parseDescription(desc) {
   margin-bottom: 1.5rem;
   border: 1px solid #e0e0e0;
 }
+
+.map-set-list {
+  margin: 0 0 1.25rem;
+}
+
+.map-set-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: .75rem;
+  border: 1px solid #d7dde5;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.map-set-card h4 { margin: 0 0 .25rem; font-size: .95rem; }
+.map-set-card span { color: #667085; font-size: .8rem; }
+.map-set-members { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .35rem; }
 
 .map-selector-row {
   margin-bottom: 1rem;

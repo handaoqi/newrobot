@@ -244,6 +244,10 @@ export async function fetchMaps() {
   return request('/maps/')
 }
 
+export async function fetchMapSets() {
+  return request('/map-sets/')
+}
+
 export async function fetchMapDetail(mapId) {
   return request(`/maps/${mapId}/`)
 }

@@ -480,10 +480,38 @@ class MapData(BaseTimestampModel):
         return self.name
 
 
+class MapSet(BaseTimestampModel):
+    """A globally ordered set of overlapping local navigation maps."""
+    name = models.CharField(max_length=128)
+    robot = models.ForeignKey(Robot, on_delete=models.SET_NULL, null=True, blank=True, related_name="map_sets")
+    version = models.CharField(max_length=64, blank=True)
+    manifest = models.JSONField(default=dict, blank=True)
+    active = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class MapSetMember(BaseTimestampModel):
+    map_set = models.ForeignKey(MapSet, on_delete=models.CASCADE, related_name="members")
+    map_data = models.OneToOneField(MapData, on_delete=models.CASCADE, related_name="map_set_member")
+    sequence = models.PositiveIntegerField()
+    submap_id = models.CharField(max_length=64)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [models.UniqueConstraint(fields=["map_set", "sequence"], name="unique_map_set_sequence")]
+
+
 class PatrolRoute(BaseTimestampModel):
     """巡逻路线模型"""
     name = models.CharField(max_length=128, verbose_name="路线名称")
     map_data = models.ForeignKey(MapData, on_delete=models.CASCADE, verbose_name="关联地图", related_name="routes")
+    map_set = models.ForeignKey(MapSet, on_delete=models.SET_NULL, null=True, blank=True, related_name="routes")
     robot = models.ForeignKey(Robot, on_delete=models.CASCADE, verbose_name="关联机器人", related_name="routes")
     waypoints = models.JSONField(default=list, verbose_name="途经点坐标数组")  # [[x1,y1],[x2,y2],...]
     waypoint_names = models.JSONField(default=list, verbose_name="途经点名称数组")
