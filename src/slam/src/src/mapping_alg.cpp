@@ -266,9 +266,24 @@ namespace robot::slam
                 response->message = "Set ERROR State!!!!!!";
                 break;
             case 5:
+                if (state_.load() != SlamState::ACTIVE)
+                {
+                    response->success = false;
+                    response->message = "Map save rejected: SLAM is not actively mapping.";
+                    RCLCPP_ERROR(get_logger(), "Map save rejected because SLAM state is not ACTIVE");
+                    break;
+                }
+                if (mapping_keyframes_.empty())
+                {
+                    response->success = false;
+                    response->message = "Map save rejected: no mapping keyframes were recorded.";
+                    RCLCPP_ERROR(get_logger(), "Map save rejected because no keyframes were recorded");
+                    break;
+                }
                 state_.store(SlamState::SAVE);
                 response->success = true;
-                response->message = "Set SAVE State!!!!!!";
+                response->message = "Map save accepted.";
+                RCLCPP_INFO(get_logger(), "Map save accepted: %zu keyframes", mapping_keyframes_.size());
                 break;
             default:
                 response->success = false;
@@ -295,6 +310,8 @@ namespace robot::slam
         gnss_correction_count_       = 0;
         dynamic_filter_scan_observations_.clear();
         mapping_keyframes_.clear();
+        pcl_wait_pub->clear();
+        pcl_wait_save->clear();
         has_last_keyframe_ = false;
         last_keyframe_stamp_ = 0.0;
 
@@ -689,7 +706,6 @@ namespace robot::slam
             }
         }
 
-        *pcl_wait_pub += *laserCloudWorld;
         recordKeyframe(laserCloudWorld);
         if (pub_world_points_flag_)
         {
@@ -1043,8 +1059,10 @@ namespace robot::slam
         }
         else if (state_.load() == SlamState::SAVE)
         {
-            finish();
-            state_.store(SlamState::READY);
+            RCLCPP_INFO(get_logger(), "Map export started: %zu keyframes", mapping_keyframes_.size());
+            const bool saved = finish();
+            state_.store(saved ? SlamState::READY : SlamState::ERROR);
+            RCLCPP_INFO(get_logger(), "Map export %s", saved ? "completed" : "failed");
         }
         else
         {
@@ -1058,68 +1076,97 @@ namespace robot::slam
             pubMapPoints(pubLaserCloudMap_);
     }
 
-    void MappingAlg::finish()
+    bool MappingAlg::finish()
     {
-        if (pcl_wait_pub->size() > 0)
+        if (mapping_keyframes_.empty())
         {
-            // Use millisecond timestamp and collision suffix to avoid multiple
-            // mapping nodes racing on the same output directory.
-            string map_subdir = makeMapSubdir(data_path_);
+            RCLCPP_ERROR(get_logger(), "Map export failed: no keyframes available");
+            return false;
+        }
 
-            if (!checkDirExist(map_subdir))
+        // Use only downsampled keyframes as the save source. Keeping every raw
+        // scan in pcl_wait_pub made large maps grow without bound in memory.
+        PointCloudType::Ptr raw_map_cloud(new PointCloudType());
+        std::size_t estimated_points = 0;
+        for (const auto& keyframe : mapping_keyframes_)
+            estimated_points += keyframe.cloud_world ? keyframe.cloud_world->size() : 0;
+        raw_map_cloud->reserve(estimated_points);
+        for (const auto& keyframe : mapping_keyframes_)
+        {
+            if (keyframe.cloud_world)
+                *raw_map_cloud += *keyframe.cloud_world;
+        }
+        if (raw_map_cloud->empty())
+        {
+            RCLCPP_ERROR(get_logger(), "Map export failed: keyframes contain no points");
+            return false;
+        }
+
+        // Use millisecond timestamp and collision suffix to avoid multiple
+        // mapping nodes racing on the same output directory.
+        string map_subdir = makeMapSubdir(data_path_);
+
+        if (!checkDirExist(map_subdir))
+        {
+            RCLCPP_ERROR(get_logger(), "Map export failed: cannot create %s", map_subdir.c_str());
+            return false;
+        }
+
+        RCLCPP_INFO(get_logger(), "Writing %zu keyframes and %zu points to %s", mapping_keyframes_.size(), raw_map_cloud->size(), map_subdir.c_str());
+        pcl::PCDWriter pcd_writer;
+        saveKeyframes(map_subdir);
+        string raw_pcd_file = map_subdir + "/map.raw_dynamic_unfiltered.pcd";
+        if (pcd_writer.writeBinary(raw_pcd_file, *raw_map_cloud) != 0)
+        {
+            RCLCPP_ERROR(get_logger(), "Map export failed: cannot write %s", raw_pcd_file.c_str());
+            return false;
+        }
+
+        PointCloudType::Ptr map_cloud = raw_map_cloud;
+        PointCloudType::Ptr dynamic_filtered_cloud(new PointCloudType());
+        if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0 && dynamic_filter_min_scan_observations_ > 1)
+        {
+            dynamic_filtered_cloud->reserve(raw_map_cloud->size());
+            for (const auto& point : raw_map_cloud->points)
             {
-                RCLCPP_ERROR(get_logger(), "Failed to create map subdirectory: %s", map_subdir.c_str());
-                return;
-            }
-
-            pcl::PCDWriter pcd_writer;
-            saveKeyframes(map_subdir);
-            string raw_pcd_file = map_subdir + "/map.raw_dynamic_unfiltered.pcd";
-            cout << "raw scan saved to " << raw_pcd_file << endl;
-            pcd_writer.writeBinary(raw_pcd_file, *pcl_wait_pub);
-
-            PointCloudType::Ptr map_cloud = pcl_wait_pub;
-            PointCloudType::Ptr dynamic_filtered_cloud(new PointCloudType());
-            if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0 && dynamic_filter_min_scan_observations_ > 1)
-            {
-                dynamic_filtered_cloud->reserve(pcl_wait_pub->size());
-                for (const auto& point : pcl_wait_pub->points)
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+                    continue;
+                auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
+                auto iter = dynamic_filter_scan_observations_.find(key);
+                if (iter != dynamic_filter_scan_observations_.end()
+                    && iter->second >= dynamic_filter_min_scan_observations_)
                 {
-                    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
-                        continue;
-                    auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
-                    auto iter = dynamic_filter_scan_observations_.find(key);
-                    if (iter != dynamic_filter_scan_observations_.end()
-                        && iter->second >= dynamic_filter_min_scan_observations_)
-                    {
-                        dynamic_filtered_cloud->push_back(point);
-                    }
+                    dynamic_filtered_cloud->push_back(point);
                 }
-                dynamic_filtered_cloud->width = static_cast<uint32_t>(dynamic_filtered_cloud->size());
-                dynamic_filtered_cloud->height = 1;
-                dynamic_filtered_cloud->is_dense = false;
-                map_cloud = dynamic_filtered_cloud;
-
-                const double keep_ratio = pcl_wait_pub->empty()
-                    ? 0.0
-                    : static_cast<double>(dynamic_filtered_cloud->size()) / static_cast<double>(pcl_wait_pub->size());
-                RCLCPP_INFO(get_logger(),
-                    "Dynamic map filter: raw=%zu filtered=%zu removed=%zu keep_ratio=%.3f voxel=%.3f min_scan_observations=%d observed_voxels=%zu",
-                    pcl_wait_pub->size(),
-                    dynamic_filtered_cloud->size(),
-                    pcl_wait_pub->size() - dynamic_filtered_cloud->size(),
-                    keep_ratio,
-                    dynamic_filter_voxel_size_,
-                    dynamic_filter_min_scan_observations_,
-                    dynamic_filter_scan_observations_.size());
             }
+            dynamic_filtered_cloud->width = static_cast<uint32_t>(dynamic_filtered_cloud->size());
+            dynamic_filtered_cloud->height = 1;
+            dynamic_filtered_cloud->is_dense = false;
+            map_cloud = dynamic_filtered_cloud;
 
-            string pcd_file = map_subdir + "/map.pcd";
-            cout << "filtered scan saved to " << pcd_file << endl;
-            pcd_writer.writeBinary(pcd_file, *map_cloud);
+            const double keep_ratio = raw_map_cloud->empty()
+                ? 0.0
+                : static_cast<double>(dynamic_filtered_cloud->size()) / static_cast<double>(raw_map_cloud->size());
+            RCLCPP_INFO(get_logger(),
+                "Dynamic map filter: raw=%zu filtered=%zu removed=%zu keep_ratio=%.3f voxel=%.3f min_scan_observations=%d observed_voxels=%zu",
+                raw_map_cloud->size(),
+                dynamic_filtered_cloud->size(),
+                raw_map_cloud->size() - dynamic_filtered_cloud->size(),
+                keep_ratio,
+                dynamic_filter_voxel_size_,
+                dynamic_filter_min_scan_observations_,
+                dynamic_filter_scan_observations_.size());
+        }
 
-            string pcd2grid_dir = map_subdir + "/map";
-            pcd2grid_ptr_->run(map_cloud, pcd2grid_dir);
+        string pcd_file = map_subdir + "/map.pcd";
+        if (pcd_writer.writeBinary(pcd_file, *map_cloud) != 0)
+        {
+            RCLCPP_ERROR(get_logger(), "Map export failed: cannot write %s", pcd_file.c_str());
+            return false;
+        }
+
+        string pcd2grid_dir = map_subdir + "/map";
+        pcd2grid_ptr_->run(map_cloud, pcd2grid_dir);
 
             std::ofstream ofs;
             std::string   path_file = map_subdir + "/map.txt";
@@ -1127,7 +1174,7 @@ namespace robot::slam
             if (!ofs.is_open())
             {
                 std::cout << "Failed to open traj_file: " << path_file << std::endl;
-                return;
+                return false;
             }
 
             double theta;
@@ -1164,7 +1211,7 @@ namespace robot::slam
                 }
             }
 
-            RCLCPP_INFO(get_logger(), "Save Map Success to %s", map_subdir.c_str());
-        }
+        RCLCPP_INFO(get_logger(), "Save Map Success to %s", map_subdir.c_str());
+        return true;
     }
 }  // namespace robot::slam

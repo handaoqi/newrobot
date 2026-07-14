@@ -272,7 +272,7 @@ namespace robot::slam
         vect3                                        pos_lid;
 
     public:
-        void finish();
+        bool finish();
 
     private:
         std::shared_ptr<Preprocess> p_pre = std::make_shared<Preprocess>();
