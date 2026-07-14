@@ -10,7 +10,29 @@ from typing import Any
 PROTOCOL_VERSION = "1.0"
 TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel"}
 MAPPING_COMMAND_TYPES = {"mapping.start", "mapping.save", "mapping.cancel", "mapping.status"}
-COMMAND_TYPES = TASK_COMMAND_TYPES | MAPPING_COMMAND_TYPES
+NAV_COMMAND_TYPES = {"nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop", "nav.initial_pose"}
+MAP_COMMAND_TYPES = {"map.activate"}
+TELEOP_COMMAND_TYPES = {
+    "teleop.takeover_enter",
+    "teleop.takeover_exit",
+    "teleop.stand_up",
+    "teleop.lie_down",
+    "teleop.move_forward",
+    "teleop.move_backward",
+    "teleop.move_left",
+    "teleop.move_right",
+    "teleop.turn_left",
+    "teleop.turn_right",
+    "teleop.move_stop",
+    "teleop.passive",
+}
+COMMAND_TYPES = (
+    TASK_COMMAND_TYPES
+    | MAPPING_COMMAND_TYPES
+    | NAV_COMMAND_TYPES
+    | MAP_COMMAND_TYPES
+    | TELEOP_COMMAND_TYPES
+)
 
 
 class ProtocolError(ValueError):
@@ -124,6 +146,16 @@ def validate_command(envelope: MessageEnvelope) -> None:
         map_name = payload["command"].get("map_name")
         if map_name is not None and not isinstance(map_name, str):
             raise ProtocolError("INVALID_MESSAGE", "mapping.start map_name must be string")
+    if envelope.message_type == "nav.initial_pose":
+        for field in ("x", "y", "yaw"):
+            value = payload["command"].get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ProtocolError("INVALID_MESSAGE", f"nav.initial_pose {field} must be numeric")
+    if envelope.message_type == "map.activate":
+        command = payload["command"]
+        for field in ("map_id", "map_version"):
+            if not str(command.get(field, "")).strip():
+                raise ProtocolError("INVALID_MESSAGE", f"map.activate requires {field}")
 
 
 def encode_message(message: dict[str, Any]) -> str:

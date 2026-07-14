@@ -16,6 +16,8 @@ class RuntimeSafetyState:
     battery_percent: int | None = None
     current_map_id: str = ""
     current_map_version: str = ""
+    current_map_local_state: str = "applied"
+    current_map_error: str = ""
 
 
 class SafetyPolicy:
@@ -41,6 +43,11 @@ class SafetyPolicy:
         ):
             raise ProtocolError("LOW_BATTERY", f"battery={self.state.battery_percent}")
         required_map = envelope.payload["command"].get("map") or {}
+        if self.state.current_map_local_state not in {"applied", ""}:
+            raise ProtocolError(
+                "MAP_LOCAL_MISMATCH",
+                self.state.current_map_error or self.state.current_map_local_state,
+            )
         if (
             required_map.get("map_id") != self.state.current_map_id
             or required_map.get("map_version") != self.state.current_map_version

@@ -5,6 +5,8 @@ PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
 MAP_DIR="${MAP_DIR:-/home/robot/.jszr/map}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_mapping_logs}"
 SLAM_CONFIG="${SLAM_CONFIG:-${PROJECT_DIR}/install/robot_slam/share/robot_slam/config/config.yaml}"
+REQUIRE_RTK="${REQUIRE_RTK:-1}"
+RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
 
 mkdir -p "${LOG_DIR}" "${MAP_DIR}"
 
@@ -12,6 +14,8 @@ set +u
 source /opt/ros/humble/setup.bash
 source "${PROJECT_DIR}/install/setup.bash"
 set -u
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 usage() {
   echo "Usage: $0 {start|save|stop|restart|status}"
@@ -52,6 +56,30 @@ wait_for_service() {
   return 1
 }
 
+ensure_rtk() {
+  if [ "${REQUIRE_RTK}" != "1" ]; then
+    return 0
+  fi
+  echo "Starting RTK/NTRIP..."
+  "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
+    cat /tmp/roamerx_rtk_start.log >&2
+    return 1
+  }
+  echo "Waiting for RTK fix on /fix..."
+  for _ in $(seq 1 "${RTK_WAIT_SECONDS}"); do
+    local status
+    status="$(timeout 3 ros2 topic echo /fix --once 2>/dev/null | awk '/status:/{getline; if ($1=="status:") print $2; exit}' || true)"
+    if [ "${status}" = "0" ] || [ "${status}" = "1" ] || [ "${status}" = "2" ]; then
+      echo "RTK/GNSS fix OK."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: RTK/GNSS did not report a valid fix within ${RTK_WAIT_SECONDS}s." >&2
+  echo "Set REQUIRE_RTK=0 to start mapping without RTK." >&2
+  return 1
+}
+
 start_mapping() {
   if pgrep -f "robot_slam.*mapping|/robot_slam/mapping|lib/robot_slam/mapping" >/dev/null 2>&1; then
     echo "Mapping node already appears to be running."
@@ -62,13 +90,21 @@ start_mapping() {
     exit 1
   fi
 
+  ensure_rtk
+
   echo "Starting SLAM mapping node..."
-  nohup bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && exec ros2 run robot_slam mapping --ros-args --params-file '${SLAM_CONFIG}'" \
-    >"${LOG_DIR}/mapping.log" 2>&1 &
+  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec '${PROJECT_DIR}/install/robot_slam/lib/robot_slam/mapping' --ros-args --params-file '${SLAM_CONFIG}'" \
+    >"${LOG_DIR}/mapping.log" 2>&1 < /dev/null &
 
   wait_for_service "/slam_state_service" 20
   echo "Switching SLAM to mapping state..."
   ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 3}" | tee "${LOG_DIR}/start_mapping.last.log"
+  sleep 2
+  if ! pgrep -f "robot_slam.*mapping|/robot_slam/mapping|lib/robot_slam/mapping" >/dev/null 2>&1; then
+    echo "ERROR: mapping process exited after switching ACTIVE. Recent log:" >&2
+    tail -n 80 "${LOG_DIR}/mapping.log" >&2 || true
+    return 1
+  fi
   echo "Mapping started. Logs: ${LOG_DIR}/mapping.log"
 }
 
@@ -97,6 +133,10 @@ status_mapping() {
   echo
   echo "Services:"
   ros2 service list 2>/dev/null | grep -E "slam_state|mapping|map" || true
+  echo
+  echo "RTK:"
+  ros2 topic info /fix 2>/dev/null || true
+  timeout 3 ros2 topic echo /rtk/ntrip_status --once 2>/dev/null | sed -n '1,40p' || true
   echo
   echo "Recent map files:"
   ls -lt "${MAP_DIR}" | head -10 || true

@@ -59,14 +59,18 @@ class EdgeMqttClient:
     def connect(self) -> None:
         properties = mqtt.Properties(mqtt.PacketTypes.CONNECT)
         properties.SessionExpiryInterval = self.config.mqtt.session_expiry_seconds
-        self.client.connect(
-            self.config.mqtt.host,
-            self.config.mqtt.port,
-            keepalive=self.config.mqtt.keepalive_seconds,
-            clean_start=False,
-            properties=properties,
-        )
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
         self.client.loop_start()
+        try:
+            self.client.connect_async(
+                self.config.mqtt.host,
+                self.config.mqtt.port,
+                keepalive=self.config.mqtt.keepalive_seconds,
+                clean_start=True,
+                properties=properties,
+            )
+        except OSError:
+            LOGGER.exception("MQTT async connect setup failed; background reconnect will continue")
 
     def disconnect(self) -> None:
         self.publish_presence("presence.offline", {"reason": "graceful_shutdown"}, retain=True)
@@ -94,7 +98,12 @@ class EdgeMqttClient:
             payload = json.loads(message.payload.decode("utf-8"))
             LOGGER.info("MQTT msg topic=%s type=%s", message.topic, payload.get("message_type", "?"))
             if message.topic.endswith("/commands") and self._command_handler:
-                self._command_handler(payload)
+                threading.Thread(
+                    target=self._command_handler,
+                    args=(payload,),
+                    daemon=True,
+                    name="mqtt-command",
+                ).start()
             elif message.topic.endswith("/sync/state") and self._sync_handler:
                 self._sync_handler(payload)
         except Exception:

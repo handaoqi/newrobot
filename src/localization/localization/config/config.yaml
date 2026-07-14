@@ -3,6 +3,7 @@ localization:
     # basic parameters
     points_topic: "/front_lidar"      # 真机: firefly 转发来的 livox 点云
     imu_topic: "/front_lidar/imu"     # 真机: 雷达内置 IMU
+    gnss_topic: "/fix"
     localization_odom_frame_id: "base_link"
     robot_odom_frame_id: "odom"
     odom_child_frame_id: "base_link"
@@ -16,9 +17,21 @@ localization:
     global_map_points_topic: "/global_map_points"
 
     # IMU parameters
-    use_imu: false
+    use_imu: true
     invert_acc: false
     invert_gyro: false
+    imu_acc_scale: 9.81 # 若 /front_lidar/imu 已是 m/s^2，实测后改为 1.0
+
+    gnss_fusion:
+      enable: true
+      gain: 0.03
+      max_correction_step: 0.25
+      max_residual: 8.0
+      max_age: 2.5
+      max_horizontal_std: 2.0
+      min_status: 0
+      use_elevation: false
+      lever_arm_base: [-0.05, 0.0, 0.15]
     
     # IMU initialization parameters
     imu_init_time: 3.0                    # IMU初始化时间(s)
@@ -50,6 +63,8 @@ localization:
     init_ori_y: 0.0
     init_ori_z: 0.0
 
+    # Livox Mid-360 manual: IMU acceleration/gyro axes are the same as point cloud axes.
+    # IMU chip position in point cloud coordinates: x=11.0mm, y=23.29mm, z=-44.12mm.
     init_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # imu安装位置的旋转矩阵
     init_T: [1.0, 0.0, 0.0, -0.011, 0.0, 1.0, 0.0, -0.02329, 0.0, 0.0, 1.0, 0.04412, 0.0, 0.0, 0.0, 1.0] # 雷达到imu的变换矩阵
 

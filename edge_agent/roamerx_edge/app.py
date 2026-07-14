@@ -11,21 +11,24 @@ from .alert_bridge import AlertBridge
 from .command_processor import CommandProcessor
 from .config import EdgeConfig
 from .local_store import LocalStore
+from .map_activation_adapter import MapActivationAdapter
 from .mapping_adapter import MappingAdapter
 from .media_client import MediaClient
 from .mqtt_client import EdgeMqttClient
+from .navigation_stack_adapter import NavigationStackAdapter
 from .protocol import build_envelope, now_iso
 from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
 from .safety_policy import RuntimeSafetyState, SafetyPolicy
 from .task_executor import TaskExecutor
 from .telemetry_collector import TelemetryCollector
+from .teleop_control_adapter import TeleopControlAdapter
 from .trajectory_buffer import TrajectoryBuffer
 
 LOGGER = logging.getLogger(__name__)
 
 
 class EdgeAgentApplication:
-    def __init__(self, config: EdgeConfig, navigation=None) -> None:
+    def __init__(self, config: EdgeConfig, navigation=None, config_path: str = "config.yaml") -> None:
         self.config = config
         self.store = LocalStore(config.storage.sqlite_path)
         self.stop_event = threading.Event()
@@ -50,8 +53,12 @@ class EdgeAgentApplication:
             navigation,
             event_callback=self.mqtt.publish_task_event,
             start_result_callback=self._publish_start_result,
+            final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
         )
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
+        self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
+        self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
+        self.teleop_control_adapter = TeleopControlAdapter(config.teleop_control)
         self.safety = SafetyPolicy(config.safety, self.safety_state)
         self.commands = CommandProcessor(
             robot_id=config.robot.id,
@@ -61,6 +68,10 @@ class EdgeAgentApplication:
             publish_ack=self.mqtt.publish_ack,
             publish_result=self.mqtt.publish_result,
             mapping_adapter=self.mapping_adapter,
+            map_activation_adapter=self.map_activation_adapter,
+            navigation_stack_adapter=self.navigation_stack_adapter,
+            localization_adapter=navigation,
+            teleop_control_adapter=self.teleop_control_adapter,
         )
         self.trajectory = TrajectoryBuffer(
             robot_id=config.robot.id,
@@ -121,16 +132,31 @@ class EdgeAgentApplication:
                     "mapping.save",
                     "mapping.cancel",
                     "mapping.status",
+                    "nav.status",
+                    "nav.start",
+                    "nav.restart",
+                    "nav.recover",
+                    "nav.stop",
+                    "nav.initial_pose",
+                    "map.activate",
+                    "teleop.takeover_enter",
+                    "teleop.takeover_exit",
+                    "teleop.stand_up",
+                    "teleop.lie_down",
+                    "teleop.move_forward",
+                    "teleop.move_backward",
+                    "teleop.move_left",
+                    "teleop.move_right",
+                    "teleop.turn_left",
+                    "teleop.turn_right",
+                    "teleop.move_stop",
+                    "teleop.passive",
                     "map.uploaded",
                     "telemetry.pose",
                     "trajectory.batch",
                     "alert.event",
                 ],
-                "current_map": {
-                    "map_id": self.config.robot.current_map_id,
-                    "map_version": self.config.robot.current_map_version,
-                    "sha256": None,
-                },
+                "current_map": self._current_map_payload(),
             },
             retain=True,
         )
@@ -168,6 +194,14 @@ class EdgeAgentApplication:
                     self.task_executor.cancel_task(self.task_executor.context.task_execution_id)
                 except Exception:
                     LOGGER.exception("failed to apply sync cancellation")
+            elif action == "hold" and self.task_executor.context:
+                try:
+                    self.task_executor.reconcile_center_state(
+                        str(payload.get("task_execution_id") or ""),
+                        payload.get("expected_task_state"),
+                    )
+                except Exception:
+                    LOGGER.exception("failed to reconcile task state from center")
             # continue/hold/report_only intentionally never auto-start motion after process restart.
 
     def _heartbeat_loop(self) -> None:
@@ -181,6 +215,7 @@ class EdgeAgentApplication:
                     "outbox_pending": self.store.outbox_count(),
                     "last_processed_command_id": None,
                     "current_task_execution_id": context.task_execution_id if context else None,
+                    "current_map": self._current_map_payload(),
                 },
             )
 
@@ -191,26 +226,29 @@ class EdgeAgentApplication:
             except Exception:
                 LOGGER.exception("failed to refresh navigation readiness")
             context = self.task_executor.context
-            self.mqtt.publish_status(
-                self.telemetry.build_status_snapshot(
-                    context.task_execution_id if context and self.task_executor.has_active_task() else None
-                )
+            snapshot = self.telemetry.build_status_snapshot(
+                context.task_execution_id if context and self.task_executor.has_active_task() else None
             )
+            snapshot["current_map"] = self._current_map_payload()
+            self.mqtt.publish_status(snapshot)
 
     def _trajectory_loop(self) -> None:
         while not self.stop_event.wait(0.5):
-            context = self.task_executor.context
-            pose = self.telemetry.latest_pose()
-            if not context or context.state != "running" or not pose:
-                continue
-            message = self.trajectory.sample(
-                context.task_execution_id,
-                self.config.robot.current_map_id,
-                self.config.robot.current_map_version,
-                pose,
-            )
-            if message:
-                self.mqtt.replay_outbox()
+            try:
+                context = self.task_executor.context
+                pose = self.telemetry.latest_pose()
+                if not context or context.state != "running" or not pose:
+                    continue
+                message = self.trajectory.sample(
+                    context.task_execution_id,
+                    self.config.robot.current_map_id,
+                    self.config.robot.current_map_version,
+                    pose,
+                )
+                if message:
+                    self.mqtt.replay_outbox()
+            except Exception:
+                LOGGER.exception("failed to sample trajectory")
 
     def _outbox_loop(self) -> None:
         while not self.stop_event.wait(2):
@@ -243,6 +281,9 @@ class EdgeAgentApplication:
         except OSError:
             return str(uuid.uuid4())
 
+    def _current_map_payload(self) -> dict:
+        return self.map_activation_adapter.status()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RoamerX Edge Agent")
@@ -252,7 +293,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    app = EdgeAgentApplication(EdgeConfig.load(args.config))
+    app = EdgeAgentApplication(EdgeConfig.load(args.config), config_path=args.config)
 
     def stop(*_args):
         app.stop_event.set()

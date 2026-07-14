@@ -36,7 +36,10 @@ bool GlobalLocalization::performGlobalLocalization(
     pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
     icp.setInputTarget(global_map);
     icp.setInputSource(current_cloud_ds);
-    icp.setMaximumIterations(100);
+    // Global localization is a startup fallback, not a continuous tracker.
+    // Keep the one-shot search bounded so a bad initial pose cannot block the
+    // lidar callback for an extended period.
+    icp.setMaximumIterations(30);
     icp.setTransformationEpsilon(1e-6);
 
     pcl::PointCloud<pcl::PointXYZI> aligned_cloud;
@@ -61,7 +64,11 @@ bool GlobalLocalization::performGlobalLocalization(
     RCLCPP_INFO(logger_, "ICP fitness score 2: %.6f", fitness_score);
     pcl::transformPointCloud(*current_cloud_ds, *current_cloud_ds, T_corr_second);
 
-    Eigen::Matrix4d T_corr_final = T_corr_second.cast<double>() * T_corr_current.cast<double>();
+    // ICP aligns the cloud after it has already been transformed by the
+    // supplied initial pose. Preserve that initial map-frame transform when
+    // returning the refined pose.
+    Eigen::Matrix4d T_corr_final =
+        T_corr_second.cast<double>() * T_corr_current.cast<double>() * initial_trans;
 
     Eigen::Vector3d current_position = T_corr_final.block<3, 1>(0, 3);
     if (init_check_count_ > 0) {

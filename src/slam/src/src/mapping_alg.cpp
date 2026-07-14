@@ -9,8 +9,40 @@
 
 #include "mapping_alg.h"
 
+#include <cmath>
+#include <unordered_set>
+
 namespace robot::slam
 {
+    DynamicFilterVoxelKey makeDynamicFilterVoxelKey(const PointType& point, double voxel_size)
+    {
+        return DynamicFilterVoxelKey{
+            static_cast<int>(std::floor(point.x / voxel_size)),
+            static_cast<int>(std::floor(point.y / voxel_size)),
+            static_cast<int>(std::floor(point.z / voxel_size))
+        };
+    }
+
+    std::string makeMapSubdir(const std::string& data_path)
+    {
+        auto now = std::chrono::system_clock::now();
+        auto now_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+
+        std::ostringstream timestamp_ss;
+        timestamp_ss << std::put_time(std::localtime(&now_t), "%Y%m%d_%H%M%S")
+                     << "_" << std::setw(3) << std::setfill('0') << ms;
+
+        std::string base = data_path + "/" + timestamp_ss.str();
+        std::string candidate = base;
+        int suffix = 1;
+        while (std::filesystem::exists(candidate))
+        {
+            candidate = base + "_" + std::to_string(suffix++);
+        }
+        return candidate;
+    }
+
     MappingAlg::MappingAlg(const rclcpp::NodeOptions& options)
         : Node("laser_mapping", options)
     {
@@ -21,6 +53,7 @@ namespace robot::slam
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.gnss_topic", "/fix");
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
@@ -42,22 +75,43 @@ namespace robot::slam
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<bool>("gnss_fusion.enable", false);
+        this->declare_parameter<double>("gnss_fusion.gain", 0.03);
+        this->declare_parameter<double>("gnss_fusion.max_correction_step", 0.25);
+        this->declare_parameter<double>("gnss_fusion.max_residual", 8.0);
+        this->declare_parameter<double>("gnss_fusion.max_age", 2.5);
+        this->declare_parameter<double>("gnss_fusion.max_horizontal_std", 2.0);
+        this->declare_parameter<int>("gnss_fusion.min_status", 0);
+        this->declare_parameter<bool>("gnss_fusion.use_elevation", false);
+        this->declare_parameter<vector<double>>("gnss_fusion.lever_arm_base", vector<double>({ -0.05, 0.0, 0.15 }));
 
         this->declare_parameter<string>("pcd2pgm.file_name", "map");
         this->declare_parameter<double>("pcd2pgm.thre_z_min", 0.2);
         this->declare_parameter<double>("pcd2pgm.thre_z_max", 2.0);
         this->declare_parameter<int>("pcd2pgm.flag_pass_through", 0);
         this->declare_parameter<double>("pcd2pgm.map_resolution", 0.05);
-        this->declare_parameter<double>("pcd2pgm.thre_radius", 0.1);
-        this->declare_parameter<int>("pcd2pgm.thres_point_count", 10);
+        this->declare_parameter<bool>("dynamic_filter.enable", true);
+        this->declare_parameter<double>("dynamic_filter.voxel_size", 0.20);
+        this->declare_parameter<int>("dynamic_filter.min_scan_observations", 3);
+        this->declare_parameter<bool>("keyframe_record.enable", true);
+        this->declare_parameter<double>("keyframe_record.min_distance_m", 0.8);
+        this->declare_parameter<double>("keyframe_record.min_yaw_rad", 0.35);
+        this->declare_parameter<double>("keyframe_record.max_interval_s", 2.0);
+        this->declare_parameter<double>("keyframe_record.voxel_size_m", 0.25);
 
         this->get_parameter_or<string>("pcd2pgm.file_name", pcd2pgm_options_.file_name, "map");
         this->get_parameter_or<double>("pcd2pgm.thre_z_min", pcd2pgm_options_.thre_z_min, 0.2);
         this->get_parameter_or<double>("pcd2pgm.thre_z_max", pcd2pgm_options_.thre_z_max, 2.0);
         this->get_parameter_or<int>("pcd2pgm.flag_pass_through", pcd2pgm_options_.flag_pass_through, 0);
         this->get_parameter_or<double>("pcd2pgm.map_resolution", pcd2pgm_options_.map_resolution, 0.05);
-        this->get_parameter_or<double>("pcd2pgm.thre_radius", pcd2pgm_options_.thre_radius, 0.1);
-        this->get_parameter_or<int>("pcd2pgm.thres_point_count", pcd2pgm_options_.thres_point_count, 10);
+        this->get_parameter_or<bool>("dynamic_filter.enable", dynamic_filter_enable_, true);
+        this->get_parameter_or<double>("dynamic_filter.voxel_size", dynamic_filter_voxel_size_, 0.20);
+        this->get_parameter_or<int>("dynamic_filter.min_scan_observations", dynamic_filter_min_scan_observations_, 3);
+        this->get_parameter_or<bool>("keyframe_record.enable", keyframe_record_enable_, true);
+        this->get_parameter_or<double>("keyframe_record.min_distance_m", keyframe_min_distance_m_, 0.8);
+        this->get_parameter_or<double>("keyframe_record.min_yaw_rad", keyframe_min_yaw_rad_, 0.35);
+        this->get_parameter_or<double>("keyframe_record.max_interval_s", keyframe_max_interval_s_, 2.0);
+        this->get_parameter_or<double>("keyframe_record.voxel_size_m", keyframe_voxel_size_m_, 0.25);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -66,6 +120,7 @@ namespace robot::slam
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
+        this->get_parameter_or<string>("common.gnss_topic", gnss_topic, "/fix");
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
         this->get_parameter_or<double>("filter_size_surf", filter_size_surf_min, 0.5);
@@ -87,6 +142,20 @@ namespace robot::slam
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("gnss_fusion.enable", use_gnss_fusion_, false);
+        this->get_parameter_or<double>("gnss_fusion.gain", gnss_fusion_gain_, 0.03);
+        this->get_parameter_or<double>("gnss_fusion.max_correction_step", gnss_max_correction_step_, 0.25);
+        this->get_parameter_or<double>("gnss_fusion.max_residual", gnss_max_residual_, 8.0);
+        this->get_parameter_or<double>("gnss_fusion.max_age", gnss_max_age_, 2.5);
+        this->get_parameter_or<double>("gnss_fusion.max_horizontal_std", gnss_max_horizontal_std_, 2.0);
+        this->get_parameter_or<int>("gnss_fusion.min_status", gnss_min_status_, 0);
+        this->get_parameter_or<bool>("gnss_fusion.use_elevation", gnss_use_elevation_, false);
+        std::vector<double> gnss_lever_arm;
+        this->get_parameter_or<vector<double>>("gnss_fusion.lever_arm_base", gnss_lever_arm, vector<double>({ -0.05, 0.0, 0.15 }));
+        if (gnss_lever_arm.size() >= 3)
+        {
+            gnss_lever_arm_base_ << gnss_lever_arm[0], gnss_lever_arm[1], gnss_lever_arm[2];
+        }
 
 #ifdef ROOT_DIR
         data_path_ = std::string(ROOT_DIR) + "/map";
@@ -133,6 +202,12 @@ namespace robot::slam
 
         sub_imu_ptr_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
+        if (use_gnss_fusion_)
+        {
+            sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+                gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+            RCLCPP_INFO(this->get_logger(), "GNSS weak fusion enabled, topic=%s, gain=%.3f", gnss_topic.c_str(), gnss_fusion_gain_);
+        }
         pubLaserCloudFull_      = this->create_publisher<sensor_msgs::msg::PointCloud2>("/world_points", rclcpp::QoS(20).best_effort());
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/body_points", 20);
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
@@ -214,6 +289,14 @@ namespace robot::slam
         memset(point_selected_surf, true, sizeof(point_selected_surf));
 
         p_imu->reset();
+        std::lock_guard<std::mutex> gnss_lock(gnss_mutex_);
+        has_gnss_                    = false;
+        gnss_origin_initialized_     = false;
+        gnss_correction_count_       = 0;
+        dynamic_filter_scan_observations_.clear();
+        mapping_keyframes_.clear();
+        has_last_keyframe_ = false;
+        last_keyframe_stamp_ = 0.0;
 
         state_ikfom state_updated;
         state_updated.pos = Zero3d;
@@ -348,6 +431,102 @@ namespace robot::slam
 
         mtx_buffer.unlock();
         sig_buffer.notify_all();
+    }
+
+    void MappingAlg::gnssCallBack(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(gnss_mutex_);
+        latest_gnss_ = *msg;
+        has_gnss_    = true;
+    }
+
+    Vec3d MappingAlg::llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const
+    {
+        constexpr double kEarthRadiusM = 6378137.0;
+        constexpr double kDegToRad     = M_PI / 180.0;
+        const double     d_lat         = (latitude_deg - gnss_origin_lat_) * kDegToRad;
+        const double     d_lon         = (longitude_deg - gnss_origin_lon_) * kDegToRad;
+        const double     lat0          = gnss_origin_lat_ * kDegToRad;
+        return Vec3d(d_lon * std::cos(lat0) * kEarthRadiusM, d_lat * kEarthRadiusM, altitude_m - gnss_origin_alt_);
+    }
+
+    bool MappingAlg::gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos)
+    {
+        if (msg.status.status < gnss_min_status_)
+            return false;
+        if (std::fabs(msg.latitude) < 1e-7 || std::fabs(msg.longitude) < 1e-7)
+            return false;
+        const double h_std = std::sqrt(std::max(msg.position_covariance[0], msg.position_covariance[4]));
+        if (h_std > gnss_max_horizontal_std_)
+            return false;
+
+        if (!gnss_origin_initialized_)
+        {
+            gnss_origin_lat_         = msg.latitude;
+            gnss_origin_lon_         = msg.longitude;
+            gnss_origin_alt_         = msg.altitude;
+            const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
+            gnss_map_offset_         = estimated_gps;
+            gnss_origin_initialized_ = true;
+            RCLCPP_INFO(this->get_logger(), "GNSS origin initialized lat=%.9f lon=%.9f alt=%.3f", gnss_origin_lat_, gnss_origin_lon_,
+                gnss_origin_alt_);
+        }
+
+        map_pos = llaToEnu(msg.latitude, msg.longitude, msg.altitude) + gnss_map_offset_;
+        return true;
+    }
+
+    void MappingAlg::applyGnssCorrection(double lidar_time)
+    {
+        if (!use_gnss_fusion_ || !flg_EKF_inited)
+            return;
+
+        sensor_msgs::msg::NavSatFix gnss;
+        {
+            std::lock_guard<std::mutex> lock(gnss_mutex_);
+            if (!has_gnss_)
+                return;
+            gnss = latest_gnss_;
+        }
+
+        const double gnss_time = get_time_sec(gnss.header.stamp);
+        if (std::fabs(lidar_time - gnss_time) > gnss_max_age_)
+            return;
+
+        Vec3d gnss_gps_map;
+        if (!gnssToMap(gnss, gnss_gps_map))
+            return;
+
+        const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
+        Vec3d       residual      = gnss_gps_map - estimated_gps;
+        if (!gnss_use_elevation_)
+            residual(2) = 0.0;
+
+        const double residual_norm = residual.norm();
+        if (residual_norm > gnss_max_residual_)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                "Reject GNSS correction: residual %.2fm exceeds %.2fm", residual_norm, gnss_max_residual_);
+            return;
+        }
+
+        Vec3d correction = residual * gnss_fusion_gain_;
+        const double correction_norm = correction.norm();
+        if (correction_norm > gnss_max_correction_step_)
+        {
+            correction *= gnss_max_correction_step_ / correction_norm;
+        }
+
+        if (correction.norm() < 1e-4)
+            return;
+
+        state_ikfom corrected = state_point;
+        corrected.pos += correction;
+        kf.change_x(corrected);
+        state_point = corrected;
+        gnss_correction_count_++;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "GNSS weak correction #%d residual=%.2fm step=%.3fm", gnss_correction_count_, residual_norm, correction.norm());
     }
 
     void MappingAlg::imuCallBack(const sensor_msgs::msg::Imu::UniquePtr msg_in)
@@ -493,7 +672,25 @@ namespace robot::slam
         {
             pointsBody2World(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
         }
+
+        if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0)
+        {
+            std::unordered_set<DynamicFilterVoxelKey, DynamicFilterVoxelKeyHash> observed_this_scan;
+            observed_this_scan.reserve(laserCloudWorld->size());
+            for (const auto& point : laserCloudWorld->points)
+            {
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+                    continue;
+                observed_this_scan.insert(makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_));
+            }
+            for (const auto& key : observed_this_scan)
+            {
+                dynamic_filter_scan_observations_[key]++;
+            }
+        }
+
         *pcl_wait_pub += *laserCloudWorld;
+        recordKeyframe(laserCloudWorld);
         if (pub_world_points_flag_)
         {
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
@@ -502,6 +699,53 @@ namespace robot::slam
             laserCloudmsg.header.frame_id = "map";
             pubLaserCloudFull->publish(laserCloudmsg);
         }
+    }
+
+    void MappingAlg::recordKeyframe(const CloudPtr& cloud_world)
+    {
+        if (!keyframe_record_enable_ || !cloud_world || cloud_world->empty())
+            return;
+        const Vec3d lidar_origin = state_point.rot * state_point.offset_T_L_I + state_point.pos;
+        const auto rotation = state_point.rot.toRotationMatrix();
+        const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+        const double distance = has_last_keyframe_ ? (lidar_origin - last_keyframe_origin_).norm() : std::numeric_limits<double>::infinity();
+        const double elapsed = has_last_keyframe_ ? lidar_end_time - last_keyframe_stamp_ : std::numeric_limits<double>::infinity();
+        double yaw_delta = std::fabs(yaw - last_keyframe_yaw_);
+        yaw_delta = std::min(yaw_delta, 2.0 * M_PI - yaw_delta);
+        if (has_last_keyframe_ && distance < keyframe_min_distance_m_ && yaw_delta < keyframe_min_yaw_rad_ && elapsed < keyframe_max_interval_s_)
+            return;
+
+        auto keyframe_cloud = CloudPtr(new PointCloudType());
+        pcl::VoxelGrid<PointType> downsample;
+        downsample.setInputCloud(cloud_world);
+        downsample.setLeafSize(keyframe_voxel_size_m_, keyframe_voxel_size_m_, keyframe_voxel_size_m_);
+        downsample.filter(*keyframe_cloud);
+        mapping_keyframes_.push_back({ lidar_end_time, lidar_origin, keyframe_cloud });
+        last_keyframe_origin_ = lidar_origin;
+        last_keyframe_yaw_ = yaw;
+        last_keyframe_stamp_ = lidar_end_time;
+        has_last_keyframe_ = true;
+    }
+
+    void MappingAlg::saveKeyframes(const std::string& map_subdir) const
+    {
+        if (mapping_keyframes_.empty())
+            return;
+        const std::filesystem::path keyframe_dir = std::filesystem::path(map_subdir) / "keyframes";
+        std::filesystem::create_directories(keyframe_dir);
+        std::ofstream poses(keyframe_dir / "keyframes.csv", std::ios::out | std::ios::trunc);
+        poses << "index,stamp,x,y,z\n";
+        pcl::PCDWriter writer;
+        for (std::size_t index = 0; index < mapping_keyframes_.size(); ++index)
+        {
+            const auto& keyframe = mapping_keyframes_[index];
+            std::ostringstream name;
+            name << "scan_" << std::setw(5) << std::setfill('0') << index << ".pcd";
+            writer.writeBinary((keyframe_dir / name.str()).string(), *keyframe.cloud_world);
+            poses << index << ',' << std::fixed << std::setprecision(6) << keyframe.stamp << ','
+                  << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ',' << keyframe.lidar_origin(2) << '\n';
+        }
+        RCLCPP_INFO(get_logger(), "Saved %zu mapping keyframes to %s", mapping_keyframes_.size(), keyframe_dir.c_str());
     }
 
     void MappingAlg::pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -778,6 +1022,8 @@ namespace robot::slam
                 double solve_H_time = 0;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
+                applyGnssCorrection(Measures.lidar_end_time);
+                state_point = kf.get_x();
                 euler_cur   = SO3ToEuler(state_point.rot);
                 pos_lid     = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 geoQuat.x   = state_point.rot.coeffs()[0];
@@ -816,12 +1062,9 @@ namespace robot::slam
     {
         if (pcl_wait_pub->size() > 0)
         {
-            // 按时间戳创建子目录，避免覆盖旧地图
-            auto now = std::chrono::system_clock::now();
-            auto now_t = std::chrono::system_clock::to_time_t(now);
-            std::ostringstream timestamp_ss;
-            timestamp_ss << std::put_time(std::localtime(&now_t), "%Y%m%d_%H%M%S");
-            string map_subdir = data_path_ + "/" + timestamp_ss.str();
+            // Use millisecond timestamp and collision suffix to avoid multiple
+            // mapping nodes racing on the same output directory.
+            string map_subdir = makeMapSubdir(data_path_);
 
             if (!checkDirExist(map_subdir))
             {
@@ -829,13 +1072,54 @@ namespace robot::slam
                 return;
             }
 
-            string pcd_file = map_subdir + "/map.pcd";
             pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to " << pcd_file << endl;
-            pcd_writer.writeBinary(pcd_file, *pcl_wait_pub);
+            saveKeyframes(map_subdir);
+            string raw_pcd_file = map_subdir + "/map.raw_dynamic_unfiltered.pcd";
+            cout << "raw scan saved to " << raw_pcd_file << endl;
+            pcd_writer.writeBinary(raw_pcd_file, *pcl_wait_pub);
+
+            PointCloudType::Ptr map_cloud = pcl_wait_pub;
+            PointCloudType::Ptr dynamic_filtered_cloud(new PointCloudType());
+            if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0 && dynamic_filter_min_scan_observations_ > 1)
+            {
+                dynamic_filtered_cloud->reserve(pcl_wait_pub->size());
+                for (const auto& point : pcl_wait_pub->points)
+                {
+                    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+                        continue;
+                    auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
+                    auto iter = dynamic_filter_scan_observations_.find(key);
+                    if (iter != dynamic_filter_scan_observations_.end()
+                        && iter->second >= dynamic_filter_min_scan_observations_)
+                    {
+                        dynamic_filtered_cloud->push_back(point);
+                    }
+                }
+                dynamic_filtered_cloud->width = static_cast<uint32_t>(dynamic_filtered_cloud->size());
+                dynamic_filtered_cloud->height = 1;
+                dynamic_filtered_cloud->is_dense = false;
+                map_cloud = dynamic_filtered_cloud;
+
+                const double keep_ratio = pcl_wait_pub->empty()
+                    ? 0.0
+                    : static_cast<double>(dynamic_filtered_cloud->size()) / static_cast<double>(pcl_wait_pub->size());
+                RCLCPP_INFO(get_logger(),
+                    "Dynamic map filter: raw=%zu filtered=%zu removed=%zu keep_ratio=%.3f voxel=%.3f min_scan_observations=%d observed_voxels=%zu",
+                    pcl_wait_pub->size(),
+                    dynamic_filtered_cloud->size(),
+                    pcl_wait_pub->size() - dynamic_filtered_cloud->size(),
+                    keep_ratio,
+                    dynamic_filter_voxel_size_,
+                    dynamic_filter_min_scan_observations_,
+                    dynamic_filter_scan_observations_.size());
+            }
+
+            string pcd_file = map_subdir + "/map.pcd";
+            cout << "filtered scan saved to " << pcd_file << endl;
+            pcd_writer.writeBinary(pcd_file, *map_cloud);
 
             string pcd2grid_dir = map_subdir + "/map";
-            pcd2grid_ptr_->run(pcl_wait_pub, pcd2grid_dir);
+            pcd2grid_ptr_->run(map_cloud, pcd2grid_dir);
 
             std::ofstream ofs;
             std::string   path_file = map_subdir + "/map.txt";
@@ -854,6 +1138,31 @@ namespace robot::slam
                 ofs << std::fixed << std::setprecision(2) << p.pose.position.x << " " << p.pose.position.y << " " << theta << std::endl;
             }
             ofs.close();
+
+            if (gnss_origin_initialized_)
+            {
+                std::ofstream meta_ofs(map_subdir + "/gnss_origin.yaml", std::ios::out | std::ios::trunc);
+                if (meta_ofs.is_open())
+                {
+                    meta_ofs << "rtk_enabled: true\n";
+                    meta_ofs << "datum: CGCS2000\n";
+                    meta_ofs << std::fixed << std::setprecision(10);
+                    meta_ofs << "origin_latitude: " << gnss_origin_lat_ << "\n";
+                    meta_ofs << "origin_longitude: " << gnss_origin_lon_ << "\n";
+                    meta_ofs << std::setprecision(4);
+                    meta_ofs << "origin_altitude: " << gnss_origin_alt_ << "\n";
+                    meta_ofs << "map_offset:\n";
+                    meta_ofs << "  x: " << gnss_map_offset_(0) << "\n";
+                    meta_ofs << "  y: " << gnss_map_offset_(1) << "\n";
+                    meta_ofs << "  z: " << gnss_map_offset_(2) << "\n";
+                    meta_ofs << "gps_link:\n";
+                    meta_ofs << "  x: " << gnss_lever_arm_base_(0) << "\n";
+                    meta_ofs << "  y: " << gnss_lever_arm_base_(1) << "\n";
+                    meta_ofs << "  z: " << gnss_lever_arm_base_(2) << "\n";
+                    meta_ofs << "gnss_corrections: " << gnss_correction_count_ << "\n";
+                    meta_ofs.close();
+                }
+            }
 
             RCLCPP_INFO(get_logger(), "Save Map Success to %s", map_subdir.c_str());
         }

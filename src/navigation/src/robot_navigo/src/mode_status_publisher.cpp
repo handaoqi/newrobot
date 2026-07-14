@@ -9,11 +9,19 @@ class ModeStatusPublisher : public rclcpp::Node
 public:
     ModeStatusPublisher() : Node("mode_status_publisher"), current_mode_(170), received_first_cmd_vel_(false)
     {
+        this->declare_parameter("nav_mode_linger_ms", 60000);
+        this->get_parameter("nav_mode_linger_ms", nav_mode_linger_ms_);
+
         publisher_ = this->create_publisher<std_msgs::msg::Int32>("/mode_switch_cmd", 10);
 
         timer_ = this->create_wall_timer(1s, std::bind(&ModeStatusPublisher::PublishStatus, this));
 
-        cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", 10, std::bind(&ModeStatusPublisher::cmdVelCallback, this, std::placeholders::_1));
+        cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/cmd_vel", 10,
+            std::bind(&ModeStatusPublisher::cmdVelCallback, this, std::placeholders::_1));
+        cmd_vel_raw_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/cmd_vel_raw", 10,
+            std::bind(&ModeStatusPublisher::cmdVelCallback, this, std::placeholders::_1));
 
         last_cmd_vel_time_ = this->now();
 
@@ -28,7 +36,7 @@ private:
         if (!received_first_cmd_vel_)
         {
             received_first_cmd_vel_ = true;
-            RCLCPP_INFO(this->get_logger(), "First /cmd_vel received, ready to switch to NAVIGATION when active");
+            RCLCPP_INFO(this->get_logger(), "First velocity command received, ready to switch to NAVIGATION when active");
         }
 
         if (current_mode_ != 171)
@@ -48,7 +56,7 @@ private:
 
         if (received_first_cmd_vel_)
         {
-            if (elapsed < rclcpp::Duration(1s))
+            if (elapsed.nanoseconds() < static_cast<int64_t>(nav_mode_linger_ms_) * 1000000)
             {
                 new_mode = 171;
             }
@@ -71,7 +79,7 @@ private:
             }
             else
             {
-                RCLCPP_INFO(this->get_logger(), "Swtiching to CONTROL mode (170)");
+                RCLCPP_INFO(this->get_logger(), "Switching to CONTROL mode (170)");
             }
         }
 
@@ -88,9 +96,11 @@ private:
 private:
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr publisher_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_raw_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     int current_mode_;
+    int nav_mode_linger_ms_ = 60000;
     bool received_first_cmd_vel_;
     rclcpp::Time last_cmd_vel_time_;
 };

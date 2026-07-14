@@ -17,6 +17,7 @@ mqtt:
 
 ros:
   localization_topic: "/localization_info"
+  scan_matching_status_topic: "/status"
   odometry_topic: "/odom/localization_odom"
   battery_topic: ""
   follow_waypoints_action: "/follow_waypoints"
@@ -52,3 +53,23 @@ mapping:
   save_data: 5
   command_timeout_seconds: 15
   save_wait_seconds: 8
+  dynamic_filter_enabled: true
+  dynamic_filter_voxel_size_m: 0.12
+  dynamic_filter_min_points_per_voxel: 3
+  dynamic_filter_clear_radius_cells: 1
+  visibility_filter_enabled: true
+  visibility_filter_voxel_size_m: 0.3
+  visibility_filter_min_free_observations: 1
+  visibility_filter_max_hit_observations: 10
+  visibility_filter_output_suffix: keyframe_visibility_loose03x
+  auto_activate_uploaded_map: true
+  upload_point_cloud: false
+  preview_max_size: 1200
+
+navigation_stack:
+  script_path: "/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh"
+  command_timeout_seconds: 45
+
+teleop_control:
+  script_path: "/home/robot/genisom_roamerx_open/script/robot/start_teleop_control.sh"
+  command_timeout_seconds: 20

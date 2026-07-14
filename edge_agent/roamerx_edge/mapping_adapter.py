@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import signal
 import subprocess
 import time
 import uuid
@@ -11,6 +14,8 @@ from pathlib import Path
 LOGGER = logging.getLogger(__name__)
 
 from .config import MappingConfig
+from .keyframe_visibility_filter import filter_with_keyframe_visibility
+from .map_preview import generate_map_preview
 from .media_client import MediaClient
 from .protocol import ProtocolError, now_iso
 
@@ -35,7 +40,15 @@ class MappingAdapter:
     """
 
     REQUIRED_FILES = ("map.yaml", "map.pgm")
-    OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt")
+    OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt", "gnss_origin.yaml")
+    SAVE_OUTPUT_TIMEOUT_SECONDS = 180
+    SLAM_PROCESS_PATTERNS = (
+        "robot_slam.*mapping",
+        "/robot_slam/mapping",
+        "lib/robot_slam/mapping",
+        "ros2 launch robot_slam",
+        "slam.launch.py",
+    )
 
     def __init__(self, config: MappingConfig, media_client: MediaClient) -> None:
         self.config = config
@@ -44,9 +57,23 @@ class MappingAdapter:
         self.session: MappingSession | None = None
         self._slam_process: subprocess.Popen | None = None
 
+    @property
+    def _slam_process_alive(self) -> bool:
+        return self._slam_process is not None and self._slam_process.poll() is None
+
+    @property
+    def _any_slam_process_alive(self) -> bool:
+        return self._slam_process_alive or bool(self._find_slam_process_pids())
+
     def start_mapping(self, command: dict) -> dict:
+        # 如果有残留 session 但 SLAM 进程已死（崩溃/中断），自动清理
         if self.session and self.session.state in {"starting", "mapping", "saving", "packaging", "uploading"}:
-            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping session is already active")
+            if self._slam_process_alive:
+                raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping session is already active")
+            LOGGER.warning("Stale session '%s' (state=%s) detected with dead SLAM process — cleaning up", self.session.session_id, self.session.state)
+            self._cleanup()
+        if not self.session and self._any_slam_process_alive:
+            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping process is already running")
         session_id = command.get("mapping_session_id") or str(uuid.uuid4())
         map_name = command.get("map_name") or f"现场地图 {time.strftime('%Y%m%d-%H%M%S')}"
         self.session = MappingSession(
@@ -65,11 +92,22 @@ class MappingAdapter:
 
     def save_mapping(self, command: dict) -> dict:
         if not self.session:
+            if self._any_slam_process_alive:
+                LOGGER.warning("save_mapping found running SLAM without active session — recovering session and saving")
+                self.session = MappingSession(
+                    session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
+                    map_name=command.get("map_name") or f"现场地图 {time.strftime('%Y%m%d-%H%M%S')}",
+                    route_hint=command.get("route_hint", ""),
+                    state="saving",
+                    started_at=now_iso(),
+                    updated_at=now_iso(),
+                )
+                return self._save_active_mapping(command)
             # 同步模式：无活跃建图会话时，直接打包最近已有的地图文件并上传
             LOGGER.info("save_mapping called without active session — treating as sync")
-            session_dir = self._find_latest_session_dir()
+            session_dir = self._find_latest_session_dir(require_complete=True)
             if not session_dir:
-                raise ProtocolError("NO_MAP_FILES", "no previous mapping output found (no session dirs)")
+                raise ProtocolError("NO_MAP_FILES", "no previous complete mapping output found")
             work_dir = session_dir
             self._validate_map_files(work_dir)
             package_path, metadata = self._package_map(command, work_dir)
@@ -79,18 +117,24 @@ class MappingAdapter:
             result["upload_result"] = upload_result
             return result
 
+        return self._save_active_mapping(command)
+
+    def _save_active_mapping(self, command: dict) -> dict:
         self._set_state("saving")
+        save_started_at = time.time()
         self._call_map_state(self.config.save_data)
-        time.sleep(max(0, self.config.save_wait_seconds))
-        # SLAM may write output into a timestamped subdirectory (YYYYMMDD_HHMMSS)
-        session_dir = self._find_latest_session_dir()
-        work_dir = session_dir or self.map_dir
+        # SLAM writes yaml/pgm asynchronously after the save service returns.
+        # Wait for an output touched after this save command instead of falling
+        # back to an older complete map directory.
+        work_dir = self._wait_for_complete_map_dir(save_started_at)
         self._validate_map_files(work_dir)
         self._set_state("packaging")
         package_path, metadata = self._package_map(command, work_dir)
         self._set_state("uploading")
         upload_result = self.media_client.upload_map_package(str(package_path), metadata)
-        self._set_state("completed")
+        self._set_state("stopping")
+        self._stop_slam_process()
+        self._set_state("exited")
         result = self.status()
         result["package_path"] = str(package_path)
         result["upload_result"] = upload_result
@@ -99,15 +143,22 @@ class MappingAdapter:
     def cancel_mapping(self, command: dict) -> dict:
         if self.session:
             self._set_state("cancelled")
+        self._stop_slam_process()
         return self.status()
 
     def status(self) -> dict:
-        files = {}
-        for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
-            path = self.map_dir / name
-            files[name] = {"exists": path.exists(), "size": path.stat().st_size if path.exists() else 0}
+        latest_session_dir = self._find_latest_session_dir(require_complete=True)
+        files = self._file_snapshot(latest_session_dir or self.map_dir)
         if not self.session:
-            return {"state": "idle", "files": files}
+            return {
+                "state": "idle",
+                "map_dir": str(self.map_dir),
+                "active_map_dir": str(latest_session_dir or self.map_dir),
+                "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
+                "process_alive": self._any_slam_process_alive,
+                "slam_pids": self._find_slam_process_pids(),
+                "files": files,
+            }
         return {
             "mapping_session_id": self.session.session_id,
             "map_name": self.session.map_name,
@@ -116,8 +167,17 @@ class MappingAdapter:
             "started_at": self.session.started_at,
             "updated_at": self.session.updated_at,
             "map_dir": str(self.map_dir),
+            "active_map_dir": str(latest_session_dir or self.map_dir),
+            "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
+            "process_alive": self._any_slam_process_alive,
+            "slam_pids": self._find_slam_process_pids(),
             "files": files,
         }
+
+    def _cleanup(self) -> None:
+        """Kill orphaned SLAM process and reset session state."""
+        self._stop_slam_process()
+        self.session = None
 
     def _ensure_slam_process(self) -> None:
         if self._slam_process and self._slam_process.poll() is None:
@@ -147,54 +207,250 @@ class MappingAdapter:
             raise ProtocolError("MAPPING_SERVICE_FAILED", output.strip() or "ros2 service call failed")
         return output
 
-    def _find_latest_session_dir(self) -> Path | None:
-        """Find the most recent SLAM output subdirectory (YYYYMMDD_HHMMSS format)."""
+    def _find_latest_session_dir(
+        self,
+        *,
+        require_complete: bool = False,
+        min_mtime: float | None = None,
+    ) -> Path | None:
+        """Find the most recent SLAM output directory.
+
+        The mapping node normally uses ``YYYYMMDD_HHMMSS``.  When two saves
+        occur in the same second it appends a millisecond suffix, for example
+        ``YYYYMMDD_HHMMSS_960``; both forms are valid map sessions.
+        """
         dirs = []
         for entry in self.map_dir.iterdir():
-            if entry.is_dir() and len(entry.name) == 15 and entry.name[8] == "_":
-                try:
-                    time.strptime(entry.name, "%Y%m%d_%H%M%S")
-                    dirs.append(entry)
-                except ValueError:
-                    pass
-        return max(dirs, key=lambda d: d.stat().st_mtime) if dirs else None
+            if not self._is_session_dir(entry):
+                continue
+            if require_complete and not self._has_required_files(entry):
+                continue
+            if min_mtime is not None and self._latest_file_mtime(entry) < min_mtime:
+                continue
+            dirs.append(entry)
+        return max(dirs, key=self._latest_file_mtime) if dirs else None
+
+    def _wait_for_complete_map_dir(self, min_mtime: float | None = None) -> Path:
+        deadline = time.monotonic() + max(
+            self.SAVE_OUTPUT_TIMEOUT_SECONDS,
+            int(self.config.save_wait_seconds),
+        )
+        last_missing: list[str] = []
+        while time.monotonic() < deadline:
+            session_dir = self._find_latest_session_dir(require_complete=True, min_mtime=min_mtime)
+            if session_dir:
+                return session_dir
+            latest = self._find_latest_session_dir()
+            base = latest or self.map_dir
+            last_missing = self._missing_required_files(base)
+            time.sleep(1)
+        raise ProtocolError("MAPPING_FILES_MISSING", f"missing map files: {', '.join(last_missing or self.REQUIRED_FILES)}")
+
+    def _latest_file_mtime(self, base: Path) -> float:
+        mtimes = [base.stat().st_mtime]
+        for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
+            path = base / name
+            if path.exists():
+                mtimes.append(path.stat().st_mtime)
+        return max(mtimes)
 
     def _validate_map_files(self, work_dir: Path | None = None) -> None:
         base = work_dir or self.map_dir
-        missing = [name for name in self.REQUIRED_FILES if not (base / name).exists()]
+        missing = self._missing_required_files(base)
         if missing:
             raise ProtocolError("MAPPING_FILES_MISSING", f"missing map files: {', '.join(missing)}")
 
+    def _missing_required_files(self, base: Path) -> list[str]:
+        return [name for name in self.REQUIRED_FILES if not (base / name).exists()]
+
+    def _has_required_files(self, base: Path) -> bool:
+        return not self._missing_required_files(base)
+
+    def _is_session_dir(self, path: Path) -> bool:
+        if not path.is_dir():
+            return False
+        if not re.fullmatch(r"\d{8}_\d{6}(?:_\d{3})?", path.name):
+            return False
+        timestamp = path.name[:15]
+        try:
+            time.strptime(timestamp, "%Y%m%d_%H%M%S")
+            return True
+        except ValueError:
+            return False
+
+    def _file_snapshot(self, base: Path) -> dict:
+        files = {}
+        for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
+            path = base / name
+            files[name] = {
+                "exists": path.exists(),
+                "size": path.stat().st_size if path.exists() else 0,
+                "path": str(path),
+                "is_symlink": path.is_symlink(),
+            }
+        return files
+
     def _package_map(self, command: dict, work_dir: Path | None = None) -> tuple[Path, dict]:
         base = work_dir or self.map_dir
+        if not self._is_session_dir(base):
+            raise ProtocolError("INVALID_MAP_OUTPUT_DIR", f"refusing to package non-session map dir: {base}")
+        filtered_base, dynamic_filter_result = self._filter_map_outputs(base)
+        preview_path = self._generate_map_preview(filtered_base)
         version = time.strftime("%Y%m%d-%H%M%S")
         package_path = self.map_dir / f"map_package_{version}.zip"
+        upload_files = ["map.yaml", "map.pgm", "map.txt"]
+        if preview_path:
+            upload_files.append(preview_path.name)
+        if self.config.upload_point_cloud:
+            upload_files.append("map.pcd")
         files = []
         with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
-                path = base / name
+            for name in upload_files:
+                path = filtered_base / name
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
+        # Navigation reads the stable files in map_dir. Point them at the
+        # filtered output so the uploaded and locally navigated maps match.
+        self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
         metadata = {
             "robot_code": self.media_client.robot_id,
             "mapping_session_id": self.session.session_id if self.session else str(uuid.uuid4()),
             # 地图名称使用 session 目录的时间戳，与 .jszr/map/<timestamp> 一致
             "map_name": command.get("map_name") or (work_dir.name if work_dir and work_dir != self.map_dir else (self.session.map_name if self.session else "untitled")),
             "map_version": version,
+            "source_map_dir": str(filtered_base),
+            "raw_map_dir": str(base),
+            "auto_activate": bool(self.config.auto_activate_uploaded_map),
             "route_hint": self.session.route_hint if self.session else "",
             "frame_id": "map",
             "resolution": command.get("resolution") or 0.05,
             "origin": command.get("origin") or [],
             "created_at": now_iso(),
             "files": files,
+            "dynamic_filter": dynamic_filter_result,
         }
         return package_path, metadata
+
+    def _generate_map_preview(self, base: Path) -> Path | None:
+        pgm_path = base / "map.pgm"
+        if not pgm_path.exists():
+            return None
+        preview_path = base / "map_preview.png"
+        try:
+            return generate_map_preview(pgm_path, preview_path, max_size=int(self.config.preview_max_size))
+        except Exception:
+            LOGGER.exception("failed to generate map preview for %s", base)
+            return None
+
+    def _filter_map_outputs(self, base: Path) -> tuple[Path, dict]:
+        """Create the navigation map from keyframe visibility evidence.
+
+        The raw SLAM output stays untouched. This keeps the filter repeatable
+        and makes the active local map identical to the map sent upstream.
+        """
+        if not self.config.visibility_filter_enabled:
+            raise ProtocolError("MAPPING_FILTER_DISABLED", "keyframe visibility filtering is required for saved maps")
+        output = base / self.config.visibility_filter_output_suffix
+        try:
+            result = filter_with_keyframe_visibility(
+                base,
+                output,
+                voxel_size_m=float(self.config.visibility_filter_voxel_size_m),
+                min_free_observations=int(self.config.visibility_filter_min_free_observations),
+                max_hit_observations=int(self.config.visibility_filter_max_hit_observations),
+            )
+        except Exception as exc:
+            LOGGER.exception("Keyframe visibility map filter failed for %s", base)
+            raise ProtocolError("MAPPING_FILTER_FAILED", f"keyframe visibility filter failed: {exc}") from exc
+        return output, result
+
+    def _refresh_current_map_links(self, base: Path, files: list[str]) -> None:
+        for name in files:
+            if name not in self.REQUIRED_FILES + self.OPTIONAL_FILES:
+                continue
+            source = base / name
+            if not source.exists():
+                continue
+            target = self.map_dir / name
+            if target.resolve() == source.resolve():
+                continue
+            tmp_link = self.map_dir / f".{name}.tmp-link"
+            if tmp_link.exists() or tmp_link.is_symlink():
+                tmp_link.unlink()
+            tmp_link.symlink_to(source)
+            tmp_link.replace(target)
+        LOGGER.info("Current map links refreshed to %s with files=%s", base, files)
 
     def _set_state(self, state: str) -> None:
         if self.session:
             self.session.state = state
             self.session.updated_at = now_iso()
+
+    def _stop_slam_process(self) -> None:
+        if self._slam_process and self._slam_process.poll() is None:
+            self._slam_process.terminate()
+            try:
+                self._slam_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._slam_process.kill()
+        self._slam_process = None
+        self._stop_orphan_slam_processes()
+
+    def _find_slam_process_pids(self) -> list[int]:
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            LOGGER.exception("failed to inspect SLAM processes")
+            return []
+        if result.returncode != 0:
+            return []
+        pids: list[int] = []
+        current_pid = os.getpid()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_text, _, args = line.partition(" ")
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if pid == current_pid:
+                continue
+            if any(re.search(pattern, args) for pattern in self.SLAM_PROCESS_PATTERNS):
+                pids.append(pid)
+        return pids
+
+    def _stop_orphan_slam_processes(self) -> None:
+        pids = self._find_slam_process_pids()
+        if not pids:
+            return
+        LOGGER.warning("Stopping orphan SLAM mapping processes: %s", pids)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                LOGGER.warning("no permission to terminate SLAM process pid=%s", pid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not self._find_slam_process_pids():
+                return
+            time.sleep(0.5)
+        for pid in self._find_slam_process_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                LOGGER.warning("no permission to kill SLAM process pid=%s", pid)
 
     def _shell_prefix(self) -> str:
         workspace_setup = self.config.workspace_setup

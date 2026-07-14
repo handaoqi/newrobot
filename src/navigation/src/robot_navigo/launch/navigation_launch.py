@@ -33,6 +33,7 @@ def generate_launch_description():
         'planner_server',
         'behavior_server',
         'velocity_optimizer',
+        'collision_monitor',
         'bt_navigator',
         'waypoint_follower',
     ]
@@ -131,7 +132,7 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav')]
             ),
             Node(
                 package='navigo_path_planner',
@@ -160,7 +161,7 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav')]
             ),
             Node(
                 package='navigo_velocity_optimizer',
@@ -171,7 +172,18 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel_raw')]
+            ),
+            Node(
+                package='navigo_collision_monitor',
+                executable='collision_monitor',
+                name='collision_monitor',
+                output='screen',
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[configured_params],
+                arguments=['--ros-args', '--log-level', log_level],
+                remappings=remappings,
             ),
             Node(
                 package='navigo_bt_navigator',
@@ -264,7 +276,14 @@ def generate_launch_description():
                         plugin='navigo_velocity_optimizer::VelocityOptimizer',
                         name='velocity_optimizer',
                         parameters=[configured_params],
-                        remappings=remappings + [('cmd_vel', 'cmd_vel_nav'),  ('cmd_vel_smoothed', 'cmd_vel')]
+                        remappings=remappings + [('cmd_vel', 'cmd_vel_nav'),  ('cmd_vel_smoothed', 'cmd_vel_raw')]
+                    ),
+                    ComposableNode(
+                        package='navigo_collision_monitor',
+                        plugin='navigo_collision_monitor::CollisionMonitor',
+                        name='collision_monitor',
+                        parameters=[configured_params],
+                        remappings=remappings,
                     ),
                     ComposableNode(
                         package='navigo_bt_navigator',

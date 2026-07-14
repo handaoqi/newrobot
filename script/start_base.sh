@@ -19,23 +19,38 @@ fi
 echo "=== 2/3 启动雷达驱动 ==="
 source /opt/robot-driver/install/setup.bash
 if ! pgrep -f livox_driver_node > /dev/null 2>&1; then
-    ros2 launch livox_driver lidar.launch.py &>/tmp/livox.log &
+    setsid nohup ros2 launch livox_driver lidar.launch.py &>/tmp/livox.log < /dev/null &
     sleep 3
     echo "雷达驱动已启动"
 else
     echo "雷达驱动已在运行"
 fi
 
-echo "=== 3/3 启动点云转激光（导航避障用） ==="
+echo "=== 3/4 启动雷达到机身静态 TF ==="
+if ! pgrep -f "/static_transform_publisher .*base_link livox_frame" > /dev/null 2>&1; then
+    setsid nohup ros2 run tf2_ros static_transform_publisher \
+        0.382765605 -0.046855740 0.513445457 \
+        0.007172121 -0.043589169 -0.009509268 0.998978536 \
+        base_link livox_frame &>/tmp/lidar_tf.log < /dev/null &
+    sleep 1
+    echo "雷达 TF 已启动"
+else
+    echo "雷达 TF 已在运行"
+fi
+
+echo "=== 4/4 启动点云转激光（导航避障用） ==="
 sleep 2  # 等雷达稳定
-if ! pgrep -f pointcloud_to_laserscan > /dev/null 2>&1; then
-    ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node \
+if ! pgrep -f "/pointcloud_to_laserscan_node" > /dev/null 2>&1; then
+    setsid nohup ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node \
         --ros-args \
         -r cloud_in:=/front_lidar \
         -r scan:=/laser_scan \
         -p target_frame:=base_link \
-        -p min_height:=0.1 \
-        -p max_height:=0.5 &>/tmp/pcl2laser.log &
+        -p transform_tolerance:=0.35 \
+        -p min_height:=0.05 \
+        -p max_height:=1.60 \
+        -p range_min:=0.45 \
+        -p range_max:=4.0 &>/tmp/pcl2laser.log < /dev/null &
     sleep 1
     echo "点云转激光已启动"
 else

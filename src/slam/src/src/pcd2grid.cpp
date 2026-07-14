@@ -10,12 +10,10 @@ namespace robot::slam
     void Pcd2Grid::run(const CloudPtr &pcd_cloud, const std::string &file_name)
     {
         CloudPtr cloud_after_pass_through = CloudPtr(new PointCloudType());
-        CloudPtr cloud_after_radius = CloudPtr(new PointCloudType());
         nav_msgs::msg::OccupancyGrid map_topic_msg;
 
         PassThroughFilter(pcd_cloud, cloud_after_pass_through);
-        RadiusOutlierFilter(cloud_after_pass_through, cloud_after_radius);
-        SetMapTopicMsg(cloud_after_radius, map_topic_msg);
+        SetMapTopicMsg(cloud_after_pass_through, map_topic_msg);
         SavePGMAndYAML(map_topic_msg, file_name);
     }
     void Pcd2Grid::PassThroughFilter(const CloudPtr &pcd_cloud, CloudPtr &cloud_after_pass_through)
@@ -33,19 +31,6 @@ namespace robot::slam
         //           << cloud_after_pass_through->points.size() << std::endl;
     }
 
-    void Pcd2Grid::RadiusOutlierFilter(const CloudPtr &pcd_cloud, CloudPtr &cloud_after_radius)
-    {
-        pcl::RadiusOutlierRemoval<PointType> radiusoutlier;
-        radiusoutlier.setInputCloud(pcd_cloud);
-        radiusoutlier.setRadiusSearch(options_.thre_radius);
-        radiusoutlier.setMinNeighborsInRadius(options_.thres_point_count);
-        radiusoutlier.filter(*cloud_after_radius);
-        // pcl::io::savePCDFile<PointType>(options_.file_name + "_radius_filter.pcd",
-        //                                 *cloud_after_radius);
-        // std::cout << "Point cloud size after radius filter: "
-        //           << cloud_after_radius->points.size() << std::endl;
-    }
-
     void Pcd2Grid::SetMapTopicMsg(const CloudPtr cloud, nav_msgs::msg::OccupancyGrid &msg)
     {
         msg.header.stamp = rclcpp::Clock().now();
@@ -53,68 +38,49 @@ namespace robot::slam
         msg.info.map_load_time = rclcpp::Clock().now();
         msg.info.resolution = options_.map_resolution;
 
-        double x_min, x_max, y_min, y_max;
-        double z_max_grey_rate = 0.05;
-        double z_min_grey_rate = 0.95;
-        double k_line =
-            (z_max_grey_rate - z_min_grey_rate) / (options_.thre_z_max - options_.thre_z_min);
-        double b_line =
-            (options_.thre_z_max * z_min_grey_rate - options_.thre_z_min * z_max_grey_rate) /
-            (options_.thre_z_max - options_.thre_z_min);
-
         if (cloud->points.empty())
         {
             RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "PCD is empty!");
             return;
         }
 
-        for (size_t i = 0; i < cloud->points.size() - 1; i++)
+        // 单轮遍历：同时找边界和标记栅格
+        double x_min = cloud->points[0].x, x_max = x_min;
+        double y_min = cloud->points[0].y, y_max = y_min;
+
+        // 第一轮：先找出边界，确定栅格尺寸
+        for (size_t i = 1; i < cloud->points.size(); i++)
         {
-            if (i == 0)
-            {
-                x_min = x_max = cloud->points[i].x;
-                y_min = y_max = cloud->points[i].y;
-            }
-
-            double x = cloud->points[i].x;
-            double y = cloud->points[i].y;
-
-            if (x < x_min)
-                x_min = x;
-            if (x > x_max)
-                x_max = x;
-
-            if (y < y_min)
-                y_min = y;
-            if (y > y_max)
-                y_max = y;
+            double x = cloud->points[i].x, y = cloud->points[i].y;
+            if (x < x_min) x_min = x;
+            if (x > x_max) x_max = x;
+            if (y < y_min) y_min = y;
+            if (y > y_max) y_max = y;
         }
 
+        double res = options_.map_resolution;
         msg.info.origin.position.x = x_min;
-        // msg.info.origin.position.y = y_min;
-        int h = int((y_max - y_min) / options_.map_resolution);
-        msg.info.origin.position.y = y_max - h * options_.map_resolution;
+        int h = int((y_max - y_min) / res);
+        msg.info.origin.position.y = y_max - h * res;
         msg.info.origin.position.z = 0.0;
         msg.info.origin.orientation.w = 1.0;
 
-        msg.info.width = int((x_max - x_min) / options_.map_resolution);
-        msg.info.height = int((y_max - y_min) / options_.map_resolution);
-        msg.data.resize(msg.info.width * msg.info.height);
-        msg.data.assign(msg.info.width * msg.info.height, 0);
+        int width  = int((x_max - x_min) / res);
+        int height = int((y_max - y_min) / res);
+        msg.info.width  = width;
+        msg.info.height = height;
+        msg.data.assign(width * height, 0);
 
-        RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Data size: %ld", msg.data.size());
+        RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "Grid size: %dx%d = %d cells", width, height, width * height);
 
+        // 第二轮：栅格化，每个点只算一次索引
         for (size_t iter = 0; iter < cloud->points.size(); iter++)
         {
-            int i = int((cloud->points[iter].x - x_min) / options_.map_resolution);
-            if (i < 0 || i >= msg.info.width)
-                continue;
-
-            int j = int((cloud->points[iter].y - y_min) / options_.map_resolution);
-            if (j < 0 || j >= msg.info.height - 1)
-                continue;
-
-            msg.data[i + j * msg.info.width] = 100;
+            int i = int((cloud->points[iter].x - x_min) / res);
+            if (i < 0 || i >= width) continue;
+            int j = int((cloud->points[iter].y - y_min) / res);
+            if (j < 0 || j >= height) continue;
+            msg.data[i + j * width] = 100;
         }
     }
 

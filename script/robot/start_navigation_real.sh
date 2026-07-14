@@ -2,22 +2,46 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-MAP_YAML="${MAP_YAML:-${PROJECT_DIR}/map/map.yaml}"
-PCD_MAP="${PCD_MAP:-/home/robot/.jszr/map/map.pcd}"
+MAP_YAML="${MAP_YAML:-/home/robot/.jszr/map/map.yaml}"
+PCD_MAP="${PCD_MAP:-}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_nav_logs}"
 PLATFORM="${PLATFORM:-NX_XG3588}"
+if [ "${PLATFORM}" = "linux" ]; then
+  PLATFORM="NX_XG3588"
+fi
 MC_CONTROLLER_TYPE="${MC_CONTROLLER_TYPE:-RL_TRACK_VELOCITY}"
 COMMUNICATION_TYPE="${COMMUNICATION_TYPE:-UDP}"
+LOCALIZATION_WAIT_SECONDS="${LOCALIZATION_WAIT_SECONDS:-60}"
+REQUIRE_RTK="${REQUIRE_RTK:-0}"
+RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
 
 mkdir -p "${LOG_DIR}"
+
+# The filtered PCD is used to generate the navigation occupancy map, but may
+# remove sparse structural features that NDT needs.  Prefer the raw mapping PCD
+# for localization when it belongs to the same active map; allow PCD_MAP to
+# override this behavior for explicit operator experiments.
+if [ -z "${PCD_MAP}" ]; then
+  ACTIVE_PCD="$(readlink -f /home/robot/.jszr/map/map.pcd 2>/dev/null || true)"
+  RAW_PCD="$(dirname "$(dirname "${ACTIVE_PCD}")")/map.raw_dynamic_unfiltered.pcd"
+  if [ -f "${RAW_PCD}" ]; then
+    PCD_MAP="${RAW_PCD}"
+  else
+    PCD_MAP="/home/robot/.jszr/map/map.pcd"
+  fi
+fi
+
+/home/robot/genisom_roamerx_open/script/robot/wait_for_valid_time.sh
 
 set +u
 source /opt/ros/humble/setup.bash
 source "${PROJECT_DIR}/install/setup.bash"
 set -u
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|status|load-map}"
+  echo "Usage: $0 {start|stop|restart|status|load-map|full-stop}"
   echo
   echo "Env:"
   echo "  PROJECT_DIR=${PROJECT_DIR}"
@@ -44,23 +68,39 @@ kill_pattern() {
   fi
 }
 
-is_running() {
+is_localization_running() {
   pgrep -f "ros2 launch localization localization.launch.py" >/dev/null 2>&1 || \
-    pgrep -f "ros2 launch robot_navigo navigation_bringup.launch.py" >/dev/null 2>&1
+    pgrep -f "localization_node" >/dev/null 2>&1
 }
 
-stop_stack() {
-  echo "Stopping RoamerX navigation stack..."
+is_navigation_running() {
+  pgrep -f "ros2 launch robot_navigo navigation_bringup.launch.py" >/dev/null 2>&1 || \
+    pgrep -f "component_container_isolated.*navigo_container" >/dev/null 2>&1
+}
+
+is_running() {
+  is_localization_running && is_navigation_running
+}
+
+stop_navigation() {
+  echo "Stopping Nav2/Navigo while preserving localization..."
   kill_pattern "ros2 launch robot_navigo navigation_bringup.launch.py"
   kill_pattern "component_container_isolated.*navigo_container"
   kill_pattern "vel_cmd_udp_pub"
   kill_pattern "vel_cmd_lcm_pub"
   kill_pattern "mode_status_pub"
   kill_pattern "odom_to_tf_broadcaster"
+  kill_pattern "pointcloud_to_laserscan_node"
+  echo "Navigation stopped. Localization is still running."
+}
+
+stop_stack() {
+  stop_navigation
+  echo "Stopping localization..."
   kill_pattern "ros2 launch localization localization.launch.py"
   kill_pattern "localization_node"
   kill_pattern "static_transform_publisher.*base_link livox_frame"
-  echo "Stopped."
+  echo "Full navigation stack stopped."
 }
 
 wait_for_node() {
@@ -76,6 +116,29 @@ wait_for_node() {
   return 1
 }
 
+ensure_rtk() {
+  echo "Starting RTK/NTRIP..."
+  "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
+    cat /tmp/roamerx_rtk_start.log >&2
+    return 1
+  }
+  if [ "${REQUIRE_RTK}" != "1" ]; then
+    return 0
+  fi
+  echo "Waiting for RTK fix on /fix..."
+  for _ in $(seq 1 "${RTK_WAIT_SECONDS}"); do
+    local status
+    status="$(timeout 3 ros2 topic echo /fix --once 2>/dev/null | awk '/status:/{getline; if ($1=="status:") print $2; exit}' || true)"
+    if [ "${status}" = "0" ] || [ "${status}" = "1" ] || [ "${status}" = "2" ]; then
+      echo "RTK/GNSS fix OK."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: RTK/GNSS did not report a valid fix within ${RTK_WAIT_SECONDS}s." >&2
+  return 1
+}
+
 load_pcd_map() {
   echo "Loading localization PCD map: ${PCD_MAP}"
   wait_for_node "/localization" 20
@@ -85,7 +148,11 @@ load_pcd_map() {
 
 wait_for_localization() {
   echo "Waiting for localization status=3..."
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 "${LOCALIZATION_WAIT_SECONDS}"); do
+    if ! is_localization_running; then
+      echo "ERROR: localization process exited before reporting status=3." >&2
+      return 1
+    fi
     local status
     status="$(timeout 3 ros2 topic echo /localization_info --once 2>/dev/null | awk '/status:/{print $2; exit}' || true)"
     if [ "${status}" = "3" ]; then
@@ -94,13 +161,19 @@ wait_for_localization() {
     fi
     sleep 1
   done
-  echo "WARN: localization did not report status=3 within timeout." >&2
-  return 0
+  echo "ERROR: localization did not report status=3 within ${LOCALIZATION_WAIT_SECONDS}s." >&2
+  return 1
+}
+
+localization_is_valid() {
+  local status
+  status="$(timeout 3 ros2 topic echo /localization_info --once 2>/dev/null | awk '/status:/{print $2; exit}' || true)"
+  [ "${status}" = "3" ]
 }
 
 start_stack() {
   if is_running; then
-    echo "Navigation/localization already appears to be running."
+    echo "Navigation and localization already appear to be running."
     echo "Use '$0 restart' to stop and start again."
     return 0
   fi
@@ -114,17 +187,37 @@ start_stack() {
     exit 1
   fi
 
-  echo "Starting localization..."
-  nohup bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && exec ros2 launch localization localization.launch.py" \
-    >"${LOG_DIR}/localization.log" 2>&1 &
+  ensure_rtk
 
-  sleep 3
-  load_pcd_map
-  wait_for_localization
+  local localization_started=false
+  if ! is_localization_running; then
+    echo "Starting localization..."
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
+      >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
+    sleep 3
+    localization_started=true
+  fi
 
-  echo "Starting Nav2/Navigo..."
-  nohup bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' map:='${MAP_YAML}'" \
-    >"${LOG_DIR}/navigation.log" 2>&1 &
+  if [ "${localization_started}" = "true" ]; then
+    load_pcd_map
+    if ! wait_for_localization; then
+      echo "ERROR: refusing to start Nav2/Navigo without valid localization." >&2
+      return 1
+    fi
+  elif localization_is_valid; then
+    echo "Localization is already valid; preserving its current map and pose."
+  else
+    echo "ERROR: localization is running but not valid. Initialize or relocalize first; refusing to reset its pose." >&2
+    return 1
+  fi
+
+  if is_navigation_running; then
+    echo "Nav2/Navigo already appears to be running."
+  else
+    echo "Starting Nav2/Navigo..."
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' map:='${MAP_YAML}'" \
+      >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
+  fi
 
   echo
   echo "Navigation stack started."
@@ -155,11 +248,14 @@ case "${MODE}" in
     start_stack
     ;;
   stop)
-    stop_stack
+    stop_navigation
     ;;
   restart)
-    stop_stack
+    stop_navigation
     start_stack
+    ;;
+  full-stop)
+    stop_stack
     ;;
   status)
     status_stack

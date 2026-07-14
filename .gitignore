@@ -2,3 +2,12 @@ build/
 install/
 log/
 .cache/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local CAD and vendor archives
+*.stp
+*.step
+*.rar

@@ -8,6 +8,7 @@
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "std_msgs/msg/int32.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "zsl-1/highlevel.h"
 
 class VelCmdUdpPublisher : public rclcpp::Node {
@@ -22,6 +23,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         "/mode_switch_cmd", 10,
         std::bind(&VelCmdUdpPublisher::HandleModeSwitchCallback, this,
                   std::placeholders::_1));
+    teleop_action_subscriber_ =
+        this->create_subscription<std_msgs::msg::String>(
+            "/teleop_action", 10,
+            std::bind(&VelCmdUdpPublisher::HandleTeleopActionCallback, this,
+                      std::placeholders::_1));
 
     this->declare_parameter("platform", rclcpp::ParameterValue(std::string("")));
     this->declare_parameter("client_ip", rclcpp::ParameterValue(std::string("")));
@@ -29,7 +35,9 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->declare_parameter("client_port", 43988);
     this->declare_parameter("server_port", 43997);
     this->declare_parameter("standup_settle_ms", 4000);
+    this->declare_parameter("standup_repeat_ms", 500);
     this->declare_parameter("cmd_timeout_ms", 500);
+    this->declare_parameter("inactive_linger_ms", 8000);
     this->declare_parameter("publish_period_ms", 20);
     this->get_parameter("platform", platform_);
     this->get_parameter("client_ip", client_ip_);
@@ -37,7 +45,9 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->get_parameter("client_port", client_port_);
     this->get_parameter("server_port", server_port_);
     this->get_parameter("standup_settle_ms", standup_settle_ms_);
+    this->get_parameter("standup_repeat_ms", standup_repeat_ms_);
     this->get_parameter("cmd_timeout_ms", cmd_timeout_ms_);
+    this->get_parameter("inactive_linger_ms", inactive_linger_ms_);
     this->get_parameter("publish_period_ms", publish_period_ms_);
 
     const std::unordered_map<std::string, std::pair<std::string, std::string>>
@@ -85,6 +95,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
 
+    if (!nav_active_) {
+      return;
+    }
+
+    if (last_cmd_) {
+      const auto idle_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - last_cmd_time_);
+      if (idle_time < std::chrono::milliseconds(inactive_linger_ms_)) {
+        return;
+      }
+    }
+
     const auto ret = sdk_highlevel_.passive();
     nav_active_ = false;
     standing_up_ = false;
@@ -110,6 +132,45 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     }
   }
 
+  void HandleTeleopActionCallback(
+      const std_msgs::msg::String::SharedPtr msg) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    const auto& action = msg->data;
+    uint32_t ret = 0;
+
+    if (action == "stand_up") {
+      StartStandUp("Teleop stand_up");
+      geometry_msgs::msg::Twist hold_cmd;
+      last_cmd_ = hold_cmd;
+      last_cmd_time_ = std::chrono::steady_clock::now();
+      nav_active_ = true;
+      return;
+    }
+    if (action == "lie_down") {
+      ret = sdk_highlevel_.lieDown();
+      nav_active_ = false;
+      standing_up_ = false;
+      last_cmd_.reset();
+    } else if (action == "passive") {
+      ret = sdk_highlevel_.passive();
+      nav_active_ = false;
+      standing_up_ = false;
+      last_cmd_.reset();
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Unknown /teleop_action: %s",
+                  action.c_str());
+      return;
+    }
+
+    if (ret == 0) {
+      RCLCPP_INFO(this->get_logger(), "Teleop action %s succeeded",
+                  action.c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Teleop action %s returned 0x%x",
+                  action.c_str(), ret);
+    }
+  }
+
   void PublishLatestVelocity() {
     std::lock_guard<std::mutex> lk(mutex_);
 
@@ -123,6 +184,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           now - stand_start_time_);
       if (elapsed < std::chrono::milliseconds(standup_settle_ms_)) {
+        const auto repeat_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_stand_command_time_);
+        if (repeat_elapsed >= std::chrono::milliseconds(standup_repeat_ms_)) {
+          const auto ret = sdk_highlevel_.standUp();
+          last_stand_command_time_ = now;
+          if (ret != 0) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 2000,
+                "standUp repeat returned 0x%x", ret);
+          }
+        }
         return;
       }
       standing_up_ = false;
@@ -140,7 +213,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         std::fabs(last_cmd_->linear.x) < 0.085 ? 0.0f : last_cmd_->linear.x;
     const float vy =
         std::fabs(last_cmd_->linear.y) < 0.085 ? 0.0f : last_cmd_->linear.y;
-    const float yaw_rate = last_cmd_->angular.z;
+    float yaw_rate = last_cmd_->angular.z;
+    if (std::fabs(yaw_rate) > 1e-4f && std::fabs(yaw_rate) < 0.025f) {
+      yaw_rate = std::copysign(0.025f, yaw_rate);
+    }
     const auto ret = sdk_highlevel_.move(vx, vy, yaw_rate);
     if (ret != 0) {
       const auto ctrl_mode = sdk_highlevel_.getCurrentCtrlmode();
@@ -154,6 +230,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     const auto ret = sdk_highlevel_.standUp();
     standing_up_ = true;
     stand_start_time_ = std::chrono::steady_clock::now();
+    last_stand_command_time_ = stand_start_time_;
     if (ret == 0) {
       RCLCPP_INFO(this->get_logger(), "%s: SDK standUp()", reason);
     } else {
@@ -168,18 +245,23 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   int client_port_ = 43988;
   int server_port_ = 43997;
   int standup_settle_ms_ = 4000;
+  int standup_repeat_ms_ = 500;
   int cmd_timeout_ms_ = 500;
+  int inactive_linger_ms_ = 8000;
   int publish_period_ms_ = 20;
   std::mutex mutex_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
       planner_vel_cmd_subscriber_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mode_switch_subscriber_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
+      teleop_action_subscriber_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 
   mc_sdk::zsl_1::HighLevel sdk_highlevel_;
   bool nav_active_ = false;
   bool standing_up_ = false;
   std::chrono::steady_clock::time_point stand_start_time_;
+  std::chrono::steady_clock::time_point last_stand_command_time_;
   std::optional<geometry_msgs::msg::Twist> last_cmd_;
   std::chrono::steady_clock::time_point last_cmd_time_;
 };

@@ -9,6 +9,7 @@ laser_mapping:
     common:
         lid_topic:  "/front_lidar"
         imu_topic:  "/front_lidar/imu"
+        gnss_topic: "/fix"
         time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
         time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
     preprocess:
@@ -29,6 +30,30 @@ laser_mapping:
         extrinsic_R: [ 1., 0., 0.,
                     0., 1., 0.,
                     0., 0., 1.]
+    gnss_fusion:
+        enable: true
+        gain: 0.03
+        max_correction_step: 0.25
+        max_residual: 8.0
+        max_age: 2.5
+        max_horizontal_std: 2.0
+        min_status: 0
+        use_elevation: false
+        lever_arm_base: [ -0.05, 0.0, 0.15 ]
+    dynamic_filter:
+        enable: true
+        voxel_size: 0.20
+        # A walking person can stay in one 20 cm voxel for several scans.
+        # Require five independent scans so transient people are not written
+        # into the persistent map, while fixed walls remain unaffected.
+        min_scan_observations: 5
+    keyframe_record:
+        enable: true
+        min_distance_m: 0.8
+        min_yaw_rad: 0.35
+        # Keep observing a stationary scene so people moving past a stopped dog can be removed later.
+        max_interval_s: 2.0
+        voxel_size_m: 0.25
     publish:
         path_en: true                # true: publish Path
         map_en: false                 # true: publish Map cloud
@@ -36,9 +61,9 @@ laser_mapping:
         body_points_en: true  # true: output the point cloud scans in IMU-body-frame
     pcd2pgm:
       file_name : "map"
-      thre_z_min : -0.1
-      thre_z_max : 2.0
+      # 2D navigation map should only contain obstacles that can collide with the dog.
+      # Higher indoor structures are kept in the PCD for localization but not projected into PGM.
+      thre_z_min : 0.05
+      thre_z_max : 0.75
       flag_pass_through : 0
       map_resolution : 0.05
-      thre_radius : 0.1
-      thres_point_count : 10

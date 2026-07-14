@@ -136,14 +136,14 @@ class LocalStore:
         }
 
     def clear_task_context(self, task_execution_id: str, final_state: str) -> None:
-        with self._connection:
+        with self._lock, self._connection:
             self._connection.execute(
                 "UPDATE task_context SET state=?, updated_at=CURRENT_TIMESTAMP WHERE task_execution_id=?",
                 (final_state, task_execution_id),
             )
 
     def enqueue_outbox(self, topic: str, payload: dict, *, qos: int = 1, retain: bool = False, dedupe_key: str | None = None) -> None:
-        with self._connection:
+        with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO outbox(topic, qos, retain, message_type, dedupe_key, payload_json)
@@ -167,7 +167,7 @@ class LocalStore:
         ]
 
     def ack_outbox(self, *, row_id: int | None = None, dedupe_key: str | None = None) -> None:
-        with self._connection:
+        with self._lock, self._connection:
             if row_id is not None:
                 self._connection.execute("DELETE FROM outbox WHERE id=?", (row_id,))
             elif dedupe_key is not None:

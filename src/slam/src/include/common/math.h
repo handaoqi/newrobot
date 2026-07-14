@@ -18,29 +18,26 @@ namespace robot::slam
 
     inline bool checkDirExist(const std::string& map_dir)
     {
-        if (!std::filesystem::exists(std::filesystem::path(map_dir).parent_path()))
+        std::error_code ec;
+        const auto path = std::filesystem::path(map_dir);
+        const auto parent = path.parent_path();
+
+        if (!parent.empty())
         {
-            if (!std::filesystem::create_directories(std::filesystem::path(map_dir).parent_path()))
+            std::filesystem::create_directories(parent, ec);
+            if (ec || !std::filesystem::exists(parent))
             {
                 return false;
             }
-            if (!std::filesystem::create_directory(map_dir))
-            {
-                return false;
-            }
-            return true;
         }
-        else
+
+        if (std::filesystem::exists(path))
         {
-            if (!std::filesystem::exists(map_dir))
-            {
-                if (!std::filesystem::create_directory(map_dir))
-                {
-                    return false;
-                }
-            }
-            return true;
+            return std::filesystem::is_directory(path);
         }
+
+        std::filesystem::create_directory(path, ec);
+        return !ec || std::filesystem::exists(path);
     }
 
     template <typename T>

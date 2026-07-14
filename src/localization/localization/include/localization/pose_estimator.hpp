@@ -97,6 +97,8 @@ public:
   MatchResult GetMatchState() const; 
   Eigen::VectorXf GetCurrentUkfState(); 
 
+  void apply_position_correction(const Eigen::Vector3f& correction);
+
   // IMU bias setters (used after static IMU initialization)
   void set_initial_biases(const Eigen::Vector3f& acc_bias, const Eigen::Vector3f& gyro_bias);
 

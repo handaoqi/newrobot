@@ -223,6 +223,31 @@ def generate_launch_description():
         output='screen'
     )
 
+    pointcloud_to_laserscan_node = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output='screen',
+        remappings=[
+            ('cloud_in', '/front_lidar'),
+            ('scan', '/laser_scan'),
+        ],
+        parameters=[{
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.35,
+            'min_height': 0.05,
+            'max_height': 1.60,
+            'angle_min': -3.14159,
+            'angle_max': 3.14159,
+            'angle_increment': 0.0087,
+            'scan_time': 0.1,
+            'range_min': 0.45,
+            'range_max': 4.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+        }],
+    )
+
     # cmd_cel_lcm_publisher_node = Node(
     #     package='robot_navigo',
     #     executable='vel_cmd_lcm_pub',
@@ -334,6 +359,7 @@ def generate_launch_description():
     # ld.add_action(odom_communication_node)
     # ld.add_action(custom_odom_baselink_node)
     ld.add_action(odom_tf_publisher_node)
+    ld.add_action(pointcloud_to_laserscan_node)
     # ld.add_action(cmd_cel_lcm_publisher_node)
     ld.add_action(load_vel_cmd_pub_node)
     ld.add_action(mode_status_pub_node)

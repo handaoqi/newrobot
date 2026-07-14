@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.protocol import decode_message
 from roamerx_edge.task_executor import TaskExecutor
@@ -10,6 +12,7 @@ class FakeNavigation:
         self.sent = []
         self.cancelled = 0
         self.stopped = True
+        self.pose = SimpleNamespace(x=3.0, y=4.0)
 
     def send_waypoints(self, waypoints, feedback_cb, result_cb):
         self.sent.append(waypoints)
@@ -23,6 +26,9 @@ class FakeNavigation:
 
     def is_robot_stopped(self):
         return self.stopped
+
+    def latest_pose(self):
+        return self.pose
 
 
 def command(message_type, state_version=0, resume_index=None):
@@ -80,4 +86,41 @@ def test_navigation_success_finishes_start_command(tmp_path):
     nav.result("succeeded", "")
     assert executor.context.state == "completed"
     assert results[0][1] == "succeeded"
+    store.close()
+
+
+def test_navigation_missed_waypoints_fails_task(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(command("task.start"))
+    nav.result("succeeded", "", {"missed_waypoints": [2]})
+    assert executor.context.state == "failed"
+    assert results[0][1] == "failed"
+    assert results[0][3] == "NAVIGATION_MISSED_WAYPOINTS"
+    store.close()
+
+
+def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.0, y=2.0)
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(command("task.start"))
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert executor.context.state == "failed"
+    assert results[0][1] == "failed"
+    assert results[0][3] == "FINAL_POSE_OUT_OF_TOLERANCE"
     store.close()

@@ -23,6 +23,7 @@
 #include <sstream>
 #include <fstream>
 #include <functional>
+#include <filesystem>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <math.h>
@@ -39,14 +40,50 @@
 #include <rclcpp/rclcpp.hpp>
 #include <robots_dog_msgs/srv/map_state.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 #include <visualization_msgs/msg/marker.hpp>
 namespace robot::slam
 {
+    struct DynamicFilterVoxelKey
+    {
+        int x;
+        int y;
+        int z;
+
+        bool operator==(const DynamicFilterVoxelKey& other) const
+        {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+
+    struct DynamicFilterVoxelKeyHash
+    {
+        std::size_t operator()(const DynamicFilterVoxelKey& key) const
+        {
+            std::size_t h = 1469598103934665603ULL;
+            auto mix = [&h](int value) {
+                h ^= static_cast<std::size_t>(value) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(key.x);
+            mix(key.y);
+            mix(key.z);
+            return h;
+        }
+    };
+
+    struct MappingKeyframe
+    {
+        double   stamp = 0.0;
+        Vec3d    lidar_origin = Zero3d;
+        CloudPtr cloud_world = CloudPtr(new PointCloudType());
+    };
+
     class MappingAlg : public rclcpp::Node
     {
     public:
@@ -77,11 +114,17 @@ namespace robot::slam
 
         void imuCallBack(const sensor_msgs::msg::Imu::UniquePtr msg_in);
 
+        void gnssCallBack(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+
         bool syncData(MeasureGroup& meas);
 
         void map_incremental();
 
         void pubWorldPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull);
+
+        void recordKeyframe(const CloudPtr& cloud_world);
+
+        void saveKeyframes(const std::string& map_subdir) const;
 
         void pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body);
 
@@ -96,6 +139,12 @@ namespace robot::slam
         void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath);
 
         void map_publish_callback();
+
+        void applyGnssCorrection(double lidar_time);
+
+        bool gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos);
+
+        Vec3d llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const;
 
         void h_share_model(state_ikfom& s, esekfom::dyn_share_datastruct<double>& ekfom_data);
 
@@ -139,7 +188,7 @@ namespace robot::slam
         std::mutex              mtx_buffer;
         std::condition_variable sig_buffer;
         std::string             root_dir_ = ROOT_DIR;
-        std::string             lid_topic, imu_topic;
+        std::string             lid_topic, imu_topic, gnss_topic;
         std::string             data_path_;
 
         double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -164,6 +213,39 @@ namespace robot::slam
         std::deque<double>        time_buffer;
         std::deque<CloudPtr>      lidar_buffer;
         std::deque<ImuMessagePtr> imu_buffer;
+
+        std::mutex                         gnss_mutex_;
+        sensor_msgs::msg::NavSatFix        latest_gnss_;
+        bool                               has_gnss_ = false;
+        bool                               gnss_origin_initialized_ = false;
+        double                             gnss_origin_lat_ = 0.0;
+        double                             gnss_origin_lon_ = 0.0;
+        double                             gnss_origin_alt_ = 0.0;
+        Vec3d                              gnss_map_offset_ = Zero3d;
+        Vec3d                              gnss_lever_arm_base_ = Zero3d;
+        bool                               use_gnss_fusion_ = false;
+        double                             gnss_fusion_gain_ = 0.03;
+        double                             gnss_max_correction_step_ = 0.25;
+        double                             gnss_max_residual_ = 8.0;
+        double                             gnss_max_age_ = 2.5;
+        double                             gnss_max_horizontal_std_ = 2.0;
+        int                                gnss_min_status_ = 0;
+        bool                               gnss_use_elevation_ = false;
+        int                                gnss_correction_count_ = 0;
+        bool                               dynamic_filter_enable_ = true;
+        double                             dynamic_filter_voxel_size_ = 0.20;
+        int                                dynamic_filter_min_scan_observations_ = 3;
+        std::unordered_map<DynamicFilterVoxelKey, int, DynamicFilterVoxelKeyHash> dynamic_filter_scan_observations_;
+        bool                               keyframe_record_enable_ = true;
+        double                             keyframe_min_distance_m_ = 0.8;
+        double                             keyframe_min_yaw_rad_ = 0.35;
+        double                             keyframe_max_interval_s_ = 2.0;
+        double                             keyframe_voxel_size_m_ = 0.25;
+        std::vector<MappingKeyframe>       mapping_keyframes_;
+        Vec3d                              last_keyframe_origin_ = Zero3d;
+        double                             last_keyframe_yaw_ = 0.0;
+        double                             last_keyframe_stamp_ = 0.0;
+        bool                               has_last_keyframe_ = false;
 
         CloudPtr featsFromMap     = CloudPtr(new PointCloudType());
         CloudPtr feats_undistort  = CloudPtr(new PointCloudType());
@@ -217,6 +299,7 @@ namespace robot::slam
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubOdomAftMapped_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubPath_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         sub_imu_ptr_;
+        rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr   sub_gnss_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_ptr_;
 
         rclcpp::Service<robots_dog_msgs::srv::MapState>::SharedPtr state_service_;

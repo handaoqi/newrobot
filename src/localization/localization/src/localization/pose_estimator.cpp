@@ -1,6 +1,7 @@
 #include <localization/pose_estimator.hpp>
 
 #include <pcl/filters/voxel_grid.h>
+#include <cmath>
 #include <localization/pose_system.hpp>
 #include <localization/odom_system.hpp>
 #include <kkl/alg/unscented_kalman_filter.hpp>
@@ -155,8 +156,6 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
  * @return cloud aligned to the globalmap
  */
 pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
-  last_correction_stamp = stamp;
-
   Eigen::Matrix4f init_guess = matrix();
   // Eigen::Matrix4f no_guess = last_observation;
   Eigen::Matrix4f imu_guess;
@@ -206,9 +205,27 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   }
 
   Eigen::Matrix4f trans = registration->getFinalTransformation();
-
-  match_result_.is_converged_ = registration->hasConverged();
   match_result_.fitness_score_ = ndt_score;
+
+  const Eigen::Matrix4f correction = init_guess.inverse() * trans;
+  const float correction_distance = correction.block<3, 1>(0, 3).norm();
+  const bool transform_valid = trans.allFinite() && std::isfinite(correction_distance);
+  const bool match_valid = registration->hasConverged() && std::isfinite(ndt_score) &&
+                           ndt_score < 0.5 && transform_valid && correction_distance < 5.0f;
+  match_result_.is_converged_ = match_valid;
+
+  if (!match_valid) {
+    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"),
+                "Rejecting NDT correction: converged=%d score=%.6f correction_distance=%.3f finite=%d",
+                registration->hasConverged(), ndt_score, correction_distance, transform_valid);
+    // The registration output may contain NaN points. Returning an empty cloud
+    // prevents downstream nearest-neighbor checks and TF publication from
+    // consuming an invalid transform.
+    aligned->clear();
+    return aligned;
+  }
+
+  last_correction_stamp = stamp;
   
   Eigen::Vector3f p = trans.block<3, 1>(0, 3);
   Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
@@ -306,4 +323,14 @@ Eigen::VectorXf PoseEstimator::GetCurrentUkfState() {
     return state;
 }
 
+void PoseEstimator::apply_position_correction(const Eigen::Vector3f& correction) {
+  if(!ukf) {
+    return;
+  }
+  ukf->mean.middleRows(0, 3) += correction;
+  if(odom_ukf) {
+    odom_ukf->mean.middleRows(0, 3) += correction;
+  }
 }
+
+} 

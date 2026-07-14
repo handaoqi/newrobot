@@ -115,7 +115,5 @@ ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
 | --pcd2pgm.thre_z_max | double | 2.0 | 提取有效点云的最大z值 |
 | --pcd2pgm.flag_pass_through | int | 0 | 统计滤波提取内点标志位 |
 | --pcd2pgm.map_resolution | double | 0.05 | 地图分辨率 |
-| --pcd2pgm.thre_radius | double | 0.1 | 半径滤波半径大小 |
-| --pcd2pgm.thres_point_count | int | 10 | 半径滤波半径数量阈值 |
 
 `注：发布map坐标系点云话题为: /world_points，qos为best_effort；发布body坐标系下点云话题为：/body_points，qos为reliable；发布路径话题为: /path，qos为reliable；发布odomtery话题为: /slam_odom，qos为reliable, tf随odom信息一起发布`

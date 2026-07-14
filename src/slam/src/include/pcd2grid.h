@@ -15,7 +15,6 @@
 
 #include <pcl/filters/conditional_removal.h>
 #include <pcl/filters/passthrough.h>
-#include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_types.h>
@@ -32,8 +31,6 @@ namespace robot::slam
         double thre_z_max = 2.0;
         int flag_pass_through = 0;
         double map_resolution = 0.05;
-        double thre_radius = 0.1;
-        int thres_point_count = 10;
     };
 
     class Pcd2Grid
@@ -48,8 +45,6 @@ namespace robot::slam
         Pcd2GridOptions options_;
 
         void PassThroughFilter(const CloudPtr &pcd_cloud, CloudPtr &cloud_after_pass_through);
-
-        void RadiusOutlierFilter(const CloudPtr &pcd_cloud, CloudPtr &cloud_after_radius);
 
         void SetMapTopicMsg(const CloudPtr cloud, nav_msgs::msg::OccupancyGrid &msg);
 

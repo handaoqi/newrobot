@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -23,14 +24,23 @@ class CommandProcessor:
         publish_ack: Callable[[str, dict], None],
         publish_result: Callable[[str, dict], None],
         mapping_adapter=None,
+        map_activation_adapter=None,
+        navigation_stack_adapter=None,
+        localization_adapter=None,
+        teleop_control_adapter=None,
     ) -> None:
         self.robot_id = robot_id
         self.store = store
         self.safety = safety
         self.task_executor = task_executor
         self.mapping_adapter = mapping_adapter
+        self.map_activation_adapter = map_activation_adapter
+        self.navigation_stack_adapter = navigation_stack_adapter
+        self.localization_adapter = localization_adapter
+        self.teleop_control_adapter = teleop_control_adapter
         self.publish_ack = publish_ack
         self.publish_result = publish_result
+        self._navigation_command_lock = threading.Lock()
 
     def handle_command(self, raw) -> tuple[dict, dict | None]:
         envelope = decode_message(raw)
@@ -107,6 +117,12 @@ class CommandProcessor:
             return None
         if envelope.message_type.startswith("mapping."):
             return self._execute_mapping(envelope, started_at)
+        if envelope.message_type.startswith("map."):
+            return self._execute_map(envelope, started_at)
+        if envelope.message_type.startswith("nav."):
+            return self._execute_navigation(envelope, started_at)
+        if envelope.message_type.startswith("teleop."):
+            return self._execute_teleop(envelope, started_at)
         execution_id = envelope.payload["task_execution_id"]
         if not self.task_executor.context:
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "no active task context")
@@ -127,6 +143,93 @@ class CommandProcessor:
             started_at=started_at,
         )
 
+    def _execute_navigation(self, envelope: MessageEnvelope, started_at: str) -> dict:
+        command = envelope.payload.get("command") or {}
+        if envelope.message_type == "nav.status":
+            if not self.navigation_stack_adapter:
+                raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
+            result_payload = self.navigation_stack_adapter.status()
+        else:
+            if not self._navigation_command_lock.acquire(blocking=False):
+                raise ProtocolError("NAV_COMMAND_BUSY", "another navigation command is still running")
+            try:
+                if envelope.message_type == "nav.initial_pose":
+                    if not self.localization_adapter:
+                        raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
+                    result_payload = self.localization_adapter.set_initial_pose(command)
+                else:
+                    if not self.navigation_stack_adapter:
+                        raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
+                    if envelope.message_type == "nav.start":
+                        result_payload = self.navigation_stack_adapter.start(command)
+                    elif envelope.message_type == "nav.restart":
+                        result_payload = self.navigation_stack_adapter.restart(command)
+                    elif envelope.message_type == "nav.recover":
+                        result_payload = self.navigation_stack_adapter.recover(command)
+                    elif envelope.message_type == "nav.stop":
+                        result_payload = self.navigation_stack_adapter.stop(command)
+                    else:
+                        raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
+            finally:
+                self._navigation_command_lock.release()
+        return build_result(
+            envelope,
+            status="succeeded",
+            result=result_payload,
+            started_at=started_at,
+        )
+
+    def _execute_teleop(self, envelope: MessageEnvelope, started_at: str) -> dict:
+        teleop_adapter = self.localization_adapter
+        if not teleop_adapter:
+            raise ProtocolError("TELEOP_UNAVAILABLE", "teleop adapter is not configured")
+        bridge_status = None
+        if self.teleop_control_adapter:
+            bridge_status = self.teleop_control_adapter.ensure_ready()
+        command = envelope.payload.get("command") or {}
+        action = envelope.message_type.removeprefix("teleop.")
+        if action == "takeover_enter":
+            result_payload = teleop_adapter.teleop_action("stand_up")
+            self.safety.state.control_mode = "manual_takeover"
+        elif action == "takeover_exit":
+            teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+            result_payload = teleop_adapter.teleop_action("passive")
+            self.safety.state.control_mode = "autonomous"
+        elif action == "stand_up":
+            result_payload = teleop_adapter.teleop_action("stand_up")
+            self.safety.state.control_mode = "manual_takeover"
+        elif action == "lie_down":
+            teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+            result_payload = teleop_adapter.teleop_action("lie_down")
+            self.safety.state.control_mode = "autonomous"
+        elif action == "move_stop":
+            result_payload = teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+        elif action == "move_forward":
+            result_payload = teleop_adapter.teleop_velocity(vx=float(command.get("vx", 0.35)))
+        elif action == "move_backward":
+            result_payload = teleop_adapter.teleop_velocity(vx=float(command.get("vx", -0.35)))
+        elif action == "move_left":
+            result_payload = teleop_adapter.teleop_velocity(vy=float(command.get("vy", 0.25)))
+        elif action == "move_right":
+            result_payload = teleop_adapter.teleop_velocity(vy=float(command.get("vy", -0.25)))
+        elif action == "turn_left":
+            result_payload = teleop_adapter.teleop_velocity(yaw_rate=float(command.get("yaw_rate", 0.45)))
+        elif action == "turn_right":
+            result_payload = teleop_adapter.teleop_velocity(yaw_rate=float(command.get("yaw_rate", -0.45)))
+        elif action == "passive":
+            result_payload = teleop_adapter.teleop_action("passive")
+            self.safety.state.control_mode = "autonomous"
+        else:
+            raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
+        if bridge_status is not None:
+            result_payload["teleop_bridge"] = bridge_status
+        return build_result(
+            envelope,
+            status="succeeded",
+            result=result_payload,
+            started_at=started_at,
+        )
+
     def _execute_mapping(self, envelope: MessageEnvelope, started_at: str) -> dict:
         if not self.mapping_adapter:
             raise ProtocolError("MAPPING_UNAVAILABLE", "mapping adapter is not configured")
@@ -139,6 +242,21 @@ class CommandProcessor:
             result_payload = self.mapping_adapter.cancel_mapping(command)
         elif envelope.message_type == "mapping.status":
             result_payload = self.mapping_adapter.status()
+        else:
+            raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
+        return build_result(
+            envelope,
+            status="succeeded",
+            result=result_payload,
+            started_at=started_at,
+        )
+
+    def _execute_map(self, envelope: MessageEnvelope, started_at: str) -> dict:
+        if not self.map_activation_adapter:
+            raise ProtocolError("MAP_ACTIVATION_UNAVAILABLE", "map activation adapter is not configured")
+        command = envelope.payload.get("command") or {}
+        if envelope.message_type == "map.activate":
+            result_payload = self.map_activation_adapter.activate(command)
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
         return build_result(

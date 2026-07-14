@@ -36,7 +36,7 @@ class MediaClient:
                 data=data,
                 files={"map_package": (file_path.name, stream, "application/zip")},
                 headers=headers,
-                timeout=60,
+                timeout=300,
             )
         response.raise_for_status()
         return response.json()

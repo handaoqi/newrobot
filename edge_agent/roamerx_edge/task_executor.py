@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from math import hypot
 from typing import Callable, Protocol
 
 from .local_store import LocalStore
@@ -12,6 +13,7 @@ class NavigationAdapter(Protocol):
     def send_waypoints(self, waypoints: list[dict], feedback_cb: Callable, result_cb: Callable) -> bool: ...
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool: ...
     def is_robot_stopped(self) -> bool: ...
+    def latest_pose(self): ...
 
 
 @dataclass
@@ -25,6 +27,8 @@ class TaskContext:
 
 
 class TaskExecutor:
+    TERMINAL_STATES = {"completed", "failed", "cancelled", "timed_out", "rejected"}
+
     def __init__(
         self,
         store: LocalStore,
@@ -32,11 +36,13 @@ class TaskExecutor:
         *,
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
+        final_waypoint_tolerance_m: float = 0.35,
     ) -> None:
         self.store = store
         self.navigation = navigation
         self.event_callback = event_callback
         self.start_result_callback = start_result_callback
+        self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
         self._lock = threading.RLock()
         self._goal_offset = 0
         raw = store.load_active_task_context()
@@ -47,13 +53,22 @@ class TaskExecutor:
             self._persist()
 
     def has_active_task(self) -> bool:
-        return self.context is not None and self.context.state not in {
-            "completed",
-            "failed",
-            "cancelled",
-            "timed_out",
-            "rejected",
-        }
+        return self.context is not None and self.context.state not in self.TERMINAL_STATES
+
+    def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
+        with self._lock:
+            if (
+                not self.context
+                or self.context.task_execution_id != execution_id
+                or expected_state not in self.TERMINAL_STATES
+            ):
+                return False
+            self.context.state = expected_state
+            self.context.state_version += 1
+            self._persist()
+            self.store.clear_task_context(execution_id, expected_state)
+            self.context = None
+            return True
 
     def start_task(self, envelope: MessageEnvelope) -> None:
         with self._lock:
@@ -183,11 +198,23 @@ class TaskExecutor:
                 "",
             )
 
-    def on_navigation_result(self, status: str, error_message: str = "") -> None:
+    def on_navigation_result(self, status: str, error_message: str = "", details: dict | None = None) -> None:
         with self._lock:
             if not self.context or self.context.state in {"pausing", "cancelling", "paused", "cancelled"}:
                 return
             if status == "succeeded":
+                missed = list((details or {}).get("missed_waypoints") or [])
+                if missed:
+                    absolute_missed = [index + self._goal_offset for index in missed]
+                    self._fail(
+                        "NAVIGATION_MISSED_WAYPOINTS",
+                        f"Nav2 reported missed waypoints: {absolute_missed}",
+                    )
+                    return
+                pose_error = self._final_pose_error()
+                if pose_error:
+                    self._fail(*pose_error)
+                    return
                 self.context.state = "completed"
                 self.context.current_waypoint_index = len(self.context.route_snapshot["waypoints"])
                 self.context.state_version += 1
@@ -210,6 +237,27 @@ class TaskExecutor:
                 return
             else:
                 self._fail("NAVIGATION_FAILED", error_message or status)
+
+    def _final_pose_error(self) -> tuple[str, str] | None:
+        if not self.context:
+            return ("TASK_CONTEXT_MISMATCH", "task context is missing")
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if not waypoints:
+            return None
+        pose = self.navigation.latest_pose()
+        if not pose:
+            return ("FINAL_POSE_UNAVAILABLE", "latest robot pose is unavailable")
+        final_waypoint = waypoints[-1]
+        distance = hypot(float(pose.x) - float(final_waypoint["x"]), float(pose.y) - float(final_waypoint["y"]))
+        if distance > self.final_waypoint_tolerance_m:
+            return (
+                "FINAL_POSE_OUT_OF_TOLERANCE",
+                (
+                    f"final pose is {distance:.2f}m from last waypoint "
+                    f"(tolerance {self.final_waypoint_tolerance_m:.2f}m)"
+                ),
+            )
+        return None
 
     def _fail(self, code: str, message: str) -> None:
         if not self.context:
