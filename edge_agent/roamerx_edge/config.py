@@ -89,10 +89,6 @@ class MappingConfig:
     auto_activate_uploaded_map: bool = True
     upload_point_cloud: bool = False
     preview_max_size: int = 1200
-    map_set_enabled: bool = True
-    submap_segment_length_m: float = 250.0
-    submap_step_length_m: float = 190.0
-    submap_margin_m: float = 12.0
 
 
 @dataclass
