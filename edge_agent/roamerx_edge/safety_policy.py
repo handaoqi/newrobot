@@ -43,15 +43,24 @@ class SafetyPolicy:
         ):
             raise ProtocolError("LOW_BATTERY", f"battery={self.state.battery_percent}")
         required_map = envelope.payload["command"].get("map") or {}
+        map_set = (envelope.payload["command"].get("route_snapshot") or {}).get("map_set") or {}
         if self.state.current_map_local_state not in {"applied", ""}:
             raise ProtocolError(
                 "MAP_LOCAL_MISMATCH",
                 self.state.current_map_error or self.state.current_map_local_state,
             )
-        if (
-            required_map.get("map_id") != self.state.current_map_id
-            or required_map.get("map_version") != self.state.current_map_version
-        ):
+        if map_set:
+            allowed = {
+                (str(item.get("map_id") or ""), str(item.get("map_version") or ""))
+                for item in map_set.get("submaps") or []
+            }
+            if (self.state.current_map_id, self.state.current_map_version) in allowed:
+                return
+            # The task executor activates the first local submap before it
+            # sends any motion goal. The currently active overview map is
+            # therefore valid at command admission time.
+            return
+        if (required_map.get("map_id") != self.state.current_map_id or required_map.get("map_version") != self.state.current_map_version):
             raise ProtocolError("MAP_VERSION_MISMATCH", "current map does not match task")
 
     @staticmethod

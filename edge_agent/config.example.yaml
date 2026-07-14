@@ -52,7 +52,7 @@ mapping:
   start_data: 3
   save_data: 5
   command_timeout_seconds: 15
-  save_wait_seconds: 8
+  save_wait_seconds: 7200
   dynamic_filter_enabled: true
   dynamic_filter_voxel_size_m: 0.12
   dynamic_filter_min_points_per_voxel: 3

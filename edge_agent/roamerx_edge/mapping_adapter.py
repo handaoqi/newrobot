@@ -18,6 +18,7 @@ from .keyframe_visibility_filter import filter_with_keyframe_visibility
 from .map_preview import generate_map_preview
 from .media_client import MediaClient
 from .protocol import ProtocolError, now_iso
+from .submap_builder import SubmapBuildConfig, build_map_set
 
 
 @dataclass
@@ -41,7 +42,7 @@ class MappingAdapter:
 
     REQUIRED_FILES = ("map.yaml", "map.pgm")
     OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt", "gnss_origin.yaml")
-    SAVE_OUTPUT_TIMEOUT_SECONDS = 180
+    SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
     SLAM_PROCESS_PATTERNS = (
         "robot_slam.*mapping",
         "/robot_slam/mapping",
@@ -296,6 +297,7 @@ class MappingAdapter:
             raise ProtocolError("INVALID_MAP_OUTPUT_DIR", f"refusing to package non-session map dir: {base}")
         filtered_base, dynamic_filter_result = self._filter_map_outputs(base)
         preview_path = self._generate_map_preview(filtered_base)
+        map_set = self._build_map_set(base, filtered_base)
         version = time.strftime("%Y%m%d-%H%M%S")
         package_path = self.map_dir / f"map_package_{version}.zip"
         upload_files = ["map.yaml", "map.pgm", "map.txt"]
@@ -310,6 +312,11 @@ class MappingAdapter:
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
+            if map_set:
+                for path in sorted((filtered_base / "map_set").rglob("*")):
+                    if path.is_file() and path.name in {"map_set_manifest.json", "submap.json", "map.yaml", "map.pgm", "map_preview.png"}:
+                        archive.write(path, arcname=str(path.relative_to(filtered_base)))
+                        files.append(str(path.relative_to(filtered_base)))
         # Navigation reads the stable files in map_dir. Point them at the
         # filtered output so the uploaded and locally navigated maps match.
         self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
@@ -329,8 +336,34 @@ class MappingAdapter:
             "created_at": now_iso(),
             "files": files,
             "dynamic_filter": dynamic_filter_result,
+            "map_set": map_set,
         }
         return package_path, metadata
+
+    def _build_map_set(self, source: Path, filtered_base: Path) -> dict:
+        if not self.config.map_set_enabled:
+            return {}
+        try:
+            manifest = build_map_set(
+                source,
+                filtered_base / "map_set",
+                config=SubmapBuildConfig(
+                    segment_length_m=float(self.config.submap_segment_length_m),
+                    step_length_m=float(self.config.submap_step_length_m),
+                    margin_m=float(self.config.submap_margin_m),
+                ),
+            )
+            return {
+                "format": manifest["format"],
+                "submap_count": len(manifest["submaps"]),
+                "total_distance_m": manifest["total_distance_m"],
+                "manifest": "map_set/map_set_manifest.json",
+            }
+        except Exception as exc:
+            # A short indoor map may not have enough keyframes. Preserve the
+            # regular map upload rather than making legacy mapping unusable.
+            LOGGER.warning("Skipping map-set build for %s: %s", source, exc)
+            return {"skipped": str(exc)}
 
     def _generate_map_preview(self, base: Path) -> Path | None:
         pgm_path = base / "map.pgm"

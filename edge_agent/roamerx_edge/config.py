@@ -76,7 +76,7 @@ class MappingConfig:
     start_data: int = 3
     save_data: int = 5
     command_timeout_seconds: int = 15
-    save_wait_seconds: int = 8
+    save_wait_seconds: int = 7200
     dynamic_filter_enabled: bool = True
     dynamic_filter_voxel_size_m: float = 0.12
     dynamic_filter_min_points_per_voxel: int = 3
@@ -89,6 +89,10 @@ class MappingConfig:
     auto_activate_uploaded_map: bool = True
     upload_point_cloud: bool = False
     preview_max_size: int = 1200
+    map_set_enabled: bool = True
+    submap_segment_length_m: float = 250.0
+    submap_step_length_m: float = 190.0
+    submap_margin_m: float = 12.0
 
 
 @dataclass

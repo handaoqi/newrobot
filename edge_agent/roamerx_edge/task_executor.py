@@ -24,6 +24,7 @@ class TaskContext:
     route_snapshot: dict
     current_waypoint_index: int
     start_command_id: str
+    current_segment_index: int = 0
 
 
 class TaskExecutor:
@@ -37,12 +38,15 @@ class TaskExecutor:
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
         final_waypoint_tolerance_m: float = 0.35,
+        map_set_coordinator=None,
     ) -> None:
         self.store = store
         self.navigation = navigation
         self.event_callback = event_callback
         self.start_result_callback = start_result_callback
         self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
+        self.map_set_coordinator = map_set_coordinator
+        self._segments = []
         self._lock = threading.RLock()
         self._goal_offset = 0
         raw = store.load_active_task_context()
@@ -84,7 +88,28 @@ class TaskExecutor:
             )
             self._persist()
             self._emit("task.accepted")
-            self._send_from(0)
+            self._segments = self.map_set_coordinator.build_segments(route) if self.map_set_coordinator else []
+            if self._segments:
+                self.map_set_coordinator.activate(self._segments[0])
+                self._send_segment(0)
+            else:
+                self._send_from(0)
+
+    def _send_segment(self, segment_index: int) -> None:
+        if not self.context:
+            raise ProtocolError("TASK_CONTEXT_MISMATCH", "task context is missing")
+        segment = self._segments[segment_index]
+        self.context.current_segment_index = segment_index
+        self.context.current_waypoint_index = segment.start_index
+        self._goal_offset = segment.start_index
+        accepted = self.navigation.send_waypoints(segment.waypoints, self.on_feedback, self.on_navigation_result)
+        if not accepted:
+            self._fail("NAV_STACK_NOT_READY", "FollowWaypoints goal was rejected")
+            return
+        self.context.state = "running"
+        self.context.state_version += 1
+        self._persist()
+        self._emit("task.started")
 
     def _send_from(self, index: int) -> None:
         if not self.context:
@@ -210,6 +235,19 @@ class TaskExecutor:
                         "NAVIGATION_MISSED_WAYPOINTS",
                         f"Nav2 reported missed waypoints: {absolute_missed}",
                     )
+                    return
+                if self._segments and self.context.current_segment_index < len(self._segments) - 1:
+                    next_index = self.context.current_segment_index + 1
+                    next_segment = self._segments[next_index]
+                    self.context.state_version += 1
+                    self._persist()
+                    self._emit("task.map_switching")
+                    try:
+                        self.map_set_coordinator.activate(next_segment)
+                    except Exception as exc:
+                        self._fail("MAP_SWITCH_FAILED", str(exc))
+                        return
+                    self._send_segment(next_index)
                     return
                 pose_error = self._final_pose_error()
                 if pose_error:

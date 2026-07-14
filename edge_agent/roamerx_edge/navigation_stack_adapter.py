@@ -37,6 +37,11 @@ class NavigationStackAdapter:
     def stop(self, command: dict | None = None) -> dict:
         return self._run("stop", timeout_seconds=self.config.command_timeout_seconds)
 
+    def switch_map(self) -> dict:
+        """Reload localization and Nav2 after map symlinks changed."""
+        self._run("full-stop", timeout_seconds=self.config.command_timeout_seconds)
+        return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 90))
+
     def _looks_ready(self, stdout: str) -> bool:
         required = (
             "/planner_server",

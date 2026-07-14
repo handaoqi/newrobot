@@ -12,6 +12,7 @@ from .command_processor import CommandProcessor
 from .config import EdgeConfig
 from .local_store import LocalStore
 from .map_activation_adapter import MapActivationAdapter
+from .map_set_coordinator import MapSetCoordinator
 from .mapping_adapter import MappingAdapter
 from .media_client import MediaClient
 from .mqtt_client import EdgeMqttClient
@@ -48,16 +49,18 @@ class EdgeAgentApplication:
             navigation = RosAdapter(config.ros, config.safety, self.telemetry, self.safety_state)
             self.ros_runtime = RosRuntime(navigation)
         self.navigation = navigation
+        self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
+        self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
+        self.map_set_coordinator = MapSetCoordinator(self.map_activation_adapter, self.navigation_stack_adapter)
         self.task_executor = TaskExecutor(
             self.store,
             navigation,
             event_callback=self.mqtt.publish_task_event,
             start_result_callback=self._publish_start_result,
             final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
+            map_set_coordinator=self.map_set_coordinator,
         )
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
-        self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
-        self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
         self.teleop_control_adapter = TeleopControlAdapter(config.teleop_control)
         self.safety = SafetyPolicy(config.safety, self.safety_state)
         self.commands = CommandProcessor(
@@ -139,6 +142,7 @@ class EdgeAgentApplication:
                     "nav.stop",
                     "nav.initial_pose",
                     "map.activate",
+                    "map_set.v1",
                     "teleop.takeover_enter",
                     "teleop.takeover_exit",
                     "teleop.stand_up",
@@ -230,6 +234,7 @@ class EdgeAgentApplication:
                 context.task_execution_id if context and self.task_executor.has_active_task() else None
             )
             snapshot["current_map"] = self._current_map_payload()
+            snapshot["map_set"] = self.map_set_coordinator.status()
             self.mqtt.publish_status(snapshot)
 
     def _trajectory_loop(self) -> None:
