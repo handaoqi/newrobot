@@ -25,12 +25,7 @@
 
 当前主要访问方式：
 
-```text
-网站访问：http://39.106.208.174:13000/
-后端 API：http://39.106.208.174:13000/api/
-视频推流：rtmp://39.106.208.174:1935/live/dog_ZSL-1A-07_front
-视频播放：http://39.106.208.174:13000/live/dog_ZSL-1A-07_front.live.flv
-```
+当前云端访问地址、API 地址和视频地址以部署环境配置为准；不再使用已下线的旧地址。
 
 说明：浏览器录音能力通常要求 HTTPS 或 localhost。若使用公网 IP 的 HTTP 地址访问，浏览器可能拒绝麦克风权限；建议后续绑定 HTTPS 域名作为正式访问入口。
 
@@ -78,9 +73,7 @@ flowchart LR
 
 用户通过浏览器访问监测网站：
 
-```text
-http://39.106.208.174:13000/
-```
+使用当前部署环境配置的访问地址。
 
 演示账号：
 
@@ -93,15 +86,15 @@ http://39.106.208.174:13000/
 
 ```yaml
 telemetry:
-  endpoint: "http://39.106.208.174:13000/api/telemetry/ingest/"
-  media_upload_endpoint: "http://39.106.208.174:13000/api/device/media/upload/"
+  endpoint: "${CENTER_BASE_URL}/api/telemetry/ingest/"
+  media_upload_endpoint: "${CENTER_BASE_URL}/api/device/media/upload/"
 
 stream:
-  rtmp_url: "rtmp://39.106.208.174:1935/live/dog_ZSL-1A-07_front"
+  rtmp_url: "${RTMP_BASE_URL}/live/dog_ZSL-1A-07_front"
 
 video:
   play_urls:
-    flv: "http://39.106.208.174:13000/live/dog_ZSL-1A-07_front.live.flv"
+    flv: "${CENTER_BASE_URL}/live/dog_ZSL-1A-07_front.live.flv"
 ```
 
 ### 3.4 当前云端能力状态

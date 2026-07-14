@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, computed } from 'vue'
+import { onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
 import {
   fetchMaps,
   fetchRobots,
@@ -25,6 +25,7 @@ const selectedMapId = ref(null)
 const mapImageError = ref({})
 const syncing = ref(false)
 const activatingMapId = ref(null)
+const collapsedMapGroups = ref(new Set())
 
 const mappingForm = ref({
   robot: '',
@@ -73,6 +74,76 @@ const selectedRobot = computed(() => {
   }
 })
 const selectedMap = computed(() => maps.value.find(m => m.id === selectedMapId.value))
+const mapGroups = computed(() => {
+  const groups = new Map()
+  for (const map of maps.value) {
+    const key = mapDateKey(map)
+    if (!groups.has(key)) {
+      groups.set(key, { key, label: mapDateLabel(key), maps: [], activeCount: 0 })
+    }
+    const group = groups.get(key)
+    group.maps.push(map)
+    if (map.active) group.activeCount += 1
+  }
+  return Array.from(groups.values())
+})
+
+function mapDateKey(map) {
+  const raw = map.created_at || map.createdAt || map.uploaded_at || map.name || ''
+  const timestampMatch = String(raw).match(/(\d{4})(\d{2})(\d{2})/)
+  if (timestampMatch) return `${timestampMatch[1]}-${timestampMatch[2]}-${timestampMatch[3]}`
+  const parsed = new Date(raw)
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10)
+  return 'unknown'
+}
+
+function mapDateLabel(key) {
+  if (key === 'unknown') return '未标注日期'
+  const [year, month, day] = key.split('-')
+  return `${year}年${month}月${day}日`
+}
+
+function isMapGroupExpanded(key) {
+  return !collapsedMapGroups.value.has(key)
+}
+
+function toggleMapGroup(key) {
+  const next = new Set(collapsedMapGroups.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  collapsedMapGroups.value = next
+}
+
+function expandAllMapGroups() {
+  collapsedMapGroups.value = new Set()
+}
+
+function collapseAllMapGroups() {
+  collapsedMapGroups.value = new Set(mapGroups.value.map(group => group.key))
+}
+
+function resetMapGroupState() {
+  const visibleKeys = new Set()
+  if (mapGroups.value[0]) visibleKeys.add(mapGroups.value[0].key)
+  for (const group of mapGroups.value) {
+    if (group.activeCount) visibleKeys.add(group.key)
+  }
+  collapsedMapGroups.value = new Set(
+    mapGroups.value.filter(group => !visibleKeys.has(group.key)).map(group => group.key),
+  )
+}
+
+function ensureMapGroupExpanded(mapId) {
+  const group = mapGroups.value.find(item => item.maps.some(map => map.id === mapId))
+  if (!group) return
+  if (collapsedMapGroups.value.has(group.key)) {
+    const next = new Set(collapsedMapGroups.value)
+    next.delete(group.key)
+    collapsedMapGroups.value = next
+  }
+}
+
+watch(selectedMapId, (mapId) => ensureMapGroupExpanded(mapId))
 const robotCurrentMap = computed(() => mappingStatus.value?.current_map || {})
 const robotCurrentMapId = computed(() => String(robotCurrentMap.value.map_id || mappingStatus.value?.current_map_id || ''))
 const robotCurrentMapVersion = computed(() => String(robotCurrentMap.value.map_version || mappingStatus.value?.current_map_version || ''))
@@ -117,13 +188,14 @@ const stateSteps = [
   { key: 'saving', label: '保存中' },
   { key: 'packaging', label: '打包中' },
   { key: 'uploading', label: '上传中' },
-  { key: 'completed', label: '已完成' },
+  { key: 'stopping', label: '退出建图' },
+  { key: 'exited', label: '已退出建图' },
 ]
 
-const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected', 'cancelled', 'completed']
+const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected', 'cancelled', 'completed', 'exited']
 const isTerminal = computed(() => terminalStates.includes(mappingState.value))
 const isError = computed(() => ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value))
-const isActiveMapping = computed(() => ['starting', 'mapping', 'saving', 'packaging', 'uploading'].includes(mappingState.value))
+const isActiveMapping = computed(() => ['starting', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value))
 
 const activeStepIndex = computed(() => {
   if (
@@ -159,6 +231,7 @@ const mappingStateLabel = computed(() => {
   const step = stateSteps.find(s => s.key === mappingState.value)
   if (step) return step.label
   if (mappingState.value === 'command_issued') return '等待Edge'
+  if (mappingState.value === 'completed') return '已完成'
   return mappingState.value
 })
 
@@ -181,6 +254,7 @@ async function loadMaps() {
     if (maps.value.length && !selectedMapId.value) {
       selectedMapId.value = maps.value[0].id
     }
+    resetMapGroupState()
     seedRobotsFromMaps()
   } catch (error) {
     console.error('加载地图失败:', error)
@@ -521,31 +595,52 @@ function parseDescription(desc) {
       <!-- 地图列表 -->
       <div v-if="loading" class="loading">加载中...</div>
       <div v-else class="map-list-section">
-        <h3 class="section-subtitle">所有地图 ({{ maps.length }})</h3>
-        <div v-if="maps.length > 0" class="map-list">
-          <article
-            v-for="map in maps"
-            :key="map.id"
-            class="map-card"
-            :class="{ 'map-card-selected': map.id === selectedMapId }"
-            @click="selectMap(map)"
-          >
-            <div class="map-thumbnail">
-              <template v-if="map.thumbnail_url && !mapImageError[map.id]">
-                <img
-                  :src="fullPreviewUrl(map.thumbnail_url)"
-                  :alt="map.name"
-                  @error.stop="handleImageError($event, map)"
-                />
-              </template>
-              <div v-else class="no-thumbnail">无预览</div>
+        <div class="map-list-heading">
+          <h3 class="section-subtitle">所有地图 ({{ maps.length }})</h3>
+          <div class="map-list-actions" v-if="mapGroups.length > 1">
+            <button class="btn btn-sm" type="button" @click="expandAllMapGroups">全部展开</button>
+            <button class="btn btn-sm" type="button" @click="collapseAllMapGroups">全部折叠</button>
+          </div>
+        </div>
+        <div v-if="maps.length > 0" class="map-groups">
+          <section v-for="group in mapGroups" :key="group.key" class="map-group">
+            <button
+              class="map-group-header"
+              type="button"
+              :aria-expanded="isMapGroupExpanded(group.key)"
+              @click="toggleMapGroup(group.key)"
+            >
+              <span class="map-group-chevron" aria-hidden="true">{{ isMapGroupExpanded(group.key) ? '▾' : '▸' }}</span>
+              <span class="map-group-title">{{ group.label }}</span>
+              <span class="map-group-count">{{ group.maps.length }} 张</span>
+              <span v-if="group.activeCount" class="badge badge-success badge-sm">活动 {{ group.activeCount }}</span>
+            </button>
+            <div v-if="isMapGroupExpanded(group.key)" class="map-list">
+              <article
+                v-for="map in group.maps"
+                :key="map.id"
+                class="map-card"
+                :class="{ 'map-card-selected': map.id === selectedMapId }"
+                @click="selectMap(map)"
+              >
+                <div class="map-thumbnail">
+                  <template v-if="map.thumbnail_url && !mapImageError[map.id]">
+                    <img
+                      :src="fullPreviewUrl(map.thumbnail_url)"
+                      :alt="map.name"
+                      @error.stop="handleImageError($event, map)"
+                    />
+                  </template>
+                  <div v-else class="no-thumbnail">无预览</div>
+                </div>
+                <div class="map-card-info">
+                  <h4>{{ map.name }}</h4>
+                  <span class="map-card-size">{{ formatSize(map.file_size) }}</span>
+                </div>
+                <span v-if="map.active" class="badge badge-success badge-sm">活动</span>
+              </article>
             </div>
-            <div class="map-card-info">
-              <h4>{{ map.name }}</h4>
-              <span class="map-card-size">{{ formatSize(map.file_size) }}</span>
-            </div>
-            <span v-if="map.active" class="badge badge-success badge-sm">活动</span>
-          </article>
+          </section>
         </div>
         <div v-else class="empty-state">
           暂无地图，点击"上传地图"或"从机器人同步"
@@ -585,6 +680,10 @@ function parseDescription(desc) {
             <span v-if="isError" class="state-badge badge-error">{{ errorLabel }}</span>
             <span v-else-if="isActiveMapping" class="state-badge badge-active">进行中</span>
             <span v-else class="state-badge">{{ mappingStateLabel }}</span>
+          </div>
+          <div v-if="mappingStatus?.result" class="state-runtime">
+            <span>建图进程: {{ mappingStatus.result.process_alive ? '运行中' : '已退出' }}</span>
+            <span v-if="mappingStatus.result.slam_pids?.length">PID {{ mappingStatus.result.slam_pids.join(', ') }}</span>
           </div>
           <div class="state-steps">
             <div
@@ -852,13 +951,79 @@ function parseDescription(desc) {
 .section-subtitle {
   font-size: 0.95rem;
   color: #666;
-  margin: 0 0 0.75rem;
+  margin: 0;
   padding-bottom: 0.5rem;
   border-bottom: 1px solid #eee;
 }
 
 .map-list-section {
   margin-bottom: 1.5rem;
+}
+
+.map-list-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.map-list-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.map-groups {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.map-group {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.map-group-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.7rem 0.85rem;
+  border: 0;
+  background: rgba(248, 250, 252, 0.86);
+  color: inherit;
+  text-align: left;
+}
+
+.map-group-header:hover {
+  background: rgba(226, 242, 253, 0.86);
+}
+
+.map-group-chevron {
+  width: 1rem;
+  color: #1976d2;
+  font-size: 1rem;
+}
+
+.map-group-title {
+  font-weight: 700;
+  color: #334155;
+}
+
+.map-group-count {
+  color: #64748b;
+  font-size: 0.78rem;
+}
+
+.map-group-header .badge {
+  margin-left: auto;
+}
+
+.map-group .map-list {
+  padding: 0.65rem;
+  border-top: 1px solid #e5e7eb;
 }
 
 .map-card {

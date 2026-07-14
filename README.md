@@ -42,6 +42,16 @@ npm run dev
 
 默认访问地址：`http://127.0.0.1:5173`
 
+## 云端部署
+
+从机器人 NX 本机部署当前平台版本：
+
+```bash
+scripts/deploy_cloud_platform.sh
+```
+
+仅更新页面可用 `--frontend-only`；仅更新 Django 后端可用 `--backend-only`。脚本在本机构建 Vue，再同步到云端并检查服务状态；不会重启机器狗端 Edge Agent。
+
 ## 演示账号
 
 - 用户名：`operator`
