@@ -4,6 +4,7 @@ import DashboardLayout from '../views/DashboardLayout.vue'
 import AnalyticsPage from '../views/AnalyticsPage.vue'
 import DashboardOverview from '../views/DashboardOverview.vue'
 import EventsPage from '../views/EventsPage.vue'
+import GuardDutyPage from '../views/GuardDutyPage.vue'
 import LoginPage from '../views/LoginPage.vue'
 import RemoteControlPage from '../views/RemoteControlPage.vue'
 import RobotsPage from '../views/RobotsPage.vue'
@@ -24,6 +25,7 @@ const routes = [
     meta: { requiresAuth: true },
     children: [
       { path: 'overview', name: 'overview', meta: { title: '实时监测中心' }, component: DashboardOverview },
+      { path: 'guard-duty', name: 'guard-duty', meta: { title: '保安值守' }, component: GuardDutyPage },
       { path: 'remote-control', name: 'remote-control', meta: { title: '远程控制' }, component: RemoteControlPage },
       { path: 'analytics', name: 'analytics', meta: { title: '统计分析中心' }, component: AnalyticsPage },
       { path: 'events', name: 'events', meta: { title: '事件中心' }, component: EventsPage },

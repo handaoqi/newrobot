@@ -11,6 +11,7 @@ const { toggleLabel, toggleTheme } = useTheme()
 const expandedMenus = ref({})
 
 const menuItems = [
+  { label: '保安值守', path: '/dashboard/guard-duty' },
   { label: '监测中心', path: '/dashboard/overview' },
   { label: '远程控制', path: '/dashboard/remote-control' },
   { label: '统计分析', path: '/dashboard/analytics' },
