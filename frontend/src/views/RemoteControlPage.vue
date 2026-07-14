@@ -23,6 +23,8 @@ const videoRef = ref(null)
 let flvPlayer = null
 let hlsPlayer = null
 let statusTimer = null
+// 操作员本地发起接管后的宽限截止时间戳；期内轮询不得把 takeoverActive 回退为 false。
+let takeoverHoldUntil = 0
 let holdTimer = null
 let holdAction = null
 let holdPointerId = null
@@ -116,6 +118,7 @@ async function enterTakeover() {
   try {
     const command = await dispatchRobotAction('takeover_enter', { note: 'Enter platform remote control page.' }, 'remote_control_enter')
     takeoverActive.value = true
+    takeoverHoldUntil = Date.now() + 8000
     commandFeedback.value = `接管指令已下发 · ${command?.status || 'created'}`
     showToast('接管指令已下发')
   } catch (error) {
@@ -132,6 +135,7 @@ async function exitTakeover() {
     await stopHoldAction()
     const command = await dispatchRobotAction('takeover_exit', { passive: true, note: 'Exit platform remote control page.' }, 'remote_control_exit')
     takeoverActive.value = false
+    takeoverHoldUntil = 0
     commandFeedback.value = `释放指令已下发 · ${command?.status || 'created'}`
     showToast('释放指令已下发')
   } catch (error) {
@@ -156,8 +160,8 @@ async function sendDiscreteAction(action, label) {
   try {
     const command = await dispatchRobotAction(action, {}, 'remote_control_action')
     commandFeedback.value = `${label}指令已下发 · ${command?.status || 'created'}`
-    if (action === 'stand_up') takeoverActive.value = true
-    if (action === 'lie_down') takeoverActive.value = false
+    if (action === 'stand_up') { takeoverActive.value = true; takeoverHoldUntil = Date.now() + 8000 }
+    if (action === 'lie_down') { takeoverActive.value = false; takeoverHoldUntil = 0 }
     showToast(`${label}指令已下发`)
   } catch (error) {
     commandFeedback.value = error.message || `${label}失败`
@@ -237,6 +241,7 @@ async function chooseRobot(robotId) {
     if (takeoverActive.value) {
       await dispatchRobotAction('takeover_exit', { passive: true }, 'remote_control_switch_robot')
       takeoverActive.value = false
+      takeoverHoldUntil = 0
     }
     selectedRobot.value = await fetchRobotDetail(robotId)
     streamUnavailable.value = false
@@ -254,8 +259,13 @@ async function refreshStatus() {
   try {
     liveStatus.value = await fetchRobotStatus(selectedRobot.value.id)
     const mode = liveStatus.value?.status?.control_mode
-    if (mode === 'manual_takeover') takeoverActive.value = true
-    if (mode === 'autonomous' || mode === 'emergency_stop') takeoverActive.value = false
+    if (mode === 'manual_takeover') {
+      takeoverActive.value = true
+      takeoverHoldUntil = 0
+    } else if ((mode === 'autonomous' || mode === 'emergency_stop') && Date.now() >= takeoverHoldUntil) {
+      // 宽限期内不回退：机器人延迟上报 control_mode 时，避免 teleop 方向键被中途禁用。
+      takeoverActive.value = false
+    }
   } catch {}
 }
 

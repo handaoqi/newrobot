@@ -11,6 +11,7 @@ const overview = ref(null)
 const robots = ref([])
 const selectedRobot = ref(null)
 const loading = ref(true)
+const loadError = ref('')
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
@@ -490,6 +491,9 @@ onMounted(async () => {
     if (initialRobotId) {
       await chooseRobot(initialRobotId, false)
     }
+  } catch (error) {
+    // 接口失败（401 已由 api 层跳登录）时置错误态，避免 overview 为 null 却渲染而白屏。
+    loadError.value = error?.message || '未能获取监测数据，请稍后重试。'
   } finally {
     loading.value = false
   }
@@ -527,7 +531,7 @@ function handleVisibilityChange() {
 </script>
 
 <template>
-  <section v-if="!loading" class="page-grid">
+  <section v-if="!loading && overview" class="page-grid">
     <div class="content-column">
       <section class="top-summary">
         <article class="status-pill online">
@@ -652,7 +656,7 @@ function handleVisibilityChange() {
         <div class="video-footer">
           <div class="footer-card">
             <strong>今日巡检时长</strong>
-            <span>{{ latestRobot?.patrol_duration_minutes || 0 }} 分钟</span>
+            <span>{{ overview.header.today_patrol_minutes || 0 }} 分钟</span>
           </div>
           <div class="footer-card area-card">
             <strong>当前巡检区域</strong>
@@ -759,7 +763,7 @@ function handleVisibilityChange() {
           </div>
           <div class="mini-row">
             <div class="mini-card">当前音量 {{ latestRobot?.speaker_volume }}%</div>
-            <div class="mini-card">喊话链路状态 正常</div>
+            <div class="mini-card">喊话链路状态 未连接</div>
           </div>
         </div>
       </section>
@@ -790,5 +794,12 @@ function handleVisibilityChange() {
     </aside>
 
     <AppToast :show="visible" :message="toastMessage" :variant="toastVariant" />
+  </section>
+
+  <section v-else-if="!loading" class="page-grid overview-error">
+    <div class="error-card">
+      <strong>数据加载失败</strong>
+      <p>{{ loadError || '未能获取监测数据，请稍后重试。' }}</p>
+    </div>
   </section>
 </template>

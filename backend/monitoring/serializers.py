@@ -129,6 +129,8 @@ class RobotSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     mode_label = serializers.CharField(source="get_mode_display", read_only=True)
     connection_status = serializers.SerializerMethodField()
+    # 展示真实"当日"告警数（按 detected_at 当天计），而非永不清零的累计计数器字段。
+    today_alerts = serializers.SerializerMethodField()
 
     class Meta:
         model = Robot
@@ -165,6 +167,11 @@ class RobotSerializer(serializers.ModelSerializer):
 
     def get_connection_status(self, obj):
         return obj.effective_connection_status()
+
+    def get_today_alerts(self, obj):
+        return InspectionEvent.objects.filter(
+            robot=obj, detected_at__date=timezone.localdate()
+        ).count()
 
 
 class EventSerializer(serializers.ModelSerializer):

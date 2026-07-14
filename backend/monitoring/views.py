@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import math
 import zipfile
 from datetime import time as datetime_time, timedelta
 from urllib.error import HTTPError, URLError
@@ -11,7 +12,7 @@ from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
 from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db import transaction
-from django.db.models import Case, Count, IntegerField, Q, When
+from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date, parse_datetime
@@ -102,6 +103,75 @@ def serialize_trend(title, subtitle, unit, accent, points):
             "average": round(total / len(points), 1) if points else 0,
         },
     }
+
+
+def _daily_counts(queryset, date_field, dates):
+    """按本地日期统计 queryset 行数，对齐到 `dates`，返回 [{"label","value"}]。"""
+    buckets = {date: 0 for date in dates}
+    for value in queryset.values_list(date_field, flat=True):
+        if value is None:
+            continue
+        local_date = timezone.localtime(value).date()
+        if local_date in buckets:
+            buckets[local_date] += 1
+    return [{"label": date.strftime("%m-%d"), "value": buckets[date]} for date in dates]
+
+
+def _daily_active_minutes(telemetry_qs, dates):
+    """按本地日期统计遥测活跃时长（当日 max-min(reported_at) 分钟），无数据则 0。"""
+    date_set = set(dates)
+    spans = {date: [None, None] for date in dates}
+    for reported_at in telemetry_qs.values_list("reported_at", flat=True):
+        if reported_at is None:
+            continue
+        local_dt = timezone.localtime(reported_at)
+        day = local_dt.date()
+        if day not in date_set:
+            continue
+        low, high = spans[day]
+        spans[day][0] = local_dt if low is None else min(low, local_dt)
+        spans[day][1] = local_dt if high is None else max(high, local_dt)
+    result = []
+    for date in dates:
+        low, high = spans[date]
+        minutes = round((high - low).total_seconds() / 60, 1) if low and high else 0
+        result.append({"label": date.strftime("%m-%d"), "value": minutes})
+    return result
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    radius = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _daily_mileage_km(telemetry_qs, dates):
+    """按本地日期统计相邻遥测点经纬度的 Haversine 累距（公里），无数据则 0。"""
+    date_set = set(dates)
+    per_day = {date: [] for date in dates}
+    rows = (
+        telemetry_qs.filter(latitude__isnull=False, longitude__isnull=False)
+        .values_list("reported_at", "latitude", "longitude")
+        .order_by("reported_at")
+    )
+    for reported_at, lat, lon in rows:
+        if reported_at is None:
+            continue
+        day = timezone.localtime(reported_at).date()
+        if day not in date_set:
+            continue
+        per_day[day].append((float(lat), float(lon)))
+    result = []
+    for date in dates:
+        points = per_day[date]
+        distance = 0.0
+        for (lat1, lon1), (lat2, lon2) in zip(points, points[1:]):
+            distance += _haversine_km(lat1, lon1, lat2, lon2)
+        result.append({"label": date.strftime("%m-%d"), "value": round(distance, 2)})
+    return result
 
 
 def request_force_delete(request) -> bool:
@@ -293,7 +363,7 @@ def _force_delete_map(map_data: MapData) -> dict:
 def build_analytics_payload():
     ensure_demo_seed()
     dates = build_period_labels(7)
-    tasks = PatrolTask.objects.all()
+    start_date = dates[0]
     events = InspectionEvent.objects.all()
 
     risk_weight_map = {"high": 3, "medium": 2, "low": 1}
@@ -303,16 +373,41 @@ def build_analytics_payload():
         if event_date in risk_totals:
             risk_totals[event_date] += risk_weight_map.get(event.risk_level, 1)
 
-    labels = [date.strftime("%m-%d") for date in dates]
-    alert_values = [1, 2, 0, 3, 2, 1, 4]
-    detection_values = [5, 6, 4, 7, 6, 5, 8]
-    duration_values = [26, 28, 24, 32, 27, 29, 30]
-    mileage_values = [0, 0, 0, 0, 0, 0, 1.3]
+    # 逐日真实聚合（今天往前滚动 7 天，窗口外的历史数据如实显示为 0）。
+    # 下面按 __date__gte 做超集预筛，helper 再按本地日期精确归桶。
+    window_events = events.filter(detected_at__date__gte=start_date)
+    window_snapshots = MediaAsset.objects.filter(
+        media_type="snapshot", event_time__date__gte=start_date
+    )
+    window_telemetry = RobotTelemetry.objects.filter(reported_at__date__gte=start_date)
 
-    alert_series = [{"label": label, "value": value} for label, value in zip(labels, alert_values)]
-    detection_series = [{"label": label, "value": value} for label, value in zip(labels, detection_values)]
-    duration_series = [{"label": label, "value": value} for label, value in zip(labels, duration_values)]
-    mileage_series = [{"label": label, "value": value} for label, value in zip(labels, mileage_values)]
+    alert_series = _daily_counts(window_events, "detected_at", dates)
+    detection_series = _daily_counts(window_snapshots, "event_time", dates)
+    duration_series = _daily_active_minutes(window_telemetry, dates)
+    mileage_series = _daily_mileage_km(window_telemetry, dates)
+
+    # 平均完成度：真实完成任务的航点完成比均值；无 completed 执行则无数据
+    completion_ratios = [
+        execution.completed_waypoints / execution.total_waypoints
+        for execution in TaskExecution.objects.filter(state="completed", total_waypoints__gt=0)
+    ]
+    if completion_ratios:
+        completion_value = f"{round(sum(completion_ratios) / len(completion_ratios) * 100)}%"
+    else:
+        completion_value = "无相关数据"
+
+    # 值守响应：已处理事件的平均响应时长；无已处理事件则无数据
+    response_deltas = [
+        (event.handled_at - event.detected_at).total_seconds()
+        for event in events.filter(handled_at__isnull=False).only("handled_at", "detected_at")
+        if event.handled_at and event.detected_at and event.handled_at >= event.detected_at
+    ]
+    if response_deltas:
+        response_value = f"{round(sum(response_deltas) / len(response_deltas) / 60)} 分钟"
+    else:
+        response_value = "无相关数据"
+
+    online_robot_count = Robot.objects.filter(status="online").count()
 
     return {
         "updated_at": timezone.now(),
@@ -325,17 +420,17 @@ def build_analytics_payload():
             {
                 "title": "检测识别",
                 "value": f"{sum(item['value'] for item in detection_series)} 次",
-                "note": "结合事件上报与遥测活跃度的综合识别次数",
+                "note": "近 7 个统计周期内的识别抓拍总量",
             },
             {
                 "title": "平均完成度",
-                "value": f"{round(sum(task.completion_rate for task in tasks) / len(tasks)) if tasks else 0}%",
-                "note": "任务执行进度持续稳定，适合持续追踪",
+                "value": completion_value,
+                "note": "基于已完成任务执行的航点完成度均值",
             },
             {
                 "title": "值守响应",
-                "value": "30 分钟",
-                "note": f"当前在线设备 {Robot.objects.filter(status='online').count()} 台，处置链路保持畅通",
+                "value": response_value,
+                "note": f"当前在线设备 {online_robot_count} 台，均值取自已处理事件响应时长",
             },
         ],
         "trends": [
@@ -394,33 +489,46 @@ def ensure_demo_seed() -> None:
             resolution=0.05,
             description="演示预置地图，现场建图后可替换为真实地图",
         )
-    demo_route, _ = PatrolRoute.objects.get_or_create(
-        name="南门-主步道-牡丹园-活动广场",
-        robot=robot,
-        map_data=demo_map,
-        defaults={
-            "waypoints": [
+    demo_route = (
+        PatrolRoute.objects.filter(
+            name="南门-主步道-牡丹园-活动广场",
+            robot=robot,
+            map_data=demo_map,
+        )
+        .order_by("id")
+        .first()
+    )
+    if demo_route is None:
+        demo_route = PatrolRoute.objects.create(
+            name="南门-主步道-牡丹园-活动广场",
+            robot=robot,
+            map_data=demo_map,
+            waypoints=[
                 {"x": 0.0, "y": 0.0, "yaw": 0.0, "name": "南门"},
                 {"x": 2.0, "y": 1.0, "yaw": 0.0, "name": "主步道"},
                 {"x": 4.0, "y": 2.0, "yaw": 0.0, "name": "牡丹园"},
                 {"x": 6.0, "y": 3.0, "yaw": 0.0, "name": "活动广场"},
             ],
-            "waypoint_names": ["南门", "主步道", "牡丹园", "活动广场"],
-            "description": "演示预置路线，现场建图后应重新绑定航点",
-        },
-    )
-    task, created_task = PatrolTask.objects.get_or_create(
+            waypoint_names=["南门", "主步道", "牡丹园", "活动广场"],
+            description="演示预置路线，现场建图后应重新绑定航点",
+        )
+    task = PatrolTask.objects.filter(
         name="公园主通道早间巡检",
         robot=robot,
-        defaults={
-            "route_name": demo_route.name,
-            "scheduled_start": timezone.now() - timezone.timedelta(hours=2),
-            "scheduled_end": timezone.now() + timezone.timedelta(hours=1),
-            "status": "running",
-            "completion_rate": 68,
-            "route": demo_route,
-        },
-    )
+    ).order_by("id").first()
+    created_task = False
+    if task is None:
+        task = PatrolTask.objects.create(
+            name="公园主通道早间巡检",
+            robot=robot,
+            route_name=demo_route.name,
+            scheduled_start=timezone.now() - timezone.timedelta(hours=2),
+            scheduled_end=timezone.now() + timezone.timedelta(hours=1),
+            status="running",
+            completion_rate=68,
+            route=demo_route,
+        )
+        created_task = True
     if not created_task and task.route_id is None:
         task.route = demo_route
         task.route_name = demo_route.name
@@ -487,13 +595,25 @@ class DashboardOverviewView(APIView):
         events = InspectionEvent.objects.all()
         today = timezone.localdate()
         today_events = events.filter(detected_at__date=today)
+        today_alert_count = today_events.count()
         latest_robot = robots.first()
         latest_event = events.first()
+        # 今日巡检时长：取最新机器人当日遥测活跃时长（max-min(reported_at) 分钟），无则 0
+        today_patrol_minutes = 0
+        if latest_robot:
+            today_telemetry = RobotTelemetry.objects.filter(
+                robot=latest_robot, reported_at__date=today
+            )
+            span = today_telemetry.aggregate(
+                low=Min("reported_at"), high=Max("reported_at")
+            )
+            if span["low"] and span["high"]:
+                today_patrol_minutes = round((span["high"] - span["low"]).total_seconds() / 60, 1)
         return Response(
             {
                 "summary": {
                     "online_robot_count": robots.filter(status="online").count(),
-                    "today_alert_count": latest_robot.today_alerts if latest_robot else today_events.count(),
+                    "today_alert_count": today_alert_count,
                     "pending_event_count": events.filter(status="pending").count(),
                     "resolved_event_count": events.filter(status="resolved").count(),
                     "completed_task_count": PatrolTask.objects.filter(status="completed").count(),
@@ -502,7 +622,8 @@ class DashboardOverviewView(APIView):
                     "device_code": latest_robot.code if latest_robot else "--",
                     "current_mode": latest_robot.get_mode_display() if latest_robot else "--",
                     "current_location": latest_robot.location if latest_robot else "--",
-                    "today_alerts": latest_robot.today_alerts if latest_robot else 0,
+                    "today_alerts": today_alert_count,
+                    "today_patrol_minutes": today_patrol_minutes,
                 },
                 "live_event": EventSerializer(latest_event, context={"request": request}).data
                 if latest_event
@@ -1622,6 +1743,24 @@ class PatrolRouteDetailView(APIView):
             )
 
 
+def validate_task_execution_readiness(task: PatrolTask) -> Response | None:
+    if not task.enabled:
+        return Response({"detail": "TASK_DISABLED"}, status=status.HTTP_409_CONFLICT)
+    if task.route is None:
+        return Response({"detail": "TASK_ROUTE_MISSING"}, status=status.HTTP_409_CONFLICT)
+    if task.robot.effective_connection_status() != "online":
+        return Response(
+            {"detail": "机器狗 Edge Agent 当前离线，无法立即执行巡检任务。请先启动 Edge Agent 并确认设备在线。"},
+            status=status.HTTP_409_CONFLICT,
+        )
+    if task.robot.localization_status != "normal" or not task.robot.nav_ready:
+        return Response(
+            {"detail": "机器狗定位或导航栈未就绪，请先在路径规划页面启动导航栈，并等待定位状态变为 normal、Nav2 ready 后再执行。"},
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
+
+
 class PatrolRouteExecuteView(APIView):
     """直接执行一条已保存路线。"""
     permission_classes = [permissions.AllowAny]
@@ -1631,17 +1770,6 @@ class PatrolRouteExecuteView(APIView):
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
         )
-        if route.robot.effective_connection_status() != "online":
-            return Response(
-                {"detail": "机器狗 Edge Agent 当前离线，无法立即执行路线。请先启动 Edge Agent 并确认设备在线。"},
-                status=status.HTTP_409_CONFLICT,
-            )
-        if route.robot.localization_status != "normal" or not route.robot.nav_ready:
-            return Response(
-                {"detail": "机器狗定位或导航栈未就绪，请先在路径规划页面启动导航栈，并等待定位状态变为 normal、Nav2 ready 后再执行。"},
-                status=status.HTTP_409_CONFLICT,
-            )
-
         now = timezone.now()
         task_name = f"路线快速执行 - {route.name}"
         task = PatrolTask.objects.filter(route=route, name=task_name).first()
@@ -1664,6 +1792,10 @@ class PatrolRouteExecuteView(APIView):
             task.scheduled_end = now + timezone.timedelta(hours=1)
             task.enabled = True
             task.save(update_fields=["robot", "route_name", "scheduled_start", "scheduled_end", "enabled", "updated_at"])
+
+        readiness_error = validate_task_execution_readiness(task)
+        if readiness_error is not None:
+            return readiness_error
 
         try:
             execution = TaskExecutionService.create_execution(
@@ -1975,16 +2107,9 @@ class PatrolTaskExecuteView(APIView):
             PatrolTask.objects.select_related("robot", "route", "route__map_data"),
             pk=task_id,
         )
-        if task.robot.effective_connection_status() != "online":
-            return Response(
-                {"detail": "机器狗 Edge Agent 当前离线，无法立即执行巡检任务。请先启动 Edge Agent 并确认设备在线。"},
-                status=status.HTTP_409_CONFLICT,
-            )
-        if task.robot.localization_status != "normal" or not task.robot.nav_ready:
-            return Response(
-                {"detail": "机器狗定位或导航栈未就绪，请先在路径规划页面启动导航栈，并等待定位状态变为 normal、Nav2 ready 后再执行。"},
-                status=status.HTTP_409_CONFLICT,
-            )
+        readiness_error = validate_task_execution_readiness(task)
+        if readiness_error is not None:
+            return readiness_error
         try:
             operator = request.user if request.user.is_authenticated else None
             execution = TaskExecutionService.create_execution(task, operator)
