@@ -178,8 +178,11 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
             description = json.loads(map_data.description)
         except (TypeError, json.JSONDecodeError):
             description = {}
-    local_image_path = description.get("image", "") if isinstance(description, dict) else ""
-    local_map_dir = local_image_path.rsplit("/", 1)[0] if local_image_path and "/" in local_image_path else ""
+    local_map_dir = description.get("source_map_dir", "") if isinstance(description, dict) else ""
+    local_image_path = f"{local_map_dir}/map.pgm" if local_map_dir else ""
+    if not local_map_dir:
+        local_image_path = description.get("image", "") if isinstance(description, dict) else ""
+        local_map_dir = local_image_path.rsplit("/", 1)[0] if local_image_path and "/" in local_image_path else ""
     if not local_map_dir and map_data.name:
         # Older uploaded maps did not store the edge-local image path in
         # description. Their name is the edge session directory, e.g.

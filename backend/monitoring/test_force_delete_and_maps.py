@@ -8,6 +8,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
+from rest_framework.test import APIRequestFactory
 
 from .models import (
     InspectionEvent,
@@ -21,6 +22,7 @@ from .models import (
     Track,
     Zone,
 )
+from .views import _map_activation_payload
 
 
 class ForceDeleteTests(TestCase):
@@ -151,3 +153,23 @@ class MapUploadMetadataTests(TestCase):
         self.assertEqual(created.origin, [-3.5, 1.25, 0.0])
         self.assertEqual(created.width, 4)
         self.assertEqual(created.height, 3)
+
+
+class MapActivationPayloadTests(TestCase):
+    def test_uses_uploaded_source_map_dir_before_original_image_path(self):
+        robot = Robot.objects.create(code="rx-map-payload", name="RX Payload", location="park", area="park")
+        map_data = MapData.objects.create(
+            name="candidate",
+            robot=robot,
+            description=json.dumps(
+                {
+                    "source_map_dir": "/home/robot/.jszr/map/source/filter_variants/candidate",
+                    "image": "/home/robot/.jszr/map/source/map.pgm",
+                }
+            ),
+        )
+
+        payload = _map_activation_payload(map_data, APIRequestFactory().post("/"))
+
+        self.assertEqual(payload["local_map_dir"], "/home/robot/.jszr/map/source/filter_variants/candidate")
+        self.assertEqual(payload["local_image_path"], "/home/robot/.jszr/map/source/filter_variants/candidate/map.pgm")

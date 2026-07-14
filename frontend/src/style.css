@@ -381,6 +381,14 @@ a { color: inherit; }
   background: linear-gradient(135deg, #ff7a7a, #d12b54);
 }
 
+.state-runtime {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .state-steps {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
