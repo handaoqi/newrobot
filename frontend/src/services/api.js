@@ -86,6 +86,16 @@ export async function sendRobotCommand(robotId, payload) {
   })
 }
 
+export async function sendRecordedAudioCommand(robotId, file, audioName = '现场录音') {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('audio_name', audioName)
+  return request(`/robots/${robotId}/commands/audio-recording/`, {
+    method: 'POST',
+    body: formData,
+  })
+}
+
 export async function fetchTasks() {
   return request('/tasks/')
 }

@@ -1,7 +1,8 @@
 from django.contrib.auth.hashers import check_password
+from django.conf import settings
 from rest_framework.permissions import BasePermission
 
-from .models import RobotCredential
+from .models import Robot, RobotCredential
 
 
 class IsAuthenticatedOrDeviceCredential(BasePermission):
@@ -22,4 +23,25 @@ class IsAuthenticatedOrDeviceCredential(BasePermission):
         if not credential or not credential.secret_hash or not check_password(secret, credential.secret_hash):
             return False
         request.device_robot = credential.robot
+        return True
+
+
+class IsAudioDeviceCredential(IsAuthenticatedOrDeviceCredential):
+    """Require device credentials in production, with an unprovisioned DEBUG fallback."""
+
+    def has_permission(self, request, view):
+        if super().has_permission(request, view):
+            return True
+        if not settings.DEBUG:
+            return False
+        robot_code = (
+            request.headers.get("X-Device-Code", "").strip()
+            or request.query_params.get("robot_code", "").strip()
+        )
+        if not robot_code:
+            return False
+        robot = Robot.objects.filter(code=robot_code).first()
+        if robot is None or robot.credentials.filter(status="active").exists():
+            return False
+        request.device_robot = robot
         return True

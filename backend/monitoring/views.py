@@ -4,12 +4,14 @@ import json
 import math
 import zipfile
 from datetime import time as datetime_time, timedelta
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
@@ -42,7 +44,7 @@ from .models import (
     Zone,
     Track,
 )
-from .permissions import IsAuthenticatedOrDeviceCredential
+from .permissions import IsAudioDeviceCredential, IsAuthenticatedOrDeviceCredential
 from .realtime import event_broker, sse_stream
 from .services.alert_service import AlertService
 from .services.command_service import CommandService
@@ -718,6 +720,13 @@ class RobotCommandView(APIView):
         serializer.is_valid(raise_exception=True)
         action = serializer.validated_data["action"]
         payload = serializer.validated_data.get("payload") or {}
+        if action == "play_audio":
+            audio_url = str(payload.get("audio_url", "")).strip()
+            if not audio_url.startswith(("http://", "https://")):
+                return Response(
+                    {"detail": "audio_url 必须是机器狗可下载的 HTTP(S) 地址"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         command_type = self.ACTION_TO_COMMAND_TYPE.get(action)
         if command_type:
             if robot.effective_connection_status() != "online":
@@ -740,6 +749,9 @@ class RobotCommandView(APIView):
             payload=payload,
         )
 
+        if command.action == "play_audio":
+            return Response(RobotCommandSerializer(command).data, status=status.HTTP_201_CREATED)
+
         response_payload, error_message = dispatch_robot_command(command)
         command.sent_at = timezone.now()
         command.response_payload = response_payload
@@ -749,6 +761,124 @@ class RobotCommandView(APIView):
 
         response_status = status.HTTP_201_CREATED if command.status == "sent" else status.HTTP_502_BAD_GATEWAY
         return Response(RobotCommandSerializer(command).data, status=response_status)
+
+
+class RobotAudioRecordingCommandView(APIView):
+    MAX_AUDIO_SIZE = 10 * 1024 * 1024
+    EXTENSION_BY_TYPE = {
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mp4": ".m4a",
+        "audio/aac": ".aac",
+    }
+    ALLOWED_EXTENSIONS = {".webm", ".ogg", ".mp3", ".wav", ".m4a", ".aac"}
+
+    def post(self, request, robot_id):
+        ensure_demo_seed()
+        robot = get_object_or_404(Robot, id=robot_id)
+        uploaded_file = request.FILES.get("file")
+        if uploaded_file is None:
+            return Response({"detail": "录音文件不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if uploaded_file.size <= 0:
+            return Response({"detail": "录音文件为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if uploaded_file.size > self.MAX_AUDIO_SIZE:
+            return Response({"detail": "录音文件不能超过 10MB"}, status=status.HTTP_400_BAD_REQUEST)
+
+        content_type = (uploaded_file.content_type or "").split(";", 1)[0].lower()
+        extension = self.EXTENSION_BY_TYPE.get(content_type)
+        if extension is None:
+            original_name = uploaded_file.name or ""
+            extension = "." + original_name.rsplit(".", 1)[-1].lower() if "." in original_name else ".webm"
+        if extension not in self.ALLOWED_EXTENSIONS:
+            return Response({"detail": "不支持的录音格式"}, status=status.HTTP_400_BAD_REQUEST)
+
+        relative_path = timezone.now().strftime("command-audio/%Y/%m/%d/")
+        saved_path = default_storage.save(f"{relative_path}{uuid4().hex}{extension}", uploaded_file)
+        media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+        media_path = f"{media_url.rstrip('/')}/{saved_path}"
+        public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
+        audio_url = f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action="play_audio",
+            payload={
+                "audio_url": audio_url,
+                "audio_name": request.data.get("audio_name") or "现场录音",
+                "source": "dashboard_recording",
+                "content_type": content_type,
+                "file_size": uploaded_file.size,
+            },
+        )
+        return Response(
+            {"audio_url": audio_url, "command": RobotCommandSerializer(command).data},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class DeviceCommandPollView(APIView):
+    permission_classes = [IsAudioDeviceCredential]
+
+    def get(self, request):
+        requested_code = (
+            request.query_params.get("robot_code")
+            or request.headers.get("X-Device-Code")
+            or ""
+        ).strip()
+        credential_robot = getattr(request, "device_robot", None)
+        if credential_robot and requested_code and credential_robot.code != requested_code:
+            return Response({"detail": "设备凭证与 robot_code 不匹配"}, status=status.HTTP_403_FORBIDDEN)
+        robot = credential_robot
+        if robot is None:
+            if not requested_code:
+                return Response({"detail": "robot_code is required"}, status=status.HTTP_400_BAD_REQUEST)
+            robot = get_object_or_404(Robot, code=requested_code)
+
+        with transaction.atomic():
+            command = (
+                RobotCommand.objects.select_for_update(skip_locked=True)
+                .filter(robot=robot, action="play_audio", status="queued")
+                .order_by("created_at")
+                .first()
+            )
+            if command is None:
+                return Response(status=status.HTTP_204_NO_CONTENT)
+            command.status = "sent"
+            command.sent_at = timezone.now()
+            command.save(update_fields=["status", "sent_at", "updated_at"])
+        return Response(RobotCommandSerializer(command).data)
+
+
+class DeviceCommandReportView(APIView):
+    permission_classes = [IsAudioDeviceCredential]
+
+    def post(self, request, command_id):
+        status_value = str(request.data.get("status", "")).strip()
+        if status_value not in {"running", "finished", "failed"}:
+            return Response(
+                {"detail": "status must be running, finished, or failed"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        command = get_object_or_404(
+            RobotCommand.objects.select_related("robot"),
+            id=command_id,
+            action="play_audio",
+        )
+        credential_robot = getattr(request, "device_robot", None)
+        if credential_robot and credential_robot.id != command.robot_id:
+            return Response({"detail": "设备凭证与命令所属机器人不匹配"}, status=status.HTTP_403_FORBIDDEN)
+
+        response_payload = request.data.get("response_payload") or {}
+        if not isinstance(response_payload, dict):
+            return Response({"detail": "response_payload must be an object"}, status=status.HTTP_400_BAD_REQUEST)
+        command.status = status_value
+        command.response_payload = response_payload
+        command.error_message = str(request.data.get("error_message") or "")
+        command.save(update_fields=["status", "response_payload", "error_message", "updated_at"])
+        return Response(RobotCommandSerializer(command).data)
 
 
 class EventListView(APIView):
