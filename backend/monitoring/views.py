@@ -1259,14 +1259,30 @@ class RobotMappingStatusView(APIView):
                 )
             except (TypeError, ValueError):
                 progress_is_current = False
+        live_sample_is_current = bool(
+            latest_status
+            and (
+                not command
+                or latest_status.sampled_at >= command.issued_at - timedelta(seconds=5)
+            )
+        )
+        command_is_active = bool(
+            command
+            and command.status in {"created", "published", "accepted", "executing"}
+        )
+        live_mapping_is_active = bool(
+            live_mapping.get("process_alive")
+            or live_mapping.get("state") not in {None, "idle"}
+            or (live_progress and progress_is_current)
+        )
 
         # 从 result_payload 提取 edge_agent 返回的真实 mapping state
         mapping_state = "idle"
         mapping_result = {}
-        if live_mapping and (
-            live_mapping.get("process_alive")
-            or live_mapping.get("state") not in {None, "idle"}
-            or (live_progress and progress_is_current)
+        if (
+            live_mapping
+            and live_sample_is_current
+            and (not command_is_active or live_mapping_is_active)
         ):
             mapping_result = live_mapping
             mapping_state = mapping_result.get("state", "idle")
