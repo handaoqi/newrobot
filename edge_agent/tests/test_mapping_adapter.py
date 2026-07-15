@@ -48,12 +48,32 @@ def test_large_map_skips_whole_cloud_visibility_filter(tmp_path):
     session.mkdir()
     (session / "map.pcd").write_bytes(b"x" * 32)
 
-    adapter = make_adapter(tmp_path, visibility_filter_max_source_bytes=16)
+    adapter = make_adapter(
+        tmp_path,
+        visibility_filter_enabled=True,
+        visibility_filter_max_source_bytes=16,
+    )
     output, result = adapter._filter_map_outputs(session)
 
     assert output == session
     assert result["skipped"] == "source_exceeds_memory_safe_visibility_limit"
     assert result["active_filter"] == "disk_sharded_cpp_keyframe_filter"
+
+
+def test_disabled_visibility_filter_packages_raw_map(tmp_path):
+    session = tmp_path / "20260715_121000_003"
+    session.mkdir()
+    (session / "map.pcd").write_bytes(b"raw-map")
+
+    adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
+    output, result = adapter._filter_map_outputs(session)
+
+    assert output == session
+    assert result == {
+        "enabled": False,
+        "mode": "manual_cleanup",
+        "source": str(session),
+    }
 
 
 def test_finds_newest_incomplete_recoverable_session(tmp_path):

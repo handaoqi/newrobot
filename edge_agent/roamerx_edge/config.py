@@ -78,11 +78,11 @@ class MappingConfig:
     save_data: int = 5
     command_timeout_seconds: int = 15
     save_wait_seconds: int = 7200
-    dynamic_filter_enabled: bool = True
+    dynamic_filter_enabled: bool = False
     dynamic_filter_voxel_size_m: float = 0.12
     dynamic_filter_min_points_per_voxel: int = 3
     dynamic_filter_clear_radius_cells: int = 1
-    visibility_filter_enabled: bool = True
+    visibility_filter_enabled: bool = False
     visibility_filter_voxel_size_m: float = 0.3
     visibility_filter_min_free_observations: int = 1
     visibility_filter_max_hit_observations: int = 10

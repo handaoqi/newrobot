@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 import yaml
 
 from .config import EdgeConfig
+from .manual_map_cleanup import ManualMapCleanupError, build_manual_cleanup_map
 from .protocol import ProtocolError
 from .safety_policy import RuntimeSafetyState
 
@@ -29,6 +31,22 @@ class MapActivationAdapter:
         map_version = str(command.get("map_version", "")).strip()
         try:
             source_dir = self._resolve_source_dir(command)
+            cleanup_result = None
+            if command.get("manual_edit"):
+                safe_version = re.sub(r"[^A-Za-z0-9_.-]+", "_", map_version)[:96] or map_id
+                edited_dir = self.map_dir / "manual_edits" / f"map_{map_id}_{safe_version}"
+                try:
+                    cleanup_result = build_manual_cleanup_map(
+                        source_dir,
+                        edited_dir,
+                        pgm_url=str(command.get("pgm_url") or ""),
+                        yaml_url=str(command.get("yaml_url") or ""),
+                        pgm_sha256=str(command.get("pgm_sha256") or ""),
+                        yaml_sha256=str(command.get("yaml_sha256") or ""),
+                    )
+                except ManualMapCleanupError as exc:
+                    raise ProtocolError("MAP_MANUAL_CLEANUP_FAILED", str(exc)) from exc
+                source_dir = edited_dir
             missing = [name for name in self.REQUIRED_FILES if not (source_dir / name).exists()]
             if missing:
                 raise ProtocolError(
@@ -59,7 +77,7 @@ class MapActivationAdapter:
             self.last_activation_error = f"{exc.code}: {exc.message}"
             raise
 
-        return {
+        result = {
             "map_id": map_id,
             "map_version": map_version,
             "map_name": command.get("map_name", ""),
@@ -68,6 +86,9 @@ class MapActivationAdapter:
             "switched_files": switched,
             "current_map": self.status(),
         }
+        if cleanup_result is not None:
+            result["manual_cleanup"] = cleanup_result
+        return result
 
     def status(self) -> dict:
         active_files = {}

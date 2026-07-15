@@ -480,7 +480,11 @@ class MappingAdapter:
         and makes the active local map identical to the map sent upstream.
         """
         if not self.config.visibility_filter_enabled:
-            raise ProtocolError("MAPPING_FILTER_DISABLED", "keyframe visibility filtering is required for saved maps")
+            return base, {
+                "enabled": False,
+                "mode": "manual_cleanup",
+                "source": str(base),
+            }
         pcd_path = base / "map.pcd"
         source_bytes = pcd_path.stat().st_size if pcd_path.exists() else 0
         max_source_bytes = int(self.config.visibility_filter_max_source_bytes)
