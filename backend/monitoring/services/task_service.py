@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any
 
@@ -73,7 +74,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
 
 def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
     map_data = route.map_data
-    return {
+    snapshot = {
         "route_id": str(route.id),
         "route_name": route.name,
         "frame_id": "map",
@@ -84,6 +85,34 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
         },
         "waypoints": normalize_waypoints(route),
     }
+    if route.map_set_id:
+        members = list(route.map_set.members.select_related("map_data").all())
+        snapshot["map_set"] = {
+            "id": str(route.map_set_id),
+            "name": route.map_set.name,
+            "version": route.map_set.version,
+            "manifest": route.map_set.manifest,
+            "submaps": [
+                {
+                    "submap_id": member.submap_id,
+                    "sequence": member.sequence,
+                    "map_id": str(member.map_data_id),
+                    "map_version": f"legacy-mapdata-{member.map_data_id}",
+                    "metadata": member.metadata,
+                    "local_map_dir": _member_local_map_dir(member),
+                }
+                for member in members
+            ],
+        }
+    return snapshot
+
+
+def _member_local_map_dir(member) -> str:
+    try:
+        description = json.loads(member.map_data.description or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(description.get("source_map_dir") or "")
 
 
 class TaskExecutionService:

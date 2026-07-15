@@ -24,6 +24,8 @@ from .models import (
     TaskExecutionEvent,
     TrajectoryPoint,
     MapData,
+    MapSet,
+    MapSetMember,
     PatrolRoute,
     Zone,
     Track,
@@ -638,10 +640,28 @@ class MapDataSerializer(serializers.ModelSerializer):
         return size
 
 
+class MapSetMemberSerializer(serializers.ModelSerializer):
+    map_data = MapDataSerializer(read_only=True)
+
+    class Meta:
+        model = MapSetMember
+        fields = ["sequence", "submap_id", "metadata", "map_data"]
+
+
+class MapSetSerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True, allow_null=True)
+    members = MapSetMemberSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MapSet
+        fields = ["id", "name", "robot", "robot_name", "version", "manifest", "active", "members", "created_at", "updated_at"]
+
+
 class PatrolRouteSerializer(serializers.ModelSerializer):
     robot_name = serializers.CharField(source="robot.name", read_only=True)
     robot_code = serializers.CharField(source="robot.code", read_only=True)
     map_name = serializers.CharField(source="map_data.name", read_only=True)
+    map_set_name = serializers.CharField(source="map_set.name", read_only=True, allow_null=True)
 
     class Meta:
         model = PatrolRoute
@@ -650,6 +670,8 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             "name",
             "map_data",
             "map_name",
+            "map_set",
+            "map_set_name",
             "robot",
             "robot_name",
             "robot_code",

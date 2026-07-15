@@ -95,6 +95,12 @@ STATIC_URL = "static/"
 MEDIA_URL = "media/"
 MEDIA_ROOT = Path(os.getenv("DJANGO_MEDIA_ROOT", BASE_DIR / "media"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+CSRF_TRUSTED_ORIGINS = [
+    item.strip()
+    for item in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "https://39.107.250.69").split(",")
+    if item.strip()
+]
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 CORS_ALLOW_ALL_ORIGINS = True

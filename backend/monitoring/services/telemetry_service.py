@@ -33,6 +33,10 @@ class TelemetryService:
         network = payload.get("network") or {}
         runtime = payload.get("runtime") or {}
         current_map = payload.get("current_map") or {}
+        map_set = payload.get("map_set") or {}
+        localization_quality = dict(localization.get("quality") or {})
+        if map_set:
+            localization_quality["map_set"] = map_set
         execution = None
         execution_id = runtime.get("task_execution_id")
         if execution_id:
@@ -52,7 +56,7 @@ class TelemetryService:
             "speed_mps": _decimal(pose.get("speed_mps")),
             "localization_status": localization.get("status", "unknown"),
             "localization_source_status": localization.get("source_status"),
-            "localization_quality": localization.get("quality") or {},
+            "localization_quality": localization_quality,
             "power_available": bool(power.get("available", False)),
             "battery_percent": power.get("percent") if power.get("available") else None,
             "charging": power.get("charging") if power.get("available") else None,

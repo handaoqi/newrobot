@@ -40,6 +40,8 @@ from .models import (
     ScheduleRun,
     TrajectoryPoint,
     MapData,
+    MapSet,
+    MapSetMember,
     PatrolRoute,
     Zone,
     Track,
@@ -65,6 +67,7 @@ from .serializers import (
     RemoteCommandSerializer,
     TelemetryIngestSerializer,
     MapDataSerializer,
+    MapSetSerializer,
     PatrolRouteSerializer,
     ZoneSerializer,
     TrackSerializer,
@@ -478,8 +481,8 @@ def ensure_demo_seed() -> None:
             "camera_id": "front",
             "stream_id": "dog_ZSL-1A-07_front",
             "play_urls": {
-                "flv": "http://39.107.250.69:8090/live/dog_ZSL-1A-07_front.live.flv",
-                "hls": "http://39.107.250.69:8090/live/dog_ZSL-1A-07_front/hls.m3u8",
+                "flv": "https://39.107.250.69/live/dog_ZSL-1A-07_front.live.flv",
+                "hls": "https://39.107.250.69/live/dog_ZSL-1A-07_front/hls.m3u8",
             },
         },
     )
@@ -1206,6 +1209,14 @@ class MapDataListView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
+class MapSetListView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        map_sets = MapSet.objects.select_related("robot").prefetch_related("members__map_data")
+        return Response(MapSetSerializer(map_sets, many=True, context={"request": request}).data)
+
+
 class MapDataDetailView(APIView):
     """地图详情视图"""
     permission_classes = [permissions.AllowAny]
@@ -1761,12 +1772,19 @@ class DeviceMapUploadView(APIView):
             return Response({"detail": "缺少 map_package 文件"}, status=status.HTTP_400_BAD_REQUEST)
 
         extracted: dict[str, bytes] = {}
+        submap_files: dict[str, dict[str, bytes]] = {}
+        map_set_manifest: dict = {}
         try:
             with zipfile.ZipFile(io.BytesIO(package.read())) as archive:
                 for name in archive.namelist():
-                    basename = name.rsplit("/", 1)[-1]
-                    if basename in {"map.yaml", "map.pgm", "map_preview.png", "preview.png"}:
-                        extracted[basename] = archive.read(name)
+                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png"}:
+                        extracted[name] = archive.read(name)
+                    elif name == "map_set/map_set_manifest.json":
+                        map_set_manifest = json.loads(archive.read(name).decode("utf-8"))
+                    elif name.startswith("map_set/"):
+                        parts = name.split("/")
+                        if len(parts) == 3 and parts[2] in {"map.yaml", "map.pgm", "map_preview.png", "submap.json"}:
+                            submap_files.setdefault(parts[1], {})[parts[2]] = archive.read(name)
         except zipfile.BadZipFile:
             return Response({"detail": "map_package 不是合法 zip"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1802,6 +1820,51 @@ class DeviceMapUploadView(APIView):
             if preview:
                 map_data.thumbnail.save(f"{map_data.id}_preview.png", ContentFile(preview), save=False)
             map_data.save()
+            map_set = None
+            if map_set_manifest and submap_files:
+                map_set = MapSet.objects.create(
+                    name=f"{map_name} 地图集",
+                    robot=robot,
+                    version=str(metadata.get("map_version") or ""),
+                    manifest=map_set_manifest,
+                )
+                source_dir = str(metadata.get("source_map_dir") or "").rstrip("/")
+                for sequence, submap in enumerate(map_set_manifest.get("submaps") or [], start=1):
+                    submap_id = str(submap.get("submap_id") or "")
+                    files = submap_files.get(submap_id) or {}
+                    if not submap_id or "map.yaml" not in files or "map.pgm" not in files:
+                        continue
+                    submap_yaml = _parse_simple_map_yaml(files["map.yaml"])
+                    submap_width, submap_height = _read_pgm_dimensions(files["map.pgm"])
+                    local_submap_dir = f"{source_dir}/map_set/{submap_id}" if source_dir else ""
+                    submap_description = {
+                        "source": "edge_mapping_submap",
+                        "map_set_id": map_set.id,
+                        "submap_id": submap_id,
+                        "source_map_dir": local_submap_dir,
+                        "metadata": submap,
+                    }
+                    member_map = MapData.objects.create(
+                        name=f"{map_name} / {submap_id}",
+                        robot=robot,
+                        resolution=float(submap_yaml.get("resolution") or 0.05),
+                        width=submap_width,
+                        height=submap_height,
+                        origin=submap_yaml.get("origin") or [],
+                        description=json.dumps(submap_description, ensure_ascii=False),
+                    )
+                    member_map.yaml_file.save(f"{member_map.id}_{submap_id}.yaml", ContentFile(files["map.yaml"]), save=False)
+                    member_map.pgm_file.save(f"{member_map.id}_{submap_id}.pgm", ContentFile(files["map.pgm"]), save=False)
+                    if files.get("map_preview.png"):
+                        member_map.thumbnail.save(f"{member_map.id}_{submap_id}.png", ContentFile(files["map_preview.png"]), save=False)
+                    member_map.save()
+                    MapSetMember.objects.create(
+                        map_set=map_set,
+                        map_data=member_map,
+                        sequence=sequence,
+                        submap_id=submap_id,
+                        metadata=submap,
+                    )
             command = None
             if auto_activate:
                 MapData.objects.filter(robot=robot, active=True).exclude(pk=map_data.pk).update(active=False)
@@ -1815,6 +1878,7 @@ class DeviceMapUploadView(APIView):
                     expiry_seconds=120,
                 )
         data = MapDataSerializer(map_data, context={"request": request}).data
+        data["map_set"] = MapSetSerializer(map_set, context={"request": request}).data if map_set else None
         data["activation_command"] = RemoteCommandSerializer(command).data if command else None
         data["detail"] = (
             "地图已上传、设为活动地图，并已向机器狗下发地图切换命令。"

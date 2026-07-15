@@ -16,8 +16,7 @@ const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
-const selectedAudioUrl = ref('/audio/bike-leave.mp3')
-const customAudioUrl = ref('')
+const selectedSpeakerTemplate = ref('驶离提醒')
 const audioCommandSending = ref(false)
 const recording = ref(false)
 const recordedBlob = ref(null)
@@ -51,21 +50,21 @@ const quickTexts = [
   {
     label: '重点路段',
     text: '您好，当前区域为巡检重点路段，请勿长时间占道停留。',
+    audioUrl: '/audio/notice.wav',
+    audioName: '重点路段',
   },
   {
     label: '驶离提醒',
-    text: '您好，请将车辆停放至指定区域，共同保持通道顺畅。',
+    text: '您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。',
+    audioUrl: '/audio/bike-leave.mp3',
+    audioName: '驶离提醒',
   },
   {
     label: '注意避让',
     text: '您好，系统检测到现场存在安全风险，请注意避让并配合引导。',
+    audioUrl: '/audio/attention.mp3',
+    audioName: '注意避让',
   },
-]
-const audioOptions = [
-  { label: '自行车驶离', url: '/audio/bike-leave.mp3' },
-  { label: '注意避让', url: '/audio/attention.mp3' },
-  { label: '通道清理', url: '/audio/clear-path.wav' },
-  { label: '安全警告', url: '/audio/warning.wav' },
 ]
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
@@ -113,12 +112,20 @@ function formatEventTime(value) {
 }
 
 function setSpeakerText(text) {
+  const template = quickTexts.find((item) => item.text === text)
   speakerText.value = text
+  if (template) selectedSpeakerTemplate.value = template.label
   showToast('已切换喊话模板')
 }
 
+const activeSpeakerTemplate = computed(() => {
+  return quickTexts.find((item) => item.text === speakerText.value) ||
+    quickTexts.find((item) => item.label === selectedSpeakerTemplate.value) ||
+    quickTexts[0]
+})
+
 function buildAudioUrl() {
-  const value = (customAudioUrl.value.trim() || selectedAudioUrl.value).trim()
+  const value = activeSpeakerTemplate.value?.audioUrl || ''
   if (!value) return ''
   try {
     return new URL(value, `${deviceAudioBase}/`).href
@@ -138,12 +145,12 @@ async function beginSpeak() {
 
   audioCommandSending.value = true
   try {
-    const selected = audioOptions.find((item) => item.url === selectedAudioUrl.value)
+    const selected = activeSpeakerTemplate.value
     await sendRobotCommand(robot.id, {
       action: 'play_audio',
       payload: {
         audio_url: audioUrl,
-        audio_name: customAudioUrl.value.trim() ? '自定义音频' : selected?.label || '现场喊话',
+        audio_name: selected?.audioName || selected?.label || '现场喊话',
         text: speakerText.value,
         source: 'dashboard_audio',
       },
@@ -389,7 +396,7 @@ function seekLatestFrame() {
 
 function keepLivePlaying() {
   const element = videoRef.value
-  if (!element || !takeoverActive.value) return
+  if (!element) return
   element.muted = true
   element.controls = false
   seekLatestFrame()
@@ -610,16 +617,25 @@ async function setupLivePlayer() {
       type: 'flv',
       isLive: true,
       url: flv,
+    }, {
+      enableStashBuffer: false,
+      liveBufferLatencyChasing: true,
     })
     flvPlayer.on(mpegts.Events.ERROR, fallbackToSnapshot)
     flvPlayer.attachMediaElement(element)
     flvPlayer.load()
     flvPlayer.play().catch(fallbackToSnapshot)
+    startLiveGuard()
     return
   }
 
   if (playableHls && Hls.isSupported()) {
-    hlsPlayer = new Hls({ lowLatencyMode: true })
+    hlsPlayer = new Hls({
+      lowLatencyMode: true,
+      liveSyncDurationCount: 1,
+      liveMaxLatencyDurationCount: 2,
+      maxLiveSyncPlaybackRate: 1.5,
+    })
     hlsPlayer.loadSource(hls)
     hlsPlayer.attachMedia(element)
     hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
@@ -627,6 +643,7 @@ async function setupLivePlayer() {
     })
     hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
       element.play().catch(fallbackToSnapshot)
+      startLiveGuard()
     })
     return
   }
@@ -634,6 +651,7 @@ async function setupLivePlayer() {
   if (playableHls) {
     element.src = hls
     element.play().catch(fallbackToSnapshot)
+    startLiveGuard()
   }
 }
 
@@ -724,8 +742,11 @@ function handleVisibilityChange() {
             muted
             playsinline
             autoplay
-            :controls="!takeoverActive"
             @pause="keepLivePlaying"
+            @progress="seekLatestFrame"
+            @timeupdate="seekLatestFrame"
+            @loadedmetadata="keepLivePlaying"
+            @waiting="keepLivePlaying"
           ></video>
           <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
             <strong>无信号</strong>
@@ -922,13 +943,6 @@ function handleVisibilityChange() {
               {{ item.label }}
             </button>
           </div>
-          <label class="audio-picker">
-            <span>预置音频</span>
-            <select v-model="selectedAudioUrl">
-              <option v-for="item in audioOptions" :key="item.url" :value="item.url">{{ item.label }}</option>
-            </select>
-          </label>
-          <input v-model="customAudioUrl" class="audio-url-input" type="url" placeholder="自定义音频 URL（需机器狗可访问）" />
           <div class="action-row">
             <button class="primary-btn" :disabled="audioCommandSending" @click="beginSpeak">
               {{ audioCommandSending ? '下发中' : '开始喊话' }}
