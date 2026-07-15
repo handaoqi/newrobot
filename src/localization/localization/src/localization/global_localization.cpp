@@ -4,11 +4,11 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <Eigen/Dense>
+#include <cmath>
 
 namespace localization {
 
-    GlobalLocalization::GlobalLocalization()
-    : init_check_count_(0), last_position_(Eigen::Vector3d::Zero()) {}
+    GlobalLocalization::GlobalLocalization() = default;
 
 GlobalLocalization::~GlobalLocalization() {}
 
@@ -53,8 +53,15 @@ bool GlobalLocalization::performGlobalLocalization(
     pcl::transformPointCloud(*current_cloud_ds, *current_cloud_ds, T_corr_current);
 
 
-    if (fitness_score > 0.25) {
-        return false; 
+    // This routine is invoked as a bounded one-shot initializer. Requiring a
+    // second callback made successful matches impossible after the caller's
+    // retry gate was consumed. Use the same fitness scale as local NDT and
+    // reject non-finite or unconverged ICP results here.
+    // The first pass is only a coarse seed for the second ICP pass. Keep this
+    // gate looser than the final acceptance threshold so borderline seeds can
+    // still be refined.
+    if (!icp.hasConverged() || !std::isfinite(fitness_score) || fitness_score > 1.0) {
+        return false;
     }
 
     // 第二次 ICP 
@@ -64,31 +71,17 @@ bool GlobalLocalization::performGlobalLocalization(
     RCLCPP_INFO(logger_, "ICP fitness score 2: %.6f", fitness_score);
     pcl::transformPointCloud(*current_cloud_ds, *current_cloud_ds, T_corr_second);
 
+    if (!icp.hasConverged() || !std::isfinite(fitness_score) || fitness_score > 0.5) {
+        return false;
+    }
+
     // ICP aligns the cloud after it has already been transformed by the
     // supplied initial pose. Preserve that initial map-frame transform when
     // returning the refined pose.
     Eigen::Matrix4d T_corr_final =
         T_corr_second.cast<double>() * T_corr_current.cast<double>() * initial_trans;
 
-    Eigen::Vector3d current_position = T_corr_final.block<3, 1>(0, 3);
-    if (init_check_count_ > 0) {
-        Eigen::Vector3d position_diff = current_position - last_position_;
-        if (position_diff.norm() < 0.1) {
-            init_check_count_++;
-        } else {
-            init_check_count_ = 0; 
-        }
-    } else {
-        init_check_count_ = 1; 
-    }
-
-    last_position_ = current_position;
-
-    if (init_check_count_ >= 2) {
-        final_pose = T_corr_final; 
-        return true;  
-    }
-
-    return false; 
+    final_pose = T_corr_final;
+    return true;
 }
 } // namespace localization

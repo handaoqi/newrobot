@@ -2,6 +2,7 @@
 #define POSE_ESTIMATOR_HPP
 
 #include <memory>
+#include <limits>
 #include <boost/optional.hpp>
 
 #include <rclcpp/rclcpp.hpp>
@@ -35,8 +36,8 @@ public:
   using PointT = pcl::PointXYZI;
 
   struct MatchResult{
-    bool  is_converged_;   ///< Indicates whether the matching operation converged.
-    float fitness_score_;  ///< The fitness score of the matching operation.
+    bool  is_converged_ = false;   ///< Indicates whether the matching operation converged.
+    float fitness_score_ = std::numeric_limits<float>::infinity();  ///< The fitness score of the matching operation.
   };
 
   /**

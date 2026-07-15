@@ -17,10 +17,10 @@ class NavigationStackAdapter:
         return self._run("status", timeout_seconds=min(self.config.command_timeout_seconds, 20))
 
     def start(self, command: dict | None = None) -> dict:
-        return self._run("start", timeout_seconds=self.config.command_timeout_seconds)
+        return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 90))
 
     def restart(self, command: dict | None = None) -> dict:
-        return self._run("restart", timeout_seconds=self.config.command_timeout_seconds)
+        return self._run("restart", timeout_seconds=max(self.config.command_timeout_seconds, 90))
 
     def recover(self, command: dict | None = None) -> dict:
         status_payload = self.status()

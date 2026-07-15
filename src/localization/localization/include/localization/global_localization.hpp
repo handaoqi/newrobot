@@ -24,9 +24,7 @@ namespace localization {
             );
         
         private:
-            Eigen::Matrix4d initial_pose_; 
-            int init_check_count_;        
-            Eigen::Vector3d last_position_; 
+            Eigen::Matrix4d initial_pose_;
             rclcpp::Logger logger_ = rclcpp::get_logger("global_localization");
         };
 
