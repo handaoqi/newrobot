@@ -19,6 +19,14 @@ async function request(path, options = {}) {
     const error = new Error(errorPayload.detail || '请求失败')
     error.payload = errorPayload
     error.status = response.status
+    // 会话过期/令牌失效：全站统一清理并跳转登录，避免各页因未捕获而白屏卡死。
+    if (response.status === 401 && path !== '/auth/login/') {
+      localStorage.removeItem('inspection_token')
+      localStorage.removeItem('inspection_user')
+      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+        window.location.assign('/login')
+      }
+    }
     throw error
   }
 
@@ -75,6 +83,16 @@ export async function sendRobotCommand(robotId, payload) {
   return request(`/robots/${robotId}/commands/`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export async function sendRecordedAudioCommand(robotId, file, audioName = '现场录音') {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('audio_name', audioName)
+  return request(`/robots/${robotId}/commands/audio-recording/`, {
+    method: 'POST',
+    body: formData,
   })
 }
 

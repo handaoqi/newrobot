@@ -14,6 +14,23 @@ TASK_STATES = [
 ]
 
 
+def backfill_patrol_task_robots(apps, schema_editor):
+    Robot = apps.get_model("monitoring", "Robot")
+    PatrolTask = apps.get_model("monitoring", "PatrolTask")
+    db_alias = schema_editor.connection.alias
+
+    robot = Robot.objects.using(db_alias).order_by("id").first()
+    if robot is None:
+        robot = Robot.objects.using(db_alias).create(
+            code="ZSL-1A-07",
+            name="南入口巡检机器人",
+            location="太阳宫园区",
+            area="园区主通道",
+        )
+
+    PatrolTask.objects.using(db_alias).filter(robot__isnull=True).update(robot=robot)
+
+
 class Migration(migrations.Migration):
     dependencies = [
         ("monitoring", "0010_p0_device_sessions_and_status"),
@@ -21,6 +38,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.RunPython(backfill_patrol_task_robots, migrations.RunPython.noop),
         migrations.AddField("patroltask", "route", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name="task_templates", to="monitoring.patrolroute")),
         migrations.AddField("patroltask", "enabled", models.BooleanField(default=True)),
         migrations.AddField("patroltask", "description", models.TextField(blank=True)),

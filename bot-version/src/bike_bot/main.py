@@ -10,6 +10,7 @@ from typing import Any
 
 import cv2
 
+from .audio_commands import AudioCommandClient
 from .config import AppConfig
 from .control import CommandServer
 from .detector import YoloDetector
@@ -487,6 +488,20 @@ def command_worker(stop_event: threading.Event, server: CommandServer, error_que
         server_thread.join(timeout=2)
 
 
+def cloud_audio_command_worker(stop_event: threading.Event, client: AudioCommandClient) -> None:
+    while not stop_event.is_set():
+        try:
+            command = client.poll_once()
+            if command:
+                LOGGER.info("received cloud audio command id=%s", command.get("id"))
+                client.handle_command(command)
+        except Exception:
+            LOGGER.exception("cloud audio command poll failed")
+            stop_event.wait(5)
+            continue
+        stop_event.wait(1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime bicycle detection edge client.")
     parser.add_argument("--config", default="config.yaml", help="path to yaml config")
@@ -512,6 +527,7 @@ def main() -> None:
         LOGGER.exception("model load failed, detection disabled")
         detector = None
     client = TelemetryClient(config, runtime_state, sdk_client)
+    audio_command_client = AudioCommandClient(config)
     pusher = StreamPusher(config)
     command_server = CommandServer(config, sdk_client) if config.control.enable else None
     stop_event = threading.Event()
@@ -545,6 +561,14 @@ def main() -> None:
                 name="detection-worker",
             )
         )
+    threads.append(
+        threading.Thread(
+            target=cloud_audio_command_worker,
+            args=(stop_event, audio_command_client),
+            daemon=False,
+            name="cloud-audio-command-worker",
+        )
+    )
     if config.stream.enable:
         threads.append(
             threading.Thread(

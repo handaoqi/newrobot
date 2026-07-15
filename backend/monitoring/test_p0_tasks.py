@@ -19,6 +19,9 @@ class TaskExecutionTests(TestCase):
             connection_status="online",
             status="online",
             last_seen_at=timezone.now(),
+            localization_status="normal",
+            ros_ready=True,
+            nav_ready=True,
         )
         self.map = MapData.objects.create(name="map", robot=self.robot)
         self.route = PatrolRoute.objects.create(

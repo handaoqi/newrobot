@@ -39,6 +39,56 @@
   --login-accent-2: #7ff1ca;
 }
 
+.audio-picker {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.audio-picker select,
+.audio-url-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+.recording-box {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel-soft);
+}
+
+.recording-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.recording-status.active span {
+  color: #d12b54;
+  font-weight: 700;
+}
+
+.recording-status strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.recording-preview {
+  width: 100%;
+}
+
 [data-theme="dark"] {
   color-scheme: dark;
   --panel: rgba(11, 25, 46, 0.88);

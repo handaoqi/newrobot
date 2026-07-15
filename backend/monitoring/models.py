@@ -435,10 +435,13 @@ class RobotCommand(BaseTimestampModel):
         ("two_leg_stand", "双腿站立"),
         ("cancel_two_leg_stand", "取消双腿站立"),
         ("attitude_control", "姿态控制"),
+        ("play_audio", "播放音频"),
     ]
     STATUS_CHOICES = [
         ("queued", "待发送"),
         ("sent", "已发送"),
+        ("running", "执行中"),
+        ("finished", "已完成"),
         ("failed", "发送失败"),
     ]
 
@@ -482,6 +485,7 @@ class MapData(BaseTimestampModel):
 
 class MapSet(BaseTimestampModel):
     """A globally ordered set of overlapping local navigation maps."""
+
     name = models.CharField(max_length=128)
     robot = models.ForeignKey(Robot, on_delete=models.SET_NULL, null=True, blank=True, related_name="map_sets")
     version = models.CharField(max_length=64, blank=True)

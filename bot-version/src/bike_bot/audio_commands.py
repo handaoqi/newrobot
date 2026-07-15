@@ -85,7 +85,10 @@ class AudioCommandClient:
         response.raise_for_status()
 
     def _headers(self) -> dict[str, str]:
-        headers = {"X-Device-Code": self.config.robot.code}
+        headers = {
+            "X-Device-Code": self.config.robot.code,
+            "X-Device-Id": self.config.robot.code,
+        }
         if self.config.telemetry.device_key:
             headers["X-Device-Key"] = self.config.telemetry.device_key
         return headers
@@ -108,19 +111,76 @@ class AudioCommandClient:
 
     def _play_audio(self, local_path: Path) -> str:
         usb_device = self._detect_usb_audio_device()
-        if usb_device and shutil.which("ffmpeg") and shutil.which("aplay"):
+        ffmpeg_available = bool(shutil.which("ffmpeg"))
+        aplay_available = bool(shutil.which("aplay"))
+        if ffmpeg_available and aplay_available and not usb_device:
+            raise RuntimeError("USB audio device is not available in aplay -l")
+
+        if usb_device and ffmpeg_available and aplay_available:
             LOGGER.info("playing audio through USB ALSA device %s: %s", usb_device, local_path)
             ffmpeg = subprocess.Popen(
-                ["ffmpeg", "-nostdin", "-loglevel", "warning", "-i", str(local_path), "-f", "wav", "-"],
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(local_path),
+                    "-vn",
+                    "-f",
+                    "s16le",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-",
+                ],
                 stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             try:
-                subprocess.run(["aplay", "-q", "-D", usb_device, "-"], stdin=ffmpeg.stdout, check=True, timeout=120)
+                playback = subprocess.run(
+                    [
+                        "aplay",
+                        "-q",
+                        "-D",
+                        usb_device,
+                        "-t",
+                        "raw",
+                        "-f",
+                        "S16_LE",
+                        "-r",
+                        "48000",
+                        "-c",
+                        "2",
+                    ],
+                    stdin=ffmpeg.stdout,
+                    capture_output=True,
+                    check=False,
+                    timeout=120,
+                )
+                if ffmpeg.stdout:
+                    ffmpeg.stdout.close()
+                ffmpeg.wait(timeout=5)
+                ffmpeg_stderr = (ffmpeg.stderr.read() if ffmpeg.stderr else b"").decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                aplay_stderr = (playback.stderr or b"").decode("utf-8", errors="replace").strip()
+                if playback.returncode != 0 or ffmpeg.returncode != 0:
+                    details = "; ".join(part for part in (aplay_stderr, ffmpeg_stderr) if part)
+                    raise RuntimeError(
+                        f"USB audio playback failed (aplay={playback.returncode}, ffmpeg={ffmpeg.returncode})"
+                        + (f": {details}" if details else "")
+                    )
                 return f"ffmpeg|aplay:{usb_device}"
             finally:
                 if ffmpeg.stdout:
                     ffmpeg.stdout.close()
-                ffmpeg.wait(timeout=5)
+                if ffmpeg.poll() is None:
+                    ffmpeg.terminate()
+                    ffmpeg.wait(timeout=5)
 
         players = [
             ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "warning", str(local_path)]),
@@ -144,7 +204,7 @@ class AudioCommandClient:
         for line in result.stdout.splitlines():
             if "USB" not in line.upper():
                 continue
-            match = re.search(r"card\s+(\d+):.*device\s+(\d+):", line)
+            match = re.search(r"card\s+\d+:\s*([^\s]+).*device\s+(\d+):", line)
             if match:
-                return f"plughw:{match.group(1)},{match.group(2)}"
+                return f"hw:CARD={match.group(1)},DEV={match.group(2)}"
         return ""

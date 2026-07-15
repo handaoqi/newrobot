@@ -14,8 +14,8 @@ video:
   camera_id: "front"
   stream_id: "dog_ZSL-1A-07_front"
   play_urls:
-    flv: "http://127.0.0.1/live/dog_ZSL-1A-07_front.live.flv"
-    hls: "http://127.0.0.1/live/dog_ZSL-1A-07_front/hls.m3u8"
+    flv: "http://<center-server-ip>:8080/live/dog_ZSL-1A-07_front.live.flv"
+    hls: "http://<center-server-ip>:8080/live/dog_ZSL-1A-07_front/hls.m3u8"
   rtsp_transport: "tcp"
   open_timeout_seconds: 8
   read_timeout_seconds: 8
@@ -54,8 +54,8 @@ detection:
   duplicate_alert_seconds: 300
 
 telemetry:
-  endpoint: "http://127.0.0.1:8000/api/telemetry/ingest/"
-  media_upload_endpoint: "http://127.0.0.1:8000/api/device/media/upload/"
+  endpoint: "http://<center-server-ip>:8000/api/telemetry/ingest/"
+  media_upload_endpoint: "http://<center-server-ip>:8000/api/device/media/upload/"
   timeout_seconds: 5
   verify_tls: false
   device_key: ""

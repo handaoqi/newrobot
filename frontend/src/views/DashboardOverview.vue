@@ -5,16 +5,23 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { API_BASE, fetchOverview, fetchRobotDetail, fetchRobots, sendRobotCommand } from '../services/api'
+import { API_BASE, fetchOverview, fetchRobotDetail, fetchRobots, sendRecordedAudioCommand, sendRobotCommand } from '../services/api'
 
 const overview = ref(null)
 const robots = ref([])
 const selectedRobot = ref(null)
 const loading = ref(true)
+const loadError = ref('')
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
+const selectedSpeakerTemplate = ref('驶离提醒')
+const audioCommandSending = ref(false)
+const recording = ref(false)
+const recordedBlob = ref(null)
+const recordedUrl = ref('')
+const recordingSeconds = ref(0)
 const videoRef = ref(null)
 const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
@@ -29,22 +36,34 @@ let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
 let takeoverExitInFlight = false
+let mediaRecorder = null
+let recordingTimer = null
+let recordingStream = null
+let recordedChunks = []
+let previewPlayer = null
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
+const deviceAudioBase = (import.meta.env.VITE_DEVICE_AUDIO_BASE || window.location.origin).replace(/\/$/, '')
 const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const quickTexts = [
   {
     label: '重点路段',
     text: '您好，当前区域为巡检重点路段，请勿长时间占道停留。',
+    audioUrl: '/audio/notice.wav',
+    audioName: '重点路段',
   },
   {
     label: '驶离提醒',
-    text: '您好，请将车辆停放至指定区域，共同保持通道顺畅。',
+    text: '您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。',
+    audioUrl: '/audio/bike-leave.mp3',
+    audioName: '驶离提醒',
   },
   {
     label: '注意避让',
     text: '您好，系统检测到现场存在安全风险，请注意避让并配合引导。',
+    audioUrl: '/audio/attention.mp3',
+    audioName: '注意避让',
   },
 ]
 
@@ -93,16 +112,164 @@ function formatEventTime(value) {
 }
 
 function setSpeakerText(text) {
+  const template = quickTexts.find((item) => item.text === text)
   speakerText.value = text
+  if (template) selectedSpeakerTemplate.value = template.label
   showToast('已切换喊话模板')
 }
 
-function beginSpeak() {
-  showToast('演示状态：现场喊话已开始播放')
+const activeSpeakerTemplate = computed(() => {
+  return quickTexts.find((item) => item.text === speakerText.value) ||
+    quickTexts.find((item) => item.label === selectedSpeakerTemplate.value) ||
+    quickTexts[0]
+})
+
+function buildAudioUrl() {
+  const value = activeSpeakerTemplate.value?.audioUrl || ''
+  if (!value) return ''
+  try {
+    return new URL(value, `${deviceAudioBase}/`).href
+  } catch {
+    return ''
+  }
 }
 
-function previewVoice() {
-  showToast('演示状态：语音预览已生成')
+async function beginSpeak() {
+  const robot = latestRobot.value
+  if (!robot?.id || audioCommandSending.value) return
+  const audioUrl = buildAudioUrl()
+  if (!audioUrl) {
+    showToast('请选择有效的音频地址')
+    return
+  }
+
+  audioCommandSending.value = true
+  try {
+    const selected = activeSpeakerTemplate.value
+    await sendRobotCommand(robot.id, {
+      action: 'play_audio',
+      payload: {
+        audio_url: audioUrl,
+        audio_name: selected?.audioName || selected?.label || '现场喊话',
+        text: speakerText.value,
+        source: 'dashboard_audio',
+      },
+    })
+    showToast('已下发音频播放指令，等待机器狗执行')
+  } catch (error) {
+    showToast(error.message || '音频播放指令下发失败')
+  } finally {
+    audioCommandSending.value = false
+  }
+}
+
+async function previewVoice() {
+  const audioUrl = buildAudioUrl()
+  if (!audioUrl) {
+    showToast('请选择有效的音频地址')
+    return
+  }
+  try {
+    if (previewPlayer) previewPlayer.pause()
+    previewPlayer = new Audio(audioUrl)
+    await previewPlayer.play()
+    showToast('正在本机预览音频')
+  } catch {
+    showToast('音频预览失败，请检查文件或地址')
+  }
+}
+
+function pickRecordingMimeType() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg']
+  return candidates.find((type) => window.MediaRecorder?.isTypeSupported(type)) || ''
+}
+
+function resetRecording() {
+  if (recordedUrl.value) URL.revokeObjectURL(recordedUrl.value)
+  recordedBlob.value = null
+  recordedUrl.value = ''
+  recordingSeconds.value = 0
+}
+
+function cleanupRecorder() {
+  if (recordingTimer) {
+    window.clearInterval(recordingTimer)
+    recordingTimer = null
+  }
+  if (recordingStream) {
+    recordingStream.getTracks().forEach((track) => track.stop())
+    recordingStream = null
+  }
+  mediaRecorder = null
+  recording.value = false
+}
+
+async function startRecording() {
+  if (recording.value || audioCommandSending.value) return
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    showToast('当前浏览器不支持录音')
+    return
+  }
+  if (!window.isSecureContext) {
+    showToast('浏览器录音需要通过 HTTPS 或 localhost 访问')
+    return
+  }
+  try {
+    resetRecording()
+    recordingStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+    const mimeType = pickRecordingMimeType()
+    mediaRecorder = new MediaRecorder(recordingStream, mimeType ? { mimeType } : undefined)
+    recordedChunks = []
+    mediaRecorder.addEventListener('dataavailable', (event) => {
+      if (event.data?.size > 0) recordedChunks.push(event.data)
+    })
+    mediaRecorder.addEventListener('stop', () => {
+      const blobType = mediaRecorder?.mimeType || mimeType || 'audio/webm'
+      recordedBlob.value = new Blob(recordedChunks, { type: blobType })
+      recordedUrl.value = URL.createObjectURL(recordedBlob.value)
+      cleanupRecorder()
+    })
+    mediaRecorder.start(250)
+    recording.value = true
+    recordingSeconds.value = 0
+    recordingTimer = window.setInterval(() => {
+      recordingSeconds.value += 1
+    }, 1000)
+    showToast('录音已开始')
+  } catch (error) {
+    cleanupRecorder()
+    showToast(error?.name === 'NotAllowedError' ? '麦克风权限被拒绝' : '无法启动录音')
+  }
+}
+
+function stopRecording() {
+  if (recording.value && mediaRecorder) mediaRecorder.stop()
+}
+
+function recordingDurationLabel() {
+  const minutes = String(Math.floor(recordingSeconds.value / 60)).padStart(2, '0')
+  const seconds = String(recordingSeconds.value % 60).padStart(2, '0')
+  return `${minutes}:${seconds}`
+}
+
+async function playRecordedAudio() {
+  const robot = latestRobot.value
+  if (!robot?.id || !recordedBlob.value || audioCommandSending.value) return
+  const extension = recordedBlob.value.type.includes('ogg') ? 'ogg' : 'webm'
+  const file = new File([recordedBlob.value], `dashboard-recording.${extension}`, {
+    type: recordedBlob.value.type || 'audio/webm',
+  })
+  audioCommandSending.value = true
+  try {
+    await sendRecordedAudioCommand(robot.id, file, '现场录音')
+    showToast('已上传录音并下发播放指令')
+  } catch (error) {
+    showToast(error.message || '录音播放指令下发失败')
+  } finally {
+    audioCommandSending.value = false
+  }
 }
 
 async function emergencyStop() {
@@ -229,7 +396,7 @@ function seekLatestFrame() {
 
 function keepLivePlaying() {
   const element = videoRef.value
-  if (!element || !takeoverActive.value) return
+  if (!element) return
   element.muted = true
   element.controls = false
   seekLatestFrame()
@@ -450,16 +617,25 @@ async function setupLivePlayer() {
       type: 'flv',
       isLive: true,
       url: flv,
+    }, {
+      enableStashBuffer: false,
+      liveBufferLatencyChasing: true,
     })
     flvPlayer.on(mpegts.Events.ERROR, fallbackToSnapshot)
     flvPlayer.attachMediaElement(element)
     flvPlayer.load()
     flvPlayer.play().catch(fallbackToSnapshot)
+    startLiveGuard()
     return
   }
 
   if (playableHls && Hls.isSupported()) {
-    hlsPlayer = new Hls({ lowLatencyMode: true })
+    hlsPlayer = new Hls({
+      lowLatencyMode: true,
+      liveSyncDurationCount: 1,
+      liveMaxLatencyDurationCount: 2,
+      maxLiveSyncPlaybackRate: 1.5,
+    })
     hlsPlayer.loadSource(hls)
     hlsPlayer.attachMedia(element)
     hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
@@ -467,6 +643,7 @@ async function setupLivePlayer() {
     })
     hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
       element.play().catch(fallbackToSnapshot)
+      startLiveGuard()
     })
     return
   }
@@ -474,6 +651,7 @@ async function setupLivePlayer() {
   if (playableHls) {
     element.src = hls
     element.play().catch(fallbackToSnapshot)
+    startLiveGuard()
   }
 }
 
@@ -490,6 +668,8 @@ onMounted(async () => {
     if (initialRobotId) {
       await chooseRobot(initialRobotId, false)
     }
+  } catch (error) {
+    loadError.value = error?.message || '未能获取监测数据，请稍后重试。'
   } finally {
     loading.value = false
   }
@@ -500,6 +680,13 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (takeoverActive.value) {
     void exitTakeover({ skipFullscreen: true, source: 'component_unmount' })
+  }
+  if (recording.value && mediaRecorder) mediaRecorder.stop()
+  cleanupRecorder()
+  resetRecording()
+  if (previewPlayer) {
+    previewPlayer.pause()
+    previewPlayer = null
   }
   destroyVideoPlayers()
   closeAlertStream()
@@ -527,7 +714,7 @@ function handleVisibilityChange() {
 </script>
 
 <template>
-  <section v-if="!loading" class="page-grid">
+  <section v-if="!loading && overview" class="page-grid">
     <div class="content-column">
       <section class="top-summary">
         <article class="status-pill online">
@@ -555,8 +742,11 @@ function handleVisibilityChange() {
             muted
             playsinline
             autoplay
-            :controls="!takeoverActive"
             @pause="keepLivePlaying"
+            @progress="seekLatestFrame"
+            @timeupdate="seekLatestFrame"
+            @loadedmetadata="keepLivePlaying"
+            @waiting="keepLivePlaying"
           ></video>
           <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
             <strong>无信号</strong>
@@ -652,7 +842,7 @@ function handleVisibilityChange() {
         <div class="video-footer">
           <div class="footer-card">
             <strong>今日巡检时长</strong>
-            <span>{{ latestRobot?.patrol_duration_minutes || 0 }} 分钟</span>
+            <span>{{ overview.header.today_patrol_minutes || 0 }} 分钟</span>
           </div>
           <div class="footer-card area-card">
             <strong>当前巡检区域</strong>
@@ -754,12 +944,28 @@ function handleVisibilityChange() {
             </button>
           </div>
           <div class="action-row">
-            <button class="primary-btn" @click="beginSpeak">开始喊话</button>
+            <button class="primary-btn" :disabled="audioCommandSending" @click="beginSpeak">
+              {{ audioCommandSending ? '下发中' : '开始喊话' }}
+            </button>
             <button class="ghost-btn" @click="previewVoice">语音预览</button>
+          </div>
+          <div class="recording-box">
+            <div class="recording-status" :class="{ active: recording }">
+              <span>{{ recording ? '录音中' : recordedBlob ? '录音完成' : '未录音' }}</span>
+              <strong>{{ recordingDurationLabel() }}</strong>
+            </div>
+            <div class="action-row">
+              <button class="ghost-btn" :disabled="audioCommandSending || recording" @click="startRecording">录音</button>
+              <button class="ghost-btn" :disabled="!recording" @click="stopRecording">停止</button>
+              <button class="primary-btn" :disabled="!recordedBlob || audioCommandSending || recording" @click="playRecordedAudio">
+                播放录音
+              </button>
+            </div>
+            <audio v-if="recordedUrl" class="recording-preview" :src="recordedUrl" controls></audio>
           </div>
           <div class="mini-row">
             <div class="mini-card">当前音量 {{ latestRobot?.speaker_volume }}%</div>
-            <div class="mini-card">喊话链路状态 正常</div>
+            <div class="mini-card">喊话链路 已接入</div>
           </div>
         </div>
       </section>
@@ -790,5 +996,12 @@ function handleVisibilityChange() {
     </aside>
 
     <AppToast :show="visible" :message="toastMessage" :variant="toastVariant" />
+  </section>
+
+  <section v-else-if="!loading" class="page-grid overview-error">
+    <div class="error-card">
+      <strong>数据加载失败</strong>
+      <p>{{ loadError || '未能获取监测数据，请稍后重试。' }}</p>
+    </div>
   </section>
 </template>
