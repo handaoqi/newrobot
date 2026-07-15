@@ -1279,11 +1279,13 @@ class RobotMappingStatusView(APIView):
         # 从 result_payload 提取 edge_agent 返回的真实 mapping state
         mapping_state = "idle"
         mapping_result = {}
+        using_live_mapping = False
         if (
             live_mapping
             and live_sample_is_current
             and (not command_is_active or live_mapping_is_active)
         ):
+            using_live_mapping = True
             mapping_result = live_mapping
             mapping_state = mapping_result.get("state", "idle")
         elif command and command.result_payload:
@@ -1310,6 +1312,17 @@ class RobotMappingStatusView(APIView):
                 "map_id": robot.current_map_id,
                 "map_version": robot.current_map_version,
             }
+        live_error_message = str(live_progress.get("error") or "")
+        current_error_code = (
+            "MAPPING_SAVE_FAILED"
+            if using_live_mapping and live_error_message
+            else ("" if using_live_mapping else (command.error_code if command else ""))
+        )
+        current_error_message = (
+            live_error_message
+            if using_live_mapping
+            else (command.error_message if command else "")
+        )
         return Response(
             {
                 "robot_id": robot.id,
@@ -1328,8 +1341,10 @@ class RobotMappingStatusView(APIView):
                 "issued_at": command.issued_at if command else None,
                 "acknowledged_at": command.acknowledged_at if command else None,
                 "finished_at": command.finished_at if command else None,
-                "error_code": command.error_code if command else "",
-                "error_message": command.error_message if command else "",
+                "error_code": current_error_code,
+                "error_message": current_error_message,
+                "last_command_error_code": command.error_code if command else "",
+                "last_command_error_message": command.error_message if command else "",
                 "result": mapping_result,
                 "map_name": mapping_result.get("map_name", ""),
                 "files": mapping_result.get("files", {}),
