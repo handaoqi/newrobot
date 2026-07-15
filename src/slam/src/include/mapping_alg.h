@@ -266,9 +266,9 @@ namespace robot::slam
         int                                gnss_min_status_ = 0;
         bool                               gnss_use_elevation_ = false;
         int                                gnss_correction_count_ = 0;
-        bool                               dynamic_filter_enable_ = true;
+        bool                               dynamic_filter_enable_ = false;
         double                             dynamic_filter_voxel_size_ = 0.20;
-        int                                dynamic_filter_min_scan_observations_ = 3;
+        int                                dynamic_filter_min_scan_observations_ = 1;
         std::size_t                        dynamic_filter_shard_count_ = 64;
         bool                               keyframe_record_enable_ = true;
         double                             keyframe_min_distance_m_ = 0.8;

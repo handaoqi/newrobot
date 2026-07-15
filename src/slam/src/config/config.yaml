@@ -41,11 +41,11 @@ laser_mapping:
         use_elevation: false
         lever_arm_base: [ -0.05, 0.0, 0.15 ]
     dynamic_filter:
-        enable: true
+        # Preserve the raw map. Transient obstacles are removed explicitly in
+        # the platform's manual map cleanup workflow after saving.
+        enable: false
         voxel_size: 0.20
-        # Require five independent persisted keyframes so transient people are
-        # not written into the map while fixed structures remain.
-        min_scan_observations: 5
+        min_scan_observations: 1
         # Partition voxel evidence on disk so long routes do not grow an
         # unbounded in-memory observation table during mapping or export.
         shard_count: 64

@@ -190,9 +190,9 @@ namespace robot::slam
         this->declare_parameter<int>("pcd2pgm.flag_pass_through", 0);
         this->declare_parameter<double>("pcd2pgm.map_resolution", 0.05);
         this->declare_parameter<std::int64_t>("pcd2pgm.max_grid_cells", 200000000);
-        this->declare_parameter<bool>("dynamic_filter.enable", true);
+        this->declare_parameter<bool>("dynamic_filter.enable", false);
         this->declare_parameter<double>("dynamic_filter.voxel_size", 0.20);
-        this->declare_parameter<int>("dynamic_filter.min_scan_observations", 3);
+        this->declare_parameter<int>("dynamic_filter.min_scan_observations", 1);
         this->declare_parameter<int>("dynamic_filter.shard_count", 64);
         this->declare_parameter<bool>("keyframe_record.enable", true);
         this->declare_parameter<double>("keyframe_record.min_distance_m", 0.8);
@@ -210,9 +210,9 @@ namespace robot::slam
         std::int64_t max_grid_cells = 200000000;
         this->get_parameter_or<std::int64_t>("pcd2pgm.max_grid_cells", max_grid_cells, 200000000);
         pcd2pgm_options_.max_grid_cells = static_cast<std::size_t>(std::max<std::int64_t>(1, max_grid_cells));
-        this->get_parameter_or<bool>("dynamic_filter.enable", dynamic_filter_enable_, true);
+        this->get_parameter_or<bool>("dynamic_filter.enable", dynamic_filter_enable_, false);
         this->get_parameter_or<double>("dynamic_filter.voxel_size", dynamic_filter_voxel_size_, 0.20);
-        this->get_parameter_or<int>("dynamic_filter.min_scan_observations", dynamic_filter_min_scan_observations_, 3);
+        this->get_parameter_or<int>("dynamic_filter.min_scan_observations", dynamic_filter_min_scan_observations_, 1);
         int dynamic_filter_shard_count = 64;
         this->get_parameter_or<int>("dynamic_filter.shard_count", dynamic_filter_shard_count, 64);
         dynamic_filter_shard_count_ = static_cast<std::size_t>(std::clamp(dynamic_filter_shard_count, 8, 512));
