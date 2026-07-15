@@ -179,6 +179,28 @@ const connectionClass = computed(() => {
 // 建图状态机
 const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle')
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
+const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
+const saveStageLabels = {
+  mapping: '采集关键帧',
+  recovering: '恢复落盘关键帧',
+  flushing_keyframes: '刷新关键帧',
+  filtering: '过滤动态点',
+  partitioning_filter: '分片统计动态点',
+  writing_pcd: '写入点云',
+  building_grid: '生成栅格图',
+  writing_metadata: '写入地图信息',
+  completed: '保存完成',
+  failed: '保存失败',
+  cancelled: '已取消建图',
+}
+const saveStageLabel = computed(() => saveStageLabels[saveProgress.value.stage] || saveProgress.value.stage || '')
+const formatBytes = (value) => {
+  const bytes = Number(value || 0)
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / (1024 ** index)).toFixed(index > 1 ? 1 : 0)} ${units[index]}`
+}
 
 const stateSteps = [
   { key: 'idle', label: '空闲' },
@@ -700,6 +722,23 @@ function parseDescription(desc) {
           <div v-if="mappingStatus?.result" class="state-runtime">
             <span>建图进程: {{ mappingStatus.result.process_alive ? '运行中' : '已退出' }}</span>
             <span v-if="mappingStatus.result.slam_pids?.length">PID {{ mappingStatus.result.slam_pids.join(', ') }}</span>
+          </div>
+          <div v-if="saveProgress.stage" class="mapping-progress">
+            <div class="mapping-progress-head">
+              <strong>{{ saveStageLabel }}</strong>
+              <span>{{ Number(saveProgress.progress_percent || 0).toFixed(0) }}%</span>
+            </div>
+            <progress :value="saveProgress.progress_percent || 0" max="100"></progress>
+            <div class="mapping-progress-stats">
+              <span>里程 {{ Number(saveProgress.trajectory_m || 0).toFixed(1) }} m</span>
+              <span>关键帧 {{ saveProgress.written_keyframes || 0 }}/{{ saveProgress.keyframe_count || 0 }}</span>
+              <span>队列 {{ saveProgress.queued_keyframes || 0 }}</span>
+              <span>内存 {{ formatBytes(saveProgress.rss_bytes) }}</span>
+              <span>预计点云 {{ formatBytes(saveProgress.estimated_output_bytes) }}</span>
+              <span>磁盘可用 {{ formatBytes(saveProgress.disk_free_bytes) }}</span>
+              <span>RTK {{ saveProgress.rtk_quality?.valid ? '有效' : '无效' }}</span>
+            </div>
+            <div v-if="saveProgress.error" class="mapping-progress-error">{{ saveProgress.error }}</div>
           </div>
           <div class="state-steps">
             <div

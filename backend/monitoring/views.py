@@ -1245,11 +1245,32 @@ class RobotMappingStatusView(APIView):
             .first()
         )
         effective_connection_status = robot.effective_connection_status()
+        latest_status = RobotStatusLatest.objects.filter(robot=robot).first()
+        live_mapping = {}
+        if latest_status and latest_status.raw_payload:
+            live_mapping = latest_status.raw_payload.get("mapping") or {}
+        live_progress = live_mapping.get("save_progress") or {}
+        progress_is_current = not command
+        if command and live_progress:
+            try:
+                progress_is_current = (
+                    float(live_progress.get("updated_at_unix") or 0)
+                    >= command.issued_at.timestamp() - 5
+                )
+            except (TypeError, ValueError):
+                progress_is_current = False
 
         # 从 result_payload 提取 edge_agent 返回的真实 mapping state
         mapping_state = "idle"
         mapping_result = {}
-        if command and command.result_payload:
+        if live_mapping and (
+            live_mapping.get("process_alive")
+            or live_mapping.get("state") not in {None, "idle"}
+            or (live_progress and progress_is_current)
+        ):
+            mapping_result = live_mapping
+            mapping_state = mapping_result.get("state", "idle")
+        elif command and command.result_payload:
             mapping_result = command.result_payload
             mapping_state = mapping_result.get("state", "idle")
         elif command:
@@ -1265,7 +1286,6 @@ class RobotMappingStatusView(APIView):
             mapping_state = status_map.get(command.status, command.status)
 
         latest_map = MapData.objects.filter(robot=robot).order_by("-created_at").first()
-        latest_status = RobotStatusLatest.objects.filter(robot=robot).first()
         robot_current_map = {}
         if latest_status and latest_status.raw_payload:
             robot_current_map = latest_status.raw_payload.get("current_map") or {}
