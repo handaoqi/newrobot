@@ -473,6 +473,15 @@ class MapData(BaseTimestampModel):
     origin = models.JSONField(default=list, verbose_name="原点坐标 [x, y, theta]")
     active = models.BooleanField(default=False, verbose_name="是否为活动地图")
     description = models.TextField(blank=True, verbose_name="地图描述")
+    parent_map = models.ForeignKey(
+        "self",
+        related_name="derived_maps",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="来源地图",
+    )
+    edit_metadata = models.JSONField(default=dict, blank=True, verbose_name="地图编辑记录")
 
     class Meta:
         verbose_name = "地图数据"

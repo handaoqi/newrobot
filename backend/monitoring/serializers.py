@@ -603,6 +603,8 @@ class MapDataSerializer(serializers.ModelSerializer):
             "origin",
             "active",
             "description",
+            "parent_map",
+            "edit_metadata",
             "file_size",
             "created_at",
             "updated_at",

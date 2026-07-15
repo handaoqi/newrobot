@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
 import {
   fetchMaps,
   fetchMapSets,
@@ -7,6 +7,7 @@ import {
   deleteMap,
   downloadMap,
   setActiveMap,
+  manuallyCleanMap,
   createMap,
   fetchRobotMappingStatus,
   startRobotMapping,
@@ -28,6 +29,19 @@ const mapImageError = ref({})
 const syncing = ref(false)
 const activatingMapId = ref(null)
 const collapsedMapGroups = ref(new Set())
+const showCleaner = ref(false)
+const cleanerCanvas = ref(null)
+const cleanerViewport = ref(null)
+const cleanerTool = ref('erase')
+const cleanerBrushM = ref(0.5)
+const cleanerZoom = ref(1)
+const cleanerStrokes = ref([])
+const cleanerRedoStrokes = ref([])
+const cleanerSaving = ref(false)
+const cleanerImageSize = ref({ width: 0, height: 0 })
+let cleanerImage = null
+let activeCleanerStroke = null
+let cleanerPanStart = null
 
 const mappingForm = ref({
   robot: '',
@@ -517,6 +531,173 @@ function parseDescription(desc) {
   } catch {}
   return { raw: desc || '' }
 }
+
+const cleanerCanvasStyle = computed(() => ({
+  width: `${Math.max(1, cleanerImageSize.value.width * cleanerZoom.value)}px`,
+  height: `${Math.max(1, cleanerImageSize.value.height * cleanerZoom.value)}px`,
+}))
+
+async function openCleaner() {
+  if (!selectedMap.value?.pgm_url || !selectedMap.value?.robot) {
+    alert('该地图缺少可编辑文件或未关联机器狗')
+    return
+  }
+  showCleaner.value = true
+  cleanerTool.value = 'erase'
+  cleanerBrushM.value = 0.5
+  cleanerStrokes.value = []
+  cleanerRedoStrokes.value = []
+  await nextTick()
+  const image = new Image()
+  image.onload = async () => {
+    cleanerImage = image
+    cleanerImageSize.value = { width: image.naturalWidth, height: image.naturalHeight }
+    await nextTick()
+    const canvas = cleanerCanvas.value
+    if (!canvas) return
+    canvas.width = image.naturalWidth
+    canvas.height = image.naturalHeight
+    const viewportWidth = cleanerViewport.value?.clientWidth || image.naturalWidth
+    const viewportHeight = cleanerViewport.value?.clientHeight || image.naturalHeight
+    cleanerZoom.value = Math.min(1, Math.max(0.2, Math.min((viewportWidth - 24) / image.naturalWidth, (viewportHeight - 24) / image.naturalHeight)))
+    redrawCleaner()
+  }
+  image.onerror = () => {
+    alert('原始地图加载失败')
+    closeCleaner()
+  }
+  image.src = fullPreviewUrl(`/api/maps/${selectedMap.value.id}/preview/?raw=1&t=${Date.now()}`)
+}
+
+function closeCleaner() {
+  if (cleanerSaving.value) return
+  showCleaner.value = false
+  activeCleanerStroke = null
+  cleanerPanStart = null
+  cleanerImage = null
+}
+
+function redrawCleaner() {
+  const canvas = cleanerCanvas.value
+  if (!canvas || !cleanerImage) return
+  const context = canvas.getContext('2d')
+  context.clearRect(0, 0, canvas.width, canvas.height)
+  context.drawImage(cleanerImage, 0, 0)
+  context.save()
+  context.strokeStyle = 'rgba(220, 38, 38, 0.72)'
+  context.fillStyle = 'rgba(220, 38, 38, 0.72)'
+  context.lineCap = 'round'
+  context.lineJoin = 'round'
+  for (const stroke of cleanerStrokes.value) {
+    const points = stroke.points
+    if (!points.length) continue
+    const brushPixels = Math.max(1, stroke.diameter_m / Number(selectedMap.value?.resolution || 0.05))
+    context.lineWidth = brushPixels
+    if (points.length === 1) {
+      context.beginPath()
+      context.arc(points[0][0], points[0][1], brushPixels / 2, 0, Math.PI * 2)
+      context.fill()
+      continue
+    }
+    context.beginPath()
+    context.moveTo(points[0][0], points[0][1])
+    for (let index = 1; index < points.length; index += 1) {
+      context.lineTo(points[index][0], points[index][1])
+    }
+    context.stroke()
+  }
+  context.restore()
+}
+
+function cleanerPoint(event) {
+  const rect = cleanerCanvas.value.getBoundingClientRect()
+  return [
+    (event.clientX - rect.left) * (cleanerCanvas.value.width / rect.width),
+    (event.clientY - rect.top) * (cleanerCanvas.value.height / rect.height),
+  ]
+}
+
+function startCleanerPointer(event) {
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+  if (cleanerTool.value === 'move') {
+    cleanerPanStart = {
+      x: event.clientX,
+      y: event.clientY,
+      left: cleanerViewport.value.scrollLeft,
+      top: cleanerViewport.value.scrollTop,
+    }
+    return
+  }
+  activeCleanerStroke = { diameter_m: cleanerBrushM.value, points: [cleanerPoint(event)] }
+  cleanerStrokes.value = [...cleanerStrokes.value, activeCleanerStroke]
+  cleanerRedoStrokes.value = []
+  redrawCleaner()
+}
+
+function moveCleanerPointer(event) {
+  if (cleanerPanStart) {
+    cleanerViewport.value.scrollLeft = cleanerPanStart.left - (event.clientX - cleanerPanStart.x)
+    cleanerViewport.value.scrollTop = cleanerPanStart.top - (event.clientY - cleanerPanStart.y)
+    return
+  }
+  if (!activeCleanerStroke) return
+  const point = cleanerPoint(event)
+  const previous = activeCleanerStroke.points[activeCleanerStroke.points.length - 1]
+  if (Math.hypot(point[0] - previous[0], point[1] - previous[1]) < 2) return
+  activeCleanerStroke.points.push(point)
+  redrawCleaner()
+}
+
+function stopCleanerPointer() {
+  activeCleanerStroke = null
+  cleanerPanStart = null
+}
+
+function undoCleaner() {
+  if (!cleanerStrokes.value.length) return
+  const next = [...cleanerStrokes.value]
+  const removed = next.pop()
+  cleanerStrokes.value = next
+  cleanerRedoStrokes.value = [...cleanerRedoStrokes.value, removed]
+  redrawCleaner()
+}
+
+function redoCleaner() {
+  if (!cleanerRedoStrokes.value.length) return
+  const redo = [...cleanerRedoStrokes.value]
+  const restored = redo.pop()
+  cleanerRedoStrokes.value = redo
+  cleanerStrokes.value = [...cleanerStrokes.value, restored]
+  redrawCleaner()
+}
+
+function resetCleaner() {
+  cleanerStrokes.value = []
+  cleanerRedoStrokes.value = []
+  redrawCleaner()
+}
+
+function changeCleanerZoom(delta) {
+  cleanerZoom.value = Math.min(3, Math.max(0.2, Number((cleanerZoom.value + delta).toFixed(2))))
+}
+
+async function saveCleaner() {
+  if (!cleanerStrokes.value.length || !selectedMap.value) return
+  if (!confirm('保存清理版后将立即设为活动地图并下发到机器狗，确定继续吗？')) return
+  cleanerSaving.value = true
+  try {
+    const result = await manuallyCleanMap(selectedMap.value.id, { strokes: cleanerStrokes.value })
+    showCleaner.value = false
+    await loadMaps()
+    selectedMapId.value = result.id
+    await refreshMappingStatus()
+    alert('清理版已保存并下发，机器狗正在同步清理定位点云。')
+  } catch (error) {
+    alert(`保存清理版失败: ${error.message}`)
+  } finally {
+    cleanerSaving.value = false
+  }
+}
 </script>
 
 <template>
@@ -599,6 +780,7 @@ function parseDescription(desc) {
             </div>
             <div class="map-preview-actions">
               <span v-if="selectedMap.active" class="badge badge-success">活动地图</span>
+              <button class="btn btn-sm btn-primary" @click="openCleaner">擦除障碍</button>
               <button class="btn btn-sm" @click="handleDownload(selectedMap)">下载</button>
               <button
                 v-if="!selectedMap.active || activeMapSync.state !== 'synced'"
@@ -852,6 +1034,59 @@ function parseDescription(desc) {
           </button>
         </div>
       </div>
+    </div>
+
+    <div v-if="showCleaner" class="cleaner-overlay">
+      <section class="cleaner-dialog" aria-modal="true" role="dialog">
+        <header class="cleaner-header">
+          <div>
+            <h3>擦除动态障碍</h3>
+            <span>{{ selectedMap?.name }} · {{ cleanerImageSize.width }} × {{ cleanerImageSize.height }}</span>
+          </div>
+          <button class="btn-close" type="button" aria-label="关闭" @click="closeCleaner">×</button>
+        </header>
+        <div class="cleaner-toolbar">
+          <div class="cleaner-segmented">
+            <button type="button" :class="{ active: cleanerTool === 'erase' }" @click="cleanerTool = 'erase'">擦除</button>
+            <button type="button" :class="{ active: cleanerTool === 'move' }" @click="cleanerTool = 'move'">移动</button>
+          </div>
+          <label class="cleaner-brush">
+            <span>画笔</span>
+            <select v-model.number="cleanerBrushM">
+              <option :value="0.2">0.2 m</option>
+              <option :value="0.5">0.5 m</option>
+              <option :value="1">1.0 m</option>
+            </select>
+          </label>
+          <div class="cleaner-icon-actions">
+            <button type="button" title="撤销" :disabled="!cleanerStrokes.length" @click="undoCleaner">↶</button>
+            <button type="button" title="重做" :disabled="!cleanerRedoStrokes.length" @click="redoCleaner">↷</button>
+            <button type="button" title="缩小" @click="changeCleanerZoom(-0.2)">−</button>
+            <span>{{ Math.round(cleanerZoom * 100) }}%</span>
+            <button type="button" title="放大" @click="changeCleanerZoom(0.2)">+</button>
+            <button type="button" title="重置擦除" :disabled="!cleanerStrokes.length" @click="resetCleaner">重置</button>
+          </div>
+        </div>
+        <div ref="cleanerViewport" class="cleaner-viewport" :class="`tool-${cleanerTool}`">
+          <canvas
+            ref="cleanerCanvas"
+            :style="cleanerCanvasStyle"
+            @pointerdown.prevent="startCleanerPointer"
+            @pointermove.prevent="moveCleanerPointer"
+            @pointerup.prevent="stopCleanerPointer"
+            @pointercancel.prevent="stopCleanerPointer"
+          ></canvas>
+        </div>
+        <footer class="cleaner-footer">
+          <span>已擦除 {{ cleanerStrokes.length }} 笔</span>
+          <div>
+            <button class="btn" type="button" :disabled="cleanerSaving" @click="closeCleaner">取消</button>
+            <button class="btn btn-primary" type="button" :disabled="cleanerSaving || !cleanerStrokes.length" @click="saveCleaner">
+              {{ cleanerSaving ? '保存中...' : '保存并启用' }}
+            </button>
+          </div>
+        </footer>
+      </section>
     </div>
   </section>
 </template>
@@ -1134,5 +1369,100 @@ function parseDescription(desc) {
 .badge-sm {
   padding: 0.15rem 0.35rem;
   font-size: 0.65rem;
+}
+
+.cleaner-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.72);
+}
+
+.cleaner-dialog {
+  width: min(1180px, 100%);
+  height: min(860px, calc(100vh - 2rem));
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  background: #fff;
+  border-radius: 6px;
+}
+
+.cleaner-header,
+.cleaner-toolbar,
+.cleaner-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #d9dee7;
+}
+
+.cleaner-header h3 { margin: 0; font-size: 1rem; }
+.cleaner-header span { color: #667085; font-size: 0.75rem; }
+.cleaner-toolbar { justify-content: flex-start; flex-wrap: wrap; background: #f8fafc; }
+.cleaner-footer { border-top: 1px solid #d9dee7; border-bottom: 0; }
+.cleaner-footer > div { display: flex; gap: 0.5rem; }
+.cleaner-footer > span { color: #667085; font-size: 0.8rem; }
+
+.cleaner-segmented,
+.cleaner-icon-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.cleaner-segmented button,
+.cleaner-icon-actions button {
+  min-width: 2.25rem;
+  min-height: 2.25rem;
+  border: 1px solid #cfd6e1;
+  border-radius: 4px;
+  background: #fff;
+  color: #344054;
+}
+
+.cleaner-segmented button.active {
+  border-color: #1976d2;
+  background: #e8f1fb;
+  color: #0b5cad;
+  font-weight: 700;
+}
+
+.cleaner-brush { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; }
+.cleaner-brush select { min-height: 2.25rem; border: 1px solid #cfd6e1; border-radius: 4px; }
+.cleaner-icon-actions span { width: 3.25rem; text-align: center; font-size: 0.75rem; }
+
+.cleaner-viewport {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  background: #27313f;
+  overscroll-behavior: contain;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.cleaner-viewport canvas {
+  display: block;
+  max-width: none;
+  background: #fff;
+  image-rendering: pixelated;
+  touch-action: none;
+}
+
+.cleaner-viewport.tool-erase canvas { cursor: crosshair; }
+.cleaner-viewport.tool-move canvas { cursor: grab; }
+
+@media (max-width: 720px) {
+  .cleaner-overlay { padding: 0; }
+  .cleaner-dialog { width: 100%; height: 100vh; border-radius: 0; }
+  .cleaner-header, .cleaner-toolbar, .cleaner-footer { padding: 0.6rem; }
+  .cleaner-toolbar { gap: 0.5rem; }
 }
 </style>

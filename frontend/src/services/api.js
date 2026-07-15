@@ -318,6 +318,13 @@ export async function setActiveMap(mapId) {
   })
 }
 
+export async function manuallyCleanMap(mapId, payload) {
+  return request(`/maps/${mapId}/manual-clean/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function fetchRoutes() {
   return request('/routes/')
 }

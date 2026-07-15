@@ -265,6 +265,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         local_map_dir = f"/home/robot/.jszr/map/{map_data.name}"
         local_image_path = f"{local_map_dir}/map.pgm"
     map_version = f"legacy-mapdata-{map_data.id}"
+    edit_metadata = map_data.edit_metadata if isinstance(map_data.edit_metadata, dict) else {}
     return {
         "map_id": str(map_data.id),
         "map_version": map_version,
@@ -278,7 +279,93 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "origin": map_data.origin,
         "width": map_data.width,
         "height": map_data.height,
+        "manual_edit": edit_metadata.get("mode") == "manual_cleanup",
+        "pgm_sha256": _file_sha256(map_data.pgm_file.path) if map_data.pgm_file else "",
+        "yaml_sha256": _file_sha256(map_data.yaml_file.path) if map_data.yaml_file else "",
     }
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_map_description(map_data: MapData) -> dict:
+    try:
+        value = json.loads(map_data.description or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _render_manual_cleanup(map_data: MapData, strokes) -> tuple[bytes, bytes, int, list[dict]]:
+    from PIL import Image, ImageDraw
+
+    if not map_data.pgm_file or not map_data.yaml_file:
+        raise ValueError("地图缺少 PGM 或 YAML 文件")
+    if not isinstance(strokes, list) or not strokes:
+        raise ValueError("至少需要一条擦除轨迹")
+    if len(strokes) > 500:
+        raise ValueError("擦除轨迹过多，请分批保存")
+
+    with Image.open(map_data.pgm_file.path) as source:
+        image = source.convert("L")
+    width, height = image.size
+    if map_data.width and map_data.height and (width, height) != (map_data.width, map_data.height):
+        raise ValueError("地图文件尺寸与数据库记录不一致")
+
+    mask = Image.new("L", image.size, 0)
+    draw = ImageDraw.Draw(mask)
+    normalized = []
+    total_points = 0
+    resolution = max(float(map_data.resolution or 0.05), 0.001)
+    for stroke in strokes:
+        if not isinstance(stroke, dict):
+            raise ValueError("擦除轨迹格式错误")
+        points = stroke.get("points") or []
+        if not isinstance(points, list) or not points:
+            continue
+        total_points += len(points)
+        if total_points > 20000:
+            raise ValueError("擦除采样点过多，请减少笔画后重试")
+        diameter_m = float(stroke.get("diameter_m") or 0.5)
+        if not 0.05 <= diameter_m <= 5.0:
+            raise ValueError("画笔尺寸必须在 0.05m 到 5m 之间")
+        parsed_points = []
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError("擦除坐标格式错误")
+            x, y = float(point[0]), float(point[1])
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError("擦除坐标必须是有限数字")
+            parsed_points.append((min(max(x, 0.0), width - 1.0), min(max(y, 0.0), height - 1.0)))
+        brush_px = max(1, round(diameter_m / resolution))
+        if len(parsed_points) == 1:
+            x, y = parsed_points[0]
+            radius = brush_px / 2
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
+        else:
+            draw.line(parsed_points, fill=255, width=brush_px, joint="curve")
+            radius = brush_px / 2
+            for x, y in (parsed_points[0], parsed_points[-1]):
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
+        normalized.append({
+            "diameter_m": diameter_m,
+            "points": [[round(x, 2), round(y, 2)] for x, y in parsed_points],
+        })
+
+    erased_cells = sum(1 for value in mask.getdata() if value)
+    if erased_cells == 0:
+        raise ValueError("擦除区域为空")
+    image.paste(255, mask=mask)
+    pgm_buffer = io.BytesIO()
+    image.save(pgm_buffer, format="PPM")
+    preview_buffer = io.BytesIO()
+    image.save(preview_buffer, format="PNG", optimize=True)
+    return pgm_buffer.getvalue(), preview_buffer.getvalue(), erased_cells, normalized
 
 
 def _task_force_delete_counts(task: PatrolTask) -> dict[str, int]:
@@ -1338,6 +1425,102 @@ class MapDataSetActiveView(APIView):
             return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
 
 
+class MapDataManualCleanView(APIView):
+    """Create and immediately activate a manually cleaned map revision."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, pk):
+        source = get_object_or_404(MapData.objects.select_related("robot"), pk=pk)
+        if not source.robot:
+            return Response({"detail": "地图未关联机器狗"}, status=status.HTTP_409_CONFLICT)
+        if MapSetMember.objects.filter(map_data=source).exists():
+            return Response({"detail": "地图集子图暂不支持单独人工擦除"}, status=status.HTTP_409_CONFLICT)
+        if TaskExecution.objects.filter(robot=source.robot, state__in=TaskExecution.ACTIVE_STATES).exists():
+            return Response({"detail": "机器人正在执行任务，不能切换地图"}, status=status.HTTP_409_CONFLICT)
+
+        try:
+            pgm_content, preview_content, erased_cells, strokes = _render_manual_cleanup(
+                source,
+                request.data.get("strokes"),
+            )
+        except (TypeError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        source_description = _parse_map_description(source)
+        base_map_id = source.edit_metadata.get("base_map_id") if isinstance(source.edit_metadata, dict) else None
+        base_map_id = base_map_id or source.id
+        source_map_dir = str(source_description.get("source_map_dir") or "")
+        if not source_map_dir and source.name:
+            source_map_dir = f"/home/robot/.jszr/map/{source.name}"
+        edit_metadata = {
+            "mode": "manual_cleanup",
+            "base_map_id": base_map_id,
+            "parent_map_id": source.id,
+            "erased_cells": erased_cells,
+            "strokes": strokes,
+            "created_at": timezone.now().isoformat(),
+        }
+        description = {
+            "source": "manual_cleanup",
+            "source_map_dir": source_map_dir,
+            "parent_map_id": source.id,
+            "base_map_id": base_map_id,
+            "route_hint": source_description.get("route_hint", ""),
+        }
+        name = str(request.data.get("name") or "").strip()
+        if not name:
+            name = f"{source.name}-人工清理-{timezone.localtime():%m%d-%H%M}"
+        if len(name) > 128:
+            return Response({"detail": "地图名称不能超过 128 个字符"}, status=status.HTTP_400_BAD_REQUEST)
+
+        cleaned = None
+        try:
+            with transaction.atomic():
+                cleaned = MapData.objects.create(
+                    name=name,
+                    robot=source.robot,
+                    resolution=source.resolution,
+                    width=source.width,
+                    height=source.height,
+                    origin=source.origin,
+                    description=json.dumps(description, ensure_ascii=False),
+                    parent_map=source,
+                    edit_metadata=edit_metadata,
+                )
+                cleaned.pgm_file.save(f"{cleaned.id}_map.pgm", ContentFile(pgm_content), save=False)
+                with source.yaml_file.open("rb") as yaml_stream:
+                    cleaned.yaml_file.save(f"{cleaned.id}_map.yaml", ContentFile(yaml_stream.read()), save=False)
+                cleaned.thumbnail.save(f"{cleaned.id}_preview.png", ContentFile(preview_content), save=False)
+                cleaned.active = True
+                cleaned.save()
+
+                MapData.objects.filter(robot=source.robot, active=True).exclude(pk=cleaned.pk).update(active=False)
+                migrated = {
+                    "routes": PatrolRoute.objects.filter(map_data=source).update(map_data=cleaned),
+                    "zones": Zone.objects.filter(map_data=source).update(map_data=cleaned),
+                    "schedules": PatrolSchedule.objects.filter(map_data=source).update(map_data=cleaned),
+                }
+                command = CommandService.create_robot_command(
+                    robot=source.robot,
+                    command_type="map.activate",
+                    payload=_map_activation_payload(cleaned, request),
+                    operator=request.user if request.user.is_authenticated else None,
+                    expiry_seconds=300,
+                )
+        except Exception:
+            if cleaned:
+                for field in (cleaned.pgm_file, cleaned.yaml_file, cleaned.thumbnail):
+                    if field:
+                        field.delete(save=False)
+            raise
+
+        data = MapDataSerializer(cleaned, context={"request": request}).data
+        data["activation_command"] = RemoteCommandSerializer(command).data
+        data["migrated_references"] = migrated
+        data["detail"] = "人工清理版已保存并下发机器狗，正在同步清理 PGM 与 PCD。"
+        return Response(data, status=status.HTTP_201_CREATED)
+
+
 class MapDataPreviewView(APIView):
     """PGM地图预览视图 - 将PGM文件转换为可预览的PNG图像"""
     permission_classes = [permissions.AllowAny]
@@ -1351,7 +1534,7 @@ class MapDataPreviewView(APIView):
         try:
             map_data = MapData.objects.get(pk=pk)
             
-            if map_data.thumbnail:
+            if map_data.thumbnail and request.query_params.get("raw") not in {"1", "true"}:
                 with open(map_data.thumbnail.path, 'rb') as f:
                     content = f.read()
                 return self._png_response(content)
@@ -1360,7 +1543,8 @@ class MapDataPreviewView(APIView):
                 return self._png_response(self._generate_placeholder_image())
             
             pgm_path = map_data.pgm_file.path
-            png_data = self._pgm_to_png(pgm_path)
+            raw_preview = request.query_params.get("raw") in {"1", "true"}
+            png_data = self._pgm_to_png(pgm_path, max_size=None if raw_preview else 1200)
             
             return self._png_response(png_data)
             
@@ -1370,7 +1554,7 @@ class MapDataPreviewView(APIView):
             print(f"Error generating preview: {e}")
             return self._png_response(self._generate_placeholder_image())
 
-    def _pgm_to_png(self, pgm_path):
+    def _pgm_to_png(self, pgm_path, max_size=1200):
         """将PGM文件转换为浏览器兼容的RGB PNG格式。"""
         from PIL import Image
 
@@ -1405,8 +1589,8 @@ class MapDataPreviewView(APIView):
         if max_val != 255:
             image = image.point(lambda value: int((value / max_val) * 255))
 
-        max_size = 1200
-        image.thumbnail((max_size, max_size), Image.Resampling.NEAREST)
+        if max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.NEAREST)
         image = image.convert("RGB")
 
         output = io.BytesIO()

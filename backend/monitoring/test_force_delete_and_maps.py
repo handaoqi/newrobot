@@ -1,11 +1,14 @@
 import io
 import json
 import zipfile
+import tempfile
 from datetime import time as datetime_time
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.files.base import ContentFile
 from django.test import TestCase
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework.test import APIRequestFactory
@@ -17,6 +20,7 @@ from .models import (
     PatrolSchedule,
     PatrolTask,
     Robot,
+    RemoteCommand,
     ScheduleRun,
     TaskExecution,
     Track,
@@ -173,3 +177,68 @@ class MapActivationPayloadTests(TestCase):
 
         self.assertEqual(payload["local_map_dir"], "/home/robot/.jszr/map/source/filter_variants/candidate")
         self.assertEqual(payload["local_image_path"], "/home/robot/.jszr/map/source/filter_variants/candidate/map.pgm")
+
+
+class ManualMapCleanupTests(TestCase):
+    def setUp(self):
+        self.media_root = tempfile.TemporaryDirectory()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root.name)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(self.media_root.cleanup)
+        self.client = APIClient()
+        self.robot = Robot.objects.create(
+            code="rx-manual-clean",
+            name="RX Manual Clean",
+            location="park",
+            area="park",
+            connection_status="online",
+            status="online",
+            last_seen_at=timezone.now(),
+        )
+        self.map = MapData.objects.create(
+            name="raw-map",
+            robot=self.robot,
+            active=True,
+            resolution=0.05,
+            width=4,
+            height=3,
+            origin=[0.0, 0.0, 0.0],
+            description=json.dumps({"source_map_dir": "/home/robot/.jszr/map/raw-map"}),
+        )
+        self.map.pgm_file.save("raw.pgm", ContentFile(b"P5\n4 3\n255\n" + bytes([0] * 12)), save=False)
+        self.map.yaml_file.save(
+            "raw.yaml",
+            ContentFile(b"image: map.pgm\nresolution: 0.05\norigin: [0.0, 0.0, 0.0]\n"),
+            save=False,
+        )
+        self.map.save()
+        self.route = PatrolRoute.objects.create(
+            name="raw route",
+            map_data=self.map,
+            robot=self.robot,
+            waypoints=[{"x": 0.0, "y": 0.0, "yaw": 0.0}],
+        )
+
+    def test_creates_revision_migrates_route_and_dispatches_manual_activation(self):
+        original = self.map.pgm_file.read()
+        response = self.client.post(
+            f"/api/maps/{self.map.id}/manual-clean/",
+            {"strokes": [{"diameter_m": 0.1, "points": [[1.0, 1.0]]}]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        cleaned = MapData.objects.get(id=response.data["id"])
+        self.map.refresh_from_db()
+        self.route.refresh_from_db()
+        self.assertEqual(self.map.pgm_file.read(), original)
+        self.assertFalse(self.map.active)
+        self.assertTrue(cleaned.active)
+        self.assertEqual(cleaned.parent_map_id, self.map.id)
+        self.assertEqual(cleaned.edit_metadata["mode"], "manual_cleanup")
+        self.assertEqual(self.route.map_data_id, cleaned.id)
+        command = RemoteCommand.objects.get(id=response.data["activation_command"]["id"])
+        self.assertTrue(command.payload["manual_edit"])
+        self.assertEqual(command.payload["local_map_dir"], "/home/robot/.jszr/map/raw-map")
+        self.assertEqual(len(command.payload["pgm_sha256"]), 64)
