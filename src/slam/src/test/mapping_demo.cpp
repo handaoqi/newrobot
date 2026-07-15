@@ -31,6 +31,5 @@ int main(int argc, char** argv)
         node->run();
         rate.sleep();
     }
-    node->finish();
     return 0;
 }

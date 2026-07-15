@@ -43,10 +43,12 @@ laser_mapping:
     dynamic_filter:
         enable: true
         voxel_size: 0.20
-        # A walking person can stay in one 20 cm voxel for several scans.
-        # Require five independent scans so transient people are not written
-        # into the persistent map, while fixed walls remain unaffected.
+        # Require five independent persisted keyframes so transient people are
+        # not written into the map while fixed structures remain.
         min_scan_observations: 5
+        # Partition voxel evidence on disk so long routes do not grow an
+        # unbounded in-memory observation table during mapping or export.
+        shard_count: 64
     keyframe_record:
         enable: true
         min_distance_m: 0.8
@@ -54,6 +56,8 @@ laser_mapping:
         # Keep observing a stationary scene so people moving past a stopped dog can be removed later.
         max_interval_s: 2.0
         voxel_size_m: 0.25
+        # Bound the background disk writer so storage stalls cannot consume RAM.
+        max_queue_size: 8
     publish:
         path_en: true                # true: publish Path
         map_en: false                 # true: publish Map cloud
@@ -67,3 +71,5 @@ laser_mapping:
       thre_z_max : 0.75
       flag_pass_through : 0
       map_resolution : 0.05
+      # Reject pathological SLAM bounds before creating an oversized raster.
+      max_grid_cells: 200000000

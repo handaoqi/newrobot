@@ -9,11 +9,110 @@
 
 #include "mapping_alg.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <sys/statvfs.h>
 #include <unordered_set>
 
 namespace robot::slam
 {
+    namespace
+    {
+#pragma pack(push, 1)
+        struct BinaryPcdPoint
+        {
+            float x;
+            float y;
+            float z;
+            float intensity;
+            float normal_x;
+            float normal_y;
+            float normal_z;
+            float curvature;
+        };
+#pragma pack(pop)
+
+        static_assert(sizeof(BinaryPcdPoint) == 32, "unexpected binary PCD point size");
+
+        BinaryPcdPoint packPoint(const PointType& point)
+        {
+            return BinaryPcdPoint{
+                point.x,
+                point.y,
+                point.z,
+                point.intensity,
+                point.normal_x,
+                point.normal_y,
+                point.normal_z,
+                point.curvature
+            };
+        }
+
+        std::string jsonEscape(const std::string& value)
+        {
+            std::ostringstream escaped;
+            for (const char ch : value)
+            {
+                switch (ch)
+                {
+                    case '\\': escaped << "\\\\"; break;
+                    case '"': escaped << "\\\""; break;
+                    case '\n': escaped << "\\n"; break;
+                    case '\r': escaped << "\\r"; break;
+                    case '\t': escaped << "\\t"; break;
+                    default: escaped << ch; break;
+                }
+            }
+            return escaped.str();
+        }
+
+        std::uint64_t residentSetBytes()
+        {
+            std::ifstream status("/proc/self/statm");
+            std::uint64_t pages = 0;
+            std::uint64_t resident = 0;
+            if (status >> pages >> resident)
+                return resident * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+            return 0;
+        }
+
+        std::uint64_t freeDiskBytes(const std::string& path)
+        {
+            struct statvfs stats {};
+            if (::statvfs(path.c_str(), &stats) == 0)
+                return static_cast<std::uint64_t>(stats.f_bavail) * static_cast<std::uint64_t>(stats.f_frsize);
+            return 0;
+        }
+
+        std::size_t binaryPcdPointCount(const std::string& path)
+        {
+            std::ifstream input(path, std::ios::binary);
+            std::string line;
+            while (std::getline(input, line))
+            {
+                if (line.rfind("POINTS ", 0) == 0)
+                {
+                    try
+                    {
+                        return static_cast<std::size_t>(std::stoull(line.substr(7)));
+                    }
+                    catch (const std::exception&)
+                    {
+                        return 0;
+                    }
+                }
+                if (line.rfind("DATA ", 0) == 0)
+                    break;
+            }
+            return 0;
+        }
+
+    }
+
     DynamicFilterVoxelKey makeDynamicFilterVoxelKey(const PointType& point, double voxel_size)
     {
         return DynamicFilterVoxelKey{
@@ -90,28 +189,43 @@ namespace robot::slam
         this->declare_parameter<double>("pcd2pgm.thre_z_max", 2.0);
         this->declare_parameter<int>("pcd2pgm.flag_pass_through", 0);
         this->declare_parameter<double>("pcd2pgm.map_resolution", 0.05);
+        this->declare_parameter<std::int64_t>("pcd2pgm.max_grid_cells", 200000000);
         this->declare_parameter<bool>("dynamic_filter.enable", true);
         this->declare_parameter<double>("dynamic_filter.voxel_size", 0.20);
         this->declare_parameter<int>("dynamic_filter.min_scan_observations", 3);
+        this->declare_parameter<int>("dynamic_filter.shard_count", 64);
         this->declare_parameter<bool>("keyframe_record.enable", true);
         this->declare_parameter<double>("keyframe_record.min_distance_m", 0.8);
         this->declare_parameter<double>("keyframe_record.min_yaw_rad", 0.35);
         this->declare_parameter<double>("keyframe_record.max_interval_s", 2.0);
         this->declare_parameter<double>("keyframe_record.voxel_size_m", 0.25);
+        this->declare_parameter<int>("keyframe_record.max_queue_size", 8);
+        this->declare_parameter<string>("storage.data_path", "");
 
         this->get_parameter_or<string>("pcd2pgm.file_name", pcd2pgm_options_.file_name, "map");
         this->get_parameter_or<double>("pcd2pgm.thre_z_min", pcd2pgm_options_.thre_z_min, 0.2);
         this->get_parameter_or<double>("pcd2pgm.thre_z_max", pcd2pgm_options_.thre_z_max, 2.0);
         this->get_parameter_or<int>("pcd2pgm.flag_pass_through", pcd2pgm_options_.flag_pass_through, 0);
         this->get_parameter_or<double>("pcd2pgm.map_resolution", pcd2pgm_options_.map_resolution, 0.05);
+        std::int64_t max_grid_cells = 200000000;
+        this->get_parameter_or<std::int64_t>("pcd2pgm.max_grid_cells", max_grid_cells, 200000000);
+        pcd2pgm_options_.max_grid_cells = static_cast<std::size_t>(std::max<std::int64_t>(1, max_grid_cells));
         this->get_parameter_or<bool>("dynamic_filter.enable", dynamic_filter_enable_, true);
         this->get_parameter_or<double>("dynamic_filter.voxel_size", dynamic_filter_voxel_size_, 0.20);
         this->get_parameter_or<int>("dynamic_filter.min_scan_observations", dynamic_filter_min_scan_observations_, 3);
+        int dynamic_filter_shard_count = 64;
+        this->get_parameter_or<int>("dynamic_filter.shard_count", dynamic_filter_shard_count, 64);
+        dynamic_filter_shard_count_ = static_cast<std::size_t>(std::clamp(dynamic_filter_shard_count, 8, 512));
         this->get_parameter_or<bool>("keyframe_record.enable", keyframe_record_enable_, true);
         this->get_parameter_or<double>("keyframe_record.min_distance_m", keyframe_min_distance_m_, 0.8);
         this->get_parameter_or<double>("keyframe_record.min_yaw_rad", keyframe_min_yaw_rad_, 0.35);
         this->get_parameter_or<double>("keyframe_record.max_interval_s", keyframe_max_interval_s_, 2.0);
         this->get_parameter_or<double>("keyframe_record.voxel_size_m", keyframe_voxel_size_m_, 0.25);
+        int keyframe_max_queue_size = 8;
+        this->get_parameter_or<int>("keyframe_record.max_queue_size", keyframe_max_queue_size, 8);
+        keyframe_max_queue_size_ = static_cast<std::size_t>(std::max(1, keyframe_max_queue_size));
+        std::string configured_data_path;
+        this->get_parameter_or<string>("storage.data_path", configured_data_path, "");
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -163,6 +277,8 @@ namespace robot::slam
         RCLCPP_INFO(this->get_logger(), "There is no macro definition of ROOT_DIR");
         data_path_ = "/home/user_name/.jszr/map";
 #endif
+        if (!configured_data_path.empty())
+            data_path_ = std::filesystem::path(configured_data_path).lexically_normal().string();
         if (!checkDirExist(data_path_))
         {
             RCLCPP_INFO(this->get_logger(), "Create map directory failed!!!!!!.");
@@ -224,7 +340,10 @@ namespace robot::slam
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
-    MappingAlg ::~MappingAlg() {}
+    MappingAlg ::~MappingAlg()
+    {
+        stopKeyframeWriter(false);
+    }
 
     void MappingAlg::init()
     {
@@ -255,10 +374,19 @@ namespace robot::slam
                 response->message = "Set READY State!!!!!!";
                 break;
             case 3:
-                state_.store(SlamState::ACTIVE);
                 reset();
-                response->success = true;
-                response->message = "Set ACTIVE State!!!!!!";
+                if (active_map_subdir_.empty())
+                {
+                    state_.store(SlamState::ERROR);
+                    response->success = false;
+                    response->message = "Failed to initialize mapping session directory.";
+                }
+                else
+                {
+                    state_.store(SlamState::ACTIVE);
+                    response->success = true;
+                    response->message = "Set ACTIVE State!!!!!!";
+                }
                 break;
             case 4:
                 state_.store(SlamState::ERROR);
@@ -266,18 +394,35 @@ namespace robot::slam
                 response->message = "Set ERROR State!!!!!!";
                 break;
             case 5:
-                if (state_.load() != SlamState::ACTIVE)
+                if (mapping_keyframes_.empty()
+                    && (state_.load() != SlamState::STABLE || !recoverLatestKeyframeSession()))
                 {
                     response->success = false;
-                    response->message = "Map save rejected: SLAM is not actively mapping.";
-                    RCLCPP_ERROR(get_logger(), "Map save rejected because SLAM state is not ACTIVE");
+                    response->message = "Map save rejected: no active or recoverable keyframes were found.";
+                    RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
                     break;
                 }
-                if (mapping_keyframes_.empty())
+                if (state_.load() != SlamState::ACTIVE
+                    && state_.load() != SlamState::ERROR
+                    && state_.load() != SlamState::READY
+                    && state_.load() != SlamState::STABLE)
                 {
                     response->success = false;
-                    response->message = "Map save rejected: no mapping keyframes were recorded.";
-                    RCLCPP_ERROR(get_logger(), "Map save rejected because no keyframes were recorded");
+                    response->message = "Map save rejected: SLAM is not mapping or recoverable.";
+                    RCLCPP_ERROR(get_logger(), "Map save rejected because SLAM state is not recoverable");
+                    break;
+                }
+                if (map_export_completed_)
+                {
+                    response->success = true;
+                    response->message = "Map was already saved.";
+                    break;
+                }
+                if (keyframe_writer_failed_)
+                {
+                    response->success = false;
+                    response->message = "Map save rejected: keyframe writer failed: " + keyframe_writer_error_;
+                    RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
                     break;
                 }
                 state_.store(SlamState::SAVE);
@@ -294,6 +439,7 @@ namespace robot::slam
 
     void MappingAlg::reset()
     {
+        stopKeyframeWriter(false);
         time_buffer.clear();
         lidar_buffer.clear();
         imu_buffer.clear();
@@ -304,12 +450,22 @@ namespace robot::slam
         memset(point_selected_surf, true, sizeof(point_selected_surf));
 
         p_imu->reset();
-        std::lock_guard<std::mutex> gnss_lock(gnss_mutex_);
-        has_gnss_                    = false;
-        gnss_origin_initialized_     = false;
-        gnss_correction_count_       = 0;
-        dynamic_filter_scan_observations_.clear();
+        {
+            std::lock_guard<std::mutex> gnss_lock(gnss_mutex_);
+            has_gnss_ = false;
+            gnss_origin_initialized_ = false;
+            gnss_correction_count_ = 0;
+        }
         mapping_keyframes_.clear();
+        keyframe_write_queue_.clear();
+        keyframe_writer_failed_ = false;
+        keyframe_writer_error_.clear();
+        written_keyframes_ = 0;
+        written_keyframe_points_ = 0;
+        dropped_keyframes_ = 0;
+        keyframe_trajectory_m_ = 0.0;
+        active_map_subdir_.clear();
+        map_export_completed_ = false;
         pcl_wait_pub->clear();
         pcl_wait_save->clear();
         has_last_keyframe_ = false;
@@ -321,6 +477,9 @@ namespace robot::slam
         state_point       = state_updated;  // 对state_point进行更新，state_point可视化用到
         kf.change_x(state_updated);
         Localmap_Initialized = false;
+
+        if (!initializeKeyframeSession())
+            active_map_subdir_.clear();
     }
 
 
@@ -690,22 +849,6 @@ namespace robot::slam
             pointsBody2World(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
         }
 
-        if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0)
-        {
-            std::unordered_set<DynamicFilterVoxelKey, DynamicFilterVoxelKeyHash> observed_this_scan;
-            observed_this_scan.reserve(laserCloudWorld->size());
-            for (const auto& point : laserCloudWorld->points)
-            {
-                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
-                    continue;
-                observed_this_scan.insert(makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_));
-            }
-            for (const auto& key : observed_this_scan)
-            {
-                dynamic_filter_scan_observations_[key]++;
-            }
-        }
-
         recordKeyframe(laserCloudWorld);
         if (pub_world_points_flag_)
         {
@@ -719,7 +862,7 @@ namespace robot::slam
 
     void MappingAlg::recordKeyframe(const CloudPtr& cloud_world)
     {
-        if (!keyframe_record_enable_ || !cloud_world || cloud_world->empty())
+        if (!keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
             return;
         const Vec3d lidar_origin = state_point.rot * state_point.offset_T_L_I + state_point.pos;
         const auto rotation = state_point.rot.toRotationMatrix();
@@ -736,32 +879,315 @@ namespace robot::slam
         downsample.setInputCloud(cloud_world);
         downsample.setLeafSize(keyframe_voxel_size_m_, keyframe_voxel_size_m_, keyframe_voxel_size_m_);
         downsample.filter(*keyframe_cloud);
-        mapping_keyframes_.push_back({ lidar_end_time, lidar_origin, keyframe_cloud });
+
+        MappingKeyframe metadata;
+        metadata.index = mapping_keyframes_.size();
+        metadata.stamp = lidar_end_time;
+        metadata.lidar_origin = lidar_origin;
+        metadata.yaw = yaw;
+        metadata.point_count = keyframe_cloud->size();
+        std::ostringstream file_name;
+        file_name << active_map_subdir_ << "/keyframes/scan_" << std::setw(5) << std::setfill('0')
+                  << metadata.index << ".pcd";
+        metadata.file_path = file_name.str();
+        {
+            std::lock_guard<std::mutex> gnss_lock(gnss_mutex_);
+            if (has_gnss_)
+            {
+                metadata.rtk_status = latest_gnss_.status.status;
+                metadata.rtk_latitude = latest_gnss_.latitude;
+                metadata.rtk_longitude = latest_gnss_.longitude;
+                metadata.rtk_altitude = latest_gnss_.altitude;
+                metadata.rtk_horizontal_std = std::sqrt(std::max(
+                    0.0, std::max(latest_gnss_.position_covariance[0], latest_gnss_.position_covariance[4])));
+                metadata.rtk_age_seconds = std::fabs(
+                    lidar_end_time - get_time_sec(latest_gnss_.header.stamp));
+                metadata.rtk_valid = metadata.rtk_status >= gnss_min_status_
+                    && metadata.rtk_age_seconds <= gnss_max_age_
+                    && metadata.rtk_horizontal_std <= gnss_max_horizontal_std_;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> writer_lock(keyframe_writer_mutex_);
+            if (keyframe_writer_failed_ || keyframe_write_queue_.size() >= keyframe_max_queue_size_)
+            {
+                ++dropped_keyframes_;
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "Keyframe disk queue unavailable (queued=%zu, limit=%zu, failed=%s); retaining next candidate",
+                    keyframe_write_queue_.size(), keyframe_max_queue_size_, keyframe_writer_failed_ ? "true" : "false");
+                return;
+            }
+            mapping_keyframes_.push_back(metadata);
+            keyframe_write_queue_.push_back(PendingKeyframe{ metadata, keyframe_cloud });
+            if (has_last_keyframe_)
+                keyframe_trajectory_m_ += distance;
+        }
+        keyframe_writer_cv_.notify_one();
         last_keyframe_origin_ = lidar_origin;
         last_keyframe_yaw_ = yaw;
         last_keyframe_stamp_ = lidar_end_time;
         has_last_keyframe_ = true;
+        writeSaveProgress("mapping", 0.0);
     }
 
-    void MappingAlg::saveKeyframes(const std::string& map_subdir) const
+    bool MappingAlg::initializeKeyframeSession()
     {
-        if (mapping_keyframes_.empty())
-            return;
-        const std::filesystem::path keyframe_dir = std::filesystem::path(map_subdir) / "keyframes";
-        std::filesystem::create_directories(keyframe_dir);
-        std::ofstream poses(keyframe_dir / "keyframes.csv", std::ios::out | std::ios::trunc);
-        poses << "index,stamp,x,y,z\n";
-        pcl::PCDWriter writer;
-        for (std::size_t index = 0; index < mapping_keyframes_.size(); ++index)
+        try
         {
-            const auto& keyframe = mapping_keyframes_[index];
-            std::ostringstream name;
-            name << "scan_" << std::setw(5) << std::setfill('0') << index << ".pcd";
-            writer.writeBinary((keyframe_dir / name.str()).string(), *keyframe.cloud_world);
-            poses << index << ',' << std::fixed << std::setprecision(6) << keyframe.stamp << ','
-                  << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ',' << keyframe.lidar_origin(2) << '\n';
+            active_map_subdir_ = makeMapSubdir(data_path_);
+            const auto keyframe_dir = std::filesystem::path(active_map_subdir_) / "keyframes";
+            std::filesystem::create_directories(keyframe_dir);
+            std::ofstream poses(keyframe_dir / "keyframes.csv", std::ios::out | std::ios::trunc);
+            if (!poses.is_open())
+                throw std::runtime_error("cannot create keyframes.csv");
+            poses << "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,rtk_horizontal_std,rtk_age_seconds\n";
+            poses.close();
+            startKeyframeWriter();
+            writeSaveProgress("mapping", 0.0);
+            RCLCPP_INFO(get_logger(), "Mapping session initialized at %s", active_map_subdir_.c_str());
+            return true;
         }
-        RCLCPP_INFO(get_logger(), "Saved %zu mapping keyframes to %s", mapping_keyframes_.size(), keyframe_dir.c_str());
+        catch (const std::exception& exc)
+        {
+            RCLCPP_ERROR(get_logger(), "Failed to initialize mapping session: %s", exc.what());
+            return false;
+        }
+    }
+
+    bool MappingAlg::recoverLatestKeyframeSession()
+    {
+        std::filesystem::path latest_dir;
+        std::filesystem::file_time_type latest_time {};
+        std::error_code filesystem_error;
+        for (const auto& entry : std::filesystem::directory_iterator(data_path_, filesystem_error))
+        {
+            if (filesystem_error || !entry.is_directory())
+                continue;
+            const auto keyframe_csv = entry.path() / "keyframes" / "keyframes.csv";
+            if (!std::filesystem::is_regular_file(keyframe_csv))
+                continue;
+            if (std::filesystem::exists(entry.path() / "map.yaml")
+                && std::filesystem::exists(entry.path() / "map.pgm"))
+                continue;
+            const auto modified = std::filesystem::last_write_time(keyframe_csv, filesystem_error);
+            if (filesystem_error)
+            {
+                filesystem_error.clear();
+                continue;
+            }
+            if (latest_dir.empty() || modified > latest_time)
+            {
+                latest_dir = entry.path();
+                latest_time = modified;
+            }
+        }
+        if (latest_dir.empty())
+            return false;
+
+        std::ifstream input(latest_dir / "keyframes" / "keyframes.csv");
+        if (!input.is_open())
+            return false;
+        auto split = [](const std::string& line) {
+            std::vector<std::string> values;
+            std::stringstream stream(line);
+            std::string value;
+            while (std::getline(stream, value, ','))
+                values.push_back(value);
+            return values;
+        };
+
+        std::string line;
+        if (!std::getline(input, line))
+            return false;
+        const auto header = split(line);
+        std::map<std::string, std::size_t> columns;
+        for (std::size_t index = 0; index < header.size(); ++index)
+            columns.emplace(header[index], index);
+        const auto has_columns = [&columns](std::initializer_list<const char*> names) {
+            return std::all_of(names.begin(), names.end(), [&columns](const char* name) {
+                return columns.find(name) != columns.end();
+            });
+        };
+        if (!has_columns({ "index", "stamp", "x", "y", "z" }))
+            return false;
+
+        std::vector<MappingKeyframe> recovered;
+        double recovered_trajectory = 0.0;
+        while (std::getline(input, line))
+        {
+            if (line.empty())
+                continue;
+            const auto values = split(line);
+            const auto field = [&values, &columns](const char* name, const std::string& fallback = "0") -> std::string {
+                const auto column = columns.find(name);
+                return column != columns.end() && column->second < values.size()
+                    ? values[column->second]
+                    : fallback;
+            };
+            try
+            {
+                MappingKeyframe keyframe;
+                keyframe.index = static_cast<std::size_t>(std::stoull(field("index")));
+                keyframe.stamp = std::stod(field("stamp"));
+                keyframe.lidar_origin << std::stod(field("x")), std::stod(field("y")), std::stod(field("z"));
+                keyframe.yaw = std::stod(field("yaw"));
+                keyframe.point_count = static_cast<std::size_t>(std::stoull(field("point_count")));
+                keyframe.rtk_valid = std::stoi(field("rtk_valid")) != 0;
+                keyframe.rtk_status = std::stoi(field("rtk_status", "-1"));
+                keyframe.rtk_latitude = std::stod(field("rtk_latitude"));
+                keyframe.rtk_longitude = std::stod(field("rtk_longitude"));
+                keyframe.rtk_altitude = std::stod(field("rtk_altitude"));
+                keyframe.rtk_horizontal_std = std::stod(field("rtk_horizontal_std"));
+                keyframe.rtk_age_seconds = std::stod(field("rtk_age_seconds"));
+                std::ostringstream file_name;
+                file_name << (latest_dir / "keyframes" / "scan_").string()
+                          << std::setw(5) << std::setfill('0') << keyframe.index << ".pcd";
+                keyframe.file_path = file_name.str();
+                if (!std::filesystem::is_regular_file(keyframe.file_path))
+                    continue;
+                if (keyframe.point_count == 0)
+                    keyframe.point_count = binaryPcdPointCount(keyframe.file_path);
+                if (keyframe.point_count == 0)
+                    continue;
+                if (!recovered.empty())
+                    recovered_trajectory += (keyframe.lidar_origin - recovered.back().lidar_origin).norm();
+                recovered.push_back(std::move(keyframe));
+            }
+            catch (const std::exception& exc)
+            {
+                RCLCPP_WARN(get_logger(), "Skipping malformed recovered keyframe row: %s", exc.what());
+            }
+        }
+        if (recovered.empty())
+            return false;
+
+        stopKeyframeWriter(false);
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            mapping_keyframes_ = std::move(recovered);
+            keyframe_write_queue_.clear();
+            written_keyframes_ = mapping_keyframes_.size();
+            written_keyframe_points_ = 0;
+            for (const auto& keyframe : mapping_keyframes_)
+                written_keyframe_points_ += keyframe.point_count;
+            keyframe_trajectory_m_ = recovered_trajectory;
+            keyframe_writer_failed_ = false;
+            keyframe_writer_error_.clear();
+        }
+        active_map_subdir_ = latest_dir.string();
+        map_export_completed_ = false;
+        writeSaveProgress("recovering", 1.0);
+        RCLCPP_WARN(get_logger(), "Recovered %zu persistent keyframes from %s",
+            mapping_keyframes_.size(), active_map_subdir_.c_str());
+        return true;
+    }
+
+    void MappingAlg::startKeyframeWriter()
+    {
+        stopKeyframeWriter(false);
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            keyframe_writer_stop_ = false;
+            keyframe_writer_active_ = false;
+        }
+        keyframe_writer_thread_ = std::thread(&MappingAlg::keyframeWriterLoop, this);
+    }
+
+    void MappingAlg::stopKeyframeWriter(bool drain)
+    {
+        if (!keyframe_writer_thread_.joinable())
+            return;
+        if (drain)
+            flushKeyframeWriter();
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            if (!drain)
+                keyframe_write_queue_.clear();
+            keyframe_writer_stop_ = true;
+        }
+        keyframe_writer_cv_.notify_all();
+        keyframe_writer_thread_.join();
+    }
+
+    bool MappingAlg::flushKeyframeWriter()
+    {
+        std::unique_lock<std::mutex> lock(keyframe_writer_mutex_);
+        keyframe_writer_cv_.wait(lock, [this]() {
+            return keyframe_writer_failed_ || (keyframe_write_queue_.empty() && !keyframe_writer_active_);
+        });
+        return !keyframe_writer_failed_;
+    }
+
+    void MappingAlg::keyframeWriterLoop()
+    {
+        pcl::PCDWriter writer;
+        while (true)
+        {
+            PendingKeyframe pending;
+            {
+                std::unique_lock<std::mutex> lock(keyframe_writer_mutex_);
+                keyframe_writer_cv_.wait(lock, [this]() {
+                    return keyframe_writer_stop_ || !keyframe_write_queue_.empty();
+                });
+                if (keyframe_write_queue_.empty())
+                {
+                    if (keyframe_writer_stop_)
+                        break;
+                    continue;
+                }
+                pending = std::move(keyframe_write_queue_.front());
+                keyframe_write_queue_.pop_front();
+                keyframe_writer_active_ = true;
+            }
+
+            std::string failure;
+            try
+            {
+                const std::string temporary = pending.metadata.file_path + ".tmp";
+                if (writer.writeBinary(temporary, *pending.cloud_world) != 0)
+                    throw std::runtime_error("PCL failed to write " + temporary);
+                std::filesystem::rename(temporary, pending.metadata.file_path);
+
+                std::ofstream poses(
+                    std::filesystem::path(active_map_subdir_) / "keyframes" / "keyframes.csv",
+                    std::ios::out | std::ios::app);
+                if (!poses.is_open())
+                    throw std::runtime_error("cannot append keyframes.csv");
+                const auto& keyframe = pending.metadata;
+                poses << keyframe.index << ',' << std::fixed << std::setprecision(6) << keyframe.stamp << ','
+                      << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ',' << keyframe.lidar_origin(2) << ','
+                      << keyframe.yaw << ','
+                      << keyframe.point_count << ',' << (keyframe.rtk_valid ? 1 : 0) << ',' << keyframe.rtk_status << ','
+                      << std::setprecision(10) << keyframe.rtk_latitude << ',' << keyframe.rtk_longitude << ','
+                      << std::setprecision(4) << keyframe.rtk_altitude << ',' << keyframe.rtk_horizontal_std << ','
+                      << keyframe.rtk_age_seconds << '\n';
+            }
+            catch (const std::exception& exc)
+            {
+                failure = exc.what();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+                if (!failure.empty())
+                {
+                    keyframe_writer_failed_ = true;
+                    keyframe_writer_error_ = failure;
+                    keyframe_write_queue_.clear();
+                }
+                else
+                {
+                    ++written_keyframes_;
+                    written_keyframe_points_ += pending.metadata.point_count;
+                }
+                keyframe_writer_active_ = false;
+            }
+            keyframe_writer_cv_.notify_all();
+            writeSaveProgress(failure.empty() ? "mapping" : "failed", 0.0, failure);
+            if (!failure.empty())
+                RCLCPP_ERROR(get_logger(), "Keyframe writer failed: %s", failure.c_str());
+        }
     }
 
     void MappingAlg::pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -1076,142 +1502,406 @@ namespace robot::slam
             pubMapPoints(pubLaserCloudMap_);
     }
 
-    bool MappingAlg::finish()
+    bool MappingAlg::streamMapFromKeyframes(const std::string& map_subdir, std::size_t& written_points)
     {
-        if (mapping_keyframes_.empty())
+        const bool filter_enabled = dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0
+            && dynamic_filter_min_scan_observations_ > 1;
+        const std::size_t shard_count = filter_enabled ? dynamic_filter_shard_count_ : 1;
+        const auto shard_dir = std::filesystem::path(map_subdir) / ".dynamic_filter_shards.tmp";
+        std::error_code filesystem_error;
+        std::filesystem::remove_all(shard_dir, filesystem_error);
+        filesystem_error.clear();
+        std::filesystem::create_directories(shard_dir, filesystem_error);
+        if (filesystem_error)
         {
-            RCLCPP_ERROR(get_logger(), "Map export failed: no keyframes available");
+            keyframe_writer_error_ = "cannot create map filter shard directory: " + filesystem_error.message();
             return false;
         }
+        const auto fail = [this, &shard_dir](const std::string& message) {
+            keyframe_writer_error_ = message;
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(shard_dir, cleanup_error);
+            return false;
+        };
 
-        // Use only downsampled keyframes as the save source. Keeping every raw
-        // scan in pcl_wait_pub made large maps grow without bound in memory.
-        PointCloudType::Ptr raw_map_cloud(new PointCloudType());
-        std::size_t estimated_points = 0;
+        std::uint64_t estimated_source_bytes = 0;
         for (const auto& keyframe : mapping_keyframes_)
-            estimated_points += keyframe.cloud_world ? keyframe.cloud_world->size() : 0;
-        raw_map_cloud->reserve(estimated_points);
-        for (const auto& keyframe : mapping_keyframes_)
+            estimated_source_bytes += keyframe.point_count * sizeof(BinaryPcdPoint);
+        const std::uint64_t required_free_bytes = estimated_source_bytes
+            + std::max<std::uint64_t>(estimated_source_bytes / 4, 512ULL * 1024ULL * 1024ULL);
+        const std::uint64_t free_bytes = freeDiskBytes(map_subdir);
+        if (free_bytes > 0 && free_bytes < required_free_bytes)
         {
-            if (keyframe.cloud_world)
-                *raw_map_cloud += *keyframe.cloud_world;
-        }
-        if (raw_map_cloud->empty())
-        {
-            RCLCPP_ERROR(get_logger(), "Map export failed: keyframes contain no points");
-            return false;
-        }
-
-        // Use millisecond timestamp and collision suffix to avoid multiple
-        // mapping nodes racing on the same output directory.
-        string map_subdir = makeMapSubdir(data_path_);
-
-        if (!checkDirExist(map_subdir))
-        {
-            RCLCPP_ERROR(get_logger(), "Map export failed: cannot create %s", map_subdir.c_str());
-            return false;
+            std::ostringstream message;
+            message << "insufficient disk space for streaming map export: free=" << free_bytes
+                    << " required=" << required_free_bytes;
+            return fail(message.str());
         }
 
-        RCLCPP_INFO(get_logger(), "Writing %zu keyframes and %zu points to %s", mapping_keyframes_.size(), raw_map_cloud->size(), map_subdir.c_str());
-        pcl::PCDWriter pcd_writer;
-        saveKeyframes(map_subdir);
-        string raw_pcd_file = map_subdir + "/map.raw_dynamic_unfiltered.pcd";
-        if (pcd_writer.writeBinary(raw_pcd_file, *raw_map_cloud) != 0)
+        std::vector<std::ofstream> point_shards;
+        std::vector<std::ofstream> hit_shards;
+        point_shards.reserve(shard_count);
+        hit_shards.reserve(shard_count);
+        for (std::size_t shard = 0; shard < shard_count; ++shard)
         {
-            RCLCPP_ERROR(get_logger(), "Map export failed: cannot write %s", raw_pcd_file.c_str());
-            return false;
+            point_shards.emplace_back(
+                shard_dir / ("points_" + std::to_string(shard) + ".bin"),
+                std::ios::binary | std::ios::trunc);
+            if (!point_shards.back().is_open())
+                return fail("cannot create point filter shard");
+            if (filter_enabled)
+            {
+                hit_shards.emplace_back(
+                    shard_dir / ("hits_" + std::to_string(shard) + ".bin"),
+                    std::ios::binary | std::ios::trunc);
+                if (!hit_shards.back().is_open())
+                    return fail("cannot create voxel evidence shard");
+            }
         }
 
-        PointCloudType::Ptr map_cloud = raw_map_cloud;
-        PointCloudType::Ptr dynamic_filtered_cloud(new PointCloudType());
-        if (dynamic_filter_enable_ && dynamic_filter_voxel_size_ > 0.0 && dynamic_filter_min_scan_observations_ > 1)
+        const DynamicFilterVoxelKeyHash key_hash;
+        std::size_t source_points = 0;
+        for (std::size_t index = 0; index < mapping_keyframes_.size(); ++index)
         {
-            dynamic_filtered_cloud->reserve(raw_map_cloud->size());
-            for (const auto& point : raw_map_cloud->points)
+            const auto& keyframe = mapping_keyframes_[index];
+            PointCloudType cloud;
+            if (pcl::io::loadPCDFile<PointType>(keyframe.file_path, cloud) != 0)
+                return fail("cannot read keyframe: " + keyframe.file_path);
+
+            std::unordered_set<DynamicFilterVoxelKey, DynamicFilterVoxelKeyHash> observed_in_keyframe;
+            if (filter_enabled)
+                observed_in_keyframe.reserve(cloud.size());
+            for (const auto& point : cloud.points)
             {
                 if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
                     continue;
-                auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
-                auto iter = dynamic_filter_scan_observations_.find(key);
-                if (iter != dynamic_filter_scan_observations_.end()
-                    && iter->second >= dynamic_filter_min_scan_observations_)
+                const auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
+                const std::size_t shard = filter_enabled ? key_hash(key) % shard_count : 0;
+                const auto packed = packPoint(point);
+                point_shards[shard].write(
+                    reinterpret_cast<const char*>(&packed), sizeof(BinaryPcdPoint));
+                if (!point_shards[shard].good())
+                    return fail("failed while writing point filter shard");
+                if (filter_enabled)
+                    observed_in_keyframe.insert(key);
+                ++source_points;
+            }
+            if (filter_enabled)
+            {
+                for (const auto& key : observed_in_keyframe)
                 {
-                    dynamic_filtered_cloud->push_back(point);
+                    const std::size_t shard = key_hash(key) % shard_count;
+                    hit_shards[shard].write(
+                        reinterpret_cast<const char*>(&key), sizeof(DynamicFilterVoxelKey));
+                    if (!hit_shards[shard].good())
+                        return fail("failed while writing voxel evidence shard");
                 }
             }
-            dynamic_filtered_cloud->width = static_cast<uint32_t>(dynamic_filtered_cloud->size());
-            dynamic_filtered_cloud->height = 1;
-            dynamic_filtered_cloud->is_dense = false;
-            map_cloud = dynamic_filtered_cloud;
+            writeSaveProgress("partitioning_filter",
+                8.0 + 27.0 * static_cast<double>(index + 1) / static_cast<double>(mapping_keyframes_.size()));
+        }
+        for (auto& stream : point_shards)
+            stream.close();
+        for (auto& stream : hit_shards)
+            stream.close();
 
-            const double keep_ratio = raw_map_cloud->empty()
-                ? 0.0
-                : static_cast<double>(dynamic_filtered_cloud->size()) / static_cast<double>(raw_map_cloud->size());
-            RCLCPP_INFO(get_logger(),
-                "Dynamic map filter: raw=%zu filtered=%zu removed=%zu keep_ratio=%.3f voxel=%.3f min_scan_observations=%d observed_voxels=%zu",
-                raw_map_cloud->size(),
-                dynamic_filtered_cloud->size(),
-                raw_map_cloud->size() - dynamic_filtered_cloud->size(),
-                keep_ratio,
-                dynamic_filter_voxel_size_,
-                dynamic_filter_min_scan_observations_,
-                dynamic_filter_scan_observations_.size());
+        const std::string pcd_file = map_subdir + "/map.pcd";
+        const std::string pcd_tmp = pcd_file + ".tmp";
+        std::ofstream pcd(pcd_tmp, std::ios::binary | std::ios::trunc);
+        if (!pcd.is_open())
+            return fail("cannot create final map.pcd");
+        pcd << "# .PCD v0.7 - Point Cloud Data file format\n"
+            << "VERSION 0.7\n"
+            << "FIELDS x y z intensity normal_x normal_y normal_z curvature\n"
+            << "SIZE 4 4 4 4 4 4 4 4\n"
+            << "TYPE F F F F F F F F\n"
+            << "COUNT 1 1 1 1 1 1 1 1\n"
+            << "WIDTH ";
+        const auto width_position = pcd.tellp();
+        pcd << "00000000000000000000\n"
+            << "HEIGHT 1\n"
+            << "VIEWPOINT 0 0 0 1 0 0 0\n"
+            << "POINTS ";
+        const auto points_position = pcd.tellp();
+        pcd << "00000000000000000000\n"
+            << "DATA binary\n";
+
+        constexpr std::size_t chunk_records = 65536;
+        std::vector<DynamicFilterVoxelKey> hit_buffer(chunk_records);
+        std::vector<BinaryPcdPoint> point_buffer(chunk_records);
+        written_points = 0;
+        const auto minimum_hits = static_cast<std::uint8_t>(
+            std::clamp(dynamic_filter_min_scan_observations_, 1, 255));
+        for (std::size_t shard = 0; shard < shard_count; ++shard)
+        {
+            std::unordered_map<DynamicFilterVoxelKey, std::uint8_t, DynamicFilterVoxelKeyHash> hit_counts;
+            const auto hit_path = shard_dir / ("hits_" + std::to_string(shard) + ".bin");
+            if (filter_enabled)
+            {
+                std::ifstream hits(hit_path, std::ios::binary);
+                if (!hits.is_open())
+                    return fail("cannot read voxel evidence shard");
+                const auto hit_bytes = std::filesystem::file_size(hit_path, filesystem_error);
+                if (!filesystem_error)
+                    hit_counts.reserve(static_cast<std::size_t>(hit_bytes / sizeof(DynamicFilterVoxelKey)));
+                filesystem_error.clear();
+                while (hits.good())
+                {
+                    hits.read(reinterpret_cast<char*>(hit_buffer.data()),
+                        static_cast<std::streamsize>(hit_buffer.size() * sizeof(DynamicFilterVoxelKey)));
+                    const auto received = static_cast<std::size_t>(hits.gcount()) / sizeof(DynamicFilterVoxelKey);
+                    for (std::size_t index = 0; index < received; ++index)
+                    {
+                        auto& count = hit_counts[hit_buffer[index]];
+                        if (count < minimum_hits)
+                            ++count;
+                    }
+                }
+            }
+
+            const auto point_path = shard_dir / ("points_" + std::to_string(shard) + ".bin");
+            std::ifstream points(point_path, std::ios::binary);
+            if (!points.is_open())
+                return fail("cannot read point filter shard");
+            while (points.good())
+            {
+                points.read(reinterpret_cast<char*>(point_buffer.data()),
+                    static_cast<std::streamsize>(point_buffer.size() * sizeof(BinaryPcdPoint)));
+                const auto received = static_cast<std::size_t>(points.gcount()) / sizeof(BinaryPcdPoint);
+                for (std::size_t index = 0; index < received; ++index)
+                {
+                    const auto& point = point_buffer[index];
+                    bool keep = true;
+                    if (filter_enabled)
+                    {
+                        PointType pcl_point;
+                        pcl_point.x = point.x;
+                        pcl_point.y = point.y;
+                        pcl_point.z = point.z;
+                        const auto count = hit_counts.find(
+                            makeDynamicFilterVoxelKey(pcl_point, dynamic_filter_voxel_size_));
+                        keep = count != hit_counts.end() && count->second >= minimum_hits;
+                    }
+                    if (!keep)
+                        continue;
+                    pcd.write(reinterpret_cast<const char*>(&point), sizeof(BinaryPcdPoint));
+                    ++written_points;
+                }
+                if (!pcd.good())
+                    return fail("failed while writing final map.pcd");
+            }
+            points.close();
+            hit_counts.clear();
+            std::filesystem::remove(point_path, filesystem_error);
+            filesystem_error.clear();
+            if (filter_enabled)
+            {
+                std::filesystem::remove(hit_path, filesystem_error);
+                filesystem_error.clear();
+            }
+            writeSaveProgress("writing_pcd",
+                35.0 + 30.0 * static_cast<double>(shard + 1) / static_cast<double>(shard_count));
+        }
+        if (written_points == 0)
+        {
+            pcd.close();
+            std::filesystem::remove(pcd_tmp, filesystem_error);
+            return fail("dynamic filter removed every map point");
+        }
+        pcd.seekp(width_position);
+        pcd << std::setw(20) << std::setfill('0') << written_points;
+        pcd.seekp(points_position);
+        pcd << std::setw(20) << std::setfill('0') << written_points;
+        pcd.flush();
+        pcd.close();
+        if (!pcd.good())
+            return fail("failed while closing map.pcd");
+        std::filesystem::rename(pcd_tmp, pcd_file, filesystem_error);
+        if (filesystem_error)
+            return fail("cannot publish final map.pcd: " + filesystem_error.message());
+        std::filesystem::remove_all(shard_dir, filesystem_error);
+
+        const double keep_ratio = source_points == 0
+            ? 0.0
+            : static_cast<double>(written_points) / static_cast<double>(source_points);
+        RCLCPP_INFO(get_logger(),
+            "Disk-sharded map export: keyframes=%zu source=%zu filtered=%zu keep_ratio=%.3f shards=%zu rss=%llu",
+            mapping_keyframes_.size(), source_points, written_points, keep_ratio, shard_count,
+            static_cast<unsigned long long>(residentSetBytes()));
+        return true;
+    }
+
+    bool MappingAlg::writeTrajectoryAndGnssMetadata(const std::string& map_subdir)
+    {
+        std::ofstream trajectory(map_subdir + "/map.txt", std::ios::out | std::ios::trunc);
+        if (!trajectory.is_open())
+        {
+            keyframe_writer_error_ = "cannot create map.txt";
+            return false;
+        }
+        trajectory << "# path\n";
+        if (!path.poses.empty())
+        {
+            for (const auto& pose : path.poses)
+            {
+                const double theta = QuaternionToYaw(pose.pose.orientation.x, pose.pose.orientation.y,
+                    pose.pose.orientation.z, pose.pose.orientation.w);
+                trajectory << std::fixed << std::setprecision(2) << pose.pose.position.x << ' '
+                           << pose.pose.position.y << ' ' << theta << '\n';
+            }
+        }
+        else
+        {
+            for (const auto& keyframe : mapping_keyframes_)
+            {
+                trajectory << std::fixed << std::setprecision(2) << keyframe.lidar_origin(0) << ' '
+                           << keyframe.lidar_origin(1) << ' ' << keyframe.yaw << '\n';
+            }
+        }
+        trajectory.close();
+
+        if (gnss_origin_initialized_)
+        {
+            std::ofstream meta(map_subdir + "/gnss_origin.yaml", std::ios::out | std::ios::trunc);
+            if (!meta.is_open())
+            {
+                keyframe_writer_error_ = "cannot create gnss_origin.yaml";
+                return false;
+            }
+            meta << "rtk_enabled: true\n";
+            meta << "datum: CGCS2000\n";
+            meta << std::fixed << std::setprecision(10);
+            meta << "origin_latitude: " << gnss_origin_lat_ << "\n";
+            meta << "origin_longitude: " << gnss_origin_lon_ << "\n";
+            meta << std::setprecision(4);
+            meta << "origin_altitude: " << gnss_origin_alt_ << "\n";
+            meta << "map_offset:\n";
+            meta << "  x: " << gnss_map_offset_(0) << "\n";
+            meta << "  y: " << gnss_map_offset_(1) << "\n";
+            meta << "  z: " << gnss_map_offset_(2) << "\n";
+            meta << "gps_link:\n";
+            meta << "  x: " << gnss_lever_arm_base_(0) << "\n";
+            meta << "  y: " << gnss_lever_arm_base_(1) << "\n";
+            meta << "  z: " << gnss_lever_arm_base_(2) << "\n";
+            meta << "gnss_corrections: " << gnss_correction_count_ << "\n";
+        }
+        return true;
+    }
+
+    void MappingAlg::writeSaveProgress(
+        const std::string& stage, double progress_percent, const std::string& error) const
+    {
+        std::lock_guard<std::mutex> progress_lock(progress_file_mutex_);
+        if (active_map_subdir_.empty())
+            return;
+        std::size_t keyframe_count = 0;
+        std::size_t queued_keyframes = 0;
+        std::size_t written_keyframes = 0;
+        std::size_t written_points = 0;
+        std::size_t dropped_keyframes = 0;
+        double trajectory_m = 0.0;
+        MappingKeyframe latest;
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            keyframe_count = mapping_keyframes_.size();
+            queued_keyframes = keyframe_write_queue_.size() + (keyframe_writer_active_ ? 1 : 0);
+            written_keyframes = written_keyframes_;
+            written_points = written_keyframe_points_;
+            dropped_keyframes = dropped_keyframes_;
+            trajectory_m = keyframe_trajectory_m_;
+            if (!mapping_keyframes_.empty())
+                latest = mapping_keyframes_.back();
         }
 
-        string pcd_file = map_subdir + "/map.pcd";
-        if (pcd_writer.writeBinary(pcd_file, *map_cloud) != 0)
+        const std::string progress_file = active_map_subdir_ + "/save_progress.json";
+        const std::string temporary = progress_file + ".tmp";
+        std::ofstream output(temporary, std::ios::out | std::ios::trunc);
+        if (!output.is_open())
+            return;
+        output << "{\n"
+               << "  \"format\": \"roamerx.streaming-map-progress.v1\",\n"
+               << "  \"stage\": \"" << jsonEscape(stage) << "\",\n"
+               << "  \"progress_percent\": " << std::fixed << std::setprecision(2)
+               << std::clamp(progress_percent, 0.0, 100.0) << ",\n"
+               << "  \"keyframe_count\": " << keyframe_count << ",\n"
+               << "  \"written_keyframes\": " << written_keyframes << ",\n"
+               << "  \"queued_keyframes\": " << queued_keyframes << ",\n"
+               << "  \"dropped_keyframes\": " << dropped_keyframes << ",\n"
+               << "  \"written_points\": " << written_points << ",\n"
+               << "  \"estimated_output_bytes\": " << written_points * sizeof(BinaryPcdPoint) << ",\n"
+               << "  \"trajectory_m\": " << std::setprecision(3) << trajectory_m << ",\n"
+               << "  \"rss_bytes\": " << residentSetBytes() << ",\n"
+               << "  \"disk_free_bytes\": " << freeDiskBytes(active_map_subdir_) << ",\n"
+               << "  \"rtk_quality\": {\"valid\": " << (latest.rtk_valid ? "true" : "false")
+               << ", \"status\": " << latest.rtk_status
+               << ", \"horizontal_std\": " << latest.rtk_horizontal_std
+               << ", \"age_seconds\": " << latest.rtk_age_seconds << "},\n"
+               << "  \"updated_at_unix\": " << std::time(nullptr) << ",\n"
+               << "  \"recoverable\": "
+               << (written_keyframes > 0 && stage != "completed" ? "true" : "false") << ",\n"
+               << "  \"error\": \"" << jsonEscape(error) << "\"\n"
+               << "}\n";
+        output.close();
+        std::error_code rename_error;
+        std::filesystem::rename(temporary, progress_file, rename_error);
+        if (rename_error)
+            std::filesystem::remove(temporary);
+    }
+
+    bool MappingAlg::finish()
+    {
+        if (map_export_completed_)
+            return true;
+        if (mapping_keyframes_.empty() || active_map_subdir_.empty())
         {
-            RCLCPP_ERROR(get_logger(), "Map export failed: cannot write %s", pcd_file.c_str());
+            RCLCPP_ERROR(get_logger(), "Map export failed: no persistent keyframes available");
             return false;
         }
 
-        string pcd2grid_dir = map_subdir + "/map";
-        pcd2grid_ptr_->run(map_cloud, pcd2grid_dir);
+        writeSaveProgress("flushing_keyframes", 2.0);
+        if (!flushKeyframeWriter())
+        {
+            writeSaveProgress("failed", 2.0, keyframe_writer_error_);
+            return false;
+        }
+        stopKeyframeWriter(true);
+        writeSaveProgress("filtering", 8.0);
 
-            std::ofstream ofs;
-            std::string   path_file = map_subdir + "/map.txt";
-            ofs.open(path_file, std::ios::out | std::ios::trunc);
-            if (!ofs.is_open())
-            {
-                std::cout << "Failed to open traj_file: " << path_file << std::endl;
-                return false;
-            }
+        std::size_t written_points = 0;
+        if (!streamMapFromKeyframes(active_map_subdir_, written_points))
+        {
+            writeSaveProgress("failed", 65.0, keyframe_writer_error_);
+            return false;
+        }
 
-            double theta;
-            ofs << "# path" << std::endl;
-            for (const auto& p : path.poses)
-            {
-                theta = QuaternionToYaw(p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w);
-                ofs << std::fixed << std::setprecision(2) << p.pose.position.x << " " << p.pose.position.y << " " << theta << std::endl;
-            }
-            ofs.close();
+        writeSaveProgress("building_grid", 68.0);
+        std::string grid_error;
+        const bool grid_saved = pcd2grid_ptr_->runFromBinaryPcd(
+            active_map_subdir_ + "/map.pcd",
+            active_map_subdir_ + "/map",
+            [this](double progress) {
+                writeSaveProgress("building_grid", 68.0 + 24.0 * progress);
+            },
+            &grid_error);
+        if (!grid_saved)
+        {
+            keyframe_writer_error_ = grid_error;
+            writeSaveProgress("failed", 92.0, grid_error);
+            return false;
+        }
 
-            if (gnss_origin_initialized_)
-            {
-                std::ofstream meta_ofs(map_subdir + "/gnss_origin.yaml", std::ios::out | std::ios::trunc);
-                if (meta_ofs.is_open())
-                {
-                    meta_ofs << "rtk_enabled: true\n";
-                    meta_ofs << "datum: CGCS2000\n";
-                    meta_ofs << std::fixed << std::setprecision(10);
-                    meta_ofs << "origin_latitude: " << gnss_origin_lat_ << "\n";
-                    meta_ofs << "origin_longitude: " << gnss_origin_lon_ << "\n";
-                    meta_ofs << std::setprecision(4);
-                    meta_ofs << "origin_altitude: " << gnss_origin_alt_ << "\n";
-                    meta_ofs << "map_offset:\n";
-                    meta_ofs << "  x: " << gnss_map_offset_(0) << "\n";
-                    meta_ofs << "  y: " << gnss_map_offset_(1) << "\n";
-                    meta_ofs << "  z: " << gnss_map_offset_(2) << "\n";
-                    meta_ofs << "gps_link:\n";
-                    meta_ofs << "  x: " << gnss_lever_arm_base_(0) << "\n";
-                    meta_ofs << "  y: " << gnss_lever_arm_base_(1) << "\n";
-                    meta_ofs << "  z: " << gnss_lever_arm_base_(2) << "\n";
-                    meta_ofs << "gnss_corrections: " << gnss_correction_count_ << "\n";
-                    meta_ofs.close();
-                }
-            }
+        writeSaveProgress("writing_metadata", 95.0);
+        if (!writeTrajectoryAndGnssMetadata(active_map_subdir_))
+        {
+            writeSaveProgress("failed", 95.0, keyframe_writer_error_);
+            return false;
+        }
 
-        RCLCPP_INFO(get_logger(), "Save Map Success to %s", map_subdir.c_str());
+        written_keyframe_points_ = written_points;
+        map_export_completed_ = true;
+        writeSaveProgress("completed", 100.0);
+        RCLCPP_INFO(get_logger(), "Save Map Success to %s (keyframes=%zu, points=%zu)",
+            active_map_subdir_.c_str(), mapping_keyframes_.size(), written_points);
         return true;
     }
 }  // namespace robot::slam

@@ -82,11 +82,15 @@ include_directories(inlcude
 
 add_executable(mapping ${SLAM_SDK} test/mapping_demo.cpp)
 
+add_executable(pcd2grid_streaming src/pcd2grid.cpp test/pcd2grid_streaming_cli.cpp)
+
 target_link_libraries(mapping ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+target_link_libraries(pcd2grid_streaming ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 ament_target_dependencies(mapping ${dependencies})
+ament_target_dependencies(pcd2grid_streaming ${dependencies})
 
-install(TARGETS mapping
+install(TARGETS mapping pcd2grid_streaming
   DESTINATION lib/${PROJECT_NAME}
 )
 

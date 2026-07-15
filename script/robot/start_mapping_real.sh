@@ -7,6 +7,7 @@ LOG_DIR="${LOG_DIR:-/tmp/roamerx_mapping_logs}"
 SLAM_CONFIG="${SLAM_CONFIG:-${PROJECT_DIR}/install/robot_slam/share/robot_slam/config/config.yaml}"
 REQUIRE_RTK="${REQUIRE_RTK:-1}"
 RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
+MAP_SAVE_WAIT_SECONDS="${MAP_SAVE_WAIT_SECONDS:-7200}"
 
 mkdir -p "${LOG_DIR}" "${MAP_DIR}"
 
@@ -111,15 +112,70 @@ start_mapping() {
 save_map() {
   wait_for_service "/slam_state_service" 5
   echo "Saving map..."
-  ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}" | tee "${LOG_DIR}/save_map.last.log"
-  sleep 3
-  echo "Recent map files:"
-  ls -lt "${MAP_DIR}" | head -10 || true
+  local save_started response deadline last_display progress_file
+  save_started="$(date +%s)"
+  response="$(ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}" | tee "${LOG_DIR}/save_map.last.log")"
+  if grep -Eq "success=(False|false)|success: false" <<<"${response}"; then
+    echo "ERROR: SLAM rejected the save request." >&2
+    return 1
+  fi
+
+  deadline=$((SECONDS + MAP_SAVE_WAIT_SECONDS))
+  last_display=""
+  while (( SECONDS < deadline )); do
+    progress_file="$(find "${MAP_DIR}" -mindepth 2 -maxdepth 2 -name save_progress.json -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+    if [ -n "${progress_file}" ]; then
+      local stage percent updated error display session_dir
+      IFS=$'\t' read -r stage percent updated error < <(
+        python3 - "${progress_file}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+error = str(payload.get("error") or "").replace("\t", " ").replace("\n", " ")
+print(
+    payload.get("stage", ""),
+    payload.get("progress_percent", 0),
+    payload.get("updated_at_unix", 0),
+    error,
+    sep="\t",
+)
+PY
+      )
+      if [ "${updated:-0}" -ge "${save_started}" ] 2>/dev/null; then
+        display="${stage} ${percent}%"
+        if [ "${display}" != "${last_display}" ]; then
+          echo "Save progress: ${display}"
+          last_display="${display}"
+        fi
+        session_dir="$(dirname "${progress_file}")"
+        if [ "${stage}" = "completed" ] && [ -f "${session_dir}/map.yaml" ] && [ -f "${session_dir}/map.pgm" ]; then
+          echo "Map save completed: ${session_dir}"
+          return 0
+        fi
+        if [ "${stage}" = "failed" ]; then
+          echo "ERROR: map save failed: ${error:-unknown error}" >&2
+          return 1
+        fi
+      fi
+    fi
+    if ! pgrep -f "robot_slam.*mapping|/robot_slam/mapping|lib/robot_slam/mapping" >/dev/null 2>&1; then
+      echo "ERROR: mapping process exited before save completed." >&2
+      return 1
+    fi
+    sleep 2
+  done
+  echo "ERROR: map save did not finish within ${MAP_SAVE_WAIT_SECONDS}s; keyframes remain recoverable." >&2
+  return 1
 }
 
 stop_mapping() {
   if ros2 service list 2>/dev/null | grep -qx "/slam_state_service"; then
-    save_map || true
+    if ! save_map; then
+      echo "ERROR: keeping SLAM process alive so save can be retried." >&2
+      return 1
+    fi
   fi
   kill_pattern "robot_slam.*mapping"
   kill_pattern "/robot_slam/mapping"

@@ -21,6 +21,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <fstream>
+#include <functional>
 
 namespace robot::slam
 {
@@ -31,6 +32,7 @@ namespace robot::slam
         double thre_z_max = 2.0;
         int flag_pass_through = 0;
         double map_resolution = 0.05;
+        std::size_t max_grid_cells = 200000000;
     };
 
     class Pcd2Grid
@@ -40,6 +42,12 @@ namespace robot::slam
         ~Pcd2Grid() {}
 
         void run(const CloudPtr &map_points, const std::string &file_name);
+
+        bool runFromBinaryPcd(
+            const std::string& pcd_file,
+            const std::string& file_name,
+            const std::function<void(double)>& progress_callback = {},
+            std::string* error = nullptr);
 
     private:
         Pcd2GridOptions options_;

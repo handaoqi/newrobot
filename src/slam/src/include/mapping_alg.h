@@ -16,7 +16,9 @@
 #include "so3_math.h"
 
 #include <Eigen/Core>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <ctime>
 #include <iomanip>
@@ -79,9 +81,25 @@ namespace robot::slam
 
     struct MappingKeyframe
     {
-        double   stamp = 0.0;
-        Vec3d    lidar_origin = Zero3d;
-        CloudPtr cloud_world = CloudPtr(new PointCloudType());
+        std::size_t index = 0;
+        double      stamp = 0.0;
+        Vec3d       lidar_origin = Zero3d;
+        double      yaw = 0.0;
+        std::string file_path;
+        std::size_t point_count = 0;
+        bool        rtk_valid = false;
+        int         rtk_status = -1;
+        double      rtk_latitude = 0.0;
+        double      rtk_longitude = 0.0;
+        double      rtk_altitude = 0.0;
+        double      rtk_horizontal_std = 0.0;
+        double      rtk_age_seconds = 0.0;
+    };
+
+    struct PendingKeyframe
+    {
+        MappingKeyframe metadata;
+        CloudPtr        cloud_world;
     };
 
     class MappingAlg : public rclcpp::Node
@@ -124,7 +142,23 @@ namespace robot::slam
 
         void recordKeyframe(const CloudPtr& cloud_world);
 
-        void saveKeyframes(const std::string& map_subdir) const;
+        bool initializeKeyframeSession();
+
+        bool recoverLatestKeyframeSession();
+
+        void startKeyframeWriter();
+
+        void stopKeyframeWriter(bool drain);
+
+        bool flushKeyframeWriter();
+
+        void keyframeWriterLoop();
+
+        bool streamMapFromKeyframes(const std::string& map_subdir, std::size_t& written_points);
+
+        bool writeTrajectoryAndGnssMetadata(const std::string& map_subdir);
+
+        void writeSaveProgress(const std::string& stage, double progress_percent, const std::string& error = "") const;
 
         void pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body);
 
@@ -235,13 +269,29 @@ namespace robot::slam
         bool                               dynamic_filter_enable_ = true;
         double                             dynamic_filter_voxel_size_ = 0.20;
         int                                dynamic_filter_min_scan_observations_ = 3;
-        std::unordered_map<DynamicFilterVoxelKey, int, DynamicFilterVoxelKeyHash> dynamic_filter_scan_observations_;
+        std::size_t                        dynamic_filter_shard_count_ = 64;
         bool                               keyframe_record_enable_ = true;
         double                             keyframe_min_distance_m_ = 0.8;
         double                             keyframe_min_yaw_rad_ = 0.35;
         double                             keyframe_max_interval_s_ = 2.0;
         double                             keyframe_voxel_size_m_ = 0.25;
+        std::size_t                        keyframe_max_queue_size_ = 8;
         std::vector<MappingKeyframe>       mapping_keyframes_;
+        std::deque<PendingKeyframe>        keyframe_write_queue_;
+        mutable std::mutex                 keyframe_writer_mutex_;
+        mutable std::mutex                 progress_file_mutex_;
+        std::condition_variable            keyframe_writer_cv_;
+        std::thread                        keyframe_writer_thread_;
+        bool                               keyframe_writer_stop_ = false;
+        bool                               keyframe_writer_active_ = false;
+        bool                               keyframe_writer_failed_ = false;
+        std::string                        keyframe_writer_error_;
+        std::size_t                        written_keyframes_ = 0;
+        std::size_t                        written_keyframe_points_ = 0;
+        std::size_t                        dropped_keyframes_ = 0;
+        double                             keyframe_trajectory_m_ = 0.0;
+        std::string                        active_map_subdir_;
+        bool                               map_export_completed_ = false;
         Vec3d                              last_keyframe_origin_ = Zero3d;
         double                             last_keyframe_yaw_ = 0.0;
         double                             last_keyframe_stamp_ = 0.0;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -56,6 +57,8 @@ class MappingAdapter:
         self.map_dir = Path(config.map_dir).expanduser()
         self.session: MappingSession | None = None
         self._slam_process: subprocess.Popen | None = None
+        self._slam_log_handle = None
+        self._slam_log_path: Path | None = None
 
     @property
     def _slam_process_alive(self) -> bool:
@@ -103,9 +106,26 @@ class MappingAdapter:
                     updated_at=now_iso(),
                 )
                 return self._save_active_mapping(command)
+            recoverable_dir = self._find_latest_recoverable_dir()
+            complete_dir = self._find_latest_session_dir(require_complete=True)
+            if recoverable_dir and (
+                not complete_dir
+                or self._latest_file_mtime(recoverable_dir) > self._latest_file_mtime(complete_dir)
+            ):
+                LOGGER.warning("Recovering interrupted map export from %s", recoverable_dir)
+                self.session = MappingSession(
+                    session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
+                    map_name=command.get("map_name") or recoverable_dir.name,
+                    route_hint=command.get("route_hint", ""),
+                    state="saving",
+                    started_at=now_iso(),
+                    updated_at=now_iso(),
+                )
+                self._ensure_slam_process()
+                return self._save_active_mapping(command)
             # 同步模式：无活跃建图会话时，直接打包最近已有的地图文件并上传
             LOGGER.info("save_mapping called without active session — treating as sync")
-            session_dir = self._find_latest_session_dir(require_complete=True)
+            session_dir = complete_dir
             if not session_dir:
                 raise ProtocolError("NO_MAP_FILES", "no previous complete mapping output found")
             work_dir = session_dir
@@ -117,6 +137,12 @@ class MappingAdapter:
             result["upload_result"] = upload_result
             return result
 
+        if not self._any_slam_process_alive:
+            LOGGER.warning(
+                "Mapping session %s has no SLAM process; restarting for persistent-keyframe recovery",
+                self.session.session_id,
+            )
+            self._ensure_slam_process()
         return self._save_active_mapping(command)
 
     def _save_active_mapping(self, command: dict) -> dict:
@@ -141,13 +167,22 @@ class MappingAdapter:
         return result
 
     def cancel_mapping(self, command: dict) -> dict:
+        progress_dir = self._find_latest_progress_dir()
         if self.session:
             self._set_state("cancelled")
         self._stop_slam_process()
+        self._mark_progress_cancelled(progress_dir)
         return self.status()
 
     def status(self) -> dict:
-        latest_session_dir = self._find_latest_session_dir(require_complete=True)
+        complete_session_dir = self._find_latest_session_dir(require_complete=True)
+        progress_session_dir = self._find_latest_progress_dir()
+        latest_session_dir = (
+            progress_session_dir
+            if self._any_slam_process_alive and progress_session_dir
+            else complete_session_dir or progress_session_dir
+        )
+        progress = self._read_save_progress(latest_session_dir)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
         if not self.session:
             return {
@@ -157,6 +192,8 @@ class MappingAdapter:
                 "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
                 "process_alive": self._any_slam_process_alive,
                 "slam_pids": self._find_slam_process_pids(),
+                "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
+                "save_progress": progress,
                 "files": files,
             }
         return {
@@ -171,6 +208,8 @@ class MappingAdapter:
             "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
             "process_alive": self._any_slam_process_alive,
             "slam_pids": self._find_slam_process_pids(),
+            "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
+            "save_progress": progress,
             "files": files,
         }
 
@@ -183,12 +222,26 @@ class MappingAdapter:
         if self._slam_process and self._slam_process.poll() is None:
             return
         command = self._shell_prefix() + self.config.slam_command
+        log_dir = Path(self.config.log_dir).expanduser()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._slam_log_path = log_dir / f"mapping-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        self._slam_log_handle = self._slam_log_path.open("ab", buffering=0)
         self._slam_process = subprocess.Popen(
             ["bash", "-lc", command],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._slam_log_handle,
+            stderr=subprocess.STDOUT,
         )
         time.sleep(5)
+        if self._slam_process.poll() is not None:
+            return_code = self._slam_process.returncode
+            self._slam_process = None
+            if self._slam_log_handle:
+                self._slam_log_handle.close()
+                self._slam_log_handle = None
+            raise ProtocolError(
+                "MAPPING_SLAM_START_FAILED",
+                f"SLAM process exited during startup with code {return_code}; log={self._slam_log_path}",
+            )
 
     def _call_map_state(self, data: int) -> str:
         payload = f'"{{data: {int(data)}}}"'
@@ -205,6 +258,8 @@ class MappingAdapter:
         output = result.stdout or result.stderr
         if result.returncode != 0:
             raise ProtocolError("MAPPING_SERVICE_FAILED", output.strip() or "ros2 service call failed")
+        if re.search(r"\bsuccess\s*[:=]\s*(?:false|False)\b", output):
+            raise ProtocolError("MAPPING_SERVICE_REJECTED", output.strip() or "SLAM rejected map state change")
         return output
 
     def _find_latest_session_dir(
@@ -219,6 +274,8 @@ class MappingAdapter:
         occur in the same second it appends a millisecond suffix, for example
         ``YYYYMMDD_HHMMSS_960``; both forms are valid map sessions.
         """
+        if not self.map_dir.exists():
+            return None
         dirs = []
         for entry in self.map_dir.iterdir():
             if not self._is_session_dir(entry):
@@ -229,6 +286,66 @@ class MappingAdapter:
                 continue
             dirs.append(entry)
         return max(dirs, key=self._latest_file_mtime) if dirs else None
+
+    def _find_latest_progress_dir(self) -> Path | None:
+        if not self.map_dir.exists():
+            return None
+        dirs = [
+            entry
+            for entry in self.map_dir.iterdir()
+            if self._is_session_dir(entry) and (entry / "save_progress.json").exists()
+        ]
+        return max(dirs, key=self._latest_file_mtime) if dirs else None
+
+    def _find_latest_recoverable_dir(self) -> Path | None:
+        if not self.map_dir.exists():
+            return None
+        candidates = []
+        for entry in self.map_dir.iterdir():
+            if not self._is_session_dir(entry):
+                continue
+            progress = self._read_save_progress(entry)
+            if (
+                progress.get("recoverable") is True
+                and progress.get("stage") != "completed"
+                and (entry / "keyframes" / "keyframes.csv").exists()
+                and not self._has_required_files(entry)
+            ):
+                candidates.append(entry)
+        return max(candidates, key=self._latest_file_mtime) if candidates else None
+
+    @staticmethod
+    def _read_save_progress(base: Path | None) -> dict:
+        if not base:
+            return {}
+        path = base / "save_progress.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            LOGGER.exception("failed to read mapping progress %s", path)
+            return {}
+
+    def _mark_progress_cancelled(self, base: Path | None) -> None:
+        progress = self._read_save_progress(base)
+        if not base or not progress or progress.get("stage") in {"completed", "failed"}:
+            return
+        progress.update(
+            stage="cancelled",
+            recoverable=False,
+            updated_at_unix=int(time.time()),
+            error="",
+        )
+        path = base / "save_progress.json"
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(progress, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            LOGGER.exception("failed to mark mapping progress cancelled: %s", path)
+            temporary.unlink(missing_ok=True)
 
     def _wait_for_complete_map_dir(self, min_mtime: float | None = None) -> Path:
         deadline = time.monotonic() + max(
@@ -242,6 +359,15 @@ class MappingAdapter:
                 return session_dir
             latest = self._find_latest_session_dir()
             base = latest or self.map_dir
+            progress = self._read_save_progress(latest)
+            if (
+                progress.get("stage") == "failed"
+                and self._latest_file_mtime(base) >= (min_mtime or 0)
+            ):
+                raise ProtocolError(
+                    "MAPPING_SAVE_FAILED",
+                    str(progress.get("error") or "SLAM map export failed"),
+                )
             last_missing = self._missing_required_files(base)
             time.sleep(1)
         raise ProtocolError("MAPPING_FILES_MISSING", f"missing map files: {', '.join(last_missing or self.REQUIRED_FILES)}")
@@ -250,6 +376,10 @@ class MappingAdapter:
         mtimes = [base.stat().st_mtime]
         for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
             path = base / name
+            if path.exists():
+                mtimes.append(path.stat().st_mtime)
+        for relative in ("save_progress.json", "keyframes/keyframes.csv"):
+            path = base / relative
             if path.exists():
                 mtimes.append(path.stat().st_mtime)
         return max(mtimes)
@@ -269,7 +399,7 @@ class MappingAdapter:
     def _is_session_dir(self, path: Path) -> bool:
         if not path.is_dir():
             return False
-        if not re.fullmatch(r"\d{8}_\d{6}(?:_\d{3})?", path.name):
+        if not re.fullmatch(r"\d{8}_\d{6}(?:_\d{3})?(?:_\d+)?", path.name):
             return False
         timestamp = path.name[:15]
         try:
@@ -351,6 +481,24 @@ class MappingAdapter:
         """
         if not self.config.visibility_filter_enabled:
             raise ProtocolError("MAPPING_FILTER_DISABLED", "keyframe visibility filtering is required for saved maps")
+        pcd_path = base / "map.pcd"
+        source_bytes = pcd_path.stat().st_size if pcd_path.exists() else 0
+        max_source_bytes = int(self.config.visibility_filter_max_source_bytes)
+        if max_source_bytes > 0 and source_bytes > max_source_bytes:
+            result = {
+                "enabled": True,
+                "skipped": "source_exceeds_memory_safe_visibility_limit",
+                "source_bytes": source_bytes,
+                "max_source_bytes": max_source_bytes,
+                "active_filter": "disk_sharded_cpp_keyframe_filter",
+            }
+            LOGGER.warning(
+                "Skipping whole-map visibility filter for %s bytes=%s limit=%s",
+                base,
+                source_bytes,
+                max_source_bytes,
+            )
+            return base, result
         output = base / self.config.visibility_filter_output_suffix
         try:
             result = filter_with_keyframe_visibility(
@@ -396,6 +544,9 @@ class MappingAdapter:
                 self._slam_process.kill()
         self._slam_process = None
         self._stop_orphan_slam_processes()
+        if self._slam_log_handle:
+            self._slam_log_handle.close()
+            self._slam_log_handle = None
 
     def _find_slam_process_pids(self) -> list[int]:
         try:

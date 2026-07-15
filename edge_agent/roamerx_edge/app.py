@@ -235,6 +235,7 @@ class EdgeAgentApplication:
             )
             snapshot["current_map"] = self._current_map_payload()
             snapshot["map_set"] = self.map_set_coordinator.status()
+            snapshot["mapping"] = self.mapping_adapter.status()
             self.mqtt.publish_status(snapshot)
 
     def _trajectory_loop(self) -> None:

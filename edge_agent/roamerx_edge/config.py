@@ -68,9 +68,10 @@ class MediaConfig:
 @dataclass
 class MappingConfig:
     map_dir: str = "/home/robot/.jszr/map"
+    log_dir: str = "/tmp/roamerx_mapping_logs"
     ros_setup: str = "/opt/ros/humble/setup.bash"
     workspace_setup: str = "~/genisom_roamerx_open/install/setup.bash"
-    slam_command: str = "ros2 run robot_slam mapping --ros-args -p config:=$HOME/genisom_roamerx_open/install/robot_slam/share/robot_slam/config/config.yaml"
+    slam_command: str = "ros2 run robot_slam mapping --ros-args --params-file $HOME/genisom_roamerx_open/install/robot_slam/share/robot_slam/config/config.yaml"
     service_name: str = "/slam_state_service"
     service_type: str = "robots_dog_msgs/srv/MapState"
     start_data: int = 3
@@ -85,6 +86,7 @@ class MappingConfig:
     visibility_filter_voxel_size_m: float = 0.3
     visibility_filter_min_free_observations: int = 1
     visibility_filter_max_hit_observations: int = 10
+    visibility_filter_max_source_bytes: int = 268435456
     visibility_filter_output_suffix: str = "keyframe_visibility_loose03x"
     auto_activate_uploaded_map: bool = True
     upload_point_cloud: bool = False
