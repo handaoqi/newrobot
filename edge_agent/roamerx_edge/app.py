@@ -94,6 +94,7 @@ class EdgeAgentApplication:
         self.mqtt.connect()
         if not self.mqtt.wait_connected(15):
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
+        self.task_executor.report_startup_interruption()
         self._publish_online()
         self._publish_sync_request()
         self._threads = [

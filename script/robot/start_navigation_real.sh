@@ -141,8 +141,7 @@ ensure_rtk() {
 
 load_pcd_map() {
   echo "Loading localization PCD map: ${PCD_MAP}"
-  wait_for_node "/localization" 20
-  ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \
+  timeout 25 ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \
     "{pcd_path: '${PCD_MAP}'}" | tee "${LOG_DIR}/load_map.last.log"
 }
 
@@ -154,7 +153,7 @@ wait_for_localization() {
       return 1
     fi
     local status
-    status="$(timeout 3 ros2 topic echo /localization_info --once 2>/dev/null | awk '/status:/{print $2; exit}' || true)"
+    status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
     if [ "${status}" = "3" ]; then
       echo "Localization OK."
       return 0
@@ -167,7 +166,7 @@ wait_for_localization() {
 
 localization_is_valid() {
   local status
-  status="$(timeout 3 ros2 topic echo /localization_info --once 2>/dev/null | awk '/status:/{print $2; exit}' || true)"
+  status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
   [ "${status}" = "3" ]
 }
 
@@ -236,7 +235,9 @@ status_stack() {
   ros2 lifecycle get /bt_navigator 2>/dev/null || true
   echo
   echo "Localization:"
-  timeout 3 ros2 topic echo /localization_info --once 2>/dev/null | awk '/status:|  x:|  y:|  z:|speed:/{print}' || true
+  local status
+  status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+  echo "status: ${status:-unavailable}"
   echo
   echo "cmd_vel:"
   ros2 topic info /cmd_vel -v 2>/dev/null | sed -n '1,80p' || true

@@ -56,6 +56,13 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
 
+    def report_startup_interruption(self) -> None:
+        """Close the command lifecycle after an active task is recovered."""
+        with self._lock:
+            if not self.context or self.context.state != "interrupted":
+                return
+            self._fail("EDGE_RESTARTED", "Edge Agent restarted while the task was active")
+
     def has_active_task(self) -> bool:
         return self.context is not None and self.context.state not in self.TERMINAL_STATES
 

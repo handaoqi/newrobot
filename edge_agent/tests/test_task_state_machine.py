@@ -124,3 +124,34 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     assert results[0][1] == "failed"
     assert results[0][3] == "FINAL_POSE_OUT_OF_TOLERANCE"
     store.close()
+
+
+def test_restart_reports_interrupted_task_and_closes_start_command(tmp_path):
+    db_path = str(tmp_path / "edge.db")
+    store = LocalStore(db_path)
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    store.close()
+
+    recovered_store = LocalStore(db_path)
+    events = []
+    results = []
+    recovered = TaskExecutor(
+        recovered_store,
+        FakeNavigation(),
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: results.append(args),
+    )
+    recovered.report_startup_interruption()
+
+    assert recovered.context.state == "failed"
+    assert events[0][0] == "task.failed"
+    assert results[0][1] == "failed"
+    assert results[0][2]["final_task_state"] == "failed"
+    assert results[0][3] == "EDGE_RESTARTED"
+    recovered_store.close()
