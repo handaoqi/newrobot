@@ -227,17 +227,21 @@ class EdgeAgentApplication:
     def _status_loop(self) -> None:
         while not self.stop_event.wait(self.config.telemetry.status_interval_seconds):
             try:
-                self.navigation.wait_until_ready(timeout_seconds=0.1)
+                mapping_status = self.mapping_adapter.status()
+                if mapping_status.get("process_alive"):
+                    self.navigation.safety_state.nav_ready = False
+                else:
+                    self.navigation.wait_until_ready(timeout_seconds=0.0)
+                context = self.task_executor.context
+                snapshot = self.telemetry.build_status_snapshot(
+                    context.task_execution_id if context and self.task_executor.has_active_task() else None
+                )
+                snapshot["current_map"] = self._current_map_payload()
+                snapshot["map_set"] = self.map_set_coordinator.status()
+                snapshot["mapping"] = mapping_status
+                self.mqtt.publish_status(snapshot)
             except Exception:
-                LOGGER.exception("failed to refresh navigation readiness")
-            context = self.task_executor.context
-            snapshot = self.telemetry.build_status_snapshot(
-                context.task_execution_id if context and self.task_executor.has_active_task() else None
-            )
-            snapshot["current_map"] = self._current_map_payload()
-            snapshot["map_set"] = self.map_set_coordinator.status()
-            snapshot["mapping"] = self.mapping_adapter.status()
-            self.mqtt.publish_status(snapshot)
+                LOGGER.exception("failed to publish telemetry status")
 
     def _trajectory_loop(self) -> None:
         while not self.stop_event.wait(0.5):

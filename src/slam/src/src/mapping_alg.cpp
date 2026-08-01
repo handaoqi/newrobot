@@ -174,15 +174,31 @@ namespace robot::slam
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<int>("imu_init.sample_count", 600);
+        this->declare_parameter<double>("imu_init.max_acc_variance", 0.5);
+        this->declare_parameter<double>("imu_init.max_gyro_variance", 0.05);
         this->declare_parameter<bool>("gnss_fusion.enable", false);
         this->declare_parameter<double>("gnss_fusion.gain", 0.03);
-        this->declare_parameter<double>("gnss_fusion.max_correction_step", 0.25);
-        this->declare_parameter<double>("gnss_fusion.max_residual", 8.0);
-        this->declare_parameter<double>("gnss_fusion.max_age", 2.5);
-        this->declare_parameter<double>("gnss_fusion.max_horizontal_std", 2.0);
+        this->declare_parameter<double>("gnss_fusion.max_correction_step", 0.10);
+        this->declare_parameter<double>("gnss_fusion.max_residual", 5.0);
+        this->declare_parameter<double>("gnss_fusion.max_age", 1.5);
+        this->declare_parameter<double>("gnss_fusion.max_horizontal_std", 1.5);
         this->declare_parameter<int>("gnss_fusion.min_status", 0);
         this->declare_parameter<bool>("gnss_fusion.use_elevation", false);
         this->declare_parameter<vector<double>>("gnss_fusion.lever_arm_base", vector<double>({ -0.05, 0.0, 0.15 }));
+        this->declare_parameter<int>("gnss_fusion.alignment_min_samples", 20);
+        this->declare_parameter<double>("gnss_fusion.alignment_min_baseline", 15.0);
+        this->declare_parameter<double>("gnss_fusion.alignment_max_rms", 1.5);
+        this->declare_parameter<double>("gnss_fusion.alignment_max_yaw_change_deg", 3.0);
+        this->declare_parameter<int>("gnss_fusion.alignment_required_fits", 3);
+        this->declare_parameter<double>("health_guard.max_frame_translation", 1.5);
+        this->declare_parameter<double>("health_guard.max_speed", 3.0);
+        this->declare_parameter<double>("health_guard.max_abs_z", 5.0);
+        this->declare_parameter<double>("health_guard.max_frame_z", 1.0);
+        this->declare_parameter<double>("health_guard.warn_speed", 1.8);
+        this->declare_parameter<double>("health_guard.warn_abs_z", 0.5);
+        this->declare_parameter<int>("health_guard.pose_guard_frames", 3);
+        this->declare_parameter<int>("health_guard.no_effective_points_limit", 10);
 
         this->declare_parameter<string>("pcd2pgm.file_name", "map");
         this->declare_parameter<double>("pcd2pgm.thre_z_min", 0.2);
@@ -256,12 +272,18 @@ namespace robot::slam
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        int imu_init_sample_count = 600;
+        double imu_init_max_acc_variance = 0.5;
+        double imu_init_max_gyro_variance = 0.05;
+        this->get_parameter_or<int>("imu_init.sample_count", imu_init_sample_count, 600);
+        this->get_parameter_or<double>("imu_init.max_acc_variance", imu_init_max_acc_variance, 0.5);
+        this->get_parameter_or<double>("imu_init.max_gyro_variance", imu_init_max_gyro_variance, 0.05);
         this->get_parameter_or<bool>("gnss_fusion.enable", use_gnss_fusion_, false);
         this->get_parameter_or<double>("gnss_fusion.gain", gnss_fusion_gain_, 0.03);
-        this->get_parameter_or<double>("gnss_fusion.max_correction_step", gnss_max_correction_step_, 0.25);
-        this->get_parameter_or<double>("gnss_fusion.max_residual", gnss_max_residual_, 8.0);
-        this->get_parameter_or<double>("gnss_fusion.max_age", gnss_max_age_, 2.5);
-        this->get_parameter_or<double>("gnss_fusion.max_horizontal_std", gnss_max_horizontal_std_, 2.0);
+        this->get_parameter_or<double>("gnss_fusion.max_correction_step", gnss_max_correction_step_, 0.10);
+        this->get_parameter_or<double>("gnss_fusion.max_residual", gnss_max_residual_, 5.0);
+        this->get_parameter_or<double>("gnss_fusion.max_age", gnss_max_age_, 1.5);
+        this->get_parameter_or<double>("gnss_fusion.max_horizontal_std", gnss_max_horizontal_std_, 1.5);
         this->get_parameter_or<int>("gnss_fusion.min_status", gnss_min_status_, 0);
         this->get_parameter_or<bool>("gnss_fusion.use_elevation", gnss_use_elevation_, false);
         std::vector<double> gnss_lever_arm;
@@ -270,6 +292,21 @@ namespace robot::slam
         {
             gnss_lever_arm_base_ << gnss_lever_arm[0], gnss_lever_arm[1], gnss_lever_arm[2];
         }
+        this->get_parameter_or<int>("gnss_fusion.alignment_min_samples", gnss_alignment_min_samples_, 20);
+        this->get_parameter_or<double>("gnss_fusion.alignment_min_baseline", gnss_alignment_min_baseline_m_, 15.0);
+        this->get_parameter_or<double>("gnss_fusion.alignment_max_rms", gnss_alignment_max_rms_m_, 1.5);
+        double gnss_alignment_yaw_change_deg = 3.0;
+        this->get_parameter_or<double>("gnss_fusion.alignment_max_yaw_change_deg", gnss_alignment_yaw_change_deg, 3.0);
+        gnss_alignment_max_yaw_change_rad_ = gnss_alignment_yaw_change_deg * M_PI / 180.0;
+        this->get_parameter_or<int>("gnss_fusion.alignment_required_fits", gnss_alignment_required_fits_, 3);
+        this->get_parameter_or<double>("health_guard.max_frame_translation", health_max_frame_translation_m_, 1.5);
+        this->get_parameter_or<double>("health_guard.max_speed", health_max_speed_mps_, 3.0);
+        this->get_parameter_or<double>("health_guard.max_abs_z", health_max_abs_z_m_, 5.0);
+        this->get_parameter_or<double>("health_guard.max_frame_z", health_max_frame_z_m_, 1.0);
+        this->get_parameter_or<double>("health_guard.warn_speed", health_warn_speed_mps_, 1.8);
+        this->get_parameter_or<double>("health_guard.warn_abs_z", health_warn_abs_z_m_, 0.5);
+        this->get_parameter_or<int>("health_guard.pose_guard_frames", health_pose_guard_frames_, 3);
+        this->get_parameter_or<int>("health_guard.no_effective_points_limit", health_no_effective_limit_, 10);
 
 #ifdef ROOT_DIR
         data_path_ = std::string(ROOT_DIR) + "/map";
@@ -309,6 +346,7 @@ namespace robot::slam
         p_imu->set_acc_cov(Vec3d(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(Vec3d(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(Vec3d(b_acc_cov, b_acc_cov, b_acc_cov));
+        p_imu->set_init_requirements(imu_init_sample_count, imu_init_max_acc_variance, imu_init_max_gyro_variance);
 
         init();
         pcd2grid_ptr_ = std::make_shared<Pcd2Grid>(pcd2pgm_options_);
@@ -318,12 +356,10 @@ namespace robot::slam
 
         sub_imu_ptr_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
-        if (use_gnss_fusion_)
-        {
-            sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-                gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
-            RCLCPP_INFO(this->get_logger(), "GNSS weak fusion enabled, topic=%s, gain=%.3f", gnss_topic.c_str(), gnss_fusion_gain_);
-        }
+        sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+            gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "GNSS collection enabled on %s; pose correction=%s", gnss_topic.c_str(),
+            use_gnss_fusion_ ? "enabled after alignment lock" : "disabled");
         pubLaserCloudFull_      = this->create_publisher<sensor_msgs::msg::PointCloud2>("/world_points", rclcpp::QoS(20).best_effort());
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/body_points", 20);
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
@@ -394,6 +430,13 @@ namespace robot::slam
                 response->message = "Set ERROR State!!!!!!";
                 break;
             case 5:
+                if (slam_diverged_)
+                {
+                    response->success = false;
+                    response->message = "Map save rejected: SLAM_DIVERGED: " + slam_health_error_;
+                    RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
+                    break;
+                }
                 if (mapping_keyframes_.empty()
                     && (state_.load() != SlamState::STABLE || !recoverLatestKeyframeSession()))
                 {
@@ -456,6 +499,26 @@ namespace robot::slam
             gnss_origin_initialized_ = false;
             gnss_correction_count_ = 0;
         }
+        gnss_alignment_samples_.clear();
+        gnss_alignment_locked_ = false;
+        gnss_enu_to_map_yaw_ = 0.0;
+        gnss_enu_to_map_translation_.setZero();
+        gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
+        gnss_last_alignment_stamp_ = -1.0;
+        gnss_alignment_stable_fits_ = 0;
+        slam_diverged_ = false;
+        slam_health_state_ = "initializing";
+        slam_health_error_code_.clear();
+        slam_health_error_.clear();
+        slam_health_warning_.clear();
+        health_frame_delta_m_ = 0.0;
+        health_speed_mps_ = 0.0;
+        health_pose_z_m_ = 0.0;
+        no_effective_points_streak_ = 0;
+        pose_anomaly_streak_ = 0;
+        has_last_health_pose_ = false;
+        last_health_stamp_ = 0.0;
+        mapping_started_stamp_ = 0.0;
         mapping_keyframes_.clear();
         keyframe_write_queue_.clear();
         keyframe_writer_failed_ = false;
@@ -470,6 +533,7 @@ namespace robot::slam
         pcl_wait_save->clear();
         has_last_keyframe_ = false;
         last_keyframe_stamp_ = 0.0;
+        last_mapping_progress_stamp_ = 0.0;
 
         state_ikfom state_updated;
         state_updated.pos = Zero3d;
@@ -636,20 +700,144 @@ namespace robot::slam
         if (h_std > gnss_max_horizontal_std_)
             return false;
 
+        if (!gnss_origin_initialized_ || !gnss_alignment_locked_)
+            return false;
+
+        const Vec3d enu = llaToEnu(msg.latitude, msg.longitude, msg.altitude);
+        const double cosine = std::cos(gnss_enu_to_map_yaw_);
+        const double sine = std::sin(gnss_enu_to_map_yaw_);
+        map_pos(0) = cosine * enu(0) - sine * enu(1) + gnss_enu_to_map_translation_(0);
+        map_pos(1) = sine * enu(0) + cosine * enu(1) + gnss_enu_to_map_translation_(1);
+        map_pos(2) = enu(2) + gnss_map_offset_(2);
+        return true;
+    }
+
+    void MappingAlg::collectGnssAlignment(double lidar_time)
+    {
+        if (!flg_EKF_inited || slam_diverged_)
+            return;
+
+        sensor_msgs::msg::NavSatFix gnss;
+        {
+            std::lock_guard<std::mutex> lock(gnss_mutex_);
+            if (!has_gnss_)
+                return;
+            gnss = latest_gnss_;
+        }
+        const double gnss_time = get_time_sec(gnss.header.stamp);
+        if (gnss_time <= gnss_last_alignment_stamp_ + 1e-6 || std::fabs(lidar_time - gnss_time) > gnss_max_age_)
+            return;
+        if (gnss.status.status < gnss_min_status_ || std::fabs(gnss.latitude) < 1e-7 || std::fabs(gnss.longitude) < 1e-7)
+            return;
+        const double h_std = std::sqrt(std::max(0.0,
+            std::max(gnss.position_covariance[0], gnss.position_covariance[4])));
+        if (!std::isfinite(h_std) || h_std > gnss_max_horizontal_std_)
+            return;
+
         if (!gnss_origin_initialized_)
         {
-            gnss_origin_lat_         = msg.latitude;
-            gnss_origin_lon_         = msg.longitude;
-            gnss_origin_alt_         = msg.altitude;
-            const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
-            gnss_map_offset_         = estimated_gps;
+            gnss_origin_lat_ = gnss.latitude;
+            gnss_origin_lon_ = gnss.longitude;
+            gnss_origin_alt_ = gnss.altitude;
             gnss_origin_initialized_ = true;
-            RCLCPP_INFO(this->get_logger(), "GNSS origin initialized lat=%.9f lon=%.9f alt=%.3f", gnss_origin_lat_, gnss_origin_lon_,
-                gnss_origin_alt_);
+            RCLCPP_INFO(get_logger(), "GNSS origin collected lat=%.9f lon=%.9f alt=%.3f; waiting for ENU-map alignment",
+                gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_);
         }
 
-        map_pos = llaToEnu(msg.latitude, msg.longitude, msg.altitude) + gnss_map_offset_;
-        return true;
+        const Vec3d enu = llaToEnu(gnss.latitude, gnss.longitude, gnss.altitude);
+        const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
+        gnss_alignment_samples_.push_back({ enu.head<2>(), estimated_gps.head<2>(), gnss_time });
+        gnss_last_alignment_stamp_ = gnss_time;
+        while (gnss_alignment_samples_.size() > gnss_alignment_max_samples_)
+            gnss_alignment_samples_.pop_front();
+        estimateGnssAlignment();
+    }
+
+    bool MappingAlg::estimateGnssAlignment()
+    {
+        if (gnss_alignment_samples_.size() < static_cast<std::size_t>(gnss_alignment_min_samples_))
+            return false;
+
+        double baseline = 0.0;
+        for (const auto& sample : gnss_alignment_samples_)
+            baseline = std::max(baseline, (sample.enu - gnss_alignment_samples_.front().enu).norm());
+        if (baseline < gnss_alignment_min_baseline_m_)
+            return false;
+
+        auto solve = [](const std::vector<const GnssAlignmentSample*>& samples,
+                         Eigen::Matrix2d& rotation, Eigen::Vector2d& translation) {
+            Eigen::Vector2d enu_mean = Eigen::Vector2d::Zero();
+            Eigen::Vector2d map_mean = Eigen::Vector2d::Zero();
+            for (const auto* sample : samples)
+            {
+                enu_mean += sample->enu;
+                map_mean += sample->map;
+            }
+            enu_mean /= static_cast<double>(samples.size());
+            map_mean /= static_cast<double>(samples.size());
+            Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+            for (const auto* sample : samples)
+                covariance += (sample->enu - enu_mean) * (sample->map - map_mean).transpose();
+            Eigen::JacobiSVD<Eigen::Matrix2d> svd(covariance, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            rotation = svd.matrixV() * svd.matrixU().transpose();
+            if (rotation.determinant() < 0.0)
+            {
+                Eigen::Matrix2d fix = Eigen::Matrix2d::Identity();
+                fix(1, 1) = -1.0;
+                rotation = svd.matrixV() * fix * svd.matrixU().transpose();
+            }
+            translation = map_mean - rotation * enu_mean;
+        };
+
+        std::vector<const GnssAlignmentSample*> all;
+        all.reserve(gnss_alignment_samples_.size());
+        for (const auto& sample : gnss_alignment_samples_)
+            all.push_back(&sample);
+        Eigen::Matrix2d rotation;
+        Eigen::Vector2d translation;
+        solve(all, rotation, translation);
+
+        std::vector<double> residuals;
+        residuals.reserve(all.size());
+        for (const auto* sample : all)
+            residuals.push_back((rotation * sample->enu + translation - sample->map).norm());
+        auto median_values = residuals;
+        const auto middle = median_values.begin() + median_values.size() / 2;
+        std::nth_element(median_values.begin(), middle, median_values.end());
+        const double outlier_limit = std::max(0.5, 3.0 * *middle);
+        std::vector<const GnssAlignmentSample*> inliers;
+        for (std::size_t index = 0; index < all.size(); ++index)
+            if (residuals[index] <= outlier_limit)
+                inliers.push_back(all[index]);
+        if (inliers.size() < static_cast<std::size_t>(gnss_alignment_min_samples_))
+            return false;
+        solve(inliers, rotation, translation);
+
+        double squared_error = 0.0;
+        for (const auto* sample : inliers)
+            squared_error += (rotation * sample->enu + translation - sample->map).squaredNorm();
+        const double rms = std::sqrt(squared_error / static_cast<double>(inliers.size()));
+        const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+        const double yaw_delta = std::fabs(std::atan2(std::sin(yaw - gnss_last_candidate_yaw_),
+            std::cos(yaw - gnss_last_candidate_yaw_)));
+        if (rms <= gnss_alignment_max_rms_m_)
+            gnss_alignment_stable_fits_ = gnss_alignment_stable_fits_ == 0 || yaw_delta <= gnss_alignment_max_yaw_change_rad_
+                ? gnss_alignment_stable_fits_ + 1 : 1;
+        else
+            gnss_alignment_stable_fits_ = 0;
+        gnss_last_candidate_yaw_ = yaw;
+        gnss_alignment_rms_ = rms;
+
+        if (!gnss_alignment_locked_ && gnss_alignment_stable_fits_ >= gnss_alignment_required_fits_)
+        {
+            gnss_alignment_locked_ = true;
+            gnss_enu_to_map_yaw_ = yaw;
+            gnss_enu_to_map_translation_ = translation;
+            gnss_map_offset_ << translation(0), translation(1), 0.0;
+            RCLCPP_INFO(get_logger(), "GNSS ENU-map alignment locked: yaw=%.2fdeg offset=[%.2f, %.2f] rms=%.2fm samples=%zu",
+                yaw * 180.0 / M_PI, translation(0), translation(1), rms, inliers.size());
+        }
+        return gnss_alignment_locked_;
     }
 
     void MappingAlg::applyGnssCorrection(double lidar_time)
@@ -703,6 +891,125 @@ namespace robot::slam
         gnss_correction_count_++;
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "GNSS weak correction #%d residual=%.2fm step=%.3fm", gnss_correction_count_, residual_norm, correction.norm());
+    }
+
+    void MappingAlg::markSlamDiverged(const std::string& reason)
+    {
+        if (slam_diverged_)
+            return;
+        slam_diverged_ = true;
+        slam_health_state_ = "diverged";
+        slam_health_error_code_ = "SLAM_DIVERGED";
+        slam_health_error_ = reason;
+        state_.store(SlamState::ERROR);
+        writeSaveProgress("failed", 0.0, reason);
+        RCLCPP_ERROR(get_logger(), "SLAM_DIVERGED: %s; keyframe recording and map export disabled", reason.c_str());
+    }
+
+    void MappingAlg::updateSlamHealth(double lidar_time)
+    {
+        if (slam_diverged_)
+            return;
+        if (!p_imu->initialization_ready())
+        {
+            slam_health_state_ = "initializing";
+            return;
+        }
+        if (!state_point.pos.allFinite())
+        {
+            markSlamDiverged("pose contains non-finite values");
+            return;
+        }
+        if (mapping_started_stamp_ <= 0.0)
+            mapping_started_stamp_ = lidar_time;
+
+        no_effective_points_streak_ = effct_feat_num < 1 ? no_effective_points_streak_ + 1 : 0;
+        if (no_effective_points_streak_ >= health_no_effective_limit_)
+        {
+            slam_health_state_ = "degraded";
+            slam_health_warning_ = "scan matching produced no effective points for "
+                + std::to_string(no_effective_points_streak_) + " consecutive scans";
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
+            return;
+        }
+
+        health_pose_z_m_ = state_point.pos(2);
+        bool hard_anomaly = false;
+        if (has_last_health_pose_)
+        {
+            const double dt = lidar_time - last_health_stamp_;
+            const Vec3d delta = state_point.pos - last_health_position_;
+            const double speed = dt > 1e-3 ? delta.norm() / dt : 0.0;
+            health_frame_delta_m_ = delta.norm();
+            health_speed_mps_ = speed;
+            hard_anomaly = delta.norm() > health_max_frame_translation_m_
+                || std::fabs(delta(2)) > health_max_frame_z_m_
+                || speed > health_max_speed_mps_;
+            pose_anomaly_streak_ = hard_anomaly ? pose_anomaly_streak_ + 1 : 0;
+            if (hard_anomaly)
+            {
+                std::ostringstream reason;
+                reason << "pose anomaly detected: frame_delta=" << delta.norm() << "m speed=" << speed
+                       << "m/s z=" << state_point.pos(2) << "m";
+                slam_health_state_ = "degraded";
+                slam_health_warning_ = reason.str();
+                last_health_position_ = state_point.pos;
+                last_health_stamp_ = lidar_time;
+                has_last_health_pose_ = true;
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
+                return;
+            }
+        }
+        has_last_health_pose_ = true;
+        last_health_position_ = state_point.pos;
+        last_health_stamp_ = lidar_time;
+        slam_health_warning_.clear();
+        if (hard_anomaly || health_speed_mps_ > health_warn_speed_mps_)
+        {
+            slam_health_state_ = "degraded";
+            std::ostringstream warning;
+            warning << "pose speed warning: " << health_speed_mps_ << "m/s";
+            slam_health_warning_ = warning.str();
+        }
+        else if (health_warn_abs_z_m_ > 0.0 && std::fabs(health_pose_z_m_) > health_warn_abs_z_m_)
+        {
+            slam_health_state_ = "degraded";
+            std::ostringstream warning;
+            warning << "pose height drift warning: z=" << health_pose_z_m_ << "m";
+            slam_health_warning_ = warning.str();
+        }
+        else if (no_effective_points_streak_ >= std::max(2, health_no_effective_limit_ / 3))
+        {
+            slam_health_state_ = "degraded";
+            slam_health_warning_ = "scan matching effective points are intermittently missing";
+        }
+        else
+        {
+            slam_health_state_ = "healthy";
+        }
+    }
+
+    bool MappingAlg::validateMappingSession(std::string& reason) const
+    {
+        if (slam_diverged_)
+        {
+            reason = slam_health_error_.empty() ? "SLAM divergence detected" : slam_health_error_;
+            return false;
+        }
+        if (mapping_keyframes_.empty())
+        {
+            reason = "no persistent keyframes available";
+            return false;
+        }
+        for (const auto& keyframe : mapping_keyframes_)
+        {
+            if (!keyframe.lidar_origin.allFinite())
+            {
+                reason = "keyframe trajectory contains invalid pose";
+                return false;
+            }
+        }
+        return true;
     }
 
     void MappingAlg::imuCallBack(const sensor_msgs::msg::Imu::UniquePtr msg_in)
@@ -862,7 +1169,7 @@ namespace robot::slam
 
     void MappingAlg::recordKeyframe(const CloudPtr& cloud_world)
     {
-        if (!keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
+        if (slam_diverged_ || !keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
             return;
         const Vec3d lidar_origin = state_point.rot * state_point.offset_T_L_I + state_point.pos;
         const auto rotation = state_point.rot.toRotationMatrix();
@@ -1410,6 +1717,16 @@ namespace robot::slam
                 state_point = kf.get_x();
                 pos_lid     = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
+                if (last_mapping_progress_stamp_ <= 0.0
+                    || Measures.lidar_end_time - last_mapping_progress_stamp_ >= 1.0)
+                {
+                    const char* stage = !p_imu->initialization_ready()
+                        ? "initializing_imu"
+                        : (mapping_keyframes_.empty() ? "waiting_first_keyframe" : "mapping");
+                    writeSaveProgress(stage, 0.0);
+                    last_mapping_progress_stamp_ = Measures.lidar_end_time;
+                }
+
                 if (feats_undistort->empty())
                 {
                     RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
@@ -1464,8 +1781,12 @@ namespace robot::slam
                 double solve_H_time = 0;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
+                collectGnssAlignment(Measures.lidar_end_time);
                 applyGnssCorrection(Measures.lidar_end_time);
                 state_point = kf.get_x();
+                updateSlamHealth(Measures.lidar_end_time);
+                if (slam_diverged_)
+                    return;
                 euler_cur   = SO3ToEuler(state_point.rot);
                 pos_lid     = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 geoQuat.x   = state_point.rot.coeffs()[0];
@@ -1768,13 +2089,20 @@ namespace robot::slam
                 keyframe_writer_error_ = "cannot create gnss_origin.yaml";
                 return false;
             }
-            meta << "rtk_enabled: true\n";
+            meta << "rtk_enabled: " << (gnss_alignment_locked_ ? "true" : "false") << "\n";
             meta << "datum: CGCS2000\n";
             meta << std::fixed << std::setprecision(10);
             meta << "origin_latitude: " << gnss_origin_lat_ << "\n";
             meta << "origin_longitude: " << gnss_origin_lon_ << "\n";
             meta << std::setprecision(4);
             meta << "origin_altitude: " << gnss_origin_alt_ << "\n";
+            meta << "alignment_locked: " << (gnss_alignment_locked_ ? 1 : 0) << "\n";
+            meta << "enu_to_map_yaw: " << gnss_enu_to_map_yaw_ << "\n";
+            meta << "alignment_rms: " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0) << "\n";
+            meta << "alignment_samples: " << gnss_alignment_samples_.size() << "\n";
+            meta << "map_offset_x: " << gnss_map_offset_(0) << "\n";
+            meta << "map_offset_y: " << gnss_map_offset_(1) << "\n";
+            meta << "map_offset_z: " << gnss_map_offset_(2) << "\n";
             meta << "map_offset:\n";
             meta << "  x: " << gnss_map_offset_(0) << "\n";
             meta << "  y: " << gnss_map_offset_(1) << "\n";
@@ -1836,9 +2164,25 @@ namespace robot::slam
                << ", \"status\": " << latest.rtk_status
                << ", \"horizontal_std\": " << latest.rtk_horizontal_std
                << ", \"age_seconds\": " << latest.rtk_age_seconds << "},\n"
+               << "  \"rtk_alignment\": {\"locked\": " << (gnss_alignment_locked_ ? "true" : "false")
+               << ", \"samples\": " << gnss_alignment_samples_.size()
+               << ", \"rms\": " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0)
+               << ", \"yaw_deg\": " << gnss_enu_to_map_yaw_ * 180.0 / M_PI
+               << ", \"fusion_enabled\": " << (use_gnss_fusion_ ? "true" : "false") << "},\n"
+               << "  \"slam_health\": {\"state\": \"" << jsonEscape(slam_health_state_)
+               << "\", \"imu_initialized\": " << (p_imu->initialization_ready() ? "true" : "false")
+               << ", \"imu_samples\": " << p_imu->initialization_samples()
+               << ", \"imu_required_samples\": " << p_imu->initialization_required_samples()
+               << ", \"no_effective_points_streak\": " << no_effective_points_streak_
+               << ", \"pose_anomaly_streak\": " << pose_anomaly_streak_
+               << ", \"frame_delta_m\": " << health_frame_delta_m_
+               << ", \"speed_mps\": " << health_speed_mps_
+               << ", \"pose_z_m\": " << health_pose_z_m_
+               << ", \"warning\": \"" << jsonEscape(slam_health_warning_) << "\"},\n"
                << "  \"updated_at_unix\": " << std::time(nullptr) << ",\n"
                << "  \"recoverable\": "
-               << (written_keyframes > 0 && stage != "completed" ? "true" : "false") << ",\n"
+               << (written_keyframes > 0 && stage != "completed" && !slam_diverged_ ? "true" : "false") << ",\n"
+               << "  \"error_code\": \"" << jsonEscape(slam_health_error_code_) << "\",\n"
                << "  \"error\": \"" << jsonEscape(error) << "\"\n"
                << "}\n";
         output.close();
@@ -1852,9 +2196,14 @@ namespace robot::slam
     {
         if (map_export_completed_)
             return true;
-        if (mapping_keyframes_.empty() || active_map_subdir_.empty())
+        std::string validation_error;
+        if (active_map_subdir_.empty() || !validateMappingSession(validation_error))
         {
-            RCLCPP_ERROR(get_logger(), "Map export failed: no persistent keyframes available");
+            keyframe_writer_error_ = validation_error.empty() ? "mapping session is invalid" : validation_error;
+            if (slam_health_error_code_.empty())
+                slam_health_error_code_ = "MAP_SANITY_CHECK_FAILED";
+            writeSaveProgress("failed", 0.0, keyframe_writer_error_);
+            RCLCPP_ERROR(get_logger(), "Map export rejected: %s", keyframe_writer_error_.c_str());
             return false;
         }
 

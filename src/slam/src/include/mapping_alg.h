@@ -16,6 +16,7 @@
 #include "so3_math.h"
 
 #include <Eigen/Core>
+#include <Eigen/SVD>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -102,6 +103,13 @@ namespace robot::slam
         CloudPtr        cloud_world;
     };
 
+    struct GnssAlignmentSample
+    {
+        Eigen::Vector2d enu = Eigen::Vector2d::Zero();
+        Eigen::Vector2d map = Eigen::Vector2d::Zero();
+        double stamp = 0.0;
+    };
+
     class MappingAlg : public rclcpp::Node
     {
     public:
@@ -176,9 +184,19 @@ namespace robot::slam
 
         void applyGnssCorrection(double lidar_time);
 
+        void collectGnssAlignment(double lidar_time);
+
+        bool estimateGnssAlignment();
+
         bool gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos);
 
         Vec3d llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const;
+
+        void updateSlamHealth(double lidar_time);
+
+        void markSlamDiverged(const std::string& reason);
+
+        bool validateMappingSession(std::string& reason) const;
 
         void h_share_model(state_ikfom& s, esekfom::dyn_share_datastruct<double>& ekfom_data);
 
@@ -259,13 +277,49 @@ namespace robot::slam
         Vec3d                              gnss_lever_arm_base_ = Zero3d;
         bool                               use_gnss_fusion_ = false;
         double                             gnss_fusion_gain_ = 0.03;
-        double                             gnss_max_correction_step_ = 0.25;
-        double                             gnss_max_residual_ = 8.0;
-        double                             gnss_max_age_ = 2.5;
-        double                             gnss_max_horizontal_std_ = 2.0;
+        double                             gnss_max_correction_step_ = 0.10;
+        double                             gnss_max_residual_ = 5.0;
+        double                             gnss_max_age_ = 1.5;
+        double                             gnss_max_horizontal_std_ = 1.5;
         int                                gnss_min_status_ = 0;
         bool                               gnss_use_elevation_ = false;
         int                                gnss_correction_count_ = 0;
+        std::deque<GnssAlignmentSample>    gnss_alignment_samples_;
+        bool                               gnss_alignment_locked_ = false;
+        double                             gnss_enu_to_map_yaw_ = 0.0;
+        Eigen::Vector2d                    gnss_enu_to_map_translation_ = Eigen::Vector2d::Zero();
+        double                             gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
+        double                             gnss_last_alignment_stamp_ = -1.0;
+        double                             gnss_last_candidate_yaw_ = 0.0;
+        int                                gnss_alignment_stable_fits_ = 0;
+        int                                gnss_alignment_min_samples_ = 20;
+        int                                gnss_alignment_required_fits_ = 3;
+        double                             gnss_alignment_min_baseline_m_ = 15.0;
+        double                             gnss_alignment_max_rms_m_ = 1.5;
+        double                             gnss_alignment_max_yaw_change_rad_ = 3.0 * M_PI / 180.0;
+        std::size_t                        gnss_alignment_max_samples_ = 300;
+        bool                               slam_diverged_ = false;
+        std::string                        slam_health_state_ = "initializing";
+        std::string                        slam_health_error_code_;
+        std::string                        slam_health_error_;
+        std::string                        slam_health_warning_;
+        int                                no_effective_points_streak_ = 0;
+        int                                pose_anomaly_streak_ = 0;
+        bool                               has_last_health_pose_ = false;
+        Vec3d                              last_health_position_ = Zero3d;
+        double                             last_health_stamp_ = 0.0;
+        double                             mapping_started_stamp_ = 0.0;
+        double                             health_max_frame_translation_m_ = 1.5;
+        double                             health_max_speed_mps_ = 3.0;
+        double                             health_max_abs_z_m_ = 5.0;
+        double                             health_max_frame_z_m_ = 1.0;
+        double                             health_warn_speed_mps_ = 1.8;
+        double                             health_warn_abs_z_m_ = 0.5;
+        double                             health_frame_delta_m_ = 0.0;
+        double                             health_speed_mps_ = 0.0;
+        double                             health_pose_z_m_ = 0.0;
+        int                                health_pose_guard_frames_ = 3;
+        int                                health_no_effective_limit_ = 10;
         bool                               dynamic_filter_enable_ = false;
         double                             dynamic_filter_voxel_size_ = 0.20;
         int                                dynamic_filter_min_scan_observations_ = 1;
@@ -296,6 +350,7 @@ namespace robot::slam
         double                             last_keyframe_yaw_ = 0.0;
         double                             last_keyframe_stamp_ = 0.0;
         bool                               has_last_keyframe_ = false;
+        double                             last_mapping_progress_stamp_ = 0.0;
 
         CloudPtr featsFromMap     = CloudPtr(new PointCloudType());
         CloudPtr feats_undistort  = CloudPtr(new PointCloudType());

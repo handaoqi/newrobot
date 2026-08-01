@@ -14,7 +14,9 @@
 
 #include "navigo_collision_monitor/collision_monitor_node.hpp"
 
+#include <algorithm>
 #include <exception>
+#include <cmath>
 #include <utility>
 #include <functional>
 
@@ -30,7 +32,9 @@ namespace navigo_collision_monitor
 CollisionMonitor::CollisionMonitor(const rclcpp::NodeOptions & options)
 : navigo_util::LifecycleNode("collision_monitor", "", options),
   process_active_(false), robot_action_prev_{DO_NOTHING, {-1.0, -1.0, -1.0}},
-  stop_stamp_{0, 0, get_clock()->get_clock_type()}, stop_pub_timeout_(1.0, 0.0)
+  stop_stamp_{0, 0, get_clock()->get_clock_type()}, stop_pub_timeout_(1.0, 0.0),
+  stop_confirmation_cycles_(1), stop_detection_count_(0),
+  allow_rotation_recovery_(false), allow_reverse_recovery_(false)
 {
 }
 
@@ -106,6 +110,7 @@ CollisionMonitor::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 
   // Reset action type to default after worker deactivating
   robot_action_prev_ = {DO_NOTHING, {-1.0, -1.0, -1.0}};
+  stop_detection_count_ = 0;
 
   // Deactivating polygons
   for (std::shared_ptr<Polygon> polygon : polygons_) {
@@ -220,6 +225,17 @@ bool CollisionMonitor::getParameters(
     node, "stop_pub_timeout", rclcpp::ParameterValue(1.0));
   stop_pub_timeout_ =
     rclcpp::Duration::from_seconds(get_parameter("stop_pub_timeout").as_double());
+
+  navigo_util::declare_parameter_if_not_declared(
+    node, "stop_confirmation_cycles", rclcpp::ParameterValue(1));
+  stop_confirmation_cycles_ =
+    std::max(1, static_cast<int>(get_parameter("stop_confirmation_cycles").as_int()));
+  navigo_util::declare_parameter_if_not_declared(
+    node, "allow_rotation_recovery", rclcpp::ParameterValue(false));
+  allow_rotation_recovery_ = get_parameter("allow_rotation_recovery").as_bool();
+  navigo_util::declare_parameter_if_not_declared(
+    node, "allow_reverse_recovery", rclcpp::ParameterValue(false));
+  allow_reverse_recovery_ = get_parameter("allow_reverse_recovery").as_bool();
 
   if (!configurePolygons(base_frame_id, transform_tolerance)) {
     return false;
@@ -386,6 +402,30 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
         action_polygon = polygon;
       }
     }
+  }
+
+  if (robot_action.action_type == STOP) {
+    const bool pure_rotation =
+      std::abs(cmd_vel_in.x) < 0.02 && std::abs(cmd_vel_in.y) < 0.02 &&
+      std::abs(cmd_vel_in.tw) > 0.01;
+    const bool reversing = cmd_vel_in.x < -0.01;
+
+    if ((allow_rotation_recovery_ && pure_rotation) ||
+      (allow_reverse_recovery_ && reversing))
+    {
+      // This stop polygon is in front. Permit commands that increase clearance.
+      robot_action = {DO_NOTHING, cmd_vel_in};
+      action_polygon.reset();
+      stop_detection_count_ = 0;
+    } else {
+      ++stop_detection_count_;
+      if (stop_detection_count_ < stop_confirmation_cycles_) {
+        robot_action = {DO_NOTHING, cmd_vel_in};
+        action_polygon.reset();
+      }
+    }
+  } else {
+    stop_detection_count_ = 0;
   }
 
   if (robot_action.action_type != robot_action_prev_.action_type) {

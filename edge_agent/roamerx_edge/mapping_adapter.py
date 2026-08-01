@@ -88,6 +88,7 @@ class MappingAdapter:
             updated_at=now_iso(),
         )
         self.map_dir.mkdir(parents=True, exist_ok=True)
+        self._stop_conflicting_navigation_stack()
         self._ensure_slam_process()
         self._call_map_state(self.config.start_data)
         self._set_state("mapping")
@@ -146,9 +147,30 @@ class MappingAdapter:
         return self._save_active_mapping(command)
 
     def _save_active_mapping(self, command: dict) -> dict:
+        progress_dir = self._find_latest_progress_dir()
+        progress = self._read_save_progress(progress_dir)
+        readiness = self._mapping_readiness(progress, self._any_slam_process_alive)
+        if not readiness["ready_for_save"]:
+            self._set_state("mapping" if self._any_slam_process_alive else "failed")
+            raise ProtocolError("MAPPING_NOT_READY", readiness["message"])
+
         self._set_state("saving")
         save_started_at = time.time()
-        self._call_map_state(self.config.save_data)
+        try:
+            self._call_map_state(self.config.save_data)
+        except ProtocolError:
+            self._set_state("mapping" if self._any_slam_process_alive else "failed")
+            progress_dir = self._find_latest_progress_dir()
+            progress = self._read_save_progress(progress_dir)
+            if (
+                progress_dir
+                and (
+                    progress.get("error_code") == "SLAM_DIVERGED"
+                    or progress.get("slam_health", {}).get("state") == "diverged"
+                )
+            ):
+                return self._rescue_diverged_mapping(command, progress_dir)
+            raise
         # SLAM writes yaml/pgm asynchronously after the save service returns.
         # Wait for an output touched after this save command instead of falling
         # back to an older complete map directory.
@@ -166,6 +188,42 @@ class MappingAdapter:
         result["upload_result"] = upload_result
         return result
 
+    def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:
+        self._set_state("recovering")
+        self._stop_slam_process()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = self.map_dir / f"{stamp}_{int(time.time_ns() / 1_000_000) % 1000:03d}"
+        script = Path(__file__).resolve().parents[2] / "script" / "robot" / "rescue_diverged_map.py"
+        completed = subprocess.run(
+            [str(script), str(source_dir), "--output", str(output_dir)],
+            capture_output=True,
+            text=True,
+            timeout=max(900, self.config.command_timeout_seconds),
+        )
+        if completed.returncode != 0:
+            raise ProtocolError(
+                "MAPPING_RESCUE_FAILED",
+                (completed.stderr or completed.stdout or "diverged map rescue failed").strip(),
+            )
+        rescue_command = dict(command)
+        rescue_command["map_name"] = (
+            f"{self.session.map_name}-发散救援" if self.session and self.session.map_name else f"{source_dir.name}-发散救援"
+        )
+        self._set_state("packaging")
+        package_path, metadata = self._package_map(rescue_command, output_dir)
+        self._set_state("uploading")
+        upload_result = self.media_client.upload_map_package(str(package_path), metadata)
+        self._set_state("exited")
+        result = self.status()
+        result.update(
+            rescued=True,
+            rescue_source_dir=str(source_dir),
+            rescue_output_dir=str(output_dir),
+            package_path=str(package_path),
+            upload_result=upload_result,
+        )
+        return result
+
     def cancel_mapping(self, command: dict) -> dict:
         progress_dir = self._find_latest_progress_dir()
         if self.session:
@@ -175,42 +233,119 @@ class MappingAdapter:
         return self.status()
 
     def status(self) -> dict:
+        process_alive = self._any_slam_process_alive
         complete_session_dir = self._find_latest_session_dir(require_complete=True)
         progress_session_dir = self._find_latest_progress_dir()
         latest_session_dir = (
             progress_session_dir
-            if self._any_slam_process_alive and progress_session_dir
+            if process_alive and progress_session_dir
             else complete_session_dir or progress_session_dir
         )
         progress = self._read_save_progress(latest_session_dir)
+        readiness = self._mapping_readiness(progress, process_alive)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
         if not self.session:
+            progress_stage = str(progress.get("stage") or "")
+            save_stages = {
+                "recovering",
+                "flushing_keyframes",
+                "filtering",
+                "partitioning_filter",
+                "writing_pcd",
+                "building_grid",
+                "writing_metadata",
+            }
+            recovered_state = "saving" if progress_stage in save_stages else ("mapping" if process_alive else "idle")
             return {
-                "state": "idle",
+                "state": recovered_state,
                 "map_dir": str(self.map_dir),
                 "active_map_dir": str(latest_session_dir or self.map_dir),
                 "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
-                "process_alive": self._any_slam_process_alive,
+                "process_alive": process_alive,
                 "slam_pids": self._find_slam_process_pids(),
                 "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
                 "save_progress": progress,
+                "readiness": readiness,
+                "ready_for_motion": readiness["ready_for_motion"],
+                "ready_for_save": readiness["ready_for_save"],
                 "files": files,
             }
+        state = self.session.state
+        if (
+            progress.get("error_code") == "SLAM_DIVERGED"
+            or progress.get("slam_health", {}).get("state") == "diverged"
+        ) and state in {"starting", "mapping", "saving"}:
+            state = "failed"
         return {
             "mapping_session_id": self.session.session_id,
             "map_name": self.session.map_name,
             "route_hint": self.session.route_hint,
-            "state": self.session.state,
+            "state": state,
             "started_at": self.session.started_at,
             "updated_at": self.session.updated_at,
             "map_dir": str(self.map_dir),
             "active_map_dir": str(latest_session_dir or self.map_dir),
             "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
-            "process_alive": self._any_slam_process_alive,
+            "process_alive": process_alive,
             "slam_pids": self._find_slam_process_pids(),
             "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
             "save_progress": progress,
+            "readiness": readiness,
+            "ready_for_motion": readiness["ready_for_motion"],
+            "ready_for_save": readiness["ready_for_save"],
             "files": files,
+        }
+
+    @staticmethod
+    def _mapping_readiness(progress: dict, process_alive: bool) -> dict:
+        health = progress.get("slam_health") or {}
+        stage = str(progress.get("stage") or "")
+        health_state = str(health.get("state") or "unknown")
+        imu_initialized = bool(health.get("imu_initialized"))
+        keyframe_count = max(
+            int(progress.get("keyframe_count") or 0),
+            int(progress.get("written_keyframes") or 0),
+        )
+        updated_at = float(progress.get("updated_at_unix") or 0)
+        sample_age_seconds = max(0.0, time.time() - updated_at) if updated_at > 0 else None
+        diverged = progress.get("error_code") == "SLAM_DIVERGED" or health_state == "diverged"
+
+        if diverged:
+            state = "diverged"
+            message = str(progress.get("error") or health.get("warning") or "SLAM 已发散，请停止并处理地图")
+        elif not process_alive:
+            state = "offline"
+            message = "建图进程未运行"
+        elif sample_age_seconds is not None and sample_age_seconds > 5.0:
+            state = "telemetry_stale"
+            message = "超过 5 秒没有收到雷达/IMU 建图状态，请勿移动机器狗"
+        elif not progress:
+            state = "starting"
+            message = "正在启动 SLAM，等待雷达和 IMU 数据"
+        elif not imu_initialized or stage == "initializing_imu":
+            state = "imu_initializing"
+            samples = int(health.get("imu_samples") or 0)
+            required = int(health.get("imu_required_samples") or 0)
+            suffix = f"（{samples}/{required}）" if required else f"（已采样 {samples}）"
+            message = f"IMU 初始化中{suffix}，请保持机器狗静止"
+        elif keyframe_count < 1 or stage == "waiting_first_keyframe":
+            state = "waiting_first_keyframe"
+            message = "IMU 已初始化，正在建立首个有效关键帧，请继续保持静止"
+        else:
+            state = "ready"
+            message = "传感器和首个关键帧正常，可以开始移动建图"
+
+        return {
+            "state": state,
+            "message": message,
+            "process_alive": process_alive,
+            "imu_initialized": imu_initialized,
+            "imu_samples": int(health.get("imu_samples") or 0),
+            "imu_required_samples": int(health.get("imu_required_samples") or 0),
+            "keyframe_count": keyframe_count,
+            "sample_age_seconds": sample_age_seconds,
+            "ready_for_motion": state == "ready",
+            "ready_for_save": keyframe_count > 0 or diverged,
         }
 
     def _cleanup(self) -> None:
@@ -241,6 +376,24 @@ class MappingAdapter:
             raise ProtocolError(
                 "MAPPING_SLAM_START_FAILED",
                 f"SLAM process exited during startup with code {return_code}; log={self._slam_log_path}",
+            )
+
+    def _stop_conflicting_navigation_stack(self) -> None:
+        """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
+        command = (
+            'script="$HOME/genisom_roamerx_open/script/robot/start_navigation_real.sh"; '
+            'if [ -x "$script" ]; then "$script" full-stop; fi'
+        )
+        result = subprocess.run(
+            ["bash", "-lc", command],
+            capture_output=True,
+            text=True,
+            timeout=max(15, self.config.command_timeout_seconds),
+        )
+        if result.returncode != 0:
+            raise ProtocolError(
+                "MAPPING_STACK_STOP_FAILED",
+                (result.stderr or result.stdout or "failed to stop navigation/localization").strip(),
             )
 
     def _call_map_state(self, data: int) -> str:
@@ -308,6 +461,8 @@ class MappingAdapter:
             if (
                 progress.get("recoverable") is True
                 and progress.get("stage") != "completed"
+                and progress.get("error_code") != "SLAM_DIVERGED"
+                and progress.get("slam_health", {}).get("state") != "diverged"
                 and (entry / "keyframes" / "keyframes.csv").exists()
                 and not self._has_required_files(entry)
             ):
@@ -386,6 +541,19 @@ class MappingAdapter:
 
     def _validate_map_files(self, work_dir: Path | None = None) -> None:
         base = work_dir or self.map_dir
+        progress = self._read_save_progress(base)
+        error_code = str(progress.get("error_code") or "")
+        health_state = str(progress.get("slam_health", {}).get("state") or "")
+        if error_code == "SLAM_DIVERGED" or health_state == "diverged":
+            raise ProtocolError(
+                "SLAM_DIVERGED",
+                str(progress.get("error") or "SLAM health guard rejected this map"),
+            )
+        if progress and progress.get("stage") == "failed":
+            raise ProtocolError(
+                error_code or "MAPPING_SAVE_FAILED",
+                str(progress.get("error") or "SLAM map export failed"),
+            )
         missing = self._missing_required_files(base)
         if missing:
             raise ProtocolError("MAPPING_FILES_MISSING", f"missing map files: {', '.join(missing)}")
@@ -424,7 +592,20 @@ class MappingAdapter:
         base = work_dir or self.map_dir
         if not self._is_session_dir(base):
             raise ProtocolError("INVALID_MAP_OUTPUT_DIR", f"refusing to package non-session map dir: {base}")
-        filtered_base, dynamic_filter_result = self._filter_map_outputs(base)
+        progress = self._read_save_progress(base)
+        rescue_metadata = progress.get("rescue") or {}
+        is_rescue = bool(rescue_metadata)
+        if is_rescue:
+            # Rescue output is already rebuilt from the valid keyframe prefix
+            # and intentionally does not copy every source scan file.
+            filtered_base = base
+            dynamic_filter_result = {
+                "enabled": False,
+                "skipped": "rescued_map_already_rebuilt",
+                "source": str(base),
+            }
+        else:
+            filtered_base, dynamic_filter_result = self._filter_map_outputs(base)
         preview_path = self._generate_map_preview(filtered_base)
         version = time.strftime("%Y%m%d-%H%M%S")
         package_path = self.map_dir / f"map_package_{version}.zip"
@@ -440,9 +621,10 @@ class MappingAdapter:
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
-        # Navigation reads the stable files in map_dir. Point them at the
-        # filtered output so the uploaded and locally navigated maps match.
-        self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
+        # A rescue map must be inspected before it can replace the active
+        # navigation map. Normal saves retain the existing auto-activation flow.
+        if not is_rescue:
+            self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
         metadata = {
             "robot_code": self.media_client.robot_id,
             "mapping_session_id": self.session.session_id if self.session else str(uuid.uuid4()),
@@ -451,7 +633,7 @@ class MappingAdapter:
             "map_version": version,
             "source_map_dir": str(filtered_base),
             "raw_map_dir": str(base),
-            "auto_activate": bool(self.config.auto_activate_uploaded_map),
+            "auto_activate": bool(self.config.auto_activate_uploaded_map and not is_rescue),
             "route_hint": self.session.route_hint if self.session else "",
             "frame_id": "map",
             "resolution": command.get("resolution") or 0.05,
@@ -459,6 +641,8 @@ class MappingAdapter:
             "created_at": now_iso(),
             "files": files,
             "dynamic_filter": dynamic_filter_result,
+            "slam_health": progress.get("slam_health") or {},
+            "rescue": rescue_metadata,
         }
         return package_path, metadata
 

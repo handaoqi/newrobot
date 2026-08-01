@@ -9,6 +9,8 @@ localization:
     odom_child_frame_id: "base_link"
     send_tf_transforms: true
     tf_use_current_time: true
+    # Keep map->odom available slightly ahead of Nav2 controller requests.
+    tf_future_offset: 0.10
     
     # topic name
     odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom 
@@ -25,10 +27,10 @@ localization:
     gnss_fusion:
       enable: true
       gain: 0.03
-      max_correction_step: 0.25
-      max_residual: 8.0
-      max_age: 2.5
-      max_horizontal_std: 2.0
+      max_correction_step: 0.10
+      max_residual: 5.0
+      max_age: 1.5
+      max_horizontal_std: 1.5
       min_status: 0
       use_elevation: false
       lever_arm_base: [-0.05, 0.0, 0.15]

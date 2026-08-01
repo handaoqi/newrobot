@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-
 from roamerx_edge.command_processor import CommandProcessor
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.safety_policy import RuntimeSafetyState, SafetyPolicy

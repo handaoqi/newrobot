@@ -59,6 +59,7 @@ public:
     odom_child_frame_id              = declare_parameter<std::string>("odom_child_frame_id", "livox_frame");
     send_tf_transforms               = declare_parameter<bool>("send_tf_transforms", false);
     tf_use_current_time              = declare_parameter<bool>("tf_use_current_time", true);
+    tf_future_offset_                = declare_parameter<double>("tf_future_offset", 0.0);
     cool_time_duration               = declare_parameter<double>("cool_time_duration", 0.5);
     reg_method                       = declare_parameter<std::string>("reg_method", "NDT_OMP");
     ndt_neighbor_search_method       = declare_parameter<std::string>("ndt_neighbor_search_method", "DIRECT7");
@@ -95,10 +96,10 @@ public:
     localization_odom_frame_id = declare_parameter<std::string>("localization_odom_frame_id", "base_link");
     use_gnss_fusion_           = declare_parameter<bool>("gnss_fusion.enable", false);
     gnss_fusion_gain_          = declare_parameter<double>("gnss_fusion.gain", 0.03);
-    gnss_max_correction_step_  = declare_parameter<double>("gnss_fusion.max_correction_step", 0.25);
-    gnss_max_residual_         = declare_parameter<double>("gnss_fusion.max_residual", 8.0);
-    gnss_max_age_              = declare_parameter<double>("gnss_fusion.max_age", 2.5);
-    gnss_max_horizontal_std_   = declare_parameter<double>("gnss_fusion.max_horizontal_std", 2.0);
+    gnss_max_correction_step_  = declare_parameter<double>("gnss_fusion.max_correction_step", 0.10);
+    gnss_max_residual_         = declare_parameter<double>("gnss_fusion.max_residual", 5.0);
+    gnss_max_age_              = declare_parameter<double>("gnss_fusion.max_age", 1.5);
+    gnss_max_horizontal_std_   = declare_parameter<double>("gnss_fusion.max_horizontal_std", 1.5);
     gnss_min_status_           = declare_parameter<int>("gnss_fusion.min_status", 0);
     gnss_use_elevation_        = declare_parameter<bool>("gnss_fusion.use_elevation", false);
     std::vector<double> gnss_lever_arm = declare_parameter<std::vector<double>>("gnss_fusion.lever_arm_base", {-0.05, 0.0, 0.15});
@@ -416,17 +417,30 @@ private:
     double offset_x = gnss_lever_arm_base_.x();
     double offset_y = gnss_lever_arm_base_.y();
     double offset_z = gnss_lever_arm_base_.z();
-    readYamlScalar(meta_path.string(), "x", offset_x);
-    readYamlScalar(meta_path.string(), "y", offset_y);
-    readYamlScalar(meta_path.string(), "z", offset_z);
+    if (!readYamlScalar(meta_path.string(), "map_offset_x", offset_x)) {
+      readYamlScalar(meta_path.string(), "x", offset_x);
+    }
+    if (!readYamlScalar(meta_path.string(), "map_offset_y", offset_y)) {
+      readYamlScalar(meta_path.string(), "y", offset_y);
+    }
+    if (!readYamlScalar(meta_path.string(), "map_offset_z", offset_z)) {
+      readYamlScalar(meta_path.string(), "z", offset_z);
+    }
+    double alignment_locked = 0.0;
+    if (!readYamlScalar(meta_path.string(), "alignment_locked", alignment_locked) || alignment_locked < 0.5) {
+      RCLCPP_WARN(get_logger(), "GNSS fusion disabled for map without a locked ENU-map alignment: %s", meta_path.c_str());
+      return false;
+    }
+    readYamlScalar(meta_path.string(), "enu_to_map_yaw", gnss_enu_to_map_yaw_);
 
     gnss_origin_lat_ = lat;
     gnss_origin_lon_ = lon;
     gnss_origin_alt_ = alt;
     gnss_map_offset_ << static_cast<float>(offset_x), static_cast<float>(offset_y), static_cast<float>(offset_z);
     gnss_map_origin_loaded_ = true;
-    RCLCPP_INFO(get_logger(), "Loaded GNSS map origin lat=%.9f lon=%.9f alt=%.3f offset=[%.3f, %.3f, %.3f]",
-      gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_, gnss_map_offset_.x(), gnss_map_offset_.y(), gnss_map_offset_.z());
+    RCLCPP_INFO(get_logger(), "Loaded GNSS map origin lat=%.9f lon=%.9f alt=%.3f offset=[%.3f, %.3f, %.3f] yaw=%.2fdeg",
+      gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_, gnss_map_offset_.x(), gnss_map_offset_.y(), gnss_map_offset_.z(),
+      gnss_enu_to_map_yaw_ * 180.0 / M_PI);
     return true;
   }
 
@@ -440,7 +454,13 @@ private:
     enu << static_cast<float>(d_lon * std::cos(lat0) * kEarthRadiusM),
            static_cast<float>(d_lat * kEarthRadiusM),
            static_cast<float>(altitude_m - gnss_origin_alt_);
-    return enu + gnss_map_offset_;
+    const float cosine = static_cast<float>(std::cos(gnss_enu_to_map_yaw_));
+    const float sine = static_cast<float>(std::sin(gnss_enu_to_map_yaw_));
+    Eigen::Vector3f map;
+    map.x() = cosine * enu.x() - sine * enu.y() + gnss_map_offset_.x();
+    map.y() = sine * enu.x() + cosine * enu.y() + gnss_map_offset_.y();
+    map.z() = enu.z() + gnss_map_offset_.z();
+    return map;
   }
 
   void applyGnssCorrection(const rclcpp::Time& stamp) {
@@ -785,7 +805,9 @@ private:
   }
 
   void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose) {
-    const rclcpp::Time tf_stamp = tf_use_current_time ? get_clock()->now() : stamp;
+    const rclcpp::Time tf_stamp =
+      (tf_use_current_time ? get_clock()->now() : stamp) +
+      rclcpp::Duration::from_seconds(tf_future_offset_);
     RCLCPP_DEBUG(
       get_logger(),
       "[publish_odometry] stamp_ns=%ld tf_stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
@@ -1635,6 +1657,7 @@ private:
   std::string localization_odom_frame_id;
   bool send_tf_transforms;
   bool tf_use_current_time;
+  double tf_future_offset_ = 0.0;
 
 	  bool use_imu;
 	  bool invert_acc;
@@ -1671,6 +1694,7 @@ private:
   double gnss_origin_lon_ = 0.0;
   double gnss_origin_alt_ = 0.0;
   Eigen::Vector3f gnss_map_offset_{0.0f, 0.0f, 0.0f};
+  double gnss_enu_to_map_yaw_ = 0.0;
   Eigen::Vector3f gnss_lever_arm_base_{-0.05f, 0.0f, 0.15f};
   bool use_gnss_fusion_ = false;
   double gnss_fusion_gain_ = 0.03;

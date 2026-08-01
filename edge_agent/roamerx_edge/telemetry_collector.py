@@ -123,7 +123,10 @@ class TelemetryCollector:
             pose = self._pose
             quality = self._localization_quality
             return {
-                "sampled_at": pose.sampled_at if pose else now_iso(),
+                # The status sample is fresh even when localization is stopped
+                # during mapping. Reusing the last pose timestamp makes the
+                # center reject changing mapping progress as stale telemetry.
+                "sampled_at": now_iso(),
                 "state_version": self._state_version,
                 "pose": {
                     "frame_id": "map",

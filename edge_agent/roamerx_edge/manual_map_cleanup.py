@@ -38,6 +38,7 @@ def build_manual_cleanup_map(
     try:
         _download(pgm_url, temp_dir / "map.pgm", pgm_sha256)
         _download(yaml_url, temp_dir / "map.yaml", yaml_sha256)
+        _normalize_map_yaml_image(temp_dir / "map.yaml")
         result = _filter_point_cloud(source_dir, temp_dir)
         for name in ("map.txt", "gnss_origin.yaml"):
             if (source_dir / name).is_file():
@@ -83,6 +84,18 @@ def _download(url: str, destination: Path, expected_sha256: str) -> None:
     if expected_sha256 and digest.hexdigest().lower() != expected_sha256.lower():
         destination.unlink(missing_ok=True)
         raise ManualMapCleanupError(f"SHA256 mismatch for {url}")
+
+
+def _normalize_map_yaml_image(yaml_path: Path) -> None:
+    """Keep an edited map package self-contained after it is downloaded."""
+    metadata = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(metadata, dict):
+        raise ManualMapCleanupError("edited map YAML must contain a mapping")
+    metadata["image"] = "map.pgm"
+    yaml_path.write_text(
+        yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _filter_point_cloud(source_dir: Path, output_dir: Path) -> dict:

@@ -30,16 +30,38 @@ laser_mapping:
         extrinsic_R: [ 1., 0., 0.,
                     0., 1., 0.,
                     0., 0., 1.]
+    imu_init:
+        # Keep the robot stationary for roughly three seconds at 200 Hz.
+        sample_count: 600
+        max_acc_variance: 0.5
+        max_gyro_variance: 0.05
     gnss_fusion:
-        enable: true
+        # GNSS is still recorded and aligned, but cannot alter LIO until the
+        # ENU-to-map alignment has been validated and fusion is enabled.
+        enable: false
         gain: 0.03
-        max_correction_step: 0.25
-        max_residual: 8.0
-        max_age: 2.5
-        max_horizontal_std: 2.0
+        max_correction_step: 0.10
+        max_residual: 5.0
+        max_age: 1.5
+        max_horizontal_std: 1.5
         min_status: 0
         use_elevation: false
         lever_arm_base: [ -0.05, 0.0, 0.15 ]
+        alignment_min_samples: 20
+        alignment_min_baseline: 15.0
+        alignment_max_rms: 1.5
+        alignment_max_yaw_change_deg: 3.0
+        alignment_required_fits: 3
+    health_guard:
+        max_frame_translation: 1.5
+        max_speed: 3.0
+        max_abs_z: 5.0
+        max_frame_z: 1.0
+        warn_speed: 1.8
+        # Absolute map Z is not a divergence signal because outdoor routes include slopes.
+        warn_abs_z: 0.0
+        pose_guard_frames: 3
+        no_effective_points_limit: 10
     dynamic_filter:
         # Preserve the raw map. Transient obstacles are removed explicitly in
         # the platform's manual map cleanup workflow after saving.
@@ -51,11 +73,11 @@ laser_mapping:
         shard_count: 64
     keyframe_record:
         enable: true
-        min_distance_m: 0.8
+        min_distance_m: 0.5
         min_yaw_rad: 0.35
         # Keep observing a stationary scene so people moving past a stopped dog can be removed later.
-        max_interval_s: 2.0
-        voxel_size_m: 0.25
+        max_interval_s: 1.0
+        voxel_size_m: 0.15
         # Bound the background disk writer so storage stalls cannot consume RAM.
         max_queue_size: 8
     publish:

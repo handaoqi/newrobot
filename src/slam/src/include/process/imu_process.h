@@ -37,6 +37,10 @@ public:
     void                          set_acc_cov(const robot::slam::Vec3d& scaler);
     void                          set_gyr_bias_cov(const robot::slam::Vec3d& b_g);
     void                          set_acc_bias_cov(const robot::slam::Vec3d& b_a);
+    void                          set_init_requirements(int sample_count, double max_acc_variance, double max_gyro_variance);
+    bool                          initialization_ready() const { return !imu_need_init_; }
+    int                           initialization_samples() const { return init_iter_num; }
+    int                           initialization_required_samples() const { return init_sample_count_; }
     Eigen::Matrix<double, 12, 12> Q;
     void                          Process(
                                  const robot::slam::MeasureGroup& meas, esekfom::esekf<state_ikfom, 12, input_ikfom>& kf_state, robot::slam::CloudPtr pcl_un_);
@@ -70,4 +74,7 @@ private:
     int                              init_iter_num  = 1;
     bool                             b_first_frame_ = true;
     bool                             imu_need_init_ = true;
+    int                              init_sample_count_ = 600;
+    double                           init_max_acc_variance_ = 0.5;
+    double                           init_max_gyro_variance_ = 0.05;
 };

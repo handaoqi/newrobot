@@ -148,25 +148,42 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 10.0
-      publish_frequency: 10.0
+      update_frequency: 2.0
+      publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
       footprint: "[[0.315,0.18],[0.315,-0.18],[-0.315,-0.18],[-0.315,0.18]]"
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "navigo_costmap_2d::StaticLayer"
         map_subscribe_transient_local: False
         footprint_clearing_enabled: True
         restore_cleared_footprint: True
+      obstacle_layer:
+        plugin: "navigo_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: true
+        observation_persistence: 0.5
+        observation_sources: scan
+        scan:
+          topic: /laser_scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          inf_is_valid: true
+          data_type: "LaserScan"
+          raytrace_max_range: 4.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.45
       inflation_layer:
         plugin: "navigo_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
         inflation_radius: 0.4
-      always_send_full_costmap: True
+      always_send_full_costmap: False
 
 map_server:
   ros__parameters:
@@ -183,13 +200,15 @@ map_saver:
 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 20.0
+    expected_planner_frequency: 1.0
     odom_topic: /odom/mc_odom
     use_sim_time: False
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "navigo_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
+      # Only allow one-cell discretization fallback. A wider value lets NavFn
+      # report success at a substitute endpoint far from the requested goal.
+      tolerance: 0.05
       use_astar: false
       allow_unknown: true
 
@@ -204,8 +223,8 @@ controller_server:
     # Progress checker parameters
     progress_checker:
       plugin: "navigo_path_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.15
+      movement_time_allowance: 6.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "navigo_path_controller::SimpleGoalChecker"
@@ -215,24 +234,24 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "navigo_path_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.30
+      xy_goal_tolerance: 0.35
       # Patrol routes use waypoints as pass-through points. Do not require the
       # robot to match each waypoint's yaw, otherwise it can stall while turning.
       yaw_goal_tolerance: 3.14
     # MPPI parameters
     FollowPath:
       plugin: "navigo_mppi_controller::MPPIController"
-      visualize: true
+      visualize: false
       time_steps: 56
       model_dt: 0.05
       batch_size: 1000
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      vx_max: 0.6 # keep low enough for 0.8m dynamic obstacle reaction
+      vx_max: 0.5 # XG firmware rejects larger combined motion commands
       vx_min: -0.12
       vy_max: 0.5 #0.5
-      wz_max: 1.9
+      wz_max: 1.0
       ax_max: 2.0
       ay_max: 2.0
       ax_min: -2.0
@@ -244,7 +263,7 @@ controller_server:
       gamma: 0.015 #0.015
       motion_model: "DiffDrive"
       visualize_all_sampled_traj: false
-      visualize_optimized_traj: true
+      visualize_optimized_traj: false
       TrajectoryVisualizer:
         trajectory_step: 5
         time_step: 3
@@ -332,8 +351,8 @@ velocity_optimizer:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [3.0, 2.0, 3.0]
-    min_velocity: [-3.0, -2.0, -3.0]
+    max_velocity: [0.5, 0.5, 1.0]
+    min_velocity: [-0.12, -0.5, -1.0]
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
     max_accel: [1.5, 1.0, 1.5]
@@ -354,23 +373,26 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: false
     stop_pub_timeout: 2.0
+    stop_confirmation_cycles: 2
+    allow_rotation_recovery: true
+    allow_reverse_recovery: true
     polygons: ["PolygonStop", "PolygonSlow"]
     PolygonStop:
       type: "polygon"
       # Last-resort collision brake. Start in front of the body so lidar zero
       # returns and self-reflections do not trigger an emergency stop.
-      points: [0.65, 0.22, 0.65, -0.22, 0.42, -0.22, 0.42, 0.22]
+      points: [0.72, 0.20, 0.72, -0.20, 0.58, -0.20, 0.58, 0.20]
       action_type: "stop"
-      max_points: 6
-      visualize: true
+      max_points: 15
+      visualize: false
       polygon_pub_topic: "polygon_stop"
       enabled: true
     PolygonSlow:
       type: "polygon"
-      points: [1.00, 0.28, 1.00, -0.28, 0.42, -0.28, 0.42, 0.28]
+      points: [1.00, 0.28, 1.00, -0.28, 0.58, -0.28, 0.58, 0.28]
       action_type: "slowdown"
-      max_points: 8
-      slowdown_ratio: 0.60
+      max_points: 20
+      slowdown_ratio: 0.70
       visualize: true
       polygon_pub_topic: "polygon_slowdown"
       enabled: true

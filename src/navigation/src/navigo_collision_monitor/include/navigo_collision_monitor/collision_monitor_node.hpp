@@ -214,6 +214,14 @@ protected:
   rclcpp::Time stop_stamp_;
   /// @brief Timeout after which 0-velocity ceases to be published
   rclcpp::Duration stop_pub_timeout_;
+
+  /// @brief Number of consecutive command cycles required before applying STOP
+  int stop_confirmation_cycles_;
+  int stop_detection_count_;
+
+  /// @brief Permit recovery commands that move away from a front stop polygon
+  bool allow_rotation_recovery_;
+  bool allow_reverse_recovery_;
 };  // class CollisionMonitor
 
 }  // namespace navigo_collision_monitor

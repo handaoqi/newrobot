@@ -32,7 +32,7 @@ bool getCurrentPose(
   const rclcpp::Time stamp)
 {
   static rclcpp::Logger logger = rclcpp::get_logger("getCurrentPose");
-  RCLCPP_INFO(
+  RCLCPP_DEBUG(
     logger,
     "[getCurrentPose] global_frame=%s robot_frame=%s stamp_ns=%ld timeout=%.3f",
     global_frame.c_str(), robot_frame.c_str(), static_cast<long>(stamp.nanoseconds()),
@@ -52,7 +52,7 @@ bool transformPoseInTargetFrame(
   const double transform_timeout)
 {
   static rclcpp::Logger logger = rclcpp::get_logger("transformPoseInTargetFrame");
-  RCLCPP_INFO(
+  RCLCPP_DEBUG(
     logger,
     "[transformPoseInTargetFrame] source=%s target=%s stamp_ns=%ld timeout=%.3f",
     input_pose.header.frame_id.c_str(), target_frame.c_str(),

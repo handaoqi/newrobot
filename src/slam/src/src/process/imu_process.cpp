@@ -11,8 +11,8 @@ ImuProcess::ImuProcess()
 {
     init_iter_num   = 1;
     Q               = process_noise_cov();
-    cov_acc         = robot::slam::Vec3d(0.1, 0.1, 0.1);
-    cov_gyr         = robot::slam::Vec3d(0.1, 0.1, 0.1);
+    cov_acc         = robot::slam::Zero3d;
+    cov_gyr         = robot::slam::Zero3d;
     cov_bias_gyr    = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     cov_bias_acc    = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     mean_acc        = robot::slam::Vec3d(0, 0, -1.0);
@@ -30,6 +30,8 @@ void ImuProcess::Reset()
     // ROS_WARN("Reset ImuProcess");
     mean_acc         = robot::slam::Vec3d(0, 0, -1.0);
     mean_gyr         = robot::slam::Vec3d(0, 0, 0);
+    cov_acc          = robot::slam::Zero3d;
+    cov_gyr          = robot::slam::Zero3d;
     angvel_last      = robot::slam::Zero3d;
     imu_need_init_   = true;
     start_timestamp_ = -1;
@@ -70,8 +72,8 @@ void ImuProcess::reset()
     IMUpose.clear();
     cur_pcl_un_.reset(new robot::slam::PointCloudType());
     Q            = process_noise_cov();
-    cov_acc      = robot::slam::Vec3d(0.1, 0.1, 0.1);
-    cov_gyr      = robot::slam::Vec3d(0.1, 0.1, 0.1);
+    cov_acc      = robot::slam::Zero3d;
+    cov_gyr      = robot::slam::Zero3d;
     cov_bias_gyr = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     cov_bias_acc = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
 }
@@ -94,6 +96,13 @@ void ImuProcess::set_gyr_bias_cov(const robot::slam::Vec3d& b_g)
 void ImuProcess::set_acc_bias_cov(const robot::slam::Vec3d& b_a)
 {
     cov_bias_acc = b_a;
+}
+
+void ImuProcess::set_init_requirements(int sample_count, double max_acc_variance, double max_gyro_variance)
+{
+    init_sample_count_ = std::max(20, sample_count);
+    init_max_acc_variance_ = std::max(0.0, max_acc_variance);
+    init_max_gyro_variance_ = std::max(0.0, max_gyro_variance);
 }
 
 void ImuProcess::IMU_init(const robot::slam::MeasureGroup& meas, esekfom::esekf<state_ikfom, 12, input_ikfom>& kf_state, int& N)
@@ -293,14 +302,31 @@ void ImuProcess::Process(
         last_imu_ = meas.imu.back();
 
         state_ikfom imu_state = kf_state.get_x();
-        if (init_iter_num > robot::slam::MAX_INI_COUNT)
+        if (init_iter_num >= init_sample_count_)
         {
+            const double max_acc_variance = cov_acc.maxCoeff();
+            const double max_gyro_variance = cov_gyr.maxCoeff();
+            if (max_acc_variance > init_max_acc_variance_ || max_gyro_variance > init_max_gyro_variance_)
+            {
+                std::cerr << "IMU initialization rejected: robot must remain stationary; samples="
+                          << init_iter_num << " acc_var=" << max_acc_variance
+                          << " gyro_var=" << max_gyro_variance << std::endl;
+                b_first_frame_ = true;
+                init_iter_num = 1;
+                return;
+            }
+            if (mean_acc.norm() < 1e-3)
+            {
+                b_first_frame_ = true;
+                init_iter_num = 1;
+                return;
+            }
             cov_acc *= pow(robot::slam::G_m_s2 / mean_acc.norm(), 2);
             imu_need_init_ = false;
 
             cov_acc = cov_acc_scale;
             cov_gyr = cov_gyr_scale;
-            std::cout << "IMU Initial Done" << std::endl;
+            std::cout << "IMU Initial Done with " << init_iter_num << " stationary samples" << std::endl;
         }
 
         return;

@@ -5,7 +5,7 @@ PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
 MAP_DIR="${MAP_DIR:-/home/robot/.jszr/map}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_mapping_logs}"
 SLAM_CONFIG="${SLAM_CONFIG:-${PROJECT_DIR}/install/robot_slam/share/robot_slam/config/config.yaml}"
-REQUIRE_RTK="${REQUIRE_RTK:-1}"
+REQUIRE_RTK="${REQUIRE_RTK:-0}"
 RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
 MAP_SAVE_WAIT_SECONDS="${MAP_SAVE_WAIT_SECONDS:-7200}"
 
@@ -89,6 +89,11 @@ start_mapping() {
   if [ ! -f "${SLAM_CONFIG}" ]; then
     echo "ERROR: SLAM config not found: ${SLAM_CONFIG}" >&2
     exit 1
+  fi
+
+  # Mapping must exclusively own map TF and localization sensor consumers.
+  if [ -x "${PROJECT_DIR}/script/robot/start_navigation_real.sh" ]; then
+    "${PROJECT_DIR}/script/robot/start_navigation_real.sh" full-stop
   fi
 
   ensure_rtk

@@ -1,6 +1,7 @@
 import numpy as np
+import yaml
 
-from roamerx_edge.manual_map_cleanup import _filter_point_cloud
+from roamerx_edge.manual_map_cleanup import _filter_point_cloud, _normalize_map_yaml_image
 from roamerx_edge.map_cleaner import _read_pcd_header
 
 
@@ -66,3 +67,17 @@ def test_projection_honors_map_origin_yaw(tmp_path):
     result = _filter_point_cloud(source, output)
 
     assert result["removed_points"] == 1
+
+
+def test_normalizes_downloaded_yaml_to_local_pgm(tmp_path):
+    yaml_path = tmp_path / "map.yaml"
+    yaml_path.write_text(
+        "image: /old/map/session/map.pgm\nresolution: 0.05\norigin: [0.0, 0.0, 0.0]\n",
+        encoding="utf-8",
+    )
+
+    _normalize_map_yaml_image(yaml_path)
+
+    metadata = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    assert metadata["image"] == "map.pgm"
+    assert metadata["resolution"] == 0.05

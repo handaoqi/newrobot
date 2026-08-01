@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -35,20 +36,26 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->declare_parameter("client_port", 43988);
     this->declare_parameter("server_port", 43997);
     this->declare_parameter("standup_settle_ms", 4000);
-    this->declare_parameter("standup_repeat_ms", 500);
+    this->declare_parameter("standup_retry_ms", 5000);
     this->declare_parameter("cmd_timeout_ms", 500);
     this->declare_parameter("inactive_linger_ms", 8000);
     this->declare_parameter("publish_period_ms", 20);
+    this->declare_parameter("sdk_max_vx", 0.5);
+    this->declare_parameter("sdk_max_vy", 0.5);
+    this->declare_parameter("sdk_max_yaw_rate", 1.0);
     this->get_parameter("platform", platform_);
     this->get_parameter("client_ip", client_ip_);
     this->get_parameter("server_ip", server_ip_);
     this->get_parameter("client_port", client_port_);
     this->get_parameter("server_port", server_port_);
     this->get_parameter("standup_settle_ms", standup_settle_ms_);
-    this->get_parameter("standup_repeat_ms", standup_repeat_ms_);
+    this->get_parameter("standup_retry_ms", standup_retry_ms_);
     this->get_parameter("cmd_timeout_ms", cmd_timeout_ms_);
     this->get_parameter("inactive_linger_ms", inactive_linger_ms_);
     this->get_parameter("publish_period_ms", publish_period_ms_);
+    this->get_parameter("sdk_max_vx", sdk_max_vx_);
+    this->get_parameter("sdk_max_vy", sdk_max_vy_);
+    this->get_parameter("sdk_max_yaw_rate", sdk_max_yaw_rate_);
 
     const std::unordered_map<std::string, std::pair<std::string, std::string>>
         platform_map = {{"NX_XG3588", {"192.168.234.1", "192.168.234.234"}},
@@ -183,24 +190,22 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     if (standing_up_) {
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           now - stand_start_time_);
-      if (elapsed < std::chrono::milliseconds(standup_settle_ms_)) {
-        const auto repeat_elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_stand_command_time_);
-        if (repeat_elapsed >= std::chrono::milliseconds(standup_repeat_ms_)) {
-          const auto ret = sdk_highlevel_.standUp();
-          last_stand_command_time_ = now;
-          if (ret != 0) {
-            RCLCPP_WARN_THROTTLE(
-                this->get_logger(), *this->get_clock(), 2000,
-                "standUp repeat returned 0x%x", ret);
-          }
-        }
+      const auto ctrl_mode = sdk_highlevel_.getCurrentCtrlmode();
+      if ((ctrl_mode == 1 || ctrl_mode == 18) &&
+          elapsed >= std::chrono::milliseconds(standup_settle_ms_)) {
+        standing_up_ = false;
+        RCLCPP_INFO(this->get_logger(),
+                    "standUp confirmed by SDK, current_ctrlmode=%u", ctrl_mode);
+      } else if (elapsed < std::chrono::milliseconds(standup_retry_ms_)) {
+        return;
+      } else {
+        const auto ret = sdk_highlevel_.standUp();
+        stand_start_time_ = now;
+        RCLCPP_WARN(this->get_logger(),
+                    "standUp not confirmed after %ldms (mode=%u); retry returned 0x%x",
+                    elapsed.count(), ctrl_mode, ret);
         return;
       }
-      standing_up_ = false;
-      RCLCPP_INFO(this->get_logger(),
-                  "standUp settled, forwarding /cmd_vel through SDK move()");
     }
 
     const auto cmd_age = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -209,20 +214,32 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
 
-    const float vx =
+    float vx =
         std::fabs(last_cmd_->linear.x) < 0.085 ? 0.0f : last_cmd_->linear.x;
-    const float vy =
-        std::fabs(last_cmd_->linear.y) < 0.085 ? 0.0f : last_cmd_->linear.y;
+    float vy =
+        std::fabs(last_cmd_->linear.y) < 0.10 ? 0.0f : last_cmd_->linear.y;
     float yaw_rate = last_cmd_->angular.z;
     if (std::fabs(yaw_rate) > 1e-4f && std::fabs(yaw_rate) < 0.025f) {
       yaw_rate = std::copysign(0.025f, yaw_rate);
     }
+    vx = std::clamp(vx, static_cast<float>(-sdk_max_vx_),
+                    static_cast<float>(sdk_max_vx_));
+    vy = std::clamp(vy, static_cast<float>(-sdk_max_vy_),
+                    static_cast<float>(sdk_max_vy_));
+    yaw_rate = std::clamp(yaw_rate, static_cast<float>(-sdk_max_yaw_rate_),
+                          static_cast<float>(sdk_max_yaw_rate_));
     const auto ret = sdk_highlevel_.move(vx, vy, yaw_rate);
     if (ret != 0) {
       const auto ctrl_mode = sdk_highlevel_.getCurrentCtrlmode();
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "SDK move() returned 0x%x, current_ctrlmode=%u",
-                           ret, ctrl_mode);
+                           "SDK move() returned 0x%x, current_ctrlmode=%u, "
+                           "cmd=(%.3f, %.3f, %.3f), raw=(%.3f, %.3f, %.3f)",
+                           ret, ctrl_mode, vx, vy, yaw_rate,
+                           last_cmd_->linear.x, last_cmd_->linear.y,
+                           last_cmd_->angular.z);
+      if (ret == 0x3007 && ctrl_mode != 1 && ctrl_mode != 18) {
+        StartStandUp("SDK move rejected while not standing");
+      }
     }
   }
 
@@ -230,7 +247,6 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     const auto ret = sdk_highlevel_.standUp();
     standing_up_ = true;
     stand_start_time_ = std::chrono::steady_clock::now();
-    last_stand_command_time_ = stand_start_time_;
     if (ret == 0) {
       RCLCPP_INFO(this->get_logger(), "%s: SDK standUp()", reason);
     } else {
@@ -245,10 +261,13 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   int client_port_ = 43988;
   int server_port_ = 43997;
   int standup_settle_ms_ = 4000;
-  int standup_repeat_ms_ = 500;
+  int standup_retry_ms_ = 5000;
   int cmd_timeout_ms_ = 500;
   int inactive_linger_ms_ = 8000;
   int publish_period_ms_ = 20;
+  double sdk_max_vx_ = 0.5;
+  double sdk_max_vy_ = 0.5;
+  double sdk_max_yaw_rate_ = 1.0;
   std::mutex mutex_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
       planner_vel_cmd_subscriber_;
@@ -261,7 +280,6 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   bool nav_active_ = false;
   bool standing_up_ = false;
   std::chrono::steady_clock::time_point stand_start_time_;
-  std::chrono::steady_clock::time_point last_stand_command_time_;
   std::optional<geometry_msgs::msg::Twist> last_cmd_;
   std::chrono::steady_clock::time_point last_cmd_time_;
 };
