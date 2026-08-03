@@ -32,10 +32,11 @@ stream:
 
 model:
   path: "models/bike.onnx"
-  backend: "opencv_dnn"
+  backend: "onnxruntime"
   confidence: 0.55
   nms_iou_threshold: 0.45
   image_size: 960
+  max_fps: 5
   device: ""
   classes:
     - "bicycle"

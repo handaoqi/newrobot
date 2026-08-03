@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import logging
 import math
 import zipfile
 from datetime import time as datetime_time, timedelta
@@ -33,6 +34,7 @@ from .models import (
     PatrolSchedule,
     Robot,
     RobotCommand,
+    SpeechTemplate,
     RobotSession,
     RobotStatusLatest,
     RobotTelemetry,
@@ -52,6 +54,7 @@ from .services.alert_service import AlertService
 from .services.command_service import CommandService
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError
+from .services import tts_service
 from .serializers import (
     EventSerializer,
     CalendarDaySerializer,
@@ -62,6 +65,8 @@ from .serializers import (
     PatrolScheduleSerializer,
     RobotCommandCreateSerializer,
     RobotCommandSerializer,
+    SpeechTemplateSerializer,
+    SpeechSynthesisSerializer,
     RobotDetailSerializer,
     RobotSerializer,
     RemoteCommandSerializer,
@@ -81,6 +86,14 @@ from .serializers import (
 )
 
 User = get_user_model()
+LOGGER = logging.getLogger(__name__)
+
+
+def build_public_media_url(request, saved_path: str) -> str:
+    media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+    media_path = f"{media_url.rstrip('/')}/{saved_path}"
+    public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
+    return f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
 
 
 def build_period_labels(days: int = 7):
@@ -888,10 +901,7 @@ class RobotAudioRecordingCommandView(APIView):
 
         relative_path = timezone.now().strftime("command-audio/%Y/%m/%d/")
         saved_path = default_storage.save(f"{relative_path}{uuid4().hex}{extension}", uploaded_file)
-        media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
-        media_path = f"{media_url.rstrip('/')}/{saved_path}"
-        public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
-        audio_url = f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
+        audio_url = build_public_media_url(request, saved_path)
         command = RobotCommand.objects.create(
             robot=robot,
             action="play_audio",
@@ -905,6 +915,75 @@ class RobotAudioRecordingCommandView(APIView):
         )
         return Response(
             {"audio_url": audio_url, "command": RobotCommandSerializer(command).data},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class SpeechTemplateListCreateView(APIView):
+    def get(self, request):
+        return Response(SpeechTemplateSerializer(SpeechTemplate.objects.all(), many=True).data)
+
+    def post(self, request):
+        serializer = SpeechTemplateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        template = serializer.save(created_by=request.user if request.user.is_authenticated else None)
+        return Response(SpeechTemplateSerializer(template).data, status=status.HTTP_201_CREATED)
+
+
+class SpeechTemplateDetailView(APIView):
+    def patch(self, request, pk):
+        template = get_object_or_404(SpeechTemplate, pk=pk)
+        serializer = SpeechTemplateSerializer(template, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        get_object_or_404(SpeechTemplate, pk=pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SpeechSynthesisView(APIView):
+    def post(self, request):
+        serializer = SpeechSynthesisSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        text = serializer.validated_data["text"]
+        try:
+            saved_path, cache_hit = tts_service.synthesize_speech(text)
+        except Exception:
+            LOGGER.exception("speech synthesis failed")
+            return Response({"detail": "语音生成失败，请稍后重试"}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({"audio_url": build_public_media_url(request, saved_path), "cache_hit": cache_hit})
+
+
+class RobotTTSCommandView(APIView):
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, id=robot_id)
+        serializer = SpeechSynthesisSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        text = serializer.validated_data["text"]
+        audio_name = serializer.validated_data.get("audio_name") or "实时文字喊话"
+        try:
+            saved_path, cache_hit = tts_service.synthesize_speech(text)
+        except Exception:
+            LOGGER.exception("robot speech synthesis failed robot=%s", robot.code)
+            return Response({"detail": "语音生成失败，请稍后重试"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        audio_url = build_public_media_url(request, saved_path)
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action="play_audio",
+            payload={
+                "audio_url": audio_url,
+                "audio_name": audio_name,
+                "text": text,
+                "source": "dashboard_tts",
+                "content_type": "audio/mpeg",
+                "tts_cache_hit": cache_hit,
+            },
+        )
+        return Response(
+            {"audio_url": audio_url, "cache_hit": cache_hit, "command": RobotCommandSerializer(command).data},
             status=status.HTTP_201_CREATED,
         )
 
@@ -1698,6 +1777,7 @@ class RobotMappingStatusView(APIView):
             latest_status
             and (
                 not command
+                or progress_is_current
                 or latest_status.sampled_at >= command.issued_at - timedelta(seconds=5)
             )
         )
@@ -2035,6 +2115,8 @@ class DeviceMapUploadView(APIView):
             "mapping_session_id": metadata.get("mapping_session_id", ""),
             "source_map_dir": metadata.get("source_map_dir", ""),
             "dynamic_filter": metadata.get("dynamic_filter", {}),
+            "slam_health": metadata.get("slam_health", {}),
+            "rescue": metadata.get("rescue", {}),
             "route_hint": metadata.get("route_hint", ""),
             "files": metadata.get("files", []),
             "image": yaml_metadata.get("image", ""),

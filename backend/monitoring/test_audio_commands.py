@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
@@ -7,7 +8,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from rest_framework.test import APIClient, APITestCase
 
-from .models import Robot, RobotCommand, RobotCredential
+from .models import Robot, RobotCommand, RobotCredential, SpeechTemplate
 
 
 class AudioCommandChainTests(APITestCase):
@@ -161,3 +162,65 @@ class RecordedAudioCommandTests(APITestCase):
         self.assertEqual(command.action, "play_audio")
         self.assertEqual(command.status, "queued")
         self.assertEqual(command.payload["content_type"], "audio/webm")
+
+
+class SpeechTemplateAndTtsTests(APITestCase):
+    def setUp(self):
+        self.robot = Robot.objects.create(
+            code="TTS-TEST-01",
+            name="TTS 测试机器人",
+            location="测试区",
+            area="测试区",
+        )
+        user = get_user_model().objects.create_user(username="tts-operator", password="secret")
+        self.client.force_authenticate(user)
+        self.public_url_override = override_settings(PUBLIC_BASE_URL="https://platform.example")
+        self.public_url_override.enable()
+        self.addCleanup(self.public_url_override.disable)
+
+    def test_speech_template_can_be_created_updated_and_deleted(self):
+        response = self.client.post(
+            "/api/speech-templates/",
+            {"name": "临时提醒", "text": "请注意安全。"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        template_id = response.data["id"]
+
+        response = self.client.patch(
+            f"/api/speech-templates/{template_id}/",
+            {"text": "请减速慢行。"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["text"], "请减速慢行。")
+
+        response = self.client.delete(f"/api/speech-templates/{template_id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(SpeechTemplate.objects.filter(id=template_id).exists())
+
+    @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/example.mp3", False))
+    def test_current_text_is_synthesized_and_queued_for_robot(self, synthesize):
+        text = "前方是重点路段，请勿占道停留。"
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/commands/tts/",
+            {"text": text, "audio_name": "重点路段"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        synthesize.assert_called_once_with(text)
+        command = RobotCommand.objects.get(id=response.data["command"]["id"])
+        self.assertEqual(command.status, "queued")
+        self.assertEqual(command.payload["text"], text)
+        self.assertEqual(command.payload["audio_url"], "https://platform.example/media/tts-audio/example.mp3")
+
+    @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/example.mp3", True))
+    def test_speech_preview_returns_cached_audio_url(self, synthesize):
+        response = self.client.post(
+            "/api/speech/synthesize/",
+            {"text": "测试语音预览。"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["cache_hit"])
+        self.assertEqual(response.data["audio_url"], "https://platform.example/media/tts-audio/example.mp3")

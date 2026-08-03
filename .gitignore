@@ -31,6 +31,19 @@ bot-version/data/telemetry/
 bot-version/snapshots/
 bot-version/*.log
 bot-version/model/
+bot-version-test/
+bot-version-audio-test/
+bot-version/config.yaml.bak-*
+*.bak-*
+
+# Local credentials and private keys
+.ssh/
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
 
 # test
 test_video/

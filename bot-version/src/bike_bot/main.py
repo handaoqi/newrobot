@@ -28,6 +28,14 @@ def _milliseconds(seconds: float) -> float:
     return round(seconds * 1000, 1)
 
 
+def _throttle_detection(stop_event: threading.Event, started_at: float, max_fps: float) -> None:
+    if max_fps <= 0:
+        return
+    remaining = (1.0 / max_fps) - (time.perf_counter() - started_at)
+    if remaining > 0:
+        stop_event.wait(remaining)
+
+
 class DetectionPerfWindow:
     def __init__(self, source_fps: float) -> None:
         self.source_fps = source_fps if source_fps > 0 else 0.0
@@ -404,6 +412,7 @@ def detection_worker(
                 )
                 if perf_window.should_log(time.perf_counter()):
                     perf_window.log_and_reset(time.perf_counter())
+                _throttle_detection(stop_event, loop_started_at, detector.config.model.max_fps)
                 continue
 
             LOGGER.info(
@@ -457,6 +466,7 @@ def detection_worker(
             )
             if perf_window.should_log(time.perf_counter()):
                 perf_window.log_and_reset(time.perf_counter())
+            _throttle_detection(stop_event, loop_started_at, detector.config.model.max_fps)
     except BaseException as exc:
         LOGGER.exception("detection worker crashed")
         error_queue.put(exc)

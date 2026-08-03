@@ -472,6 +472,92 @@ a { color: inherit; }
   font-size: 0.82rem;
 }
 
+.slam-health-alert {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #e59b24;
+  border-radius: 6px;
+  background: #fff7e6;
+  color: #713b00;
+}
+
+.mapping-readiness {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #d6a62e;
+  border-radius: 6px;
+  background: #fff8df;
+  color: #644600;
+}
+
+.mapping-readiness.is-ready {
+  border-color: #16845b;
+  background: #eaf8f1;
+  color: #075d3d;
+}
+
+.mapping-readiness.is-error {
+  border-color: #d92d20;
+  background: #fff0ee;
+  color: #8f160d;
+}
+
+.mapping-readiness-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 14px;
+}
+
+.mapping-readiness-main strong {
+  font-size: 16px;
+}
+
+.mapping-readiness-sensors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mapping-readiness-sensors span {
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.mapping-readiness-sensors span.ok {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.slam-health-alert.is-diverged {
+  border-color: #d92d20;
+  background: #fff0ee;
+  color: #8f160d;
+}
+
+.slam-health-alert > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.slam-health-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+}
+
+.text-danger,
+.rescue-map-label {
+  color: #b42318;
+}
+
 .state-steps {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
@@ -1649,6 +1735,29 @@ a { color: inherit; }
 }
 .speaker-box .mini-row {
   gap: 12px;
+}
+.template-editor {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto auto auto;
+  gap: 10px;
+  align-items: center;
+}
+.template-editor input {
+  min-width: 0;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel-soft);
+}
+@media (max-width: 720px) {
+  .template-editor {
+    grid-template-columns: 1fr 1fr;
+  }
+  .template-editor input {
+    grid-column: 1 / -1;
+  }
 }
 .list-panel .table-card {
   position: relative;

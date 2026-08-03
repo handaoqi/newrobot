@@ -22,7 +22,19 @@ class TelemetryService:
         incoming_sampled_at = parse_datetime(str(payload["sampled_at"]))
         if incoming_sampled_at and timezone.is_naive(incoming_sampled_at):
             incoming_sampled_at = timezone.make_aware(incoming_sampled_at)
-        if latest and incoming_version <= latest.state_version and (
+        incoming_mapping_progress = (
+            ((payload.get("mapping") or {}).get("save_progress") or {}).get("updated_at_unix") or 0
+        )
+        latest_mapping_progress = (
+            ((((latest.raw_payload or {}).get("mapping") or {}).get("save_progress") or {}).get("updated_at_unix") or 0)
+            if latest
+            else 0
+        )
+        try:
+            mapping_progress_advanced = float(incoming_mapping_progress) > float(latest_mapping_progress)
+        except (TypeError, ValueError):
+            mapping_progress_advanced = False
+        if latest and not mapping_progress_advanced and incoming_version <= latest.state_version and (
             not incoming_sampled_at or incoming_sampled_at <= latest.sampled_at
         ):
             return latest, False

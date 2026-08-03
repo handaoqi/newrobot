@@ -96,6 +96,36 @@ export async function sendRecordedAudioCommand(robotId, file, audioName = '现�
   })
 }
 
+export async function sendTextToSpeechCommand(robotId, text, audioName = '实时文字喊话') {
+  return request(`/robots/${robotId}/commands/tts/`, {
+    method: 'POST',
+    body: JSON.stringify({ text, audio_name: audioName }),
+  })
+}
+
+export async function synthesizeSpeech(text) {
+  return request('/speech/synthesize/', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  })
+}
+
+export async function fetchSpeechTemplates() {
+  return request('/speech-templates/')
+}
+
+export async function createSpeechTemplate(payload) {
+  return request('/speech-templates/', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function updateSpeechTemplate(templateId, payload) {
+  return request(`/speech-templates/${templateId}/`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+
+export async function deleteSpeechTemplate(templateId) {
+  return request(`/speech-templates/${templateId}/`, { method: 'DELETE' })
+}
+
 export async function fetchTasks() {
   return request('/tasks/')
 }

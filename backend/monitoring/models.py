@@ -443,6 +443,8 @@ class RobotCommand(BaseTimestampModel):
         ("running", "执行中"),
         ("finished", "已完成"),
         ("failed", "发送失败"),
+        ("expired", "已过期"),
+        ("superseded", "已被新命令替换"),
     ]
 
     robot = models.ForeignKey(Robot, related_name="commands", on_delete=models.CASCADE)
@@ -458,6 +460,24 @@ class RobotCommand(BaseTimestampModel):
 
     def __str__(self) -> str:
         return f"{self.robot.code} {self.action} {self.status}"
+
+
+class SpeechTemplate(BaseTimestampModel):
+    name = models.CharField(max_length=64, unique=True)
+    text = models.CharField(max_length=500)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="speech_templates",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.name
 
 
 class MapData(BaseTimestampModel):

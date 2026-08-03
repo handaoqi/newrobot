@@ -52,6 +52,7 @@ class ModelConfig:
     confidence: float = 0.55
     nms_iou_threshold: float = 0.45
     image_size: int = 960
+    max_fps: float = 0.0
     device: str = ""
     classes: list[str] | None = None
 

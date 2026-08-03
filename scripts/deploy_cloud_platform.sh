@@ -59,5 +59,5 @@ if "$DEPLOY_BACKEND"; then
 fi
 
 echo "[deploy] Checking cloud API..."
-curl --fail --silent --show-error --max-time 15 "$BASE_URL/api/maps/" >/dev/null
+curl --noproxy '*' --fail --silent --show-error --max-time 15 "$BASE_URL/api/maps/" >/dev/null
 echo "[deploy] Complete: $BASE_URL"

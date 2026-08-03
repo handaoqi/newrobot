@@ -5,7 +5,20 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { API_BASE, fetchOverview, fetchRobotDetail, fetchRobots, sendRecordedAudioCommand, sendRobotCommand } from '../services/api'
+import {
+  API_BASE,
+  createSpeechTemplate,
+  deleteSpeechTemplate,
+  fetchOverview,
+  fetchRobotDetail,
+  fetchRobots,
+  fetchSpeechTemplates,
+  sendRecordedAudioCommand,
+  sendRobotCommand,
+  sendTextToSpeechCommand,
+  synthesizeSpeech,
+  updateSpeechTemplate,
+} from '../services/api'
 
 const overview = ref(null)
 const robots = ref([])
@@ -16,7 +29,10 @@ const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
-const selectedSpeakerTemplate = ref('驶离提醒')
+const speechTemplates = ref([])
+const selectedSpeakerTemplateId = ref(null)
+const templateName = ref('驶离提醒')
+const templateSaving = ref(false)
 const audioCommandSending = ref(false)
 const recording = ref(false)
 const recordedBlob = ref(null)
@@ -43,29 +59,8 @@ let recordedChunks = []
 let previewPlayer = null
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
-const deviceAudioBase = (import.meta.env.VITE_DEVICE_AUDIO_BASE || window.location.origin).replace(/\/$/, '')
+const AUDIO_COMMAND_COOLDOWN_MS = 3000
 const { toastMessage, toastVariant, visible, showToast } = useToast()
-
-const quickTexts = [
-  {
-    label: '重点路段',
-    text: '您好，当前区域为巡检重点路段，请勿长时间占道停留。',
-    audioUrl: '/audio/notice.wav',
-    audioName: '重点路段',
-  },
-  {
-    label: '驶离提醒',
-    text: '您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。',
-    audioUrl: '/audio/bike-leave.mp3',
-    audioName: '驶离提醒',
-  },
-  {
-    label: '注意避让',
-    text: '您好，系统检测到现场存在安全风险，请注意避让并配合引导。',
-    audioUrl: '/audio/attention.mp3',
-    audioName: '注意避让',
-  },
-]
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
@@ -111,71 +106,108 @@ function formatEventTime(value) {
   })
 }
 
-function setSpeakerText(text) {
-  const template = quickTexts.find((item) => item.text === text)
-  speakerText.value = text
-  if (template) selectedSpeakerTemplate.value = template.label
+function setSpeakerTemplate(template) {
+  speakerText.value = template.text
+  templateName.value = template.name
+  selectedSpeakerTemplateId.value = template.id
   showToast('已切换喊话模板')
 }
 
-const activeSpeakerTemplate = computed(() => {
-  return quickTexts.find((item) => item.text === speakerText.value) ||
-    quickTexts.find((item) => item.label === selectedSpeakerTemplate.value) ||
-    quickTexts[0]
-})
-
-function buildAudioUrl() {
-  const value = activeSpeakerTemplate.value?.audioUrl || ''
-  if (!value) return ''
-  try {
-    return new URL(value, `${deviceAudioBase}/`).href
-  } catch {
-    return ''
-  }
+async function loadSpeechTemplates() {
+  speechTemplates.value = await fetchSpeechTemplates()
+  const selected = speechTemplates.value.find((item) => item.id === selectedSpeakerTemplateId.value) ||
+    speechTemplates.value.find((item) => item.name === templateName.value) ||
+    speechTemplates.value[0]
+  if (selected && selectedSpeakerTemplateId.value === null) setSpeakerTemplate(selected)
 }
 
 async function beginSpeak() {
   const robot = latestRobot.value
   if (!robot?.id || audioCommandSending.value) return
-  const audioUrl = buildAudioUrl()
-  if (!audioUrl) {
-    showToast('请选择有效的音频地址')
+  const text = speakerText.value.trim()
+  if (!text) {
+    showToast('请输入需要播报的文字')
     return
   }
 
+  const commandStartedAt = Date.now()
   audioCommandSending.value = true
   try {
-    const selected = activeSpeakerTemplate.value
-    await sendRobotCommand(robot.id, {
-      action: 'play_audio',
-      payload: {
-        audio_url: audioUrl,
-        audio_name: selected?.audioName || selected?.label || '现场喊话',
-        text: speakerText.value,
-        source: 'dashboard_audio',
-      },
-    })
-    showToast('已下发音频播放指令，等待机器狗执行')
+    await sendTextToSpeechCommand(robot.id, text, templateName.value.trim() || '实时文字喊话')
+    showToast('文字已生成语音并下发，等待机器狗播放')
   } catch (error) {
-    showToast(error.message || '音频播放指令下发失败')
+    showToast(error.message || '文字转语音下发失败')
   } finally {
+    const cooldownRemaining = AUDIO_COMMAND_COOLDOWN_MS - (Date.now() - commandStartedAt)
+    if (cooldownRemaining > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, cooldownRemaining))
+    }
     audioCommandSending.value = false
   }
 }
 
 async function previewVoice() {
-  const audioUrl = buildAudioUrl()
-  if (!audioUrl) {
-    showToast('请选择有效的音频地址')
+  const text = speakerText.value.trim()
+  if (!text || audioCommandSending.value) {
+    if (!text) showToast('请输入需要预览的文字')
     return
   }
+  audioCommandSending.value = true
   try {
+    const result = await synthesizeSpeech(text)
     if (previewPlayer) previewPlayer.pause()
-    previewPlayer = new Audio(audioUrl)
+    previewPlayer = new Audio(result.audio_url)
     await previewPlayer.play()
-    showToast('正在本机预览音频')
-  } catch {
-    showToast('音频预览失败，请检查文件或地址')
+    showToast('正在预览当前文字生成的语音')
+  } catch (error) {
+    showToast(error.message || '语音预览失败')
+  } finally {
+    audioCommandSending.value = false
+  }
+}
+
+async function saveSpeechTemplate() {
+  const name = templateName.value.trim()
+  const text = speakerText.value.trim()
+  if (!name || !text || templateSaving.value) {
+    showToast(!name ? '请输入文案名称' : '请输入播报文字')
+    return
+  }
+  templateSaving.value = true
+  try {
+    const saved = selectedSpeakerTemplateId.value
+      ? await updateSpeechTemplate(selectedSpeakerTemplateId.value, { name, text })
+      : await createSpeechTemplate({ name, text })
+    selectedSpeakerTemplateId.value = saved.id
+    await loadSpeechTemplates()
+    showToast('喊话文案已保存')
+  } catch (error) {
+    showToast(error.message || '保存文案失败')
+  } finally {
+    templateSaving.value = false
+  }
+}
+
+function startNewSpeechTemplate() {
+  selectedSpeakerTemplateId.value = null
+  templateName.value = ''
+  speakerText.value = ''
+}
+
+async function removeSpeechTemplate() {
+  if (!selectedSpeakerTemplateId.value || templateSaving.value) return
+  templateSaving.value = true
+  try {
+    await deleteSpeechTemplate(selectedSpeakerTemplateId.value)
+    selectedSpeakerTemplateId.value = null
+    templateName.value = ''
+    speakerText.value = ''
+    await loadSpeechTemplates()
+    showToast('喊话文案已删除')
+  } catch (error) {
+    showToast(error.message || '删除文案失败')
+  } finally {
+    templateSaving.value = false
   }
 }
 
@@ -261,6 +293,7 @@ async function playRecordedAudio() {
   const file = new File([recordedBlob.value], `dashboard-recording.${extension}`, {
     type: recordedBlob.value.type || 'audio/webm',
   })
+  const commandStartedAt = Date.now()
   audioCommandSending.value = true
   try {
     await sendRecordedAudioCommand(robot.id, file, '现场录音')
@@ -268,6 +301,10 @@ async function playRecordedAudio() {
   } catch (error) {
     showToast(error.message || '录音播放指令下发失败')
   } finally {
+    const cooldownRemaining = AUDIO_COMMAND_COOLDOWN_MS - (Date.now() - commandStartedAt)
+    if (cooldownRemaining > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, cooldownRemaining))
+    }
     audioCommandSending.value = false
   }
 }
@@ -661,9 +698,16 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
   setupAlertStream()
   try {
-    const [overviewData, robotData] = await Promise.all([fetchOverview(), fetchRobots()])
+    const [overviewData, robotData, templateData] = await Promise.all([
+      fetchOverview(),
+      fetchRobots(),
+      fetchSpeechTemplates().catch(() => []),
+    ])
     overview.value = overviewData
     robots.value = robotData
+    speechTemplates.value = templateData
+    const initialTemplate = templateData.find((item) => item.name === templateName.value) || templateData[0]
+    if (initialTemplate) setSpeakerTemplate(initialTemplate)
     const initialRobotId = overviewData.latest_robot?.id || robotData[0]?.id
     if (initialRobotId) {
       await chooseRobot(initialRobotId, false)
@@ -931,23 +975,31 @@ function handleVisibilityChange() {
           <span class="panel-badge">Control</span>
         </div>
         <div class="speaker-box">
-          <textarea v-model="speakerText"></textarea>
+          <textarea v-model="speakerText" maxlength="500" placeholder="输入什么文字，机器狗就播报什么文字"></textarea>
           <div class="quick-actions">
             <button
-              v-for="item in quickTexts"
-              :key="item.label"
+              v-for="item in speechTemplates"
+              :key="item.id"
               class="chip"
-              :class="{ active: speakerText === item.text }"
-              @click="setSpeakerText(item.text)"
+              :class="{ active: selectedSpeakerTemplateId === item.id }"
+              @click="setSpeakerTemplate(item)"
             >
-              {{ item.label }}
+              {{ item.name }}
             </button>
+          </div>
+          <div class="template-editor">
+            <input v-model="templateName" maxlength="64" placeholder="文案名称，例如：重点路段" />
+            <button class="ghost-btn" :disabled="templateSaving" @click="saveSpeechTemplate">
+              {{ selectedSpeakerTemplateId ? '更新文案' : '保存文案' }}
+            </button>
+            <button class="ghost-btn" :disabled="templateSaving" @click="startNewSpeechTemplate">新建</button>
+            <button class="danger-btn" :disabled="!selectedSpeakerTemplateId || templateSaving" @click="removeSpeechTemplate">删除</button>
           </div>
           <div class="action-row">
             <button class="primary-btn" :disabled="audioCommandSending" @click="beginSpeak">
-              {{ audioCommandSending ? '下发中' : '开始喊话' }}
+              {{ audioCommandSending ? '语音生成中' : '开始喊话' }}
             </button>
-            <button class="ghost-btn" @click="previewVoice">语音预览</button>
+            <button class="ghost-btn" :disabled="audioCommandSending" @click="previewVoice">语音预览</button>
           </div>
           <div class="recording-box">
             <div class="recording-status" :class="{ active: recording }">

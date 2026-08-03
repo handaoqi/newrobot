@@ -18,6 +18,7 @@ from .models import (
     RemoteCommand,
     Robot,
     RobotCommand,
+    SpeechTemplate,
     RobotSession,
     RobotStatusLatest,
     TaskExecution,
@@ -570,6 +571,29 @@ class RobotCommandSerializer(serializers.ModelSerializer):
             "sent_at",
             "created_at",
         ]
+
+
+class SpeechTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpeechTemplate
+        fields = ["id", "name", "text", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("文案名称不能为空")
+        return value
+
+    def validate_text(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("播报文字不能为空")
+        return value
+
+
+class SpeechSynthesisSerializer(serializers.Serializer):
+    text = serializers.CharField(max_length=500, trim_whitespace=True)
+    audio_name = serializers.CharField(max_length=64, required=False, allow_blank=True, trim_whitespace=True)
 
 
 class MapDataSerializer(serializers.ModelSerializer):

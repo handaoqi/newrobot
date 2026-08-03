@@ -1,6 +1,7 @@
 django>=5.2,<6.1
 djangorestframework==3.17.1
 django-cors-headers==4.9.0
+edge-tts==7.2.8
 Pillow==12.2.0
 paramiko==3.5.0
 paho-mqtt>=2.1,<3
