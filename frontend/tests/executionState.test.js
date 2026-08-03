@@ -1,16 +1,29 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { executionActions, powerLabel } from '../src/services/executionState.js'
+import { executionActions, isExecutionActive, powerLabel } from '../src/services/executionState.js'
 
-test('terminal tasks cannot resume or cancel', () => {
-  assert.deepEqual(executionActions('completed'), { pause: false, resume: false, cancel: false })
-  assert.deepEqual(executionActions('cancelled'), { pause: false, resume: false, cancel: false })
+test('terminal tasks disable the combined control but keep force exit available', () => {
+  assert.deepEqual(executionActions('completed').control, { enabled: false, action: null, label: '任务结束' })
+  assert.deepEqual(executionActions('cancelled').control, { enabled: false, action: null, label: '任务结束' })
+  assert.equal(executionActions('completed').forceExit, true)
 })
 
-test('only paused tasks can resume', () => {
-  assert.equal(executionActions('paused').resume, true)
-  assert.equal(executionActions('running').resume, false)
+test('combined control follows running and paused states', () => {
+  assert.deepEqual(executionActions('running').control, { enabled: true, action: 'pause', label: '暂停' })
+  assert.deepEqual(executionActions('paused').control, { enabled: true, action: 'resume', label: '继续' })
+  assert.deepEqual(executionActions('accepted').control, { enabled: true, action: 'pause', label: '暂停' })
+  assert.deepEqual(executionActions('interrupted').control, { enabled: true, action: 'resume', label: '继续' })
+  assert.equal(executionActions('running').statusLabel, '任务执行中')
+  assert.equal(executionActions('paused').statusLabel, '任务暂停中')
+  assert.equal(executionActions('cancelling').statusLabel, '任务退出中')
+})
+
+test('all persisted in-flight states are active', () => {
+  for (const state of ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted']) {
+    assert.equal(isExecutionActive(state), true)
+  }
+  assert.equal(isExecutionActive('failed'), false)
 })
 
 test('unknown power is explicit', () => {

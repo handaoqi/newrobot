@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import uuid
+import logging
 from collections.abc import Callable
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -11,8 +13,10 @@ from .models import (
     InboundMessage,
     RemoteCommand,
     Robot,
+    RobotCommand,
     RobotSession,
     TaskExecution,
+    SpeechTemplate,
     TrajectoryBatchReceipt,
     TrajectoryPoint,
 )
@@ -22,9 +26,120 @@ from .serializers import EventSerializer, TaskExecutionSerializer
 from .services.alert_service import AlertService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
+from .services import tts_service
 
 
 ResponsePublisher = Callable[[str, dict, int, bool], None]
+LOGGER = logging.getLogger(__name__)
+
+
+def _public_media_url(saved_path: str) -> str:
+    base_url = str(getattr(settings, "PUBLIC_BASE_URL", "") or "").rstrip("/")
+    media_url = str(settings.MEDIA_URL).strip("/")
+    return f"{base_url}/{media_url}/{saved_path.lstrip('/')}"
+
+
+def _queue_waypoint_speech(execution: TaskExecution, robot: Robot, waypoint_index: int):
+    waypoints = (execution.route_snapshot or {}).get("waypoints") or []
+    if waypoint_index < 0 or waypoint_index >= len(waypoints):
+        return None
+    waypoint = waypoints[waypoint_index]
+    template_id = waypoint.get("speech_template_id")
+    if not template_id:
+        return None
+    duplicate_filter = {
+        "robot": robot,
+        "action": "play_audio",
+        "payload__source": "patrol_waypoint_speech",
+        "payload__task_execution_id": str(execution.id),
+        "payload__waypoint_index": waypoint_index,
+    }
+    if RobotCommand.objects.filter(**duplicate_filter).exists():
+        return None
+    template = SpeechTemplate.objects.filter(
+        id=template_id,
+        category__name=settings.INSPECTION_SPEECH_CATEGORY_NAME,
+    ).first()
+    if not template:
+        LOGGER.warning("waypoint speech template unavailable execution=%s waypoint=%s", execution.id, waypoint_index)
+        return None
+    try:
+        saved_path, cache_hit = tts_service.synthesize_speech(template.text)
+    except Exception:
+        LOGGER.exception("waypoint speech synthesis failed execution=%s waypoint=%s", execution.id, waypoint_index)
+        return None
+    return RobotCommand.objects.create(
+        robot=robot,
+        action="play_audio",
+        payload={
+            "audio_url": _public_media_url(saved_path),
+            "audio_name": template.name,
+            "text": template.text,
+            "source": "patrol_waypoint_speech",
+            "content_type": "audio/mpeg",
+            "tts_cache_hit": cache_hit,
+            "task_execution_id": str(execution.id),
+            "waypoint_index": waypoint_index,
+            "waypoint_id": waypoint.get("waypoint_id", ""),
+        },
+    )
+
+
+def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict):
+    """Queue the fixed recovery announcement selected by the robot-side stage."""
+    stage_titles = {
+        "obstacle_detected": "发现障碍物",
+        "recovery_attempt": "后退尝试避障",
+        "leave_route": "劝阻离开线路",
+    }
+    stage = str(payload.get("speech_stage") or "")
+    title = stage_titles.get(stage)
+    if not title:
+        LOGGER.warning("unsupported obstacle speech stage execution=%s stage=%s", execution.id, stage)
+        return None
+    attempt = int(payload.get("recovery_attempt") or 0)
+    episode_id = str(payload.get("obstacle_episode_id") or "")
+    duplicate_filter = {
+        "robot": robot,
+        "action": "play_audio",
+        "payload__source": "patrol_obstacle_speech",
+        "payload__task_execution_id": str(execution.id),
+        "payload__speech_stage": stage,
+        "payload__recovery_attempt": attempt,
+    }
+    if episode_id:
+        duplicate_filter["payload__obstacle_episode_id"] = episode_id
+    if RobotCommand.objects.filter(**duplicate_filter).exists():
+        return None
+    template = SpeechTemplate.objects.filter(
+        name=title,
+        category__name=settings.INSPECTION_SPEECH_CATEGORY_NAME,
+    ).first()
+    if not template:
+        LOGGER.warning("obstacle speech template missing execution=%s title=%s", execution.id, title)
+        return None
+    try:
+        saved_path, cache_hit = tts_service.synthesize_speech(template.text)
+    except Exception:
+        LOGGER.exception("obstacle speech synthesis failed execution=%s title=%s", execution.id, title)
+        return None
+    return RobotCommand.objects.create(
+        robot=robot,
+        action="play_audio",
+        payload={
+            "audio_url": _public_media_url(saved_path),
+            "audio_name": template.name,
+            "text": template.text,
+            "source": "patrol_obstacle_speech",
+            "content_type": "audio/mpeg",
+            "tts_cache_hit": cache_hit,
+            "task_execution_id": str(execution.id),
+            "obstacle_episode_id": episode_id,
+            "speech_stage": stage,
+            "recovery_attempt": attempt,
+            "front_obstacle_distance_m": payload.get("front_obstacle_distance_m"),
+        },
+    )
 
 
 def _event_time(payload: dict, *keys: str):
@@ -247,7 +362,34 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
     if execution:
         final_state = command.result_payload.get("final_task_state")
         if not final_state and terminal_status in {"failed", "timed_out", "expired"}:
-            final_state = "timed_out" if command.error_code in {"COMMAND_EXPIRED", "COMMAND_TIMED_OUT"} else "failed"
+            if command.command_type == "task.pause":
+                # A late pause failure must never overwrite a newer resume.
+                # If pause is still the latest intent, restore running state.
+                if execution.state == "pausing":
+                    execution = TaskExecutionService.transition(
+                        execution,
+                        "running",
+                        event_type="task.pause.failed",
+                        reason_code=command.error_code,
+                        reason_message=command.error_message,
+                        payload=payload,
+                    )
+                final_state = None
+            elif command.command_type == "task.resume":
+                # Symmetric handling: keep a newer pause, otherwise restore
+                # the last confirmed paused state.
+                if execution.state == "resuming":
+                    execution = TaskExecutionService.transition(
+                        execution,
+                        "paused",
+                        event_type="task.resume.failed",
+                        reason_code=command.error_code,
+                        reason_message=command.error_message,
+                        payload=payload,
+                    )
+                final_state = None
+            else:
+                final_state = "timed_out" if command.error_code in {"COMMAND_EXPIRED", "COMMAND_TIMED_OUT"} else "failed"
         if final_state and final_state != execution.state:
             execution = TaskExecutionService.transition(
                 execution,
@@ -275,6 +417,14 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
             progress_fields.append("current_waypoint_index")
         if progress_fields:
             execution.save(update_fields=progress_fields + ["updated_at"])
+        # FollowWaypoints publishes feedback when it advances to the next
+        # waypoint, so the progress handler above announces every waypoint
+        # except the last one.  The final arrival is only known here, from the
+        # terminal task result.
+        if final_state == "completed":
+            final_index = len((execution.route_snapshot or {}).get("waypoints") or []) - 1
+            if final_index >= 0:
+                _queue_waypoint_speech(execution, robot, final_index)
         realtime_publisher.publish_task_event(str(execution.id), payload)
     return {"status": command.status}
 
@@ -288,8 +438,18 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         )
     except TaskExecution.DoesNotExist as exc:
         raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
+    if envelope.message_type == "task.obstacle_speech":
+        command = _queue_obstacle_speech(execution, robot, payload)
+        realtime_publisher.publish_task_event(
+            str(execution.id),
+            {"type": "obstacle_speech", "payload": payload, "audio_command_id": command.id if command else None},
+        )
+        return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
     if envelope.message_type == "task.progress":
+        previous_completed_waypoints = execution.completed_waypoints
         execution = TaskExecutionService.apply_progress(execution, payload)
+        if execution.completed_waypoints > previous_completed_waypoints:
+            _queue_waypoint_speech(execution, robot, execution.completed_waypoints - 1)
     else:
         target = payload["state"]
         incoming_version = int(payload["state_version"])

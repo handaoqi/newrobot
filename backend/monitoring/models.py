@@ -97,6 +97,24 @@ class Robot(BaseTimestampModel):
         return "online"
 
 
+class RobotPersonDetectionState(BaseTimestampModel):
+    """Latest person detections only; high-rate frames must not become alert records."""
+
+    robot = models.OneToOneField(
+        Robot,
+        related_name="person_detection_state",
+        on_delete=models.CASCADE,
+    )
+    camera_id = models.CharField(max_length=32, default="front")
+    frame_width = models.PositiveIntegerField(default=0)
+    frame_height = models.PositiveIntegerField(default=0)
+    captured_at = models.DateTimeField(default=timezone.now)
+    detections = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["robot__code"]
+
+
 class PatrolTask(BaseTimestampModel):
     STATUS_CHOICES = [
         ("pending", "待执行"),
@@ -425,6 +443,7 @@ class RobotCommand(BaseTimestampModel):
         ("move_right", "右移"),
         ("turn_left", "左转"),
         ("turn_right", "右转"),
+        ("move_velocity", "跟随速度"),
         ("takeover_enter", "进入远程接管"),
         ("takeover_exit", "退出远程接管"),
         ("move_stop", "停止移动"),
@@ -462,9 +481,26 @@ class RobotCommand(BaseTimestampModel):
         return f"{self.robot.code} {self.action} {self.status}"
 
 
+class SpeechCategory(BaseTimestampModel):
+    name = models.CharField(max_length=64, unique=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class SpeechTemplate(BaseTimestampModel):
     name = models.CharField(max_length=64, unique=True)
     text = models.CharField(max_length=500)
+    category = models.ForeignKey(
+        SpeechCategory,
+        related_name="templates",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         related_name="speech_templates",
@@ -478,6 +514,42 @@ class SpeechTemplate(BaseTimestampModel):
 
     def __str__(self) -> str:
         return self.name
+
+
+class RecordedAudio(BaseTimestampModel):
+    ASR_STATUS_CHOICES = [
+        ("pending", "识别中"),
+        ("completed", "识别完成"),
+        ("failed", "识别失败"),
+    ]
+
+    title = models.CharField(max_length=128)
+    category = models.ForeignKey(
+        SpeechCategory,
+        related_name="recordings",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    file = models.FileField(upload_to="recorded-audio/%Y/%m/%d/")
+    content_type = models.CharField(max_length=128, blank=True)
+    file_size = models.PositiveIntegerField(default=0)
+    transcript = models.TextField(blank=True)
+    asr_status = models.CharField(max_length=16, choices=ASR_STATUS_CHOICES, default="pending")
+    asr_error = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="recorded_audios",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
 
 
 class MapData(BaseTimestampModel):
@@ -761,6 +833,7 @@ class RemoteCommand(BaseTimestampModel):
         ("task.pause", "暂停任务"),
         ("task.resume", "继续任务"),
         ("task.cancel", "终止任务"),
+        ("task.force_exit", "强制退出并清理任务"),
         ("mapping.start", "开始建图"),
         ("mapping.save", "停止并保存地图"),
         ("mapping.cancel", "取消建图"),
@@ -782,6 +855,7 @@ class RemoteCommand(BaseTimestampModel):
         ("teleop.move_right", "右移"),
         ("teleop.turn_left", "左转"),
         ("teleop.turn_right", "右转"),
+        ("teleop.move_velocity", "跟随速度"),
         ("teleop.move_stop", "停止移动"),
         ("teleop.passive", "软急停"),
     ]

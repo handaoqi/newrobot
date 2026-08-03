@@ -15,17 +15,17 @@ class TaskStateError(ValueError):
 
 
 ALLOWED_TRANSITIONS = {
-    "created": {"dispatching"},
-    "dispatching": {"accepted", "rejected", "timed_out"},
+    "created": {"dispatching", "pausing", "resuming", "cancelling", "cancelled"},
+    "dispatching": {"accepted", "pausing", "resuming", "cancelling", "cancelled", "rejected", "timed_out"},
     # MQTT delivery can make the final Result overtake task.started.
     # Edge Result is authoritative, so terminal reconciliation is legal here.
-    "accepted": {"running", "completed", "cancelled", "failed", "timed_out", "interrupted"},
-    "running": {"pausing", "cancelling", "completed", "failed", "timed_out", "interrupted"},
-    "pausing": {"paused", "failed", "interrupted"},
-    "paused": {"resuming", "cancelling", "interrupted"},
-    "resuming": {"running", "failed", "interrupted"},
+    "accepted": {"running", "pausing", "resuming", "cancelling", "completed", "cancelled", "failed", "timed_out", "interrupted"},
+    "running": {"pausing", "resuming", "cancelling", "cancelled", "completed", "failed", "timed_out", "interrupted"},
+    "pausing": {"accepted", "running", "paused", "resuming", "cancelling", "cancelled", "failed", "interrupted"},
+    "paused": {"pausing", "resuming", "cancelling", "cancelled", "interrupted"},
+    "resuming": {"accepted", "running", "paused", "pausing", "cancelling", "cancelled", "failed", "interrupted"},
     "cancelling": {"cancelled", "failed", "interrupted"},
-    "interrupted": {"paused", "running", "cancelling", "failed"},
+    "interrupted": {"paused", "running", "pausing", "resuming", "cancelling", "cancelled", "failed"},
 }
 
 
@@ -46,6 +46,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             waypoint_id = str(raw.get("waypoint_id") or f"wp-{index + 1}")
             dwell_seconds = int(raw.get("dwell_seconds", 0))
             actions = list(raw.get("actions") or [])
+            speech_template_id = raw.get("speech_template_id")
+            speech_template_name = str(raw.get("speech_template_name") or "")
+            speech_text = str(raw.get("speech_text") or "")
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
             x, y = raw[0], raw[1]
             yaw = raw[2] if len(raw) >= 3 else 0.0
@@ -53,10 +56,12 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             waypoint_id = f"wp-{index + 1}"
             dwell_seconds = 0
             actions = []
+            speech_template_id = None
+            speech_template_name = ""
+            speech_text = ""
         else:
             raise TaskStateError(f"route waypoint {index} has invalid format")
-        normalized.append(
-            {
+        waypoint = {
                 "waypoint_id": waypoint_id,
                 "sequence": index,
                 "name": name,
@@ -66,7 +71,15 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "dwell_seconds": dwell_seconds,
                 "actions": actions,
             }
-        )
+        if speech_template_id not in (None, ""):
+            waypoint.update(
+                {
+                    "speech_template_id": int(speech_template_id),
+                    "speech_template_name": speech_template_name,
+                    "speech_text": speech_text,
+                }
+            )
+        normalized.append(waypoint)
     if not normalized:
         raise TaskStateError("route must contain at least one waypoint")
     return normalized

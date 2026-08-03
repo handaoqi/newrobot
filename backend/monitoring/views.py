@@ -5,14 +5,12 @@ import logging
 import math
 import zipfile
 from datetime import time as datetime_time, timedelta
-from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
-from django.core.files.storage import default_storage
 from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
@@ -33,7 +31,10 @@ from .models import (
     PatrolTask,
     PatrolSchedule,
     Robot,
+    RobotPersonDetectionState,
     RobotCommand,
+    RecordedAudio,
+    SpeechCategory,
     SpeechTemplate,
     RobotSession,
     RobotStatusLatest,
@@ -54,7 +55,7 @@ from .services.alert_service import AlertService
 from .services.command_service import CommandService
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError
-from .services import tts_service
+from .services import asr_service, tts_service
 from .serializers import (
     EventSerializer,
     CalendarDaySerializer,
@@ -65,12 +66,15 @@ from .serializers import (
     PatrolScheduleSerializer,
     RobotCommandCreateSerializer,
     RobotCommandSerializer,
+    RecordedAudioSerializer,
+    SpeechCategorySerializer,
     SpeechTemplateSerializer,
     SpeechSynthesisSerializer,
     RobotDetailSerializer,
     RobotSerializer,
     RemoteCommandSerializer,
     TelemetryIngestSerializer,
+    PersonDetectionIngestSerializer,
     MapDataSerializer,
     MapSetSerializer,
     PatrolRouteSerializer,
@@ -94,6 +98,63 @@ def build_public_media_url(request, saved_path: str) -> str:
     media_path = f"{media_url.rstrip('/')}/{saved_path}"
     public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
     return f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
+
+
+def is_bicycle_detection(detection: dict) -> bool:
+    values = {
+        str(detection.get("object_class") or "").strip().lower(),
+        str(detection.get("type") or "").strip().lower(),
+        str(detection.get("label") or "").strip().lower(),
+    }
+    if values & {"bicycle", "bike", "自行车", "vehicle_illegal_parking", "自行车违停"}:
+        return True
+    return any("自行车" in value or "bicycle" in value for value in values)
+
+
+def queue_bicycle_departure_speech(request, robot: Robot, detection: dict, event: InspectionEvent):
+    if not settings.BICYCLE_AUTO_SPEECH_ENABLED or not is_bicycle_detection(detection):
+        return None
+
+    cutoff = timezone.now() - timedelta(seconds=settings.BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS)
+    recent_filter = {
+        "robot": robot,
+        "action": "play_audio",
+        "payload__source": "vision_bicycle_auto",
+        "created_at__gte": cutoff,
+    }
+    if RobotCommand.objects.filter(**recent_filter).exists():
+        return None
+
+    template = SpeechTemplate.objects.filter(name=settings.BICYCLE_AUTO_SPEECH_TEMPLATE_NAME).first()
+    if not template:
+        LOGGER.warning("automatic bicycle speech template missing: %s", settings.BICYCLE_AUTO_SPEECH_TEMPLATE_NAME)
+        return None
+
+    try:
+        saved_path, cache_hit = tts_service.synthesize_speech(template.text)
+    except Exception:
+        LOGGER.exception("automatic bicycle speech synthesis failed robot=%s event=%s", robot.code, event.event_id)
+        return None
+
+    with transaction.atomic():
+        locked_robot = Robot.objects.select_for_update().get(pk=robot.pk)
+        if RobotCommand.objects.filter(**{**recent_filter, "robot": locked_robot}).exists():
+            return None
+        return RobotCommand.objects.create(
+            robot=locked_robot,
+            action="play_audio",
+            payload={
+                "audio_url": build_public_media_url(request, saved_path),
+                "audio_name": template.name,
+                "text": template.text,
+                "source": "vision_bicycle_auto",
+                "content_type": "audio/mpeg",
+                "tts_cache_hit": cache_hit,
+                "inspection_event_id": str(event.event_id),
+                "object_class": detection.get("object_class", ""),
+                "track_id": detection.get("track_id", ""),
+            },
+        )
 
 
 def build_period_labels(days: int = 7):
@@ -812,6 +873,7 @@ class RobotCommandView(APIView):
         "move_right": "teleop.move_right",
         "turn_left": "teleop.turn_left",
         "turn_right": "teleop.turn_right",
+        "move_velocity": "teleop.move_velocity",
         "move_stop": "teleop.move_stop",
         "passive": "teleop.passive",
     }
@@ -899,24 +961,89 @@ class RobotAudioRecordingCommandView(APIView):
         if extension not in self.ALLOWED_EXTENSIONS:
             return Response({"detail": "不支持的录音格式"}, status=status.HTTP_400_BAD_REQUEST)
 
-        relative_path = timezone.now().strftime("command-audio/%Y/%m/%d/")
-        saved_path = default_storage.save(f"{relative_path}{uuid4().hex}{extension}", uploaded_file)
-        audio_url = build_public_media_url(request, saved_path)
+        title = str(request.data.get("title") or request.data.get("audio_name") or "现场录音").strip()
+        if not title:
+            return Response({"detail": "录音标题不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(title) > 128:
+            return Response({"detail": "录音标题不能超过 128 个字符"}, status=status.HTTP_400_BAD_REQUEST)
+
+        category = None
+        category_id = request.data.get("category")
+        if category_id not in (None, "", "null"):
+            category = get_object_or_404(SpeechCategory, pk=category_id)
+
+        uploaded_file.name = f"recording{extension}"
+        recording = RecordedAudio.objects.create(
+            title=title,
+            category=category,
+            file=uploaded_file,
+            content_type=content_type,
+            file_size=uploaded_file.size,
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        asr_service.process_recording(recording)
+        recording.refresh_from_db()
+        recording_data = RecordedAudioSerializer(recording, context={"request": request}).data
+        audio_url = recording_data["audio_url"]
+        play_now = str(request.data.get("play_now", "true")).strip().lower() not in {"0", "false", "no", "off"}
+        command = None
+        if play_now:
+            command = RobotCommand.objects.create(
+                robot=robot,
+                action="play_audio",
+                payload={
+                    "audio_url": audio_url,
+                    "audio_name": title,
+                    "source": "dashboard_recording",
+                    "recording_id": recording.id,
+                    "content_type": recording.content_type,
+                    "file_size": recording.file_size,
+                },
+            )
+        return Response(
+            {
+                "audio_url": audio_url,
+                "recording": recording_data,
+                "command": RobotCommandSerializer(command).data if command else None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class RecordedAudioListView(APIView):
+    def get(self, request):
+        recordings = RecordedAudio.objects.select_related("category").all()
+        return Response(RecordedAudioSerializer(recordings, many=True, context={"request": request}).data)
+
+
+class RecordedAudioDetailView(APIView):
+    def delete(self, request, pk):
+        recording = get_object_or_404(RecordedAudio, pk=pk)
+        stored_file = recording.file
+        recording.delete()
+        if stored_file:
+            stored_file.delete(save=False)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class RobotRecordedAudioPlayView(APIView):
+    def post(self, request, robot_id, recording_id):
+        robot = get_object_or_404(Robot, id=robot_id)
+        recording = get_object_or_404(RecordedAudio, id=recording_id)
+        recording_data = RecordedAudioSerializer(recording, context={"request": request}).data
         command = RobotCommand.objects.create(
             robot=robot,
             action="play_audio",
             payload={
-                "audio_url": audio_url,
-                "audio_name": request.data.get("audio_name") or "现场录音",
-                "source": "dashboard_recording",
-                "content_type": content_type,
-                "file_size": uploaded_file.size,
+                "audio_url": recording_data["audio_url"],
+                "audio_name": recording.title,
+                "source": "dashboard_recording_library",
+                "recording_id": recording.id,
+                "content_type": recording.content_type,
+                "file_size": recording.file_size,
             },
         )
-        return Response(
-            {"audio_url": audio_url, "command": RobotCommandSerializer(command).data},
-            status=status.HTTP_201_CREATED,
-        )
+        return Response(RobotCommandSerializer(command).data, status=status.HTTP_201_CREATED)
 
 
 class SpeechTemplateListCreateView(APIView):
@@ -940,6 +1067,30 @@ class SpeechTemplateDetailView(APIView):
 
     def delete(self, request, pk):
         get_object_or_404(SpeechTemplate, pk=pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SpeechCategoryListCreateView(APIView):
+    def get(self, request):
+        return Response(SpeechCategorySerializer(SpeechCategory.objects.all(), many=True).data)
+
+    def post(self, request):
+        serializer = SpeechCategorySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        category = serializer.save()
+        return Response(SpeechCategorySerializer(category).data, status=status.HTTP_201_CREATED)
+
+
+class SpeechCategoryDetailView(APIView):
+    def patch(self, request, pk):
+        category = get_object_or_404(SpeechCategory, pk=pk)
+        serializer = SpeechCategorySerializer(category, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        get_object_or_404(SpeechCategory, pk=pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1010,11 +1161,21 @@ class DeviceCommandPollView(APIView):
             command = (
                 RobotCommand.objects.select_for_update(skip_locked=True)
                 .filter(robot=robot, action="play_audio", status="queued")
-                .order_by("created_at")
+                .order_by("-created_at")
                 .first()
             )
             if command is None:
                 return Response(status=status.HTTP_204_NO_CONTENT)
+            RobotCommand.objects.filter(
+                robot=robot,
+                action="play_audio",
+                status="queued",
+                created_at__lt=command.created_at,
+            ).update(
+                status="superseded",
+                error_message="已被更新的播报替换",
+                updated_at=timezone.now(),
+            )
             command.status = "sent"
             command.sent_at = timezone.now()
             command.save(update_fields=["status", "sent_at", "updated_at"])
@@ -1026,9 +1187,9 @@ class DeviceCommandReportView(APIView):
 
     def post(self, request, command_id):
         status_value = str(request.data.get("status", "")).strip()
-        if status_value not in {"running", "finished", "failed"}:
+        if status_value not in {"running", "finished", "failed", "superseded"}:
             return Response(
-                {"detail": "status must be running, finished, or failed"},
+                {"detail": "status must be running, finished, failed, or superseded"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         command = get_object_or_404(
@@ -1253,6 +1414,7 @@ class TelemetryIngestView(APIView):
 
         frame_width = video.get("frame_width")
         frame_height = video.get("frame_height")
+        queued_audio_command_ids = []
         for detection in payload.get("detections", []):
             bbox = detection.get("bbox") or {}
             event = InspectionEvent.objects.create(
@@ -1291,10 +1453,74 @@ class TelemetryIngestView(APIView):
                     },
                 },
             )
+            audio_command = queue_bicycle_departure_speech(request, robot, detection, event)
+            if audio_command:
+                queued_audio_command_ids.append(audio_command.id)
 
         return Response(
-            {"detail": "上报成功", "robot_id": robot.id, "telemetry_id": telemetry.id, "duplicate": False},
+            {
+                "detail": "上报成功",
+                "robot_id": robot.id,
+                "telemetry_id": telemetry.id,
+                "duplicate": False,
+                "audio_commands_queued": queued_audio_command_ids,
+            },
             status=status.HTTP_201_CREATED,
+        )
+
+
+class DevicePersonDetectionView(APIView):
+    permission_classes = [IsAuthenticatedOrDeviceCredential]
+
+    def post(self, request):
+        serializer = PersonDetectionIngestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        robot = get_object_or_404(Robot, code=payload["robot_code"])
+        if hasattr(request, "device_robot") and request.device_robot.id != robot.id:
+            return Response({"detail": "设备凭证与 robot_code 不匹配"}, status=status.HTTP_403_FORBIDDEN)
+        state, _ = RobotPersonDetectionState.objects.update_or_create(
+            robot=robot,
+            defaults={
+                "camera_id": payload["camera_id"],
+                "frame_width": payload["frame_width"],
+                "frame_height": payload["frame_height"],
+                "captured_at": payload["captured_at"],
+                "detections": payload["detections"],
+            },
+        )
+        return Response(
+            {"detail": "人形检测帧已更新", "count": len(state.detections)},
+            status=status.HTTP_200_OK,
+        )
+
+
+class RobotPersonDetectionView(APIView):
+    def get(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        state = RobotPersonDetectionState.objects.filter(robot=robot).first()
+        if state is None:
+            return Response(
+                {
+                    "robot_id": robot.id,
+                    "camera_id": robot.camera_id,
+                    "available": False,
+                    "stale": True,
+                    "detections": [],
+                }
+            )
+        stale = timezone.now() - state.captured_at > timedelta(seconds=3)
+        return Response(
+            {
+                "robot_id": robot.id,
+                "camera_id": state.camera_id,
+                "available": not stale,
+                "stale": stale,
+                "frame_width": state.frame_width,
+                "frame_height": state.frame_height,
+                "captured_at": state.captured_at,
+                "detections": [] if stale else state.detections,
+            }
         )
 
 
@@ -2677,6 +2903,10 @@ class TaskExecutionResumeView(TaskExecutionCommandView):
 
 class TaskExecutionCancelView(TaskExecutionCommandView):
     command_type = "task.cancel"
+
+
+class TaskExecutionForceExitView(TaskExecutionCommandView):
+    command_type = "task.force_exit"
 
 
 class TaskExecutionTrajectoryView(APIView):

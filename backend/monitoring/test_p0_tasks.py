@@ -3,7 +3,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, TaskExecution
+from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, SpeechCategory, SpeechTemplate, TaskExecution
 from .services.command_service import CommandService
 from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
 
@@ -48,6 +48,25 @@ class TaskExecutionTests(TestCase):
         execution.refresh_from_db()
         self.assertEqual(execution.route_snapshot["waypoints"][0]["x"], 1.0)
 
+    def test_route_snapshot_preserves_waypoint_speech_template(self):
+        category = SpeechCategory.objects.create(name="巡检智能播报")
+        template = SpeechTemplate.objects.create(name="到点提醒", text="已到达巡检点", category=category)
+        self.route.waypoints = [
+            {
+                "x": 1,
+                "y": 2,
+                "yaw": 0,
+                "speech_template_id": template.id,
+                "speech_template_name": template.name,
+                "speech_text": template.text,
+            }
+        ]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertEqual(waypoint["speech_template_id"], template.id)
+        self.assertEqual(waypoint["speech_template_name"], "到点提醒")
+
     def test_one_active_execution_per_robot(self):
         TaskExecutionService.create_execution(self.task, self.user)
         with self.assertRaises(TaskStateError):
@@ -64,6 +83,15 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(command.events.get().event_type, "created")
         execution.refresh_from_db()
         self.assertEqual(execution.state, "dispatching")
+
+    def test_force_exit_clears_active_execution_and_unblocks_next_task(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        command = CommandService.create(execution, "task.force_exit", self.user)
+        execution.refresh_from_db()
+        self.assertEqual(command.command_type, "task.force_exit")
+        self.assertEqual(execution.state, "cancelled")
+        next_execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.assertEqual(next_execution.state, "created")
 
     def test_task_api_execute_and_busy_conflict(self):
         client = APIClient()

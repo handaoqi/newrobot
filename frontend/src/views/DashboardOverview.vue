@@ -7,12 +7,18 @@ import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
+  createSpeechCategory,
   createSpeechTemplate,
+  deleteSpeechCategory,
+  deleteRecordedAudio,
   deleteSpeechTemplate,
   fetchOverview,
+  fetchRecordedAudios,
   fetchRobotDetail,
   fetchRobots,
+  fetchSpeechCategories,
   fetchSpeechTemplates,
+  playSavedRecording,
   sendRecordedAudioCommand,
   sendRobotCommand,
   sendTextToSpeechCommand,
@@ -29,15 +35,25 @@ const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
+const speechCategories = ref([])
 const speechTemplates = ref([])
+const selectedCategoryFilter = ref('all')
 const selectedSpeakerTemplateId = ref(null)
+const selectedRecordingId = ref(null)
+const selectedTemplateCategoryId = ref(null)
 const templateName = ref('驶离提醒')
+const newCategoryName = ref('')
 const templateSaving = ref(false)
+const categorySaving = ref(false)
 const audioCommandSending = ref(false)
 const recording = ref(false)
 const recordedBlob = ref(null)
 const recordedUrl = ref('')
 const recordingSeconds = ref(0)
+const recordingTitle = ref('现场录音')
+const recordingCategoryId = ref(null)
+const savedRecordings = ref([])
+const recordingSaving = ref(false)
 const videoRef = ref(null)
 const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
@@ -64,6 +80,18 @@ const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
+const speechLibraryItems = computed(() => [
+  ...speechTemplates.value.map((item) => ({ ...item, title: item.name, source_type: 'tts' })),
+  ...savedRecordings.value.map((item) => ({ ...item, name: item.title, text: item.transcript, source_type: 'recording' })),
+])
+const filteredSpeechItems = computed(() => {
+  if (selectedCategoryFilter.value === 'all') return speechLibraryItems.value
+  if (selectedCategoryFilter.value === 'uncategorized') {
+    return speechLibraryItems.value.filter((item) => !item.category)
+  }
+  return speechLibraryItems.value.filter((item) => item.category === selectedCategoryFilter.value)
+})
+const selectedSourceType = computed(() => selectedRecordingId.value ? 'recording' : 'tts')
 const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
@@ -110,20 +138,46 @@ function setSpeakerTemplate(template) {
   speakerText.value = template.text
   templateName.value = template.name
   selectedSpeakerTemplateId.value = template.id
+  selectedRecordingId.value = null
+  selectedTemplateCategoryId.value = template.category || null
   showToast('已切换喊话模板')
 }
 
-async function loadSpeechTemplates() {
-  speechTemplates.value = await fetchSpeechTemplates()
+function setSpeechItem(item) {
+  if (item.source_type === 'recording') {
+    selectedRecordingId.value = item.id
+    selectedSpeakerTemplateId.value = null
+    templateName.value = item.title
+    speakerText.value = item.transcript || (item.asr_status === 'failed' ? '语音识别失败，可直接播放原录音' : '语音识别中')
+    selectedTemplateCategoryId.value = item.category || null
+    showToast('已切换到录音喊话，开始喊话将播放原录音')
+    return
+  }
+  setSpeakerTemplate(item)
+}
+
+async function loadSpeechLibrary() {
+  const [categories, templates] = await Promise.all([fetchSpeechCategories(), fetchSpeechTemplates()])
+  speechCategories.value = categories
+  speechTemplates.value = templates
   const selected = speechTemplates.value.find((item) => item.id === selectedSpeakerTemplateId.value) ||
     speechTemplates.value.find((item) => item.name === templateName.value) ||
     speechTemplates.value[0]
   if (selected && selectedSpeakerTemplateId.value === null) setSpeakerTemplate(selected)
 }
 
+async function loadRecordingLibrary() {
+  savedRecordings.value = await fetchRecordedAudios()
+}
+
 async function beginSpeak() {
   const robot = latestRobot.value
   if (!robot?.id || audioCommandSending.value) return
+  if (selectedRecordingId.value) {
+    const recordingItem = savedRecordings.value.find((item) => item.id === selectedRecordingId.value)
+    if (recordingItem) await replaySavedRecording(recordingItem)
+    return
+  }
   const text = speakerText.value.trim()
   if (!text) {
     showToast('请输入需要播报的文字')
@@ -147,6 +201,19 @@ async function beginSpeak() {
 }
 
 async function previewVoice() {
+  if (selectedRecordingId.value) {
+    const recordingItem = savedRecordings.value.find((item) => item.id === selectedRecordingId.value)
+    if (!recordingItem?.audio_url) return
+    if (previewPlayer) previewPlayer.pause()
+    previewPlayer = new Audio(recordingItem.audio_url)
+    try {
+      await previewPlayer.play()
+      showToast('正在预览原录音')
+    } catch (_error) {
+      showToast('录音预览失败')
+    }
+    return
+  }
   const text = speakerText.value.trim()
   if (!text || audioCommandSending.value) {
     if (!text) showToast('请输入需要预览的文字')
@@ -176,10 +243,10 @@ async function saveSpeechTemplate() {
   templateSaving.value = true
   try {
     const saved = selectedSpeakerTemplateId.value
-      ? await updateSpeechTemplate(selectedSpeakerTemplateId.value, { name, text })
-      : await createSpeechTemplate({ name, text })
+      ? await updateSpeechTemplate(selectedSpeakerTemplateId.value, { name, text, category: selectedTemplateCategoryId.value })
+      : await createSpeechTemplate({ name, text, category: selectedTemplateCategoryId.value })
     selectedSpeakerTemplateId.value = saved.id
-    await loadSpeechTemplates()
+    await loadSpeechLibrary()
     showToast('喊话文案已保存')
   } catch (error) {
     showToast(error.message || '保存文案失败')
@@ -190,6 +257,10 @@ async function saveSpeechTemplate() {
 
 function startNewSpeechTemplate() {
   selectedSpeakerTemplateId.value = null
+  selectedRecordingId.value = null
+  selectedTemplateCategoryId.value = typeof selectedCategoryFilter.value === 'number'
+    ? selectedCategoryFilter.value
+    : null
   templateName.value = ''
   speakerText.value = ''
 }
@@ -202,12 +273,50 @@ async function removeSpeechTemplate() {
     selectedSpeakerTemplateId.value = null
     templateName.value = ''
     speakerText.value = ''
-    await loadSpeechTemplates()
+    await loadSpeechLibrary()
     showToast('喊话文案已删除')
   } catch (error) {
     showToast(error.message || '删除文案失败')
   } finally {
     templateSaving.value = false
+  }
+}
+
+async function addSpeechCategory() {
+  const name = newCategoryName.value.trim()
+  if (!name || categorySaving.value) {
+    if (!name) showToast('请输入分类名称')
+    return
+  }
+  categorySaving.value = true
+  try {
+    const category = await createSpeechCategory(name)
+    newCategoryName.value = ''
+    selectedCategoryFilter.value = category.id
+    selectedTemplateCategoryId.value = category.id
+    await loadSpeechLibrary()
+    showToast('播报分类已创建')
+  } catch (error) {
+    showToast(error.message || '创建分类失败')
+  } finally {
+    categorySaving.value = false
+  }
+}
+
+async function removeSpeechCategory() {
+  const categoryId = selectedCategoryFilter.value
+  if (typeof categoryId !== 'number' || categorySaving.value) return
+  categorySaving.value = true
+  try {
+    await deleteSpeechCategory(categoryId)
+    if (selectedTemplateCategoryId.value === categoryId) selectedTemplateCategoryId.value = null
+    selectedCategoryFilter.value = 'all'
+    await loadSpeechLibrary()
+    showToast('分类已删除，原有文案已转为未分类')
+  } catch (error) {
+    showToast(error.message || '删除分类失败')
+  } finally {
+    categorySaving.value = false
   }
 }
 
@@ -286,26 +395,70 @@ function recordingDurationLabel() {
   return `${minutes}:${seconds}`
 }
 
-async function playRecordedAudio() {
+async function saveRecordedAudio(playNow = false) {
   const robot = latestRobot.value
-  if (!robot?.id || !recordedBlob.value || audioCommandSending.value) return
+  const title = recordingTitle.value.trim()
+  if (!robot?.id || !recordedBlob.value || recordingSaving.value || audioCommandSending.value) return
+  if (!title) {
+    showToast('请输入录音标题')
+    return
+  }
   const extension = recordedBlob.value.type.includes('ogg') ? 'ogg' : 'webm'
   const file = new File([recordedBlob.value], `dashboard-recording.${extension}`, {
     type: recordedBlob.value.type || 'audio/webm',
   })
   const commandStartedAt = Date.now()
+  recordingSaving.value = true
+  if (playNow) audioCommandSending.value = true
+  try {
+    const result = await sendRecordedAudioCommand(robot.id, file, {
+      title,
+      category: recordingCategoryId.value,
+      playNow,
+    })
+    await loadRecordingLibrary()
+    const saved = savedRecordings.value.find((item) => item.id === result.recording?.id)
+    if (saved) setSpeechItem({ ...saved, source_type: 'recording' })
+    showToast(playNow ? '录音已保存并下发播放' : '录音已保存')
+  } catch (error) {
+    showToast(error.message || '录音保存失败')
+  } finally {
+    if (playNow) {
+      const cooldownRemaining = AUDIO_COMMAND_COOLDOWN_MS - (Date.now() - commandStartedAt)
+      if (cooldownRemaining > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, cooldownRemaining))
+      }
+      audioCommandSending.value = false
+    }
+    recordingSaving.value = false
+  }
+}
+
+async function replaySavedRecording(recordingItem) {
+  const robot = latestRobot.value
+  if (!robot?.id || audioCommandSending.value) return
   audioCommandSending.value = true
   try {
-    await sendRecordedAudioCommand(robot.id, file, '现场录音')
-    showToast('已上传录音并下发播放指令')
+    await playSavedRecording(robot.id, recordingItem.id)
+    showToast(`已下发录音“${recordingItem.title}”`)
   } catch (error) {
     showToast(error.message || '录音播放指令下发失败')
   } finally {
-    const cooldownRemaining = AUDIO_COMMAND_COOLDOWN_MS - (Date.now() - commandStartedAt)
-    if (cooldownRemaining > 0) {
-      await new Promise((resolve) => window.setTimeout(resolve, cooldownRemaining))
-    }
-    audioCommandSending.value = false
+    window.setTimeout(() => { audioCommandSending.value = false }, AUDIO_COMMAND_COOLDOWN_MS)
+  }
+}
+
+async function removeRecordedAudio(recordingItem) {
+  if (recordingSaving.value || !window.confirm(`确定删除录音“${recordingItem.title}”吗？`)) return
+  recordingSaving.value = true
+  try {
+    await deleteRecordedAudio(recordingItem.id)
+    await loadRecordingLibrary()
+    showToast('录音已删除')
+  } catch (error) {
+    showToast(error.message || '删除录音失败')
+  } finally {
+    recordingSaving.value = false
   }
 }
 
@@ -698,14 +851,18 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
   setupAlertStream()
   try {
-    const [overviewData, robotData, templateData] = await Promise.all([
+    const [overviewData, robotData, categoryData, templateData, recordingData] = await Promise.all([
       fetchOverview(),
       fetchRobots(),
+      fetchSpeechCategories().catch(() => []),
       fetchSpeechTemplates().catch(() => []),
+      fetchRecordedAudios().catch(() => []),
     ])
     overview.value = overviewData
     robots.value = robotData
+    speechCategories.value = categoryData
     speechTemplates.value = templateData
+    savedRecordings.value = recordingData
     const initialTemplate = templateData.find((item) => item.name === templateName.value) || templateData[0]
     if (initialTemplate) setSpeakerTemplate(initialTemplate)
     const initialRobotId = overviewData.latest_robot?.id || robotData[0]?.id
@@ -975,45 +1132,107 @@ function handleVisibilityChange() {
           <span class="panel-badge">Control</span>
         </div>
         <div class="speaker-box">
-          <textarea v-model="speakerText" maxlength="500" placeholder="输入什么文字，机器狗就播报什么文字"></textarea>
+          <div class="speech-category-manager">
+            <div class="speech-category-tabs">
+              <button class="chip" :class="{ active: selectedCategoryFilter === 'all' }" @click="selectedCategoryFilter = 'all'">全部</button>
+              <button
+                v-for="category in speechCategories"
+                :key="category.id"
+                class="chip"
+                :class="{ active: selectedCategoryFilter === category.id }"
+                @click="selectedCategoryFilter = category.id"
+              >
+                {{ category.name }}（{{ (category.template_count || 0) + (category.recording_count || 0) }}）
+              </button>
+              <button class="chip" :class="{ active: selectedCategoryFilter === 'uncategorized' }" @click="selectedCategoryFilter = 'uncategorized'">未分类</button>
+            </div>
+            <div class="speech-category-create">
+              <input v-model="newCategoryName" maxlength="64" placeholder="新分类名称" @keyup.enter="addSpeechCategory" />
+              <button class="ghost-btn" :disabled="categorySaving" @click="addSpeechCategory">创建分类</button>
+              <button class="danger-btn" :disabled="typeof selectedCategoryFilter !== 'number' || categorySaving" @click="removeSpeechCategory">删除当前分类</button>
+            </div>
+          </div>
           <div class="quick-actions">
             <button
-              v-for="item in speechTemplates"
-              :key="item.id"
+              v-for="item in filteredSpeechItems"
+              :key="`${item.source_type}-${item.id}`"
               class="chip"
-              :class="{ active: selectedSpeakerTemplateId === item.id }"
-              @click="setSpeakerTemplate(item)"
+              :class="[
+                `speech-source-${item.source_type}`,
+                { active: item.source_type === 'recording' ? selectedRecordingId === item.id : selectedSpeakerTemplateId === item.id },
+              ]"
+              @click="setSpeechItem(item)"
             >
-              {{ item.name }}
+              <span>{{ item.name }}</span>
+              <small>{{ item.source_type === 'recording' ? '录音' : '文案' }}</small>
             </button>
           </div>
           <div class="template-editor">
-            <input v-model="templateName" maxlength="64" placeholder="文案名称，例如：重点路段" />
-            <button class="ghost-btn" :disabled="templateSaving" @click="saveSpeechTemplate">
+            <input v-model="templateName" maxlength="64" :readonly="selectedSourceType === 'recording'" placeholder="新建标题，例如：重点路段" />
+            <select v-model="selectedTemplateCategoryId" :disabled="selectedSourceType === 'recording'">
+              <option :value="null">未分类</option>
+              <option v-for="category in speechCategories" :key="category.id" :value="category.id">{{ category.name }}</option>
+            </select>
+            <button class="ghost-btn" :disabled="templateSaving || selectedSourceType === 'recording'" @click="saveSpeechTemplate">
               {{ selectedSpeakerTemplateId ? '更新文案' : '保存文案' }}
             </button>
             <button class="ghost-btn" :disabled="templateSaving" @click="startNewSpeechTemplate">新建</button>
-            <button class="danger-btn" :disabled="!selectedSpeakerTemplateId || templateSaving" @click="removeSpeechTemplate">删除</button>
+            <button class="danger-btn" :disabled="!selectedSpeakerTemplateId || templateSaving || selectedSourceType === 'recording'" @click="removeSpeechTemplate">删除</button>
           </div>
+          <textarea
+            v-model="speakerText"
+            maxlength="500"
+            :readonly="selectedSourceType === 'recording'"
+            :class="{ 'recording-transcript': selectedSourceType === 'recording' }"
+            :placeholder="selectedSourceType === 'recording' ? '录音保存后会自动识别文字' : '输入什么文字，机器狗就播报什么文字'"
+          ></textarea>
           <div class="action-row">
             <button class="primary-btn" :disabled="audioCommandSending" @click="beginSpeak">
-              {{ audioCommandSending ? '语音生成中' : '开始喊话' }}
+              {{ audioCommandSending ? '下发中' : '开始喊话' }}
             </button>
-            <button class="ghost-btn" :disabled="audioCommandSending" @click="previewVoice">语音预览</button>
+            <button class="ghost-btn" :disabled="audioCommandSending" @click="previewVoice">
+              {{ selectedSourceType === 'recording' ? '原录音预览' : '语音预览' }}
+            </button>
           </div>
           <div class="recording-box">
             <div class="recording-status" :class="{ active: recording }">
               <span>{{ recording ? '录音中' : recordedBlob ? '录音完成' : '未录音' }}</span>
               <strong>{{ recordingDurationLabel() }}</strong>
             </div>
+            <div class="recording-meta">
+              <input v-model="recordingTitle" maxlength="128" placeholder="录音标题，例如：南门劝导" />
+              <select v-model="recordingCategoryId">
+                <option :value="null">未分类</option>
+                <option v-for="category in speechCategories" :key="category.id" :value="category.id">{{ category.name }}</option>
+              </select>
+            </div>
             <div class="action-row">
-              <button class="ghost-btn" :disabled="audioCommandSending || recording" @click="startRecording">录音</button>
+              <button class="ghost-btn" :disabled="audioCommandSending || recordingSaving || recording" @click="startRecording">录音</button>
               <button class="ghost-btn" :disabled="!recording" @click="stopRecording">停止</button>
-              <button class="primary-btn" :disabled="!recordedBlob || audioCommandSending || recording" @click="playRecordedAudio">
-                播放录音
+              <button class="ghost-btn" :disabled="!recordedBlob || recordingSaving || recording" @click="saveRecordedAudio(false)">
+                {{ recordingSaving ? '保存中' : '仅保存' }}
+              </button>
+              <button class="primary-btn" :disabled="!recordedBlob || audioCommandSending || recordingSaving || recording" @click="saveRecordedAudio(true)">
+                保存并播放
               </button>
             </div>
             <audio v-if="recordedUrl" class="recording-preview" :src="recordedUrl" controls></audio>
+            <div v-if="savedRecordings.length" class="recording-library">
+              <div class="recording-library-title">已保存录音</div>
+              <article v-for="item in savedRecordings" :key="item.id" class="recording-item">
+                <div>
+                  <strong class="recording-title">{{ item.title }} <em>录音</em></strong>
+                  <small class="recording-copy">
+                    {{ item.transcript || (item.asr_status === 'failed' ? `识别失败：${item.asr_error || '未识别到文字'}` : '文案识别中') }}
+                  </small>
+                  <small>{{ item.category_name || '未分类' }} · {{ formatEventTime(item.created_at) }}</small>
+                </div>
+                <div class="recording-item-actions">
+                  <button class="ghost-btn" :disabled="audioCommandSending" @click="replaySavedRecording(item)">开始喊话</button>
+                  <button class="danger-btn" :disabled="recordingSaving" @click="removeRecordedAudio(item)">删除</button>
+                </div>
+              </article>
+            </div>
           </div>
           <div class="mini-row">
             <div class="mini-card">当前音量 {{ latestRobot?.speaker_volume }}%</div>

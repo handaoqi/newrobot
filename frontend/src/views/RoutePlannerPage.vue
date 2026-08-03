@@ -7,11 +7,14 @@ import {
   fetchRobotStatus,
   fetchRobots,
   fetchRoutes,
+  fetchSpeechCategories,
+  fetchSpeechTemplates,
   createRoute,
   updateRoute,
   deleteRoute,
   executeRoute,
   sendRobotNavigationCommand,
+  synthesizeSpeech,
 } from '../services/api'
 import { API_BASE } from '../services/api'
 
@@ -25,6 +28,8 @@ const getFullUrl = (relativeUrl) => {
   return `${API_BASE.replace('/api', '')}${relativeUrl}`
 }
 const routes = ref([])
+const speechCategories = ref([])
+const speechTemplates = ref([])
 const selectedMap = ref(null)
 const selectedRoute = ref(null)
 const waypoints = ref([])
@@ -32,6 +37,7 @@ const waypointNames = ref([])
 const showRouteDialog = ref(false)
 const loading = ref(false)
 const mapImageRef = ref(null)
+const drillTimelineListRef = ref(null)
 const imageReadyTick = ref(0)
 const navStatus = ref(null)
 const navCommandBusy = ref('')
@@ -47,7 +53,21 @@ const localizationInitMessage = ref('')
 const poseHistory = ref([])
 const showPoseTrail = ref(true)
 const lastPoseSampleKey = ref('')
+const drillRunning = ref(false)
+const drillPosition = ref(null)
+const drillCurrentIndex = ref(null)
+const drillMessage = ref('')
+const drillTimeline = ref([])
+const drillElapsedSeconds = ref(0)
+const drillCurrentSpeed = ref(0)
 let navTimer = null
+let drillClockTimer = null
+let drillStartedAt = null
+let drillEventSequence = 0
+let drillAnimationFrame = null
+let drillCancelled = false
+let drillAudio = null
+let drillAudioResolve = null
 
 const routeForm = ref({
   name: '',
@@ -67,12 +87,20 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (navTimer) clearInterval(navTimer)
   window.removeEventListener('resize', refreshImageGeometry)
+  stopDrill(false)
 })
 
 async function loadData() {
   loading.value = true
   try {
-    const [mapsResult, mapSetsResult, routesResult, robotsResult] = await Promise.allSettled([fetchMaps(), fetchMapSets(), fetchRoutes(), fetchRobots()])
+    const [mapsResult, mapSetsResult, routesResult, robotsResult, categoriesResult, templatesResult] = await Promise.allSettled([
+      fetchMaps(),
+      fetchMapSets(),
+      fetchRoutes(),
+      fetchRobots(),
+      fetchSpeechCategories(),
+      fetchSpeechTemplates(),
+    ])
     if (mapsResult.status === 'fulfilled') maps.value = mapsResult.value
     else console.error('加载地图失败:', mapsResult.reason)
     if (mapSetsResult.status === 'fulfilled') mapSets.value = mapSetsResult.value
@@ -81,6 +109,10 @@ async function loadData() {
     else console.error('加载路线失败:', routesResult.reason)
     if (robotsResult.status === 'fulfilled') robots.value = robotsResult.value
     else console.error('加载机器人失败:', robotsResult.reason)
+    if (categoriesResult.status === 'fulfilled') speechCategories.value = categoriesResult.value
+    else console.error('加载播报分类失败:', categoriesResult.reason)
+    if (templatesResult.status === 'fulfilled') speechTemplates.value = templatesResult.value
+    else console.error('加载播报文案失败:', templatesResult.reason)
     seedRobotsFromMapsAndRoutes()
     if (!selectedMap.value && maps.value.length) {
       handleMapSelect(maps.value.find(map => map.active) || maps.value[0])
@@ -102,6 +134,12 @@ const selectedRobot = computed(() => {
     name: selectedRoute.value?.robot_name || selectedMap.value?.robot_name || '机器狗',
     code: selectedRoute.value?.robot_code || selectedMap.value?.robot_code || String(robotId),
   }
+})
+
+const inspectionSpeechCategory = computed(() => speechCategories.value.find(item => item.name === '巡检智能播报') || null)
+const inspectionSpeechTemplates = computed(() => {
+  if (!inspectionSpeechCategory.value) return []
+  return speechTemplates.value.filter(item => String(item.category) === String(inspectionSpeechCategory.value.id))
 })
 
 function seedRobotsFromMapsAndRoutes() {
@@ -136,6 +174,7 @@ function handleMapSelect(map) {
 
 function handleMapClick(event) {
   if (!selectedMap.value) return
+  if (drillRunning.value) return
 
   const image = mapImageRef.value || event.currentTarget
   const geometry = getMapGeometry()
@@ -182,9 +221,259 @@ function removeWaypoint(index) {
   waypointNames.value.splice(index, 1)
 }
 
+function setWaypointSpeech(index, templateId) {
+  const template = inspectionSpeechTemplates.value.find(item => String(item.id) === String(templateId))
+  const current = waypoints.value[index]
+  waypoints.value[index] = {
+    ...current,
+    speech_template_id: template?.id || null,
+    speech_template_name: template?.name || '',
+    speech_text: template?.text || '',
+  }
+}
+
 function clearWaypoints() {
+  stopDrill(false)
   waypoints.value = []
   waypointNames.value = []
+}
+
+function drillDisplayPosition() {
+  if (!drillPosition.value) return null
+  return waypointDisplayPosition(drillPosition.value)
+}
+
+function formatDrillClock(value) {
+  return new Date(value).toLocaleTimeString('zh-CN', { hour12: false })
+}
+
+function formatDrillElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0))
+  const minutes = String(Math.floor(total / 60)).padStart(2, '0')
+  const remaining = String(total % 60).padStart(2, '0')
+  return `${minutes}:${remaining}`
+}
+
+function recordDrillEvent(type, title, detail = '', metadata = {}) {
+  const occurredAt = Date.now()
+  drillTimeline.value.push({
+    id: ++drillEventSequence,
+    type,
+    title,
+    detail,
+    occurredAt,
+    elapsedSeconds: drillStartedAt ? (occurredAt - drillStartedAt) / 1000 : 0,
+    ...metadata,
+  })
+  nextTick(() => {
+    if (drillTimelineListRef.value) {
+      drillTimelineListRef.value.scrollTop = drillTimelineListRef.value.scrollHeight
+    }
+  })
+}
+
+function startDrillClock() {
+  if (drillClockTimer) window.clearInterval(drillClockTimer)
+  drillClockTimer = window.setInterval(() => {
+    drillElapsedSeconds.value = drillStartedAt ? (Date.now() - drillStartedAt) / 1000 : 0
+  }, 250)
+}
+
+function stopDrillClock() {
+  if (drillClockTimer) {
+    window.clearInterval(drillClockTimer)
+    drillClockTimer = null
+  }
+}
+
+function clearDrillTimeline() {
+  if (drillRunning.value) return
+  drillTimeline.value = []
+  drillElapsedSeconds.value = 0
+  drillMessage.value = ''
+  drillStartedAt = null
+}
+
+function drillSegmentMetrics(fromPoint, toPoint) {
+  const from = normalizeStoredWaypoint(fromPoint)
+  const to = normalizeStoredWaypoint(toPoint)
+  const distance = Math.hypot(to.x - from.x, to.y - from.y)
+  const duration = Math.max(1000, Math.min(3200, distance * 550))
+  return { from, to, distance, duration, speed: distance / (duration / 1000) }
+}
+
+function stopDrill(showMessage = true) {
+  const wasRunning = drillRunning.value
+  drillCancelled = true
+  if (drillAnimationFrame) {
+    cancelAnimationFrame(drillAnimationFrame)
+    drillAnimationFrame = null
+  }
+  if (drillAudio) {
+    drillAudio.pause()
+    drillAudio = null
+  }
+  if (drillAudioResolve) {
+    drillAudioResolve()
+    drillAudioResolve = null
+  }
+  window.speechSynthesis?.cancel()
+  drillRunning.value = false
+  drillCurrentSpeed.value = 0
+  drillPosition.value = null
+  drillCurrentIndex.value = null
+  if (wasRunning && showMessage) {
+    drillMessage.value = '演练已停止'
+    recordDrillEvent('stop', '演练停止', '用户手动停止演练', { speed: 0 })
+  }
+  stopDrillClock()
+}
+
+function animateDrillSegment(fromPoint, toPoint) {
+  const { from, to, duration } = drillSegmentMetrics(fromPoint, toPoint)
+  return new Promise((resolve) => {
+    const startedAt = performance.now()
+    const tick = (now) => {
+      if (drillCancelled) {
+        resolve(false)
+        return
+      }
+      const progress = Math.min(1, (now - startedAt) / duration)
+      const eased = progress < 0.5 ? 2 * progress * progress : 1 - ((-2 * progress + 2) ** 2) / 2
+      drillPosition.value = {
+        frame_id: 'map',
+        x: from.x + (to.x - from.x) * eased,
+        y: from.y + (to.y - from.y) * eased,
+        yaw: Math.atan2(to.y - from.y, to.x - from.x),
+      }
+      if (progress >= 1) {
+        drillAnimationFrame = null
+        resolve(true)
+        return
+      }
+      drillAnimationFrame = requestAnimationFrame(tick)
+    }
+    drillAnimationFrame = requestAnimationFrame(tick)
+  })
+}
+
+function fallbackBrowserSpeech(text) {
+  return new Promise((resolve) => {
+    if (!window.speechSynthesis || drillCancelled) {
+      resolve()
+      return
+    }
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = 'zh-CN'
+    utterance.rate = 0.95
+    utterance.onend = resolve
+    utterance.onerror = resolve
+    window.speechSynthesis.speak(utterance)
+  })
+}
+
+async function playDrillSpeech(point, index) {
+  const text = String(point.speech_text || '').trim()
+  if (!text || drillCancelled) return
+  drillMessage.value = `到达点${index + 1}，正在播报：${point.speech_template_name || text}`
+  recordDrillEvent('speech', `点${index + 1} 开始播报`, text, {
+    pointIndex: index,
+    pointName: waypointNames.value[index] || `点${index + 1}`,
+    speechTitle: point.speech_template_name || '',
+    speed: 0,
+  })
+  try {
+    const result = await synthesizeSpeech(text)
+    if (drillCancelled) return
+    drillAudio = new Audio(result.audio_url)
+    await drillAudio.play()
+    await new Promise((resolve) => {
+      const finish = () => {
+        drillAudioResolve = null
+        resolve()
+      }
+      drillAudioResolve = finish
+      drillAudio.addEventListener('ended', finish, { once: true })
+      drillAudio.addEventListener('error', finish, { once: true })
+    })
+    drillAudio = null
+  } catch (_error) {
+    await fallbackBrowserSpeech(text)
+  }
+  if (!drillCancelled) {
+    recordDrillEvent('speech-end', `点${index + 1} 播报完成`, point.speech_template_name || text, {
+      pointIndex: index,
+      speed: 0,
+    })
+  }
+}
+
+async function startDrill() {
+  if (drillRunning.value) {
+    stopDrill()
+    return
+  }
+  if (waypoints.value.length < 2) {
+    alert('演练至少需要起点和终点两个途经点')
+    return
+  }
+  drillCancelled = false
+  drillTimeline.value = []
+  drillEventSequence = 0
+  drillStartedAt = Date.now()
+  drillElapsedSeconds.value = 0
+  drillCurrentSpeed.value = 0
+  startDrillClock()
+  drillRunning.value = true
+  drillCurrentIndex.value = 0
+  drillPosition.value = normalizeStoredWaypoint(waypoints.value[0])
+  drillMessage.value = '演练开始：机器狗位于起点'
+  recordDrillEvent('start', '演练开始', `起点：${waypointNames.value[0] || '点1'}`, {
+    pointIndex: 0,
+    pointName: waypointNames.value[0] || '点1',
+    speed: 0,
+  })
+  recordDrillEvent('arrival', '到达点1', waypointDisplayText(waypoints.value[0]), {
+    pointIndex: 0,
+    pointName: waypointNames.value[0] || '点1',
+    speed: 0,
+  })
+  await playDrillSpeech(waypoints.value[0], 0)
+  for (let index = 1; index < waypoints.value.length && !drillCancelled; index += 1) {
+    drillMessage.value = `正在前往点${index + 1}`
+    const metrics = drillSegmentMetrics(waypoints.value[index - 1], waypoints.value[index])
+    drillCurrentSpeed.value = metrics.speed
+    recordDrillEvent(
+      'move',
+      `前往点${index + 1}`,
+      `距离 ${metrics.distance.toFixed(2)} m，模拟速度 ${metrics.speed.toFixed(2)} m/s`,
+      {
+        pointIndex: index,
+        pointName: waypointNames.value[index] || `点${index + 1}`,
+        distance: metrics.distance,
+        speed: metrics.speed,
+      },
+    )
+    const completed = await animateDrillSegment(waypoints.value[index - 1], waypoints.value[index])
+    if (!completed) return
+    drillCurrentSpeed.value = 0
+    drillCurrentIndex.value = index
+    drillPosition.value = normalizeStoredWaypoint(waypoints.value[index])
+    recordDrillEvent('arrival', `到达点${index + 1}`, waypointDisplayText(waypoints.value[index]), {
+      pointIndex: index,
+      pointName: waypointNames.value[index] || `点${index + 1}`,
+      speed: 0,
+    })
+    await playDrillSpeech(waypoints.value[index], index)
+  }
+  if (!drillCancelled) {
+    drillRunning.value = false
+    drillCurrentSpeed.value = 0
+    drillMessage.value = '演练完成：机器狗已到达终点'
+    recordDrillEvent('complete', '演练完成', `终点：${waypointNames.value.at(-1) || `点${waypoints.value.length}`}`, { speed: 0 })
+    drillElapsedSeconds.value = (Date.now() - drillStartedAt) / 1000
+    stopDrillClock()
+  }
 }
 
 async function handleSaveRoute() {
@@ -249,6 +538,11 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     return imagePointToWaypoint(mapPointToImagePoint(first, second, geometry), geometry, yaw)
   }
 
+  const speechFields = {
+    speech_template_id: point.speech_template_id || null,
+    speech_template_name: point.speech_template_name || '',
+    speech_text: point.speech_text || '',
+  }
   const normalized = {
     x: Number(point.x),
     y: Number(point.y),
@@ -256,22 +550,29 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     frame_id: point.frame_id || 'map',
   }
   if (Number.isFinite(Number(point.image_x)) && Number.isFinite(Number(point.image_y)) && geometry) {
-    return imagePointToWaypoint(
+    return {
+      ...imagePointToWaypoint(
       { imageX: Number(point.image_x), imageY: Number(point.image_y) },
       geometry,
       normalized.yaw,
-    )
+      ),
+      ...speechFields,
+    }
   }
   if (Number.isFinite(Number(point.u)) && Number.isFinite(Number(point.v)) && geometry) {
-    return imagePointToWaypoint(
+    return {
+      ...imagePointToWaypoint(
       { imageX: Number(point.u) * geometry.mapWidth, imageY: Number(point.v) * geometry.mapHeight },
       geometry,
       normalized.yaw,
-    )
+      ),
+      ...speechFields,
+    }
   }
   return {
     ...normalized,
     ...mapPointToImagePoint(normalized.x, normalized.y, geometry),
+    ...speechFields,
   }
 }
 
@@ -288,6 +589,9 @@ function withWaypointYaw(points) {
       image_y: Number(current.image_y.toFixed(4)),
       u: Number(current.u.toFixed(8)),
       v: Number(current.v.toFixed(8)),
+      speech_template_id: current.speech_template_id || null,
+      speech_template_name: current.speech_template_name || '',
+      speech_text: current.speech_text || '',
     }
   })
 }
@@ -980,9 +1284,19 @@ async function handleDeleteRoute(route) {
     <section class="panel detail-panel">
       <div class="panel-header">
         <h2>路径规划</h2>
-        <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0">
-          保存路线
-        </button>
+        <div class="route-header-actions">
+          <button
+            class="btn drill-btn"
+            :class="{ running: drillRunning }"
+            :disabled="!drillRunning && (!selectedMap || waypoints.length < 2)"
+            @click="startDrill"
+          >
+            {{ drillRunning ? '■ 停止演练' : '▶ 演练' }}
+          </button>
+          <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+            保存路线
+          </button>
+        </div>
       </div>
 
       <div class="route-planner-layout">
@@ -1024,7 +1338,22 @@ async function handleDeleteRoute(route) {
             <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
             <div v-else class="waypoint-list">
               <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
-                <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                <div class="waypoint-main">
+                  <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                  <label>
+                    <span>巡检智能播报</span>
+                    <select :value="point.speech_template_id || ''" @change="setWaypointSpeech(index, $event.target.value)">
+                      <option value="">到点不播报</option>
+                      <option v-for="template in inspectionSpeechTemplates" :key="template.id" :value="template.id">
+                        {{ template.name }}
+                      </option>
+                    </select>
+                  </label>
+                  <small v-if="point.speech_text">{{ point.speech_text }}</small>
+                  <small v-else-if="!inspectionSpeechTemplates.length" class="waypoint-speech-empty">
+                    “巡检智能播报”分类下暂无文案
+                  </small>
+                </div>
                 <button class="btn-close" @click="removeWaypoint(index)">×</button>
               </div>
             </div>
@@ -1177,11 +1506,12 @@ async function handleDeleteRoute(route) {
 
         <!-- 右侧地图预览区 -->
         <div class="map-preview-area">
-          <div v-if="!selectedMap" class="map-placeholder">
-            请先选择地图
-          </div>
-          <div v-else class="map-container">
-            <div v-if="selectedMap.thumbnail_url" class="map-image-layer">
+          <div class="map-stage-layout">
+            <div v-if="!selectedMap" class="map-placeholder">
+              请先选择地图
+            </div>
+            <div v-else class="map-container">
+              <div v-if="selectedMap.thumbnail_url" class="map-image-layer">
               <img ref="mapImageRef" :src="getFullUrl(selectedMap.thumbnail_url)" alt="地图预览" @load="refreshImageGeometry" @click="handleMapClick" />
 
               <!-- 定位尾迹 -->
@@ -1191,8 +1521,18 @@ async function handleDeleteRoute(route) {
 
               <!-- 途经点标记 -->
               <div class="waypoint-markers">
-                <div v-for="(point, index) in waypoints" :key="index" class="waypoint-marker" :style="waypointDisplayPosition(point)">
+                <div
+                  v-for="(point, index) in waypoints"
+                  :key="index"
+                  class="waypoint-marker"
+                  :class="{ 'drill-arrived': drillCurrentIndex === index && drillPosition }"
+                  :style="waypointDisplayPosition(point)"
+                >
                   {{ index + 1 }}
+                </div>
+                <div v-if="drillDisplayPosition()" class="drill-robot-marker" :style="drillDisplayPosition()">
+                  <span class="drill-dog-icon">🐕</span>
+                  <strong>演练</strong>
                 </div>
                 <div v-if="robotDisplayPosition()" class="robot-marker" :style="robotDisplayPosition()">
                   <span :style="robotHeadingStyle()"></span>
@@ -1210,12 +1550,52 @@ async function handleDeleteRoute(route) {
               <svg v-if="waypoints.length > 1" class="path-lines">
                 <polyline :points="pathPolylinePoints()" fill="none" stroke="#1976d2" stroke-width="2" />
               </svg>
+              </div>
+              <div v-else class="map-placeholder">地图预览不可用</div>
             </div>
-            <div v-else class="map-placeholder">地图预览不可用</div>
+
+            <aside class="drill-timeline-panel">
+              <div class="drill-timeline-header">
+                <div>
+                  <span>演练记录</span>
+                  <strong>时间轴</strong>
+                </div>
+                <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
+              </div>
+              <div class="drill-timeline-summary">
+                <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
+                <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
+                <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
+              </div>
+              <div v-if="!drillTimeline.length" class="drill-timeline-empty">
+                点击“演练”后，这里会记录移动、到达点位和播报内容。
+              </div>
+              <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
+                <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
+                  <div class="timeline-node"></div>
+                  <div class="timeline-content">
+                    <div class="timeline-time">
+                      <span>{{ formatDrillClock(event.occurredAt) }}</span>
+                      <em>+{{ formatDrillElapsed(event.elapsedSeconds) }}</em>
+                    </div>
+                    <strong>{{ event.title }}</strong>
+                    <p v-if="event.detail">{{ event.detail }}</p>
+                    <div class="timeline-meta">
+                      <span v-if="event.pointName">📍 {{ event.pointName }}</span>
+                      <span v-if="event.speed !== undefined">速度 {{ Number(event.speed).toFixed(2) }} m/s</span>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </aside>
           </div>
 
           <div class="map-hint" v-if="selectedMap">
             点击地图添加途经点；设初始定位时先点机器狗位置，再点狗头朝向。
+          </div>
+          <div v-if="drillMessage" class="drill-status" :class="{ active: drillRunning }">
+            <span class="drill-status-dot"></span>
+            {{ drillMessage }}
           </div>
         </div>
       </div>
@@ -1224,6 +1604,44 @@ async function handleDeleteRoute(route) {
 </template>
 
 <style scoped>
+.route-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.drill-btn {
+  min-width: 118px;
+  border: 2px solid #f97316;
+  color: #fff;
+  background: linear-gradient(135deg, #f97316, #dc2626);
+  box-shadow: 0 8px 22px rgba(220, 38, 38, 0.3);
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  animation: drill-button-pulse 1.8s ease-in-out infinite;
+}
+
+.drill-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 26px rgba(220, 38, 38, 0.42);
+}
+
+.drill-btn.running {
+  border-color: #991b1b;
+  background: #991b1b;
+  animation: none;
+}
+
+.drill-btn:disabled {
+  box-shadow: none;
+  animation: none;
+}
+
+@keyframes drill-button-pulse {
+  0%, 100% { box-shadow: 0 8px 22px rgba(220, 38, 38, 0.25); }
+  50% { box-shadow: 0 8px 28px rgba(249, 115, 22, 0.58); }
+}
+
 .route-planner-layout {
   display: grid;
   grid-template-columns: 300px 1fr;
@@ -1280,7 +1698,7 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-list {
-  max-height: 200px;
+  max-height: 360px;
   overflow-y: auto;
 }
 
@@ -1293,6 +1711,43 @@ async function handleDeleteRoute(route) {
   border-radius: 4px;
   margin-bottom: 0.5rem;
   font-size: 0.875rem;
+}
+
+.waypoint-main {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 0.45rem;
+}
+
+.waypoint-main label {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem;
+  color: #667085;
+  font-size: 0.78rem;
+}
+
+.waypoint-main select {
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 0.5rem;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.waypoint-main > small {
+  overflow: hidden;
+  color: #667085;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.waypoint-speech-empty {
+  color: #b54708 !important;
 }
 
 .waypoint-actions {
@@ -1615,6 +2070,14 @@ async function handleDeleteRoute(route) {
   overflow: hidden;
 }
 
+.map-stage-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  min-height: 0;
+  flex: 1;
+  gap: 0.85rem;
+}
+
 .map-container {
   flex: 1;
   position: relative;
@@ -1633,6 +2096,186 @@ async function handleDeleteRoute(route) {
     linear-gradient(-45deg, transparent 75%, #eef1f6 75%);
   background-size: 24px 24px;
   background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+}
+
+.drill-timeline-panel {
+  display: flex;
+  min-width: 0;
+  max-height: calc(100vh - 285px);
+  padding: 0.85rem;
+  border: 1px solid #fed7aa;
+  border-radius: 12px;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 30px rgba(124, 45, 18, 0.12);
+}
+
+.drill-timeline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.drill-timeline-header > div {
+  display: grid;
+  gap: 1px;
+}
+
+.drill-timeline-header span {
+  color: #b54708;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.drill-timeline-header strong {
+  color: #7c2d12;
+  font-size: 1.05rem;
+}
+
+.drill-timeline-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.4rem;
+  margin-top: 0.7rem;
+}
+
+.drill-timeline-summary div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 0.45rem;
+  border-radius: 7px;
+  background: #fff7ed;
+}
+
+.drill-timeline-summary span {
+  color: #9a3412;
+  font-size: 0.62rem;
+}
+
+.drill-timeline-summary strong {
+  overflow: hidden;
+  color: #7c2d12;
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drill-timeline-empty {
+  display: grid;
+  min-height: 180px;
+  padding: 1rem;
+  place-items: center;
+  color: #9a6b53;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.drill-timeline-list {
+  min-height: 0;
+  margin-top: 0.75rem;
+  padding: 0 0.2rem 0 0.1rem;
+  overflow-y: auto;
+}
+
+.drill-timeline-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 0.45rem;
+  padding-bottom: 0.85rem;
+}
+
+.drill-timeline-item:not(:last-child)::before {
+  position: absolute;
+  top: 13px;
+  bottom: -2px;
+  left: 5px;
+  width: 2px;
+  background: #fed7aa;
+  content: '';
+}
+
+.timeline-node {
+  position: relative;
+  z-index: 1;
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #f97316;
+  box-shadow: 0 0 0 2px #fdba74;
+}
+
+.event-speech .timeline-node,
+.event-speech-end .timeline-node {
+  background: #2563eb;
+  box-shadow: 0 0 0 2px #93c5fd;
+}
+
+.event-arrival .timeline-node,
+.event-complete .timeline-node {
+  background: #16a34a;
+  box-shadow: 0 0 0 2px #86efac;
+}
+
+.event-stop .timeline-node {
+  background: #dc2626;
+  box-shadow: 0 0 0 2px #fca5a5;
+}
+
+.timeline-content {
+  min-width: 0;
+}
+
+.timeline-time {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  color: #9a6b53;
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-time em {
+  color: #c2410c;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.timeline-content > strong {
+  display: block;
+  margin-top: 2px;
+  color: #431407;
+  font-size: 0.8rem;
+}
+
+.timeline-content p {
+  margin: 0.22rem 0 0;
+  color: #6b4d3e;
+  font-size: 0.7rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.3rem;
+}
+
+.timeline-meta span {
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: #9a3412;
+  background: #ffedd5;
+  font-size: 0.62rem;
 }
 
 .map-image-layer {
@@ -1682,6 +2325,79 @@ async function handleDeleteRoute(route) {
   font-weight: bold;
   transform: translate(-50%, -50%);
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.waypoint-marker.drill-arrived {
+  border-color: #fff;
+  background: #f97316;
+  box-shadow: 0 0 0 5px rgba(249, 115, 22, 0.28);
+  transform: translate(-50%, -50%) scale(1.18);
+}
+
+.drill-robot-marker {
+  position: absolute;
+  z-index: 14;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: linear-gradient(145deg, #fb923c, #dc2626);
+  box-shadow: 0 6px 18px rgba(127, 29, 29, 0.45);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.drill-dog-icon {
+  font-size: 22px;
+  line-height: 1;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
+}
+
+.drill-robot-marker strong {
+  position: absolute;
+  top: 43px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #fff;
+  background: #b42318;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.drill-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  margin-top: 0.65rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  color: #9a3412;
+  background: #fff7ed;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.drill-status-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+
+.drill-status.active .drill-status-dot {
+  background: #f97316;
+  box-shadow: 0 0 0 4px rgba(249, 115, 22, 0.18);
+  animation: drill-dot-pulse 1s ease-in-out infinite;
+}
+
+@keyframes drill-dot-pulse {
+  50% { opacity: 0.42; }
 }
 
 .robot-marker {
@@ -1783,6 +2499,14 @@ async function handleDeleteRoute(route) {
 
   .map-container {
     min-height: 420px;
+  }
+
+  .map-stage-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .drill-timeline-panel {
+    max-height: 420px;
   }
 }
 

@@ -3,6 +3,11 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+ASR_ENABLED = os.getenv("ASR_ENABLED", "true").lower() == "true"
+ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH", "/opt/roamerx/shared/models/faster-whisper-base")
+ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh")
+INSPECTION_SPEECH_CATEGORY_NAME = os.getenv("INSPECTION_SPEECH_CATEGORY_NAME", "巡检智能播报")
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-demo-inspection-platform-key")
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() == "true"
 ALLOWED_HOSTS = [
@@ -98,6 +103,9 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 TTS_RATE = os.getenv("TTS_RATE", "-5%")
 TTS_VOLUME = os.getenv("TTS_VOLUME", "+0%")
+BICYCLE_AUTO_SPEECH_ENABLED = os.getenv("BICYCLE_AUTO_SPEECH_ENABLED", "true").lower() == "true"
+BICYCLE_AUTO_SPEECH_TEMPLATE_NAME = os.getenv("BICYCLE_AUTO_SPEECH_TEMPLATE_NAME", "驶离提醒")
+BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS = int(os.getenv("BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS", "30"))
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 CSRF_TRUSTED_ORIGINS = [
     item.strip()

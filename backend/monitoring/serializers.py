@@ -18,6 +18,8 @@ from .models import (
     RemoteCommand,
     Robot,
     RobotCommand,
+    RecordedAudio,
+    SpeechCategory,
     SpeechTemplate,
     RobotSession,
     RobotStatusLatest,
@@ -510,6 +512,40 @@ class TelemetryIngestSerializer(serializers.Serializer):
     detections = serializers.ListField(child=serializers.DictField(), required=False, default=list)
 
 
+class PersonDetectionIngestSerializer(serializers.Serializer):
+    robot_code = serializers.CharField(max_length=32)
+    camera_id = serializers.CharField(max_length=32, required=False, default="front")
+    frame_width = serializers.IntegerField(min_value=1, max_value=16384)
+    frame_height = serializers.IntegerField(min_value=1, max_value=16384)
+    captured_at = serializers.DateTimeField()
+    detections = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+    def validate_detections(self, detections):
+        cleaned = []
+        for item in detections[:20]:
+            bbox = item.get("bbox") or {}
+            try:
+                x = max(0, int(bbox.get("x", 0)))
+                y = max(0, int(bbox.get("y", 0)))
+                width = max(0, int(bbox.get("width", 0)))
+                height = max(0, int(bbox.get("height", 0)))
+                confidence = min(1.0, max(0.0, float(item.get("confidence", 0))))
+            except (TypeError, ValueError):
+                continue
+            track_id = str(item.get("track_id", ""))[:64]
+            if not track_id or width <= 0 or height <= 0:
+                continue
+            cleaned.append(
+                {
+                    "track_id": track_id,
+                    "label": "person",
+                    "confidence": round(confidence, 4),
+                    "bbox": {"x": x, "y": y, "width": width, "height": height},
+                }
+            )
+        return cleaned
+
+
 class MediaUploadSerializer(serializers.Serializer):
     robot_code = serializers.CharField(max_length=32)
     camera_id = serializers.CharField(max_length=32, required=False, allow_blank=True)
@@ -550,6 +586,21 @@ class RobotCommandCreateSerializer(serializers.Serializer):
     action = serializers.ChoiceField(choices=[choice[0] for choice in RobotCommand.ACTION_CHOICES])
     payload = serializers.DictField(required=False, default=dict)
 
+    def validate(self, attrs):
+        if attrs["action"] != "move_velocity":
+            return attrs
+        payload = attrs.get("payload") or {}
+        cleaned = dict(payload)
+        limits = {"vx": 0.2, "vy": 0.15, "yaw_rate": 0.35}
+        for field, limit in limits.items():
+            try:
+                value = float(payload.get(field, 0.0))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({"payload": f"{field} 必须是数值"})
+            cleaned[field] = max(-limit, min(limit, value))
+        attrs["payload"] = cleaned
+        return attrs
+
 
 class RobotCommandSerializer(serializers.ModelSerializer):
     robot_code = serializers.CharField(source="robot.code", read_only=True)
@@ -573,10 +624,31 @@ class RobotCommandSerializer(serializers.ModelSerializer):
         ]
 
 
+class SpeechCategorySerializer(serializers.ModelSerializer):
+    template_count = serializers.IntegerField(source="templates.count", read_only=True)
+    recording_count = serializers.IntegerField(source="recordings.count", read_only=True)
+
+    class Meta:
+        model = SpeechCategory
+        fields = ["id", "name", "template_count", "recording_count", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("分类名称不能为空")
+        return value
+
+
 class SpeechTemplateSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True, default="未分类")
+    source_type = serializers.SerializerMethodField()
+
     class Meta:
         model = SpeechTemplate
-        fields = ["id", "name", "text", "created_at", "updated_at"]
+        fields = ["id", "name", "text", "category", "category_name", "source_type", "created_at", "updated_at"]
+
+    def get_source_type(self, obj):
+        return "tts"
 
     def validate_name(self, value):
         value = value.strip()
@@ -594,6 +666,42 @@ class SpeechTemplateSerializer(serializers.ModelSerializer):
 class SpeechSynthesisSerializer(serializers.Serializer):
     text = serializers.CharField(max_length=500, trim_whitespace=True)
     audio_name = serializers.CharField(max_length=64, required=False, allow_blank=True, trim_whitespace=True)
+
+
+class RecordedAudioSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True, default="未分类")
+    audio_url = serializers.SerializerMethodField()
+    source_type = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RecordedAudio
+        fields = [
+            "id",
+            "title",
+            "category",
+            "category_name",
+            "audio_url",
+            "transcript",
+            "asr_status",
+            "asr_error",
+            "source_type",
+            "content_type",
+            "file_size",
+            "created_at",
+        ]
+
+    def get_source_type(self, obj):
+        return "recording"
+
+    def get_audio_url(self, obj):
+        if not obj.file:
+            return ""
+        url = obj.file.url
+        public_base_url = str(getattr(settings, "PUBLIC_BASE_URL", "") or "").rstrip("/")
+        if public_base_url:
+            return f"{public_base_url}{url}"
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
 
 
 class MapDataSerializer(serializers.ModelSerializer):
@@ -707,6 +815,27 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def validate_waypoints(self, value):
+        try:
+            template_ids = {
+                int(point["speech_template_id"])
+                for point in value
+                if isinstance(point, dict) and point.get("speech_template_id") not in (None, "")
+            }
+        except (TypeError, ValueError):
+            raise serializers.ValidationError("途经点播报文案编号无效")
+        if not template_ids:
+            return value
+        valid_ids = set(
+            SpeechTemplate.objects.filter(
+                id__in=template_ids,
+                category__name=settings.INSPECTION_SPEECH_CATEGORY_NAME,
+            ).values_list("id", flat=True)
+        )
+        if valid_ids != template_ids:
+            raise serializers.ValidationError("途经点只能选择“巡检智能播报”分类下的文案")
+        return value
 
 
 class ZoneSerializer(serializers.ModelSerializer):

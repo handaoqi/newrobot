@@ -1,10 +1,11 @@
 from datetime import datetime
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import InspectionEvent, Robot
+from .models import InspectionEvent, Robot, RobotCommand
 from .views import ensure_demo_seed
 
 
@@ -49,7 +50,8 @@ class MonitoringApiTests(TestCase):
         robot_codes = {robot["code"] for robot in response.data}
         self.assertIn("ZSL-1A-07", robot_codes)
 
-    def test_telemetry_ingest(self):
+    @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/bicycle-reminder.mp3", True))
+    def test_telemetry_ingest(self, synthesize_speech):
         self.authenticate()
         robot = Robot.objects.first()
         before_count = InspectionEvent.objects.count()
@@ -96,6 +98,43 @@ class MonitoringApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(InspectionEvent.objects.count(), before_count + 1)
+        self.assertEqual(len(response.data["audio_commands_queued"]), 1)
+        command = RobotCommand.objects.get(id=response.data["audio_commands_queued"][0])
+        self.assertEqual(command.action, "play_audio")
+        self.assertEqual(command.payload["source"], "vision_bicycle_auto")
+        self.assertEqual(command.payload["audio_name"], "驶离提醒")
+        self.assertIn("请尽快驶离指定区域", command.payload["text"])
+        synthesize_speech.assert_called_once()
+
+        second_response = self.client.post(
+            "/api/telemetry/ingest/",
+            {
+                "sequence_id": "test-0002",
+                "robot_code": robot.code,
+                "robot_name": robot.name,
+                "reported_at": "2026-05-02T14:35:19+08:00",
+                "position": {"name": "太阳宫公园南入口", "latitude": 39.983521, "longitude": 116.447153},
+                "motion": {"speed": 1.26, "heading": 83.5},
+                "power": {"battery_level": 78, "charging": False},
+                "network": {"signal_strength": 92, "network_type": "5G"},
+                "runtime": {"mode": "auto", "status": "online"},
+                "detections": [
+                    {
+                        "type": "vehicle_illegal_parking",
+                        "label": "自行车违停",
+                        "object_class": "bicycle",
+                        "confidence": 0.93,
+                        "risk_level": "medium",
+                        "event_time": "2026-05-02T14:35:17+08:00",
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(second_response.status_code, 201)
+        self.assertEqual(second_response.data["audio_commands_queued"], [])
+        self.assertEqual(RobotCommand.objects.filter(payload__source="vision_bicycle_auto").count(), 1)
+        synthesize_speech.assert_called_once()
 
     def test_event_list_pagination_and_status_filter(self):
         self.authenticate()

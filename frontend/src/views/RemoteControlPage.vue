@@ -5,7 +5,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
-import { fetchRobotDetail, fetchRobots, fetchRobotStatus, sendRobotCommand } from '../services/api'
+import {
+  fetchRobotDetail,
+  fetchRobotPersonDetections,
+  fetchRobots,
+  fetchRobotStatus,
+  sendRobotCommand,
+} from '../services/api'
 
 const robots = ref([])
 const selectedRobot = ref(null)
@@ -19,10 +25,18 @@ const activeHoldAction = ref('')
 const speedScale = ref(0.7)
 const commandFeedback = ref('')
 const videoRef = ref(null)
+const personDetectionState = ref({ detections: [] })
+const selectedPersonTrackId = ref('')
+const followActive = ref(false)
+const followStatus = ref('等待选择人员')
 
 let flvPlayer = null
 let hlsPlayer = null
 let statusTimer = null
+let personDetectionTimer = null
+let followTimer = null
+let followCommandInFlight = false
+let targetLostSince = 0
 // 操作员本地发起接管后的宽限截止时间戳；期内轮询不得把 takeoverActive 回退为 false。
 let takeoverHoldUntil = 0
 let holdTimer = null
@@ -52,7 +66,9 @@ const livePlayUrls = computed(() => selectedRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 const status = computed(() => liveStatus.value?.status || {})
 const localizationQuality = computed(() => status.value?.localization_quality || {})
-const canControl = computed(() => takeoverActive.value && selectedRobot.value?.id && !commandSending.value)
+const canControl = computed(() => takeoverActive.value && !followActive.value && selectedRobot.value?.id && !commandSending.value)
+const personDetections = computed(() => personDetectionState.value?.detections || [])
+const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
 
 const motionActions = computed(() => [
   { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.35) } },
@@ -132,6 +148,7 @@ async function exitTakeover() {
   if (!selectedRobot.value?.id || commandSending.value) return
   commandSending.value = true
   try {
+    await stopFollowing('已释放接管')
     await stopHoldAction()
     const command = await dispatchRobotAction('takeover_exit', { passive: true, note: 'Exit platform remote control page.' }, 'remote_control_exit')
     takeoverActive.value = false
@@ -152,6 +169,104 @@ async function sendStop(source = 'remote_control_stop') {
   } catch (error) {
     showToast(error.message || '停止指令失败')
   }
+}
+
+async function refreshPersonDetections() {
+  if (!selectedRobot.value?.id) return
+  try {
+    personDetectionState.value = await fetchRobotPersonDetections(selectedRobot.value.id)
+  } catch {
+    personDetectionState.value = { detections: [] }
+  }
+}
+
+function detectionStyle(item) {
+  const frameWidth = personDetectionState.value?.frame_width || 1
+  const frameHeight = personDetectionState.value?.frame_height || 1
+  const box = item.bbox || {}
+  return {
+    left: `${(Number(box.x || 0) / frameWidth) * 100}%`,
+    top: `${(Number(box.y || 0) / frameHeight) * 100}%`,
+    width: `${(Number(box.width || 0) / frameWidth) * 100}%`,
+    height: `${(Number(box.height || 0) / frameHeight) * 100}%`,
+  }
+}
+
+function selectPerson(item) {
+  if (followActive.value) return
+  selectedPersonTrackId.value = item.track_id
+  followStatus.value = `已选择 ${item.track_id}，可以开始跟随`
+}
+
+function calculateFollowVelocity(person) {
+  const frameWidth = Number(personDetectionState.value?.frame_width || 1)
+  const frameHeight = Number(personDetectionState.value?.frame_height || 1)
+  const box = person.bbox || {}
+  const centerError = (Number(box.x || 0) + Number(box.width || 0) / 2) / frameWidth - 0.5
+  const heightRatio = Number(box.height || 0) / frameHeight
+  let vx = 0
+  if (heightRatio < 0.40) vx = Math.min(0.16, (0.40 - heightRatio) * 0.7)
+  else if (heightRatio > 0.62) vx = Math.max(-0.08, (0.62 - heightRatio) * 0.5)
+  const yawRate = Math.abs(centerError) < 0.07 ? 0 : Math.max(-0.28, Math.min(0.28, -centerError * 0.75))
+  if (Math.abs(centerError) > 0.32) vx = 0
+  return { vx: Number(vx.toFixed(3)), vy: 0, yaw_rate: Number(yawRate.toFixed(3)) }
+}
+
+async function followControlTick() {
+  if (!followActive.value || followCommandInFlight) return
+  const person = selectedPerson.value
+  if (!person || personDetectionState.value?.stale) {
+    if (!targetLostSince) targetLostSince = Date.now()
+    followStatus.value = '目标暂时丢失，已停车等待恢复'
+    followCommandInFlight = true
+    try { await sendStop('person_follow_target_lost') } finally { followCommandInFlight = false }
+    if (Date.now() - targetLostSince >= 2000) await stopFollowing('目标丢失超过 2 秒，跟随已停止')
+    return
+  }
+  targetLostSince = 0
+  const velocity = calculateFollowVelocity(person)
+  followStatus.value = `跟随中 · 前进 ${velocity.vx.toFixed(2)} m/s · 转向 ${velocity.yaw_rate.toFixed(2)} rad/s`
+  followCommandInFlight = true
+  try {
+    await dispatchRobotAction('move_velocity', velocity, 'person_follow')
+  } catch (error) {
+    await stopFollowing(error.message || '跟随指令失败')
+  } finally {
+    followCommandInFlight = false
+  }
+}
+
+async function startFollowing() {
+  if (!selectedPersonTrackId.value || followActive.value || commandSending.value) return
+  commandSending.value = true
+  try {
+    if (!takeoverActive.value) {
+      await dispatchRobotAction('takeover_enter', { note: 'Enter person follow mode.' }, 'person_follow_enter')
+      takeoverActive.value = true
+      takeoverHoldUntil = Date.now() + 8000
+    }
+    followActive.value = true
+    targetLostSince = 0
+    followStatus.value = '跟随已启动'
+    await followControlTick()
+    followTimer = window.setInterval(followControlTick, 400)
+    showToast('人员跟随已启动，请保持现场通道畅通')
+  } catch (error) {
+    followStatus.value = error.message || '启动跟随失败'
+    showToast(followStatus.value)
+  } finally {
+    commandSending.value = false
+  }
+}
+
+async function stopFollowing(message = '跟随已停止') {
+  const wasActive = followActive.value
+  followActive.value = false
+  window.clearInterval(followTimer)
+  followTimer = null
+  targetLostSince = 0
+  followStatus.value = message
+  if (wasActive) await sendStop('person_follow_stop')
 }
 
 async function sendDiscreteAction(action, label) {
@@ -175,6 +290,7 @@ async function emergencyStop() {
   if (!selectedRobot.value?.id || commandSending.value) return
   commandSending.value = true
   try {
+    await stopFollowing('软急停已触发')
     await stopHoldAction()
     await dispatchRobotAction('passive', { note: 'Remote page emergency stop.' }, 'remote_control_emergency_stop')
     showToast('已下发软急停')
@@ -238,6 +354,7 @@ async function chooseRobot(robotId) {
   switchingRobot.value = true
   try {
     await stopHoldAction()
+    await stopFollowing('已切换设备')
     if (takeoverActive.value) {
       await dispatchRobotAction('takeover_exit', { passive: true }, 'remote_control_switch_robot')
       takeoverActive.value = false
@@ -246,6 +363,7 @@ async function chooseRobot(robotId) {
     selectedRobot.value = await fetchRobotDetail(robotId)
     streamUnavailable.value = false
     await refreshStatus()
+    await refreshPersonDetections()
     if (!loading.value) setupLivePlayer()
   } catch (error) {
     showToast(error.message || '切换设备失败')
@@ -380,6 +498,7 @@ onMounted(async () => {
     robots.value = await fetchRobots()
     if (robots.value[0]?.id) await chooseRobot(robots.value[0].id)
     statusTimer = window.setInterval(refreshStatus, 2000)
+    personDetectionTimer = window.setInterval(refreshPersonDetections, 350)
   } finally {
     loading.value = false
   }
@@ -395,6 +514,8 @@ onBeforeUnmount(async () => {
   document.removeEventListener('selectstart', preventRemoteGesture, { capture: true })
   document.removeEventListener('dragstart', preventRemoteGesture, { capture: true })
   window.clearInterval(statusTimer)
+  window.clearInterval(personDetectionTimer)
+  await stopFollowing('页面关闭，跟随已停止')
   if (takeoverActive.value) {
     await stopHoldAction()
     await dispatchRobotAction('takeover_exit', { passive: true }, 'remote_control_unmount').catch(() => {})
@@ -435,10 +556,33 @@ watch(livePlayUrls, () => {
             <strong>无视频流</strong>
             <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
           </div>
+          <button
+            v-for="person in personDetections"
+            :key="person.track_id"
+            type="button"
+            class="person-detection-box"
+            :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
+            :style="detectionStyle(person)"
+            :disabled="followActive"
+            @click="selectPerson(person)"
+          >
+            <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
+          </button>
           <div class="remote-video-overlay">
             <span>{{ selectedRobot?.code || '--' }}</span>
             <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
           </div>
+        </div>
+        <div class="person-follow-toolbar">
+          <div>
+            <strong>人员跟随</strong>
+            <span>{{ personDetectionState?.available ? `识别到 ${personDetections.length} 人` : '等待人形检测数据' }}</span>
+            <small>{{ followStatus }}</small>
+          </div>
+          <button class="follow-start-btn" type="button" :disabled="!selectedPerson || followActive || commandSending" @click="startFollowing">
+            {{ followActive ? '跟随中' : '开始跟随' }}
+          </button>
+          <button class="danger-btn" type="button" :disabled="!followActive" @click="stopFollowing()">停止跟随</button>
         </div>
       </section>
 
@@ -615,11 +759,81 @@ watch(livePlayUrls, () => {
 
 .remote-video-stage {
   position: relative;
-  min-height: 520px;
+  min-height: 0;
+  aspect-ratio: 16 / 9;
   border: 1px solid rgba(120, 194, 255, 0.22);
   border-radius: 18px;
   overflow: hidden;
   background: #06111f;
+}
+
+.person-detection-box {
+  position: absolute;
+  z-index: 3;
+  border: 3px solid #42e5ff;
+  border-radius: 8px;
+  padding: 0;
+  color: white;
+  background: rgba(20, 190, 235, 0.08);
+  cursor: crosshair;
+  box-shadow: 0 0 0 1px rgba(3, 14, 25, 0.8), 0 0 18px rgba(66, 229, 255, 0.28);
+}
+
+.person-detection-box span {
+  position: absolute;
+  left: -3px;
+  top: -29px;
+  padding: 4px 7px;
+  border-radius: 6px 6px 6px 0;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+  background: #0787aa;
+}
+
+.person-detection-box.selected,
+.person-detection-box.following {
+  border-color: #ffcc36;
+  background: rgba(255, 204, 54, 0.14);
+  box-shadow: 0 0 0 1px rgba(3, 14, 25, 0.8), 0 0 24px rgba(255, 204, 54, 0.55);
+}
+
+.person-detection-box.selected span,
+.person-detection-box.following span {
+  color: #182332;
+  background: #ffcc36;
+}
+
+.person-follow-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid rgba(66, 229, 255, 0.3);
+  border-radius: 14px;
+  background: rgba(66, 229, 255, 0.07);
+}
+
+.person-follow-toolbar > div {
+  display: grid;
+  gap: 4px;
+}
+
+.person-follow-toolbar span,
+.person-follow-toolbar small {
+  color: var(--muted);
+}
+
+.follow-start-btn {
+  min-height: 44px;
+  border: 1px solid rgba(255, 204, 54, 0.65);
+  border-radius: 999px;
+  padding: 0 20px;
+  color: #17202c;
+  font-weight: 900;
+  background: #ffcc36;
 }
 
 .remote-video-source {
@@ -933,8 +1147,10 @@ watch(livePlayUrls, () => {
 
 @media (max-width: 720px) {
   .remote-video-stage {
-    min-height: 360px;
+    min-height: 0;
   }
+
+  .person-follow-toolbar { grid-template-columns: 1fr; }
 
   .remote-pad-wrap {
     display: grid;

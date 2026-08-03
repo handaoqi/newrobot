@@ -16,6 +16,7 @@ class CommandService:
         "task.pause": "pausing",
         "task.resume": "resuming",
         "task.cancel": "cancelling",
+        "task.force_exit": "cancelling",
     }
 
     @classmethod
@@ -58,12 +59,31 @@ class CommandService:
             source="center",
             payload={"command_type": command_type},
         )
-        TaskExecutionService.transition(
-            execution,
-            target,
-            event_type=f"{command_type}.requested",
-            payload={"command_id": str(command.id)},
-        )
+        if command_type == "task.force_exit":
+            # This is deliberately a local clean-up too.  A lost edge session
+            # must not leave a unique active-task row preventing the next task.
+            active_executions = list(
+                TaskExecution.objects.select_for_update().filter(
+                    robot=execution.robot,
+                    state__in=TaskExecution.ACTIVE_STATES,
+                )
+            )
+            for active_execution in active_executions:
+                TaskExecutionService.transition(
+                    active_execution,
+                    "cancelled",
+                    event_type="task.force_exit.requested",
+                    reason_code="FORCE_EXIT",
+                    reason_message="操作员强制退出并清理任务状态",
+                    payload={"command_id": str(command.id), "requested_execution_id": str(execution.id)},
+                )
+        else:
+            TaskExecutionService.transition(
+                execution,
+                target,
+                event_type=f"{command_type}.requested",
+                payload={"command_id": str(command.id)},
+            )
         return command
 
     @staticmethod
@@ -100,6 +120,30 @@ class CommandService:
         CommandEvent.objects.create(command=command, event_type="timeout", source="center")
         if command.task_execution_id and command.task_execution.state in TaskExecution.ACTIVE_STATES:
             try:
+                if command.command_type == "task.pause":
+                    if command.task_execution.state == "pausing":
+                        TaskExecutionService.transition(
+                            command.task_execution,
+                            "running",
+                            event_type="task.pause.timeout",
+                            reason_code="COMMAND_TIMED_OUT",
+                            reason_message="暂停指令超时，保留任务执行状态",
+                            payload={"command_id": str(command.id)},
+                        )
+                    return
+                if command.command_type == "task.resume":
+                    if command.task_execution.state == "resuming":
+                        TaskExecutionService.transition(
+                            command.task_execution,
+                            "paused",
+                            event_type="task.resume.timeout",
+                            reason_code="COMMAND_TIMED_OUT",
+                            reason_message="继续指令超时，保留任务暂停状态",
+                            payload={"command_id": str(command.id)},
+                        )
+                    return
+                if command.command_type == "task.force_exit":
+                    return
                 TaskExecutionService.transition(
                     command.task_execution,
                     "timed_out",

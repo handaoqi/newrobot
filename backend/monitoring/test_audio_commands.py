@@ -8,7 +8,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from rest_framework.test import APIClient, APITestCase
 
-from .models import Robot, RobotCommand, RobotCredential, SpeechTemplate
+from .models import RecordedAudio, Robot, RobotCommand, RobotCredential, SpeechCategory, SpeechTemplate
 
 
 class AudioCommandChainTests(APITestCase):
@@ -95,6 +95,44 @@ class AudioCommandChainTests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(RobotCommand.objects.count(), 0)
 
+    def test_poll_returns_newest_audio_and_supersedes_older_queue(self):
+        older = RobotCommand.objects.create(
+            robot=self.robot,
+            action="play_audio",
+            payload={"audio_url": "https://platform.example/audio/older.wav"},
+        )
+        newest = RobotCommand.objects.create(
+            robot=self.robot,
+            action="play_audio",
+            payload={"audio_url": "https://platform.example/audio/newest.wav"},
+        )
+        response = self.device_client.get(
+            "/api/device/commands/poll/",
+            {"robot_code": self.robot.code},
+            **self.device_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["id"], newest.id)
+        older.refresh_from_db()
+        self.assertEqual(older.status, "superseded")
+
+    def test_device_can_report_audio_as_superseded(self):
+        command = RobotCommand.objects.create(
+            robot=self.robot,
+            action="play_audio",
+            payload={"audio_url": "https://platform.example/audio/old.wav"},
+            status="running",
+        )
+        response = self.device_client.post(
+            f"/api/device/commands/{command.id}/report/",
+            {"status": "superseded", "error_message": "replaced by newer announcement"},
+            format="json",
+            **self.device_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        command.refresh_from_db()
+        self.assertEqual(command.status, "superseded")
+
     def test_device_poll_requires_valid_credential(self):
         response = APIClient().get(
             "/api/device/commands/poll/",
@@ -148,6 +186,16 @@ class RecordedAudioCommandTests(APITestCase):
         )
         user = get_user_model().objects.create_user(username="audio-uploader", password="secret")
         self.client.force_authenticate(user)
+        self.asr_patcher = patch("monitoring.views.asr_service.process_recording", side_effect=self._complete_asr)
+        self.asr_patcher.start()
+        self.addCleanup(self.asr_patcher.stop)
+
+    @staticmethod
+    def _complete_asr(recording):
+        recording.transcript = "请尽快驶离此区域"
+        recording.asr_status = "completed"
+        recording.asr_error = ""
+        recording.save(update_fields=["transcript", "asr_status", "asr_error", "updated_at"])
 
     def test_recording_upload_creates_downloadable_audio_command(self):
         audio = SimpleUploadedFile("recording.webm", b"test-audio-content", content_type="audio/webm;codecs=opus")
@@ -157,11 +205,52 @@ class RecordedAudioCommandTests(APITestCase):
             format="multipart",
         )
         self.assertEqual(response.status_code, 201)
-        self.assertTrue(response.data["audio_url"].startswith("https://platform.example/media/command-audio/"))
+        self.assertTrue(response.data["audio_url"].startswith("https://platform.example/media/recorded-audio/"))
+        self.assertEqual(response.data["recording"]["title"], "现场录音")
+        self.assertEqual(response.data["recording"]["transcript"], "请尽快驶离此区域")
+        self.assertEqual(response.data["recording"]["source_type"], "recording")
         command = RobotCommand.objects.get(id=response.data["command"]["id"])
         self.assertEqual(command.action, "play_audio")
         self.assertEqual(command.status, "queued")
         self.assertEqual(command.payload["content_type"], "audio/webm")
+
+    def test_recording_can_be_saved_with_title_and_category_without_playing(self):
+        category = SpeechCategory.objects.create(name="现场处置")
+        audio = SimpleUploadedFile("recording.webm", b"saved-audio", content_type="audio/webm")
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/commands/audio-recording/",
+            {"file": audio, "title": "南门劝导", "category": category.id, "play_now": "false"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNone(response.data["command"])
+        recording = RecordedAudio.objects.get(id=response.data["recording"]["id"])
+        self.assertEqual(recording.title, "南门劝导")
+        self.assertEqual(recording.category, category)
+        self.assertFalse(RobotCommand.objects.exists())
+
+    def test_saved_recording_can_be_replayed_and_deleted(self):
+        recording = RecordedAudio.objects.create(
+            title="重复播放录音",
+            file=SimpleUploadedFile("saved.webm", b"saved-audio", content_type="audio/webm"),
+            content_type="audio/webm",
+            file_size=11,
+        )
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/commands/recorded-audio/{recording.id}/",
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        command = RobotCommand.objects.get(id=response.data["id"])
+        self.assertEqual(command.payload["source"], "dashboard_recording_library")
+        self.assertEqual(command.payload["audio_name"], "重复播放录音")
+
+        stored_path = recording.file.path
+        response = self.client.delete(f"/api/recorded-audio/{recording.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(RecordedAudio.objects.filter(id=recording.id).exists())
+        self.assertFalse(__import__("os").path.exists(stored_path))
 
 
 class SpeechTemplateAndTtsTests(APITestCase):
@@ -198,6 +287,33 @@ class SpeechTemplateAndTtsTests(APITestCase):
         response = self.client.delete(f"/api/speech-templates/{template_id}/")
         self.assertEqual(response.status_code, 204)
         self.assertFalse(SpeechTemplate.objects.filter(id=template_id).exists())
+
+    def test_speech_category_can_be_created_and_assigned(self):
+        category_response = self.client.post(
+            "/api/speech-categories/",
+            {"name": "临时管制"},
+            format="json",
+        )
+        self.assertEqual(category_response.status_code, 201)
+        category_id = category_response.data["id"]
+
+        template_response = self.client.post(
+            "/api/speech-templates/",
+            {"name": "施工提醒", "text": "前方施工，请绕行。", "category": category_id},
+            format="json",
+        )
+        self.assertEqual(template_response.status_code, 201)
+        self.assertEqual(template_response.data["category"], category_id)
+        self.assertEqual(template_response.data["category_name"], "临时管制")
+
+        list_response = self.client.get("/api/speech-categories/")
+        category_data = next(item for item in list_response.data if item["id"] == category_id)
+        self.assertEqual(category_data["template_count"], 1)
+
+        delete_response = self.client.delete(f"/api/speech-categories/{category_id}/")
+        self.assertEqual(delete_response.status_code, 204)
+        self.assertFalse(SpeechCategory.objects.filter(id=category_id).exists())
+        self.assertIsNone(SpeechTemplate.objects.get(name="施工提醒").category_id)
 
     @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/example.mp3", False))
     def test_current_text_is_synthesized_and_queued_for_robot(self, synthesize):

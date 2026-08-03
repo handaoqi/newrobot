@@ -79,6 +79,10 @@ export async function fetchRobotDetail(robotId) {
   return request(`/robots/${robotId}/`)
 }
 
+export async function fetchRobotPersonDetections(robotId) {
+  return request(`/robots/${robotId}/person-detections/`)
+}
+
 export async function sendRobotCommand(robotId, payload) {
   return request(`/robots/${robotId}/commands/`, {
     method: 'POST',
@@ -86,14 +90,31 @@ export async function sendRobotCommand(robotId, payload) {
   })
 }
 
-export async function sendRecordedAudioCommand(robotId, file, audioName = '现场录音') {
+export async function sendRecordedAudioCommand(robotId, file, { title = '现场录音', category = null, playNow = true } = {}) {
   const formData = new FormData()
   formData.append('file', file)
-  formData.append('audio_name', audioName)
+  formData.append('title', title)
+  if (category) formData.append('category', String(category))
+  formData.append('play_now', playNow ? 'true' : 'false')
   return request(`/robots/${robotId}/commands/audio-recording/`, {
     method: 'POST',
     body: formData,
   })
+}
+
+export async function fetchRecordedAudios() {
+  return request('/recorded-audio/')
+}
+
+export async function playSavedRecording(robotId, recordingId) {
+  return request(`/robots/${robotId}/commands/recorded-audio/${recordingId}/`, {
+    method: 'POST',
+    body: '{}',
+  })
+}
+
+export async function deleteRecordedAudio(recordingId) {
+  return request(`/recorded-audio/${recordingId}/`, { method: 'DELETE' })
 }
 
 export async function sendTextToSpeechCommand(robotId, text, audioName = '实时文字喊话') {
@@ -124,6 +145,22 @@ export async function updateSpeechTemplate(templateId, payload) {
 
 export async function deleteSpeechTemplate(templateId) {
   return request(`/speech-templates/${templateId}/`, { method: 'DELETE' })
+}
+
+export async function fetchSpeechCategories() {
+  return request('/speech-categories/')
+}
+
+export async function createSpeechCategory(name) {
+  return request('/speech-categories/', { method: 'POST', body: JSON.stringify({ name }) })
+}
+
+export async function updateSpeechCategory(categoryId, name) {
+  return request(`/speech-categories/${categoryId}/`, { method: 'PATCH', body: JSON.stringify({ name }) })
+}
+
+export async function deleteSpeechCategory(categoryId) {
+  return request(`/speech-categories/${categoryId}/`, { method: 'DELETE' })
 }
 
 export async function fetchTasks() {

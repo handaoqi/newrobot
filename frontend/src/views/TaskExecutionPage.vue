@@ -60,6 +60,7 @@ async function refresh() {
 }
 
 async function act(action) {
+  if (action === 'force-exit' && !window.confirm('强制退出会停止当前导航，并清理该机器人的全部未结束任务。确认继续？')) return
   error.value = ''
   try {
     execution.value = await sendTaskExecutionAction(execution.value.id, action)
@@ -67,6 +68,10 @@ async function act(action) {
   } catch (exc) {
     error.value = exc.message
   }
+}
+
+function controlTask() {
+  if (actions.value.control.action) act(actions.value.control.action)
 }
 
 function refreshImageGeometry() {
@@ -187,6 +192,39 @@ function buildFailureInfo() {
     ? parseWaypointIndexes(message)
     : []
 
+  if (['pausing', 'paused'].includes(execution.value?.state)) {
+    return {
+      severity: 'idle',
+      title: '任务暂停中',
+      summary: '当前导航已暂停，点击“继续”可从当前航点恢复执行。',
+      detail: '',
+      waypointIndexes: [],
+      suggestion: '',
+    }
+  }
+
+  if (execution.value?.state === 'cancelled') {
+    return {
+      severity: 'idle',
+      title: '任务结束',
+      summary: '任务已退出，机器人任务状态已清理。',
+      detail: '',
+      waypointIndexes: [],
+      suggestion: '',
+    }
+  }
+
+  if (['failed', 'timed_out', 'rejected'].includes(execution.value?.state)) {
+    return {
+      severity: 'bad',
+      title: '任务结束',
+      summary: execution.value.failure_code || '任务未能继续执行。',
+      detail: execution.value.failure_message || '',
+      waypointIndexes: [],
+      suggestion: '可查看命令生命周期确认结束原因，清理状态后重新执行任务。',
+    }
+  }
+
   if (code === 'NAVIGATION_MISSED_WAYPOINTS') {
     return {
       severity: 'bad',
@@ -306,7 +344,7 @@ onBeforeUnmount(() => {
             <h3>{{ execution.task_name }}</h3>
             <p>{{ execution.robot_name }} / {{ execution.route_name }}</p>
           </div>
-          <span class="panel-badge">{{ execution.state }}</span>
+          <span class="panel-badge">{{ actions.statusLabel }}</span>
         </div>
         <div class="metrics-grid">
           <div class="metric-card"><strong>{{ currentIndex + 1 }} / {{ execution.total_waypoints || waypoints.length }}</strong><span>当前航点</span></div>
@@ -332,9 +370,8 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="action-row">
-          <button class="ghost-btn" :disabled="!actions.pause" @click="act('pause')">暂停</button>
-          <button class="primary-btn" :disabled="!actions.resume" @click="act('resume')">继续</button>
-          <button class="danger-btn" :disabled="!actions.cancel" @click="act('cancel')">终止</button>
+          <button class="primary-btn" :disabled="!actions.control.enabled" @click="controlTask">{{ actions.control.label }}</button>
+          <button class="danger-btn" :disabled="!actions.forceExit" @click="act('force-exit')">强制退出</button>
         </div>
         <p v-if="error" class="form-error">{{ error }}</p>
       </div>

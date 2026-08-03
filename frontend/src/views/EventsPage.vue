@@ -1,7 +1,10 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 
 import { fetchEvents, handleEvent } from '../services/api'
+
+const route = useRoute()
 
 const filters = [
   { label: '全部记录', value: '' },
@@ -22,7 +25,9 @@ const sortOptions = [
   { label: '置信度优先', value: 'confidence_desc' },
 ]
 
-const activeFilter = ref('pending')
+const eventStatusValues = new Set(['', 'pending', 'resolved'])
+const requestedStatus = String(route.query.status ?? 'pending')
+const activeFilter = ref(eventStatusValues.has(requestedStatus) ? requestedStatus : 'pending')
 const events = ref([])
 const selectedEvent = ref(null)
 const loading = ref(true)
@@ -302,6 +307,15 @@ async function markResolved() {
     archiving.value = false
   }
 }
+
+watch(() => route.query.status, (value) => {
+  const requested = String(value ?? 'pending')
+  const nextFilter = eventStatusValues.has(requested) ? requested : 'pending'
+  if (nextFilter === activeFilter.value) return
+  activeFilter.value = nextFilter
+  selectedEvent.value = null
+  loadEvents()
+})
 
 onMounted(loadEvents)
 </script>
