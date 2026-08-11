@@ -49,7 +49,7 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(execution.route_snapshot["waypoints"][0]["x"], 1.0)
 
     def test_route_snapshot_preserves_waypoint_speech_template(self):
-        category = SpeechCategory.objects.create(name="巡检智能播报")
+        category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")
         template = SpeechTemplate.objects.create(name="到点提醒", text="已到达巡检点", category=category)
         self.route.waypoints = [
             {
@@ -101,6 +101,27 @@ class TaskExecutionTests(TestCase):
         second = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
         self.assertEqual(second.status_code, 409)
         self.assertEqual(RemoteCommand.objects.count(), 1)
+
+    def test_task_execute_can_request_navigation_rosbag(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_task_execute_rejects_invalid_navigation_rosbag_flag(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": "yes"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_route_api_execute_creates_quick_task_and_command(self):
         client = APIClient()

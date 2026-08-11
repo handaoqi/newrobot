@@ -14,6 +14,7 @@
 | [板端识别与视频链路](./edge-and-video-pipeline.md)      | `bot-version` 模块、YOLO 检测、抓拍、遥测、RTSP/RTMP/FLV/HLS |
 | [bot-version 项目结构与实现分析](./bot_version_eval.md) | `bot-version` 目录结构、功能介绍、核心实现、风险与改进建议     |
 | [运维、测试与排障](./operations-and-troubleshooting.md) | 健康检查、常见问题、验证步骤、生产化建议                       |
+| [“无界公园”软件著作权材料包](./software-copyright/README.md) | 六项软著名称、信息采集表、代码边界、说明书初稿和提交检查表 |
 
 ## 项目一句话说明
 

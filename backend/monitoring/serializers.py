@@ -9,6 +9,7 @@ from rest_framework import serializers
 from PIL import Image, ImageDraw
 
 from .models import (
+    AlertSkillBinding,
     CalendarDay,
     CommandEvent,
     InspectionEvent,
@@ -587,6 +588,18 @@ class RobotCommandCreateSerializer(serializers.Serializer):
     payload = serializers.DictField(required=False, default=dict)
 
     def validate(self, attrs):
+        if attrs["action"] == "audio_volume":
+            payload = attrs.get("payload") or {}
+            if str(payload.get("target") or "") not in {"speaker_3588", "speaker_nx"}:
+                raise serializers.ValidationError({"payload": "扬声器目标无效"})
+            try:
+                volume = int(payload.get("volume"))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({"payload": "音量必须是 0-100 的整数"})
+            if not 0 <= volume <= 100:
+                raise serializers.ValidationError({"payload": "音量必须在 0-100 之间"})
+            attrs["payload"] = {**payload, "volume": volume}
+            return attrs
         if attrs["action"] != "move_velocity":
             return attrs
         payload = attrs.get("payload") or {}
@@ -661,6 +674,25 @@ class SpeechTemplateSerializer(serializers.ModelSerializer):
         if not value:
             raise serializers.ValidationError("播报文字不能为空")
         return value
+
+
+class AlertSkillBindingSerializer(serializers.ModelSerializer):
+    display_name = serializers.CharField(source="get_skill_key_display", read_only=True)
+    template = SpeechTemplateSerializer(read_only=True)
+    template_id = serializers.PrimaryKeyRelatedField(
+        source="template",
+        queryset=SpeechTemplate.objects.all(),
+        write_only=True,
+    )
+
+    class Meta:
+        model = AlertSkillBinding
+        fields = ["skill_key", "display_name", "enabled", "template", "template_id", "updated_at"]
+        read_only_fields = ["skill_key", "display_name", "updated_at"]
+
+
+class AlertSkillPreviewSerializer(serializers.Serializer):
+    robot_id = serializers.IntegerField(min_value=1)
 
 
 class SpeechSynthesisSerializer(serializers.Serializer):
@@ -913,6 +945,12 @@ class RobotStatusSerializer(serializers.ModelSerializer):
     task_execution_id = serializers.UUIDField(source="task_execution.id", read_only=True, allow_null=True)
     localization_quality = serializers.SerializerMethodField()
     current_map = serializers.SerializerMethodField()
+    sensors = serializers.SerializerMethodField()
+    power = serializers.SerializerMethodField()
+    network = serializers.SerializerMethodField()
+    audio = serializers.SerializerMethodField()
+    navigation = serializers.SerializerMethodField()
+    power_mode = serializers.SerializerMethodField()
 
     def get_localization_quality(self, obj):
         raw_quality = (obj.raw_payload or {}).get("localization", {}).get("quality")
@@ -922,6 +960,37 @@ class RobotStatusSerializer(serializers.ModelSerializer):
         return (obj.raw_payload or {}).get("current_map") or {
             "map_id": obj.map_id,
             "map_version": obj.map_version,
+        }
+
+    def get_sensors(self, obj):
+        return (obj.raw_payload or {}).get("sensors") or {}
+
+    def get_power(self, obj):
+        return (obj.raw_payload or {}).get("power") or {
+            "available": obj.power_available,
+            "percent": obj.battery_percent,
+            "charging": obj.charging,
+        }
+
+    def get_network(self, obj):
+        return (obj.raw_payload or {}).get("network") or {
+            "available": obj.signal_percent is not None,
+            "type": obj.network_type,
+            "signal_percent": obj.signal_percent,
+        }
+
+    def get_audio(self, obj):
+        return (obj.raw_payload or {}).get("audio") or {}
+
+    def get_navigation(self, obj):
+        return (obj.raw_payload or {}).get("navigation") or {}
+
+    def get_power_mode(self, obj):
+        return (obj.raw_payload or {}).get("power_mode") or {
+            "mode": "normal",
+            "transition_state": "unknown",
+            "auto_charge_enabled": False,
+            "services": {},
         }
 
     class Meta:
@@ -942,11 +1011,17 @@ class RobotStatusSerializer(serializers.ModelSerializer):
             "localization_status",
             "localization_source_status",
             "localization_quality",
+            "sensors",
             "power_available",
             "battery_percent",
             "charging",
+            "power",
             "network_type",
             "signal_percent",
+            "network",
+            "audio",
+            "navigation",
+            "power_mode",
             "ros_ready",
             "nav_ready",
             "emergency_stop",

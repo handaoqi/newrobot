@@ -12,18 +12,22 @@ import {
   deleteSpeechCategory,
   deleteRecordedAudio,
   deleteSpeechTemplate,
+  fetchAlertSkills,
   fetchOverview,
   fetchRecordedAudios,
   fetchRobotDetail,
   fetchRobots,
+  fetchRobotStatus,
   fetchSpeechCategories,
   fetchSpeechTemplates,
   playSavedRecording,
+  previewAlertSkill,
   sendRecordedAudioCommand,
   sendRobotCommand,
   sendTextToSpeechCommand,
   synthesizeSpeech,
   updateSpeechTemplate,
+  updateAlertSkill,
 } from '../services/api'
 
 const overview = ref(null)
@@ -37,6 +41,10 @@ const takeoverActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const speechCategories = ref([])
 const speechTemplates = ref([])
+const alertSkills = ref([])
+const alertSkillSaving = ref('')
+const alertSkillPreviewing = ref('')
+const robotAudioStatus = ref(null)
 const selectedCategoryFilter = ref('all')
 const selectedSpeakerTemplateId = ref(null)
 const selectedRecordingId = ref(null)
@@ -73,6 +81,7 @@ let recordingTimer = null
 let recordingStream = null
 let recordedChunks = []
 let previewPlayer = null
+let audioStatusTimer = null
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
 const AUDIO_COMMAND_COOLDOWN_MS = 3000
@@ -80,6 +89,8 @@ const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
+const speaker3588Status = computed(() => robotAudioStatus.value?.speaker_3588 || null)
+const speakerNxStatus = computed(() => robotAudioStatus.value?.speaker_nx || null)
 const speechLibraryItems = computed(() => [
   ...speechTemplates.value.map((item) => ({ ...item, title: item.name, source_type: 'tts' })),
   ...savedRecordings.value.map((item) => ({ ...item, name: item.title, text: item.transcript, source_type: 'recording' })),
@@ -164,6 +175,51 @@ async function loadSpeechLibrary() {
     speechTemplates.value.find((item) => item.name === templateName.value) ||
     speechTemplates.value[0]
   if (selected && selectedSpeakerTemplateId.value === null) setSpeakerTemplate(selected)
+}
+
+function normalizeAlertSkills(items) {
+  return items.map((item) => ({
+    ...item,
+    template_id: item.template?.id || null,
+    saved_template_id: item.template?.id || null,
+    saved_enabled: item.enabled,
+  }))
+}
+
+function alertSkillHasUnsavedChanges(skill) {
+  return skill.template_id !== skill.saved_template_id || skill.enabled !== skill.saved_enabled
+}
+
+async function saveAlertSkill(skill) {
+  if (!skill.template_id || alertSkillSaving.value) return
+  alertSkillSaving.value = skill.skill_key
+  try {
+    const saved = await updateAlertSkill(skill.skill_key, {
+      template_id: skill.template_id,
+      enabled: skill.enabled,
+    })
+    const index = alertSkills.value.findIndex((item) => item.skill_key === skill.skill_key)
+    if (index >= 0) alertSkills.value[index] = normalizeAlertSkills([saved])[0]
+    showToast(`${skill.display_name}播报模板已绑定`)
+  } catch (error) {
+    showToast(error.message || '告警播报绑定失败')
+  } finally {
+    alertSkillSaving.value = ''
+  }
+}
+
+async function previewBoundAlertSkill(skill) {
+  const robot = latestRobot.value
+  if (!robot?.id || !skill.template_id || alertSkillPreviewing.value || alertSkillHasUnsavedChanges(skill)) return
+  alertSkillPreviewing.value = skill.skill_key
+  try {
+    await previewAlertSkill(skill.skill_key, robot.id)
+    showToast(`${skill.display_name}双音响试播已下发`)
+  } catch (error) {
+    showToast(error.message || '双音响试播下发失败')
+  } finally {
+    alertSkillPreviewing.value = ''
+  }
 }
 
 async function loadRecordingLibrary() {
@@ -751,11 +807,29 @@ async function chooseRobot(robotId, announce = true) {
   if (!robotId || switchingRobot.value || selectedRobot.value?.id === robotId) return
   switchingRobot.value = true
   try {
-    selectedRobot.value = await fetchRobotDetail(robotId)
+    const [robotDetail, liveStatus] = await Promise.all([
+      fetchRobotDetail(robotId),
+      fetchRobotStatus(robotId).catch(() => null),
+    ])
+    selectedRobot.value = robotDetail
+    robotAudioStatus.value = liveStatus?.status?.audio || null
     streamUnavailable.value = false
     if (announce) showToast(`已切换至 ${selectedRobot.value.name}`)
   } finally {
     switchingRobot.value = false
+  }
+}
+
+async function refreshAudioStatus() {
+  const robotId = latestRobot.value?.id
+  if (!robotId) return
+  try {
+    const liveStatus = await fetchRobotStatus(robotId)
+    if (latestRobot.value?.id === robotId) {
+      robotAudioStatus.value = liveStatus?.status?.audio || null
+    }
+  } catch (_error) {
+    // Retain the last valid device sample during a transient request failure.
   }
 }
 
@@ -851,18 +925,20 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
   setupAlertStream()
   try {
-    const [overviewData, robotData, categoryData, templateData, recordingData] = await Promise.all([
+    const [overviewData, robotData, categoryData, templateData, recordingData, alertSkillData] = await Promise.all([
       fetchOverview(),
       fetchRobots(),
       fetchSpeechCategories().catch(() => []),
       fetchSpeechTemplates().catch(() => []),
       fetchRecordedAudios().catch(() => []),
+      fetchAlertSkills().catch(() => []),
     ])
     overview.value = overviewData
     robots.value = robotData
     speechCategories.value = categoryData
     speechTemplates.value = templateData
     savedRecordings.value = recordingData
+    alertSkills.value = normalizeAlertSkills(alertSkillData)
     const initialTemplate = templateData.find((item) => item.name === templateName.value) || templateData[0]
     if (initialTemplate) setSpeakerTemplate(initialTemplate)
     const initialRobotId = overviewData.latest_robot?.id || robotData[0]?.id
@@ -876,6 +952,7 @@ onMounted(async () => {
   }
 
   setupLivePlayer()
+  audioStatusTimer = window.setInterval(refreshAudioStatus, 5000)
 })
 
 onBeforeUnmount(() => {
@@ -891,6 +968,7 @@ onBeforeUnmount(() => {
   }
   destroyVideoPlayers()
   closeAlertStream()
+  if (audioStatusTimer) window.clearInterval(audioStatusTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   window.removeEventListener('blur', stopHoldAction)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -1059,6 +1137,67 @@ function handleVisibilityChange() {
           <button class="danger-btn" :disabled="commandSending" @click="emergencyStop">
             {{ commandSending ? '下发中...' : '紧急停止' }}
           </button>
+        </div>
+
+        <div class="alert-skill-config">
+          <div class="alert-skill-heading">
+            <div>
+              <strong>告警技能</strong>
+              <span>双音响同步播报，并应用高增益硬削波告警音效</span>
+            </div>
+            <div class="alert-skill-badges">
+              <span class="panel-badge">双音响</span>
+              <span class="panel-badge alert-effect-badge">炸麦</span>
+            </div>
+          </div>
+          <div class="alert-audio-status" aria-label="告警音效与扬声器状态">
+            <span><small>音频增益</small><strong>+12 dB</strong></span>
+            <span><small>削波效果</small><strong>硬削波 55%</strong></span>
+            <span><small>峰值保护</small><strong>98%</strong></span>
+            <span :class="{ offline: !speaker3588Status?.online }">
+              <small>3588 音响</small>
+              <strong>{{ speaker3588Status?.online ? `${speaker3588Status.volume_percent}%` : '离线' }}</strong>
+            </span>
+            <span :class="{ offline: !speakerNxStatus?.online }">
+              <small>NX 音响</small>
+              <strong>{{ speakerNxStatus?.online ? `${speakerNxStatus.volume_percent}%` : '离线' }}</strong>
+            </span>
+          </div>
+          <div class="alert-skill-list">
+            <div v-for="skill in alertSkills" :key="skill.skill_key" class="alert-skill-row">
+              <label class="alert-skill-toggle">
+                <input v-model="skill.enabled" type="checkbox" />
+                <span>{{ skill.display_name }}</span>
+              </label>
+              <select v-model="skill.template_id" :aria-label="`${skill.display_name}播报模板`">
+                <option v-for="template in speechTemplates" :key="template.id" :value="template.id">
+                  {{ template.name }}
+                </option>
+              </select>
+              <span class="alert-skill-copy">
+                {{ speechTemplates.find((template) => template.id === skill.template_id)?.text || '未配置播报模板' }}
+              </span>
+              <div class="alert-skill-actions">
+                <button
+                  type="button"
+                  class="ghost-btn"
+                  :disabled="!skill.template_id || Boolean(alertSkillSaving) || Boolean(alertSkillPreviewing)"
+                  @click="saveAlertSkill(skill)"
+                >
+                  {{ alertSkillSaving === skill.skill_key ? '保存中' : '保存' }}
+                </button>
+                <button
+                  type="button"
+                  class="primary-btn"
+                  :title="alertSkillHasUnsavedChanges(skill) ? '请先保存当前模板配置' : '在当前机器人上使用两个音响试播'"
+                  :disabled="!skill.template_id || !latestRobot?.id || Boolean(alertSkillSaving) || Boolean(alertSkillPreviewing) || alertSkillHasUnsavedChanges(skill)"
+                  @click="previewBoundAlertSkill(skill)"
+                >
+                  {{ alertSkillPreviewing === skill.skill_key ? '试播中' : '试播' }}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 

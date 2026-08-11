@@ -32,11 +32,32 @@ const latestCommand = computed(() => {
 })
 const failureInfo = computed(() => buildFailureInfo())
 const failedWaypointIndexes = computed(() => failureInfo.value.waypointIndexes)
+const localizationLossMarkers = computed(() => (execution.value?.events || [])
+  .filter(event => event.reason_code === 'LOCALIZATION_LOST' && event.event_type === 'task.pausing')
+  .map((event, index) => {
+    const pose = trustedPoseForLossEvent(event)
+    return {
+      ...pose,
+      eventId: event.id,
+      sequence: index + 1,
+      occurredAt: event.occurred_at,
+      poseSource: event.payload?.last_trusted_pose ? 'edge' : 'trajectory',
+    }
+  })
+  .filter(point => Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y))))
 const progress = computed(() => {
   if (!execution.value?.total_waypoints) return 0
   return Math.round(execution.value.completed_waypoints / execution.value.total_waypoints * 100)
 })
 const isActive = computed(() => ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted'].includes(execution.value?.state))
+const rosbagStatus = computed(() => {
+  const events = [...(execution.value?.events || [])].reverse()
+  for (const event of events) {
+    const status = event?.payload?.rosbag
+    if (status && typeof status === 'object') return status
+  }
+  return null
+})
 
 function fullUrl(relativeUrl) {
   if (!relativeUrl) return ''
@@ -133,6 +154,36 @@ function robotDisplayPosition() {
 
 function robotHeadingStyle() {
   return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(robotPoint()?.yaw || 0)}rad)` }
+}
+
+function lossHeadingStyle(point) {
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(point?.yaw || 0)}rad)` }
+}
+
+function lossMarkerTitle(point) {
+  const time = point.occurredAt ? new Date(point.occurredAt).toLocaleString('zh-CN', { hour12: false }) : '—'
+  return `第 ${point.sequence} 次定位丢失\n最后可信位置 x=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}\n航向 ${Number(point.yaw || 0).toFixed(3)} rad\n${time}`
+}
+
+function trustedPoseForLossEvent(event) {
+  const reported = event?.payload?.last_trusted_pose
+  if (Number.isFinite(Number(reported?.x)) && Number.isFinite(Number(reported?.y))) return reported
+
+  const lossTime = new Date(event?.occurred_at || '').getTime()
+  if (!Number.isFinite(lossTime)) return null
+  return [...trajectory.value].reverse().find((point) => {
+    const sampleTime = new Date(point.sampled_at || point.received_at || '').getTime()
+    return point.localization_status === 'normal'
+      && Number.isFinite(sampleTime)
+      && sampleTime <= lossTime
+      && Number.isFinite(Number(point.x))
+      && Number.isFinite(Number(point.y))
+  }) || null
+}
+
+function lossMarkerTime(point) {
+  if (!point.occurredAt) return '—'
+  return new Date(point.occurredAt).toLocaleTimeString('zh-CN', { hour12: false })
 }
 
 function sampleIsStale(value, thresholdMs = 10000) {
@@ -309,6 +360,28 @@ function targetText() {
   return `${currentTarget.value.name || `点${currentIndex.value + 1}`} (${Number(currentTarget.value.x).toFixed(2)}, ${Number(currentTarget.value.y).toFixed(2)})`
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / (1024 ** unitIndex)).toFixed(unitIndex ? 1 : 0)} ${units[unitIndex]}`
+}
+
+function rosbagDuration() {
+  const status = rosbagStatus.value
+  if (!status) return 0
+  if (status.running && status.started_at_unix) {
+    return Math.max(0, Math.floor(Date.now() / 1000) - Number(status.started_at_unix))
+  }
+  return Math.max(0, Number(status.duration_seconds || 0))
+}
+
+function durationText(seconds) {
+  const value = Math.max(0, Number(seconds || 0))
+  return `${Math.floor(value / 60)}分${Math.floor(value % 60)}秒`
+}
+
 function localizationDebugItems() {
   const status = robotStatus.value?.status || {}
   const quality = status.localization_quality || {}
@@ -369,6 +442,12 @@ onBeforeUnmount(() => {
             <strong>{{ value }}</strong>
           </div>
         </div>
+        <div v-if="rosbagStatus" class="detail-card rosbag-card" :class="{ recording: rosbagStatus.running, failed: rosbagStatus.error }">
+          <strong>{{ rosbagStatus.running ? '导航诊断包录制中' : (rosbagStatus.error ? '导航诊断包异常' : '导航诊断包已保存') }}</strong>
+          <p>{{ durationText(rosbagDuration()) }} · {{ formatBytes(rosbagStatus.size_bytes) }}</p>
+          <small v-if="rosbagStatus.bag_dir" :title="rosbagStatus.bag_dir">{{ rosbagStatus.bag_dir }}</small>
+          <small v-if="rosbagStatus.error">{{ rosbagStatus.error }}</small>
+        </div>
         <div class="action-row">
           <button class="primary-btn" :disabled="!actions.control.enabled" @click="controlTask">{{ actions.control.label }}</button>
           <button class="danger-btn" :disabled="!actions.forceExit" @click="act('force-exit')">强制退出</button>
@@ -403,7 +482,7 @@ onBeforeUnmount(() => {
       <div class="execution-map-head">
         <div>
           <h3>{{ mapData?.name || execution.map_name || '执行地图' }}</h3>
-          <p>{{ robotStatus?.robot_code || execution.robot_code }} · 轨迹 {{ trajectory.length }} 点</p>
+          <p>{{ robotStatus?.robot_code || execution.robot_code }} · 轨迹 {{ trajectory.length }} 点 · 定位丢失 {{ localizationLossMarkers.length }} 次</p>
         </div>
         <span class="panel-badge">{{ robotPoint() ? `x ${robotPoint().x.toFixed(2)} / y ${robotPoint().y.toFixed(2)}` : '暂无定位' }}</span>
       </div>
@@ -428,8 +507,26 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="currentTarget" class="execution-marker target" :style="displayPosition(currentTarget)">目标</div>
             <div v-if="lastTrajectoryPoint()" class="execution-marker final" :style="displayPosition(lastTrajectoryPoint())">终点</div>
+            <div
+              v-for="point in localizationLossMarkers"
+              :key="`localization-loss-${point.eventId}`"
+              class="localization-loss-marker"
+              :style="displayPosition(point)"
+              :title="lossMarkerTitle(point)"
+            >
+              <span class="localization-loss-heading" :style="lossHeadingStyle(point)"></span>
+              <small>{{ point.sequence }}</small>
+            </div>
             <div v-if="robotDisplayPosition()" class="execution-robot" :style="robotDisplayPosition()">
               <span :style="robotHeadingStyle()"></span>
+            </div>
+          </div>
+          <div v-if="localizationLossMarkers.length" class="localization-loss-list">
+            <strong>定位丢失位置</strong>
+            <div v-for="point in localizationLossMarkers" :key="`localization-loss-detail-${point.eventId}`">
+              <i></i>
+              <span>#{{ point.sequence }} x {{ Number(point.x).toFixed(2) }} / y {{ Number(point.y).toFixed(2) }}</span>
+              <small>yaw {{ Number(point.yaw || 0).toFixed(3) }} rad · {{ lossMarkerTime(point) }}</small>
             </div>
           </div>
         </div>
@@ -564,6 +661,90 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
+.localization-loss-marker {
+  position: absolute;
+  width: 30px;
+  height: 30px;
+  transform: translate(-50%, -50%);
+  z-index: 9;
+  pointer-events: auto;
+}
+
+.localization-loss-marker::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  background: #dc2626;
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.3), 0 3px 10px rgba(127, 29, 29, 0.45);
+}
+
+.localization-loss-marker small {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  transform: translate(-50%, 2px);
+  min-width: 18px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #991b1b;
+  color: #fff;
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+}
+
+.localization-loss-heading {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 15px solid #7f1d1d;
+  transform-origin: 50% 100%;
+  z-index: 2;
+}
+
+.localization-loss-list {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 12;
+  display: grid;
+  gap: 6px;
+  width: min(310px, calc(100% - 24px));
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid rgba(220, 38, 38, 0.32);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+}
+
+.localization-loss-list > div {
+  display: grid;
+  grid-template-columns: 10px 1fr;
+  column-gap: 7px;
+  font-size: 12px;
+}
+
+.localization-loss-list i {
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #dc2626;
+}
+
+.localization-loss-list small {
+  grid-column: 2;
+  color: #64748b;
+}
+
 .execution-robot {
   position: absolute;
   width: 34px;
@@ -598,6 +779,23 @@ onBeforeUnmount(() => {
 .execution-waypoints {
   display: grid;
   gap: 8px;
+}
+
+.rosbag-card {
+  border-left: 3px solid #64748b;
+}
+
+.rosbag-card.recording {
+  border-left-color: #dc2626;
+}
+
+.rosbag-card.failed {
+  border-left-color: #d97706;
+}
+
+.rosbag-card small {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .execution-waypoint {

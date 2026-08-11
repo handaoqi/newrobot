@@ -11,6 +11,7 @@ from .config import AppConfig
 from .logging_utils import rotate_file_if_needed
 
 LOGGER = logging.getLogger(__name__)
+AUDIO_PROBE_INTERVAL_SECONDS = 15
 
 
 def _milliseconds(seconds: float) -> float:
@@ -39,9 +40,11 @@ class StreamPusher:
     def remote_audio_enabled(self) -> bool:
         return self.config.stream.audio_enabled and self.config.stream.audio_mode == "remote_pulse"
 
-    def build_command(self) -> list[str]:
+    def build_command(self, include_remote_audio: bool | None = None) -> list[str]:
         stream = self.config.stream
         video = self.config.video
+        if include_remote_audio is None:
+            include_remote_audio = self.remote_audio_enabled()
         if not stream.rtmp_url:
             raise ValueError("stream.rtmp_url is required when stream.enable is true")
 
@@ -55,7 +58,7 @@ class StreamPusher:
             command.extend(["-rtsp_transport", video.rtsp_transport])
 
         command.extend(["-i", str(video.source)])
-        if self.remote_audio_enabled():
+        if include_remote_audio:
             command.extend([
                 "-thread_queue_size", "512",
                 "-f", "s16le",
@@ -65,7 +68,7 @@ class StreamPusher:
                 "-map", "0:v:0",
                 "-map", "1:a:0",
             ])
-        elif not stream.audio_enabled:
+        elif not stream.audio_enabled or self.remote_audio_enabled():
             command.append("-an")
 
         if stream.video_codec == "copy":
@@ -73,7 +76,7 @@ class StreamPusher:
         else:
             command.extend(["-c:v", stream.video_codec, "-preset", "veryfast", "-tune", "zerolatency"])
 
-        if self.remote_audio_enabled():
+        if include_remote_audio:
             command.extend([
                 "-c:a", "aac",
                 "-b:a", stream.audio_bitrate,
@@ -111,6 +114,53 @@ class StreamPusher:
         command.extend([f"{playback.remote_user}@{playback.remote_host}", remote_command])
         return command
 
+    def build_remote_audio_probe_command(self) -> list[str]:
+        playback = self.config.audio_playback
+        command = [
+            "ssh",
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=6",
+            "-p", str(playback.remote_port),
+        ]
+        if playback.identity_file:
+            command.extend(["-i", playback.identity_file])
+        pulse_server = playback.pulse_server or "/run/user/1000/pulse/native"
+        remote_command = f"PULSE_SERVER={shlex.quote(pulse_server)} pactl list short sources"
+        command.extend([f"{playback.remote_user}@{playback.remote_host}", remote_command])
+        return command
+
+    def remote_audio_available(self) -> bool:
+        if not self.remote_audio_enabled():
+            return False
+        try:
+            result = subprocess.run(
+                self.build_remote_audio_probe_command(),
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            LOGGER.warning("remote audio probe failed; using video-only stream: %s", exc)
+            return False
+        if result.returncode != 0:
+            LOGGER.warning(
+                "remote audio probe exited code=%s; using video-only stream",
+                result.returncode,
+            )
+            return False
+
+        sources = {
+            fields[1]
+            for line in result.stdout.splitlines()
+            if len(fields := line.split("\t")) > 1
+        }
+        configured_source = self.config.stream.audio_source or "@DEFAULT_SOURCE@"
+        if configured_source == "@DEFAULT_SOURCE@":
+            return any(not source.endswith(".monitor") for source in sources)
+        return configured_source in sources
+
     @staticmethod
     def _terminate_process(process: subprocess.Popen | None) -> None:
         if process is None or process.poll() is not None:
@@ -124,7 +174,10 @@ class StreamPusher:
 
     def run_forever(self, stop_event) -> None:
         while not stop_event.is_set():
-            command = self.build_command()
+            use_remote_audio = self.remote_audio_available()
+            if self.remote_audio_enabled() and not use_remote_audio:
+                LOGGER.warning("configured audio source is unavailable; starting video-only stream")
+            command = self.build_command(include_remote_audio=use_remote_audio)
             LOGGER.info("starting zlm stream push: %s", " ".join(command))
             started_at = time.perf_counter()
             log_path = Path(self.config.storage.stream_log_path)
@@ -137,7 +190,7 @@ class StreamPusher:
             with log_path.open("a", encoding="utf-8") as stream_log:
                 audio_process = None
                 ffmpeg_stdin = None
-                if self.remote_audio_enabled():
+                if use_remote_audio:
                     audio_command = self.build_remote_audio_command()
                     LOGGER.info("starting remote PulseAudio capture host=%s source=%s", self.config.audio_playback.remote_host, self.config.stream.audio_source)
                     audio_process = subprocess.Popen(
@@ -162,9 +215,21 @@ class StreamPusher:
                 )
                 while process.poll() is None:
                     if audio_process and audio_process.poll() is not None:
-                        LOGGER.warning("remote PulseAudio capture exited code=%s; restarting stream", audio_process.returncode)
+                        LOGGER.warning(
+                            "remote PulseAudio capture exited code=%s; falling back to video-only stream",
+                            audio_process.returncode,
+                        )
                         self._terminate_process(process)
                         break
+                    if not use_remote_audio and self.remote_audio_enabled():
+                        if stop_event.wait(AUDIO_PROBE_INTERVAL_SECONDS):
+                            self._terminate_process(process)
+                            return
+                        if self.remote_audio_available():
+                            LOGGER.info("remote audio source is available; restarting stream with audio")
+                            self._terminate_process(process)
+                            break
+                        continue
                     if stop_event.wait(1):
                         LOGGER.info("stopping zlm stream push")
                         self._terminate_process(process)

@@ -27,7 +27,12 @@ COMMAND_TYPES = {
     "nav.recover",
     "nav.stop",
     "nav.initial_pose",
+    "nav.relocalize",
     "map.activate",
+    "sensor.restart",
+    "charge.start",
+    "charge.stop",
+    "audio.volume",
 }
 UPLINK_MESSAGE_TYPES = {
     "presence.online",
@@ -204,6 +209,9 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         actions = waypoint.get("actions", [])
         if not isinstance(actions, list) or any(action != "snapshot" for action in actions):
             raise ProtocolError("INVALID_MESSAGE", "P0 waypoint actions only support snapshot")
+    record_rosbag = command.get("record_rosbag")
+    if record_rosbag is not None and not isinstance(record_rosbag, bool):
+        raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
 
 
 def _validate_trajectory_batch(payload: dict[str, Any]) -> None:

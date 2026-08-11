@@ -27,6 +27,7 @@ from .services.alert_service import AlertService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
 from .services import tts_service
+from .services.alert_skill_service import resolve_alert_template
 
 
 ResponsePublisher = Callable[[str, dict, int, bool], None]
@@ -87,16 +88,17 @@ def _queue_waypoint_speech(execution: TaskExecution, robot: Robot, waypoint_inde
 
 def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict):
     """Queue the fixed recovery announcement selected by the robot-side stage."""
-    stage_titles = {
-        "obstacle_detected": "发现障碍物",
-        "recovery_attempt": "后退尝试避障",
-        "leave_route": "劝阻离开线路",
+    stage_skills = {
+        "obstacle_detected": ("obstacle_detected", "发现障碍物"),
+        "recovery_attempt": ("avoidance", "后退尝试避障"),
+        "leave_route": ("dissuasion", "劝阻离开线路"),
     }
     stage = str(payload.get("speech_stage") or "")
-    title = stage_titles.get(stage)
-    if not title:
+    skill = stage_skills.get(stage)
+    if not skill:
         LOGGER.warning("unsupported obstacle speech stage execution=%s stage=%s", execution.id, stage)
         return None
+    skill_key, title = skill
     attempt = int(payload.get("recovery_attempt") or 0)
     episode_id = str(payload.get("obstacle_episode_id") or "")
     duplicate_filter = {
@@ -111,10 +113,7 @@ def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict
         duplicate_filter["payload__obstacle_episode_id"] = episode_id
     if RobotCommand.objects.filter(**duplicate_filter).exists():
         return None
-    template = SpeechTemplate.objects.filter(
-        name=title,
-        category__name=settings.INSPECTION_SPEECH_CATEGORY_NAME,
-    ).first()
+    template = resolve_alert_template(skill_key, title)
     if not template:
         LOGGER.warning("obstacle speech template missing execution=%s title=%s", execution.id, title)
         return None
@@ -131,6 +130,8 @@ def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict
             "audio_name": template.name,
             "text": template.text,
             "source": "patrol_obstacle_speech",
+            "alert_skill": skill_key,
+            "dual_output": True,
             "content_type": "audio/mpeg",
             "tts_cache_hit": cache_hit,
             "task_execution_id": str(execution.id),

@@ -101,6 +101,14 @@ class AudioPlaybackConfig:
     pulse_server: str = ""
     pulse_sink: str = ""
     player_path: str = "/usr/bin/ffplay"
+    sync_enabled: bool = True
+    sync_lead_time_ms: int = 800
+    sync_ready_timeout_seconds: float = 2.0
+    sync_clock_offset_limit_ms: float = 1.0
+    local_alsa_device: str = ""
+    remote_alsa_device: str = ""
+    local_latency_compensation_ms: float = 0.0
+    remote_latency_compensation_ms: float = 0.0
 
 
 @dataclass

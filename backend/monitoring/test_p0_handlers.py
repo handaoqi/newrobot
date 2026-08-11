@@ -162,7 +162,7 @@ class MessageHandlerTests(TestCase):
 
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/waypoint.mp3", True))
     def test_completed_waypoint_queues_selected_speech(self, synthesize_speech):
-        category = SpeechCategory.objects.create(name="巡检智能播报")
+        category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")
         template = SpeechTemplate.objects.create(name="到点播报", text="已到达巡检点", category=category)
         snapshot = self.execution.route_snapshot
         snapshot["waypoints"][0].update(
@@ -194,9 +194,12 @@ class MessageHandlerTests(TestCase):
 
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/obstacle.mp3", True))
     def test_obstacle_speech_uses_fixed_title_and_allows_three_recovery_attempts(self, synthesize_speech):
-        category = SpeechCategory.objects.create(name="巡检智能播报")
+        category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")
         for name in ("发现障碍物", "后退尝试避障", "劝阻离开线路"):
-            SpeechTemplate.objects.create(name=name, text=f"{name}文案", category=category)
+            SpeechTemplate.objects.update_or_create(
+                name=name,
+                defaults={"text": f"{name}文案", "category": category},
+            )
         for sequence, stage, attempt in (
             (1, "obstacle_detected", 0),
             (2, "recovery_attempt", 1),
@@ -238,10 +241,15 @@ class MessageHandlerTests(TestCase):
             "发现障碍物", "后退尝试避障", "后退尝试避障", "后退尝试避障", "劝阻离开线路", "发现障碍物",
         ])
         self.assertEqual(synthesize_speech.call_count, 6)
+        self.assertEqual(
+            [item.payload["alert_skill"] for item in commands],
+            ["obstacle_detected", "avoidance", "avoidance", "avoidance", "dissuasion", "obstacle_detected"],
+        )
+        self.assertTrue(all(item.payload["dual_output"] for item in commands))
 
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/final.mp3", True))
     def test_task_completion_queues_final_waypoint_speech(self, synthesize_speech):
-        category = SpeechCategory.objects.create(name="巡检智能播报")
+        category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")
         template = SpeechTemplate.objects.create(name="终点播报", text="已到达巡检终点", category=category)
         snapshot = self.execution.route_snapshot
         snapshot["waypoints"][1].update(

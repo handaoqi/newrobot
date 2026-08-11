@@ -14,6 +14,7 @@ const menuItems = [
   { label: '保安值守', path: '/dashboard/guard-duty' },
   { label: '监测中心', path: '/dashboard/overview' },
   { label: '远程控制', path: '/dashboard/remote-control' },
+  { label: '远程 AI 开发', path: '/dashboard/remote-development' },
   { label: '统计分析', path: '/dashboard/analytics' },
   { label: '事件中心', path: '/dashboard/events' },
   { label: '机器人管理', path: '/dashboard/robots' },

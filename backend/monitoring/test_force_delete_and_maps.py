@@ -138,6 +138,10 @@ class MapUploadMetadataTests(TestCase):
         with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("map.yaml", "image: map.pgm\nresolution: 0.08\norigin: [-3.5, 1.25, 0.0]\n")
             archive.writestr("map.pgm", b"P5\n# comment\n4 3\n255\n" + bytes([0] * 12))
+            archive.writestr(
+                "gnss_origin.yaml",
+                "origin_latitude: 39.0\norigin_longitude: 116.0\nalignment_locked: 1\n",
+            )
         package.seek(0)
 
         response = self.client.post(
@@ -157,6 +161,8 @@ class MapUploadMetadataTests(TestCase):
         self.assertEqual(created.origin, [-3.5, 1.25, 0.0])
         self.assertEqual(created.width, 4)
         self.assertEqual(created.height, 3)
+        description = json.loads(created.description)
+        self.assertIn("origin_latitude: 39.0", description["gnss_origin_yaml"])
 
 
 class MapActivationPayloadTests(TestCase):

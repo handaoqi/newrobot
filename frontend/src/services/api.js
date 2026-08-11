@@ -90,6 +90,10 @@ export async function sendRobotCommand(robotId, payload) {
   })
 }
 
+export async function fetchRobotCommand(robotId, commandId) {
+  return request(`/robots/${robotId}/commands/${commandId}/`)
+}
+
 export async function sendRecordedAudioCommand(robotId, file, { title = '现场录音', category = null, playNow = true } = {}) {
   const formData = new FormData()
   formData.append('file', file)
@@ -147,6 +151,21 @@ export async function deleteSpeechTemplate(templateId) {
   return request(`/speech-templates/${templateId}/`, { method: 'DELETE' })
 }
 
+export async function fetchAlertSkills() {
+  return request('/alert-skills/')
+}
+
+export async function updateAlertSkill(skillKey, payload) {
+  return request(`/alert-skills/${skillKey}/`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+
+export async function previewAlertSkill(skillKey, robotId) {
+  return request(`/alert-skills/${skillKey}/preview/`, {
+    method: 'POST',
+    body: JSON.stringify({ robot_id: robotId }),
+  })
+}
+
 export async function fetchSpeechCategories() {
   return request('/speech-categories/')
 }
@@ -179,8 +198,11 @@ export async function deletePatrolTask(taskId, { force = false } = {}) {
   return request(`/patrol-tasks/${taskId}/${force ? '?force=true' : ''}`, { method: 'DELETE' })
 }
 
-export async function executePatrolTask(taskId) {
-  return request(`/patrol-tasks/${taskId}/execute/`, { method: 'POST', body: '{}' })
+export async function executePatrolTask(taskId, { recordRosbag = false } = {}) {
+  return request(`/patrol-tasks/${taskId}/execute/`, {
+    method: 'POST',
+    body: JSON.stringify({ record_rosbag: recordRosbag }),
+  })
 }
 
 export async function fetchPatrolSchedules(params = {}) {
@@ -278,11 +300,18 @@ export async function fetchRobotNavigationStatus(robotId) {
 }
 
 export async function sendRobotNavigationCommand(robotId, action, payload = {}) {
-  const allowed = new Set(['probe', 'start', 'restart', 'recover', 'stop', 'initial-pose'])
+  const allowed = new Set(['probe', 'start', 'restart', 'recover', 'relocalize', 'stop', 'initial-pose'])
   if (!allowed.has(action)) throw new Error('不支持的导航命令')
   return request(`/robots/${robotId}/navigation/${action}/`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export async function restartRobotSensor(robotId, sensor) {
+  return request(`/robots/${robotId}/sensors/restart/`, {
+    method: 'POST',
+    body: JSON.stringify({ sensor }),
   })
 }
 
@@ -420,8 +449,11 @@ export async function deleteRoute(routeId) {
   })
 }
 
-export async function executeRoute(routeId) {
-  return request(`/routes/${routeId}/execute/`, { method: 'POST', body: '{}' })
+export async function executeRoute(routeId, { recordRosbag = false } = {}) {
+  return request(`/routes/${routeId}/execute/`, {
+    method: 'POST',
+    body: JSON.stringify({ record_rosbag: recordRosbag }),
+  })
 }
 
 export async function fetchZones() {
@@ -478,5 +510,32 @@ export async function downloadFromRobot(payload) {
   return request('/maps/robot/download/', {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export async function fetchDevelopmentAgents() {
+  return request('/development/agents/')
+}
+
+export async function fetchDevelopmentTasks(robotId = '') {
+  const query = robotId ? `?robot=${encodeURIComponent(robotId)}` : ''
+  return request(`/development/tasks/${query}`)
+}
+
+export async function fetchDevelopmentTask(taskId) {
+  return request(`/development/tasks/${taskId}/`)
+}
+
+export async function createDevelopmentTask(payload) {
+  return request('/development/tasks/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function cancelDevelopmentTask(taskId) {
+  return request(`/development/tasks/${taskId}/cancel/`, {
+    method: 'POST',
+    body: '{}',
   })
 }

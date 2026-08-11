@@ -7,9 +7,12 @@ import threading
 from typing import Any
 
 from django.conf import settings
+from django.db import models
+from django.utils import timezone
 
 from .message_handlers import handle_mqtt_message
-from .models import RemoteCommand
+from .dev_message_handlers import handle_dev_mqtt_message
+from .models import DevelopmentTask, RemoteCommand
 from .protocol import build_command_message
 from .services.command_service import CommandService
 
@@ -71,6 +74,9 @@ class PlatformMqttClient:
             "robots/+/commands/+/ack",
             "robots/+/commands/+/result",
             "robots/+/sync/state",
+            "robots/+/dev/presence",
+            "robots/+/dev/tasks/+/events",
+            "robots/+/dev/tasks/+/result",
         ):
             client.subscribe(topic, qos=1 if "pose" not in topic and "status" not in topic else 0)
         LOGGER.info("MQTT device worker connected")
@@ -81,7 +87,10 @@ class PlatformMqttClient:
 
     def on_message(self, client, userdata, message) -> None:
         try:
-            handle_mqtt_message(message.topic, message.payload, self.publish_json)
+            if "/dev/" in message.topic:
+                handle_dev_mqtt_message(message.topic, message.payload)
+            else:
+                handle_mqtt_message(message.topic, message.payload, self.publish_json)
         except Exception:
             LOGGER.exception("failed to process device message topic=%s", message.topic)
 
@@ -112,5 +121,49 @@ class PlatformMqttClient:
         count = 0
         for command in RemoteCommand.objects.filter(status="created").select_related("robot", "task_execution"):
             self.publish_command(command)
+            count += 1
+        return count
+
+    def publish_pending_development_tasks(self) -> int:
+        now = timezone.now()
+        retry_before = now - timezone.timedelta(seconds=5)
+        tasks = DevelopmentTask.objects.select_related("robot").filter(
+            models.Q(status="created") | models.Q(status="published", published_at__lt=retry_before)
+        )[:10]
+        count = 0
+        for task in tasks:
+            self.publish_json(
+                f"robots/{task.robot.code}/dev/tasks",
+                {
+                    "task_id": str(task.id),
+                    "workspace": task.workspace,
+                    "prompt": task.prompt,
+                    "created_at": task.created_at,
+                },
+                qos=1,
+                retain=False,
+            )
+            task.status = "published"
+            task.published_at = now
+            task.save(update_fields=["status", "published_at", "updated_at"])
+            count += 1
+        return count
+
+    def publish_pending_development_controls(self) -> int:
+        now = timezone.now()
+        retry_before = now - timezone.timedelta(seconds=5)
+        tasks = DevelopmentTask.objects.select_related("robot").filter(status="cancelling").filter(
+            models.Q(cancel_published_at__isnull=True) | models.Q(cancel_published_at__lt=retry_before)
+        )[:10]
+        count = 0
+        for task in tasks:
+            self.publish_json(
+                f"robots/{task.robot.code}/dev/tasks/{task.id}/control",
+                {"task_id": str(task.id), "action": "cancel", "timestamp": now},
+                qos=1,
+                retain=False,
+            )
+            task.cancel_published_at = now
+            task.save(update_fields=["cancel_published_at", "updated_at"])
             count += 1
         return count

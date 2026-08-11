@@ -47,6 +47,7 @@ const mappingForm = ref({
   robot: '',
   map_name: '太阳宫园区 V1',
   route_hint: '南门 → 主步道 → 牡丹园 → 活动广场',
+  record_rosbag: true,
 })
 let statusTimer = null
 let lastSlamAlert = ''
@@ -195,6 +196,7 @@ const connectionClass = computed(() => {
 const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle')
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
+const rosbagStatus = computed(() => mappingStatus.value?.result?.rosbag || {})
 const slamHealth = computed(() => saveProgress.value.slam_health || {})
 const slamHealthState = computed(() => slamHealth.value.state || 'unknown')
 const slamDiverged = computed(() => (
@@ -273,6 +275,25 @@ const readinessSampleAge = computed(() => {
   const age = mappingReadiness.value.sample_age_seconds
   return age === null || age === undefined ? null : Number(age)
 })
+const mappingProcessAlive = computed(() => Boolean(mappingStatus.value?.result?.process_alive))
+const mappingTelemetryFresh = computed(() => (
+  mappingProcessAlive.value
+  && readinessSampleAge.value !== null
+  && readinessSampleAge.value <= 5
+))
+const mappingStartupChecks = computed(() => {
+  const imuSamples = Number(mappingReadiness.value.imu_samples || slamHealth.value.imu_samples || 0)
+  const keyframeCount = Number(mappingReadiness.value.keyframe_count || saveProgress.value.keyframe_count || 0)
+  return [
+    { key: 'edge', label: 'Edge Agent', detail: connectionStatus.value === 'online' ? '已连接' : '未连接', ok: connectionStatus.value === 'online' },
+    { key: 'slam', label: 'SLAM 进程', detail: mappingProcessAlive.value ? '运行中' : '等待启动', ok: mappingProcessAlive.value },
+    { key: 'lidar', label: '激光雷达', detail: mappingTelemetryFresh.value ? '数据正常' : '等待实时数据', ok: mappingTelemetryFresh.value },
+    { key: 'imu_stream', label: 'IMU 数据', detail: mappingTelemetryFresh.value && imuSamples > 0 ? `${imuSamples} 帧` : '等待实时数据', ok: mappingTelemetryFresh.value && imuSamples > 0 },
+    { key: 'imu_init', label: 'IMU 初始化', detail: mappingReadiness.value.imu_initialized ? '已完成' : '请保持静止', ok: Boolean(mappingReadiness.value.imu_initialized) },
+    { key: 'keyframe', label: '首个关键帧', detail: keyframeCount > 0 ? `已建立（${keyframeCount}）` : '等待建立', ok: keyframeCount > 0 },
+  ]
+})
+const mappingStartupReady = computed(() => mappingStartupChecks.value.every(item => item.ok))
 const saveStageLabels = {
   initializing_imu: 'IMU 初始化',
   waiting_first_keyframe: '建立首个关键帧',
@@ -315,10 +336,18 @@ const stateSteps = [
 
 const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected', 'cancelled', 'completed', 'exited']
 const isTerminal = computed(() => terminalStates.includes(mappingState.value))
-const isError = computed(() => slamDiverged.value || ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value))
+const isError = computed(() => (
+  slamDiverged.value
+  || readinessState.value === 'telemetry_stale'
+  || ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value)
+))
 const isActiveMapping = computed(() => ['starting', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value))
 const displayMappingState = computed(() => {
   if (mappingState.value !== 'mapping') return mappingState.value
+  if (readinessState.value === 'telemetry_stale') {
+    if (!mappingReadiness.value.imu_initialized) return 'imu_initializing'
+    return Number(mappingReadiness.value.keyframe_count || 0) > 0 ? 'mapping' : 'waiting_first_keyframe'
+  }
   if (['starting', 'imu_initializing', 'waiting_first_keyframe'].includes(readinessState.value)) {
     return readinessState.value
   }
@@ -362,6 +391,7 @@ const errorLabel = computed(() => {
     command_rejected: '命令被拒',
     cancelled: '已取消',
   }
+  if (readinessState.value === 'telemetry_stale') return '传感器状态超时'
   return slamDiverged.value ? 'SLAM 发散' : (labels[mappingState.value] || '错误')
 })
 
@@ -465,6 +495,7 @@ async function handleStartMapping() {
     await startRobotMapping(mappingForm.value.robot, {
       map_name: mappingForm.value.map_name,
       route_hint: mappingForm.value.route_hint,
+      record_rosbag: mappingForm.value.record_rosbag,
     })
     await refreshMappingStatus()
   } catch (error) {
@@ -1030,7 +1061,22 @@ async function saveCleaner() {
             <span v-if="readinessSampleAge !== null">状态延迟 {{ readinessSampleAge.toFixed(1) }}s</span>
           </div>
         </div>
-        <div v-if="slamHealthIssue" class="slam-health-alert" :class="{ 'is-diverged': slamDiverged }" role="alert">
+        <div v-if="showMappingReadiness" class="mapping-startup-checks" :class="{ 'is-ready': mappingStartupReady }">
+          <div class="mapping-startup-checks-head">
+            <strong>建图前置检查</strong>
+            <span>{{ mappingStartupReady ? '全部通过，可以移动建图' : '检查中，请保持机器狗静止' }}</span>
+          </div>
+          <div class="mapping-startup-check-grid">
+            <div v-for="item in mappingStartupChecks" :key="item.key" class="mapping-startup-check" :class="{ ok: item.ok }">
+              <span class="mapping-startup-check-icon" aria-hidden="true">{{ item.ok ? '✓' : '…' }}</span>
+              <span>
+                <strong>{{ item.label }}</strong>
+                <small>{{ item.detail }}</small>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div v-if="showMappingReadiness" class="slam-health-alert" :class="{ 'is-diverged': slamDiverged, 'is-healthy': !slamHealthIssue }" role="status">
           <div>
             <strong>{{ slamHealthLabel }}</strong>
             <span>{{ slamHealthMessage }}</span>
@@ -1039,7 +1085,20 @@ async function saveCleaner() {
             <span>速度 {{ Number(slamHealth.speed_mps || 0).toFixed(2) }} m/s</span>
             <span>Z 漂移 {{ Number(slamHealth.pose_z_m || 0).toFixed(2) }} m</span>
             <span>帧跳变 {{ Number(slamHealth.frame_delta_m || 0).toFixed(2) }} m</span>
+            <span>连续无匹配点 {{ slamHealth.no_effective_points_streak || 0 }} 帧</span>
             <span>连续异常 {{ slamHealth.pose_anomaly_streak || 0 }}</span>
+          </div>
+        </div>
+        <div v-if="showMappingReadiness || rosbagStatus.bag_dir" class="rosbag-status" :class="{ 'is-recording': rosbagStatus.running }">
+          <div>
+            <strong>诊断数据录制</strong>
+            <span>{{ rosbagStatus.running ? '录制中' : (rosbagStatus.bag_dir ? '已停止并保存' : '未录制') }}</span>
+          </div>
+          <div class="rosbag-status-metrics">
+            <span v-if="rosbagStatus.duration_seconds !== undefined">时长 {{ Math.floor(Number(rosbagStatus.duration_seconds || 0) / 60) }}分{{ Number(rosbagStatus.duration_seconds || 0) % 60 }}秒</span>
+            <span v-if="rosbagStatus.size_bytes !== undefined">大小 {{ formatBytes(rosbagStatus.size_bytes) }}</span>
+            <span v-if="rosbagStatus.bag_dir" :title="rosbagStatus.bag_dir">{{ rosbagStatus.bag_dir }}</span>
+            <span v-if="rosbagStatus.error" class="text-danger">{{ rosbagStatus.error }}</span>
           </div>
         </div>
         <div class="state-machine">
@@ -1066,7 +1125,10 @@ async function saveCleaner() {
               <span>内存 {{ formatBytes(saveProgress.rss_bytes) }}</span>
               <span>预计点云 {{ formatBytes(saveProgress.estimated_output_bytes) }}</span>
               <span>磁盘可用 {{ formatBytes(saveProgress.disk_free_bytes) }}</span>
-              <span>RTK {{ saveProgress.rtk_quality?.valid ? '有效' : '无效' }}</span>
+              <span>
+                RTK {{ saveProgress.rtk_quality?.valid ? '可融合' : '激光兜底' }}
+                · {{ Number(saveProgress.rtk_quality?.horizontal_std ?? -1) >= 0 ? `${Number(saveProgress.rtk_quality.horizontal_std).toFixed(2)} m` : '无精度' }}
+              </span>
               <span :class="{ 'text-danger': slamHealthIssue }">{{ slamHealthLabel }}</span>
             </div>
             <div v-if="saveProgress.error" class="mapping-progress-error">{{ saveProgress.error }}</div>
@@ -1111,11 +1173,18 @@ async function saveCleaner() {
             <span>演示路线</span>
             <input v-model="mappingForm.route_hint" type="text" />
           </label>
+          <label class="mapping-record-option">
+            <input v-model="mappingForm.record_rosbag" type="checkbox" :disabled="isActiveMapping" />
+            <span>
+              <strong>同步录制诊断数据</strong>
+              <small>记录雷达、IMU、里程计、TF和RTK，便于离线复现漂移</small>
+            </span>
+          </label>
         </div>
 
         <div class="mapping-actions">
-          <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || connectionStatus !== 'online'" @click="handleStartMapping">
-            开始建图
+          <button class="btn btn-primary" :disabled="mappingBusy || isActiveMapping || !selectedRobot || connectionStatus !== 'online'" @click="handleStartMapping">
+            {{ mappingBusy ? '正在下发...' : '启动并检查' }}
           </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
             {{ slamDiverged ? '停止并生成救援地图' : '停止并保存地图' }}
@@ -1141,8 +1210,8 @@ async function saveCleaner() {
         <div class="mapping-guide">
           <strong>操作步骤：</strong>
           <span>1. 确保 NX 板 edge_agent 已启动（连接状态显示"已连接"）</span>
-          <span>2. 点击"开始建图" → Edge Agent 自动启动 ROS2 SLAM 进程</span>
-          <span>3. 等待状态显示“可以开始移动”，再用 Orche APP / 遥控器操控机器狗走场</span>
+          <span>2. 点击"启动并检查" → Edge Agent 自动启动雷达、IMU 和 ROS2 SLAM</span>
+          <span>3. 等待六项前置检查全部通过，再用 Orche APP / 遥控器操控机器狗走场</span>
           <span>4. 回到平台点击"停止并保存地图" → 自动打包上传</span>
           <span>5. 上传完成后可在上方"选择地图"查看预览</span>
         </div>

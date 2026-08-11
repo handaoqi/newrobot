@@ -25,12 +25,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
+    AlertSkillBinding,
     InspectionEvent,
     CalendarDay,
     MediaAsset,
     PatrolTask,
     PatrolSchedule,
     Robot,
+    RemoteCommand,
     RobotPersonDetectionState,
     RobotCommand,
     RecordedAudio,
@@ -56,7 +58,10 @@ from .services.command_service import CommandService
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services import asr_service, tts_service
+from .services.alert_skill_service import resolve_alert_template
 from .serializers import (
+    AlertSkillBindingSerializer,
+    AlertSkillPreviewSerializer,
     EventSerializer,
     CalendarDaySerializer,
     MediaAssetSerializer,
@@ -125,7 +130,7 @@ def queue_bicycle_departure_speech(request, robot: Robot, detection: dict, event
     if RobotCommand.objects.filter(**recent_filter).exists():
         return None
 
-    template = SpeechTemplate.objects.filter(name=settings.BICYCLE_AUTO_SPEECH_TEMPLATE_NAME).first()
+    template = resolve_alert_template("bicycle_alert", settings.BICYCLE_AUTO_SPEECH_TEMPLATE_NAME)
     if not template:
         LOGGER.warning("automatic bicycle speech template missing: %s", settings.BICYCLE_AUTO_SPEECH_TEMPLATE_NAME)
         return None
@@ -148,6 +153,8 @@ def queue_bicycle_departure_speech(request, robot: Robot, detection: dict, event
                 "audio_name": template.name,
                 "text": template.text,
                 "source": "vision_bicycle_auto",
+                "alert_skill": "bicycle_alert",
+                "dual_output": True,
                 "content_type": "audio/mpeg",
                 "tts_cache_hit": cache_hit,
                 "inspection_event_id": str(event.event_id),
@@ -356,6 +363,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "manual_edit": edit_metadata.get("mode") == "manual_cleanup",
         "pgm_sha256": _file_sha256(map_data.pgm_file.path) if map_data.pgm_file else "",
         "yaml_sha256": _file_sha256(map_data.yaml_file.path) if map_data.yaml_file else "",
+        "gnss_origin_yaml": description.get("gnss_origin_yaml", "") if isinstance(description, dict) else "",
     }
 
 
@@ -876,6 +884,9 @@ class RobotCommandView(APIView):
         "move_velocity": "teleop.move_velocity",
         "move_stop": "teleop.move_stop",
         "passive": "teleop.passive",
+        "charge_start": "charge.start",
+        "charge_stop": "charge.stop",
+        "audio_volume": "audio.volume",
     }
 
     def post(self, request, robot_id):
@@ -904,7 +915,7 @@ class RobotCommandView(APIView):
                 command_type=command_type,
                 payload=payload,
                 operator=request.user if request.user.is_authenticated else None,
-                expiry_seconds=5,
+                expiry_seconds=30 if action in {"charge_start", "charge_stop"} else 10,
             )
             return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
@@ -923,9 +934,18 @@ class RobotCommandView(APIView):
         command.error_message = error_message
         command.status = "failed" if error_message else "sent"
         command.save(update_fields=["sent_at", "response_payload", "error_message", "status", "updated_at"])
-
         response_status = status.HTTP_201_CREATED if command.status == "sent" else status.HTTP_502_BAD_GATEWAY
         return Response(RobotCommandSerializer(command).data, status=response_status)
+
+
+class RobotRemoteCommandDetailView(APIView):
+    def get(self, request, robot_id, command_id):
+        command = get_object_or_404(
+            RemoteCommand.objects.prefetch_related("events"),
+            id=command_id,
+            robot_id=robot_id,
+        )
+        return Response(RemoteCommandSerializer(command).data)
 
 
 class RobotAudioRecordingCommandView(APIView):
@@ -1068,6 +1088,66 @@ class SpeechTemplateDetailView(APIView):
     def delete(self, request, pk):
         get_object_or_404(SpeechTemplate, pk=pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AlertSkillBindingListView(APIView):
+    def get(self, request):
+        bindings = AlertSkillBinding.objects.select_related("template", "template__category")
+        return Response(AlertSkillBindingSerializer(bindings, many=True).data)
+
+
+class AlertSkillBindingDetailView(APIView):
+    def patch(self, request, skill_key):
+        binding = get_object_or_404(AlertSkillBinding, skill_key=skill_key)
+        serializer = AlertSkillBindingSerializer(binding, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class AlertSkillPreviewView(APIView):
+    def post(self, request, skill_key):
+        serializer = AlertSkillPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        binding = get_object_or_404(
+            AlertSkillBinding.objects.select_related("template"),
+            skill_key=skill_key,
+        )
+        if binding.template is None:
+            return Response({"detail": "请先为告警技能绑定播报模板"}, status=status.HTTP_400_BAD_REQUEST)
+
+        robot = get_object_or_404(Robot, id=serializer.validated_data["robot_id"])
+        if robot.connection_status != "online":
+            return Response({"detail": "机器人离线，无法试播"}, status=status.HTTP_409_CONFLICT)
+
+        try:
+            saved_path, cache_hit = tts_service.synthesize_speech(binding.template.text)
+        except Exception:
+            LOGGER.exception("alert skill preview synthesis failed skill=%s robot=%s", skill_key, robot.code)
+            return Response({"detail": "试播语音生成失败，请稍后重试"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action="play_audio",
+            payload={
+                "audio_url": build_public_media_url(request, saved_path),
+                "audio_name": binding.template.name,
+                "text": binding.template.text,
+                "source": "dashboard_alert_skill_preview",
+                "alert_skill": binding.skill_key,
+                "dual_output": True,
+                "content_type": "audio/mpeg",
+                "tts_cache_hit": cache_hit,
+                "preview": True,
+            },
+        )
+        return Response(
+            {
+                "skill": AlertSkillBindingSerializer(binding).data,
+                "command": RobotCommandSerializer(command).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class SpeechCategoryListCreateView(APIView):
@@ -2139,6 +2219,7 @@ class RobotMappingStartView(RobotMappingCommandView):
             "map_name": map_name,
             "route_hint": request.data.get("route_hint", ""),
             "operator_note": request.data.get("operator_note", ""),
+            "record_rosbag": bool(request.data.get("record_rosbag", False)),
         }
 
 
@@ -2183,7 +2264,10 @@ class RobotNavigationStatusView(APIView):
         robot = get_object_or_404(Robot, pk=robot_id)
         latest = RobotStatusLatest.objects.filter(robot=robot).first()
         command = robot.remote_commands.filter(
-            command_type__in=["nav.start", "nav.restart", "nav.recover", "nav.stop", "nav.initial_pose"]
+            command_type__in=[
+                "nav.start", "nav.restart", "nav.recover", "nav.stop",
+                "nav.initial_pose", "nav.relocalize",
+            ]
         ).order_by("-issued_at").first()
         return Response(
             {
@@ -2248,21 +2332,28 @@ class RobotNavigationInitialPoseView(APIView):
                 {"detail": "机器狗 Edge Agent 当前离线，无法设置初始定位。"},
                 status=status.HTTP_409_CONFLICT,
             )
+        seed_source = str(request.data.get("seed_source") or "").strip()
+        supplied = [request.data.get(field) is not None for field in ("x", "y", "yaw")]
+        if not any(supplied) and seed_source not in {"mapping_start", "last_trusted", "rtk"}:
+            return Response({"detail": "初始定位需要 x、y、yaw 或建图起点。"}, status=status.HTTP_400_BAD_REQUEST)
+        if any(supplied) and not all(supplied):
+            return Response({"detail": "初始定位需要同时提供数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            x = float(request.data.get("x"))
-            y = float(request.data.get("y"))
-            yaw = float(request.data.get("yaw", 0))
-        except (TypeError, ValueError):
-            return Response({"detail": "初始定位需要数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
+            coordinates = (
+                {field: float(request.data[field]) for field in ("x", "y", "yaw")}
+                if all(supplied)
+                else {}
+            )
+        except (TypeError, ValueError, KeyError):
+            return Response({"detail": "初始定位需要同时提供数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
         command = CommandService.create_robot_command(
             robot=robot,
             command_type="nav.initial_pose",
             payload={
                 "reason": "manual_initial_pose",
                 "frame_id": request.data.get("frame_id") or "map",
-                "x": x,
-                "y": y,
-                "yaw": yaw,
+                "seed_source": seed_source,
+                **coordinates,
                 "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
                 "map_version": request.data.get("map_version") or robot.current_map_version or "",
             },
@@ -2295,6 +2386,69 @@ class RobotNavigationRecoverView(RobotNavigationCommandView):
     expiry_seconds = 180
 
 
+class RobotNavigationRelocalizeView(RobotNavigationCommandView):
+    command_type = "nav.relocalize"
+    expiry_seconds = 180
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        payload = {
+            "reason": "operator_active_relocalization",
+            "seed_source": request.data.get("seed_source") or "last_trusted",
+            "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
+            "map_version": request.data.get("map_version") or robot.current_map_version or "",
+        }
+        supplied = [request.data.get(field) is not None for field in ("x", "y", "yaw")]
+        if any(supplied):
+            if not all(supplied):
+                raise ValueError("主动重定位需要同时提供 x、y、yaw")
+            payload.update({
+                "x": float(request.data["x"]),
+                "y": float(request.data["y"]),
+                "yaw": float(request.data["yaw"]),
+            })
+        return payload
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        if robot.effective_connection_status() != "online":
+            return Response({"detail": "机器狗 Edge Agent 当前离线。"}, status=status.HTTP_409_CONFLICT)
+        try:
+            payload = self.build_payload(request, robot)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "主动重定位的 x、y、yaw 必须同时为数值。"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        command = CommandService.create_robot_command(
+            robot=robot,
+            command_type=self.command_type,
+            payload=payload,
+            operator=request.user if request.user.is_authenticated else None,
+            expiry_seconds=self.expiry_seconds,
+        )
+        return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
+
+
+class RobotSensorRestartView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        if robot.effective_connection_status() != "online":
+            return Response({"detail": "机器狗 Edge Agent 当前离线。"}, status=status.HTTP_409_CONFLICT)
+        sensor = str(request.data.get("sensor") or "").strip().lower()
+        if sensor not in {"lidar", "imu", "lidar_imu", "rtk"}:
+            return Response({"detail": "仅支持重启雷达/IMU或 RTK。"}, status=status.HTTP_400_BAD_REQUEST)
+        command = CommandService.create_robot_command(
+            robot=robot,
+            command_type="sensor.restart",
+            payload={"sensor": sensor, "reason": "operator_sensor_recovery"},
+            operator=request.user if request.user.is_authenticated else None,
+            expiry_seconds=60,
+        )
+        return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
+
+
 class DeviceMapUploadView(APIView):
     """Edge Agent 上传现场建图结果。"""
     permission_classes = [permissions.AllowAny]
@@ -2319,7 +2473,7 @@ class DeviceMapUploadView(APIView):
         try:
             with zipfile.ZipFile(io.BytesIO(package.read())) as archive:
                 for name in archive.namelist():
-                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png"}:
+                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml"}:
                         extracted[name] = archive.read(name)
                     elif name == "map_set/map_set_manifest.json":
                         map_set_manifest = json.loads(archive.read(name).decode("utf-8"))
@@ -2346,6 +2500,7 @@ class DeviceMapUploadView(APIView):
             "route_hint": metadata.get("route_hint", ""),
             "files": metadata.get("files", []),
             "image": yaml_metadata.get("image", ""),
+            "gnss_origin_yaml": extracted.get("gnss_origin.yaml", b"").decode("utf-8", errors="ignore")[:16384],
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
@@ -2507,6 +2662,9 @@ class PatrolRouteExecuteView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, pk):
+        record_rosbag = request.data.get("record_rosbag", False)
+        if not isinstance(record_rosbag, bool):
+            return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         route = get_object_or_404(
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
@@ -2547,6 +2705,7 @@ class PatrolRouteExecuteView(APIView):
                 execution,
                 "task.start",
                 request.user if request.user.is_authenticated else None,
+                command_options={"record_rosbag": record_rosbag},
             )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
@@ -2844,6 +3003,9 @@ class PatrolTaskExecuteView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, task_id):
+        record_rosbag = request.data.get("record_rosbag", False)
+        if not isinstance(record_rosbag, bool):
+            return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         task = get_object_or_404(
             PatrolTask.objects.select_related("robot", "route", "route__map_data"),
             pk=task_id,
@@ -2854,7 +3016,12 @@ class PatrolTaskExecuteView(APIView):
         try:
             operator = request.user if request.user.is_authenticated else None
             execution = TaskExecutionService.create_execution(task, operator)
-            CommandService.create(execution, "task.start", operator)
+            CommandService.create(
+                execution,
+                "task.start",
+                operator,
+                command_options={"record_rosbag": record_rosbag},
+            )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         execution.refresh_from_db()

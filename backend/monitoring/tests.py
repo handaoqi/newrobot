@@ -5,7 +5,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import InspectionEvent, Robot, RobotCommand
+from .models import AlertSkillBinding, InspectionEvent, Robot, RobotCommand, SpeechTemplate
 from .views import ensure_demo_seed
 
 
@@ -28,6 +28,61 @@ class MonitoringApiTests(TestCase):
         response = self.client.get("/api/dashboard/overview/")
         self.assertEqual(response.status_code, 200)
         self.assertIn("summary", response.data)
+
+    def test_alert_skill_binding_can_be_updated(self):
+        self.authenticate()
+        template = SpeechTemplate.objects.create(name="自行车测试播报", text="自行车测试文案")
+        response = self.client.patch(
+            "/api/alert-skills/bicycle_alert/",
+            {"template_id": template.id, "enabled": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["template"]["id"], template.id)
+        binding = AlertSkillBinding.objects.get(skill_key="bicycle_alert")
+        self.assertEqual(binding.template_id, template.id)
+
+    @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/alert-preview.mp3", True))
+    def test_disabled_alert_skill_can_be_previewed_on_both_speakers(self, synthesize_speech):
+        self.authenticate()
+        robot = Robot.objects.first()
+        robot.connection_status = "online"
+        robot.save(update_fields=["connection_status", "updated_at"])
+        template = SpeechTemplate.objects.create(name="试播模板", text="双音响试播内容")
+        binding = AlertSkillBinding.objects.get(skill_key="avoidance")
+        binding.template = template
+        binding.enabled = False
+        binding.save(update_fields=["template", "enabled", "updated_at"])
+
+        response = self.client.post(
+            "/api/alert-skills/avoidance/preview/",
+            {"robot_id": robot.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        command = RobotCommand.objects.get(id=response.data["command"]["id"])
+        self.assertEqual(command.payload["source"], "dashboard_alert_skill_preview")
+        self.assertEqual(command.payload["alert_skill"], "avoidance")
+        self.assertEqual(command.payload["audio_name"], "试播模板")
+        self.assertTrue(command.payload["dual_output"])
+        self.assertTrue(command.payload["preview"])
+        synthesize_speech.assert_called_once_with("双音响试播内容")
+
+    def test_alert_skill_preview_rejects_offline_robot(self):
+        self.authenticate()
+        robot = Robot.objects.first()
+        robot.connection_status = "offline"
+        robot.save(update_fields=["connection_status", "updated_at"])
+
+        response = self.client.post(
+            "/api/alert-skills/bicycle_alert/preview/",
+            {"robot_id": robot.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(RobotCommand.objects.filter(payload__preview=True).count(), 0)
 
     def test_dashboard_analytics(self):
         self.authenticate()
@@ -103,6 +158,8 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(command.action, "play_audio")
         self.assertEqual(command.payload["source"], "vision_bicycle_auto")
         self.assertEqual(command.payload["audio_name"], "驶离提醒")
+        self.assertEqual(command.payload["alert_skill"], "bicycle_alert")
+        self.assertTrue(command.payload["dual_output"])
         self.assertIn("请尽快驶离指定区域", command.payload["text"])
         synthesize_speech.assert_called_once()
 

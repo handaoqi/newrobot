@@ -21,10 +21,17 @@ class CommandService:
 
     @classmethod
     @transaction.atomic
-    def create(cls, execution: TaskExecution, command_type: str, operator=None) -> RemoteCommand:
+    def create(
+        cls,
+        execution: TaskExecution,
+        command_type: str,
+        operator=None,
+        command_options: dict | None = None,
+    ) -> RemoteCommand:
         if command_type not in cls.COMMAND_TARGET_STATES:
             raise ValueError(f"unsupported command type: {command_type}")
         target = cls.COMMAND_TARGET_STATES[command_type]
+        command_options = command_options or {}
         if command_type == "task.start":
             command_payload = {
                 "task_id": str(execution.task_id),
@@ -36,6 +43,7 @@ class CommandService:
                     "max_duration_seconds": getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800),
                     "continue_on_disconnect": True,
                 },
+                "record_rosbag": bool(command_options.get("record_rosbag", False)),
             }
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)
         elif command_type == "task.resume":

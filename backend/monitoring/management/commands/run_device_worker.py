@@ -26,6 +26,8 @@ class Command(BaseCommand):
             while not stop_event.wait(0.15):
                 try:
                     client.publish_pending_commands()
+                    client.publish_pending_development_tasks()
+                    client.publish_pending_development_controls()
                     now = timezone.now()
                     if now >= next_slow_check:
                         self._expire_commands()

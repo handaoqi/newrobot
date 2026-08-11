@@ -16,6 +16,7 @@ const tasks = ref([])
 const robots = ref([])
 const routes = ref([])
 const error = ref('')
+const recordNavigationBag = ref(false)
 const form = ref({ name: '', robot: '', route: '', description: '', enabled: true })
 
 const routeOptions = computed(() => {
@@ -91,7 +92,7 @@ async function createTask() {
 async function execute(task) {
   error.value = ''
   try {
-    const execution = await executePatrolTask(task.id)
+    const execution = await executePatrolTask(task.id, { recordRosbag: recordNavigationBag.value })
     router.push(`/dashboard/task-executions/${execution.id}`)
   } catch (exc) {
     error.value = exc.message
@@ -162,6 +163,13 @@ onMounted(load)
     </section>
 
     <section class="panel detail-panel">
+      <label class="diagnostic-record-toggle">
+        <input v-model="recordNavigationBag" type="checkbox" />
+        <span>
+          <strong>录制导航诊断包</strong>
+          <small>仅影响“立即执行”；任务结束后自动保存到机器狗。</small>
+        </span>
+      </label>
       <div class="task-list">
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div>
@@ -181,3 +189,33 @@ onMounted(load)
     </section>
   </section>
 </template>
+
+<style scoped>
+.diagnostic-record-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--table-bg);
+  cursor: pointer;
+  user-select: none;
+}
+
+.diagnostic-record-toggle input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.diagnostic-record-toggle span {
+  display: grid;
+  gap: 2px;
+}
+
+.diagnostic-record-toggle small {
+  color: var(--muted);
+}
+</style>

@@ -1,14 +1,16 @@
 import shutil
 import tempfile
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
-from .models import RecordedAudio, Robot, RobotCommand, RobotCredential, SpeechCategory, SpeechTemplate
+from .models import RecordedAudio, RemoteCommand, Robot, RobotCommand, RobotCredential, SpeechCategory, SpeechTemplate
 
 
 class AudioCommandChainTests(APITestCase):
@@ -94,6 +96,22 @@ class AudioCommandChainTests(APITestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(RobotCommand.objects.count(), 0)
+
+    def test_operator_can_poll_remote_audio_volume_result(self):
+        command = RemoteCommand.objects.create(
+            robot=self.robot,
+            command_type="audio.volume",
+            payload={"target": "speaker_nx", "volume": 64},
+            status="succeeded",
+            expires_at=timezone.now() + timedelta(seconds=10),
+            result_payload={"target": "speaker_nx", "volume": 64},
+        )
+
+        response = self.web_client.get(f"/api/robots/{self.robot.id}/commands/{command.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "succeeded")
+        self.assertEqual(response.data["result_payload"]["volume"], 64)
 
     def test_poll_returns_newest_audio_and_supersedes_older_queue(self):
         older = RobotCommand.objects.create(

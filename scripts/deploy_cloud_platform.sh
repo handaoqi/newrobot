@@ -54,6 +54,8 @@ if "$DEPLOY_BACKEND"; then
     --exclude='*.pyc' \
     --exclude='data/' \
     "$PROJECT_DIR/backend/" "$CLOUD_HOST:$REMOTE_ROOT/backend/"
+  echo "[deploy] Applying database migrations..."
+  ssh "$CLOUD_HOST" "set -a; source /opt/roamerx/shared/center.env; set +a; cd '$REMOTE_ROOT' && /root/miniconda/envs/py310/bin/python backend/manage.py migrate --noinput"
   echo "[deploy] Restarting cloud API and device worker..."
   ssh "$CLOUD_HOST" "systemctl restart roamerx-center-api.service roamerx-device-worker.service && sleep 3 && systemctl is-active roamerx-center-api.service roamerx-device-worker.service"
 fi

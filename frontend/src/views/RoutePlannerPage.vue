@@ -14,6 +14,7 @@ import {
   deleteRoute,
   executeRoute,
   sendRobotNavigationCommand,
+  restartRobotSensor,
   synthesizeSpeech,
 } from '../services/api'
 import { API_BASE } from '../services/api'
@@ -41,6 +42,7 @@ const drillTimelineListRef = ref(null)
 const imageReadyTick = ref(0)
 const navStatus = ref(null)
 const navCommandBusy = ref('')
+const sensorCommandBusy = ref('')
 const navError = ref('')
 const routeExecuteBusy = ref(false)
 const lastExecution = ref(null)
@@ -731,6 +733,25 @@ async function sendNavigationCommand(action) {
   }
 }
 
+async function handleRestartSensor(sensor) {
+  const robotId = selectedRobot.value?.id || selectedMap.value?.robot
+  if (!robotId) {
+    navError.value = '未选择机器人'
+    return
+  }
+  sensorCommandBusy.value = sensor
+  navError.value = ''
+  try {
+    await restartRobotSensor(robotId, sensor)
+    await sleep(3000)
+    await refreshNavigationStatus()
+  } catch (error) {
+    navError.value = error.message || '传感器重启失败'
+  } finally {
+    sensorCommandBusy.value = ''
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -757,22 +778,20 @@ async function initializeLocalization() {
     })
     await sleep(2500)
     await refreshNavigationStatus()
-
-    if (!manualInitialPose.value) {
-      initialPoseMode.value = true
-      initialPoseStep.value = 'position'
-      localizationInitState.value = 'waiting_pose'
-      localizationInitMessage.value = '请在地图点击机器狗真实位置，再点击狗头朝向'
-      navError.value = localizationInitMessage.value
-      return
-    }
-
     localizationInitState.value = 'sending_pose'
-    localizationInitMessage.value = '正在下发初始定位'
-    await publishInitialPose(false, false)
+    const rtk = navStatus.value?.status?.sensors?.rtk
+    const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
+    localizationInitMessage.value = useFixedRtk
+      ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
+      : 'RTK Fix 不可用，正在下发建图起点位姿'
+    await sendRobotNavigationCommand(robotId, 'initial-pose', {
+      seed_source: useFixedRtk ? 'rtk' : 'mapping_start',
+      map_id: selectedMap.value?.id,
+      map_version: selectedMap.value?.description || '',
+    })
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
-    for (let index = 0; index < 6; index += 1) {
+    for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
       await refreshNavigationStatus()
       if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
@@ -787,6 +806,47 @@ async function initializeLocalization() {
   } catch (error) {
     localizationInitState.value = 'failed'
     localizationInitMessage.value = error.message || '定位初始化失败'
+    navError.value = localizationInitMessage.value
+  } finally {
+    navCommandBusy.value = ''
+  }
+}
+
+async function activeRelocalize() {
+  const robotId = selectedRobot.value?.id || selectedMap.value?.robot
+  if (!robotId) {
+    navError.value = '未选择机器人'
+    return
+  }
+  navCommandBusy.value = 'relocalize'
+  localizationInitState.value = 'waiting_convergence'
+  localizationInitMessage.value = '正在静止搜索定位候选'
+  navError.value = ''
+  try {
+    const payload = {
+      seed_source: 'last_trusted',
+      map_id: selectedMap.value?.id,
+      map_version: selectedMap.value?.description || '',
+    }
+    if (manualInitialPose.value) {
+      payload.x = Number(manualInitialPose.value.x)
+      payload.y = Number(manualInitialPose.value.y)
+      payload.yaw = Number(manualInitialPose.value.yaw || 0)
+    }
+    await sendRobotNavigationCommand(robotId, 'relocalize', payload)
+    for (let index = 0; index < 35; index += 1) {
+      await sleep(2000)
+      await refreshNavigationStatus()
+      if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
+        localizationInitState.value = 'done'
+        localizationInitMessage.value = '主动重定位完成'
+        return
+      }
+    }
+    throw new Error('主动重定位未在限定时间内收敛')
+  } catch (error) {
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = error.message || '主动重定位失败'
     navError.value = localizationInitMessage.value
   } finally {
     navCommandBusy.value = ''
@@ -1146,37 +1206,57 @@ function stateMachineSteps() {
 
 function sensorStateRows() {
   const status = navStatus.value?.status || {}
-  const quality = localizationQuality()
-  const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
-  const qualityFresh = quality?.sampled_at && !localizationQualityStale(quality)
+  const sensors = status.sensors || {}
   const hasPose = status.x !== null && status.x !== undefined && status.y !== null && status.y !== undefined
   const navReady = Boolean(status.nav_ready)
+  const sensorRow = (key, name, fallbackDetail, restartSensor = '') => {
+    const sensor = sensors[key]
+    if (!sensor) {
+      return { key, name, value: '未上报', detail: fallbackDetail, state: 'unknown', restartSensor }
+    }
+    const hz = Number(sensor.frequency_hz || 0)
+    const age = Number(sensor.sample_age_seconds)
+    if (key === 'rtk') {
+      const modeLabels = {
+        rtk_primary: 'RTK 主定位',
+        hybrid: '融合定位',
+        lidar_fallback: '激光兜底',
+      }
+      const qualityLabels = {
+        rtk_fixed: '固定解',
+        rtk_float: '浮点解',
+        standalone: '单点解',
+        invalid: '无效',
+      }
+      const std = Number(sensor.horizontal_std_m)
+      const detail = `${qualityLabels[sensor.quality] || '未知质量'} · 水平误差 ${Number.isFinite(std) ? `${std.toFixed(2)} m` : '—'} · ${hz.toFixed(1)} Hz`
+      return {
+        key,
+        name,
+        value: sensor.online ? (modeLabels[sensor.fusion_mode] || '质量未知') : '无实时数据',
+        detail,
+        state: sensor.online && sensor.fusion_usable ? 'ok' : (sensor.online ? 'warn' : 'bad'),
+        restartSensor: sensor.online ? '' : restartSensor,
+      }
+    }
+    return {
+      key,
+      name,
+      value: sensor.online ? '在线' : '无实时数据',
+      detail: sensor.sampled_at
+        ? `${hz.toFixed(1)} Hz · ${Number.isFinite(age) ? age.toFixed(1) : '—'}s 前`
+        : fallbackDetail,
+      state: sensor.online ? 'ok' : 'bad',
+      restartSensor,
+    }
+  }
 
   return [
-    {
-      name: '激光雷达 /laser_scan',
-      value: quality ? '参与定位/避障' : '未见质量上报',
-      detail: qualityFresh ? `NDT ${formatNumber(quality.matching_error, 3)} · ${formatDateTimeWithAge(quality.sampled_at)}` : '前端依赖定位质量侧证，未直接订阅 ROS',
-      state: qualityFresh && localizationStatus !== 'lost' ? 'ok' : quality ? 'warn' : 'unknown',
-    },
-    {
-      name: 'IMU /front_lidar/imu',
-      value: quality ? '参与定位融合' : '未上报',
-      detail: '当前接口未拆分 IMU 频率，只能通过定位质量间接判断',
-      state: quality ? 'ok' : 'unknown',
-    },
-    {
-      name: '里程计 /odom/mc_odom',
-      value: hasPose ? '有位姿输出' : '无位姿',
-      detail: `速度 ${formatNumber(status.speed_mps)} m/s · 控制模式 ${status.control_mode || '—'}`,
-      state: hasPose ? 'ok' : 'warn',
-    },
-    {
-      name: 'RTK/GNSS',
-      value: '未接入当前室内导航状态',
-      detail: '当前状态接口没有 RTK fix/卫星数/差分状态字段',
-      state: 'idle',
-    },
+    sensorRow('lidar', '激光雷达 /front_lidar', '等待 Edge Agent 实时频率上报', 'lidar_imu'),
+    sensorRow('imu', 'IMU /front_lidar/imu', '等待 Edge Agent 实时频率上报', 'lidar_imu'),
+    sensorRow('odometry', '里程计 /odom/mc_odom', hasPose ? '已有位姿但无独立频率上报' : '等待里程计数据'),
+    sensorRow('rtk', 'RTK/GNSS /fix', '未收到 GNSS 数据', 'rtk'),
+    sensorRow('laser_scan', '避障扫描 /laser_scan', '点云转二维扫描链路无数据', 'lidar_imu'),
     {
       name: '视觉',
       value: '未上报',
@@ -1374,9 +1454,21 @@ async function handleDeleteRoute(route) {
                 <button class="btn btn-sm btn-danger" @click="handleDeleteRoute(route)">删除</button>
               </div>
             </div>
+            <div v-if="selectedRoute" class="route-preview-actions">
+              <button
+                class="btn drill-btn route-preview-btn"
+                :disabled="routeExecuteBusy"
+                @click="handleExecuteRoute"
+              >
+                {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
+              </button>
+              <small class="route-preview-note">
+                {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”
+              </small>
+            </div>
           </div>
 
-          <div class="panel-section test-panel">
+          <div class="panel-section">
             <h3>5. 导航测试</h3>
             <div class="status-grid">
               <div>
@@ -1418,6 +1510,9 @@ async function handleDeleteRoute(route) {
               </button>
               <button class="btn btn-sm btn-primary" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="initializeLocalization">
                 {{ navCommandBusy === 'localization-init' ? '初始化中...' : '初始化定位' }}
+              </button>
+              <button class="btn btn-sm" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="activeRelocalize">
+                {{ navCommandBusy === 'relocalize' ? '搜索中...' : '主动重定位' }}
               </button>
               <button class="btn btn-sm btn-primary" :disabled="routeExecuteBusy || !selectedRoute?.id || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready" @click="handleExecuteRoute">
                 {{ routeExecuteBusy ? '执行中...' : '执行当前路线' }}
@@ -1481,9 +1576,15 @@ async function handleDeleteRoute(route) {
                   <strong>传感器与避障链路</strong>
                   <span>上报 / 推断 / 未上报</span>
                 </div>
-                <div v-for="row in sensorStateRows()" :key="row.name" class="sensor-state-row">
+                <div v-for="row in sensorStateRows()" :key="row.key || row.name" class="sensor-state-row" :class="{ 'has-action': row.restartSensor && row.state !== 'ok' }">
                   <span>{{ row.name }}</span>
                   <strong :class="statusBadgeClass(row.state)">{{ row.value }}</strong>
+                  <button
+                    v-if="row.restartSensor && row.state !== 'ok'"
+                    class="btn btn-sm sensor-restart-btn"
+                    :disabled="!!sensorCommandBusy || navStatus?.connection_status !== 'online'"
+                    @click="handleRestartSensor(row.restartSensor)"
+                  >{{ sensorCommandBusy === row.restartSensor ? '重启中' : '重启' }}</button>
                   <small>{{ row.detail }}</small>
                 </div>
               </div>
@@ -1610,36 +1711,42 @@ async function handleDeleteRoute(route) {
   gap: 0.75rem;
 }
 
-.drill-btn {
+.btn.drill-btn {
   min-width: 118px;
-  border: 2px solid #f97316;
+  border: 2px solid #15803d;
   color: #fff;
-  background: linear-gradient(135deg, #f97316, #dc2626);
-  box-shadow: 0 8px 22px rgba(220, 38, 38, 0.3);
+  background: #16a34a;
+  box-shadow: 0 8px 22px rgba(22, 163, 74, 0.28);
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   animation: drill-button-pulse 1.8s ease-in-out infinite;
 }
 
-.drill-btn:hover:not(:disabled) {
+.btn.drill-btn:hover:not(:disabled) {
+  border-color: #166534;
+  color: #fff;
+  background: #15803d;
   transform: translateY(-1px);
-  box-shadow: 0 10px 26px rgba(220, 38, 38, 0.42);
+  box-shadow: 0 10px 26px rgba(22, 163, 74, 0.38);
 }
 
-.drill-btn.running {
+.btn.drill-btn.running {
   border-color: #991b1b;
+  color: #fff;
   background: #991b1b;
   animation: none;
 }
 
-.drill-btn:disabled {
+.btn.drill-btn:disabled {
+  color: #fff;
+  background: #16a34a;
   box-shadow: none;
   animation: none;
 }
 
 @keyframes drill-button-pulse {
-  0%, 100% { box-shadow: 0 8px 22px rgba(220, 38, 38, 0.25); }
-  50% { box-shadow: 0 8px 28px rgba(249, 115, 22, 0.58); }
+  0%, 100% { box-shadow: 0 8px 22px rgba(22, 163, 74, 0.24); }
+  50% { box-shadow: 0 8px 28px rgba(22, 163, 74, 0.48); }
 }
 
 .route-planner-layout {
@@ -1651,6 +1758,8 @@ async function handleDeleteRoute(route) {
 
 .side-panel {
   display: flex;
+  width: 100%;
+  min-width: 0;
   flex-direction: column;
   gap: 1rem;
   overflow-y: auto;
@@ -1658,6 +1767,8 @@ async function handleDeleteRoute(route) {
 }
 
 .panel-section {
+  width: 100%;
+  min-width: 0;
   background: #f9f9f9;
   padding: 1rem;
   border-radius: 4px;
@@ -1754,11 +1865,6 @@ async function handleDeleteRoute(route) {
   display: flex;
   gap: 0.5rem;
   margin-top: 0.5rem;
-}
-
-.test-panel {
-  border: 1px solid #dbe4ef;
-  background: #fff;
 }
 
 .status-grid {
@@ -1892,6 +1998,18 @@ async function handleDeleteRoute(route) {
   border-bottom: 1px solid #f2f4f7;
 }
 
+.sensor-state-row.has-action {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.sensor-restart-btn {
+  align-self: center;
+  justify-self: end;
+  min-width: 52px;
+  padding: 0.3rem 0.55rem;
+  white-space: nowrap;
+}
+
 .sensor-state-head {
   background: #f8fafc;
 }
@@ -1903,6 +2021,17 @@ async function handleDeleteRoute(route) {
 
 .sensor-state-row small {
   grid-column: 1 / -1;
+}
+
+.sensor-state-row.has-action small {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+}
+
+.sensor-state-row.has-action .sensor-restart-btn {
+  grid-column: 2;
+  grid-row: 2;
 }
 
 .localization-debug-panel {
@@ -2056,6 +2185,22 @@ async function handleDeleteRoute(route) {
 .route-item small {
   color: #666;
   font-size: 0.75rem;
+}
+
+.route-preview-btn {
+  margin-top: 0;
+}
+
+.route-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.35rem;
+}
+
+.route-preview-note {
+  color: #667085;
+  line-height: 1.4;
 }
 
 .map-preview-area {
@@ -2508,6 +2653,7 @@ async function handleDeleteRoute(route) {
   .drill-timeline-panel {
     max-height: 420px;
   }
+
 }
 
 .btn {

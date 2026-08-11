@@ -455,6 +455,9 @@ class RobotCommand(BaseTimestampModel):
         ("cancel_two_leg_stand", "取消双腿站立"),
         ("attitude_control", "姿态控制"),
         ("play_audio", "播放音频"),
+        ("charge_start", "开始充电"),
+        ("charge_stop", "断开充电"),
+        ("audio_volume", "调节音量"),
     ]
     STATUS_CHOICES = [
         ("queued", "待发送"),
@@ -514,6 +517,31 @@ class SpeechTemplate(BaseTimestampModel):
 
     def __str__(self) -> str:
         return self.name
+
+
+class AlertSkillBinding(BaseTimestampModel):
+    SKILL_CHOICES = [
+        ("bicycle_alert", "自行车告警"),
+        ("obstacle_detected", "发现障碍"),
+        ("avoidance", "避障"),
+        ("dissuasion", "劝阻"),
+    ]
+
+    skill_key = models.CharField(max_length=32, choices=SKILL_CHOICES, unique=True)
+    template = models.ForeignKey(
+        SpeechTemplate,
+        related_name="alert_skill_bindings",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    enabled = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.get_skill_key_display()
 
 
 class RecordedAudio(BaseTimestampModel):
@@ -844,7 +872,12 @@ class RemoteCommand(BaseTimestampModel):
         ("nav.recover", "恢复导航栈"),
         ("nav.stop", "停止导航栈"),
         ("nav.initial_pose", "设置初始定位"),
+        ("nav.relocalize", "主动重定位"),
         ("map.activate", "切换活动地图"),
+        ("sensor.restart", "重启传感器"),
+        ("charge.start", "开始充电"),
+        ("charge.stop", "断开充电"),
+        ("audio.volume", "调节扬声器音量"),
         ("teleop.takeover_enter", "进入远程接管"),
         ("teleop.takeover_exit", "退出远程接管"),
         ("teleop.stand_up", "站立"),
@@ -1026,4 +1059,80 @@ class TrajectoryBatchReceipt(models.Model):
     class Meta:
         constraints = [
             models.CheckConstraint(condition=Q(last_seq__gte=models.F("first_seq")), name="trajectory_batch_valid_range")
+        ]
+
+
+class DevelopmentAgentState(BaseTimestampModel):
+    robot = models.OneToOneField(
+        Robot,
+        related_name="development_agent_state",
+        primary_key=True,
+        on_delete=models.CASCADE,
+    )
+    status = models.CharField(max_length=16, default="offline")
+    agent_version = models.CharField(max_length=64, blank=True)
+    codex_binary = models.CharField(max_length=512, blank=True)
+    workspaces = models.JSONField(default=list, blank=True)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+
+
+class DevelopmentTask(BaseTimestampModel):
+    STATUS_CHOICES = [
+        ("created", "待下发"),
+        ("published", "已下发"),
+        ("running", "执行中"),
+        ("cancelling", "取消中"),
+        ("succeeded", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已取消"),
+        ("timed_out", "超时"),
+        ("rejected", "已拒绝"),
+    ]
+    TERMINAL_STATES = {"succeeded", "failed", "cancelled", "timed_out", "rejected"}
+    ACTIVE_STATES = {"created", "published", "running", "cancelling"}
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="development_tasks", on_delete=models.PROTECT)
+    workspace = models.CharField(max_length=64)
+    prompt = models.TextField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="created")
+    operator = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="development_tasks",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    cancel_published_at = models.DateTimeField(null=True, blank=True)
+    exit_code = models.IntegerField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+    last_message = models.TextField(blank=True)
+    codex_thread_id = models.CharField(max_length=128, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["robot", "status"], name="dev_task_robot_status_idx"),
+            models.Index(fields=["-created_at"], name="dev_task_recent_idx"),
+        ]
+
+
+class DevelopmentTaskEvent(models.Model):
+    task = models.ForeignKey(DevelopmentTask, related_name="events", on_delete=models.CASCADE)
+    sequence = models.PositiveBigIntegerField()
+    event_type = models.CharField(max_length=32)
+    stream = models.CharField(max_length=16, blank=True)
+    text = models.TextField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    occurred_at = models.DateTimeField(default=timezone.now)
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.UniqueConstraint(fields=["task", "sequence"], name="uniq_dev_task_event_sequence")
         ]

@@ -93,7 +93,15 @@ const robotTasks = computed(() => {
   if (!latestRobot.value?.id) return tasks.value
   return tasks.value.filter((task) => String(task.robot) === String(latestRobot.value.id))
 })
-const presetTask = computed(() => robotTasks.value.find((task) => task.enabled) || robotTasks.value[0] || null)
+const presetTask = computed(() => {
+  const enabledTasks = robotTasks.value.filter((task) => task.enabled)
+  const status = navigationStatus.value?.status || {}
+  const activeMapId = status.map_id || navigationStatus.value?.current_map_id || latestRobot.value?.current_map_id
+  if (activeMapId) {
+    return enabledTasks.find((task) => String(task.map_id || '') === String(activeMapId)) || null
+  }
+  return enabledTasks[0] || null
+})
 const latestAlert = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const alerts = computed(() => latestRobot.value?.recent_events || [])
 const pendingEventCount = computed(() => Number(overview.value?.summary?.pending_event_count || 0))
@@ -431,10 +439,10 @@ async function refreshExecutionVisual() {
       routeData.value = await fetchRouteDetail(routeId)
     }
     const mapId = (isRunning.value ? execution.value?.map_data : null)
-      || navigationStatus.value?.status?.map_id
-      || navigationStatus.value?.current_map_id
       || routeData.value?.map_data
       || presetTask.value?.map_id
+      || navigationStatus.value?.status?.map_id
+      || navigationStatus.value?.current_map_id
     if (mapId && String(mapData.value?.id || '') !== String(mapId)) {
       mapData.value = await fetchMapDetail(mapId)
       await nextTick()
