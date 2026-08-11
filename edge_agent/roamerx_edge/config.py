@@ -162,6 +162,12 @@ class ChargeControlConfig:
         "zenoh_route", "imu_daemon", "ecal2ros", "motion_control",
         "spline_daemon", "dog_task", "monitor", "push_image",
     )
+    cooling_stop_services: tuple[str, ...] = (
+        "rkaiq_3A.service", "rknn_server.service", "lightdm.service",
+    )
+    normal_start_services: tuple[str, ...] = (
+        "rkaiq_3A.service", "rknn_server.service", "lightdm.service",
+    )
 
 
 @dataclass
@@ -179,6 +185,9 @@ class PowerModeConfig:
     controller_runtime_eggs: tuple[str, ...] = (
         "push_image", "spline_daemon", "motion_control", "dog_task",
         "imu_daemon", "ecal2ros", "monitor", "zenoh_route",
+    )
+    controller_runtime_services: tuple[str, ...] = (
+        "rkaiq_3A.service", "rknn_server.service", "lightdm.service",
     )
 
 

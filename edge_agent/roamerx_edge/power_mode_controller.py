@@ -68,6 +68,7 @@ class PowerModeController:
             ("controller_sensors", "3588传感器转发", ("imu_daemon", "ecal2ros")),
             ("controller_monitor", "3588设备监控", ("monitor",)),
             ("controller_ros", "3588 ROS路由", ("zenoh_route",)),
+            ("controller_acceleration", "3588图形与推理", ("service_0", "service_1", "service_2")),
         )
         for key, name, eggs in remote_groups:
             available = remote_eggs is not None and all(egg in remote_eggs for egg in eggs)
@@ -244,6 +245,12 @@ class PowerModeController:
             checks.append(
                 f"if robot-launch egg {quoted} 2>/dev/null | grep -q running; "
                 f"then echo {quoted}=1; else echo {quoted}=0; fi"
+            )
+        for index, service in enumerate(self.config.controller_runtime_services):
+            quoted = shlex.quote(service)
+            checks.append(
+                f"if systemctl is-active --quiet {quoted}; "
+                f"then echo service_{index}=1; else echo service_{index}=0; fi"
             )
         try:
             result = self.runner(

@@ -50,7 +50,9 @@ def test_service_status_is_compared_with_current_mode(tmp_path):
         if command[:3] == ["systemctl", "is-active", "roamerx-edge-agent.service"]:
             return result()
         if command[0] == "ssh":
-            return result(stdout="\n".join(f"{egg}=0" for egg in PowerModeConfig().controller_runtime_eggs))
+            values = [f"{egg}=0" for egg in PowerModeConfig().controller_runtime_eggs]
+            values.extend(f"service_{index}=0" for index, _ in enumerate(PowerModeConfig().controller_runtime_services))
+            return result(stdout="\n".join(values))
         return result(returncode=1)
 
     config = PowerModeConfig(
@@ -69,6 +71,7 @@ def test_service_status_is_compared_with_current_mode(tmp_path):
     assert services["controller_video"]["matches_mode"] is True
     assert services["controller_motion"]["matches_mode"] is True
     assert services["controller_sensors"]["matches_mode"] is True
+    assert services["controller_acceleration"]["matches_mode"] is True
 
 
 def test_cooling_schedules_forced_reboot(tmp_path):
@@ -142,4 +145,6 @@ def test_charge_commands_stop_and_restore_3588_runtime_eggs():
     adapter.stop()
 
     assert "robot-launch stop push_image spline_daemon motion_control dog_task" in commands[0][1]
+    assert "systemctl stop rkaiq_3A.service rknn_server.service lightdm.service" in commands[0][1]
     assert "robot-launch start zenoh_route imu_daemon ecal2ros motion_control" in commands[1][1]
+    assert "systemctl start rkaiq_3A.service rknn_server.service lightdm.service" in commands[1][1]

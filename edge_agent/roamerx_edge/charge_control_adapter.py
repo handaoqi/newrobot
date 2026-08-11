@@ -37,8 +37,10 @@ class ChargeControlAdapter:
         working_directory = shlex.quote(self.config.working_directory)
         executable = shlex.quote(self.config.executable)
         cooling_eggs = " ".join(shlex.quote(egg) for egg in self.config.cooling_stop_eggs)
+        cooling_services = " ".join(shlex.quote(service) for service in self.config.cooling_stop_services)
         command = (
             f"sudo systemctl stop {unit}.service 2>/dev/null || true; "
+            f"sudo systemctl stop {cooling_services}; "
             "robot-launch stop arc_platform >/dev/null 2>&1 || true; "
             f"robot-launch stop {cooling_eggs} >/dev/null 2>&1 || true; sleep 4; "
             f"sudo systemd-run --unit={unit} --collect --property=User=root "
@@ -57,8 +59,10 @@ class ChargeControlAdapter:
     def _stop_remote(self) -> dict:
         unit = shlex.quote(self.config.service_name)
         normal_eggs = " ".join(shlex.quote(egg) for egg in self.config.normal_start_eggs)
+        normal_services = " ".join(shlex.quote(service) for service in self.config.normal_start_services)
         command = (
             f"sudo systemctl stop {unit}.service; "
+            f"sudo systemctl start {normal_services}; "
             f"robot-launch start {normal_eggs} >/dev/null 2>&1; sleep 5; "
             "robot-launch start arc_platform >/dev/null 2>&1; sleep 3; "
             "robot-launch egg arc_platform"
