@@ -37,6 +37,7 @@ class LocalStore:
                     route_snapshot_json TEXT NOT NULL,
                     current_waypoint_index INTEGER NOT NULL DEFAULT 0,
                     start_command_id TEXT,
+                    record_rosbag INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
@@ -59,6 +60,13 @@ class LocalStore:
                 );
                 """
             )
+            task_columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(task_context)").fetchall()
+            }
+            if "record_rosbag" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN record_rosbag INTEGER NOT NULL DEFAULT 0"
+                )
 
     def get_processed_command(self, command_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(
@@ -96,14 +104,15 @@ class LocalStore:
                 """
                 INSERT INTO task_context(
                     task_execution_id, state, state_version, route_snapshot_json,
-                    current_waypoint_index, start_command_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    current_waypoint_index, start_command_id, record_rosbag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_execution_id) DO UPDATE SET
                     state=excluded.state,
                     state_version=excluded.state_version,
                     route_snapshot_json=excluded.route_snapshot_json,
                     current_waypoint_index=excluded.current_waypoint_index,
                     start_command_id=excluded.start_command_id,
+                    record_rosbag=excluded.record_rosbag,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -113,6 +122,7 @@ class LocalStore:
                     json.dumps(context["route_snapshot"], ensure_ascii=False),
                     context.get("current_waypoint_index", 0),
                     context.get("start_command_id"),
+                    int(bool(context.get("record_rosbag", False))),
                 ),
             )
 
@@ -133,6 +143,7 @@ class LocalStore:
             "route_snapshot": json.loads(row["route_snapshot_json"]),
             "current_waypoint_index": row["current_waypoint_index"],
             "start_command_id": row["start_command_id"],
+            "record_rosbag": bool(row["record_rosbag"]),
         }
 
     def clear_task_context(self, task_execution_id: str, final_state: str) -> None:
@@ -175,6 +186,38 @@ class LocalStore:
 
     def outbox_count(self) -> int:
         return int(self._connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
+
+    def set_metadata(self, key: str, value: Any) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO agent_metadata(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (key, json.dumps(value, ensure_ascii=False)),
+            )
+
+    def get_metadata(self, key: str) -> Any | None:
+        row = self._connection.execute(
+            "SELECT value FROM agent_metadata WHERE key=?",
+            (key,),
+        ).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    @staticmethod
+    def _trusted_pose_key(map_id: str, map_version: str) -> str:
+        return f"trusted_pose:{map_id}:{map_version}"
+
+    def save_last_trusted_pose(self, map_id: str, map_version: str, pose: dict) -> None:
+        if not map_id:
+            return
+        self.set_metadata(self._trusted_pose_key(map_id, map_version), pose)
+
+    def load_last_trusted_pose(self, map_id: str, map_version: str) -> dict | None:
+        if not map_id:
+            return None
+        value = self.get_metadata(self._trusted_pose_key(map_id, map_version))
+        return value if isinstance(value, dict) else None
 
     def next_trajectory_seq(self, task_execution_id: str) -> int:
         with self._lock, self._connection:

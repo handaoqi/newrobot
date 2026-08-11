@@ -1,6 +1,7 @@
 import json
 import subprocess
 import time
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -16,9 +17,41 @@ class RunningProcess:
 
 
 def make_adapter(tmp_path, **overrides):
+    overrides.setdefault("rosbag_script", str(tmp_path / "missing-rosbag-script"))
     config = MappingConfig(map_dir=str(tmp_path), **overrides)
     media = SimpleNamespace(robot_id="test-dog")
     return MappingAdapter(config, media)
+
+
+def test_start_mapping_records_before_slam_start(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda: calls.append("stop_nav"))
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors_ready"))
+    monkeypatch.setattr(adapter, "_start_rosbag", lambda label: calls.append(("start_bag", label)))
+    monkeypatch.setattr(adapter, "_ensure_slam_process", lambda: calls.append("start_slam"))
+    monkeypatch.setattr(adapter, "_call_map_state", lambda data: calls.append(("map_state", data)))
+    monkeypatch.setattr(adapter, "status", lambda: {"state": adapter.session.state})
+
+    result = adapter.start_mapping({"map_name": "park", "record_rosbag": True})
+
+    assert result["state"] == "mapping"
+    assert calls == ["stop_nav", "sensors_ready", ("start_bag", "park"), "start_slam", ("map_state", 3)]
+
+
+def test_start_mapping_stops_rosbag_when_slam_fails(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda: None)
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: None)
+    monkeypatch.setattr(adapter, "_start_rosbag", lambda label: calls.append("start_bag"))
+    monkeypatch.setattr(adapter, "_ensure_slam_process", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(adapter, "_stop_rosbag", lambda: calls.append("stop_bag"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        adapter.start_mapping({"map_name": "park", "record_rosbag": True})
+
+    assert calls == ["start_bag", "stop_bag"]
 
 
 def test_status_prefers_active_progress_directory(tmp_path):
@@ -76,6 +109,25 @@ def test_disabled_visibility_filter_packages_raw_map(tmp_path):
         "mode": "manual_cleanup",
         "source": str(session),
     }
+
+
+def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):
+    session = tmp_path / "20260715_122000_004"
+    session.mkdir()
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "map.txt").write_text("0 0 0\n")
+    (session / "gnss_origin.yaml").write_text(
+        "origin_latitude: 39.0\norigin_longitude: 116.0\nalignment_locked: 1\n"
+    )
+    adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
+    monkeypatch.setattr(adapter, "_generate_map_preview", lambda _base: None)
+
+    package, metadata = adapter._package_map({}, session)
+
+    with zipfile.ZipFile(package) as archive:
+        assert "gnss_origin.yaml" in archive.namelist()
+    assert "gnss_origin.yaml" in metadata["files"]
 
 
 def test_finds_newest_incomplete_recoverable_session(tmp_path):

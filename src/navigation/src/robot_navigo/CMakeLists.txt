@@ -41,6 +41,7 @@ find_package(navigation2 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -225,9 +226,20 @@ ament_target_dependencies(costmap_listener
         nav2_msgs
         rclcpp)
 
+add_executable(sensor_health_monitor
+        src/sensor_health_monitor.cpp
+)
+ament_target_dependencies(sensor_health_monitor
+        rclcpp
+        sensor_msgs
+        nav_msgs
+        std_msgs
+)
+
 #==========================>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 install(PROGRAMS
         scripts/emap_publisher.py
+        scripts/self_filter_scan.py
         DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -279,6 +291,9 @@ install(TARGETS costmap_listener
         DESTINATION lib/${PROJECT_NAME}
 )
 install(TARGETS mode_status_pub
+        DESTINATION lib/${PROJECT_NAME}
+)
+install(TARGETS sensor_health_monitor
         DESTINATION lib/${PROJECT_NAME}
 )
 # install(TARGETS detector_node

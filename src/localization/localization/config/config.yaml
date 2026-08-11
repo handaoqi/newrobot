@@ -7,6 +7,14 @@ localization:
     localization_odom_frame_id: "base_link"
     robot_odom_frame_id: "odom"
     odom_child_frame_id: "base_link"
+    robot_odom_topic: "/odom/mc_odom"
+    # Use the robot's high-rate odometry delta as the NDT initial guess. This
+    # keeps scan matching aligned during in-place turns where IMU-only UKF
+    # prediction can be pulled into a stale NDT local optimum.
+    # The controller odometry uses device-uptime timestamps and its yaw drifts
+    # against lidar SLAM. Keep it recorded for diagnostics, but do not seed NDT
+    # until that clock/frame contract has been calibrated.
+    enable_robot_odometry_prediction: false
     send_tf_transforms: true
     tf_use_current_time: true
     # Keep map->odom available slightly ahead of Nav2 controller requests.
@@ -26,14 +34,24 @@ localization:
 
     gnss_fusion:
       enable: true
-      gain: 0.03
-      max_correction_step: 0.10
+      gain: 0.20
+      max_correction_step: 0.30
       max_residual: 5.0
       max_age: 1.5
       max_horizontal_std: 1.5
-      min_status: 0
+      min_status: 1
       use_elevation: false
       lever_arm_base: [-0.05, 0.0, 0.15]
+      auto_recovery_enable: true
+      auto_recovery_retry_seconds: 5.0
+      rtk_pvh_topic: /rtk_pvh
+      # Fixed-RTK recovery requires a valid dual-antenna heading. Invalid or
+      # high-variance heading samples are rejected instead of changing pose.
+      use_heading: true
+      heading_offset_deg: 0.0
+      heading_max_std_deg: 5.0
+      heading_min_baseline_m: 0.20
+      heading_max_age: 1.5
     
     # IMU initialization parameters
     imu_init_time: 3.0                    # IMU初始化时间(s)
@@ -78,5 +96,9 @@ localization:
     use_global_localization_init: true
     init_pose_change_threshold: 0.01      
     init_quat_change_threshold: 0.01      
-    global_localization_timeout: 10.0     
+    global_localization_timeout: 10.0
+    # After one second of continuous NDT failure at 10 Hz, try one bounded
+    # global ICP from the last pose that passed scan-matching validation.
+    runtime_relocalization_failure_threshold: 10
+    runtime_relocalization_retry_seconds: 5.0
 

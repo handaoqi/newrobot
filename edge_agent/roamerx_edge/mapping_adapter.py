@@ -59,6 +59,7 @@ class MappingAdapter:
         self._slam_process: subprocess.Popen | None = None
         self._slam_log_handle = None
         self._slam_log_path: Path | None = None
+        self._record_rosbag = False
 
     @property
     def _slam_process_alive(self) -> bool:
@@ -89,8 +90,16 @@ class MappingAdapter:
         )
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self._stop_conflicting_navigation_stack()
-        self._ensure_slam_process()
-        self._call_map_state(self.config.start_data)
+        self._ensure_mapping_sensors()
+        self._record_rosbag = bool(command.get("record_rosbag", False))
+        if self._record_rosbag:
+            self._start_rosbag(map_name)
+        try:
+            self._ensure_slam_process()
+            self._call_map_state(self.config.start_data)
+        except Exception:
+            self._stop_rosbag()
+            raise
         self._set_state("mapping")
         return self.status()
 
@@ -154,6 +163,9 @@ class MappingAdapter:
             self._set_state("mapping" if self._any_slam_process_alive else "failed")
             raise ProtocolError("MAPPING_NOT_READY", readiness["message"])
 
+        # The diagnostic bag captures sensor input while the robot is mapping;
+        # stop it before the CPU- and disk-heavy map export begins.
+        self._stop_rosbag()
         self._set_state("saving")
         save_started_at = time.time()
         try:
@@ -181,6 +193,7 @@ class MappingAdapter:
         self._set_state("uploading")
         upload_result = self.media_client.upload_map_package(str(package_path), metadata)
         self._set_state("stopping")
+        self._stop_rosbag()
         self._stop_slam_process()
         self._set_state("exited")
         result = self.status()
@@ -228,6 +241,7 @@ class MappingAdapter:
         progress_dir = self._find_latest_progress_dir()
         if self.session:
             self._set_state("cancelled")
+        self._stop_rosbag()
         self._stop_slam_process()
         self._mark_progress_cancelled(progress_dir)
         return self.status()
@@ -244,6 +258,7 @@ class MappingAdapter:
         progress = self._read_save_progress(latest_session_dir)
         readiness = self._mapping_readiness(progress, process_alive)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
+        rosbag = self._rosbag_status()
         if not self.session:
             progress_stage = str(progress.get("stage") or "")
             save_stages = {
@@ -269,6 +284,7 @@ class MappingAdapter:
                 "ready_for_motion": readiness["ready_for_motion"],
                 "ready_for_save": readiness["ready_for_save"],
                 "files": files,
+                "rosbag": rosbag,
             }
         state = self.session.state
         if (
@@ -294,6 +310,7 @@ class MappingAdapter:
             "ready_for_motion": readiness["ready_for_motion"],
             "ready_for_save": readiness["ready_for_save"],
             "files": files,
+            "rosbag": rosbag,
         }
 
     @staticmethod
@@ -350,8 +367,55 @@ class MappingAdapter:
 
     def _cleanup(self) -> None:
         """Kill orphaned SLAM process and reset session state."""
+        self._stop_rosbag()
         self._stop_slam_process()
         self.session = None
+
+    def _rosbag_command(self, action: str, label: str = "") -> dict:
+        script = Path(self.config.rosbag_script).expanduser()
+        if not script.is_file():
+            if action == "status":
+                return {"running": False, "available": False, "error": f"script not found: {script}"}
+            raise ProtocolError("ROSBAG_UNAVAILABLE", f"rosbag script not found: {script}")
+        args = [str(script), action]
+        if label:
+            args.append(label)
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=max(10, int(self.config.rosbag_stop_timeout_seconds)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProtocolError("ROSBAG_COMMAND_TIMEOUT", f"rosbag {action} timed out") from exc
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            message = (result.stderr or output or f"rosbag {action} failed").strip()
+            if action == "status":
+                return {"running": False, "available": True, "error": message}
+            raise ProtocolError("ROSBAG_COMMAND_FAILED", message)
+        try:
+            payload = json.loads(output.splitlines()[-1]) if output else {}
+        except (ValueError, IndexError):
+            payload = {"running": action == "start", "error": "invalid recorder status"}
+        payload["available"] = True
+        return payload
+
+    def _start_rosbag(self, label: str) -> None:
+        self._rosbag_command("start", label)
+
+    def _stop_rosbag(self) -> None:
+        status = self._rosbag_status()
+        if not status.get("running"):
+            return
+        try:
+            self._rosbag_command("stop")
+        except ProtocolError:
+            LOGGER.exception("failed to stop mapping rosbag recorder")
+
+    def _rosbag_status(self) -> dict:
+        return self._rosbag_command("status")
 
     def _ensure_slam_process(self) -> None:
         if self._slam_process and self._slam_process.poll() is None:
@@ -377,6 +441,23 @@ class MappingAdapter:
                 "MAPPING_SLAM_START_FAILED",
                 f"SLAM process exited during startup with code {return_code}; log={self._slam_log_path}",
             )
+
+    def _ensure_mapping_sensors(self) -> None:
+        script = Path(self.config.sensor_start_script).expanduser()
+        if not script.is_file():
+            raise ProtocolError("MAPPING_SENSOR_SCRIPT_MISSING", f"mapping sensor script not found: {script}")
+        try:
+            result = subprocess.run(
+                [str(script)],
+                capture_output=True,
+                text=True,
+                timeout=max(10, int(self.config.sensor_start_timeout_seconds)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProtocolError("MAPPING_SENSOR_TIMEOUT", "timed out waiting for LiDAR/IMU data") from exc
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "LiDAR/IMU startup failed").strip()
+            raise ProtocolError("MAPPING_SENSOR_NOT_READY", message)
 
     def _stop_conflicting_navigation_stack(self) -> None:
         """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
@@ -609,7 +690,9 @@ class MappingAdapter:
         preview_path = self._generate_map_preview(filtered_base)
         version = time.strftime("%Y%m%d-%H%M%S")
         package_path = self.map_dir / f"map_package_{version}.zip"
-        upload_files = ["map.yaml", "map.pgm", "map.txt"]
+        # Keep the ENU-to-map transform with the map package. Without this
+        # file, an uploaded map cannot use RTK for initialization or fusion.
+        upload_files = ["map.yaml", "map.pgm", "map.txt", "gnss_origin.yaml"]
         if preview_path:
             upload_files.append(preview_path.name)
         if self.config.upload_point_cloud:

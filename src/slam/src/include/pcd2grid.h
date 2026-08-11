@@ -33,6 +33,13 @@ namespace robot::slam
         int flag_pass_through = 0;
         double map_resolution = 0.05;
         std::size_t max_grid_cells = 200000000;
+        std::uint8_t min_points_per_cell = 1;
+        std::uint8_t support_radius_cells = 0;
+        bool use_xy_bounds = false;
+        double x_min = 0.0;
+        double x_max = 0.0;
+        double y_min = 0.0;
+        double y_max = 0.0;
     };
 
     class Pcd2Grid

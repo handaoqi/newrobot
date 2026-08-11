@@ -119,6 +119,16 @@ void PoseEstimator::set_initial_biases(const Eigen::Vector3f& acc_bias, const Ei
  * @brief update the state of the odomety-based pose estimation
  */
 void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
+  Eigen::Quaternionf delta_orientation(odom_delta.block<3, 3>(0, 0));
+  delta_orientation.normalize();
+  if (!odom_orientation_initialized_) {
+    odom_orientation_prediction_ = quat();
+    odom_orientation_initialized_ = true;
+  } else {
+    odom_orientation_prediction_ =
+      (odom_orientation_prediction_ * delta_orientation).normalized();
+  }
+
   if(!odom_ukf) {
     Eigen::MatrixXf odom_process_noise = Eigen::MatrixXf::Identity(7, 7);
     Eigen::MatrixXf odom_measurement_noise = Eigen::MatrixXf::Identity(7, 7) * 1e-3;
@@ -156,44 +166,22 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
  * @return cloud aligned to the globalmap
  */
 pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
-  Eigen::Matrix4f init_guess = matrix();
+  Eigen::Matrix4f imu_guess = matrix();
+  Eigen::Matrix4f init_guess = imu_guess;
   // Eigen::Matrix4f no_guess = last_observation;
-  Eigen::Matrix4f imu_guess;
-  Eigen::Matrix4f odom_guess;
+  Eigen::Matrix4f odom_guess = imu_guess;
   // Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
 
-  // if(!odom_ukf) {
-  //   init_guess = imu_guess = matrix();
-  // } else {
-  //   imu_guess = matrix();
-  //   odom_guess = odom_matrix();
-
-  //   Eigen::VectorXf imu_mean(7);
-  //   Eigen::MatrixXf imu_cov = Eigen::MatrixXf::Identity(7, 7);
-  //   imu_mean.block<3, 1>(0, 0) = ukf->mean.block<3, 1>(0, 0);
-  //   imu_mean.block<4, 1>(3, 0) = ukf->mean.block<4, 1>(6, 0);
-
-  //   imu_cov.block<3, 3>(0, 0) = ukf->cov.block<3, 3>(0, 0);
-  //   imu_cov.block<3, 4>(0, 3) = ukf->cov.block<3, 4>(0, 6);
-  //   imu_cov.block<4, 3>(3, 0) = ukf->cov.block<4, 3>(6, 0);
-  //   imu_cov.block<4, 4>(3, 3) = ukf->cov.block<4, 4>(6, 6);
-
-  //   Eigen::VectorXf odom_mean = odom_ukf->mean;
-  //   Eigen::MatrixXf odom_cov = odom_ukf->cov;
-
-  //   if (imu_mean.tail<4>().dot(odom_mean.tail<4>()) < 0.0) {
-  //     odom_mean.tail<4>() *= -1.0;
-  //   }
-
-  //   Eigen::MatrixXf inv_imu_cov = imu_cov.inverse();
-  //   Eigen::MatrixXf inv_odom_cov = odom_cov.inverse();
-
-  //   Eigen::MatrixXf fused_cov = (inv_imu_cov + inv_odom_cov).inverse();
-  //   Eigen::VectorXf fused_mean = fused_cov * inv_imu_cov * imu_mean + fused_cov * inv_odom_cov * odom_mean;
-
-  //   init_guess.block<3, 1>(0, 3) = Eigen::Vector3f(fused_mean[0], fused_mean[1], fused_mean[2]);
-  //   init_guess.block<3, 3>(0, 0) = Eigen::Quaternionf(fused_mean[3], fused_mean[4], fused_mean[5], fused_mean[6]).normalized().toRotationMatrix();
-  // }
+  // The chassis orientation is reliable during in-place turns, while its
+  // translation scale does not agree closely enough with lidar localization.
+  // Use only the odometry rotation as the NDT seed and retain the IMU/NDT
+  // position estimate.
+  if (odom_orientation_initialized_) {
+    odom_guess = odom_matrix();
+    if (odom_orientation_prediction_.coeffs().allFinite()) {
+      init_guess.block<3, 3>(0, 0) = odom_orientation_prediction_.toRotationMatrix();
+    }
+  }
 
   pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
   registration->setInputSource(cloud);
@@ -242,7 +230,17 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   // wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
 
   ukf->correct(observation);
-  // imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
+  imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
+
+  if (odom_orientation_initialized_) {
+    if (odom_orientation_prediction_.coeffs().dot(q.coeffs()) < 0.0f) {
+      q.coeffs() *= -1.0f;
+    }
+    const float disagreement = odom_orientation_prediction_.angularDistance(q);
+    const float correction_gain = disagreement < 0.15f ? 0.20f : 0.02f;
+    odom_orientation_prediction_ =
+      odom_orientation_prediction_.slerp(correction_gain, q).normalized();
+  }
 
   if(odom_ukf) {
     if (observation.tail<4>().dot(odom_ukf->mean.tail<4>()) < 0.0) {

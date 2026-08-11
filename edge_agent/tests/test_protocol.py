@@ -39,3 +39,31 @@ def test_accepts_nav_initial_pose_command():
     payload["payload"]["command"] = {"x": 1.0, "y": 2.0, "yaw": 0.5, "frame_id": "map"}
     envelope = decode_message(payload)
     assert envelope.message_type == "nav.initial_pose"
+
+
+def test_accepts_nav_initial_pose_with_mapping_start_seed():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.initial_pose"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"seed_source": "mapping_start"}
+    envelope = decode_message(payload)
+    assert envelope.payload["command"]["seed_source"] == "mapping_start"
+
+
+def test_accepts_nav_relocalize_with_mapping_start_seed():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.relocalize"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"seed_source": "mapping_start"}
+    envelope = decode_message(payload)
+    assert envelope.message_type == "nav.relocalize"
+
+
+def test_nav_relocalize_rejects_partial_pose():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.relocalize"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"x": 1.0, "y": 2.0}
+    with pytest.raises(ProtocolError) as exc:
+        decode_message(payload)
+    assert exc.value.code == "INVALID_MESSAGE"

@@ -58,20 +58,27 @@ wait_for_service() {
 }
 
 ensure_rtk() {
+  if ! pgrep -f 'rtk_ntrip_bridge.py' >/dev/null 2>&1; then
+    echo "Starting RTK/NTRIP..."
+    "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
+      cat /tmp/roamerx_rtk_start.log >&2
+      if [ "${REQUIRE_RTK}" = "1" ]; then
+        return 1
+      fi
+      echo "WARNING: continuing with LiDAR+IMU only." >&2
+      return 0
+    }
+  fi
   if [ "${REQUIRE_RTK}" != "1" ]; then
+    echo "RTK recording enabled; poor fixes will automatically fall back to LiDAR+IMU."
     return 0
   fi
-  echo "Starting RTK/NTRIP..."
-  "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
-    cat /tmp/roamerx_rtk_start.log >&2
-    return 1
-  }
-  echo "Waiting for RTK fix on /fix..."
+  echo "Waiting for fusion-usable RTK fix on /fix..."
   for _ in $(seq 1 "${RTK_WAIT_SECONDS}"); do
     local status
     status="$(timeout 3 ros2 topic echo /fix --once 2>/dev/null | awk '/status:/{getline; if ($1=="status:") print $2; exit}' || true)"
-    if [ "${status}" = "0" ] || [ "${status}" = "1" ] || [ "${status}" = "2" ]; then
-      echo "RTK/GNSS fix OK."
+    if [ "${status}" = "1" ] || [ "${status}" = "2" ]; then
+      echo "RTK/GNSS fusion fix OK."
       return 0
     fi
     sleep 1
@@ -95,6 +102,8 @@ start_mapping() {
   if [ -x "${PROJECT_DIR}/script/robot/start_navigation_real.sh" ]; then
     "${PROJECT_DIR}/script/robot/start_navigation_real.sh" full-stop
   fi
+
+  "${PROJECT_DIR}/script/robot/ensure_mapping_sensors.sh"
 
   ensure_rtk
 

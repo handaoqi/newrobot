@@ -30,3 +30,13 @@ def test_trajectory_sequence_persists(tmp_path):
     assert store.next_trajectory_seq("exec") == 0
     assert store.next_trajectory_seq("exec") == 1
     store.close()
+
+
+def test_last_trusted_pose_is_scoped_by_map(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    pose = {"x": 12.5, "y": -3.0, "yaw": 0.7, "source": "test"}
+    store.save_last_trusted_pose("92", "v1", pose)
+
+    assert store.load_last_trusted_pose("92", "v1") == pose
+    assert store.load_last_trusted_pose("92", "v2") is None
+    store.close()

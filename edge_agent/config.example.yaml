@@ -27,11 +27,32 @@ telemetry:
   heartbeat_interval_seconds: 10
   trajectory_flush_seconds: 5
   trajectory_batch_size: 20
+  system_probe_interval_seconds: 10
+  system_probe_stale_seconds: 30
+  battery_ssh_host: "3588"
+  modem_at_device: "/dev/ttyUSB2"
+  charging_current_threshold_ma: 300
+  charger_speaker_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
+  nx_speaker_card: 2
+  nx_speaker_control: "PCM"
 
 safety:
   stop_speed_threshold_mps: 0.03
+  localization_stable_seconds: 3.0
+  localization_loss_samples: 5
   stop_confirmation_seconds: 1.0
+  standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
+
+obstacle_speech:
+  enabled: true
+  obstacle_clear_seconds: 3.0
+  no_progress_seconds: 5.0
+  min_progress_m: 0.5
+  obstacle_max_distance_m: 0.9
+  collision_limit_ratio: 0.6
+  minimum_blocked_task_seconds: 300.0
+  navigation_retry_seconds: 5.0
 
 storage:
   sqlite_path: "/var/lib/roamerx-edge/edge.db"
@@ -67,11 +88,49 @@ mapping:
   auto_activate_uploaded_map: true
   upload_point_cloud: false
   preview_max_size: 1200
+  rosbag_script: "/home/robot/genisom_roamerx_open/script/robot/mapping_rosbag.sh"
+  rosbag_stop_timeout_seconds: 45
+  sensor_start_script: "/home/robot/genisom_roamerx_open/script/robot/ensure_mapping_sensors.sh"
+  sensor_start_timeout_seconds: 40
 
 navigation_stack:
   script_path: "/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh"
   command_timeout_seconds: 45
+  rosbag_script: "/home/robot/genisom_roamerx_open/script/robot/navigation_rosbag.sh"
+  rosbag_stop_timeout_seconds: 45
 
 teleop_control:
   script_path: "/home/robot/genisom_roamerx_open/script/robot/start_teleop_control.sh"
   command_timeout_seconds: 20
+
+sensor_control:
+  lidar_restart_script: "/home/robot/genisom_roamerx_open/script/robot/restart_livox_sensor.sh"
+  rtk_restart_script: "/home/robot/genisom_roamerx_open/script/robot/start_rtk_ntrip.sh"
+  command_timeout_seconds: 30
+
+charge_control:
+  remote_host: "3588"
+  service_name: "roamerx-charge-pile"
+  working_directory: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
+  executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
+  command_timeout_seconds: 20
+  full_battery_percent: 100
+  full_confirmation_samples: 3
+
+power_mode:
+  state_path: /home/robot/edge_agent/data/power_mode.json
+  cooling_marker_path: /home/robot/edge_agent/data/cooling_standby
+  monitoring_service: roamerx-bike-bot.service
+  navigation_script: /home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh
+  sensor_start_script: /home/robot/genisom_roamerx_open/script/robot/ensure_navigation_sensors.sh
+  cooling_power_mode: 1
+  normal_power_mode: 0
+  normal_start_timeout_seconds: 120
+  reboot_delay_seconds: 12
+
+audio_control:
+  remote_host: "3588"
+  remote_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
+  nx_card: 2
+  nx_control: "PCM"
+  command_timeout_seconds: 10

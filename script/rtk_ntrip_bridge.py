@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import math
 import os
 import select
 import socket
@@ -57,6 +58,13 @@ class RtkPosition:
     satellites: int = 0
     hdop: float = 1.0
     stamp: float = 0.0
+    quality: str = "invalid"
+    horizontal_std_m: float = math.inf
+    vertical_std_m: float = math.inf
+    solution_status: int = -1
+    position_type: int = -1
+    differential_age_s: float = math.inf
+    solution_satellites: int = 0
 
     def valid(self) -> bool:
         return abs(self.latitude) > 1e-7 and abs(self.longitude) > 1e-7
@@ -118,6 +126,13 @@ class NtripBridge(Node):
             "position_timeout_sec": 30.0,
             "default_horizontal_std_m": 0.8,
             "default_vertical_std_m": 1.5,
+            "fixed_max_horizontal_std_m": 0.20,
+            "float_max_horizontal_std_m": 1.50,
+            "max_differential_age_sec": 5.0,
+            "min_solution_satellites": 5,
+            # NovAtel-compatible BESTPOS position types used by the controller.
+            "fixed_position_types": [48, 49, 50],
+            "float_position_types": [17, 18, 32, 33, 34],
         }
         defaults.update(data)
         defaults["port"] = int(defaults["port"])
@@ -127,13 +142,52 @@ class NtripBridge(Node):
         defaults["position_timeout_sec"] = float(defaults["position_timeout_sec"])
         defaults["default_horizontal_std_m"] = float(defaults["default_horizontal_std_m"])
         defaults["default_vertical_std_m"] = float(defaults["default_vertical_std_m"])
+        defaults["fixed_max_horizontal_std_m"] = float(defaults["fixed_max_horizontal_std_m"])
+        defaults["float_max_horizontal_std_m"] = float(defaults["float_max_horizontal_std_m"])
+        defaults["max_differential_age_sec"] = float(defaults["max_differential_age_sec"])
+        defaults["min_solution_satellites"] = int(defaults["min_solution_satellites"])
+        defaults["fixed_position_types"] = {int(value) for value in defaults["fixed_position_types"]}
+        defaults["float_position_types"] = {int(value) for value in defaults["float_position_types"]}
         if not defaults["username"] or not defaults["password"]:
             raise RuntimeError("NTRIP username/password is not configured")
         return defaults
 
+    def classify_quality(self, pos, valid: bool, horizontal_std_m: float) -> str:
+        solution_ok = int(pos.p_sol_status) == 0
+        position_type = int(pos.pos_type)
+        differential_age = float(pos.diff_age_s)
+        satellites = int(pos.soln_svs_num)
+        common_ok = (
+            valid
+            and solution_ok
+            and math.isfinite(horizontal_std_m)
+            and satellites >= self.config["min_solution_satellites"]
+            and 0.0 <= differential_age <= self.config["max_differential_age_sec"]
+        )
+        if (
+            common_ok
+            and position_type in self.config["fixed_position_types"]
+            and horizontal_std_m <= self.config["fixed_max_horizontal_std_m"]
+        ):
+            return "rtk_fixed"
+        if (
+            common_ok
+            and position_type in self.config["float_position_types"]
+            and horizontal_std_m <= self.config["float_max_horizontal_std_m"]
+        ):
+            return "rtk_float"
+        if valid and solution_ok:
+            return "standalone"
+        return "invalid"
+
     def on_rtk(self, msg: UniRtkPvh):
         pos = msg.bestnav
         valid = abs(float(pos.latitude_deg)) > 1e-7 and abs(float(pos.longitude_deg)) > 1e-7
+        lat_std = float(pos.lat_std) if float(pos.lat_std) > 0.0 else self.config["default_horizontal_std_m"]
+        lon_std = float(pos.lon_std) if float(pos.lon_std) > 0.0 else self.config["default_horizontal_std_m"]
+        hgt_std = float(pos.hgt_std) if float(pos.hgt_std) > 0.0 else self.config["default_vertical_std_m"]
+        horizontal_std = max(lat_std, lon_std)
+        quality = self.classify_quality(pos, valid, horizontal_std)
         with self.position_lock:
             self.position = RtkPosition(
                 latitude=float(pos.latitude_deg),
@@ -142,11 +196,25 @@ class NtripBridge(Node):
                 satellites=int(pos.svs_num),
                 hdop=1.0,
                 stamp=time.time(),
+                quality=quality,
+                horizontal_std_m=horizontal_std,
+                vertical_std_m=hgt_std,
+                solution_status=int(pos.p_sol_status),
+                position_type=int(pos.pos_type),
+                differential_age_s=float(pos.diff_age_s),
+                solution_satellites=int(pos.soln_svs_num),
             )
         fix = NavSatFix()
         fix.header = msg.header
+        # The controller header may use device uptime. Downstream fusion needs
+        # the ROS reception time so LiDAR, IMU and GNSS age checks agree.
+        fix.header.stamp = self.get_clock().now().to_msg()
         fix.header.frame_id = self.config["gps_frame_id"]
-        fix.status.status = NavSatStatus.STATUS_FIX if valid else NavSatStatus.STATUS_NO_FIX
+        fix.status.status = {
+            "rtk_fixed": NavSatStatus.STATUS_GBAS_FIX,
+            "rtk_float": NavSatStatus.STATUS_SBAS_FIX,
+            "standalone": NavSatStatus.STATUS_FIX,
+        }.get(quality, NavSatStatus.STATUS_NO_FIX)
         fix.status.service = (
             NavSatStatus.SERVICE_GPS
             | NavSatStatus.SERVICE_GLONASS
@@ -156,9 +224,6 @@ class NtripBridge(Node):
         fix.latitude = float(pos.latitude_deg)
         fix.longitude = float(pos.longitude_deg)
         fix.altitude = float(pos.altitude_m)
-        lat_std = float(pos.lat_std) if float(pos.lat_std) > 0.05 else self.config["default_horizontal_std_m"]
-        lon_std = float(pos.lon_std) if float(pos.lon_std) > 0.05 else self.config["default_horizontal_std_m"]
-        hgt_std = float(pos.hgt_std) if float(pos.hgt_std) > 0.05 else self.config["default_vertical_std_m"]
         lat_var = lat_std * lat_std
         lon_var = lon_std * lon_std
         hgt_var = hgt_std * hgt_std
@@ -170,8 +235,8 @@ class NtripBridge(Node):
         nmea.header.frame_id = self.config["gps_frame_id"]
         nmea.nav_sat_fix = fix
         nmea.utc_time = f"{float(pos.utc_time_s):.3f}"
-        nmea.qual = 1 if valid else 0
-        nmea.satellites_used = int(pos.svs_num)
+        nmea.qual = {"rtk_fixed": 4, "rtk_float": 5, "standalone": 1}.get(quality, 0)
+        nmea.satellites_used = int(pos.soln_svs_num)
         nmea.hdop = 1.0
         nmea.undulation = float(pos.undulation)
         nmea.undulation_units = "M"
@@ -204,6 +269,14 @@ class NtripBridge(Node):
             lat=round(pos.latitude, 8),
             lon=round(pos.longitude, 8),
             satellites=pos.satellites,
+            solution_satellites=pos.solution_satellites,
+            quality=pos.quality,
+            fusion_usable=pos.quality in {"rtk_fixed", "rtk_float"},
+            horizontal_std_m=round(pos.horizontal_std_m, 3) if math.isfinite(pos.horizontal_std_m) else None,
+            vertical_std_m=round(pos.vertical_std_m, 3) if math.isfinite(pos.vertical_std_m) else None,
+            solution_status=pos.solution_status,
+            position_type=pos.position_type,
+            differential_age_s=round(pos.differential_age_s, 2) if math.isfinite(pos.differential_age_s) else None,
             age_sec=round(time.time() - pos.stamp, 1) if pos.stamp else None,
         )
 

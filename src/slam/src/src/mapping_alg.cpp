@@ -38,6 +38,16 @@ namespace robot::slam
 
         static_assert(sizeof(BinaryPcdPoint) == 32, "unexpected binary PCD point size");
 
+#pragma pack(push, 1)
+        struct ExportPointRecord
+        {
+            BinaryPcdPoint point;
+            float reference_z;
+        };
+#pragma pack(pop)
+
+        static_assert(sizeof(ExportPointRecord) == 36, "unexpected export point record size");
+
         BinaryPcdPoint packPoint(const PointType& point)
         {
             return BinaryPcdPoint{
@@ -191,6 +201,14 @@ namespace robot::slam
         this->declare_parameter<double>("gnss_fusion.alignment_max_rms", 1.5);
         this->declare_parameter<double>("gnss_fusion.alignment_max_yaw_change_deg", 3.0);
         this->declare_parameter<int>("gnss_fusion.alignment_required_fits", 3);
+        this->declare_parameter<bool>("odom_guard.enable", false);
+        this->declare_parameter<string>("odom_guard.topic", "/odom/mc_odom");
+        this->declare_parameter<double>("odom_guard.max_speed", 2.0);
+        this->declare_parameter<double>("odom_guard.max_vertical_speed", 0.10);
+        this->declare_parameter<double>("odom_guard.max_lidar_correction", 0.35);
+        this->declare_parameter<double>("odom_guard.max_lidar_z_correction", 0.03);
+        this->declare_parameter<double>("odom_guard.max_lidar_rotation", 0.35);
+        this->declare_parameter<double>("odom_guard.max_abs_z_from_start", 10.0);
         this->declare_parameter<double>("health_guard.max_frame_translation", 1.5);
         this->declare_parameter<double>("health_guard.max_speed", 3.0);
         this->declare_parameter<double>("health_guard.max_abs_z", 5.0);
@@ -206,6 +224,9 @@ namespace robot::slam
         this->declare_parameter<int>("pcd2pgm.flag_pass_through", 0);
         this->declare_parameter<double>("pcd2pgm.map_resolution", 0.05);
         this->declare_parameter<std::int64_t>("pcd2pgm.max_grid_cells", 200000000);
+        this->declare_parameter<int>("pcd2pgm.min_points_per_cell", 1);
+        this->declare_parameter<int>("pcd2pgm.support_radius_cells", 0);
+        this->declare_parameter<double>("pcd2pgm.projection_padding_m", 25.0);
         this->declare_parameter<bool>("dynamic_filter.enable", false);
         this->declare_parameter<double>("dynamic_filter.voxel_size", 0.20);
         this->declare_parameter<int>("dynamic_filter.min_scan_observations", 1);
@@ -226,6 +247,13 @@ namespace robot::slam
         std::int64_t max_grid_cells = 200000000;
         this->get_parameter_or<std::int64_t>("pcd2pgm.max_grid_cells", max_grid_cells, 200000000);
         pcd2pgm_options_.max_grid_cells = static_cast<std::size_t>(std::max<std::int64_t>(1, max_grid_cells));
+        int min_points_per_cell = 1;
+        this->get_parameter_or<int>("pcd2pgm.min_points_per_cell", min_points_per_cell, 1);
+        pcd2pgm_options_.min_points_per_cell = static_cast<std::uint8_t>(std::clamp(min_points_per_cell, 1, 255));
+        int support_radius_cells = 0;
+        this->get_parameter_or<int>("pcd2pgm.support_radius_cells", support_radius_cells, 0);
+        pcd2pgm_options_.support_radius_cells = static_cast<std::uint8_t>(std::clamp(support_radius_cells, 0, 8));
+        this->get_parameter_or<double>("pcd2pgm.projection_padding_m", pcd2pgm_projection_padding_m_, 25.0);
         this->get_parameter_or<bool>("dynamic_filter.enable", dynamic_filter_enable_, false);
         this->get_parameter_or<double>("dynamic_filter.voxel_size", dynamic_filter_voxel_size_, 0.20);
         this->get_parameter_or<int>("dynamic_filter.min_scan_observations", dynamic_filter_min_scan_observations_, 1);
@@ -299,6 +327,14 @@ namespace robot::slam
         this->get_parameter_or<double>("gnss_fusion.alignment_max_yaw_change_deg", gnss_alignment_yaw_change_deg, 3.0);
         gnss_alignment_max_yaw_change_rad_ = gnss_alignment_yaw_change_deg * M_PI / 180.0;
         this->get_parameter_or<int>("gnss_fusion.alignment_required_fits", gnss_alignment_required_fits_, 3);
+        this->get_parameter_or<bool>("odom_guard.enable", odom_guard_enable_, false);
+        this->get_parameter_or<string>("odom_guard.topic", odom_guard_topic, "/odom/mc_odom");
+        this->get_parameter_or<double>("odom_guard.max_speed", odom_guard_max_speed_mps_, 2.0);
+        this->get_parameter_or<double>("odom_guard.max_vertical_speed", odom_guard_max_vertical_speed_mps_, 0.10);
+        this->get_parameter_or<double>("odom_guard.max_lidar_correction", odom_guard_max_lidar_correction_m_, 0.35);
+        this->get_parameter_or<double>("odom_guard.max_lidar_z_correction", odom_guard_max_lidar_z_correction_m_, 0.03);
+        this->get_parameter_or<double>("odom_guard.max_lidar_rotation", odom_guard_max_lidar_rotation_rad_, 0.35);
+        this->get_parameter_or<double>("odom_guard.max_abs_z_from_start", odom_guard_max_abs_z_from_start_m_, 10.0);
         this->get_parameter_or<double>("health_guard.max_frame_translation", health_max_frame_translation_m_, 1.5);
         this->get_parameter_or<double>("health_guard.max_speed", health_max_speed_mps_, 3.0);
         this->get_parameter_or<double>("health_guard.max_abs_z", health_max_abs_z_m_, 5.0);
@@ -358,8 +394,16 @@ namespace robot::slam
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
         sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
             gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+        if (odom_guard_enable_)
+        {
+            odom_guard_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                odom_guard_topic, rclcpp::QoS(100).best_effort(),
+                std::bind(&MappingAlg::odomGuardCallBack, this, std::placeholders::_1));
+        }
         RCLCPP_INFO(this->get_logger(), "GNSS collection enabled on %s; pose correction=%s", gnss_topic.c_str(),
             use_gnss_fusion_ ? "enabled after alignment lock" : "disabled");
+        RCLCPP_INFO(this->get_logger(), "Odometry replay guard=%s topic=%s", odom_guard_enable_ ? "enabled" : "disabled",
+            odom_guard_topic.c_str());
         pubLaserCloudFull_      = this->create_publisher<sensor_msgs::msg::PointCloud2>("/world_points", rclcpp::QoS(20).best_effort());
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/body_points", 20);
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
@@ -506,6 +550,16 @@ namespace robot::slam
         gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
         gnss_last_alignment_stamp_ = -1.0;
         gnss_alignment_stable_fits_ = 0;
+        {
+            std::lock_guard<std::mutex> odom_lock(odom_guard_mutex_);
+            has_odom_guard_ = false;
+        }
+        odom_guard_initialized_ = false;
+        odom_guard_position_.setZero();
+        odom_guard_stamp_ = 0.0;
+        odom_guard_initial_z_ = 0.0;
+        odom_guard_rejected_updates_ = 0;
+        odom_guard_clamped_z_updates_ = 0;
         slam_diverged_ = false;
         slam_health_state_ = "initializing";
         slam_health_error_code_.clear();
@@ -678,6 +732,113 @@ namespace robot::slam
         std::lock_guard<std::mutex> lock(gnss_mutex_);
         latest_gnss_ = *msg;
         has_gnss_    = true;
+    }
+
+    void MappingAlg::odomGuardCallBack(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(odom_guard_mutex_);
+        latest_odom_guard_ = *msg;
+        has_odom_guard_ = true;
+    }
+
+    bool MappingAlg::applyOdomGuardPrediction(double lidar_time)
+    {
+        if (!odom_guard_enable_)
+            return false;
+
+        nav_msgs::msg::Odometry odom;
+        {
+            std::lock_guard<std::mutex> lock(odom_guard_mutex_);
+            if (!has_odom_guard_)
+                return false;
+            odom = latest_odom_guard_;
+        }
+
+        state_ikfom guarded = kf.get_x();
+        Vec3d body_velocity(
+            odom.twist.twist.linear.x,
+            odom.twist.twist.linear.y,
+            0.0);
+        if (!body_velocity.allFinite())
+            return false;
+        const double speed = body_velocity.norm();
+        if (speed > odom_guard_max_speed_mps_ && speed > 1e-6)
+            body_velocity *= odom_guard_max_speed_mps_ / speed;
+        Vec3d world_velocity = guarded.rot * body_velocity;
+        world_velocity(2) = std::clamp(
+            world_velocity(2), -odom_guard_max_vertical_speed_mps_, odom_guard_max_vertical_speed_mps_);
+
+        if (!odom_guard_initialized_)
+        {
+            odom_guard_position_ = guarded.pos;
+            odom_guard_stamp_ = lidar_time;
+            odom_guard_initial_z_ = guarded.pos(2);
+            odom_guard_initialized_ = true;
+        }
+        else
+        {
+            const double dt = lidar_time - odom_guard_stamp_;
+            if (dt > 0.0 && dt < 0.5)
+                guarded.pos = odom_guard_position_ + world_velocity * dt;
+            else
+                odom_guard_position_ = guarded.pos;
+            odom_guard_stamp_ = lidar_time;
+        }
+        guarded.pos(2) = std::clamp(
+            guarded.pos(2),
+            odom_guard_initial_z_ - odom_guard_max_abs_z_from_start_m_,
+            odom_guard_initial_z_ + odom_guard_max_abs_z_from_start_m_);
+        guarded.vel = world_velocity;
+        kf.change_x(guarded);
+        state_point = guarded;
+        return true;
+    }
+
+    bool MappingAlg::acceptOdomGuardCorrection(double lidar_time, const state_ikfom& prediction)
+    {
+        state_ikfom candidate = kf.get_x();
+        const double translation = (candidate.pos - prediction.pos).norm();
+        const double z_correction = candidate.pos(2) - prediction.pos(2);
+        const Mat3d relative_rotation = prediction.rot.conjugate().toRotationMatrix()
+            * candidate.rot.toRotationMatrix();
+        const double cosine = std::clamp((relative_rotation.trace() - 1.0) * 0.5, -1.0, 1.0);
+        const double rotation = std::acos(cosine);
+        const bool rejected = !candidate.pos.allFinite()
+            || translation > odom_guard_max_lidar_correction_m_
+            || rotation > odom_guard_max_lidar_rotation_rad_;
+
+        if (rejected)
+        {
+            state_ikfom restored = prediction;
+            kf.change_x(restored);
+            state_point = restored;
+            odom_guard_rejected_updates_++;
+            slam_health_state_ = "degraded";
+            std::ostringstream warning;
+            warning << "odom guard rejected lidar update: translation=" << translation
+                    << "m rotation=" << rotation << "rad";
+            slam_health_warning_ = warning.str();
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
+        }
+        else
+        {
+            if (std::fabs(z_correction) > odom_guard_max_lidar_z_correction_m_)
+            {
+                candidate.pos(2) = prediction.pos(2);
+                odom_guard_clamped_z_updates_++;
+            }
+            candidate.pos(2) = std::clamp(
+                candidate.pos(2),
+                odom_guard_initial_z_ - odom_guard_max_abs_z_from_start_m_,
+                odom_guard_initial_z_ + odom_guard_max_abs_z_from_start_m_);
+            candidate.vel = prediction.vel;
+            kf.change_x(candidate);
+            state_point = candidate;
+        }
+
+        odom_guard_position_ = state_point.pos;
+        odom_guard_stamp_ = lidar_time;
+        return !rejected;
     }
 
     Vec3d MappingAlg::llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const
@@ -874,7 +1035,11 @@ namespace robot::slam
             return;
         }
 
-        Vec3d correction = residual * gnss_fusion_gain_;
+        // Fixed RTK acts as the primary absolute-position constraint. Float
+        // solutions remain useful, but are deliberately applied more softly.
+        const double quality_gain = gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
+            ? gnss_fusion_gain_ : gnss_fusion_gain_ * 0.25;
+        Vec3d correction = residual * quality_gain;
         const double correction_norm = correction.norm();
         if (correction_norm > gnss_max_correction_step_)
         {
@@ -890,7 +1055,9 @@ namespace robot::slam
         state_point = corrected;
         gnss_correction_count_++;
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "GNSS weak correction #%d residual=%.2fm step=%.3fm", gnss_correction_count_, residual_norm, correction.norm());
+            "GNSS correction #%d mode=%s residual=%.2fm step=%.3fm", gnss_correction_count_,
+            gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX ? "rtk_primary" : "hybrid",
+            residual_norm, correction.norm());
     }
 
     void MappingAlg::markSlamDiverged(const std::string& reason)
@@ -1714,6 +1881,7 @@ namespace robot::slam
                 }
 
                 p_imu->Process(Measures, kf, feats_undistort);
+                const bool odom_guard_active = applyOdomGuardPrediction(Measures.lidar_end_time);
                 state_point = kf.get_x();
                 pos_lid     = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1778,9 +1946,12 @@ namespace robot::slam
                 int  rematch_num       = 0;
                 bool nearest_search_en = true;  //
 
+                const state_ikfom guarded_prediction = kf.get_x();
                 double solve_H_time = 0;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
+                const bool lidar_update_accepted = !odom_guard_active
+                    || acceptOdomGuardCorrection(Measures.lidar_end_time, guarded_prediction);
                 collectGnssAlignment(Measures.lidar_end_time);
                 applyGnssCorrection(Measures.lidar_end_time);
                 state_point = kf.get_x();
@@ -1793,6 +1964,13 @@ namespace robot::slam
                 geoQuat.y   = state_point.rot.coeffs()[1];
                 geoQuat.z   = state_point.rot.coeffs()[2];
                 geoQuat.w   = state_point.rot.coeffs()[3];
+                if (!lidar_update_accepted)
+                {
+                    publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+                    if (path_en)
+                        publish_path(pubPath_);
+                    return;
+                }
                 map_incremental();
 
                 publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
@@ -1847,8 +2025,10 @@ namespace robot::slam
 
         std::uint64_t estimated_source_bytes = 0;
         for (const auto& keyframe : mapping_keyframes_)
-            estimated_source_bytes += keyframe.point_count * sizeof(BinaryPcdPoint);
-        const std::uint64_t required_free_bytes = estimated_source_bytes
+            estimated_source_bytes += keyframe.point_count * sizeof(ExportPointRecord);
+        // Temporary shards plus the 3D localization PCD and slope-normalized
+        // 2D projection PCD coexist briefly during export.
+        const std::uint64_t required_free_bytes = estimated_source_bytes * 3
             + std::max<std::uint64_t>(estimated_source_bytes / 4, 512ULL * 1024ULL * 1024ULL);
         const std::uint64_t free_bytes = freeDiskBytes(map_subdir);
         if (free_bytes > 0 && free_bytes < required_free_bytes)
@@ -1898,9 +2078,9 @@ namespace robot::slam
                     continue;
                 const auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
                 const std::size_t shard = filter_enabled ? key_hash(key) % shard_count : 0;
-                const auto packed = packPoint(point);
+                const ExportPointRecord packed{ packPoint(point), static_cast<float>(keyframe.lidar_origin.z()) };
                 point_shards[shard].write(
-                    reinterpret_cast<const char*>(&packed), sizeof(BinaryPcdPoint));
+                    reinterpret_cast<const char*>(&packed), sizeof(ExportPointRecord));
                 if (!point_shards[shard].good())
                     return fail("failed while writing point filter shard");
                 if (filter_enabled)
@@ -1928,28 +2108,36 @@ namespace robot::slam
 
         const std::string pcd_file = map_subdir + "/map.pcd";
         const std::string pcd_tmp = pcd_file + ".tmp";
+        const std::string grid_pcd_file = map_subdir + "/.map_grid_relative.pcd";
+        const std::string grid_pcd_tmp = grid_pcd_file + ".tmp";
         std::ofstream pcd(pcd_tmp, std::ios::binary | std::ios::trunc);
-        if (!pcd.is_open())
-            return fail("cannot create final map.pcd");
-        pcd << "# .PCD v0.7 - Point Cloud Data file format\n"
-            << "VERSION 0.7\n"
-            << "FIELDS x y z intensity normal_x normal_y normal_z curvature\n"
-            << "SIZE 4 4 4 4 4 4 4 4\n"
-            << "TYPE F F F F F F F F\n"
-            << "COUNT 1 1 1 1 1 1 1 1\n"
-            << "WIDTH ";
-        const auto width_position = pcd.tellp();
-        pcd << "00000000000000000000\n"
-            << "HEIGHT 1\n"
-            << "VIEWPOINT 0 0 0 1 0 0 0\n"
-            << "POINTS ";
-        const auto points_position = pcd.tellp();
-        pcd << "00000000000000000000\n"
-            << "DATA binary\n";
+        std::ofstream grid_pcd(grid_pcd_tmp, std::ios::binary | std::ios::trunc);
+        if (!pcd.is_open() || !grid_pcd.is_open())
+            return fail("cannot create map PCD outputs");
+        const auto write_pcd_header = [](std::ofstream& stream, std::streampos& width, std::streampos& points) {
+            stream << "# .PCD v0.7 - Point Cloud Data file format\n"
+                   << "VERSION 0.7\n"
+                   << "FIELDS x y z intensity normal_x normal_y normal_z curvature\n"
+                   << "SIZE 4 4 4 4 4 4 4 4\n"
+                   << "TYPE F F F F F F F F\n"
+                   << "COUNT 1 1 1 1 1 1 1 1\n"
+                   << "WIDTH ";
+            width = stream.tellp();
+            stream << "00000000000000000000\n"
+                   << "HEIGHT 1\n"
+                   << "VIEWPOINT 0 0 0 1 0 0 0\n"
+                   << "POINTS ";
+            points = stream.tellp();
+            stream << "00000000000000000000\n"
+                   << "DATA binary\n";
+        };
+        std::streampos width_position, points_position, grid_width_position, grid_points_position;
+        write_pcd_header(pcd, width_position, points_position);
+        write_pcd_header(grid_pcd, grid_width_position, grid_points_position);
 
         constexpr std::size_t chunk_records = 65536;
         std::vector<DynamicFilterVoxelKey> hit_buffer(chunk_records);
-        std::vector<BinaryPcdPoint> point_buffer(chunk_records);
+        std::vector<ExportPointRecord> point_buffer(chunk_records);
         written_points = 0;
         const auto minimum_hits = static_cast<std::uint8_t>(
             std::clamp(dynamic_filter_min_scan_observations_, 1, 255));
@@ -1987,11 +2175,12 @@ namespace robot::slam
             while (points.good())
             {
                 points.read(reinterpret_cast<char*>(point_buffer.data()),
-                    static_cast<std::streamsize>(point_buffer.size() * sizeof(BinaryPcdPoint)));
-                const auto received = static_cast<std::size_t>(points.gcount()) / sizeof(BinaryPcdPoint);
+                    static_cast<std::streamsize>(point_buffer.size() * sizeof(ExportPointRecord)));
+                const auto received = static_cast<std::size_t>(points.gcount()) / sizeof(ExportPointRecord);
                 for (std::size_t index = 0; index < received; ++index)
                 {
-                    const auto& point = point_buffer[index];
+                    const auto& record = point_buffer[index];
+                    const auto& point = record.point;
                     bool keep = true;
                     if (filter_enabled)
                     {
@@ -2006,10 +2195,13 @@ namespace robot::slam
                     if (!keep)
                         continue;
                     pcd.write(reinterpret_cast<const char*>(&point), sizeof(BinaryPcdPoint));
+                    auto grid_point = point;
+                    grid_point.z -= record.reference_z;
+                    grid_pcd.write(reinterpret_cast<const char*>(&grid_point), sizeof(BinaryPcdPoint));
                     ++written_points;
                 }
-                if (!pcd.good())
-                    return fail("failed while writing final map.pcd");
+                if (!pcd.good() || !grid_pcd.good())
+                    return fail("failed while writing map PCD outputs");
             }
             points.close();
             hit_counts.clear();
@@ -2026,20 +2218,30 @@ namespace robot::slam
         if (written_points == 0)
         {
             pcd.close();
+            grid_pcd.close();
             std::filesystem::remove(pcd_tmp, filesystem_error);
+            std::filesystem::remove(grid_pcd_tmp, filesystem_error);
             return fail("dynamic filter removed every map point");
         }
-        pcd.seekp(width_position);
-        pcd << std::setw(20) << std::setfill('0') << written_points;
-        pcd.seekp(points_position);
-        pcd << std::setw(20) << std::setfill('0') << written_points;
-        pcd.flush();
-        pcd.close();
-        if (!pcd.good())
-            return fail("failed while closing map.pcd");
+        const auto finalize_pcd = [written_points](std::ofstream& stream, std::streampos width, std::streampos points) {
+            stream.seekp(width);
+            stream << std::setw(20) << std::setfill('0') << written_points;
+            stream.seekp(points);
+            stream << std::setw(20) << std::setfill('0') << written_points;
+            stream.flush();
+            stream.close();
+            return stream.good();
+        };
+        if (!finalize_pcd(pcd, width_position, points_position)
+            || !finalize_pcd(grid_pcd, grid_width_position, grid_points_position))
+            return fail("failed while closing map PCD outputs");
         std::filesystem::rename(pcd_tmp, pcd_file, filesystem_error);
         if (filesystem_error)
             return fail("cannot publish final map.pcd: " + filesystem_error.message());
+        filesystem_error.clear();
+        std::filesystem::rename(grid_pcd_tmp, grid_pcd_file, filesystem_error);
+        if (filesystem_error)
+            return fail("cannot publish slope-normalized grid PCD: " + filesystem_error.message());
         std::filesystem::remove_all(shard_dir, filesystem_error);
 
         const double keep_ratio = source_points == 0
@@ -2175,6 +2377,8 @@ namespace robot::slam
                << ", \"imu_required_samples\": " << p_imu->initialization_required_samples()
                << ", \"no_effective_points_streak\": " << no_effective_points_streak_
                << ", \"pose_anomaly_streak\": " << pose_anomaly_streak_
+               << ", \"odom_guard_rejected_updates\": " << odom_guard_rejected_updates_
+               << ", \"odom_guard_clamped_z_updates\": " << odom_guard_clamped_z_updates_
                << ", \"frame_delta_m\": " << health_frame_delta_m_
                << ", \"speed_mps\": " << health_speed_mps_
                << ", \"pose_z_m\": " << health_pose_z_m_
@@ -2225,13 +2429,34 @@ namespace robot::slam
 
         writeSaveProgress("building_grid", 68.0);
         std::string grid_error;
-        const bool grid_saved = pcd2grid_ptr_->runFromBinaryPcd(
-            active_map_subdir_ + "/map.pcd",
+        auto grid_options = pcd2pgm_options_;
+        if (!mapping_keyframes_.empty() && pcd2pgm_projection_padding_m_ > 0.0)
+        {
+            grid_options.use_xy_bounds = true;
+            grid_options.x_min = grid_options.x_max = mapping_keyframes_.front().lidar_origin.x();
+            grid_options.y_min = grid_options.y_max = mapping_keyframes_.front().lidar_origin.y();
+            for (const auto& keyframe : mapping_keyframes_)
+            {
+                grid_options.x_min = std::min(grid_options.x_min, keyframe.lidar_origin.x());
+                grid_options.x_max = std::max(grid_options.x_max, keyframe.lidar_origin.x());
+                grid_options.y_min = std::min(grid_options.y_min, keyframe.lidar_origin.y());
+                grid_options.y_max = std::max(grid_options.y_max, keyframe.lidar_origin.y());
+            }
+            grid_options.x_min -= pcd2pgm_projection_padding_m_;
+            grid_options.x_max += pcd2pgm_projection_padding_m_;
+            grid_options.y_min -= pcd2pgm_projection_padding_m_;
+            grid_options.y_max += pcd2pgm_projection_padding_m_;
+        }
+        Pcd2Grid grid_builder(grid_options);
+        const bool grid_saved = grid_builder.runFromBinaryPcd(
+            active_map_subdir_ + "/.map_grid_relative.pcd",
             active_map_subdir_ + "/map",
             [this](double progress) {
                 writeSaveProgress("building_grid", 68.0 + 24.0 * progress);
             },
             &grid_error);
+        std::error_code grid_cleanup_error;
+        std::filesystem::remove(active_map_subdir_ + "/.map_grid_relative.pcd", grid_cleanup_error);
         if (!grid_saved)
         {
             keyframe_writer_error_ = grid_error;

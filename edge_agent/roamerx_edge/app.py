@@ -8,6 +8,8 @@ import time
 import uuid
 
 from .alert_bridge import AlertBridge
+from .audio_control_adapter import AudioControlAdapter
+from .charge_control_adapter import ChargeControlAdapter
 from .command_processor import CommandProcessor
 from .config import EdgeConfig
 from .local_store import LocalStore
@@ -18,12 +20,16 @@ from .media_client import MediaClient
 from .mqtt_client import EdgeMqttClient
 from .navigation_stack_adapter import NavigationStackAdapter
 from .protocol import build_envelope, now_iso
+from .power_mode_controller import PowerModeController
 from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
+from .rosbag_recorder import RosbagRecorder
 from .safety_policy import RuntimeSafetyState, SafetyPolicy
+from .sensor_control_adapter import SensorControlAdapter
 from .task_executor import TaskExecutor
 from .telemetry_collector import TelemetryCollector
 from .teleop_control_adapter import TeleopControlAdapter
 from .trajectory_buffer import TrajectoryBuffer
+from .system_telemetry import SystemTelemetryProbe
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +45,10 @@ class EdgeAgentApplication:
             current_map_version=config.robot.current_map_version,
         )
         self.telemetry = TelemetryCollector(config.robot, self.safety_state)
+        self.telemetry.configure_system_probe_staleness(
+            config.telemetry.system_probe_stale_seconds
+        )
+        self.system_telemetry = SystemTelemetryProbe(config.telemetry, self.telemetry)
         self.mqtt = EdgeMqttClient(config, self.store)
         self.media_client = MediaClient(config.media, config.robot.id)
         self.ros_runtime = None
@@ -52,16 +62,40 @@ class EdgeAgentApplication:
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
         self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
         self.map_set_coordinator = MapSetCoordinator(self.map_activation_adapter, self.navigation_stack_adapter)
+        self.navigation_rosbag = RosbagRecorder(
+            config.navigation_stack.rosbag_script,
+            config.navigation_stack.rosbag_stop_timeout_seconds,
+        )
         self.task_executor = TaskExecutor(
             self.store,
             navigation,
             event_callback=self.mqtt.publish_task_event,
             start_result_callback=self._publish_start_result,
             final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
+            standup_confirmation_timeout_seconds=config.safety.standup_confirmation_timeout_seconds,
             map_set_coordinator=self.map_set_coordinator,
+            obstacle_speech=config.obstacle_speech,
+            rosbag_recorder=self.navigation_rosbag,
         )
+        set_localization_failure_callback = getattr(
+            navigation, "set_localization_failure_callback", None
+        )
+        if callable(set_localization_failure_callback):
+            set_localization_failure_callback(self.task_executor.on_localization_lost)
+        set_localization_recovery_callback = getattr(
+            navigation, "set_localization_recovery_callback", None
+        )
+        if callable(set_localization_recovery_callback):
+            set_localization_recovery_callback(self.task_executor.on_localization_recovered)
+        set_trusted_pose_callback = getattr(navigation, "set_trusted_pose_callback", None)
+        if callable(set_trusted_pose_callback):
+            set_trusted_pose_callback(self._persist_last_trusted_pose)
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
         self.teleop_control_adapter = TeleopControlAdapter(config.teleop_control)
+        self.sensor_control_adapter = SensorControlAdapter(config.sensor_control)
+        self.power_mode_controller = PowerModeController(config.power_mode)
+        self.charge_control_adapter = ChargeControlAdapter(config.charge_control, self.power_mode_controller)
+        self.audio_control_adapter = AudioControlAdapter(config.audio_control)
         self.safety = SafetyPolicy(config.safety, self.safety_state)
         self.commands = CommandProcessor(
             robot_id=config.robot.id,
@@ -75,6 +109,9 @@ class EdgeAgentApplication:
             navigation_stack_adapter=self.navigation_stack_adapter,
             localization_adapter=navigation,
             teleop_control_adapter=self.teleop_control_adapter,
+            sensor_control_adapter=self.sensor_control_adapter,
+            charge_control_adapter=self.charge_control_adapter,
+            audio_control_adapter=self.audio_control_adapter,
         )
         self.trajectory = TrajectoryBuffer(
             robot_id=config.robot.id,
@@ -88,6 +125,7 @@ class EdgeAgentApplication:
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
+        self.power_mode_controller.reconcile_startup()
         if self.ros_runtime:
             self.ros_runtime.start()
             self.navigation.wait_until_ready(timeout_seconds=3.0)
@@ -95,6 +133,9 @@ class EdgeAgentApplication:
         if not self.mqtt.wait_connected(15):
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
         self.task_executor.report_startup_interruption()
+        self.system_telemetry.poll()
+        self.charge_control_adapter.observe_power(self.telemetry.latest_power())
+        self.power_mode_controller.refresh_service_status(self.telemetry.latest_power())
         self._publish_online()
         self._publish_sync_request()
         self._threads = [
@@ -102,12 +143,14 @@ class EdgeAgentApplication:
             threading.Thread(target=self._status_loop, daemon=True, name="status"),
             threading.Thread(target=self._trajectory_loop, daemon=True, name="trajectory"),
             threading.Thread(target=self._outbox_loop, daemon=True, name="outbox"),
+            threading.Thread(target=self._system_telemetry_loop, daemon=True, name="system-telemetry"),
         ]
         for thread in self._threads:
             thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.task_executor.stop()
         for thread in self._threads:
             thread.join(timeout=3)
         self.mqtt.disconnect()
@@ -142,6 +185,11 @@ class EdgeAgentApplication:
                     "nav.recover",
                     "nav.stop",
                     "nav.initial_pose",
+                    "nav.relocalize",
+                    "sensor.restart",
+                    "charge.start",
+                    "charge.stop",
+                    "audio.volume",
                     "map.activate",
                     "map_set.v1",
                     "teleop.takeover_enter",
@@ -154,6 +202,7 @@ class EdgeAgentApplication:
                     "teleop.move_right",
                     "teleop.turn_left",
                     "teleop.turn_right",
+                    "teleop.move_velocity",
                     "teleop.move_stop",
                     "teleop.passive",
                     "map.uploaded",
@@ -239,6 +288,9 @@ class EdgeAgentApplication:
                 snapshot["current_map"] = self._current_map_payload()
                 snapshot["map_set"] = self.map_set_coordinator.status()
                 snapshot["mapping"] = mapping_status
+                obstacle_snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
+                snapshot["navigation"] = obstacle_snapshot() if callable(obstacle_snapshot) else {}
+                snapshot["power_mode"] = self.power_mode_controller.snapshot()
                 self.mqtt.publish_status(snapshot)
             except Exception:
                 LOGGER.exception("failed to publish telemetry status")
@@ -264,6 +316,13 @@ class EdgeAgentApplication:
     def _outbox_loop(self) -> None:
         while not self.stop_event.wait(2):
             self.mqtt.replay_outbox()
+
+    def _system_telemetry_loop(self) -> None:
+        while not self.stop_event.wait(self.config.telemetry.system_probe_interval_seconds):
+            self.system_telemetry.poll()
+            power = self.telemetry.latest_power()
+            self.charge_control_adapter.observe_power(power)
+            self.power_mode_controller.refresh_service_status(power)
 
     def _publish_start_result(self, command_id: str, status: str, result: dict, code: str, message: str) -> None:
         context = self.task_executor.context
@@ -294,6 +353,20 @@ class EdgeAgentApplication:
 
     def _current_map_payload(self) -> dict:
         return self.map_activation_adapter.status()
+
+    def _persist_last_trusted_pose(self, pose) -> None:
+        self.store.save_last_trusted_pose(
+            str(self.config.robot.current_map_id or ""),
+            str(self.config.robot.current_map_version or ""),
+            {
+                "x": float(pose.x),
+                "y": float(pose.y),
+                "z": float(pose.z),
+                "yaw": float(pose.yaw),
+                "sampled_at": pose.sampled_at,
+                "source": "last_trusted_localization",
+            },
+        )
 
 
 def main() -> None:

@@ -230,7 +230,7 @@ def generate_launch_description():
         output='screen',
         remappings=[
             ('cloud_in', '/front_lidar'),
-            ('scan', '/laser_scan'),
+            ('scan', '/laser_scan_raw'),
         ],
         parameters=[{
             'target_frame': 'base_link',
@@ -241,11 +241,37 @@ def generate_launch_description():
             'angle_max': 3.14159,
             'angle_increment': 0.0087,
             'scan_time': 0.1,
-            'range_min': 0.45,
+            'range_min': 0.18,
             'range_max': 4.0,
             'use_inf': True,
             'inf_epsilon': 1.0,
         }],
+    )
+
+    # Keep 0.18m close-obstacle sensitivity while discarding only the fixed
+    # front-lidar returns that belong to the robot body/foreleg.
+    self_filter_scan_node = Node(
+        package='robot_navigo',
+        executable='self_filter_scan.py',
+        name='self_filter_scan',
+        output='screen',
+        parameters=[{
+            'self_x_min': 0.10,
+            'self_x_max': 0.46,
+            'self_y_min': -0.19,
+            'self_y_max': 0.10,
+        }],
+        remappings=[
+            ('scan_in', '/laser_scan_raw'),
+            ('scan_out', '/laser_scan'),
+        ],
+    )
+
+    sensor_health_monitor_node = Node(
+        package='robot_navigo',
+        executable='sensor_health_monitor',
+        name='sensor_health_monitor',
+        output='screen',
     )
 
     # cmd_cel_lcm_publisher_node = Node(
@@ -359,7 +385,8 @@ def generate_launch_description():
     # ld.add_action(odom_communication_node)
     # ld.add_action(custom_odom_baselink_node)
     ld.add_action(odom_tf_publisher_node)
-    ld.add_action(pointcloud_to_laserscan_node)
+    # The sensor conversion and health chain is started independently by
+    # ensure_navigation_sensors.sh so a failed Nav2 restart cannot stop it.
     # ld.add_action(cmd_cel_lcm_publisher_node)
     ld.add_action(load_vel_cmd_pub_node)
     ld.add_action(mode_status_pub_node)

@@ -29,6 +29,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
             "/teleop_action", 10,
             std::bind(&VelCmdUdpPublisher::HandleTeleopActionCallback, this,
                       std::placeholders::_1));
+    motion_state_publisher_ =
+        this->create_publisher<std_msgs::msg::String>("/robot_motion_state", 10);
 
     this->declare_parameter("platform", rclcpp::ParameterValue(std::string("")));
     this->declare_parameter("client_ip", rclcpp::ParameterValue(std::string("")));
@@ -42,7 +44,9 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->declare_parameter("publish_period_ms", 20);
     this->declare_parameter("sdk_max_vx", 0.5);
     this->declare_parameter("sdk_max_vy", 0.5);
-    this->declare_parameter("sdk_max_yaw_rate", 1.0);
+    this->declare_parameter("sdk_max_yaw_rate", 0.5);
+    this->declare_parameter("turn_linear_limit_yaw_rate", 0.35);
+    this->declare_parameter("turn_max_linear_speed", 0.10);
     this->get_parameter("platform", platform_);
     this->get_parameter("client_ip", client_ip_);
     this->get_parameter("server_ip", server_ip_);
@@ -56,6 +60,9 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->get_parameter("sdk_max_vx", sdk_max_vx_);
     this->get_parameter("sdk_max_vy", sdk_max_vy_);
     this->get_parameter("sdk_max_yaw_rate", sdk_max_yaw_rate_);
+    this->get_parameter("turn_linear_limit_yaw_rate",
+                        turn_linear_limit_yaw_rate_);
+    this->get_parameter("turn_max_linear_speed", turn_max_linear_speed_);
 
     const std::unordered_map<std::string, std::pair<std::string, std::string>>
         platform_map = {{"NX_XG3588", {"192.168.234.1", "192.168.234.234"}},
@@ -88,6 +95,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     publish_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(publish_period_ms_),
         std::bind(&VelCmdUdpPublisher::PublishLatestVelocity, this));
+    PublishMotionState("passive");
   }
 
  private:
@@ -118,6 +126,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     nav_active_ = false;
     standing_up_ = false;
     last_cmd_.reset();
+    PublishMotionState("passive");
     if (ret == 0) {
       RCLCPP_INFO(this->get_logger(), "NAV INACTIVE: SDK passive()");
     } else {
@@ -158,11 +167,13 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
+      PublishMotionState(ret == 0 ? "lying_down" : "lie_down_failed");
     } else if (action == "passive") {
       ret = sdk_highlevel_.passive();
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
+      PublishMotionState(ret == 0 ? "passive" : "passive_failed");
     } else {
       RCLCPP_WARN(this->get_logger(), "Unknown /teleop_action: %s",
                   action.c_str());
@@ -194,6 +205,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       if ((ctrl_mode == 1 || ctrl_mode == 18) &&
           elapsed >= std::chrono::milliseconds(standup_settle_ms_)) {
         standing_up_ = false;
+        PublishMotionState("standing");
         RCLCPP_INFO(this->get_logger(),
                     "standUp confirmed by SDK, current_ctrlmode=%u", ctrl_mode);
       } else if (elapsed < std::chrono::milliseconds(standup_retry_ms_)) {
@@ -228,6 +240,12 @@ class VelCmdUdpPublisher : public rclcpp::Node {
                     static_cast<float>(sdk_max_vy_));
     yaw_rate = std::clamp(yaw_rate, static_cast<float>(-sdk_max_yaw_rate_),
                           static_cast<float>(sdk_max_yaw_rate_));
+    if (std::fabs(yaw_rate) >= turn_linear_limit_yaw_rate_) {
+      vx = std::clamp(vx, static_cast<float>(-turn_max_linear_speed_),
+                      static_cast<float>(turn_max_linear_speed_));
+      vy = std::clamp(vy, static_cast<float>(-turn_max_linear_speed_),
+                      static_cast<float>(turn_max_linear_speed_));
+    }
     const auto ret = sdk_highlevel_.move(vx, vy, yaw_rate);
     if (ret != 0) {
       const auto ctrl_mode = sdk_highlevel_.getCurrentCtrlmode();
@@ -247,12 +265,19 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     const auto ret = sdk_highlevel_.standUp();
     standing_up_ = true;
     stand_start_time_ = std::chrono::steady_clock::now();
+    PublishMotionState(ret == 0 ? "standing_up" : "stand_up_retrying");
     if (ret == 0) {
       RCLCPP_INFO(this->get_logger(), "%s: SDK standUp()", reason);
     } else {
       RCLCPP_WARN(this->get_logger(), "%s: SDK standUp() returned 0x%x",
                   reason, ret);
     }
+  }
+
+  void PublishMotionState(const std::string& state) {
+    std_msgs::msg::String msg;
+    msg.data = state;
+    motion_state_publisher_->publish(msg);
   }
 
   std::string server_ip_;
@@ -267,13 +292,16 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   int publish_period_ms_ = 20;
   double sdk_max_vx_ = 0.5;
   double sdk_max_vy_ = 0.5;
-  double sdk_max_yaw_rate_ = 1.0;
+  double sdk_max_yaw_rate_ = 0.5;
+  double turn_linear_limit_yaw_rate_ = 0.35;
+  double turn_max_linear_speed_ = 0.10;
   std::mutex mutex_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
       planner_vel_cmd_subscriber_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mode_switch_subscriber_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
       teleop_action_subscriber_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr motion_state_publisher_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 
   mc_sdk::zsl_1::HighLevel sdk_highlevel_;

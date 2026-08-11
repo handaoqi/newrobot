@@ -142,6 +142,12 @@ namespace robot::slam
 
         void gnssCallBack(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
 
+        void odomGuardCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
+
+        bool applyOdomGuardPrediction(double lidar_time);
+
+        bool acceptOdomGuardCorrection(double lidar_time, const state_ikfom& prediction);
+
         bool syncData(MeasureGroup& meas);
 
         void map_incremental();
@@ -240,7 +246,7 @@ namespace robot::slam
         std::mutex              mtx_buffer;
         std::condition_variable sig_buffer;
         std::string             root_dir_ = ROOT_DIR;
-        std::string             lid_topic, imu_topic, gnss_topic;
+        std::string             lid_topic, imu_topic, gnss_topic, odom_guard_topic;
         std::string             data_path_;
 
         double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -255,6 +261,7 @@ namespace robot::slam
         bool   is_first_lidar = true;
 
         Pcd2GridOptions           pcd2pgm_options_;
+        double                    pcd2pgm_projection_padding_m_ = 25.0;
         std::shared_ptr<Pcd2Grid> pcd2grid_ptr_;
 
         std::vector<vector<int>>  pointSearchInd_surf;
@@ -298,6 +305,23 @@ namespace robot::slam
         double                             gnss_alignment_max_rms_m_ = 1.5;
         double                             gnss_alignment_max_yaw_change_rad_ = 3.0 * M_PI / 180.0;
         std::size_t                        gnss_alignment_max_samples_ = 300;
+        rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_guard_sub_;
+        std::mutex                         odom_guard_mutex_;
+        nav_msgs::msg::Odometry            latest_odom_guard_;
+        bool                               odom_guard_enable_ = false;
+        bool                               has_odom_guard_ = false;
+        bool                               odom_guard_initialized_ = false;
+        Vec3d                              odom_guard_position_ = Zero3d;
+        double                             odom_guard_stamp_ = 0.0;
+        double                             odom_guard_max_speed_mps_ = 2.0;
+        double                             odom_guard_max_vertical_speed_mps_ = 0.10;
+        double                             odom_guard_max_lidar_correction_m_ = 0.35;
+        double                             odom_guard_max_lidar_z_correction_m_ = 0.03;
+        double                             odom_guard_max_lidar_rotation_rad_ = 0.35;
+        double                             odom_guard_max_abs_z_from_start_m_ = 10.0;
+        double                             odom_guard_initial_z_ = 0.0;
+        std::size_t                        odom_guard_rejected_updates_ = 0;
+        std::size_t                        odom_guard_clamped_z_updates_ = 0;
         bool                               slam_diverged_ = false;
         std::string                        slam_health_state_ = "initializing";
         std::string                        slam_health_error_code_;

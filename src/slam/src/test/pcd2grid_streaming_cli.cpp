@@ -1,5 +1,6 @@
 #include "pcd2grid.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -7,10 +8,10 @@
 
 int main(int argc, char** argv)
 {
-    if (argc < 3 || argc > 7)
+    if (argc < 3 || argc > 9)
     {
         std::cerr << "Usage: pcd2grid_streaming INPUT_PCD OUTPUT_PREFIX "
-                     "[RESOLUTION] [Z_MIN] [Z_MAX] [MAX_CELLS]\n";
+                     "[RESOLUTION] [Z_MIN] [Z_MAX] [MAX_CELLS] [MIN_POINTS] [SUPPORT_RADIUS]\n";
         return 2;
     }
 
@@ -23,6 +24,10 @@ int main(int argc, char** argv)
         options.thre_z_max = std::stod(argv[5]);
     if (argc > 6)
         options.max_grid_cells = static_cast<std::size_t>(std::stoull(argv[6]));
+    if (argc > 7)
+        options.min_points_per_cell = static_cast<std::uint8_t>(std::clamp(std::stoi(argv[7]), 1, 255));
+    if (argc > 8)
+        options.support_radius_cells = static_cast<std::uint8_t>(std::clamp(std::stoi(argv[8]), 0, 8));
 
     rclcpp::init(argc, argv);
     robot::slam::Pcd2Grid converter(options);

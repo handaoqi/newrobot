@@ -113,6 +113,8 @@ private:
   MatchResult     match_result_;
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>> ukf;
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>> odom_ukf;
+  bool odom_orientation_initialized_ = false;
+  Eigen::Quaternionf odom_orientation_prediction_ = Eigen::Quaternionf::Identity();
 
   Eigen::Matrix4f last_observation;
   boost::optional<Eigen::Matrix4f> wo_pred_error;

@@ -35,6 +35,14 @@ namespace
         const bool inside = point.z >= options.thre_z_min && point.z <= options.thre_z_max;
         return options.flag_pass_through ? !inside : inside;
     }
+
+    bool pointPassesProjectionFilter(const BinaryPcdPoint& point, const robot::slam::Pcd2GridOptions& options)
+    {
+        return pointPassesHeightFilter(point, options)
+            && (!options.use_xy_bounds
+                || (point.x >= options.x_min && point.x <= options.x_max
+                    && point.y >= options.y_min && point.y <= options.y_max));
+    }
 }
 
 namespace robot::slam
@@ -115,7 +123,7 @@ namespace robot::slam
             {
                 const auto& point = buffer[i];
                 if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)
-                    || !pointPassesHeightFilter(point, options_))
+                    || !pointPassesProjectionFilter(point, options_))
                     continue;
                 x_min = std::min(x_min, static_cast<double>(point.x));
                 x_max = std::max(x_max, static_cast<double>(point.x));
@@ -183,12 +191,16 @@ namespace robot::slam
             {
                 const auto& point = buffer[i];
                 if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)
-                    || !pointPassesHeightFilter(point, options_))
+                    || !pointPassesProjectionFilter(point, options_))
                     continue;
                 const auto col = static_cast<std::int64_t>(std::floor((point.x - x_min) / resolution));
                 const auto row = static_cast<std::int64_t>(std::floor((point.y - y_min) / resolution));
                 if (col >= 0 && row >= 0 && static_cast<std::size_t>(col) < width && static_cast<std::size_t>(row) < height)
-                    grid[static_cast<std::size_t>(row) * width + static_cast<std::size_t>(col)] = 100;
+                {
+                    auto& cell = grid[static_cast<std::size_t>(row) * width + static_cast<std::size_t>(col)];
+                    if (cell < options_.min_points_per_cell)
+                        ++cell;
+                }
             }
             scanned += received;
             if (progress_callback)
@@ -219,7 +231,32 @@ namespace robot::slam
             const std::size_t source_row = height - 1 - output_row;
             const auto* source = grid + source_row * width;
             for (std::size_t col = 0; col < width; ++col)
-                row_buffer[col] = source[col] >= 100 ? 0 : 255;
+            {
+                bool occupied = false;
+                if (source[col] > 0)
+                {
+                    unsigned int support = 0;
+                    const std::size_t radius = options_.support_radius_cells;
+                    const std::size_t row_min = source_row > radius ? source_row - radius : 0;
+                    const std::size_t row_max = std::min(height - 1, source_row + radius);
+                    const std::size_t col_min = col > radius ? col - radius : 0;
+                    const std::size_t col_max = std::min(width - 1, col + radius);
+                    for (std::size_t nearby_row = row_min; nearby_row <= row_max && !occupied; ++nearby_row)
+                    {
+                        const auto* nearby = grid + nearby_row * width;
+                        for (std::size_t nearby_col = col_min; nearby_col <= col_max; ++nearby_col)
+                        {
+                            support += nearby[nearby_col];
+                            if (support >= options_.min_points_per_cell)
+                            {
+                                occupied = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                row_buffer[col] = occupied ? 0 : 255;
+            }
             pgm.write(reinterpret_cast<const char*>(row_buffer.data()), static_cast<std::streamsize>(row_buffer.size()));
             if (progress_callback && (output_row % 256 == 0 || output_row + 1 == height))
                 progress_callback(0.80 + 0.20 * static_cast<double>(output_row + 1) / static_cast<double>(height));
@@ -271,8 +308,9 @@ namespace robot::slam
         }
 
         RCLCPP_INFO(rclcpp::get_logger("pcd2grid"),
-            "Saved disk-backed grid %zux%zu (%zu cells, %zu projected points)",
-            width, height, cell_count, projected_points);
+            "Saved disk-backed grid %zux%zu (%zu cells, %zu projected points, min_support=%u radius=%u)",
+            width, height, cell_count, projected_points,
+            options_.min_points_per_cell, options_.support_radius_cells);
         return true;
     }
     void Pcd2Grid::PassThroughFilter(const CloudPtr &pcd_cloud, CloudPtr &cloud_after_pass_through)

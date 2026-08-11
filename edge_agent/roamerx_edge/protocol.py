@@ -8,10 +8,16 @@ from typing import Any
 
 
 PROTOCOL_VERSION = "1.0"
-TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel"}
+TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel", "task.force_exit"}
 MAPPING_COMMAND_TYPES = {"mapping.start", "mapping.save", "mapping.cancel", "mapping.status"}
-NAV_COMMAND_TYPES = {"nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop", "nav.initial_pose"}
+NAV_COMMAND_TYPES = {
+    "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",
+    "nav.initial_pose", "nav.relocalize",
+}
 MAP_COMMAND_TYPES = {"map.activate"}
+SENSOR_COMMAND_TYPES = {"sensor.restart"}
+CHARGE_COMMAND_TYPES = {"charge.start", "charge.stop"}
+AUDIO_COMMAND_TYPES = {"audio.volume"}
 TELEOP_COMMAND_TYPES = {
     "teleop.takeover_enter",
     "teleop.takeover_exit",
@@ -23,6 +29,7 @@ TELEOP_COMMAND_TYPES = {
     "teleop.move_right",
     "teleop.turn_left",
     "teleop.turn_right",
+    "teleop.move_velocity",
     "teleop.move_stop",
     "teleop.passive",
 }
@@ -31,6 +38,9 @@ COMMAND_TYPES = (
     | MAPPING_COMMAND_TYPES
     | NAV_COMMAND_TYPES
     | MAP_COMMAND_TYPES
+    | SENSOR_COMMAND_TYPES
+    | CHARGE_COMMAND_TYPES
+    | AUDIO_COMMAND_TYPES
     | TELEOP_COMMAND_TYPES
 )
 
@@ -142,20 +152,56 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("x", "y", "yaw"):
                 if isinstance(waypoint.get(field), bool) or not isinstance(waypoint.get(field), (int, float)):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be numeric")
+        record_rosbag = payload["command"].get("record_rosbag")
+        if record_rosbag is not None and not isinstance(record_rosbag, bool):
+            raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
     if envelope.message_type == "mapping.start":
         map_name = payload["command"].get("map_name")
         if map_name is not None and not isinstance(map_name, str):
             raise ProtocolError("INVALID_MESSAGE", "mapping.start map_name must be string")
+        record_rosbag = payload["command"].get("record_rosbag")
+        if record_rosbag is not None and not isinstance(record_rosbag, bool):
+            raise ProtocolError("INVALID_MESSAGE", "mapping.start record_rosbag must be boolean")
     if envelope.message_type == "nav.initial_pose":
-        for field in ("x", "y", "yaw"):
-            value = payload["command"].get(field)
+        command = payload["command"]
+        supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]
+        seed_source = str(command.get("seed_source") or "").strip()
+        if not supplied and seed_source not in {"mapping_start", "last_trusted", "rtk"}:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                "nav.initial_pose requires x, y and yaw or a supported seed_source",
+            )
+        if supplied and len(supplied) != 3:
+            raise ProtocolError("INVALID_MESSAGE", "nav.initial_pose requires x, y and yaw together")
+        for field in supplied:
+            value = command.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"nav.initial_pose {field} must be numeric")
+    if envelope.message_type == "nav.relocalize":
+        command = payload["command"]
+        supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]
+        if supplied and len(supplied) != 3:
+            raise ProtocolError("INVALID_MESSAGE", "nav.relocalize requires x, y and yaw together")
+        for field in supplied:
+            value = command.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ProtocolError("INVALID_MESSAGE", f"nav.relocalize {field} must be numeric")
     if envelope.message_type == "map.activate":
         command = payload["command"]
         for field in ("map_id", "map_version"):
             if not str(command.get(field, "")).strip():
                 raise ProtocolError("INVALID_MESSAGE", f"map.activate requires {field}")
+    if envelope.message_type == "sensor.restart":
+        sensor = str(payload["command"].get("sensor") or "").strip().lower()
+        if sensor not in {"lidar", "imu", "lidar_imu", "rtk"}:
+            raise ProtocolError("INVALID_MESSAGE", "sensor.restart requires lidar_imu or rtk")
+    if envelope.message_type == "audio.volume":
+        command = payload["command"]
+        if str(command.get("target") or "") not in {"speaker_3588", "speaker_nx"}:
+            raise ProtocolError("INVALID_MESSAGE", "audio.volume requires a valid target")
+        volume = command.get("volume")
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or not 0 <= volume <= 100:
+            raise ProtocolError("INVALID_MESSAGE", "audio.volume must be between 0 and 100")
 
 
 def encode_message(message: dict[str, Any]) -> str:

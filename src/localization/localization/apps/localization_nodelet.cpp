@@ -20,6 +20,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <std_srvs/srv/empty.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -40,6 +41,7 @@
 #include <robots_dog_msgs/srv/load_map.hpp>
 #include <robots_dog_msgs/srv/localization_state.hpp>
 #include <robots_dog_msgs/msg/localization.hpp>
+#include <robots_dog_msgs/msg/uni_rtk_pvh.hpp>
 
 using namespace std;
 
@@ -80,11 +82,13 @@ public:
     std::string imu_topic               = declare_parameter<std::string>("imu_topic", "/livox/imu");
     std::string points_topic            = declare_parameter<std::string>("points_topic", "/livox/lidar");
     std::string odom_topic              = declare_parameter<std::string>("odom_topic", "/odom/localization_odom");
+    robot_odom_topic_                   = declare_parameter<std::string>("robot_odom_topic", "/odom/mc_odom");
     std::string aligned_points_topic    = declare_parameter<std::string>("aligned_points_topic", "/aligned_points");
     std::string status_topic            = declare_parameter<std::string>("status_topic", "/status");
     std::string localization_info_topic = declare_parameter<std::string>("localization_info_topic", "/localization_info");
     std::string global_map_points_topic = declare_parameter<std::string>("global_map_points_topic", "/global_map_points");
     std::string gnss_topic              = declare_parameter<std::string>("gnss_topic", "/fix");
+    std::string rtk_pvh_topic           = declare_parameter<std::string>("gnss_fusion.rtk_pvh_topic", "/rtk_pvh");
 
     // Load numeric parameters
     imu_data_filter_num_      = declare_parameter<int>("imu_data_filter_num", 5);
@@ -102,6 +106,14 @@ public:
     gnss_max_horizontal_std_   = declare_parameter<double>("gnss_fusion.max_horizontal_std", 1.5);
     gnss_min_status_           = declare_parameter<int>("gnss_fusion.min_status", 0);
     gnss_use_elevation_        = declare_parameter<bool>("gnss_fusion.use_elevation", false);
+    gnss_auto_recovery_enable_ = declare_parameter<bool>("gnss_fusion.auto_recovery_enable", true);
+    gnss_auto_recovery_retry_seconds_ = std::max(1.0,
+      declare_parameter<double>("gnss_fusion.auto_recovery_retry_seconds", 5.0));
+    gnss_use_heading_ = declare_parameter<bool>("gnss_fusion.use_heading", false);
+    gnss_heading_offset_rad_ = declare_parameter<double>("gnss_fusion.heading_offset_deg", 0.0) * M_PI / 180.0;
+    gnss_heading_max_std_deg_ = declare_parameter<double>("gnss_fusion.heading_max_std_deg", 5.0);
+    gnss_heading_min_baseline_m_ = declare_parameter<double>("gnss_fusion.heading_min_baseline_m", 0.20);
+    gnss_heading_max_age_ = declare_parameter<double>("gnss_fusion.heading_max_age", 1.5);
     std::vector<double> gnss_lever_arm = declare_parameter<std::vector<double>>("gnss_fusion.lever_arm_base", {-0.05, 0.0, 0.15});
     if (gnss_lever_arm.size() >= 3) {
       gnss_lever_arm_base_ << gnss_lever_arm[0], gnss_lever_arm[1], gnss_lever_arm[2];
@@ -138,6 +150,15 @@ public:
     
     declare_parameter<float>("global_localization_timeout", 10.0);
     get_parameter("global_localization_timeout", global_localization_timeout_);
+
+    declare_parameter<int>("runtime_relocalization_failure_threshold", 10);
+    get_parameter("runtime_relocalization_failure_threshold", runtime_relocalization_failure_threshold_);
+    runtime_relocalization_failure_threshold_ =
+      std::max(1, runtime_relocalization_failure_threshold_);
+    declare_parameter<double>("runtime_relocalization_retry_seconds", 5.0);
+    get_parameter("runtime_relocalization_retry_seconds", runtime_relocalization_retry_seconds_);
+    runtime_relocalization_retry_seconds_ =
+      std::max(1.0, runtime_relocalization_retry_seconds_);
 
     static_imu_init_.SetParam(imu_init_time_, imu_init_queue_size_, imu_init_max_gyro_var_, imu_init_max_acce_var_);
     
@@ -226,13 +247,28 @@ public:
         std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1));
     }
     points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
+    if (enable_robot_odometry_prediction) {
+      robot_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        robot_odom_topic_, rclcpp::QoS(100),
+        std::bind(&HdlLocalizationNode::robot_odom_callback, this, std::placeholders::_1));
+      RCLCPP_INFO(get_logger(), "Robot odometry prediction enabled, topic=%s", robot_odom_topic_.c_str());
+    }
     if (use_gnss_fusion_) {
       gnss_sub = create_subscription<sensor_msgs::msg::NavSatFix>(
         gnss_topic, 20, std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
-      RCLCPP_INFO(get_logger(), "GNSS weak fusion enabled, topic=%s, gain=%.3f", gnss_topic.c_str(), gnss_fusion_gain_);
+      rtk_pvh_sub_ = create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
+        rtk_pvh_topic, 20, std::bind(&HdlLocalizationNode::rtk_pvh_callback, this, std::placeholders::_1));
+      RCLCPP_INFO(get_logger(),
+        "GNSS fusion enabled, fix=%s pvh=%s gain=%.3f auto_recovery=%s heading=%s",
+        gnss_topic.c_str(), rtk_pvh_topic.c_str(), gnss_fusion_gain_,
+        gnss_auto_recovery_enable_ ? "true" : "false", gnss_use_heading_ ? "true" : "false");
     }
     initialpose_sub =
       create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 8, std::bind(&HdlLocalizationNode::initialpose_callback, this, std::placeholders::_1));
+    rtk_initial_pose_service_ = create_service<std_srvs::srv::Trigger>(
+      "/localization/seed_from_rtk",
+      std::bind(&HdlLocalizationNode::rtk_initial_pose_callback, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     localization_lidar_info_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(100), // 10Hz 
@@ -463,6 +499,125 @@ private:
     return map;
   }
 
+  void rtk_pvh_callback(const robots_dog_msgs::msg::UniRtkPvh::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+    const auto& heading = msg->heading;
+    latest_gnss_heading_deg_ = static_cast<double>(heading.heading_deg);
+    latest_gnss_heading_std_deg_ = static_cast<double>(heading.heading_std);
+    latest_gnss_heading_baseline_m_ = static_cast<double>(heading.base_line);
+    latest_gnss_heading_status_ = static_cast<int>(heading.sol_status);
+    latest_gnss_heading_type_ = static_cast<int>(heading.heading_type);
+    latest_gnss_heading_receive_time_ = get_clock()->now();
+    has_gnss_heading_ = true;
+  }
+
+  bool seedPositionFromGnss(
+    const rclcpp::Time& stamp,
+    const char* reason,
+    bool require_fixed = false,
+    bool require_heading = false) {
+    if (!use_gnss_fusion_ || !gnss_map_origin_loaded_) {
+      return false;
+    }
+    sensor_msgs::msg::NavSatFix gnss;
+    {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      if (!has_gnss_) return false;
+      gnss = latest_gnss_;
+    }
+    const double h_std = std::sqrt(std::max(0.0,
+      std::max(gnss.position_covariance[0], gnss.position_covariance[4])));
+    const double age = std::fabs((stamp - rclcpp::Time(gnss.header.stamp)).seconds());
+    if (gnss.status.status < gnss_min_status_ ||
+        (require_fixed && gnss.status.status < sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) ||
+        !std::isfinite(h_std) ||
+        h_std > gnss_max_horizontal_std_ || age > gnss_max_age_) {
+      return false;
+    }
+    bool heading_applied = false;
+    if (gnss_use_heading_) {
+      std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+      const double heading_age = has_gnss_heading_
+        ? (get_clock()->now() - latest_gnss_heading_receive_time_).seconds()
+        : std::numeric_limits<double>::infinity();
+      if (has_gnss_heading_ && latest_gnss_heading_status_ == 0 && latest_gnss_heading_type_ > 0 &&
+          latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_ &&
+          latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_ &&
+          heading_age >= 0.0 && heading_age <= gnss_heading_max_age_) {
+        const double yaw_enu = M_PI / 2.0 - latest_gnss_heading_deg_ * M_PI / 180.0;
+        const double yaw_map = std::atan2(
+          std::sin(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_),
+          std::cos(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_));
+        last_init_quat_ = Eigen::AngleAxisf(static_cast<float>(yaw_map), Eigen::Vector3f::UnitZ());
+        heading_applied = true;
+      }
+    }
+    if (require_heading && !heading_applied) {
+      return false;
+    }
+    const Eigen::Vector3f gps_map = llaToMap(gnss.latitude, gnss.longitude, gnss.altitude);
+    const Eigen::Matrix3f rotation = last_init_quat_.normalized().toRotationMatrix();
+    const Eigen::Vector3f base_map = gps_map - rotation * gnss_lever_arm_base_;
+    last_init_pos_.x() = base_map.x();
+    last_init_pos_.y() = base_map.y();
+    has_set_init_pose_ = true;
+    last_pose_source_ = gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
+      ? "rtk_fixed" : "rtk_float";
+    RCLCPP_INFO(get_logger(),
+      "GNSS seed for %s: mode=%s map_xy=[%.3f, %.3f] std=%.3fm age=%.2fs heading=%s",
+      reason, last_pose_source_.c_str(), last_init_pos_.x(), last_init_pos_.y(), h_std, age,
+      heading_applied ? "rtk" : "preserved");
+    return true;
+  }
+
+  bool resetPoseEstimatorFromFixedRtk(const char* reason) {
+    if (!seedPositionFromGnss(get_clock()->now(), reason, true, true)) {
+      return false;
+    }
+    pose_estimator.reset(new localization::PoseEstimator(
+      registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+    is_init_success_ = false;
+    init_match_count_ = 0;
+    localization_state_ = 1;
+    is_extrapolating_ = false;
+    gl_once_gate_ = false;
+    consecutive_match_failures_ = 0;
+    runtime_relocalization_attempted_ = true;
+    gnss_recovery_seed_pending_ = true;
+    last_gnss_recovery_attempt_ = std::chrono::steady_clock::now();
+    last_global_localization_attempt_ = last_gnss_recovery_attempt_;
+    {
+      std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
+      imu_data.clear();
+    }
+    {
+      std::lock_guard<std::mutex> odom_lock(robot_odom_mutex_);
+      odom_prediction_initialized_ = false;
+      consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
+    }
+    return true;
+  }
+
+  void rtk_initial_pose_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+    response->success = resetPoseEstimatorFromFixedRtk("operator initialization");
+    if (response->success) {
+      std::ostringstream message;
+      message << std::fixed << std::setprecision(3)
+              << "fixed RTK initial pose accepted x=" << last_init_pos_.x()
+              << " y=" << last_init_pos_.y();
+      response->message = message.str();
+      RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+    } else {
+      response->message =
+        "fixed RTK pose unavailable: require fresh GBAS fix, valid map GNSS alignment, "
+        "horizontal std within limit, and valid dual-antenna heading";
+      RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
+    }
+  }
+
   void applyGnssCorrection(const rclcpp::Time& stamp) {
     if (!use_gnss_fusion_ || !pose_estimator || !gnss_map_origin_loaded_) {
       return;
@@ -507,7 +662,9 @@ private:
       return;
     }
 
-    Eigen::Vector3f correction = residual * static_cast<float>(gnss_fusion_gain_);
+    const double quality_gain = gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
+      ? gnss_fusion_gain_ : gnss_fusion_gain_ * 0.25;
+    Eigen::Vector3f correction = residual * static_cast<float>(quality_gain);
     const double correction_norm = correction.norm();
     if (correction_norm > gnss_max_correction_step_) {
       correction *= static_cast<float>(gnss_max_correction_step_ / correction_norm);
@@ -519,8 +676,10 @@ private:
     pose_estimator->apply_position_correction(correction);
     gnss_correction_count_++;
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-      "GNSS localization correction #%d residual=%.2fm step=%.3fm",
-      gnss_correction_count_, residual_norm, correction.norm());
+      "GNSS localization correction #%d mode=%s residual=%.2fm step=%.3fm",
+      gnss_correction_count_,
+      gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX ? "rtk_primary" : "hybrid",
+      residual_norm, correction.norm());
   }
 
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
@@ -546,6 +705,22 @@ private:
       std::lock_guard<std::mutex> lock(imu_data_mutex);
       imu_data.push_back(correct_imu_data_ptr_);
     }
+  }
+
+  void robot_odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    pose.translation() << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
+    Eigen::Quaterniond orientation(
+      msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
+      msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+    if (!std::isfinite(orientation.norm()) || orientation.norm() < 1e-6) {
+      return;
+    }
+    pose.linear() = orientation.normalized().toRotationMatrix();
+    std::lock_guard<std::mutex> lock(robot_odom_mutex_);
+    latest_robot_odom_ = pose.cast<float>().matrix();
+    latest_robot_odom_receive_time_ = get_clock()->now();
+    ++latest_robot_odom_sequence_;
   }
 
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
@@ -586,11 +761,50 @@ private:
     auto filtered = downsample(raw_points_ptr_);
     TransformPoints(filtered, raw_points_ptr_);
     // last_scan = filtered;
-    
+
+    bool gnss_seeded_this_frame = false;
+    if (gnss_auto_recovery_enable_ && !gnss_recovery_seed_pending_ &&
+        !is_init_success_ && gnss_map_origin_loaded_) {
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed = last_gnss_recovery_attempt_ == std::chrono::steady_clock::time_point{}
+        ? std::numeric_limits<double>::infinity()
+        : std::chrono::duration<double>(now - last_gnss_recovery_attempt_).count();
+      if (elapsed >= gnss_auto_recovery_retry_seconds_ &&
+          resetPoseEstimatorFromFixedRtk("automatic recovery")) {
+        gnss_seeded_this_frame = true;
+        RCLCPP_INFO(get_logger(), "Pose estimator reseeded from fixed RTK XY and heading; validating with local NDT");
+      }
+    }
+
+    if (gnss_recovery_seed_pending_ && !is_init_success_) {
+      const double seed_age = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_gnss_recovery_attempt_).count();
+      if (seed_age >= gnss_auto_recovery_retry_seconds_) {
+        gnss_recovery_seed_pending_ = false;
+        gl_once_gate_ = true;
+        RCLCPP_INFO(get_logger(),
+          "RTK local NDT validation did not converge after %.1fs; escalating to bounded global localization",
+          seed_age);
+      }
+    }
+
+    if (!gnss_seeded_this_frame && runtime_relocalization_attempted_ && !is_init_success_ && !gl_once_gate_) {
+      const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_global_localization_attempt_).count();
+      if (elapsed >= runtime_relocalization_retry_seconds_) {
+        gl_once_gate_ = true;
+        RCLCPP_INFO(
+          get_logger(),
+          "Rearming global relocalization after %.1fs at the last trusted pose",
+          elapsed);
+      }
+    }
     if (use_global_localization_init_ && gl_once_gate_ && global_localization_ptr_ && !is_init_success_) {
       // Consume the one-shot gate before doing the expensive synchronous ICP.
       // A failed attempt must not be retried for every incoming lidar frame.
       gl_once_gate_ = false;
+      last_global_localization_attempt_ = std::chrono::steady_clock::now();
+      seedPositionFromGnss(rclcpp::Time(points_msg->header.stamp), "global relocalization");
       RCLCPP_INFO(get_logger(), "Attempting global localization for better initial pose...");
       if (performGlobalLocalization(raw_points_ptr_)) {
         RCLCPP_INFO(get_logger(), "Global localization successful! Using new initial pose.");
@@ -601,7 +815,14 @@ private:
         localization_state_ = 1;
         RCLCPP_INFO(get_logger(), "Pose estimator recreated with global localization result");
       } else {
-        RCLCPP_WARN(get_logger(), "Global localization failed once; disabling retries and continuing with local NDT.");
+        RCLCPP_WARN(
+          get_logger(),
+          "Global localization failed once; keeping the last trusted pose and waiting for operator initialization.");
+        if (runtime_relocalization_attempted_ && has_valid_pose_history_) {
+          pose_estimator.reset(new localization::PoseEstimator(
+            registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+          is_extrapolating_ = true;
+        }
       }
     }
     
@@ -629,12 +850,12 @@ private:
     }
 
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());  
-    // Do not integrate IMU or wheel odometry while scan matching is lost.  The
-    // IMU-only state is unbounded here and previously accumulated into a
-    // kilometre-scale map->odom TF before a new NDT correction could arrive.
+    // Do not integrate IMU translation while scan matching is lost or the
+    // initial pose is still being verified. Discard samples from that period
+    // so a later recovery cannot replay a stale backlog into the UKF.
     if (!is_extrapolating_ && !use_imu) {
       pose_estimator->predict(stamp);
-    } else if (!is_extrapolating_) {
+    } else if (!is_extrapolating_ && is_init_success_) {
       std::lock_guard<std::mutex> lock(imu_data_mutex);
       auto imu_iter = imu_data.begin();
       int num = 0;
@@ -652,34 +873,33 @@ private:
         }
       }
       imu_data.erase(imu_data.begin(), imu_iter);
+    } else if (use_imu) {
+      std::lock_guard<std::mutex> lock(imu_data_mutex);
+      imu_data.clear();
     }
-
-    // odometry-based prediction
-    rclcpp::Time last_correction_time = pose_estimator->last_correction_time();
-    if (!is_extrapolating_ && enable_robot_odometry_prediction && last_correction_time != rclcpp::Time((int64_t)0, get_clock()->get_clock_type())) {
-      geometry_msgs::msg::TransformStamped odom_delta;
-      if (tf_buffer->canTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id, rclcpp::Duration(std::chrono::milliseconds(100)))) {
-        odom_delta =
-          tf_buffer->lookupTransform(odom_child_frame_id, last_correction_time, odom_child_frame_id, stamp, robot_odom_frame_id);
-      } else if (tf_buffer->canTransform(
-                   odom_child_frame_id,
-                   last_correction_time,
-                   odom_child_frame_id,
-                   rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-                   robot_odom_frame_id,
-                   rclcpp::Duration(std::chrono::milliseconds(0)))) {
-        odom_delta = tf_buffer->lookupTransform(
-          odom_child_frame_id,
-          last_correction_time,
-          odom_child_frame_id,
-          rclcpp::Time((int64_t)0, get_clock()->get_clock_type()),
-          robot_odom_frame_id);
+    // Use adjacent received odometry poses directly. The device header carries
+    // controller uptime rather than ROS epoch time, so TF time queries are not
+    // a reliable source of motion deltas on this platform.
+    if (enable_robot_odometry_prediction) {
+      Eigen::Matrix4f odom_delta = Eigen::Matrix4f::Identity();
+      bool has_odom_delta = false;
+      {
+        std::lock_guard<std::mutex> lock(robot_odom_mutex_);
+        const double age = (get_clock()->now() - latest_robot_odom_receive_time_).seconds();
+        if (latest_robot_odom_sequence_ > 0 && age >= 0.0 && age < 0.5) {
+          if (odom_prediction_initialized_ && latest_robot_odom_sequence_ != consumed_robot_odom_sequence_) {
+            odom_delta = previous_robot_odom_.inverse() * latest_robot_odom_;
+            has_odom_delta = odom_delta.allFinite();
+          }
+          previous_robot_odom_ = latest_robot_odom_;
+          consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
+          odom_prediction_initialized_ = true;
+        }
       }
-      if (odom_delta.header.stamp == rclcpp::Time((int64_t)0, get_clock()->get_clock_type())) {
-        RCLCPP_WARN_STREAM(get_logger(), "failed to look up transform between " << cloud->header.frame_id << " and " << robot_odom_frame_id);
-      } else {
-        Eigen::Isometry3d delta = tf2::transformToEigen(odom_delta);
-        pose_estimator->predict_odom(delta.cast<float>().matrix());
+      // Wheel yaw remains useful for recovering from a transient NDT loss, but
+      // must not perturb the operator-provided pose before initialization.
+      if (has_odom_delta && is_init_success_) {
+        pose_estimator->predict_odom(odom_delta);
       }
     }
     // correct
@@ -690,29 +910,48 @@ private:
     if (match_result.is_converged_ && match_result.fitness_score_ < 0.5) {
       applyGnssCorrection(rclcpp::Time(stamp));
       localization_state_ = 3;
+      consecutive_match_failures_ = 0;
+      runtime_relocalization_attempted_ = false;
+      gnss_recovery_seed_pending_ = false;
       RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!!");
     } else {
       localization_state_ = 4;
-      {
-        // Keep the NDT initial guess at the last verified pose.  Before the
-        // first verified match, use the operator-supplied initial pose instead.
-        // Resetting once per rejected scan is intentional: it prevents bad
-        // inertial prediction from becoming the next registration seed.
-        Eigen::Vector3f safe_position = has_valid_pose_history_
-          ? last_pose_.block<3, 1>(0, 3)
-          : last_init_pos_;
-        Eigen::Quaternionf safe_orientation = has_valid_pose_history_
-          ? Eigen::Quaternionf(last_pose_.block<3, 3>(0, 0))
-          : last_init_quat_;
-        pose_estimator.reset(new localization::PoseEstimator(
-          registration, stamp, safe_position, safe_orientation, cool_time_duration));
-        if (has_valid_pose_history_) {
+      consecutive_match_failures_++;
+      // Keep the estimator and its odometry anchor alive. Recreating it here
+      // freezes the seed at the last NDT yaw, making recovery impossible while
+      // the robot is still turning.
+      if (has_valid_pose_history_) {
         last_velocity_.setZero();
         last_angular_velocity_.setZero();
-        }
       }
       is_extrapolating_ = true;
       current_confidence_ = 0.0;
+      if (is_init_success_ && has_valid_pose_history_ &&
+          !runtime_relocalization_attempted_ &&
+          consecutive_match_failures_ >= runtime_relocalization_failure_threshold_) {
+        last_init_pos_ = last_pose_.block<3, 1>(0, 3);
+        last_init_quat_ = Eigen::Quaternionf(last_pose_.block<3, 3>(0, 0));
+        last_init_quat_.normalize();
+        has_set_init_pose_ = true;
+        last_pose_source_ = "runtime_last_valid";
+        is_init_success_ = false;
+        init_match_count_ = 0;
+        gl_once_gate_ = true;
+        runtime_relocalization_attempted_ = true;
+        {
+          std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
+          imu_data.clear();
+        }
+        {
+          std::lock_guard<std::mutex> odom_lock(robot_odom_mutex_);
+          odom_prediction_initialized_ = false;
+          consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
+        }
+        RCLCPP_WARN(
+          get_logger(),
+          "NDT failed for %d consecutive frames; scheduling one global relocalization from the last trusted pose",
+          consecutive_match_failures_);
+      }
       RCLCPP_INFO(get_logger(), "Continuous Localization may not good!!!");
     }
 
@@ -785,6 +1024,18 @@ private:
       init_match_count_ = 0;
       localization_state_ = 1;
       gl_once_gate_ = true;
+      is_extrapolating_ = false;
+      consecutive_match_failures_ = 0;
+      runtime_relocalization_attempted_ = false;
+      {
+        std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
+        imu_data.clear();
+      }
+      {
+        std::lock_guard<std::mutex> odom_lock(robot_odom_mutex_);
+        odom_prediction_initialized_ = false;
+        consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
+      }
       RCLCPP_INFO(get_logger(), "New initial pose set from RViz - Position: [%.3f, %.3f, %.3f], Quaternion: [%.3f, %.3f, %.3f, %.3f]",
                    last_init_pos_.x(), last_init_pos_.y(), last_init_pos_.z(), last_init_quat_.w(), last_init_quat_.x(), last_init_quat_.y(), last_init_quat_.z());
       RCLCPP_INFO(get_logger(), "Localization will restart with new pose");
@@ -1323,9 +1574,17 @@ private:
     status.header = header;
     status.matching_error = registration->getFitnessScore();
     const Eigen::Matrix4f final_transform = registration->getFinalTransformation();
-    const Eigen::Vector3f final_translation = final_transform.block<3, 1>(0, 3);
-    const double relative_translation_m = static_cast<double>(final_translation.norm());
-    status.relative_pose = tf2::eigenToTransform(Eigen::Isometry3d(final_transform.cast<double>())).transform;
+    // NDT returns an absolute map pose. Report and validate the frame-to-frame
+    // delta; using the absolute translation makes every pose beyond 20 m look
+    // like a localization jump.
+    Eigen::Matrix4f relative_transform = Eigen::Matrix4f::Identity();
+    if (has_valid_pose_history_) {
+      relative_transform = last_pose_.inverse() * final_transform;
+    }
+    const Eigen::Vector3f relative_translation = relative_transform.block<3, 1>(0, 3);
+    const double relative_translation_m = static_cast<double>(relative_translation.norm());
+    status.relative_pose = tf2::eigenToTransform(
+      Eigen::Isometry3d(relative_transform.cast<double>())).transform;
     if (!aligned || aligned->empty()) {
       status.has_converged = false;
       status.inlier_fraction = 0.0f;
@@ -1536,11 +1795,8 @@ private:
                 return;
             }
         }
-        if (is_extrapolating_) {
-            is_extrapolating_ = false;
-            current_confidence_ = 1.0;
-            RCLCPP_DEBUG(get_logger(), "Sensor data recovered, resetting extrapolation state, confidence: 1.0");
-        }
+        // Sensor availability and scan-match validity are independent. Only a
+        // valid NDT correction may leave extrapolation mode.
         if (pose_estimator) {
             publish_odometry(this->get_clock()->now(), pose_estimator->matrix());
         }
@@ -1637,11 +1893,26 @@ private:
         localization_state_ = 0; 
         init_match_count_ = 0;
         gl_once_gate_ = true;
+        consecutive_match_failures_ = 0;
+        runtime_relocalization_attempted_ = false;
+        gnss_recovery_seed_pending_ = false;
+        last_gnss_recovery_attempt_ = std::chrono::steady_clock::time_point{};
         has_set_init_pose_ = false;
         last_init_pos_ = Eigen::Vector3f(init_pos_x_, init_pos_y_, init_pos_z_);
         last_init_quat_ = Eigen::Quaternionf(init_ori_w_, init_ori_x_, init_ori_y_, init_ori_z_);
+        seedPositionFromGnss(get_clock()->now(), "map initialization");
         pose_estimator.reset(new localization::PoseEstimator(
           registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+        is_extrapolating_ = false;
+        {
+          std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
+          imu_data.clear();
+        }
+        {
+          std::lock_guard<std::mutex> odom_lock(robot_odom_mutex_);
+          odom_prediction_initialized_ = false;
+          consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
+        }
         lidar_status_buffer_.clear();
         imu_status_buffer_.clear();
         for (int i = 0; i < buffer_size_; i++) {
@@ -1654,6 +1925,7 @@ private:
 private:
   std::string robot_odom_frame_id;
   std::string odom_child_frame_id;
+  std::string robot_odom_topic_;
   std::string localization_odom_frame_id;
   bool send_tf_transforms;
   bool tf_use_current_time;
@@ -1667,12 +1939,15 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr                         imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 points_sub;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr                   gnss_sub;
+  rclcpp::Subscription<robots_dog_msgs::msg::UniRtkPvh>::SharedPtr              rtk_pvh_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 globalmap_sub;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              rtk_initial_pose_service_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               pose_pub;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            robot_odom_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         aligned_pub;
   rclcpp::Publisher<localization::msg::ScanMatchingStatus>::SharedPtr status_pub;
   rclcpp::Publisher<robots_dog_msgs::msg::Localization>::SharedPtr    localization_info_pub_;
@@ -1705,6 +1980,23 @@ private:
   int gnss_min_status_ = 0;
   bool gnss_use_elevation_ = false;
   int gnss_correction_count_ = 0;
+  bool gnss_auto_recovery_enable_ = true;
+  double gnss_auto_recovery_retry_seconds_ = 5.0;
+  bool gnss_use_heading_ = false;
+  double gnss_heading_offset_rad_ = 0.0;
+  double gnss_heading_max_std_deg_ = 5.0;
+  double gnss_heading_min_baseline_m_ = 0.20;
+  double gnss_heading_max_age_ = 1.5;
+  std::mutex gnss_heading_mutex_;
+  bool has_gnss_heading_ = false;
+  double latest_gnss_heading_deg_ = 0.0;
+  double latest_gnss_heading_std_deg_ = std::numeric_limits<double>::infinity();
+  double latest_gnss_heading_baseline_m_ = 0.0;
+  int latest_gnss_heading_status_ = -1;
+  int latest_gnss_heading_type_ = 0;
+  rclcpp::Time latest_gnss_heading_receive_time_{0, 0, RCL_ROS_TIME};
+  std::chrono::steady_clock::time_point last_gnss_recovery_attempt_{};
+  bool gnss_recovery_seed_pending_ = false;
   
   // transformation matrices 
   Eigen::Matrix3f init_rotation_matrix_ = Eigen::Matrix3f::Identity();
@@ -1735,6 +2027,11 @@ private:
   bool global_localization_in_progress_ = false;
   rclcpp::Time global_localization_start_time_;
   bool gl_once_gate_ = true;
+  int runtime_relocalization_failure_threshold_ = 10;
+  double runtime_relocalization_retry_seconds_ = 5.0;
+  std::chrono::steady_clock::time_point last_global_localization_attempt_{};
+  int consecutive_match_failures_ = 0;
+  bool runtime_relocalization_attempted_ = false;
   // Sensor data validity tracking
   rclcpp::Time last_lidar_data_time_;
   rclcpp::Time last_imu_data_time_;
@@ -1781,6 +2078,13 @@ private:
   double ndt_neighbor_search_radius;
   double ndt_resolution;
   bool enable_robot_odometry_prediction;
+  std::mutex robot_odom_mutex_;
+  Eigen::Matrix4f latest_robot_odom_ = Eigen::Matrix4f::Identity();
+  Eigen::Matrix4f previous_robot_odom_ = Eigen::Matrix4f::Identity();
+  rclcpp::Time latest_robot_odom_receive_time_{0, 0, RCL_ROS_TIME};
+  uint64_t latest_robot_odom_sequence_ = 0;
+  uint64_t consumed_robot_odom_sequence_ = 0;
+  bool odom_prediction_initialized_ = false;
   int imu_data_filter_num_ = 5;  // Number of IMU data points to filter.
 
   bool is_init_success_ = false;

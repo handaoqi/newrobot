@@ -84,14 +84,26 @@ is_running() {
 
 stop_navigation() {
   echo "Stopping Nav2/Navigo while preserving localization..."
+  kill_pattern "ros2 bag record.*roamerx_nav_logs/diagnostics"
   kill_pattern "ros2 launch robot_navigo navigation_bringup.launch.py"
   kill_pattern "component_container_isolated.*navigo_container"
   kill_pattern "vel_cmd_udp_pub"
   kill_pattern "vel_cmd_lcm_pub"
   kill_pattern "mode_status_pub"
   kill_pattern "odom_to_tf_broadcaster"
-  kill_pattern "pointcloud_to_laserscan_node"
   echo "Navigation stopped. Localization is still running."
+}
+
+start_navigation_diagnostics() {
+  local diagnostics_dir="${LOG_DIR}/diagnostics"
+  local session_dir="${diagnostics_dir}/$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "${session_dir}"
+  # Record the controller output before and after collision monitoring along
+  # with both protection polygons. This makes a future blocked-path event
+  # replayable without recording the high-bandwidth camera or point cloud.
+  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 bag record --storage sqlite3 --max-bag-size 104857600 --max-cache-size 10485760 -o '${session_dir}/nav_diagnostics' /cmd_vel_raw /cmd_vel /polygon_stop /polygon_slowdown" \
+    >"${session_dir}/recorder.log" 2>&1 < /dev/null &
+  echo "Navigation diagnostics recording: ${session_dir}/nav_diagnostics"
 }
 
 stop_stack() {
@@ -100,6 +112,9 @@ stop_stack() {
   kill_pattern "ros2 launch localization localization.launch.py"
   kill_pattern "localization_node"
   kill_pattern "static_transform_publisher.*base_link livox_frame"
+  kill_pattern "pointcloud_to_laserscan_node"
+  kill_pattern "self_filter_scan.py"
+  kill_pattern "sensor_health_monitor"
   echo "Full navigation stack stopped."
 }
 
@@ -171,6 +186,7 @@ localization_is_valid() {
 }
 
 start_stack() {
+  "${PROJECT_DIR}/script/robot/ensure_navigation_sensors.sh"
   if is_running; then
     echo "Navigation and localization already appear to be running."
     echo "Use '$0 restart' to stop and start again."
@@ -216,6 +232,7 @@ start_stack() {
     echo "Starting Nav2/Navigo..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' map:='${MAP_YAML}'" \
       >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
+    start_navigation_diagnostics
   fi
 
   echo

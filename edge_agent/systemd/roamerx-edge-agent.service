@@ -14,6 +14,10 @@ Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
 ExecStart=/usr/bin/python3 /opt/roamerx/edge_agent/run_edge_agent.py --config /etc/roamerx/edge-agent.yaml
 Restart=always
 RestartSec=5
+# Sensors, localization and Nav2 are independently managed long-running
+# processes. Restarting the MQTT Edge process must not terminate them.
+KillMode=process
+TimeoutStopSec=15
 StateDirectory=roamerx-edge
 NoNewPrivileges=true
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from .config import SafetyConfig
@@ -9,6 +10,7 @@ from .protocol import MessageEnvelope, ProtocolError
 @dataclass
 class RuntimeSafetyState:
     localization_status: str = "unknown"
+    localization_normal_since_monotonic: float = 0.0
     nav_ready: bool = False
     emergency_stop: bool = False
     control_mode: str = "unknown"
@@ -30,6 +32,13 @@ class SafetyPolicy:
             raise ProtocolError("ROBOT_BUSY", "another motion task is active")
         if self.state.localization_status != "normal":
             raise ProtocolError("LOCALIZATION_NOT_READY", self.state.localization_status)
+        stable_for = time.monotonic() - self.state.localization_normal_since_monotonic
+        if stable_for < self.config.localization_stable_seconds:
+            raise ProtocolError(
+                "LOCALIZATION_NOT_STABLE",
+                f"normal for {max(0.0, stable_for):.1f}s; "
+                f"requires {self.config.localization_stable_seconds:.1f}s",
+            )
         if not self.state.nav_ready:
             raise ProtocolError("NAV_STACK_NOT_READY", "FollowWaypoints action server is unavailable")
         if self.state.emergency_stop:
@@ -65,12 +74,12 @@ class SafetyPolicy:
 
     @staticmethod
     def validate_pause(state: str) -> None:
-        if state != "running":
+        if state not in {"accepted", "running", "pausing", "paused", "resuming", "interrupted"}:
             raise ProtocolError("INVALID_TASK_STATE", f"cannot pause from {state}")
 
     @staticmethod
     def validate_resume(state: str) -> None:
-        if state != "paused":
+        if state not in {"accepted", "running", "pausing", "paused", "resuming", "interrupted"}:
             raise ProtocolError("INVALID_TASK_STATE", f"cannot resume from {state}")
 
     @staticmethod

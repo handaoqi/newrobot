@@ -16,7 +16,7 @@ class MapActivationAdapter:
     """Switch the local map selected by the platform."""
 
     REQUIRED_FILES = ("map.yaml", "map.pgm", "map.pcd")
-    OPTIONAL_FILES = ("map.txt",)
+    OPTIONAL_FILES = ("map.txt", "gnss_origin.yaml")
 
     def __init__(self, config: EdgeConfig, safety_state: RuntimeSafetyState, config_path: str) -> None:
         self.config = config
@@ -31,6 +31,14 @@ class MapActivationAdapter:
         map_version = str(command.get("map_version", "")).strip()
         try:
             source_dir = self._resolve_source_dir(command)
+            gnss_origin_yaml = str(command.get("gnss_origin_yaml") or "")
+            if gnss_origin_yaml and not (source_dir / "gnss_origin.yaml").exists():
+                if len(gnss_origin_yaml.encode("utf-8")) > 16384 or not all(
+                    key in gnss_origin_yaml
+                    for key in ("origin_latitude:", "origin_longitude:", "alignment_locked:")
+                ):
+                    raise ProtocolError("MAP_GNSS_METADATA_INVALID", "GNSS map origin metadata is invalid")
+                (source_dir / "gnss_origin.yaml").write_text(gnss_origin_yaml, encoding="utf-8")
             cleanup_result = None
             if command.get("manual_edit"):
                 safe_version = re.sub(r"[^A-Za-z0-9_.-]+", "_", map_version)[:96] or map_id
@@ -58,10 +66,12 @@ class MapActivationAdapter:
             for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
                 source = source_dir / name
                 target = self.map_dir / name
-                if not source.exists():
-                    continue
                 if target.exists() or target.is_symlink():
                     target.unlink()
+                # Optional metadata is map-scoped. Leaving a previous map's
+                # GNSS origin active silently applies the wrong ENU transform.
+                if not source.exists():
+                    continue
                 target.symlink_to(source)
                 switched[name] = str(source)
 
@@ -131,6 +141,35 @@ class MapActivationAdapter:
         self.safety_state.current_map_local_state = local_state
         self.safety_state.current_map_error = local_error
         return status
+
+    def mapping_start_pose(self) -> dict:
+        """Read the first recorded map trajectory pose for cold-start localization."""
+        trajectory = self.map_dir / "map.txt"
+        try:
+            with trajectory.open("r", encoding="utf-8") as stream:
+                for raw_line in stream:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    fields = line.replace(",", " ").split()
+                    if len(fields) < 3:
+                        continue
+                    return {
+                        "x": float(fields[0]),
+                        "y": float(fields[1]),
+                        "z": 0.0,
+                        "yaw": float(fields[2]),
+                        "source": "mapping_start",
+                    }
+        except (OSError, ValueError) as exc:
+            raise ProtocolError(
+                "MAPPING_START_POSE_INVALID",
+                f"cannot read mapping start pose from {trajectory}: {exc}",
+            ) from exc
+        raise ProtocolError(
+            "MAPPING_START_POSE_MISSING",
+            f"map trajectory has no usable start pose: {trajectory}",
+        )
 
     def _resolve_source_dir(self, command: dict) -> Path:
         explicit = str(command.get("local_map_dir") or "").strip()

@@ -36,15 +36,15 @@ laser_mapping:
         max_acc_variance: 0.5
         max_gyro_variance: 0.05
     gnss_fusion:
-        # GNSS is still recorded and aligned, but cannot alter LIO until the
-        # ENU-to-map alignment has been validated and fusion is enabled.
-        enable: false
-        gain: 0.03
-        max_correction_step: 0.10
+        # Only quality-gated RTK float/fixed fixes may alter LIO. Invalid GNSS
+        # automatically falls back to LiDAR + IMU without resetting the pose.
+        enable: true
+        gain: 0.20
+        max_correction_step: 0.30
         max_residual: 5.0
         max_age: 1.5
         max_horizontal_std: 1.5
-        min_status: 0
+        min_status: 1
         use_elevation: false
         lever_arm_base: [ -0.05, 0.0, 0.15 ]
         alignment_min_samples: 20
@@ -52,6 +52,17 @@ laser_mapping:
         alignment_max_rms: 1.5
         alignment_max_yaw_change_deg: 3.0
         alignment_required_fits: 3
+    odom_guard:
+        # Disabled for live mapping until the lower-controller timestamp is fixed.
+        # Offline rosbag replay enables this as a translation sanity constraint.
+        enable: false
+        topic: "/odom/mc_odom"
+        max_speed: 2.0
+        max_vertical_speed: 0.10
+        max_lidar_correction: 0.35
+        max_lidar_z_correction: 0.03
+        max_lidar_rotation: 0.35
+        max_abs_z_from_start: 10.0
     health_guard:
         max_frame_translation: 1.5
         max_speed: 3.0
@@ -95,3 +106,8 @@ laser_mapping:
       map_resolution : 0.05
       # Reject pathological SLAM bounds before creating an oversized raster.
       max_grid_cells: 200000000
+      # Retain sparse structure when nearby 5cm cells support each other, but
+      # reject isolated returns. Crop far returns around the driven trajectory.
+      min_points_per_cell: 3
+      support_radius_cells: 1
+      projection_padding_m: 25.0
