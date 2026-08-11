@@ -1,0 +1,113 @@
+laser_mapping:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 2
+    max_iteration: 3
+    filter_size_surf: 0.2
+    filter_size_map: 0.2
+    cube_side_length: 1000.0
+    common:
+        lid_topic:  "/front_lidar"
+        imu_topic:  "/front_lidar/imu"
+        gnss_topic: "/fix"
+        time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+        time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+    preprocess:
+        lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+        scan_line: 4
+        blind: 0.5
+        timestamp_unit: 3
+        scan_rate: 10
+    mapping:
+        acc_cov: 0.1
+        gyr_cov: 0.1
+        b_acc_cov: 0.0001
+        b_gyr_cov: 0.0001
+        fov_degree:    360.0
+        det_range:     100.0
+        extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+        extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+        extrinsic_R: [ 1., 0., 0.,
+                    0., 1., 0.,
+                    0., 0., 1.]
+    imu_init:
+        # Keep the robot stationary for roughly three seconds at 200 Hz.
+        sample_count: 600
+        max_acc_variance: 0.5
+        max_gyro_variance: 0.05
+    gnss_fusion:
+        # Only quality-gated RTK float/fixed fixes may alter LIO. Invalid GNSS
+        # automatically falls back to LiDAR + IMU without resetting the pose.
+        enable: true
+        gain: 0.20
+        max_correction_step: 0.30
+        max_residual: 5.0
+        max_age: 1.5
+        max_horizontal_std: 1.5
+        min_status: 1
+        use_elevation: false
+        lever_arm_base: [ -0.05, 0.0, 0.15 ]
+        alignment_min_samples: 20
+        alignment_min_baseline: 15.0
+        alignment_max_rms: 1.5
+        alignment_max_yaw_change_deg: 3.0
+        alignment_required_fits: 3
+    odom_guard:
+        # Disabled for live mapping until the lower-controller timestamp is fixed.
+        # Offline rosbag replay enables this as a translation sanity constraint.
+        enable: false
+        topic: "/odom/mc_odom"
+        max_speed: 2.0
+        max_vertical_speed: 0.10
+        max_lidar_correction: 0.35
+        max_lidar_z_correction: 0.03
+        max_lidar_rotation: 0.35
+        max_abs_z_from_start: 10.0
+    health_guard:
+        max_frame_translation: 1.5
+        max_speed: 3.0
+        max_abs_z: 5.0
+        max_frame_z: 1.0
+        warn_speed: 1.8
+        # Absolute map Z is not a divergence signal because outdoor routes include slopes.
+        warn_abs_z: 0.0
+        pose_guard_frames: 3
+        no_effective_points_limit: 10
+    dynamic_filter:
+        # Preserve the raw map. Transient obstacles are removed explicitly in
+        # the platform's manual map cleanup workflow after saving.
+        enable: false
+        voxel_size: 0.20
+        min_scan_observations: 1
+        # Partition voxel evidence on disk so long routes do not grow an
+        # unbounded in-memory observation table during mapping or export.
+        shard_count: 64
+    keyframe_record:
+        enable: true
+        min_distance_m: 0.5
+        min_yaw_rad: 0.35
+        # Keep observing a stationary scene so people moving past a stopped dog can be removed later.
+        max_interval_s: 1.0
+        voxel_size_m: 0.15
+        # Bound the background disk writer so storage stalls cannot consume RAM.
+        max_queue_size: 8
+    publish:
+        path_en: true                # true: publish Path
+        map_en: false                 # true: publish Map cloud
+        world_points_en:  true       # false: close all the point cloud output
+        body_points_en: true  # true: output the point cloud scans in IMU-body-frame
+    pcd2pgm:
+      file_name : "map"
+      # 2D navigation map should only contain obstacles that can collide with the dog.
+      # Higher indoor structures are kept in the PCD for localization but not projected into PGM.
+      thre_z_min : 0.05
+      thre_z_max : 0.75
+      flag_pass_through : 0
+      map_resolution : 0.05
+      # Reject pathological SLAM bounds before creating an oversized raster.
+      max_grid_cells: 200000000
+      # Retain sparse structure when nearby 5cm cells support each other, but
+      # reject isolated returns. Crop far returns around the driven trajectory.
+      min_points_per_cell: 3
+      support_radius_cells: 1
+      projection_padding_m: 25.0

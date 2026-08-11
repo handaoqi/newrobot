@@ -1,0 +1,23 @@
+[Unit]
+Description=RoamerX Remote Codex Development Agent
+After=network-online.target roamerx-edge-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+WorkingDirectory=/home/robot/genisom_roamerx_open/dev_agent
+Environment=HOME=/home/robot
+Environment=CODEX_HOME=/home/robot/.codex
+Environment=PYTHONUNBUFFERED=1
+Environment=http_proxy=http://127.0.0.1:7890
+Environment=https_proxy=http://127.0.0.1:7890
+ExecStart=/usr/bin/python3 /home/robot/genisom_roamerx_open/dev_agent/run_dev_agent.py --edge-config /home/robot/edge_agent/config.yaml --config /home/robot/genisom_roamerx_open/dev_agent/config.example.yaml
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

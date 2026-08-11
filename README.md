@@ -1,36 +1,53 @@
-# 机器狗公园巡检项目
+# DogRobot
 
-这个仓库用于协作开发机器狗公园巡检系统。当前代码重点覆盖远程连接、ROS2 状态读取、建图、地图查看、单点导航、运动测试和视频预览，下一步要扩展为固定路线自主巡检。
+DogRobot is the unified repository for the RoamerX robot runtime, cloud
+platform, edge control, and deployment tooling.
 
-## 当前目录
+## Repository Layout
 
-- `dog_mvp_platform/`：浏览器巡检控制台和 Python 后端。
-- `dog_mobile_web_proxy.py`：本地控制台的轻量访问代理，可加 Basic Auth。
-- `dog_orin_reverse_tunnel_setup.sh`：部署到 Orin 的反向 SSH 隧道脚本模板。
-- `start_dog_remote_control.cmd`：Windows 本地启动远程控制台的脚本。
-- `docs/`：协作流程、巡检任务规划和机器人端代码同步建议。
+- `robot/`: ROS 2 Humble SLAM, localization, navigation, messages, and
+  real-robot scripts for the NX computer.
+- `edge-agent/`: MQTT command, telemetry, map, charging, audio, and power-mode
+  agent deployed on each robot.
+- `dev-agent/`: optional remote development agent.
+- `platform/backend/`: Django API, device worker, scheduler, and persistence.
+- `platform/frontend/`: Vue operator interface.
+- `platform/bot-version/`: video inference, streaming, and alert reporting.
+- `deploy/`: stable entry points for robot, cloud, and RK3588 deployment.
 
-## 本地运行
+Runtime data and credentials are intentionally excluded. Maps live under
+`/home/robot/.jszr/map`, rosbags under `/home/robot/rosbags`, device settings
+under `/home/robot/edge_agent`, and cloud state under `/opt/roamerx/shared`.
 
-```powershell
-cd "D:\Users\talent\Documents\New project\dog_mvp_platform"
-python server.py
+## Common Commands
+
+Build the robot workspace:
+
+```bash
+cd robot
+./build.sh all
 ```
 
-浏览器访问：
+Test the cloud platform:
 
-```text
-http://127.0.0.1:8765
+```bash
+cd platform/backend && python3 manage.py test monitoring
+cd ../frontend && npm test && npm run build
 ```
 
-需要远程连接机器狗时，先配置本机环境变量或复制 `.env.example` 为本地私有配置文件。不要把真实密码、密钥、服务器地址访问文档提交到仓库。
+Test both agent packages:
 
-## 协作原则
+```bash
+scripts/test_agents.sh
+```
 
-1. GitHub 私密仓库作为代码源头。
-2. 每个人在自己的分支开发，通过 Pull Request 合并。
-3. 机器狗上的代码不直接手改成唯一版本，改动要回传到仓库。
-4. 机器人运行数据、地图大文件、日志、密钥和密码不入库。
-5. 厂商安装目录只记录依赖和启动方式，不整包提交。
+Deploy using the stable wrappers:
 
-详细建议见 `docs/COLLABORATION.md`。
+```bash
+deploy/robot/deploy.sh --host robot@ROBOT_IP --build
+deploy/cloud/deploy.sh
+```
+
+The canonical branch is `main`. Pre-consolidation snapshots are retained as
+the annotated tags `archive/legacy-main-20260812`,
+`archive/robot-20260812`, and `archive/platform-20260812`.

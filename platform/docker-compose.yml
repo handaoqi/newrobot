@@ -1,0 +1,51 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      network: host
+    container_name: playground-backend
+    restart: unless-stopped
+    environment:
+      DJANGO_DEBUG: "True"
+      DJANGO_ALLOWED_HOSTS: "*"
+      CORS_ALLOW_ALL_ORIGINS: "True"
+      SQLITE_DB_PATH: "/app/data/db.sqlite3"
+      GUNICORN_WORKER_CLASS: "gthread"
+      GUNICORN_WORKERS: "3"
+      GUNICORN_THREADS: "8"
+      GUNICORN_TIMEOUT: "300"
+    volumes:
+      - backend_data:/app/data
+      - backend_media:/app/media
+    ports:
+      - "18000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      network: host
+    container_name: playground-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - zlmediakit
+    ports:
+      - "13000:80"
+
+  zlmediakit:
+    image: zlmediakit/zlmediakit:master
+    container_name: playground-zlmediakit
+    restart: unless-stopped
+    ports:
+      - "1935:1935"
+      - "8080:80"
+      - "8443:443"
+      - "8554:554"
+      - "10000:10000"
+      - "10000:10000/udp"
+      - "8000:8000/udp"
+      - "9000:9000/udp"
+
+volumes:
+  backend_data:
+  backend_media:

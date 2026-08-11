@@ -1,0 +1,22 @@
+# Center worker account. The browser must never receive this credential.
+user platform-worker
+topic read robots/+/presence
+topic read robots/+/telemetry/#
+topic read robots/+/events/#
+topic read robots/+/commands/+/ack
+topic read robots/+/commands/+/result
+topic read robots/+/sync/state
+topic write robots/+/commands
+topic write robots/+/sync/request
+topic write robots/+/telemetry/trajectory/ack
+
+# Device usernames must exactly equal robot_id, for example rx-001.
+pattern read robots/%u/commands
+pattern read robots/%u/sync/request
+pattern read robots/%u/telemetry/trajectory/ack
+pattern write robots/%u/presence
+pattern write robots/%u/telemetry/#
+pattern write robots/%u/events/#
+pattern write robots/%u/commands/+/ack
+pattern write robots/%u/commands/+/result
+pattern write robots/%u/sync/state

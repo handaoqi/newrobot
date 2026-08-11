@@ -1,4 +1,0 @@
-std_msgs/Header header
-
-robots_dog_msgs/UniHeading heading
-robots_dog_msgs/UniBestNav bestnav

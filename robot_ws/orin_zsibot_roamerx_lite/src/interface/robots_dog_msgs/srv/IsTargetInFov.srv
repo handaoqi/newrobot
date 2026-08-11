@@ -1,5 +1,0 @@
-builtin_interfaces/Time timestamp
-float32 fov_tolerance_far
-float32 fov_tolerance_near
----
-bool is_in_target_fov

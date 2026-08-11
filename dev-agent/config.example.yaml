@@ -1,0 +1,13 @@
+codex:
+  binary: /home/robot/.nvm/versions/node/v22.22.3/bin/codex
+  home: /home/robot/.codex
+  yolo: true
+  timeout_seconds: 7200
+
+workspaces:
+  robot-main: /home/robot/genisom_roamerx_open
+  cloud-platform: /home/robot/yw/roamerx_analysis/center_platform/platform_server_code
+
+storage:
+  log_dir: /home/robot/.local/state/roamerx-dev-agent/tasks
+  conversation_file: /home/robot/.local/state/roamerx-dev-agent/conversation.json

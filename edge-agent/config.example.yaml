@@ -1,0 +1,143 @@
+robot:
+  id: "rx-001"
+  agent_version: "0.1.0"
+  current_map_id: "site-a-main"
+  current_map_version: "v1"
+
+mqtt:
+  host: "center.example.com"
+  port: 8883
+  username: "rx-001"
+  password: ""
+  ca_file: "/etc/roamerx/ca.crt"
+  cert_file: "/etc/roamerx/rx-001.crt"
+  key_file: "/etc/roamerx/rx-001.key"
+  keepalive_seconds: 20
+  session_expiry_seconds: 86400
+
+ros:
+  localization_topic: "/localization_info"
+  scan_matching_status_topic: "/status"
+  odometry_topic: "/odom/localization_odom"
+  battery_topic: ""
+  follow_waypoints_action: "/follow_waypoints"
+
+telemetry:
+  status_interval_seconds: 2
+  heartbeat_interval_seconds: 10
+  trajectory_flush_seconds: 5
+  trajectory_batch_size: 20
+  system_probe_interval_seconds: 10
+  system_probe_stale_seconds: 30
+  battery_ssh_host: "3588"
+  modem_at_device: "/dev/ttyUSB2"
+  charging_current_threshold_ma: 300
+  charger_speaker_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
+  nx_speaker_card: 2
+  nx_speaker_control: "PCM"
+
+safety:
+  stop_speed_threshold_mps: 0.03
+  localization_stable_seconds: 3.0
+  localization_loss_samples: 5
+  stop_confirmation_seconds: 1.0
+  standup_confirmation_timeout_seconds: 12.0
+  low_battery_percent: 20
+
+obstacle_speech:
+  enabled: true
+  obstacle_clear_seconds: 3.0
+  no_progress_seconds: 5.0
+  min_progress_m: 0.5
+  obstacle_max_distance_m: 0.9
+  collision_limit_ratio: 0.6
+  minimum_blocked_task_seconds: 300.0
+  navigation_retry_seconds: 5.0
+
+storage:
+  sqlite_path: "/var/lib/roamerx-edge/edge.db"
+
+media:
+  upload_url: "https://center.example.com/api/device/media/upload/"
+  map_upload_url: "https://center.example.com/api/device/maps/upload/"
+  device_id: "rx-001"
+  device_key: ""
+
+mapping:
+  log_dir: /tmp/roamerx_mapping_logs
+  map_dir: "/home/robot/.jszr/map"
+  ros_setup: "/opt/ros/humble/setup.bash"
+  workspace_setup: "~/genisom_roamerx_open/install/setup.bash"
+  slam_command: "ros2 run robot_slam mapping --ros-args --params-file $HOME/genisom_roamerx_open/install/robot_slam/share/robot_slam/config/config.yaml"
+  service_name: "/slam_state_service"
+  service_type: "robots_dog_msgs/srv/MapState"
+  start_data: 3
+  save_data: 5
+  command_timeout_seconds: 15
+  save_wait_seconds: 7200
+  dynamic_filter_enabled: false
+  dynamic_filter_voxel_size_m: 0.12
+  dynamic_filter_min_points_per_voxel: 3
+  dynamic_filter_clear_radius_cells: 1
+  visibility_filter_enabled: false
+  visibility_filter_voxel_size_m: 0.3
+  visibility_filter_min_free_observations: 1
+  visibility_filter_max_hit_observations: 10
+  visibility_filter_max_source_bytes: 268435456
+  visibility_filter_output_suffix: keyframe_visibility_loose03x
+  auto_activate_uploaded_map: true
+  upload_point_cloud: false
+  preview_max_size: 1200
+  rosbag_script: "/home/robot/genisom_roamerx_open/script/robot/mapping_rosbag.sh"
+  rosbag_stop_timeout_seconds: 45
+  sensor_start_script: "/home/robot/genisom_roamerx_open/script/robot/ensure_mapping_sensors.sh"
+  sensor_start_timeout_seconds: 40
+
+navigation_stack:
+  script_path: "/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh"
+  command_timeout_seconds: 45
+  rosbag_script: "/home/robot/genisom_roamerx_open/script/robot/navigation_rosbag.sh"
+  rosbag_stop_timeout_seconds: 45
+
+teleop_control:
+  script_path: "/home/robot/genisom_roamerx_open/script/robot/start_teleop_control.sh"
+  command_timeout_seconds: 20
+
+sensor_control:
+  lidar_restart_script: "/home/robot/genisom_roamerx_open/script/robot/restart_livox_sensor.sh"
+  rtk_restart_script: "/home/robot/genisom_roamerx_open/script/robot/start_rtk_ntrip.sh"
+  command_timeout_seconds: 30
+
+charge_control:
+  remote_host: "3588"
+  service_name: "roamerx-charge-pile"
+  working_directory: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
+  executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
+  command_timeout_seconds: 35
+  full_battery_percent: 100
+  full_confirmation_samples: 3
+  cooling_stop_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
+  normal_start_eggs: [zenoh_route, imu_daemon, ecal2ros, motion_control, spline_daemon, dog_task, monitor, push_image]
+  cooling_stop_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
+  normal_start_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
+
+power_mode:
+  state_path: /home/robot/edge_agent/data/power_mode.json
+  cooling_marker_path: /home/robot/edge_agent/data/cooling_standby
+  monitoring_service: roamerx-bike-bot.service
+  navigation_script: /home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh
+  sensor_start_script: /home/robot/genisom_roamerx_open/script/robot/ensure_navigation_sensors.sh
+  cooling_power_mode: 1
+  normal_power_mode: 0
+  normal_start_timeout_seconds: 120
+  reboot_delay_seconds: 12
+  controller_host: "3588"
+  controller_runtime_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
+  controller_runtime_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
+
+audio_control:
+  remote_host: "3588"
+  remote_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
+  nx_card: 2
+  nx_control: "PCM"
+  command_timeout_seconds: 10

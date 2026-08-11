@@ -1,0 +1,18 @@
+[Unit]
+Description=RoamerX center MQTT device worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roamerx
+WorkingDirectory=/opt/roamerx/platform_server_code/backend
+EnvironmentFile=/etc/roamerx/center.env
+ExecStart=/opt/roamerx/venv/bin/python manage.py run_device_worker
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

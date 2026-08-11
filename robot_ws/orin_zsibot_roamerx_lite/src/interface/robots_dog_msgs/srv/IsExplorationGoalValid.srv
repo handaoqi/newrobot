@@ -1,4 +1,0 @@
-builtin_interfaces/Time timestamp
-geometry_msgs/PoseStamped goal
----
-bool is_valid

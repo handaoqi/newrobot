@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+
+PROTOCOL_VERSION = "1.0"
+COMMAND_TYPES = {
+    "task.start",
+    "task.pause",
+    "task.resume",
+    "task.cancel",
+    "task.force_exit",
+    "mapping.start",
+    "mapping.save",
+    "mapping.cancel",
+    "mapping.status",
+    "nav.status",
+    "nav.start",
+    "nav.restart",
+    "nav.recover",
+    "nav.stop",
+    "nav.initial_pose",
+    "nav.relocalize",
+    "map.activate",
+    "sensor.restart",
+    "charge.start",
+    "charge.stop",
+    "audio.volume",
+}
+UPLINK_MESSAGE_TYPES = {
+    "presence.online",
+    "presence.heartbeat",
+    "presence.offline",
+    "telemetry.status",
+    "telemetry.pose",
+    "trajectory.batch",
+    "trajectory.ack",
+    "command.ack",
+    "command.result",
+    "task.progress",
+    "task.obstacle_speech",
+    "task.accepted",
+    "task.started",
+    "task.pausing",
+    "task.paused",
+    "task.resuming",
+    "task.cancelling",
+    "task.completed",
+    "task.failed",
+    "task.cancelled",
+    "task.interrupted",
+    "alert.event",
+    "sync.request",
+    "sync.response",
+}
+ALL_MESSAGE_TYPES = UPLINK_MESSAGE_TYPES | COMMAND_TYPES
+
+
+class ProtocolError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _required(mapping: dict[str, Any], key: str) -> Any:
+    if key not in mapping or mapping[key] is None:
+        raise ProtocolError("INVALID_MESSAGE", f"missing required field: {key}")
+    return mapping[key]
+
+
+def _uuid(value: Any, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ProtocolError("INVALID_MESSAGE", f"{field} must be UUID") from exc
+
+
+def normalize_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = parse_datetime(str(value))
+    if parsed is None:
+        raise ProtocolError("INVALID_MESSAGE", f"invalid timestamp: {value}")
+    if timezone.is_naive(parsed):
+        raise ProtocolError("INVALID_MESSAGE", "timestamp must include timezone")
+    return parsed
+
+
+@dataclass(frozen=True)
+class MessageEnvelope:
+    protocol_version: str
+    message_id: uuid.UUID
+    message_type: str
+    robot_id: str
+    session_id: str
+    sent_at: datetime
+    trace_id: uuid.UUID
+    sequence: int | None
+    payload: dict[str, Any]
+    raw: dict[str, Any]
+
+
+def parse_message(raw: bytes | str | dict[str, Any]) -> MessageEnvelope:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError("INVALID_MESSAGE", "message is not valid JSON") from exc
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        raise ProtocolError("INVALID_MESSAGE", "message must be JSON object")
+
+    version = str(_required(data, "protocol_version"))
+    if version != PROTOCOL_VERSION:
+        raise ProtocolError("UNSUPPORTED_PROTOCOL_VERSION", f"unsupported protocol version: {version}")
+
+    message_type = str(_required(data, "message_type"))
+    if message_type not in ALL_MESSAGE_TYPES:
+        raise ProtocolError("INVALID_MESSAGE", f"unsupported message_type: {message_type}")
+
+    robot_id = str(_required(data, "robot_id")).strip()
+    if not robot_id:
+        raise ProtocolError("INVALID_MESSAGE", "robot_id must not be empty")
+
+    sequence = data.get("sequence")
+    if sequence is not None:
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ProtocolError("INVALID_MESSAGE", "sequence must be a non-negative integer")
+
+    payload = _required(data, "payload")
+    if not isinstance(payload, dict):
+        raise ProtocolError("INVALID_MESSAGE", "payload must be an object")
+
+    envelope = MessageEnvelope(
+        protocol_version=version,
+        message_id=_uuid(_required(data, "message_id"), "message_id"),
+        message_type=message_type,
+        robot_id=robot_id,
+        session_id=str(_required(data, "session_id")),
+        sent_at=normalize_timestamp(_required(data, "sent_at")),
+        trace_id=_uuid(_required(data, "trace_id"), "trace_id"),
+        sequence=sequence,
+        payload=payload,
+        raw=data,
+    )
+    validate_payload(envelope)
+    return envelope
+
+
+def validate_payload(envelope: MessageEnvelope) -> None:
+    payload = envelope.payload
+    if envelope.message_type in COMMAND_TYPES:
+        _uuid(_required(payload, "command_id"), "command_id")
+        normalize_timestamp(_required(payload, "issued_at"))
+        expires_at = normalize_timestamp(_required(payload, "expires_at"))
+        if expires_at <= normalize_timestamp(payload["issued_at"]):
+            raise ProtocolError("INVALID_MESSAGE", "expires_at must be after issued_at")
+        if envelope.message_type.startswith("task."):
+            _uuid(_required(payload, "task_execution_id"), "task_execution_id")
+        command = _required(payload, "command")
+        if not isinstance(command, dict):
+            raise ProtocolError("INVALID_MESSAGE", "command must be an object")
+        if envelope.message_type == "task.start":
+            _validate_task_start(command)
+    elif envelope.message_type == "command.ack":
+        _uuid(_required(payload, "command_id"), "command_id")
+        if _required(payload, "ack") not in {"accepted", "rejected"}:
+            raise ProtocolError("INVALID_MESSAGE", "ack must be accepted or rejected")
+    elif envelope.message_type == "command.result":
+        _uuid(_required(payload, "command_id"), "command_id")
+        if _required(payload, "status") not in {"succeeded", "failed", "cancelled", "timed_out"}:
+            raise ProtocolError("INVALID_MESSAGE", "invalid command result status")
+    elif envelope.message_type == "trajectory.batch":
+        _validate_trajectory_batch(payload)
+    elif envelope.message_type == "alert.event":
+        _uuid(_required(payload, "event_id"), "event_id")
+        normalize_timestamp(_required(payload, "occurred_at"))
+        _required(payload, "event_type")
+        _required(payload, "severity")
+
+
+def _validate_task_start(command: dict[str, Any]) -> None:
+    route = _required(command, "route_snapshot")
+    if not isinstance(route, dict):
+        raise ProtocolError("INVALID_MESSAGE", "route_snapshot must be an object")
+    waypoints = _required(route, "waypoints")
+    if not isinstance(waypoints, list) or not waypoints:
+        raise ProtocolError("INVALID_MESSAGE", "task.start requires at least one waypoint")
+    for index, waypoint in enumerate(waypoints):
+        if not isinstance(waypoint, dict):
+            raise ProtocolError("INVALID_MESSAGE", "waypoint must be an object")
+        if waypoint.get("sequence") != index:
+            raise ProtocolError("INVALID_MESSAGE", "waypoint sequence must start at 0 and be contiguous")
+        for coordinate in ("x", "y", "yaw"):
+            if isinstance(waypoint.get(coordinate), bool) or not isinstance(waypoint.get(coordinate), (int, float)):
+                raise ProtocolError("INVALID_MESSAGE", f"waypoint {coordinate} must be numeric")
+        actions = waypoint.get("actions", [])
+        if not isinstance(actions, list) or any(action != "snapshot" for action in actions):
+            raise ProtocolError("INVALID_MESSAGE", "P0 waypoint actions only support snapshot")
+    record_rosbag = command.get("record_rosbag")
+    if record_rosbag is not None and not isinstance(record_rosbag, bool):
+        raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
+
+
+def _validate_trajectory_batch(payload: dict[str, Any]) -> None:
+    _uuid(_required(payload, "task_execution_id"), "task_execution_id")
+    _uuid(_required(payload, "batch_id"), "batch_id")
+    points = _required(payload, "points")
+    if not isinstance(points, list) or not 1 <= len(points) <= 100:
+        raise ProtocolError("INVALID_MESSAGE", "trajectory points must contain 1..100 items")
+    sequences = []
+    for point in points:
+        if not isinstance(point, dict):
+            raise ProtocolError("INVALID_MESSAGE", "trajectory point must be an object")
+        seq = _required(point, "seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise ProtocolError("INVALID_MESSAGE", "trajectory seq must be non-negative integer")
+        sequences.append(seq)
+        normalize_timestamp(_required(point, "sampled_at"))
+        for coordinate in ("x", "y", "yaw"):
+            if isinstance(point.get(coordinate), bool) or not isinstance(point.get(coordinate), (int, float)):
+                raise ProtocolError("INVALID_MESSAGE", f"trajectory {coordinate} must be numeric")
+    if sequences != list(range(sequences[0], sequences[0] + len(sequences))):
+        raise ProtocolError("INVALID_MESSAGE", "trajectory seq must be contiguous")
+    if payload.get("first_seq") != sequences[0] or payload.get("last_seq") != sequences[-1]:
+        raise ProtocolError("INVALID_MESSAGE", "trajectory batch range does not match points")
+
+
+def build_command_message(command: Any, *, session_id: str = "") -> dict[str, Any]:
+    task_execution_id = str(command.task_execution_id) if command.task_execution_id else None
+    payload = {
+        "command_id": str(command.id),
+        "issued_at": command.issued_at.isoformat(timespec="milliseconds"),
+        "expires_at": command.expires_at.isoformat(timespec="milliseconds"),
+        "operator_id": str(command.operator_id) if command.operator_id else None,
+        "task_execution_id": task_execution_id,
+        "command": command.payload,
+    }
+    if task_execution_id:
+        payload["expected_robot_state_version"] = command.robot.last_state_version
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "message_id": str(uuid.uuid4()),
+        "message_type": command.command_type,
+        "robot_id": command.robot.code,
+        "session_id": session_id or str(uuid.uuid4()),
+        "sent_at": timezone.now().isoformat(timespec="milliseconds"),
+        "trace_id": str(command.trace_id),
+        "payload": payload,
+    }

@@ -1,75 +1,24 @@
-# Local secrets and access notes
-.env
+**/__pycache__/
+**/.pytest_cache/
+**/node_modules/
+**/dist/
+**/build/
+**/install/
+**/log/
+*.py[cod]
+*.secret.yaml
+*.secret.yml
+*.env
 .env.*
 !.env.example
-REMOTE_ACCESS_INFO.md
-ssh_askpass_*.cmd
 *.pem
 *.key
 *.ppk
 id_rsa*
 id_ed25519*
 known_hosts*
-
-# Runtime state and logs
-.dog_remote_tunnel.*
-*.log
-*.pid
-
-# Python cache and local environments
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-
-# Generated archives and encoded bundles
-*.zip
-*.tar
-*.tar.gz
-*.b64
-
-# Generated render/check folders
-lo_pdf/
-lo_test/
-lo_test2/
-lo_test3/
-report_pdf_check/
-tech_stack_render/
-patrol_comparison_render/
-
-# Generated report documents and one-off report builders
-*.docx
-*.pdf
-make_*_docx.py
-make_*_report.py
-
-# Local scans, screenshots, and temporary artifacts
-_file_scan_summary.json
-_snapshot_test.jpg
-*.tmp
-*.bak
-
-# Robot data that can grow very large
 *.bag
 *.db3
 *.mcap
-*.pcd
-*.bin
-*.pgm
-*.gif
-robot_ws/_archives/
-robot_ws/vendor/
-robot_ws/**/build/
-robot_ws/**/install/
-robot_ws/**/log/
-robot_ws/**/.colcon/
-genisom_l1_sdk/
-
-# OS/editor files
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+*.log
+*.pid

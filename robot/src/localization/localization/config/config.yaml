@@ -1,0 +1,104 @@
+localization:
+  ros__parameters:
+    # basic parameters
+    points_topic: "/front_lidar"      # 真机: firefly 转发来的 livox 点云
+    imu_topic: "/front_lidar/imu"     # 真机: 雷达内置 IMU
+    gnss_topic: "/fix"
+    localization_odom_frame_id: "base_link"
+    robot_odom_frame_id: "odom"
+    odom_child_frame_id: "base_link"
+    robot_odom_topic: "/odom/mc_odom"
+    # Use the robot's high-rate odometry delta as the NDT initial guess. This
+    # keeps scan matching aligned during in-place turns where IMU-only UKF
+    # prediction can be pulled into a stale NDT local optimum.
+    # The controller odometry uses device-uptime timestamps and its yaw drifts
+    # against lidar SLAM. Keep it recorded for diagnostics, but do not seed NDT
+    # until that clock/frame contract has been calibrated.
+    enable_robot_odometry_prediction: false
+    send_tf_transforms: true
+    tf_use_current_time: true
+    # Keep map->odom available slightly ahead of Nav2 controller requests.
+    tf_future_offset: 0.10
+    
+    # topic name
+    odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom 
+    aligned_points_topic: "/aligned_points"
+    localization_info_topic: "/localization_info"
+    global_map_points_topic: "/global_map_points"
+
+    # IMU parameters
+    use_imu: true
+    invert_acc: false
+    invert_gyro: false
+    imu_acc_scale: 9.81 # 若 /front_lidar/imu 已是 m/s^2，实测后改为 1.0
+
+    gnss_fusion:
+      enable: true
+      gain: 0.20
+      max_correction_step: 0.30
+      max_residual: 5.0
+      max_age: 1.5
+      max_horizontal_std: 1.5
+      min_status: 1
+      use_elevation: false
+      lever_arm_base: [-0.05, 0.0, 0.15]
+      auto_recovery_enable: true
+      auto_recovery_retry_seconds: 5.0
+      rtk_pvh_topic: /rtk_pvh
+      # Fixed-RTK recovery requires a valid dual-antenna heading. Invalid or
+      # high-variance heading samples are rejected instead of changing pose.
+      use_heading: true
+      heading_offset_deg: 0.0
+      heading_max_std_deg: 5.0
+      heading_min_baseline_m: 0.20
+      heading_max_age: 1.5
+    
+    # IMU initialization parameters
+    imu_init_time: 3.0                    # IMU初始化时间(s)
+    imu_init_queue_size: 600              # IMU初始化队列长度
+    imu_init_max_gyro_var: 0.05          # IMU陀螺仪最大方差阈值
+    imu_init_max_acce_var: 0.5           # IMU加速度计最大方差阈值
+
+    # numeric parameters
+    imu_data_filter_num: 5
+    globalmap_voxel_size: 0.3
+    points_voxel_filter_size: 0.2
+
+    # other parameters
+    cool_time_duration: 0.5
+
+    # registration method parameters
+    reg_method: "NDT_OMP"
+    ndt_neighbor_search_method: "DIRECT7"
+    ndt_neighbor_search_radius: 1.0
+    ndt_resolution: 0.5
+
+    # initial pose parameters
+    specify_init_pose: true
+    init_pos_x: 0.0
+    init_pos_y: 0.0
+    init_pos_z: 0.0
+    init_ori_w: 1.0
+    init_ori_x: 0.0
+    init_ori_y: 0.0
+    init_ori_z: 0.0
+
+    # Livox Mid-360 manual: IMU acceleration/gyro axes are the same as point cloud axes.
+    # IMU chip position in point cloud coordinates: x=11.0mm, y=23.29mm, z=-44.12mm.
+    init_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # imu安装位置的旋转矩阵
+    init_T: [1.0, 0.0, 0.0, -0.011, 0.0, 1.0, 0.0, -0.02329, 0.0, 0.0, 1.0, 0.04412, 0.0, 0.0, 0.0, 1.0] # 雷达到imu的变换矩阵
+
+    # initial pose initialization parameters 
+    init_match_count_threshold: 2         
+    init_match_score_threshold: 0.45      
+
+    # Global localization parameters
+    use_global_localization_init: true
+    init_pose_change_threshold: 0.01      
+    init_quat_change_threshold: 0.01      
+    global_localization_timeout: 10.0
+    # After one second of continuous NDT failure at 10 Hz, try one bounded
+    # global ICP from the last pose that passed scan-matching validation.
+    runtime_relocalization_failure_threshold: 10
+    runtime_relocalization_retry_seconds: 5.0
+
