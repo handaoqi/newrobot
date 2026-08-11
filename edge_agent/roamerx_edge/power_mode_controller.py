@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shlex
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -58,6 +60,25 @@ class PowerModeController:
                 "active": active,
                 "expected_active": expected,
                 "matches_mode": active == expected,
+            }
+        remote_eggs = self._remote_egg_status()
+        remote_groups = (
+            ("controller_video", "3588视频推流", ("push_image",)),
+            ("controller_motion", "3588运动与任务", ("spline_daemon", "motion_control", "dog_task")),
+            ("controller_sensors", "3588传感器转发", ("imu_daemon", "ecal2ros")),
+            ("controller_monitor", "3588设备监控", ("monitor",)),
+            ("controller_ros", "3588 ROS路由", ("zenoh_route",)),
+        )
+        for key, name, eggs in remote_groups:
+            available = remote_eggs is not None and all(egg in remote_eggs for egg in eggs)
+            active = available and all(remote_eggs[egg] for egg in eggs)
+            expected = not cooling
+            services[key] = {
+                "name": name,
+                "active": active,
+                "available": available,
+                "expected_active": expected,
+                "matches_mode": available and active == expected,
             }
         charger_active = bool(power.get("charger_controller_active"))
         services["charge_controller"] = {
@@ -215,6 +236,31 @@ class PowerModeController:
             )
         except Exception:
             return "unknown"
+
+    def _remote_egg_status(self) -> dict[str, bool] | None:
+        checks = []
+        for egg in self.config.controller_runtime_eggs:
+            quoted = shlex.quote(egg)
+            checks.append(
+                f"if robot-launch egg {quoted} 2>/dev/null | grep -q running; "
+                f"then echo {quoted}=1; else echo {quoted}=0; fi"
+            )
+        try:
+            result = self.runner(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                    self.config.controller_host, "; ".join(checks),
+                ],
+                10,
+            )
+            if result.returncode != 0:
+                return None
+            return {
+                key: value == "1"
+                for key, value in re.findall(r"^([a-z0-9_]+)=([01])$", result.stdout, flags=re.MULTILINE)
+            }
+        except Exception:
+            return None
 
     def _schedule_power_mode_reboot(self, mode: int) -> None:
         unit = f"roamerx-power-mode-{int(datetime.now(timezone.utc).timestamp())}"

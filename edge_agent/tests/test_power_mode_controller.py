@@ -49,6 +49,8 @@ def test_service_status_is_compared_with_current_mode(tmp_path):
             return result(stdout="NV Power Mode: 10W\n1\n")
         if command[:3] == ["systemctl", "is-active", "roamerx-edge-agent.service"]:
             return result()
+        if command[0] == "ssh":
+            return result(stdout="\n".join(f"{egg}=0" for egg in PowerModeConfig().controller_runtime_eggs))
         return result(returncode=1)
 
     config = PowerModeConfig(
@@ -64,6 +66,9 @@ def test_service_status_is_compared_with_current_mode(tmp_path):
     assert services["detection_video"]["matches_mode"] is True
     assert services["charge_controller"]["matches_mode"] is True
     assert services["power_profile"]["matches_mode"] is True
+    assert services["controller_video"]["matches_mode"] is True
+    assert services["controller_motion"]["matches_mode"] is True
+    assert services["controller_sensors"]["matches_mode"] is True
 
 
 def test_cooling_schedules_forced_reboot(tmp_path):
@@ -113,3 +118,28 @@ def test_full_charge_stops_charger_and_restores_normal(tmp_path):
         time.sleep(0.01)
 
     assert calls == ["stop", "normal"]
+
+
+def test_charge_commands_stop_and_restore_3588_runtime_eggs():
+    class FakePowerMode:
+        def enter_cooling(self):
+            return {"mode": "cooling_standby"}
+
+        def set_auto_charge_enabled(self, _enabled):
+            return None
+
+        def ensure_cooling_power_profile(self):
+            return {"mode": "cooling_standby", "transition_state": "ready"}
+
+        def restore_normal(self):
+            return {"mode": "normal"}
+
+    adapter = ChargeControlAdapter(ChargeControlConfig(), FakePowerMode())
+    commands = []
+    adapter._run = lambda action, command: commands.append((action, command)) or {"action": action}
+
+    adapter.start()
+    adapter.stop()
+
+    assert "robot-launch stop push_image spline_daemon motion_control dog_task" in commands[0][1]
+    assert "robot-launch start zenoh_route imu_daemon ecal2ros motion_control" in commands[1][1]

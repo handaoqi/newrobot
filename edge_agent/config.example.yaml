@@ -113,9 +113,11 @@ charge_control:
   service_name: "roamerx-charge-pile"
   working_directory: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
   executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
-  command_timeout_seconds: 20
+  command_timeout_seconds: 35
   full_battery_percent: 100
   full_confirmation_samples: 3
+  cooling_stop_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
+  normal_start_eggs: [zenoh_route, imu_daemon, ecal2ros, motion_control, spline_daemon, dog_task, monitor, push_image]
 
 power_mode:
   state_path: /home/robot/edge_agent/data/power_mode.json
@@ -127,6 +129,8 @@ power_mode:
   normal_power_mode: 0
   normal_start_timeout_seconds: 120
   reboot_delay_seconds: 12
+  controller_host: "3588"
+  controller_runtime_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
 
 audio_control:
   remote_host: "3588"

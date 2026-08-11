@@ -151,9 +151,17 @@ class ChargeControlConfig:
     service_name: str = "roamerx-charge-pile"
     working_directory: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
     executable: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
-    command_timeout_seconds: int = 20
+    command_timeout_seconds: int = 35
     full_battery_percent: int = 100
     full_confirmation_samples: int = 3
+    cooling_stop_eggs: tuple[str, ...] = (
+        "push_image", "spline_daemon", "motion_control", "dog_task",
+        "imu_daemon", "ecal2ros", "monitor", "zenoh_route",
+    )
+    normal_start_eggs: tuple[str, ...] = (
+        "zenoh_route", "imu_daemon", "ecal2ros", "motion_control",
+        "spline_daemon", "dog_task", "monitor", "push_image",
+    )
 
 
 @dataclass
@@ -167,6 +175,11 @@ class PowerModeConfig:
     normal_power_mode: int = 0
     normal_start_timeout_seconds: int = 120
     reboot_delay_seconds: int = 12
+    controller_host: str = "3588"
+    controller_runtime_eggs: tuple[str, ...] = (
+        "push_image", "spline_daemon", "motion_control", "dog_task",
+        "imu_daemon", "ecal2ros", "monitor", "zenoh_route",
+    )
 
 
 @dataclass

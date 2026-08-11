@@ -63,7 +63,7 @@ class SystemTelemetryProbe:
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=3",
                 self.config.battery_ssh_host,
-                "timeout 4 ecal_mon_cli --proto battery_state -c 1 2>/dev/null; "
+                "timeout 4 ecal_mon_cli --proto power_mcu/bms_info -c 1 2>/dev/null; "
                 "echo __CHARGE_SERVICE__; systemctl is-active roamerx-charge-pile.service 2>/dev/null || true; "
                 "echo __CHARGE_STATE__; sudo journalctl -u roamerx-charge-pile.service -n 80 --no-pager 2>/dev/null "
                 "| grep -E 'connected=|charge pin=' | tail -n 2",
