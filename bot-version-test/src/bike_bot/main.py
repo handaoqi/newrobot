@@ -341,6 +341,7 @@ def status_worker(stop_event: threading.Event, client: TelemetryClient, interval
 def detection_worker(
     stop_event: threading.Event,
     detector: YoloDetector,
+    person_detector: YoloDetector | None,
     client: TelemetryClient,
     runtime_state: RuntimeState,
     error_queue: Queue[BaseException],
@@ -351,6 +352,8 @@ def detection_worker(
     last_frame_id = 0
     frame_number = 0
     perf_window = DetectionPerfWindow(0.0)
+    person_detection_enabled = False
+    next_person_mode_poll_at = 0.0
     try:
         while not stop_event.is_set():
             sample = latest_capture.wait_for_latest(last_frame_id)
@@ -374,9 +377,33 @@ def detection_worker(
 
             detect_started_at = time.perf_counter()
             result = detector.detect(frame)
+            now = time.monotonic()
+            if now >= next_person_mode_poll_at:
+                requested = client.fetch_person_detection_enabled()
+                if requested is not None and requested != person_detection_enabled:
+                    person_detection_enabled = requested
+                    LOGGER.info("person detection inference %s", "enabled" if requested else "disabled")
+                next_person_mode_poll_at = now + 1.0
+            live_tracks = [
+                track
+                for track in (result.tracked_objects or [])
+                if str(track.label).lower() in {"bicycle", "bike", "自行车"}
+            ]
+            if person_detection_enabled:
+                if person_detector is not None:
+                    person_result = person_detector.detect(result.preview_frame)
+                    result.preview_frame = person_result.preview_frame
+                    result.target_count += person_result.target_count
+                    live_tracks.extend(person_result.tracked_objects or [])
+                else:
+                    live_tracks.extend(
+                        track
+                        for track in (result.tracked_objects or [])
+                        if str(track.label).lower() == "person"
+                    )
+            client.send_person_detections(live_tracks)
             detect_seconds = time.perf_counter() - detect_started_at
             target_count = result.target_count
-            client.send_person_detections(result.tracked_objects or [])
             preview_started_at = time.perf_counter()
             preview_frame = detector.annotate_status(result.preview_frame, fps=fps, target_count=target_count)
             should_continue = detector.show_preview(preview_frame)
@@ -530,6 +557,18 @@ def main() -> None:
     except Exception:
         LOGGER.exception("model load failed, detection disabled")
         detector = None
+    person_detector = None
+    if config.person_model is not None:
+        try:
+            person_detector = YoloDetector(
+                config,
+                model_config=config.person_model,
+                target_labels=["person"],
+                event_labels=[],
+                emit_events=False,
+            )
+        except Exception:
+            LOGGER.exception("person model load failed, person following disabled")
     client = TelemetryClient(config, runtime_state, sdk_client)
     audio_command_client = AudioCommandClient(config)
     pusher = StreamPusher(config)
@@ -560,7 +599,7 @@ def main() -> None:
         threads.append(
             threading.Thread(
                 target=detection_worker,
-                args=(stop_event, detector, client, runtime_state, error_queue),
+                args=(stop_event, detector, person_detector, client, runtime_state, error_queue),
                 daemon=False,
                 name="detection-worker",
             )

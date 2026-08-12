@@ -12,13 +12,22 @@
 
 ## 1. 安装
 
-板端默认使用 ONNX + OpenCV DNN 推理，不需要安装 PyTorch。
+板端使用 ONNX Runtime GPU 推理，不需要安装 PyTorch。先安装通用依赖：
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+Jetson JetPack 6 / CUDA 12.6 需要安装 NVIDIA Jetson AI Lab 提供的适配包，不能使用通用 PyPI wheel：
+
+```bash
+chmod +x ../deploy/install_jetson_onnxruntime.sh
+../deploy/install_jetson_onnxruntime.sh
+```
+
+脚本固定安装 `onnxruntime-gpu 1.23.0`，并检查 `CUDAExecutionProvider` 是否可用。
 
 如果你想直接使用 `python -m bike_bot.main` 这类模块启动方式，再额外执行一次：
 
@@ -40,8 +49,9 @@ copy config.example.yaml config.yaml
 - `video.rtsp_transport`: `tcp` 或 `udp`
 - `video.open_timeout_seconds`: RTSP 建连超时时间
 - `video.read_timeout_seconds`: RTSP 读帧超时时间
-- `model.path`: 你的 ONNX 模型路径，例如 `models/bike.onnx`
-- `model.backend`: 板端使用 `opencv_dnn`，开发机也可设为 `ultralytics` 直接加载 `.pt`
+- `model.path`: 自行车告警专用 ONNX 模型，例如 `models/bike.onnx`
+- `person_model.path`: 人员跟随使用的通用 YOLO 模型；平台开启跟踪识别后才执行推理
+- `model.backend` / `person_model.backend`: 板端优先使用 `onnxruntime` CUDA Provider，也可使用 `opencv_dnn`
 - `detection.tracking_enabled`: 是否启用同车跟踪去重
 - `detection.track_ttl_seconds`: 目标离开画面多久后释放跟踪 ID
 - `detection.duplicate_alert_seconds`: 同一跟踪 ID 两次告警的最小间隔
