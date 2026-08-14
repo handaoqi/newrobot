@@ -14,7 +14,7 @@ localization:
     # The controller odometry uses device-uptime timestamps and its yaw drifts
     # against lidar SLAM. Keep it recorded for diagnostics, but do not seed NDT
     # until that clock/frame contract has been calibrated.
-    enable_robot_odometry_prediction: false
+    enable_robot_odometry_prediction: true
     send_tf_transforms: true
     tf_use_current_time: true
     # Keep map->odom available slightly ahead of Nav2 controller requests.
@@ -52,6 +52,21 @@ localization:
       heading_max_std_deg: 5.0
       heading_min_baseline_m: 0.20
       heading_max_age: 1.5
+
+    source_arbiter:
+      enable: true
+      # LiDAR is approximately 10 Hz: every fifth moving frame gives 2 Hz NDT.
+      moving_ndt_stride: 5
+      # Do not abandon a healthy NDT source on a single noisy moving scan.
+      ndt_failure_hysteresis_frames: 3
+      bridge_max_distance_m: 10.0
+      bridge_max_seconds: 20.0
+      max_horizontal_sigma_m: 0.8
+      max_yaw_sigma_deg: 15.0
+      odom_translation_variance_per_m: 0.0025
+      max_odom_speed_mps: 1.5
+      max_odom_yaw_rate_rps: 2.0
+      absolute_recovery_samples: 2
     
     # IMU initialization parameters
     imu_init_time: 3.0                    # IMU初始化时间(s)

@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable
 
-from .config import TelemetryConfig
+from .config import ChargeControlConfig, TelemetryConfig
 from .telemetry_collector import TelemetryCollector
 
 
@@ -36,10 +36,12 @@ class SystemTelemetryProbe:
         self,
         config: TelemetryConfig,
         telemetry: TelemetryCollector,
+        charge_config: ChargeControlConfig | None = None,
         runner: Callable[[list[str], float], CommandResult] = _run,
     ) -> None:
         self.config = config
         self.telemetry = telemetry
+        self.charge_config = charge_config or ChargeControlConfig()
         self.runner = runner
 
     def poll(self) -> None:
@@ -65,6 +67,7 @@ class SystemTelemetryProbe:
                 self.config.battery_ssh_host,
                 "timeout 4 ecal_mon_cli --proto power_mcu/bms_info -c 1 2>/dev/null; "
                 "echo __CHARGE_SERVICE__; systemctl is-active roamerx-charge-pile.service 2>/dev/null || true; "
+                "echo __CHARGE_MODE__; cat /var/lib/roamerx-charge-pile/state 2>/dev/null || echo unknown; "
                 "echo __CHARGE_STATE__; sudo journalctl -u roamerx-charge-pile.service -n 80 --no-pager 2>/dev/null "
                 "| grep -E 'connected=|charge pin=' | tail -n 2",
             ],
@@ -92,7 +95,14 @@ class SystemTelemetryProbe:
         charge_pin = int(state_matches[-1][0]) if state_matches else None
         negative_contact = int(state_matches[-1][1]) if state_matches else None
         positive_contact = int(state_matches[-1][2]) if state_matches else None
+        if not bluetooth_connected:
+            charge_pin = None
+            negative_contact = None
+            positive_contact = None
         controller_active = "__CHARGE_SERVICE__\nactive" in result.stdout
+        mode_match = re.search(r"__CHARGE_MODE__\n(lying|unknown)", result.stdout)
+        controller_mode = mode_match.group(1) if mode_match else "unknown"
+        charging_requested = controller_mode == "lying"
         charger_confirmed = bool(
             controller_active
             and bluetooth_connected
@@ -105,18 +115,26 @@ class SystemTelemetryProbe:
             and current_ma >= self.config.charging_current_threshold_ma
         )
         temperature_c = round(values["temp"] / 1000, 1) if "temp" in values else None
-        thermal_protection = bool(
-            charger_confirmed
-            and not charging
-            and temperature_c is not None
+        bms_error_code = values.get("error")
+        thermal_protection_by_bms = bms_error_code == 1034
+        thermal_protection_by_temperature = bool(
+            temperature_c is not None
             and temperature_c >= self.config.charging_overheat_threshold_c
+        )
+        thermal_protection = bool(
+            charging_requested
+            and charger_confirmed
+            and not charging
+            and (thermal_protection_by_bms or thermal_protection_by_temperature)
         )
         if charging:
             charge_state = "charging"
         elif thermal_protection:
             charge_state = "thermal_protection"
-        elif charger_confirmed:
+        elif charging_requested and charger_confirmed:
             charge_state = "waiting"
+        elif controller_active and bluetooth_connected:
+            charge_state = "ready"
         else:
             charge_state = "disconnected"
         self.telemetry.on_battery(
@@ -125,16 +143,31 @@ class SystemTelemetryProbe:
             voltage_v=round(values["volt"] / 1000, 2) if "volt" in values else None,
             current_a=round(current_ma / 1000, 2) if current_ma is not None else None,
             temperature_c=temperature_c,
-            error_code=values.get("error"),
+            error_code=bms_error_code,
             source="power_mcu/bms_info",
             bluetooth_connected=bluetooth_connected,
             charge_pin=charge_pin,
             negative_contact=negative_contact,
             positive_contact=positive_contact,
             charger_controller_active=controller_active,
+            charger_controller_mode=controller_mode,
+            charging_requested=charging_requested,
             charge_state=charge_state,
             thermal_protection=thermal_protection,
+            thermal_protection_source=(
+                "bms_error_1034" if thermal_protection_by_bms
+                else "temperature_threshold" if thermal_protection_by_temperature
+                else ""
+            ),
             charging_overheat_threshold_c=self.config.charging_overheat_threshold_c,
+            full_battery_percent=self.charge_config.full_battery_percent,
+            low_battery_start_percent=self.charge_config.low_battery_start_percent,
+            low_battery_confirmation_samples=self.charge_config.low_battery_confirmation_samples,
+            rated_capacity_wh=self.config.battery_rated_capacity_wh,
+            remaining_energy_wh=round(
+                self.config.battery_rated_capacity_wh * max(0, min(100, values["power"])) / 100, 1
+            ),
+            remaining_energy_estimated=True,
         )
 
     def _poll_network(self) -> None:

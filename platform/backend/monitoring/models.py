@@ -78,6 +78,14 @@ class Robot(BaseTimestampModel):
     )
     current_map_id = models.CharField(max_length=128, blank=True)
     current_map_version = models.CharField(max_length=64, blank=True)
+    charging_map = models.ForeignKey(
+        "MapData", related_name="charging_robots", on_delete=models.SET_NULL,
+        null=True, blank=True,
+    )
+    charging_route = models.ForeignKey(
+        "PatrolRoute", related_name="charging_robots", on_delete=models.SET_NULL,
+        null=True, blank=True,
+    )
     last_state_version = models.BigIntegerField(default=0)
     last_seen_at = models.DateTimeField(null=True, blank=True)
 
@@ -98,7 +106,7 @@ class Robot(BaseTimestampModel):
 
 
 class RobotPersonDetectionState(BaseTimestampModel):
-    """Latest person detections only; high-rate frames must not become alert records."""
+    """Latest live detection boxes; high-rate frames must not become alert records."""
 
     robot = models.OneToOneField(
         Robot,
@@ -110,6 +118,7 @@ class RobotPersonDetectionState(BaseTimestampModel):
     frame_height = models.PositiveIntegerField(default=0)
     captured_at = models.DateTimeField(default=timezone.now)
     detections = models.JSONField(default=list, blank=True)
+    enabled = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["robot__code"]
@@ -437,6 +446,11 @@ class RobotCommand(BaseTimestampModel):
         ("shake_hand", "握手"),
         ("stand_up", "站立"),
         ("lie_down", "趴下"),
+        ("crawl_forward", "匍匐前进"),
+        ("speed_micro", "微速档"),
+        ("speed_slow", "低速档"),
+        ("speed_normal", "中速档"),
+        ("speed_fast", "高速档"),
         ("move_forward", "前进"),
         ("move_backward", "后退"),
         ("move_left", "左移"),
@@ -457,7 +471,12 @@ class RobotCommand(BaseTimestampModel):
         ("play_audio", "播放音频"),
         ("charge_start", "开始充电"),
         ("charge_stop", "断开充电"),
+        ("motion_start", "启动运控"),
+        ("motion_stop", "停止运控"),
         ("audio_volume", "调节音量"),
+        ("skill", "执行遥控技能"),
+        ("skill_status", "查询遥控技能"),
+        ("skill_cancel", "取消遥控技能"),
     ]
     STATUS_CHOICES = [
         ("queued", "待发送"),
@@ -587,6 +606,8 @@ class MapData(BaseTimestampModel):
     pgm_file = models.FileField(upload_to='maps/', verbose_name="PGM地图文件", null=True, blank=True)
     yaml_file = models.FileField(upload_to='maps/', verbose_name="YAML配置文件", null=True, blank=True)
     thumbnail = models.ImageField(upload_to='maps/thumbnails/', null=True, blank=True, verbose_name="缩略图")
+    trajectory_file = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图轨迹")
+    mapping_trace = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图定位轨迹")
     resolution = models.FloatField(default=0.05, verbose_name="分辨率(m/像素)")
     width = models.IntegerField(default=0, verbose_name="宽度(像素)")
     height = models.IntegerField(default=0, verbose_name="高度(像素)")
@@ -877,11 +898,18 @@ class RemoteCommand(BaseTimestampModel):
         ("sensor.restart", "重启传感器"),
         ("charge.start", "开始充电"),
         ("charge.stop", "断开充电"),
+        ("motion.start", "启动运控"),
+        ("motion.stop", "停止运控"),
         ("audio.volume", "调节扬声器音量"),
         ("teleop.takeover_enter", "进入远程接管"),
         ("teleop.takeover_exit", "退出远程接管"),
         ("teleop.stand_up", "站立"),
         ("teleop.lie_down", "趴下"),
+        ("teleop.crawl_forward", "匍匐前进"),
+        ("teleop.speed_micro", "微速档"),
+        ("teleop.speed_slow", "低速档"),
+        ("teleop.speed_normal", "中速档"),
+        ("teleop.speed_fast", "高速档"),
         ("teleop.move_forward", "前进"),
         ("teleop.move_backward", "后退"),
         ("teleop.move_left", "左移"),
@@ -891,6 +919,9 @@ class RemoteCommand(BaseTimestampModel):
         ("teleop.move_velocity", "跟随速度"),
         ("teleop.move_stop", "停止移动"),
         ("teleop.passive", "软急停"),
+        ("teleop.skill", "执行遥控技能"),
+        ("teleop.skill_status", "查询遥控技能"),
+        ("teleop.skill_cancel", "取消遥控技能"),
     ]
     STATUS_CHOICES = [
         ("created", "已创建"),
@@ -1094,6 +1125,7 @@ class DevelopmentTask(BaseTimestampModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     robot = models.ForeignKey(Robot, related_name="development_tasks", on_delete=models.PROTECT)
     workspace = models.CharField(max_length=64)
+    model = models.CharField(max_length=64, default="gpt-5.6-terra")
     prompt = models.TextField()
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="created")
     operator = models.ForeignKey(
@@ -1135,4 +1167,35 @@ class DevelopmentTaskEvent(models.Model):
         ordering = ["sequence"]
         constraints = [
             models.UniqueConstraint(fields=["task", "sequence"], name="uniq_dev_task_event_sequence")
+        ]
+
+
+class VoiceRecognitionEvent(BaseTimestampModel):
+    """Text-only audit trail for each development voice-recognition attempt."""
+
+    OUTCOME_CHOICES = [
+        ("accepted", "已创建开发任务"),
+        ("armed", "已唤醒，等待指令"),
+        ("busy", "已有开发任务执行中"),
+        ("ignored", "未命中唤醒词"),
+        ("no_speech", "未识别到有效语音"),
+    ]
+
+    robot = models.ForeignKey(Robot, related_name="voice_recognition_events", on_delete=models.CASCADE)
+    task = models.ForeignKey(
+        DevelopmentTask,
+        related_name="voice_recognition_events",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    transcript = models.TextField(blank=True)
+    command = models.TextField(blank=True)
+    asr_engine = models.CharField(max_length=64, blank=True)
+    outcome = models.CharField(max_length=16, choices=OUTCOME_CHOICES)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["robot", "-created_at"], name="voice_rec_robot_time_idx"),
         ]

@@ -4,6 +4,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 from typing import Any
 
 from django.conf import settings
@@ -13,7 +14,7 @@ from django.utils import timezone
 from .message_handlers import handle_mqtt_message
 from .dev_message_handlers import handle_dev_mqtt_message
 from .models import DevelopmentTask, RemoteCommand
-from .protocol import build_command_message
+from .protocol import ProtocolError, build_command_message
 from .services.command_service import CommandService
 
 LOGGER = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class PlatformMqttClient:
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
+        self._last_protocol_error_at: dict[str, float] = {}
         self._connected = threading.Event()
 
     def connect(self) -> None:
@@ -77,6 +79,7 @@ class PlatformMqttClient:
             "robots/+/dev/presence",
             "robots/+/dev/tasks/+/events",
             "robots/+/dev/tasks/+/result",
+            "robots/+/dev/voice/audio",
         ):
             client.subscribe(topic, qos=1 if "pose" not in topic and "status" not in topic else 0)
         LOGGER.info("MQTT device worker connected")
@@ -88,9 +91,16 @@ class PlatformMqttClient:
     def on_message(self, client, userdata, message) -> None:
         try:
             if "/dev/" in message.topic:
-                handle_dev_mqtt_message(message.topic, message.payload)
+                handle_dev_mqtt_message(message.topic, message.payload, self.publish_json)
             else:
                 handle_mqtt_message(message.topic, message.payload, self.publish_json)
+        except ProtocolError as exc:
+            # A malformed telemetry batch must not turn into thousands of tracebacks.
+            now = time.monotonic()
+            last_reported = self._last_protocol_error_at.get(message.topic, 0.0)
+            if now - last_reported >= 60.0:
+                LOGGER.warning("discarded invalid device message topic=%s error=%s", message.topic, exc)
+                self._last_protocol_error_at[message.topic] = now
         except Exception:
             LOGGER.exception("failed to process device message topic=%s", message.topic)
 
@@ -137,7 +147,9 @@ class PlatformMqttClient:
                 {
                     "task_id": str(task.id),
                     "workspace": task.workspace,
+                    "model": task.model,
                     "prompt": task.prompt,
+                    "conversation_id": "main",
                     "created_at": task.created_at,
                 },
                 qos=1,

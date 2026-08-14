@@ -55,6 +55,7 @@ namespace navigo_path_controller
 SimpleGoalChecker::SimpleGoalChecker()
 : xy_goal_tolerance_(0.25),
   yaw_goal_tolerance_(0.25),
+  required_yaw_goal_tolerance_(0.25),
   stateful_(true),
   check_xy_(true),
   xy_goal_tolerance_sq_(0.0625)
@@ -78,16 +79,25 @@ void SimpleGoalChecker::initialize(
   navigo_util::declare_parameter_if_not_declared(
     node,
     plugin_name + ".stateful", rclcpp::ParameterValue(true));
+  navigo_util::declare_parameter_if_not_declared(
+    node,
+    plugin_name + ".required_yaw_goal_tolerance", rclcpp::ParameterValue(0.25));
 
   node->get_parameter(plugin_name + ".xy_goal_tolerance", xy_goal_tolerance_);
   node->get_parameter(plugin_name + ".yaw_goal_tolerance", yaw_goal_tolerance_);
   node->get_parameter(plugin_name + ".stateful", stateful_);
+  node->get_parameter(plugin_name + ".required_yaw_goal_tolerance", required_yaw_goal_tolerance_);
 
   xy_goal_tolerance_sq_ = xy_goal_tolerance_ * xy_goal_tolerance_;
 
   // Add callback for dynamic parameters
   dyn_params_handler_ = node->add_on_set_parameters_callback(
     std::bind(&SimpleGoalChecker::dynamicParametersCallback, this, _1));
+  require_goal_yaw_sub_ = node->create_subscription<std_msgs::msg::Bool>(
+    "/navigation/require_goal_yaw", rclcpp::QoS(1).reliable().transient_local(),
+    [this](const std_msgs::msg::Bool::SharedPtr message) {
+      require_goal_yaw_.store(message->data);
+    });
 }
 
 void SimpleGoalChecker::reset()
@@ -111,10 +121,13 @@ bool SimpleGoalChecker::isGoalReached(
       check_xy_ = false;
     }
   }
+  if (!require_goal_yaw_.load()) {
+    return true;
+  }
   double dyaw = angles::shortest_angular_distance(
     tf2::getYaw(query_pose.orientation),
     tf2::getYaw(goal_pose.orientation));
-  return fabs(dyaw) < yaw_goal_tolerance_;
+  return fabs(dyaw) < required_yaw_goal_tolerance_;
 }
 
 bool SimpleGoalChecker::getTolerances(
@@ -126,8 +139,8 @@ bool SimpleGoalChecker::getTolerances(
   pose_tolerance.position.x = xy_goal_tolerance_;
   pose_tolerance.position.y = xy_goal_tolerance_;
   pose_tolerance.position.z = invalid_field;
-  pose_tolerance.orientation =
-    navigo_util::geometry_utils::orientationAroundZAxis(yaw_goal_tolerance_);
+  pose_tolerance.orientation = navigo_util::geometry_utils::orientationAroundZAxis(
+    require_goal_yaw_.load() ? required_yaw_goal_tolerance_ : yaw_goal_tolerance_);
 
   vel_tolerance.linear.x = invalid_field;
   vel_tolerance.linear.y = invalid_field;
@@ -154,6 +167,8 @@ SimpleGoalChecker::dynamicParametersCallback(std::vector<rclcpp::Parameter> para
         xy_goal_tolerance_sq_ = xy_goal_tolerance_ * xy_goal_tolerance_;
       } else if (name == plugin_name_ + ".yaw_goal_tolerance") {
         yaw_goal_tolerance_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".required_yaw_goal_tolerance") {
+        required_yaw_goal_tolerance_ = parameter.as_double();
       }
     } else if (type == ParameterType::PARAMETER_BOOL) {
       if (name == plugin_name_ + ".stateful") {

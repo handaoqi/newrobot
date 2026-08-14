@@ -41,6 +41,7 @@
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
+#include <robots_dog_msgs/msg/uni_rtk_pvh.hpp>
 #include <robots_dog_msgs/srv/map_state.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -95,6 +96,10 @@ namespace robot::slam
         double      rtk_altitude = 0.0;
         double      rtk_horizontal_std = 0.0;
         double      rtk_age_seconds = 0.0;
+        bool        rtk_heading_valid = false;
+        double      rtk_heading_deg = 0.0;
+        double      rtk_heading_std_deg = 0.0;
+        double      rtk_heading_age_seconds = 0.0;
     };
 
     struct PendingKeyframe
@@ -141,6 +146,8 @@ namespace robot::slam
         void imuCallBack(const sensor_msgs::msg::Imu::UniquePtr msg_in);
 
         void gnssCallBack(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+
+        void rtkPvhCallBack(const robots_dog_msgs::msg::UniRtkPvh::SharedPtr msg);
 
         void odomGuardCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
 
@@ -246,7 +253,7 @@ namespace robot::slam
         std::mutex              mtx_buffer;
         std::condition_variable sig_buffer;
         std::string             root_dir_ = ROOT_DIR;
-        std::string             lid_topic, imu_topic, gnss_topic, odom_guard_topic;
+        std::string             lid_topic, imu_topic, gnss_topic, rtk_pvh_topic, odom_guard_topic;
         std::string             data_path_;
 
         double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -276,6 +283,17 @@ namespace robot::slam
         std::mutex                         gnss_mutex_;
         sensor_msgs::msg::NavSatFix        latest_gnss_;
         bool                               has_gnss_ = false;
+        std::mutex                         gnss_heading_mutex_;
+        bool                               has_gnss_heading_ = false;
+        double                             latest_gnss_heading_deg_ = 0.0;
+        double                             latest_gnss_heading_std_deg_ = 0.0;
+        double                             latest_gnss_heading_baseline_m_ = 0.0;
+        int                                latest_gnss_heading_status_ = -1;
+        int                                latest_gnss_heading_type_ = 0;
+        rclcpp::Time                       latest_gnss_heading_receive_time_ { 0, 0, RCL_ROS_TIME };
+        double                             gnss_heading_min_baseline_m_ = 0.20;
+        double                             gnss_heading_max_std_deg_ = 5.0;
+        double                             gnss_heading_max_age_s_ = 1.5;
         bool                               gnss_origin_initialized_ = false;
         double                             gnss_origin_lat_ = 0.0;
         double                             gnss_origin_lon_ = 0.0;
@@ -429,6 +447,7 @@ namespace robot::slam
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubPath_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         sub_imu_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr   sub_gnss_ptr_;
+        rclcpp::Subscription<robots_dog_msgs::msg::UniRtkPvh>::SharedPtr sub_rtk_pvh_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_ptr_;
 
         rclcpp::Service<robots_dog_msgs::srv::MapState>::SharedPtr state_service_;

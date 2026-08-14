@@ -17,6 +17,33 @@ from .protocol import ProtocolError
 
 LOGGER = logging.getLogger(__name__)
 
+LOCAL_SERVICE_NAMES = {
+    "roamerx-dev-agent.service": ("dev_agent", "NX · 远程开发 Agent"),
+    "roamerx-robot-mcp.service": ("robot_mcp", "NX · 机器人 MCP"),
+    "roamerx-zenoh.service": ("zenoh", "NX · ROS Zenoh 路由"),
+    "roamerx-5g-share.service": ("network_share", "NX · 5G 网络共享"),
+}
+CONTROLLER_EGG_NAMES = {
+    "arc_platform": "3588 · 本体基础平台",
+    "monitor": "3588 · 设备监控",
+    "time_sync": "3588 · 硬件时间同步",
+    "power_daemon": "3588 · 电源管理",
+    "spline_daemon": "3588 · 轨迹插值",
+    "motion_control": "3588 · 运动控制",
+    "zenoh_route": "3588 · ROS Zenoh 路由",
+    "dog_task": "3588 · 机器狗任务",
+    "push_image": "3588 · 视频推流",
+    "ecal2ros": "3588 · eCAL/ROS 转发",
+    "imu_daemon": "3588 · IMU 转发",
+}
+CONTROLLER_SERVICE_NAMES = {
+    "robot-launch.service": "3588 · Robot Launch 管理器",
+    "roamerx-charge-pile.service": "3588 · 充电控制服务",
+    "rkaiq_3A.service": "3588 · 相机 3A",
+    "rknn_server.service": "3588 · RKNN 推理服务",
+    "lightdm.service": "3588 · 图形会话",
+}
+
 
 def _run(command: list[str], timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
@@ -40,14 +67,23 @@ class PowerModeController:
         power = power or {}
         mode = self.snapshot().get("mode", "normal")
         cooling = mode == "cooling_standby"
-        probes = (
-            ("edge_agent", "Edge Agent", ["systemctl", "is-active", "roamerx-edge-agent.service"], True),
-            ("detection_video", "AI识别与视频", ["systemctl", "is-active", self.config.monitoring_service], not cooling),
-            ("lidar_imu", "Livox LiDAR/IMU", ["pgrep", "-f", "[l]ivox_driver_node"], not cooling),
-            ("rtk", "RTK差分定位", ["pgrep", "-f", "[r]tk_ntrip_bridge.py"], not cooling),
-            ("localization", "激光定位", ["pgrep", "-f", "[l]ocalization_node"], not cooling),
-            ("navigation", "Nav2导航", ["pgrep", "-f", "[n]avigo_container"], not cooling),
-        )
+        probes = [
+            ("edge_agent", "NX · Edge Agent", ["systemctl", "is-active", "roamerx-edge-agent.service"], True),
+        ]
+        for unit in self.config.always_on_services:
+            key, name = LOCAL_SERVICE_NAMES.get(
+                unit,
+                (f"nx_service_{self._safe_key(unit)}", f"NX · {unit}"),
+            )
+            probes.append((key, name, ["systemctl", "is-active", unit], True))
+        probes.extend((
+            ("detection_video", "NX · AI识别与视频", ["systemctl", "is-active", self.config.monitoring_service], not cooling),
+            ("teleop_bridge", "NX · 遥控运动桥", ["systemctl", "is-active", self.config.teleop_bridge_service], not cooling),
+            ("lidar_imu", "NX · Livox LiDAR/IMU", ["pgrep", "-f", "[l]ivox_driver_node"], not cooling),
+            ("rtk", "NX · RTK差分定位", ["pgrep", "-f", "[r]tk_ntrip_bridge.py"], not cooling),
+            ("localization", "NX · 激光定位", ["pgrep", "-f", "[l]ocalization_node"], not cooling),
+            ("navigation", "NX · Nav2导航", ["pgrep", "-f", "[n]avigo_container"], not cooling),
+        ))
         services = {}
         for key, name, command, expected in probes:
             try:
@@ -61,69 +97,68 @@ class PowerModeController:
                 "expected_active": expected,
                 "matches_mode": active == expected,
             }
-        remote_eggs = self._remote_egg_status()
-        remote_groups = (
-            ("controller_video", "3588视频推流", ("push_image",)),
-            ("controller_motion", "3588运动与任务", ("spline_daemon", "motion_control", "dog_task")),
-            ("controller_sensors", "3588传感器转发", ("imu_daemon", "ecal2ros")),
-            ("controller_monitor", "3588设备监控", ("monitor",)),
-            ("controller_ros", "3588 ROS路由", ("zenoh_route",)),
-            ("controller_acceleration", "3588图形与推理", ("service_0", "service_1", "service_2")),
-        )
-        for key, name, eggs in remote_groups:
-            available = remote_eggs is not None and all(egg in remote_eggs for egg in eggs)
-            active = available and all(remote_eggs[egg] for egg in eggs)
-            expected = not cooling
+        remote = self._remote_runtime_status()
+        for egg in (*self.config.controller_always_eggs, *self.config.controller_runtime_eggs):
+            key = f"controller_egg_{self._safe_key(egg)}"
+            available = remote is not None and egg in remote["eggs"]
+            active = bool(available and remote["eggs"][egg])
+            expected = True if egg in self.config.controller_always_eggs else not cooling
             services[key] = {
-                "name": name,
+                "name": CONTROLLER_EGG_NAMES.get(egg, f"3588 · {egg}"),
                 "active": active,
                 "available": available,
                 "expected_active": expected,
                 "matches_mode": available and active == expected,
             }
-        charger_active = bool(power.get("charger_controller_active"))
-        services["charge_controller"] = {
-            "name": "充电控制",
-            "active": charger_active,
-            "expected_active": cooling,
-            "matches_mode": charger_active == cooling,
-        }
-        profile_name = self._power_profile()
-        services["power_profile"] = {
-            "name": "NX功耗档位",
-            "active": profile_name != "unknown",
-            "value": profile_name,
-            "expected_value": "10W" if cooling else "MAXN",
-            "matches_mode": profile_name == ("10W" if cooling else "MAXN"),
-        }
+        for unit in (*self.config.controller_always_services, *self.config.controller_runtime_services):
+            key = f"controller_service_{self._safe_key(unit)}"
+            available = remote is not None and unit in remote["services"]
+            active = bool(available and remote["services"][unit])
+            expected = True if unit in self.config.controller_always_services else not cooling
+            services[key] = {
+                "name": CONTROLLER_SERVICE_NAMES.get(unit, f"3588 · {unit}"),
+                "active": active,
+                "available": available,
+                "expected_active": expected,
+                "matches_mode": available and active == expected,
+            }
         with self._lock:
             self._services = services
         return self.snapshot()
 
     def reconcile_startup(self) -> dict:
         state = self.snapshot()
-        profile = self._power_profile()
         if state.get("mode") == "cooling_standby":
             self._set_cooling_marker(True)
+            self._run_optional(
+                ["sudo", "systemctl", "stop", self.config.teleop_bridge_service],
+                20,
+                allowed_returncodes={0, 1},
+            )
             self._run_optional(
                 ["sudo", "systemctl", "disable", "--now", self.config.monitoring_service],
                 20,
                 allowed_returncodes={0, 1},
             )
             self._stop_sensor_processes()
-            if profile == "10W":
-                with self._lock:
-                    self._update(transition_state="ready", reboot_required=False, last_error="", last_warning="")
+            with self._lock:
+                self._update(transition_state="ready", reboot_required=False, last_error="", last_warning="")
             return self.snapshot()
-        if state.get("transition_state") == "rebooting" and profile == "MAXN":
+        self._set_cooling_marker(False)
+        try:
             return self._start_normal_services()
-        return state
+        except ProtocolError:
+            # Keep Edge online so the platform can display the failure and retry.
+            LOGGER.exception("failed to reconcile normal-mode services during startup")
+            return self.snapshot()
 
     def enter_cooling(self) -> dict:
         with self._lock:
             self._update(mode="cooling_standby", transition_state="entering", last_error="", last_warning="")
         try:
             self._set_cooling_marker(True)
+            passive_confirmed = self._request_motor_passive()
+            self._run_required(["sudo", "systemctl", "stop", self.config.teleop_bridge_service], 15)
             self._run_required(["sudo", "systemctl", "disable", "--now", self.config.monitoring_service], 20)
             self._run_required([self.config.navigation_script, "full-stop"], 30)
             self._stop_sensor_processes()
@@ -133,7 +168,7 @@ class PowerModeController:
                     transition_state="ready",
                     reboot_required=False,
                     last_error="",
-                    last_warning="",
+                    last_warning="" if passive_confirmed else "未确认关节自由态，请检查本体控制模式",
                 )
         except Exception as exc:
             with self._lock:
@@ -141,54 +176,32 @@ class PowerModeController:
             raise ProtocolError("COOLING_MODE_FAILED", str(exc)) from exc
         return self.snapshot()
 
-    def ensure_cooling_power_profile(self) -> dict:
-        if self._power_profile() == "10W":
-            return self.snapshot()
-        with self._lock:
-            self._update(
-                mode="cooling_standby",
-                transition_state="rebooting",
-                reboot_required=True,
-                last_error="",
-                last_warning="NX正在重启并切换到10W功耗档位",
-            )
-        self._schedule_power_mode_reboot(self.config.cooling_power_mode)
-        return self.snapshot()
-
     def restore_normal(self) -> dict:
         with self._lock:
             self._update(mode="normal", transition_state="restoring", last_error="", last_warning="")
         self._set_cooling_marker(False)
         self._run_required(["sudo", "systemctl", "enable", self.config.monitoring_service], 20)
-        if self._power_profile() != "MAXN":
-            with self._lock:
-                self._update(
-                    mode="normal",
-                    transition_state="rebooting",
-                    reboot_required=True,
-                    auto_charge_enabled=False,
-                    last_warning="NX正在重启并恢复MAXN功耗档位",
-                )
-            self._schedule_power_mode_reboot(self.config.normal_power_mode)
-            return self.snapshot()
         return self._start_normal_services()
 
     def _start_normal_services(self) -> dict:
-        failures = []
-        for command, timeout in (
-            ([self.config.sensor_start_script], 45),
-            (["sudo", "systemctl", "enable", "--now", self.config.monitoring_service], 20),
-            ([self.config.navigation_script, "start"], self.config.normal_start_timeout_seconds),
-        ):
-            try:
-                self._run_required(command, timeout)
-            except Exception as exc:
-                failures.append(str(exc))
-        if failures:
-            message = "; ".join(failures)
+        # Motion recovery after leaving the dock must not be held hostage by
+        # localization readiness. Navigation exposes its own readiness state.
+        try:
+            local_units = [
+                *self.config.always_on_services,
+                self.config.monitoring_service,
+                self.config.teleop_bridge_service,
+            ]
+            self._run_required(
+                ["sudo", "systemctl", "enable", "--now", *local_units], 30
+            )
+            self._start_remote_normal_services()
+        except Exception as exc:
+            message = str(exc)
             with self._lock:
                 self._update(mode="normal", transition_state="error", last_error=message)
             raise ProtocolError("NORMAL_MODE_RESTORE_FAILED", message)
+
         with self._lock:
             self._update(
                 mode="normal",
@@ -198,17 +211,77 @@ class PowerModeController:
                 last_error="",
                 last_warning="",
             )
+        # The navigation script may wait for NDT convergence. It must not hold
+        # up Edge's MQTT status reporting after the robot has left the dock.
+        navigation_log = "/tmp/roamerx-normal-navigation-start.log"
+        command = [
+            "bash", "-lc",
+            f"nohup {shlex.quote(self.config.navigation_script)} start "
+            f">{shlex.quote(navigation_log)} 2>&1 </dev/null &",
+        ]
+        try:
+            self._run_required(command, 5)
+        except Exception as exc:
+            warning = f"导航栈启动请求失败：{exc}"
+            LOGGER.warning("normal mode restored without navigation launch: %s", exc)
+            with self._lock:
+                self._update(last_warning=warning)
         return self.snapshot()
+
+    def _start_remote_normal_services(self) -> None:
+        services = (*self.config.controller_always_services, *self.config.controller_runtime_services)
+        eggs = (*self.config.controller_always_eggs, *self.config.controller_runtime_eggs)
+        quoted_services = " ".join(shlex.quote(service) for service in services)
+        quoted_eggs = " ".join(shlex.quote(egg) for egg in eggs)
+        command = (
+            "set -e; "
+            f"sudo systemctl start {quoted_services}; "
+            f"for egg in {quoted_eggs}; do "
+            "if ! robot-launch egg \"$egg\" 2>/dev/null | grep -q running; then "
+            "robot-launch start \"$egg\" >/dev/null; fi; done; "
+            "sleep 3; "
+            f"for service in {quoted_services}; do systemctl is-active --quiet \"$service\"; done; "
+            f"for egg in {quoted_eggs}; do robot-launch egg \"$egg\" 2>/dev/null | grep -q running; done"
+        )
+        self._run_required(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", self.config.controller_host, command],
+            self.config.normal_start_timeout_seconds,
+        )
 
     def set_auto_charge_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._update(auto_charge_enabled=bool(enabled))
 
+    def set_charge_stage(self, stage: str, detail: str = "") -> None:
+        with self._lock:
+            self._update(charge_stage=stage, charge_stage_detail=detail)
+
     def _run_required(self, command: list[str], timeout: float) -> None:
         result = self.runner(command, timeout)
         if result.returncode != 0:
-            output = (result.stderr or result.stdout or "command failed").strip()[-1200:]
+            output = (result.stderr or result.stdout or "command failed").strip()
+            if len(output) > 1200:
+                output = f"{output[:600]}\n... output truncated ...\n{output[-600:]}"
             raise RuntimeError(f"{' '.join(command)}: {output}")
+
+    def _request_motor_passive(self) -> bool:
+        command = [
+            "bash",
+            "-lc",
+            "source /opt/ros/humble/setup.bash && "
+            "export ROS_DOMAIN_ID=24 RMW_IMPLEMENTATION=rmw_zenoh_cpp && "
+            "timeout 8 ros2 topic pub --once /teleop_action std_msgs/msg/String '{data: passive}'",
+        ]
+        try:
+            result = self.runner(command, 10)
+            if result.returncode == 0:
+                # The SDK enters motor-free mode shortly after passive() succeeds.
+                self.runner(["sleep", "2"], 3)
+                return True
+            LOGGER.warning("motor passive request failed: %s", (result.stderr or result.stdout).strip()[-800:])
+        except Exception:
+            LOGGER.exception("motor passive request failed")
+        return False
 
     def _stop_sensor_processes(self) -> None:
         for pattern in (
@@ -228,25 +301,17 @@ class PowerModeController:
             output = (result.stderr or result.stdout or "command failed").strip()[-1200:]
             raise RuntimeError(f"{' '.join(command)}: {output}")
 
-    def _power_profile(self) -> str:
-        try:
-            result = self.runner(["sudo", "nvpmodel", "-q"], 5)
-            return next(
-                (line.strip().removeprefix("NV Power Mode:").strip() for line in result.stdout.splitlines() if "NV Power Mode:" in line),
-                "unknown",
-            )
-        except Exception:
-            return "unknown"
-
-    def _remote_egg_status(self) -> dict[str, bool] | None:
+    def _remote_runtime_status(self) -> dict[str, dict[str, bool]] | None:
         checks = []
-        for egg in self.config.controller_runtime_eggs:
+        eggs = (*self.config.controller_always_eggs, *self.config.controller_runtime_eggs)
+        services = (*self.config.controller_always_services, *self.config.controller_runtime_services)
+        for index, egg in enumerate(eggs):
             quoted = shlex.quote(egg)
             checks.append(
                 f"if robot-launch egg {quoted} 2>/dev/null | grep -q running; "
-                f"then echo {quoted}=1; else echo {quoted}=0; fi"
+                f"then echo egg_{index}=1; else echo egg_{index}=0; fi"
             )
-        for index, service in enumerate(self.config.controller_runtime_services):
+        for index, service in enumerate(services):
             quoted = shlex.quote(service)
             checks.append(
                 f"if systemctl is-active --quiet {quoted}; "
@@ -262,28 +327,23 @@ class PowerModeController:
             )
             if result.returncode != 0:
                 return None
-            return {
+            values = {
                 key: value == "1"
                 for key, value in re.findall(r"^([a-z0-9_]+)=([01])$", result.stdout, flags=re.MULTILINE)
+            }
+            return {
+                "eggs": {egg: values.get(f"egg_{index}", False) for index, egg in enumerate(eggs)},
+                "services": {
+                    service: values.get(f"service_{index}", False)
+                    for index, service in enumerate(services)
+                },
             }
         except Exception:
             return None
 
-    def _schedule_power_mode_reboot(self, mode: int) -> None:
-        unit = f"roamerx-power-mode-{int(datetime.now(timezone.utc).timestamp())}"
-        try:
-            self._run_required(
-                [
-                    "sudo", "systemd-run", f"--unit={unit}", "--collect",
-                    f"--on-active={self.config.reboot_delay_seconds}s",
-                    "/usr/sbin/nvpmodel", "--force", "-m", str(mode),
-                ],
-                15,
-            )
-        except Exception as exc:
-            with self._lock:
-                self._update(transition_state="error", reboot_required=False, last_error=str(exc))
-            raise ProtocolError("POWER_MODE_REBOOT_FAILED", str(exc)) from exc
+    @staticmethod
+    def _safe_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
 
     def _set_cooling_marker(self, enabled: bool) -> None:
         if enabled:
@@ -303,6 +363,8 @@ class PowerModeController:
             "mode": "normal",
             "transition_state": "ready",
             "auto_charge_enabled": False,
+            "charge_stage": "idle",
+            "charge_stage_detail": "",
             "reboot_required": False,
             "last_error": "",
             "last_warning": "",

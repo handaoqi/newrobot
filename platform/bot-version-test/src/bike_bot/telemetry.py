@@ -179,7 +179,7 @@ class TelemetryClient:
 
     def send_person_detections(self, tracked_objects: list, *, captured_at: str | None = None) -> bool:
         endpoint = self.config.telemetry.person_detection_endpoint
-        if not endpoint or not self.config.detection.person_detection_enabled:
+        if not endpoint:
             return False
         monotonic_now = time.monotonic()
         if monotonic_now - self._last_person_report_at < self.config.detection.person_report_interval_seconds:
@@ -192,13 +192,14 @@ class TelemetryClient:
             frame_height = self._actual_frame_height or self.config.video.height
         detections = []
         for track in tracked_objects:
-            if str(track.label).lower() != "person":
+            label = str(track.label).lower()
+            if label not in {"person", "bicycle", "bike", "自行车"}:
                 continue
             x, y, width, height = track.bbox
             detections.append(
                 {
                     "track_id": track.track_id,
-                    "label": "person",
+                    "label": label,
                     "confidence": round(float(track.confidence), 4),
                     "bbox": {"x": x, "y": y, "width": width, "height": height},
                 }
@@ -225,6 +226,30 @@ class TelemetryClient:
             name="person-detection-reporter",
         ).start()
         return True
+
+    def fetch_person_detection_enabled(self) -> bool | None:
+        endpoint = self.config.telemetry.person_detection_endpoint
+        if not endpoint or not self.config.detection.person_detection_enabled:
+            return False
+        headers = {
+            "X-Device-Code": self.config.robot.code,
+            "X-Device-Id": os.getenv("BIKE_BOT_DEVICE_ID", self.config.robot.code),
+        }
+        if self.config.telemetry.device_key:
+            headers["X-Device-Key"] = self.config.telemetry.device_key
+        try:
+            response = requests.get(
+                endpoint,
+                params={"robot_code": self.config.robot.code},
+                headers=headers,
+                timeout=self.config.telemetry.timeout_seconds,
+                verify=self.config.telemetry.verify_tls,
+            )
+            response.raise_for_status()
+            return bool(response.json().get("enabled"))
+        except (requests.RequestException, ValueError) as exc:
+            LOGGER.warning("person detection mode query failed: %s", exc)
+            return None
 
     def _post_person_detections(self, endpoint: str, payload: dict, headers: dict) -> None:
         try:

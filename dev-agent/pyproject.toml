@@ -12,9 +12,15 @@ dependencies = [
   "PyYAML>=6,<7",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["roamerx_dev_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

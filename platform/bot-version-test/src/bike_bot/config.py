@@ -172,6 +172,7 @@ class AppConfig:
     video: VideoConfig
     stream: StreamConfig
     model: ModelConfig
+    person_model: ModelConfig | None
     detection: DetectionConfig
     telemetry: TelemetryConfig
     audio_playback: AudioPlaybackConfig
@@ -194,6 +195,7 @@ class AppConfig:
             video=VideoConfig(source=video_source, **{k: v for k, v in data["video"].items() if k != "source"}),
             stream=StreamConfig(**data.get("stream", {})),
             model=ModelConfig(**data["model"]),
+            person_model=ModelConfig(**data["person_model"]) if data.get("person_model") else None,
             detection=DetectionConfig(**data["detection"]),
             telemetry=TelemetryConfig(**data["telemetry"]),
             audio_playback=AudioPlaybackConfig(**data.get("audio_playback", {})),

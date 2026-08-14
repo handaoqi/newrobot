@@ -382,15 +382,62 @@ function durationText(seconds) {
   return `${Math.floor(value / 60)}分${Math.floor(value % 60)}秒`
 }
 
+function localizationSourceLabel(source) {
+  const labels = {
+    ndt_imu: 'NDT + IMU',
+    rtk_imu: 'RTK + IMU',
+    imu_odom_bridge: 'IMU + 里程计桥接',
+    unavailable: '无可用定位源',
+  }
+  return labels[source] || source || '等待决策'
+}
+
+function localizationDecisionBasis(quality = {}) {
+  const decision = quality.decision || {}
+  const source = decision.active_source || ''
+  const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
+  const rtkUsable = decision.rtk_usable === true
+  const rtkQuality = decision.rtk_quality || '无数据'
+  const score = Number(quality.matching_error)
+  const ndtDetail = Number.isFinite(score) ? `NDT健康（分数 ${score.toFixed(3)}）` : 'NDT质量未上报'
+  const rtkDetail = `RTK ${rtkQuality}${rtkUsable ? '，可用' : '，不可用'}`
+
+  if (source === 'rtk_imu') {
+    return preferred === 'rtk'
+      ? `RTK优先，${rtkDetail}；采用RTK + IMU。`
+      : `NDT不健康，${rtkDetail}；切换RTK + IMU兜底。`
+  }
+  if (source === 'ndt_imu') {
+    return preferred === 'rtk' && !rtkUsable
+      ? `RTK优先但${rtkDetail}；${ndtDetail}，采用NDT + IMU。`
+      : `NDT优先，${ndtDetail}；${rtkDetail}。`
+  }
+  if (source === 'imu_odom_bridge') {
+    return `NDT不健康且${rtkDetail}；进入受限桥接 ${Number(decision.bridge_distance_m || 0).toFixed(2)}m / ${Number(decision.bridge_elapsed_s || 0).toFixed(1)}s。`
+  }
+  const rejection = decision.bridge_rejection_reason ? `桥接拒绝：${decision.bridge_rejection_reason}。` : ''
+  return `NDT不健康，${rtkDetail}；暂无绝对定位源。${rejection}`
+}
+
 function localizationDebugItems() {
   const status = robotStatus.value?.status || {}
   const quality = status.localization_quality || {}
+  const decision = quality.decision || {}
   const mapMatch = mapData.value?.id && status.map_id
     ? String(mapData.value.id) === String(status.map_id)
     : true
   return [
     ['地图一致', mapMatch ? '是' : `否：页面 ${mapData.value?.id || '—'} / 机器人 ${status.map_id || '—'}`, mapMatch ? 'ok' : 'bad'],
     ['定位状态', status.localization_status || 'unknown', status.localization_status === 'normal' ? 'ok' : 'bad'],
+    ['当前定位决策', localizationSourceLabel(decision.active_source), ['ndt_imu', 'rtk_imu'].includes(decision.active_source) ? 'ok' : 'warn'],
+    ['当前决策依据', localizationDecisionBasis(quality), ['ndt_imu', 'rtk_imu'].includes(decision.active_source) ? 'ok' : decision.active_source === 'imu_odom_bridge' ? 'warn' : 'bad'],
+    ['绝对定位确认', decision.absolute_stable ? `稳定（${Number(decision.absolute_stable_samples || 0)}帧）` : `等待（${Number(decision.absolute_stable_samples || 0)}帧）`, decision.absolute_stable ? 'ok' : 'warn'],
+    ['途经点优先方式', String(decision.preferred_source || 'ndt').toUpperCase(), 'idle'],
+    ['RTK质量', decision.rtk_quality || '—', decision.rtk_usable ? 'ok' : 'warn'],
+    ['RTK地图坐标', Number.isFinite(Number(decision.rtk_x)) ? `${Number(decision.rtk_x).toFixed(2)}, ${Number(decision.rtk_y).toFixed(2)}` : '—', decision.rtk_usable ? 'ok' : 'warn'],
+    ['RTK航向', Number.isFinite(Number(decision.rtk_yaw)) ? `${(Number(decision.rtk_yaw) * 180 / Math.PI).toFixed(1)}°` : '—', decision.rtk_usable ? 'ok' : 'warn'],
+    ['桥接余量', decision.active_source === 'imu_odom_bridge' ? `${Number(decision.bridge_distance_m || 0).toFixed(2)}m / ${Number(decision.bridge_elapsed_s || 0).toFixed(1)}s` : '—', decision.active_source === 'imu_odom_bridge' ? 'warn' : 'idle'],
+    ['桥接拒绝原因', decision.bridge_rejection_reason || '—', decision.bridge_rejection_reason ? 'bad' : 'idle'],
     ['NDT分数', Number.isFinite(Number(quality.matching_error)) ? Number(quality.matching_error).toFixed(3) : '—', ndtQualityValid(quality) ? 'ok' : 'warn'],
     ['内点率', Number.isFinite(Number(quality.inlier_fraction)) ? Number(quality.inlier_fraction).toFixed(3) : '—', ndtQualityValid(quality) ? 'ok' : 'warn'],
     ['最终点距离', distanceText(lastTrajectoryPoint() || robotPoint(), waypoints.value[waypoints.value.length - 1]), execution.value?.state === 'failed' ? 'warn' : 'idle'],

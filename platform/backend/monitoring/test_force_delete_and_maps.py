@@ -142,6 +142,15 @@ class MapUploadMetadataTests(TestCase):
                 "gnss_origin.yaml",
                 "origin_latitude: 39.0\norigin_longitude: 116.0\nalignment_locked: 1\n",
             )
+            archive.writestr("map.txt", "# path\n1.0 2.0 0.5\n")
+            archive.writestr(
+                "mapping_trace.json",
+                json.dumps({
+                    "format": "roamerx.mapping-trace.v1",
+                    "frame_id": "map",
+                    "samples": [{"index": 0, "stamp": 1.0, "slam": {"x": 1.0, "y": 2.0, "yaw": 0.5}, "rtk": {"valid": False}}],
+                }),
+            )
         package.seek(0)
 
         response = self.client.post(
@@ -158,6 +167,11 @@ class MapUploadMetadataTests(TestCase):
         self.assertEqual(response.status_code, 201)
         created = MapData.objects.get(name="uploaded")
         self.assertEqual(created.resolution, 0.08)
+        self.assertTrue(created.trajectory_file)
+        self.assertTrue(created.mapping_trace)
+        trace_response = self.client.get(f"/api/maps/{created.id}/mapping-trace/")
+        self.assertEqual(trace_response.status_code, 200)
+        self.assertEqual(trace_response.data["samples"][0]["slam"]["x"], 1.0)
         self.assertEqual(created.origin, [-3.5, 1.25, 0.0])
         self.assertEqual(created.width, 4)
         self.assertEqual(created.height, 3)

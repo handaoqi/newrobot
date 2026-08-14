@@ -35,6 +35,7 @@
 #ifndef NAVIGO_PATH_CONTROLLER__PLUGINS__SIMPLE_GOAL_CHECKER_HPP_
 #define NAVIGO_PATH_CONTROLLER__PLUGINS__SIMPLE_GOAL_CHECKER_HPP_
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +44,7 @@
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "navigo_core/goal_checker.hpp"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include "std_msgs/msg/bool.hpp"
 
 namespace navigo_path_controller
 {
@@ -72,12 +74,14 @@ public:
     geometry_msgs::msg::Twist & vel_tolerance) override;
 
 protected:
-  double xy_goal_tolerance_, yaw_goal_tolerance_;
+  double xy_goal_tolerance_, yaw_goal_tolerance_, required_yaw_goal_tolerance_;
   bool stateful_, check_xy_;
+  std::atomic_bool require_goal_yaw_ {false};
   // Cached squared xy_goal_tolerance_
   double xy_goal_tolerance_sq_;
   // Dynamic parameters handler
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr require_goal_yaw_sub_;
   std::string plugin_name_;
 
   /**

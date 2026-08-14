@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import cv2
 
-from .config import AppConfig
+from .config import AppConfig, ModelConfig
 from .models import BoundingBox, DetectionPayload, now_iso
 from .tracking import IoUTracker, TrackingDetection
 
@@ -129,15 +129,24 @@ class SnapshotManager:
 
 
 class YoloDetector:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        model_config: ModelConfig | None = None,
+        target_labels: list[str] | None = None,
+        event_labels: list[str] | None = None,
+        emit_events: bool = True,
+    ) -> None:
         self.config = config
-        classes = config.model.classes or ["bicycle"]
-        self.target_labels = {item.lower() for item in classes}
-        self.event_labels = {
-            item.lower() for item in (config.detection.event_classes or classes)
-        }
+        self.model_config = model_config or config.model
+        classes = self.model_config.classes or ["bicycle"]
+        self.target_labels = {item.lower() for item in (target_labels or classes)}
+        configured_event_labels = event_labels if event_labels is not None else (config.detection.event_classes or classes)
+        self.event_labels = {item.lower() for item in configured_event_labels}
+        self.emit_events = emit_events
         self.class_names = [item.lower() for item in classes]
-        self.model_backend = self._resolve_backend(config.model.backend, config.model.path)
+        self.model_backend = self._resolve_backend(self.model_config.backend, self.model_config.path)
         self.model = self._load_model()
         self.snapshot_manager = SnapshotManager(
             config.snapshot.directory,
@@ -165,10 +174,10 @@ class YoloDetector:
     def _load_model(self) -> Any:
         if self.model_backend == "opencv_dnn":
             try:
-                net = cv2.dnn.readNetFromONNX(self.config.model.path)
+                net = cv2.dnn.readNetFromONNX(self.model_config.path)
                 net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                LOGGER.info("loaded ONNX model with OpenCV DNN: %s", self.config.model.path)
+                LOGGER.info("loaded ONNX model with OpenCV DNN: %s", self.model_config.path)
                 return net
             except cv2.error as exc:
                 LOGGER.warning("OpenCV DNN failed to load ONNX, falling back to onnxruntime: %s", exc)
@@ -183,13 +192,13 @@ class YoloDetector:
             session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             session = ort.InferenceSession(
-                self.config.model.path,
+                self.model_config.path,
                 sess_options=session_options,
                 providers=providers,
             )
             LOGGER.info(
                 "loaded ONNX model with onnxruntime: %s providers=%s",
-                self.config.model.path,
+                self.model_config.path,
                 session.get_providers(),
             )
             return session
@@ -197,8 +206,8 @@ class YoloDetector:
         if self.model_backend == "ultralytics":
             from ultralytics import YOLO
 
-            LOGGER.info("loaded Ultralytics model: %s", self.config.model.path)
-            return YOLO(self.config.model.path)
+            LOGGER.info("loaded Ultralytics model: %s", self.model_config.path)
+            return YOLO(self.model_config.path)
 
         raise ValueError(f"unsupported model backend: {self.model_backend}")
 
@@ -308,7 +317,7 @@ class YoloDetector:
                 cv2.LINE_AA,
             )
 
-            if track.label not in self.event_labels or not self.tracker.should_alert(track.track_id):
+            if not self.emit_events or track.label not in self.event_labels or not self.tracker.should_alert(track.track_id):
                 continue
 
             bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
@@ -340,9 +349,9 @@ class YoloDetector:
     def _predict_ultralytics(self, frame) -> list[RawDetection]:
         results = self.model.predict(
             frame,
-            conf=self.config.model.confidence,
-            imgsz=self.config.model.image_size,
-            device=self.config.model.device or None,
+            conf=self.model_config.confidence,
+            imgsz=self.model_config.image_size,
+            device=self.model_config.device or None,
             verbose=False,
         )
         if not results:
@@ -364,11 +373,11 @@ class YoloDetector:
         return raw_detections
 
     def _predict_opencv_dnn(self, frame) -> list[RawDetection]:
-        input_image, scale, pad_x, pad_y = letterbox(frame, self.config.model.image_size)
+        input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
             input_image,
             1 / 255.0,
-            (self.config.model.image_size, self.config.model.image_size),
+            (self.model_config.image_size, self.model_config.image_size),
             swapRB=True,
             crop=False,
         )
@@ -378,11 +387,11 @@ class YoloDetector:
         return self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
 
     def _predict_onnxruntime(self, frame) -> list[RawDetection]:
-        input_image, scale, pad_x, pad_y = letterbox(frame, self.config.model.image_size)
+        input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
             input_image,
             1 / 255.0,
-            (self.config.model.image_size, self.config.model.image_size),
+            (self.model_config.image_size, self.model_config.image_size),
             swapRB=True,
             crop=False,
         )
@@ -416,7 +425,7 @@ class YoloDetector:
             else:
                 class_id = max(range(len(class_scores)), key=lambda index: class_scores[index])
                 confidence = float(class_scores[class_id])
-            if confidence < self.config.model.confidence:
+            if confidence < self.model_config.confidence:
                 continue
 
             x1 = int(round((cx - box_w / 2 - pad_x) / scale))
@@ -436,8 +445,8 @@ class YoloDetector:
         keep = cv2.dnn.NMSBoxes(
             boxes,
             scores,
-            self.config.model.confidence,
-            self.config.model.nms_iou_threshold,
+            self.model_config.confidence,
+            self.model_config.nms_iou_threshold,
         )
         if len(keep) == 0:
             return []

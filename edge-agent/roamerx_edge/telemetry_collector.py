@@ -50,6 +50,7 @@ class TelemetryCollector:
         self._lock = threading.Lock()
         self._pose: PoseSnapshot | None = None
         self._localization_quality: LocalizationQualitySnapshot | None = None
+        self._localization_decision: dict = {}
         self._state_version = 0
         self.power_available = False
         self.battery_percent = None
@@ -163,6 +164,15 @@ class TelemetryCollector:
                 prediction_errors=prediction_errors,
             )
 
+    def on_localization_decision(self, payload: dict) -> None:
+        with self._lock:
+            self._localization_decision = dict(payload or {})
+            self._state_version += 1
+
+    def localization_decision(self) -> dict:
+        with self._lock:
+            return dict(self._localization_decision)
+
     def configure_system_probe_staleness(self, stale_seconds: float) -> None:
         self._system_probe_stale_seconds = max(1.0, float(stale_seconds))
 
@@ -250,6 +260,7 @@ class TelemetryCollector:
                         "relative_translation_m": quality.relative_translation_m,
                         "prediction_errors": quality.prediction_errors,
                     } if quality else None,
+                    "decision": dict(self._localization_decision),
                 },
                 "power": {
                     "available": power_fresh,

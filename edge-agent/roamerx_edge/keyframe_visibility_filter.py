@@ -57,7 +57,7 @@ def filter_with_keyframe_visibility(source: Path, output: Path, *, voxel_size_m:
         [not (frees[tuple(voxel)] >= min_free_observations and hits[tuple(voxel)] <= max_hit_observations) for voxel in map_voxels],
         dtype=bool,
     )
-    for name in ("map.yaml", "map.txt"):
+    for name in ("map.yaml", "map.txt", "gnss_origin.yaml"):
         if (source / name).exists():
             shutil.copy2(source / name, output / name)
     shutil.copy2(source / "map.pgm", output / "map.pgm")

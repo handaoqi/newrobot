@@ -1,14 +1,56 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import re
+import tempfile
 import uuid
+import wave
+from pathlib import Path
 
 from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from pypinyin import Style, lazy_pinyin
 
-from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot
+from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot, VoiceRecognitionEvent
+from .message_handlers import _public_media_url
+from .services import asr_service, tts_service
+
+_VOICE_WAKE_UNTIL: dict[str, object] = {}
+LOGGER = logging.getLogger(__name__)
+# Wake matching remains anchored at the start of the utterance, but is based on
+# Mandarin syllables instead of an exact ASR spelling.  The matcher deliberately
+# has no list of observed misspellings: any homophone (for example “晓太洋”)
+# is handled from its pinyin, and a single near-syllable is allowed without
+# permitting an unrelated phrase to create a development task.
+VOICE_WAKE_ALIASES = ("小太阳", "小太陽")
+VOICE_WAKE_PINYIN = ("xiao", "tai", "yang")
+_PINYIN_INITIALS = (
+    "zh", "ch", "sh",
+    "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
+    "j", "q", "x", "r", "z", "c", "s", "y", "w",
+)
+_NEAR_INITIAL_GROUPS = (
+    frozenset(("b", "p")),
+    frozenset(("d", "t")),
+    frozenset(("g", "k")),
+    frozenset(("n", "l")),
+    frozenset(("f", "h")),
+    frozenset(("j", "q", "x")),
+    frozenset(("z", "zh")),
+    frozenset(("c", "ch")),
+    frozenset(("s", "sh")),
+)
+VOICE_WAKE_WINDOW_SECONDS = 8
+LOCAL_ASR_ENGINE = "nx-sensevoice"
+# A task's final agent message is normally the user-facing Chinese result.
+# Preserve it in full for the speaker; the ceiling only prevents a malformed
+# event from monopolising the robot's audio output indefinitely.
+TASK_SUMMARY_MAX_CHARS = 1800
+TASK_SUMMARY_MAX_SUPPRESS_SECONDS = 600
 
 
 def _timestamp(value):
@@ -16,7 +58,99 @@ def _timestamp(value):
     return parsed or timezone.now()
 
 
-def handle_dev_mqtt_message(topic: str, raw_payload: bytes | str | dict) -> dict:
+def _split_pinyin_syllable(syllable: str) -> tuple[str, str]:
+    """Return Mandarin initial and rime for a tone-free pinyin syllable."""
+    normalized = re.sub(r"[^a-zv]", "", syllable.lower().replace("ü", "v"))
+    for initial in _PINYIN_INITIALS:
+        if normalized.startswith(initial):
+            return initial, normalized[len(initial):]
+    return "", normalized
+
+
+def _initial_similarity(expected: str, actual: str) -> float:
+    if expected == actual:
+        return 1.0
+    if any(expected in group and actual in group for group in _NEAR_INITIAL_GROUPS):
+        return 0.5
+    return 0.0
+
+
+def _rime_similarity(expected: str, actual: str) -> float:
+    if expected == actual:
+        return 1.0
+    # A dropped glide is a common ASR variation: xiao/lao and xiao/yao keep
+    # the same "ao" rime.  Requiring at least two shared trailing letters
+    # keeps xiao/you ("ao" versus "ou") from being accepted.
+    if min(len(expected), len(actual)) >= 2 and (
+        expected.endswith(actual) or actual.endswith(expected)
+    ):
+        return 0.75
+    return 0.0
+
+
+def _syllable_similarity(expected: str, actual: str) -> float:
+    """Score one Mandarin syllable from 0.0 to 1.0 without variant tables."""
+    if expected == actual:
+        return 1.0
+    expected_initial, expected_rime = _split_pinyin_syllable(expected)
+    actual_initial, actual_rime = _split_pinyin_syllable(actual)
+    rime_score = _rime_similarity(expected_rime, actual_rime)
+    if not rime_score:
+        return 0.0
+    # The rime carries more acoustic information than the initial.  A close
+    # initial helps, but an ASR initial substitution alone is not a rejection.
+    return (0.75 * rime_score) + (0.25 * _initial_similarity(expected_initial, actual_initial))
+
+
+def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
+    """Return the prefix end and ASR spelling when it sounds like 小太阳."""
+    exact = re.match(
+        rf"^\s*({'|'.join(re.escape(item) for item in VOICE_WAKE_ALIASES)})",
+        transcript,
+    )
+    if exact:
+        return exact.end(), exact.group(1)
+
+    candidate_match = re.match(r"^(\s*)([\u4e00-\u9fff]{3})", transcript)
+    if not candidate_match:
+        return 0, ""
+    candidate = candidate_match.group(2)
+    syllables = tuple(lazy_pinyin(candidate, style=Style.NORMAL, errors="default"))
+    if len(syllables) != len(VOICE_WAKE_PINYIN):
+        return 0, ""
+    scores = tuple(
+        _syllable_similarity(expected, actual)
+        for expected, actual in zip(VOICE_WAKE_PINYIN, syllables)
+    )
+    # Require two high-confidence syllables and a strong combined score.  It
+    # admits homophones and one near-syllable, but not phrases sharing only
+    # “太阳”, such as “有太阳” or “狗太阳”.
+    if sum(scores) < 2.5 or sum(score >= 0.95 for score in scores) < 2:
+        return 0, ""
+    return len(candidate_match.group(1)) + len(candidate), candidate
+
+
+def _looks_like_short_wake_attempt(transcript: str) -> bool:
+    """Identify a garbled, short retry while the wake window is already open.
+
+    A wake-only request opens a short window so that the next utterance can be
+    used as the development command.  Without this guard, an ASR retry such as
+    “小要大呀” could be mistaken for that command.  It is safer to keep the
+    window open and ask for the command than to submit meaningless text to
+    Codex.  This deliberately applies only to short utterances beginning with
+    the first wake syllable; normal commands remain unchanged.
+    """
+    compact = re.sub(r"[\s，。,.!！?？]", "", transcript)
+    if len(compact) > 4:
+        return False
+    candidate_match = re.match(r"^[\u4e00-\u9fff]{3}", compact)
+    if not candidate_match:
+        return False
+    syllables = tuple(lazy_pinyin(candidate_match.group(), style=Style.NORMAL, errors="default"))
+    return bool(syllables) and _syllable_similarity(VOICE_WAKE_PINYIN[0], syllables[0]) >= 0.95
+
+
+def handle_dev_mqtt_message(topic: str, raw_payload: bytes | str | dict, publish=None) -> dict:
     if isinstance(raw_payload, dict):
         payload = raw_payload
     else:
@@ -38,7 +172,17 @@ def handle_dev_mqtt_message(topic: str, raw_payload: bytes | str | dict) -> dict
                 "last_seen_at": _timestamp(payload.get("timestamp")),
             },
         )
+        if payload.get("agent_restarted"):
+            DevelopmentTask.objects.filter(
+                robot=robot, status__in=DevelopmentTask.ACTIVE_STATES,
+            ).update(
+                status="failed",
+                finished_at=timezone.now(),
+                error_message="ROBOT_AGENT_RESTARTED: Codex process was interrupted by Agent restart",
+            )
         return {"status": state.status}
+    if parts[3] == "voice" and len(parts) == 5 and parts[4] == "audio":
+        return _handle_voice_audio(robot, payload, publish)
     if len(parts) < 6 or parts[3] != "tasks":
         raise ValueError("invalid development task topic")
     task_id = uuid.UUID(parts[4])
@@ -46,8 +190,161 @@ def handle_dev_mqtt_message(topic: str, raw_payload: bytes | str | dict) -> dict
     if parts[5] == "events":
         return _handle_event(task, payload)
     if parts[5] == "result":
-        return _handle_result(task, payload)
+        return _handle_result(task, payload, publish)
     raise ValueError("unsupported development topic")
+
+
+def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
+    transcript = _voice_transcript(payload)
+    LOGGER.info(
+        "received voice transcript robot=%s engine=%s text=%r",
+        robot.code,
+        payload.get("asr_engine") or "cloud",
+        transcript[:500],
+    )
+    if not transcript:
+        _record_voice_recognition(robot, payload, transcript, "no_speech")
+        return {"status": "no_speech", "transcript": transcript}
+    now = timezone.now()
+    wake_end, wake_phrase = _fuzzy_wake_match(transcript)
+    wake_matched = bool(wake_phrase)
+    command = ""
+    armed_until = _VOICE_WAKE_UNTIL.get(robot.code)
+    if wake_matched:
+        command = transcript[wake_end:].strip(" ，。,.!！?？")
+        _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
+    elif armed_until and armed_until >= now:
+        if _looks_like_short_wake_attempt(transcript):
+            _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
+            _publish_voice_ack(robot, publish, "我在，请说任务")
+            _record_voice_recognition(robot, payload, transcript, "armed")
+            return {"status": "armed", "transcript": transcript}
+        command = transcript
+    elif armed_until:
+        _VOICE_WAKE_UNTIL.pop(robot.code, None)
+    if len(re.sub(r"[\s，。,.!！?？]", "", command)) < 2:
+        command = ""
+    if not command:
+        if wake_matched:
+            _publish_voice_ack(robot, publish, "我在")
+        outcome = "armed" if wake_matched else "ignored"
+        _record_voice_recognition(robot, payload, transcript, outcome)
+        return {"status": outcome, "transcript": transcript}
+    _VOICE_WAKE_UNTIL.pop(robot.code, None)
+    if DevelopmentTask.objects.filter(robot=robot, status__in=DevelopmentTask.ACTIVE_STATES).exists():
+        _record_voice_recognition(robot, payload, transcript, "busy", command=command)
+        return {"status": "busy", "transcript": transcript}
+    task = DevelopmentTask.objects.create(robot=robot, workspace="robot-main", model="gpt-5.6-terra", prompt=command)
+    _record_voice_recognition(robot, payload, transcript, "accepted", command=command, task=task)
+    _publish_voice_ack(robot, publish, "收到", task_id=task.id)
+    return {"status": "accepted", "task_id": str(task.id), "transcript": transcript}
+
+
+def _record_voice_recognition(
+    robot: Robot,
+    payload: dict,
+    transcript: str,
+    outcome: str,
+    *,
+    command: str = "",
+    task: DevelopmentTask | None = None,
+) -> None:
+    """Persist recognised text only; raw microphone audio is never stored here."""
+    VoiceRecognitionEvent.objects.create(
+        robot=robot,
+        task=task,
+        transcript=transcript[:1000],
+        command=command[:1000],
+        asr_engine=str(payload.get("asr_engine") or "cloud")[0:64],
+        outcome=outcome,
+    )
+
+
+def _publish_voice_ack(
+    robot: Robot,
+    publish,
+    text: str,
+    task_id=None,
+    *,
+    kind: str = "acknowledgement",
+    suppress_seconds: int | None = None,
+) -> None:
+    try:
+        saved_path, _cache_hit = tts_service.synthesize_speech(text)
+        if publish:
+            payload = {"audio_url": _public_media_url(saved_path), "kind": kind}
+            if suppress_seconds is not None:
+                payload["suppress_seconds"] = suppress_seconds
+            publish(f"robots/{robot.code}/dev/voice/ack", payload, 1, False)
+    except Exception:
+        LOGGER.exception("voice playback TTS failed task=%s kind=%s", task_id or "wake", kind)
+
+
+def _latest_agent_message(task: DevelopmentTask) -> str:
+    """Return Codex's latest human-facing message, not its JSON bookkeeping."""
+    for raw_text in task.events.filter(event_type="output", stream="stdout").order_by("-sequence").values_list("text", flat=True):
+        try:
+            event = json.loads(raw_text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        message = str(item.get("text") or "").strip()
+        if message:
+            return message
+    return ""
+
+
+def _compact_voice_text(text: str, limit: int = TASK_SUMMARY_MAX_CHARS) -> str:
+    text = re.sub(r"[`*_#>]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 16].rstrip()}。内容过长，剩余部分请在开发页面查看。"
+
+
+def _task_completion_announcement(task: DevelopmentTask) -> str | None:
+    if task.status == "succeeded":
+        result = _compact_voice_text(_latest_agent_message(task))
+        return (
+            f"Codex任务已完成。以下是本次执行结果。{result}"
+            if result else "Codex任务已完成。"
+        )
+    if task.status == "failed":
+        detail = _compact_voice_text(task.error_message)
+        return f"Codex任务失败。{detail}" if detail else "Codex任务失败。"
+    if task.status == "timed_out":
+        return "Codex任务超时结束。"
+    if task.status == "cancelled":
+        return "Codex任务已取消。"
+    return None
+
+
+def _summary_suppress_seconds(text: str) -> int:
+    # Mandarin TTS is normally about 3 characters per second; add startup margin
+    # so the microphone cannot feed this completion broadcast back as a command.
+    return min(TASK_SUMMARY_MAX_SUPPRESS_SECONDS, max(6, 4 + (len(text) + 2) // 3))
+
+
+def _voice_transcript(payload: dict) -> str:
+    """Use a successful NX-local ASR result, otherwise retain the old cloud path."""
+    if payload.get("asr_engine") == LOCAL_ASR_ENGINE:
+        transcript = str(payload.get("transcript") or "").strip()
+        if len(transcript) > 1000:
+            raise ValueError("invalid NX local ASR transcript")
+        return transcript
+    try:
+        pcm = base64.b64decode(str(payload.get("audio_b64") or ""), validate=True)
+    except ValueError as exc:
+        raise ValueError("invalid voice audio") from exc
+    if not pcm or len(pcm) > 800_000:
+        raise ValueError("invalid voice audio size")
+    with tempfile.TemporaryDirectory(prefix="roamerx-voice-") as directory:
+        audio_path = Path(directory) / "voice.wav"
+        with wave.open(str(audio_path), "wb") as output:
+            output.setnchannels(1); output.setsampwidth(2); output.setframerate(16000); output.writeframes(pcm)
+        return asr_service.transcribe_audio(str(audio_path))
 
 
 @transaction.atomic
@@ -83,8 +380,10 @@ def _handle_event(task: DevelopmentTask, payload: dict) -> dict:
 
 
 @transaction.atomic
-def _handle_result(task: DevelopmentTask, payload: dict) -> dict:
+def _handle_result(task: DevelopmentTask, payload: dict, publish=None) -> dict:
     task = DevelopmentTask.objects.select_for_update().get(pk=task.pk)
+    if task.status in DevelopmentTask.TERMINAL_STATES:
+        return {"status": task.status, "duplicate": True}
     status = str(payload.get("status") or "failed")
     if status not in DevelopmentTask.TERMINAL_STATES:
         status = "failed"
@@ -109,4 +408,18 @@ def _handle_result(task: DevelopmentTask, payload: dict) -> dict:
             "occurred_at": task.finished_at,
         },
     )
+    announcement = _task_completion_announcement(task)
+    if announcement and publish:
+        task_id = task.id
+        suppress_seconds = _summary_suppress_seconds(announcement)
+        transaction.on_commit(
+            lambda: _publish_voice_ack(
+                task.robot,
+                publish,
+                announcement,
+                task_id=task_id,
+                kind="task_summary",
+                suppress_seconds=suppress_seconds,
+            )
+        )
     return {"status": status}

@@ -23,6 +23,8 @@ class NavigationAdapter(Protocol):
     def is_robot_stopped(self) -> bool: ...
     def latest_pose(self): ...
     def latest_trusted_pose(self): ...
+    def set_localization_policy(self, source: str, phase: str) -> dict: ...
+    def localization_decision(self) -> dict: ...
 
 
 @dataclass
@@ -35,6 +37,7 @@ class TaskContext:
     start_command_id: str
     current_segment_index: int = 0
     record_rosbag: bool = False
+    docking: dict | None = None
 
 
 class TaskExecutor:
@@ -52,6 +55,7 @@ class TaskExecutor:
         map_set_coordinator=None,
         obstacle_speech=None,
         rosbag_recorder=None,
+        docking_arrived_handler=None,
     ) -> None:
         self.store = store
         self.navigation = navigation
@@ -62,6 +66,7 @@ class TaskExecutor:
         self.map_set_coordinator = map_set_coordinator
         self.obstacle_speech = obstacle_speech
         self.rosbag_recorder = rosbag_recorder
+        self.docking_arrived_handler = docking_arrived_handler
         self._rosbag_state: dict = {}
         self._segments = []
         self._lock = threading.RLock()
@@ -77,6 +82,8 @@ class TaskExecutor:
         self._task_started_at = None
         self._blocked_retry_timer = None
         self._paused_for_localization = False
+        self._navigation_prepared = False
+        self._segment_avoidance_enabled = True
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
         if self.context:
@@ -87,13 +94,15 @@ class TaskExecutor:
     def stop(self) -> None:
         self._stop_obstacle_monitor()
         self._stop_task_rosbag()
+        self._restore_navigation_profile()
         if self._blocked_retry_timer:
             self._blocked_retry_timer.cancel()
             self._blocked_retry_timer = None
 
     def _obstacle_monitor_enabled(self) -> bool:
         return bool(
-            self.obstacle_speech
+            self._segment_avoidance_enabled
+            and self.obstacle_speech
             and self.obstacle_speech.enabled
             and callable(getattr(self.navigation, "obstacle_monitor_snapshot", None))
         )
@@ -212,6 +221,12 @@ class TaskExecutor:
             },
             "",
         )
+
+    def report_docking_charge(self, event_type: str, *, message: str = "", extra: dict | None = None) -> None:
+        """Publish charge-contact milestones for the platform docking dialog."""
+        with self._lock:
+            if self._is_docking_task():
+                self._emit(event_type, message=message, extra=extra)
         LOGGER.info(
             "obstacle speech episode=%s stage=%s attempt=%s distance=%s raw_planar=%s actual_planar=%s",
             self._obstacle_episode_id,
@@ -279,7 +294,9 @@ class TaskExecutor:
                 or not self._paused_for_localization
             ):
                 return
-            resume_index = self.context.current_waypoint_index
+            resume_index = self._nearest_remaining_waypoint_index(
+                self.context.current_waypoint_index
+            )
             self._paused_for_localization = False
             self.context.state = "resuming"
             self.context.state_version += 1
@@ -290,6 +307,24 @@ class TaskExecutor:
                 message="localization is stable; resuming from the pending waypoint",
             )
             self._send_from(resume_index)
+
+    def _nearest_remaining_waypoint_index(self, start_index: int) -> int:
+        if not self.context:
+            return start_index
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if start_index >= len(waypoints):
+            return start_index
+        pose = self.navigation.latest_pose()
+        if pose is None:
+            return start_index
+        candidates = range(max(0, start_index), len(waypoints))
+        return min(
+            candidates,
+            key=lambda index: hypot(
+                float(pose.x) - float(waypoints[index]["x"]),
+                float(pose.y) - float(waypoints[index]["y"]),
+            ),
+        )
 
     def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
         with self._lock:
@@ -312,7 +347,11 @@ class TaskExecutor:
         with self._lock:
             command = envelope.payload["command"]
             route = command["route_snapshot"]
-            initial_waypoint_index = self._nearest_waypoint_index(route)
+            docking = dict(command.get("docking") or {})
+            # Docking is deliberately ordered: waypoint 0 establishes the
+            # safe approach line and must never be skipped by nearest-point
+            # task startup behavior.
+            initial_waypoint_index = 0 if docking.get("enabled") else self._nearest_waypoint_index(route)
             self.context = TaskContext(
                 task_execution_id=envelope.payload["task_execution_id"],
                 state="accepted",
@@ -324,6 +363,7 @@ class TaskExecutor:
                 current_waypoint_index=initial_waypoint_index,
                 start_command_id=envelope.payload["command_id"],
                 record_rosbag=bool(command.get("record_rosbag", False)),
+                docking=docking,
             )
             self._persist()
             LOGGER.info(
@@ -396,7 +436,10 @@ class TaskExecutor:
         self.context.current_segment_index = segment_index
         self.context.current_waypoint_index = goal_start_index
         self._goal_offset = goal_start_index
-        waypoints = self.context.route_snapshot["waypoints"][goal_start_index:segment.end_index]
+        waypoint = self.context.route_snapshot["waypoints"][goal_start_index]
+        self._apply_navigation_profile(goal_start_index)
+        self._set_localization_policy(waypoint, "moving")
+        waypoints = [waypoint]
         accepted = self.navigation.send_waypoints(waypoints, self.on_feedback, self.on_navigation_result)
         if not accepted:
             self._fail("NAV_STACK_NOT_READY", "FollowWaypoints goal was rejected")
@@ -419,7 +462,10 @@ class TaskExecutor:
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "task context is missing")
         if not self._prepare_robot_for_navigation():
             return
-        waypoints = self.context.route_snapshot["waypoints"][index:]
+        self._apply_navigation_profile(index)
+        waypoint = self.context.route_snapshot["waypoints"][index]
+        self._set_localization_policy(waypoint, "moving")
+        waypoints = [waypoint]
         self._goal_offset = index
         accepted = self.navigation.send_waypoints(waypoints, self.on_feedback, self.on_navigation_result)
         if not accepted:
@@ -438,12 +484,34 @@ class TaskExecutor:
         self.on_feedback(0)
         self._start_obstacle_monitor()
 
+    def _set_localization_policy(self, waypoint: dict, phase: str) -> None:
+        setter = getattr(self.navigation, "set_localization_policy", None)
+        if callable(setter):
+            setter(waypoint.get("localization_mode", "ndt"), phase)
+
+    def _absolute_localization_ready(self, timeout_seconds: float = 5.0) -> bool:
+        getter = getattr(self.navigation, "localization_decision", None)
+        if not callable(getter):
+            return True
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while time.monotonic() <= deadline:
+            decision = getter() or {}
+            source = str(decision.get("active_source") or "")
+            if source in {"ndt_imu", "rtk_imu"} and bool(decision.get("absolute_stable")):
+                return True
+            time.sleep(0.1)
+        return False
+
     def _prepare_robot_for_navigation(self) -> bool:
+        if self._navigation_prepared:
+            return True
         prepare = getattr(self.navigation, "prepare_for_navigation", None)
         if not callable(prepare):
+            self._navigation_prepared = True
             return True
         LOGGER.info("standing robot before starting navigation")
         if prepare(timeout_seconds=self.standup_confirmation_timeout_seconds):
+            self._navigation_prepared = True
             return True
         self._stop_obstacle_monitor()
         self._fail(
@@ -473,6 +541,7 @@ class TaskExecutor:
                 stop_motion()
             if not self.navigation.is_robot_stopped():
                 raise ProtocolError("ROBOT_NOT_STOPPED", "robot speed did not reach stop threshold")
+            self._restore_navigation_profile()
             self.context.state = "paused"
             self.context.state_version += 1
             self._persist()
@@ -513,6 +582,7 @@ class TaskExecutor:
         with self._lock:
             self._stop_obstacle_monitor()
             self._stop_task_rosbag()
+            self._restore_navigation_profile()
             context = self.context
             if context:
                 self.navigation.cancel_navigation()
@@ -539,6 +609,7 @@ class TaskExecutor:
             if not self.navigation.is_robot_stopped():
                 raise ProtocolError("ROBOT_NOT_STOPPED", "robot speed did not reach stop threshold")
             self._stop_task_rosbag()
+            self._restore_navigation_profile()
             self.context.state = "cancelled"
             self.context.state_version += 1
             self._persist()
@@ -592,24 +663,61 @@ class TaskExecutor:
                         f"Nav2 reported missed waypoints: {absolute_missed}",
                     )
                     return
-                if self._segments and self.context.current_segment_index < len(self._segments) - 1:
-                    next_index = self.context.current_segment_index + 1
-                    next_segment = self._segments[next_index]
+                reached_index = self._goal_offset
+                reached_waypoint = self.context.route_snapshot["waypoints"][reached_index]
+                self._set_localization_policy(reached_waypoint, "stationary")
+                if not self._absolute_localization_ready():
+                    self.navigation.stop_motion()
+                    self._restore_navigation_profile()
+                    self._paused_for_localization = True
+                    self.context.state = "paused"
+                    self.context.current_waypoint_index = reached_index
                     self.context.state_version += 1
                     self._persist()
-                    self._emit("task.map_switching")
-                    try:
-                        self.map_set_coordinator.activate(next_segment)
-                    except Exception as exc:
-                        self._fail("MAP_SWITCH_FAILED", str(exc))
-                        return
-                    self._send_segment(next_index)
+                    self._emit(
+                        "task.paused",
+                        code="ABSOLUTE_LOCALIZATION_REQUIRED",
+                        message="waypoint reached by dead reckoning; waiting for NDT or RTK confirmation",
+                    )
                     return
+
+                next_waypoint_index = reached_index + 1
+                self.context.current_waypoint_index = next_waypoint_index
+                self.context.state_version += 1
+                self._persist()
+                total_waypoints = len(self.context.route_snapshot["waypoints"])
+                if next_waypoint_index < total_waypoints:
+                    if self._segments:
+                        current_segment = self._segments[self.context.current_segment_index]
+                        if next_waypoint_index >= current_segment.end_index:
+                            next_segment_index = self.context.current_segment_index + 1
+                            next_segment = self._segments[next_segment_index]
+                            self._emit("task.map_switching")
+                            try:
+                                self.map_set_coordinator.activate(next_segment)
+                            except Exception as exc:
+                                self._fail("MAP_SWITCH_FAILED", str(exc))
+                                return
+                            self._send_segment(next_segment_index, next_waypoint_index)
+                            return
+                    self._send_from(next_waypoint_index)
+                    return
+                if self._is_docking_task():
+                    self._restore_navigation_profile()
+                    if callable(self.docking_arrived_handler):
+                        try:
+                            self.docking_arrived_handler(dict(self.context.docking or {}))
+                        except Exception as exc:
+                            self._fail("DOCK_CHARGE_START_FAILED", str(exc))
+                            return
+                else:
+                    self._restore_navigation_profile()
                 pose_error = self._final_pose_error()
                 if pose_error:
                     self._fail(*pose_error)
                     return
                 self._stop_task_rosbag()
+                self._navigation_prepared = False
                 self.context.state = "completed"
                 self.context.current_waypoint_index = len(self.context.route_snapshot["waypoints"])
                 self.context.state_version += 1
@@ -632,12 +740,62 @@ class TaskExecutor:
             elif status == "cancelled":
                 self._stop_obstacle_monitor()
                 self._stop_task_rosbag()
+                self._restore_navigation_profile()
                 return
             else:
+                self._restore_navigation_profile()
                 if self._hold_blocked_task():
                     return
                 self._stop_obstacle_monitor()
                 self._fail("NAVIGATION_FAILED", error_message or status)
+
+    def _is_docking_task(self) -> bool:
+        return bool(self.context and (self.context.docking or {}).get("enabled"))
+
+    def _apply_docking_profile(self, waypoint_index: int) -> None:
+        if not self._is_docking_task():
+            return
+        final_index = int((self.context.docking or {}).get("final_waypoint_index", 1))
+        setter = getattr(self.navigation, "set_docking_profile", None)
+        if callable(setter):
+            setter(final_approach=waypoint_index >= final_index)
+        if waypoint_index >= final_index:
+            self._stop_obstacle_monitor()
+            self._emit("task.docking_final_approach", message="进入充电桩末段：微速、实时避障关闭")
+
+    def _apply_navigation_profile(self, waypoint_index: int) -> None:
+        if not self.context:
+            return
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        target = waypoints[waypoint_index]
+        source = waypoints[waypoint_index - 1] if waypoint_index > 0 else None
+        avoid_obstacles = bool(source.get("avoidance_to_next", True)) if source else True
+        if self._is_docking_task():
+            final_index = int((self.context.docking or {}).get("final_waypoint_index", 1))
+            if waypoint_index >= final_index:
+                avoid_obstacles = False
+        self._segment_avoidance_enabled = avoid_obstacles
+        setter = getattr(self.navigation, "set_waypoint_profile", None)
+        if callable(setter):
+            setter(avoid_obstacles=avoid_obstacles, require_yaw=bool(target.get("require_yaw", False)))
+        self._apply_docking_profile(waypoint_index)
+        if not avoid_obstacles:
+            self._stop_obstacle_monitor()
+
+    def _restore_docking_profile(self) -> None:
+        setter = getattr(self.navigation, "set_docking_profile", None)
+        if callable(setter):
+            setter(final_approach=False)
+
+    def _restore_navigation_profile(self) -> None:
+        self._segment_avoidance_enabled = True
+        try:
+            setter = getattr(self.navigation, "set_waypoint_profile", None)
+            if callable(setter):
+                setter(avoid_obstacles=True, require_yaw=False)
+            self._restore_docking_profile()
+        except Exception:
+            LOGGER.exception("failed to restore default navigation profile")
 
     def _hold_blocked_task(self) -> bool:
         """Keep a genuinely obstructed task alive and retry it for five minutes."""
@@ -708,6 +866,8 @@ class TaskExecutor:
         if not self.context:
             return
         self._stop_task_rosbag()
+        self._navigation_prepared = False
+        self._restore_navigation_profile()
         self.context.state = "failed"
         self.context.state_version += 1
         self._persist()

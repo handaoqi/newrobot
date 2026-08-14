@@ -47,6 +47,7 @@ class TelemetryService:
         current_map = payload.get("current_map") or {}
         map_set = payload.get("map_set") or {}
         localization_quality = dict(localization.get("quality") or {})
+        localization_quality["decision"] = dict(localization.get("decision") or {})
         if map_set:
             localization_quality["map_set"] = map_set
         execution = None

@@ -1,6 +1,9 @@
 codex:
   binary: /home/robot/.nvm/versions/node/v22.22.3/bin/codex
-  home: /home/robot/.codex
+  # The Agent gets its own mutable cache. Auth, sessions and skills below are
+  # linked from shared_home so the main conversation still resumes normally.
+  home: /home/robot/.codex-dev-agent
+  shared_home: /home/robot/.codex
   yolo: true
   timeout_seconds: 7200
 
@@ -11,3 +14,28 @@ workspaces:
 storage:
   log_dir: /home/robot/.local/state/roamerx-dev-agent/tasks
   conversation_file: /home/robot/.local/state/roamerx-dev-agent/conversation.json
+
+voice:
+  enabled: true
+  capture_mode: local_alsa
+  # Type-C microphone/speaker attached directly to the NX board.
+  alsa_device: hw:0,0
+  # Physical microphone on the dog 3588. The listener publishes only speech
+  # segments; cloud ASR detects the wake phrase "小太阳".
+  host: 192.168.234.1
+  user: firefly
+  identity_file: /home/robot/.ssh/id_rsa
+  pulse_server: /run/user/1000/pulse/native
+  source: alsa_input.usb-TTGK_Technology_USB_Audio_33022920230925-00.mono-fallback
+  # This USB microphone's idle level is about RMS 17; keep the threshold low
+  # enough to capture normal speech. The wake phrase is the final filter.
+  rms_threshold: 18
+  # NX-local FunASR/SenseVoice uses the Orin GPU. A cloud ASR fallback keeps
+  # voice commands available during local model restart, but never replaces a
+  # successful local (including empty/non-speech) result.
+  local_asr_enabled: true
+  local_asr_url: http://127.0.0.1:18080/v1/audio/transcriptions
+  local_asr_model: sensevoice
+  local_asr_language: zh
+  local_asr_timeout_seconds: 30
+  local_asr_fallback_to_cloud: true

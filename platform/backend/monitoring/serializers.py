@@ -137,6 +137,7 @@ class RobotSerializer(serializers.ModelSerializer):
     connection_status = serializers.SerializerMethodField()
     # 展示真实"当日"告警数（按 detected_at 当天计），而非永不清零的累计计数器字段。
     today_alerts = serializers.SerializerMethodField()
+    charging_config = serializers.SerializerMethodField()
 
     class Meta:
         model = Robot
@@ -169,6 +170,7 @@ class RobotSerializer(serializers.ModelSerializer):
             "current_map_id",
             "current_map_version",
             "last_seen_at",
+            "charging_config",
         ]
 
     def get_connection_status(self, obj):
@@ -178,6 +180,17 @@ class RobotSerializer(serializers.ModelSerializer):
         return InspectionEvent.objects.filter(
             robot=obj, detected_at__date=timezone.localdate()
         ).count()
+
+    def get_charging_config(self, obj):
+        route = obj.charging_route
+        map_data = obj.charging_map
+        return {
+            "map_id": map_data.id if map_data else None,
+            "map_name": map_data.name if map_data else "",
+            "route_id": route.id if route else None,
+            "route_name": route.name if route else "",
+            "configured": bool(map_data and route),
+        }
 
 
 class EventSerializer(serializers.ModelSerializer):
@@ -536,10 +549,13 @@ class PersonDetectionIngestSerializer(serializers.Serializer):
             track_id = str(item.get("track_id", ""))[:64]
             if not track_id or width <= 0 or height <= 0:
                 continue
+            label = str(item.get("label", "person")).strip().lower()
+            if label not in {"person", "bicycle", "bike", "自行车"}:
+                continue
             cleaned.append(
                 {
                     "track_id": track_id,
-                    "label": "person",
+                    "label": label,
                     "confidence": round(confidence, 4),
                     "bbox": {"x": x, "y": y, "width": width, "height": height},
                 }
@@ -604,7 +620,11 @@ class RobotCommandCreateSerializer(serializers.Serializer):
             return attrs
         payload = attrs.get("payload") or {}
         cleaned = dict(payload)
-        limits = {"vx": 0.2, "vy": 0.15, "yaw_rate": 0.35}
+        limits = (
+            {"vx": 0.2, "vy": 0.15, "yaw_rate": 0.35}
+            if payload.get("source") == "person_follow"
+            else {"vx": 0.5, "vy": 0.5, "yaw_rate": 0.5}
+        )
         for field, limit in limits.items():
             try:
                 value = float(payload.get(field, 0.0))
@@ -745,6 +765,7 @@ class MapDataSerializer(serializers.ModelSerializer):
     pgm_url = serializers.SerializerMethodField()
     yaml_url = serializers.SerializerMethodField()
     thumbnail_url = serializers.SerializerMethodField()
+    mapping_trace_url = serializers.SerializerMethodField()
     file_size = serializers.SerializerMethodField()
 
     class Meta:
@@ -761,6 +782,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "pgm_url",
             "yaml_url",
             "thumbnail_url",
+            "mapping_trace_url",
             "resolution",
             "width",
             "height",
@@ -796,6 +818,9 @@ class MapDataSerializer(serializers.ModelSerializer):
     def get_thumbnail_url(self, obj):
         # 返回相对路径，前端 getFullUrl() 会自动拼接正确的 base URL
         return f"/api/maps/{obj.id}/preview/"
+
+    def get_mapping_trace_url(self, obj):
+        return f"/api/maps/{obj.id}/mapping-trace/"
 
     def get_file_size(self, obj):
         size = 0
@@ -849,6 +874,20 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
 
     def validate_waypoints(self, value):
+        for index, point in enumerate(value):
+            if not isinstance(point, dict):
+                continue
+            for field in ("avoidance_to_next", "require_yaw"):
+                if field in point and not isinstance(point[field], bool):
+                    raise serializers.ValidationError(f"途经点 {index + 1} 的 {field} 必须是布尔值")
+        invalid_modes = [
+            point.get("localization_mode")
+            for point in value
+            if isinstance(point, dict)
+            and str(point.get("localization_mode") or "ndt").lower() not in {"ndt", "rtk"}
+        ]
+        if invalid_modes:
+            raise serializers.ValidationError("途经点定位方式只能是 NDT 或 RTK")
         try:
             template_ids = {
                 int(point["speech_template_id"])
@@ -953,8 +992,13 @@ class RobotStatusSerializer(serializers.ModelSerializer):
     power_mode = serializers.SerializerMethodField()
 
     def get_localization_quality(self, obj):
-        raw_quality = (obj.raw_payload or {}).get("localization", {}).get("quality")
-        return raw_quality or obj.localization_quality or {}
+        raw_localization = (obj.raw_payload or {}).get("localization") or {}
+        quality = dict(obj.localization_quality or {})
+        quality.update(raw_localization.get("quality") or {})
+        decision = raw_localization.get("decision") or quality.get("decision")
+        if decision:
+            quality["decision"] = dict(decision)
+        return quality
 
     def get_current_map(self, obj):
         return (obj.raw_payload or {}).get("current_map") or {

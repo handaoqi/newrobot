@@ -31,7 +31,16 @@ bot-version/data/telemetry/
 bot-version/snapshots/
 bot-version/*.log
 bot-version/model/
-bot-version-test/
+bot-version-test/.ssh/
+bot-version-test/__pycache__/
+bot-version-test/**/__pycache__/
+bot-version-test/data/
+bot-version-test/snapshots/
+bot-version-test/config*.yaml
+!bot-version-test/config.example.yaml
+bot-version-test/models/bike.onnx
+bot-version-test/*.bak-*
+bot-version-test/**/*.bak-*
 bot-version-audio-test/
 bot-version/config.yaml.bak-*
 *.bak-*

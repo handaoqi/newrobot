@@ -17,12 +17,17 @@ NAV_COMMAND_TYPES = {
 MAP_COMMAND_TYPES = {"map.activate"}
 SENSOR_COMMAND_TYPES = {"sensor.restart"}
 CHARGE_COMMAND_TYPES = {"charge.start", "charge.stop"}
+MOTION_CONTROL_COMMAND_TYPES = {"motion.start", "motion.stop"}
 AUDIO_COMMAND_TYPES = {"audio.volume"}
 TELEOP_COMMAND_TYPES = {
     "teleop.takeover_enter",
     "teleop.takeover_exit",
     "teleop.stand_up",
     "teleop.lie_down",
+    "teleop.speed_micro",
+    "teleop.speed_slow",
+    "teleop.speed_normal",
+    "teleop.speed_fast",
     "teleop.move_forward",
     "teleop.move_backward",
     "teleop.move_left",
@@ -32,6 +37,9 @@ TELEOP_COMMAND_TYPES = {
     "teleop.move_velocity",
     "teleop.move_stop",
     "teleop.passive",
+    "teleop.skill",
+    "teleop.skill_status",
+    "teleop.skill_cancel",
 }
 COMMAND_TYPES = (
     TASK_COMMAND_TYPES
@@ -40,6 +48,7 @@ COMMAND_TYPES = (
     | MAP_COMMAND_TYPES
     | SENSOR_COMMAND_TYPES
     | CHARGE_COMMAND_TYPES
+    | MOTION_CONTROL_COMMAND_TYPES
     | AUDIO_COMMAND_TYPES
     | TELEOP_COMMAND_TYPES
 )
@@ -152,6 +161,9 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("x", "y", "yaw"):
                 if isinstance(waypoint.get(field), bool) or not isinstance(waypoint.get(field), (int, float)):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be numeric")
+            for field in ("avoidance_to_next", "require_yaw"):
+                if field in waypoint and not isinstance(waypoint[field], bool):
+                    raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")

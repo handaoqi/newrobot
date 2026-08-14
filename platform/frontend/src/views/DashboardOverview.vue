@@ -16,6 +16,7 @@ import {
   fetchOverview,
   fetchRecordedAudios,
   fetchRobotDetail,
+  fetchRobotPersonDetections,
   fetchRobots,
   fetchRobotStatus,
   fetchSpeechCategories,
@@ -65,6 +66,7 @@ const recordingSaving = ref(false)
 const videoRef = ref(null)
 const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
+const liveDetectionState = ref({ detections: [] })
 let flvPlayer = null
 let hlsPlayer = null
 let liveGuardTimer = null
@@ -82,6 +84,7 @@ let recordingStream = null
 let recordedChunks = []
 let previewPlayer = null
 let audioStatusTimer = null
+let liveDetectionTimer = null
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
 const AUDIO_COMMAND_COOLDOWN_MS = 3000
@@ -106,6 +109,9 @@ const selectedSourceType = computed(() => selectedRecordingId.value ? 'recording
 const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const bicycleDetections = computed(() => (liveDetectionState.value?.detections || []).filter((item) =>
+  ['bicycle', 'bike', '自行车'].includes(String(item.label || '').toLowerCase()),
+))
 const activeHoldAction = ref('')
 const motionActions = [
   { action: 'move_forward', label: '前进', arrow: '↑', position: 'up', payload: { vx: 0.35 }, hold: true },
@@ -143,6 +149,40 @@ function formatEventTime(value) {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+async function refreshLiveDetections() {
+  const robotId = latestRobot.value?.id
+  if (!robotId) {
+    liveDetectionState.value = { detections: [] }
+    return
+  }
+  try {
+    const state = await fetchRobotPersonDetections(robotId)
+    if (latestRobot.value?.id === robotId) liveDetectionState.value = state
+  } catch {
+    liveDetectionState.value = { detections: [] }
+  }
+}
+
+function bicycleDetectionStyle(item) {
+  const stage = videoStageRef.value
+  const frameWidth = Number(liveDetectionState.value?.frame_width || 1)
+  const frameHeight = Number(liveDetectionState.value?.frame_height || 1)
+  const stageWidth = Number(stage?.clientWidth || 1)
+  const stageHeight = Number(stage?.clientHeight || 1)
+  const scale = Math.max(stageWidth / frameWidth, stageHeight / frameHeight)
+  const renderedWidth = frameWidth * scale
+  const renderedHeight = frameHeight * scale
+  const offsetX = (stageWidth - renderedWidth) / 2
+  const offsetY = (stageHeight - renderedHeight) / 2
+  const box = item.bbox || {}
+  return {
+    left: `${offsetX + Number(box.x || 0) * scale}px`,
+    top: `${offsetY + Number(box.y || 0) * scale}px`,
+    width: `${Number(box.width || 0) * scale}px`,
+    height: `${Number(box.height || 0) * scale}px`,
+  }
 }
 
 function setSpeakerTemplate(template) {
@@ -806,6 +846,7 @@ function destroyVideoPlayers() {
 async function chooseRobot(robotId, announce = true) {
   if (!robotId || switchingRobot.value || selectedRobot.value?.id === robotId) return
   switchingRobot.value = true
+  liveDetectionState.value = { detections: [] }
   try {
     const [robotDetail, liveStatus] = await Promise.all([
       fetchRobotDetail(robotId),
@@ -953,6 +994,8 @@ onMounted(async () => {
 
   setupLivePlayer()
   audioStatusTimer = window.setInterval(refreshAudioStatus, 5000)
+  await refreshLiveDetections()
+  liveDetectionTimer = window.setInterval(refreshLiveDetections, 400)
 })
 
 onBeforeUnmount(() => {
@@ -969,6 +1012,7 @@ onBeforeUnmount(() => {
   destroyVideoPlayers()
   closeAlertStream()
   if (audioStatusTimer) window.clearInterval(audioStatusTimer)
+  if (liveDetectionTimer) window.clearInterval(liveDetectionTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   window.removeEventListener('blur', stopHoldAction)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -1030,6 +1074,15 @@ function handleVisibilityChange() {
           <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
             <strong>无信号</strong>
             <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
+          </div>
+
+          <div
+            v-for="detection in bicycleDetections"
+            :key="detection.track_id"
+            class="bicycle-detection-box"
+            :style="bicycleDetectionStyle(detection)"
+          >
+            <span>自行车 · {{ Math.round(Number(detection.confidence || 0) * 100) }}%</span>
           </div>
 
           <div class="video-overlay">

@@ -21,13 +21,13 @@ class SensorHealthMonitor : public rclcpp::Node {
   SensorHealthMonitor() : Node("sensor_health_monitor"), last_report_(Clock::now()) {
     const auto qos = rclcpp::SensorDataQoS();
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-        "/laser_scan", qos, [this](const sensor_msgs::msg::LaserScan::SharedPtr) { mark(scan_); });
+        "/laser_scan", qos, [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) { mark(scan_, msg->header.stamp); });
     lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "/front_lidar", qos, [this](const sensor_msgs::msg::PointCloud2::SharedPtr) { mark(lidar_); });
+        "/front_lidar", qos, [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { mark(lidar_, msg->header.stamp); });
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-        "/front_lidar/imu", qos, [this](const sensor_msgs::msg::Imu::SharedPtr) { mark(imu_); });
+        "/front_lidar/imu", qos, [this](const sensor_msgs::msg::Imu::SharedPtr msg) { mark(imu_, msg->header.stamp); });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        "/odom/mc_odom", qos, [this](const nav_msgs::msg::Odometry::SharedPtr) { mark(odom_); });
+        "/odom/mc_odom", qos, [this](const nav_msgs::msg::Odometry::SharedPtr msg) { mark(odom_, msg->header.stamp); });
     rtk_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
         "/fix", qos, [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           rtk_fix_status_.store(static_cast<int>(msg->status.status), std::memory_order_relaxed);
@@ -36,7 +36,7 @@ class SensorHealthMonitor : public rclcpp::Node {
           rtk_horizontal_std_m_.store(
               horizontal_variance >= 0.0 ? std::sqrt(horizontal_variance) : -1.0,
               std::memory_order_relaxed);
-          mark(rtk_);
+          mark(rtk_, msg->header.stamp);
         });
     publisher_ = create_publisher<std_msgs::msg::String>("/sensor_health", 2);
     timer_ = create_wall_timer(1s, std::bind(&SensorHealthMonitor::publish_health, this));
@@ -48,15 +48,35 @@ class SensorHealthMonitor : public rclcpp::Node {
   struct Counter {
     std::atomic<uint64_t> count{0};
     std::atomic<int64_t> last_ns{0};
+    std::atomic<int64_t> measurement_stamp_ns{0};
   };
 
   static int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
   }
 
-  static void mark(Counter &counter) {
+  static void mark(Counter &counter, const builtin_interfaces::msg::Time &stamp) {
     counter.count.fetch_add(1, std::memory_order_relaxed);
     counter.last_ns.store(now_ns(), std::memory_order_relaxed);
+    counter.measurement_stamp_ns.store(
+        static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec,
+        std::memory_order_relaxed);
+  }
+
+  static std::string timestamp_health(Counter &counter) {
+    const int64_t stamp_ns = counter.measurement_stamp_ns.load(std::memory_order_relaxed);
+    if (stamp_ns < 946684800000000000LL) {
+      return ",\"measurement_time_valid\":false,\"measurement_time_offset_ms\":null";
+    }
+    const int64_t system_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const double offset_ms = (system_ns - stamp_ns) / 1e6;
+    std::ostringstream out;
+    out << ",\"measurement_time_valid\":"
+        << (std::fabs(offset_ms) <= 100.0 ? "true" : "false")
+        << ",\"measurement_time_offset_ms\":" << std::fixed << std::setprecision(3)
+        << offset_ms;
+    return out.str();
   }
 
   static void append_sensor(
@@ -82,11 +102,11 @@ class SensorHealthMonitor : public rclcpp::Node {
     last_report_ = now;
     std::ostringstream out;
     out << '{';
-    append_sensor(out, "lidar", "/front_lidar", lidar_, elapsed, 1.0);
+    append_sensor(out, "lidar", "/front_lidar", lidar_, elapsed, 1.0, timestamp_health(lidar_));
     out << ',';
     append_sensor(out, "laser_scan", "/laser_scan", scan_, elapsed, 1.0);
     out << ',';
-    append_sensor(out, "imu", "/front_lidar/imu", imu_, elapsed, 0.5);
+    append_sensor(out, "imu", "/front_lidar/imu", imu_, elapsed, 0.5, timestamp_health(imu_));
     out << ',';
     append_sensor(out, "odometry", "/odom/mc_odom", odom_, elapsed, 1.0);
     out << ',';
@@ -105,7 +125,7 @@ class SensorHealthMonitor : public rclcpp::Node {
     else rtk_extra << "null";
     append_sensor(
         out, "rtk", "/fix", rtk_, elapsed, 3.0,
-        rtk_extra.str());
+        rtk_extra.str() + timestamp_health(rtk_));
     out << '}';
     std_msgs::msg::String message;
     message.data = out.str();

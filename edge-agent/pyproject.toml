@@ -20,3 +20,4 @@ include = ["roamerx_edge*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

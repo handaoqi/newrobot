@@ -11,10 +11,16 @@ from pathlib import Path
 import paho.mqtt.client as mqtt
 
 from . import __version__
-from .codex_runner import CodexRunner
+from .codex_runner import (
+    CodexRunner,
+    is_known_models_cache_warning,
+    is_session_integrity_warning,
+)
 from .config import DevAgentConfig
 from .conversation_store import ConversationStore
 from .protocol import DevTaskRequest, TaskMessageError
+from .voice_listener import VoiceCommandListener
+from .voice_ack_player import VoiceAckPlayer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -23,15 +29,37 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def build_effective_prompt(*, workspace_path: str, prompt: str, session_id: str | None) -> str:
+    if session_id:
+        return (
+            "这是当前 Codex 主会话的后续指令，请沿用已有上下文继续处理。\n"
+            "不要重新介绍会话，也不要重复读取已经加载的项目说明；"
+            "仅在文件可能变化或本轮确有需要时重新检查。\n"
+            f"本轮指定工作区：{workspace_path}\n\n"
+            f"用户新指令：\n{prompt}"
+        )
+    return (
+        f"本轮远程开发指定工作区：{workspace_path}\n"
+        "执行前请进入该目录，并读取该目录适用的 AGENTS.md 等项目说明。\n\n"
+        f"用户指令：\n{prompt}"
+    )
+
+
 class DevAgentApplication:
     def __init__(self, config: DevAgentConfig) -> None:
         self.config = config
         self.runner = CodexRunner(config.codex)
+        # Prepare this before connecting to MQTT so an immediately received task
+        # can never resume a desktop application's session file.
+        self.runner.prepare_codex_home()
         self.conversation = ConversationStore(config.conversation_file)
         self._sequence: dict[str, int] = {}
         self._task_lock = threading.Lock()
         self._known_tasks: set[str] = set()
         self._heartbeat_started = False
+        self._startup_presence_pending = True
+        self.voice = VoiceCommandListener(config.voice, self._publish_voice)
+        self.voice_ack = VoiceAckPlayer(config.voice)
         self.log_dir = Path(config.log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.client = mqtt.Client(
@@ -74,6 +102,7 @@ class DevAgentApplication:
             return
         client.subscribe(self._topic("dev/tasks"), qos=1)
         client.subscribe(self._topic("dev/tasks/+/control"), qos=1)
+        client.subscribe(self._topic("dev/voice/ack"), qos=1)
         self._publish(
             self._topic("dev/presence"),
             {
@@ -81,6 +110,8 @@ class DevAgentApplication:
                 "agent_version": __version__,
                 "codex_binary": self.config.codex.binary,
                 "workspaces": sorted(self.config.workspaces),
+                "conversations": self.conversation.sessions(),
+                "agent_restarted": self._startup_presence_pending,
                 "timestamp": now_iso(),
             },
             retain=True,
@@ -88,7 +119,12 @@ class DevAgentApplication:
         if not self._heartbeat_started:
             self._heartbeat_started = True
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="dev-heartbeat").start()
+            self.voice.start()
+        self._startup_presence_pending = False
         LOGGER.info("connected to MQTT broker")
+
+    def _publish_voice(self, payload: dict) -> None:
+        self._publish(self._topic("dev/voice/audio"), payload)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
         LOGGER.warning("MQTT disconnected: %s", reason_code)
@@ -103,6 +139,7 @@ class DevAgentApplication:
                     "agent_version": __version__,
                     "codex_binary": self.config.codex.binary,
                     "workspaces": sorted(self.config.workspaces),
+                    "conversations": self.conversation.sessions(),
                     "timestamp": now_iso(),
                 },
                 retain=True,
@@ -116,6 +153,19 @@ class DevAgentApplication:
             return
         if message.topic.endswith("/control"):
             self._handle_control(payload)
+            return
+        if message.topic.endswith("/voice/ack"):
+            try:
+                announcement_kind = str(payload.get("kind") or "")
+                try:
+                    suppress_seconds = float(payload.get("suppress_seconds", 3.0))
+                except (TypeError, ValueError):
+                    suppress_seconds = 3.0
+                maximum_suppression = 600.0 if announcement_kind == "task_summary" else 60.0
+                self.voice.suppress(min(maximum_suppression, max(0.0, suppress_seconds)))
+                self.voice_ack.play(str(payload.get("audio_url") or ""))
+            except Exception:
+                LOGGER.exception("voice acknowledgement playback could not start")
             return
         threading.Thread(
             target=self._handle_task,
@@ -143,32 +193,66 @@ class DevAgentApplication:
         self._known_tasks.add(task.task_id)
         self._sequence[task.task_id] = 0
         try:
-            self._emit(task.task_id, "status", status="running", text="Codex 已启动")
-            session_id = self.conversation.thread_id()
+            self._emit(task.task_id, "status", status="running", text="Codex 正在处理新指令")
+            session_id = self.conversation.thread_id(task.conversation_id)
             workspace_path = self.config.workspaces[task.workspace]
-            effective_prompt = (
-                f"本轮远程开发指定工作区：{workspace_path}\n"
-                "执行前请进入该目录，并读取该目录适用的 AGENTS.md 等项目说明。\n\n"
-                f"用户指令：\n{task.prompt}"
+            effective_prompt = build_effective_prompt(
+                workspace_path=workspace_path,
+                prompt=task.prompt,
+                session_id=session_id,
             )
             self._emit(
                 task.task_id,
                 "conversation",
                 status="resuming" if session_id else "creating",
-                text="继续统一 Codex 对话" if session_id else "创建统一 Codex 对话",
+                text=(
+                    "已连接主会话，沿用现有上下文"
+                    if session_id else "正在初始化主会话"
+                ),
                 codex_thread_id=session_id,
+                conversation_id=task.conversation_id,
             )
             exit_code, last_message, cancelled = self.runner.run(
                 task_id=task.task_id,
                 prompt=effective_prompt,
                 workspace=workspace_path,
                 session_id=session_id,
+                model=task.model,
                 on_output=lambda stream, text, parsed: self._on_codex_output(
-                    task.task_id, stream, text, parsed
+                    task.task_id, task.conversation_id, stream, text, parsed
                 ),
             )
+            if self.runner.had_session_integrity_error and not cancelled:
+                # A completed tool call without its output cannot be replayed by
+                # Codex. Do not keep resuming that corrupted thread forever.
+                self.conversation.clear(task.conversation_id)
+                self._emit(
+                    task.task_id,
+                    "conversation",
+                    status="recovering",
+                    text="会话工具状态不完整，已自动新建会话并重试当前指令",
+                    conversation_id=task.conversation_id,
+                )
+                exit_code, last_message, cancelled = self.runner.run(
+                    task_id=task.task_id,
+                    prompt=build_effective_prompt(
+                        workspace_path=workspace_path,
+                        prompt=task.prompt,
+                        session_id=None,
+                    ),
+                    workspace=workspace_path,
+                    session_id=None,
+                    model=task.model,
+                    on_output=lambda stream, text, parsed: self._on_codex_output(
+                        task.task_id, task.conversation_id, stream, text, parsed
+                    ),
+                )
             status = "cancelled" if cancelled else ("succeeded" if exit_code == 0 else "failed")
-            self._publish_result(task.task_id, status, exit_code=exit_code, last_message=last_message)
+            self._publish_result(
+                task.task_id, status, conversation_id=task.conversation_id,
+                codex_thread_id=self.conversation.thread_id(task.conversation_id),
+                exit_code=exit_code, last_message=last_message,
+            )
         except TimeoutError as exc:
             self._publish_result(task.task_id, "timed_out", error=str(exc))
         except Exception as exc:
@@ -189,9 +273,17 @@ class DevAgentApplication:
             text="正在取消 Codex 任务" if cancelled else "任务当前未运行",
         )
 
-    def _on_codex_output(self, task_id: str, stream: str, text: str, parsed: dict | None) -> None:
+    def _on_codex_output(
+        self, task_id: str, conversation_id: str, stream: str, text: str, parsed: dict | None
+    ) -> None:
+        if stream == "stderr" and is_known_models_cache_warning(text):
+            LOGGER.warning("suppressed non-fatal Codex model-cache warning task=%s", task_id)
+            return
+        if stream == "stderr" and is_session_integrity_warning(text):
+            LOGGER.warning("suppressed recoverable Codex session warning task=%s", task_id)
+            return
         if parsed and parsed.get("type") == "thread.started" and parsed.get("thread_id"):
-            self.conversation.save(str(parsed["thread_id"]))
+            self.conversation.save(str(parsed["thread_id"]), conversation_id)
         event = {
             "task_id": task_id,
             "timestamp": now_iso(),
@@ -205,7 +297,8 @@ class DevAgentApplication:
             stream=stream,
             text=text,
             codex_event=parsed,
-            codex_thread_id=self.conversation.thread_id(),
+            codex_thread_id=self.conversation.thread_id(conversation_id),
+            conversation_id=conversation_id,
         )
 
     def _emit(self, task_id: str, event_type: str, **payload) -> None:

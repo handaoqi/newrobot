@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   fetchMaps,
+  fetchMapMappingTrace,
   fetchMapSets,
   fetchRobotNavigationStatus,
   fetchRobotStatus,
@@ -18,6 +19,18 @@ import {
   synthesizeSpeech,
 } from '../services/api'
 import { API_BASE } from '../services/api'
+import {
+  KEYFRAME_PAGE_SIZE,
+  MAP_ZOOM_MAX,
+  MAP_ZOOM_MIN,
+  MAP_ZOOM_STEP,
+  clampMapZoom,
+  headingBetweenMapPoints,
+  headingDegreesToRadians,
+  normalizeHeadingDegrees,
+  paginateKeyframes,
+  resolveMapClickAction,
+} from '../services/routePlannerState'
 
 const maps = ref([])
 const mapSets = ref([])
@@ -38,6 +51,7 @@ const waypointNames = ref([])
 const showRouteDialog = ref(false)
 const loading = ref(false)
 const mapImageRef = ref(null)
+const mapViewportRef = ref(null)
 const drillTimelineListRef = ref(null)
 const imageReadyTick = ref(0)
 const navStatus = ref(null)
@@ -54,6 +68,22 @@ const localizationInitState = ref('idle')
 const localizationInitMessage = ref('')
 const poseHistory = ref([])
 const showPoseTrail = ref(true)
+const mappingTrace = ref([])
+const mappingTraceLoading = ref(false)
+const showMappingTrace = ref(true)
+const inspectedMapPoint = ref(null)
+const mapClickMode = ref('waypoint')
+const inspectPoseStep = ref('position')
+const inspectedHeadingTarget = ref(null)
+const mapInteractionError = ref('')
+const mapZoom = ref(1)
+const mapImageNaturalWidth = ref(0)
+const waypointYawDrafts = ref([])
+const waypointYawErrors = ref([])
+const waypointYawConfirmed = ref([])
+const keyframePanelOpen = ref(false)
+const keyframePage = ref(1)
+const selectedKeyframeIndex = ref(null)
 const lastPoseSampleKey = ref('')
 const drillRunning = ref(false)
 const drillPosition = ref(null)
@@ -157,12 +187,20 @@ function seedRobotsFromMapsAndRoutes() {
   robots.value = Array.from(known.values())
 }
 
-function handleMapSelect(map) {
+async function handleMapSelect(map) {
   selectedMap.value = map
   selectedRoute.value = null
   waypoints.value = []
   waypointNames.value = []
+  resetWaypointYawEditors()
   clearPoseHistory()
+  inspectedMapPoint.value = null
+  inspectedHeadingTarget.value = null
+  inspectPoseStep.value = 'position'
+  mapInteractionError.value = ''
+  selectedKeyframeIndex.value = null
+  keyframePage.value = 1
+  mapZoom.value = 1
   routeForm.value = {
     name: '',
     map_data: map?.id || null,
@@ -172,6 +210,23 @@ function handleMapSelect(map) {
   }
   refreshImageGeometry()
   refreshNavigationStatus()
+  await loadMappingTrace(map)
+}
+
+async function loadMappingTrace(map = selectedMap.value) {
+  mappingTrace.value = []
+  keyframePage.value = 1
+  selectedKeyframeIndex.value = null
+  if (!map?.id) return
+  mappingTraceLoading.value = true
+  try {
+    const result = await fetchMapMappingTrace(map.id)
+    if (String(selectedMap.value?.id) === String(map.id)) mappingTrace.value = result.samples || []
+  } catch (error) {
+    console.error('加载建图轨迹失败:', error)
+  } finally {
+    mappingTraceLoading.value = false
+  }
 }
 
 function handleMapClick(event) {
@@ -187,7 +242,9 @@ function handleMapClick(event) {
   if (displayX < 0 || displayY < 0 || displayX > rect.width || displayY > rect.height) return
 
   const imagePoint = displayToImagePoint(displayX, displayY, geometry)
-  if (initialPoseMode.value) {
+  const clickedMapPoint = imagePointToWaypoint(imagePoint, geometry)
+  const clickAction = resolveMapClickAction(mapClickMode.value, initialPoseMode.value)
+  if (clickAction === 'initial_pose') {
     const clickedPose = imagePointToWaypoint(imagePoint, geometry, Number(manualInitialPose.value?.yaw || 0))
     if (initialPoseStep.value === 'position' || !manualInitialPose.value) {
       manualInitialPose.value = clickedPose
@@ -196,31 +253,87 @@ function handleMapClick(event) {
       navError.value = '已设置初始位置，请再点击狗头朝向'
       return
     }
-    const dx = clickedPose.x - manualInitialPose.value.x
-    const dy = clickedPose.y - manualInitialPose.value.y
-    if (Math.hypot(dx, dy) < 0.05) {
+    const yaw = headingBetweenMapPoints(manualInitialPose.value, clickedPose)
+    if (yaw === null) {
       navError.value = '朝向点离初始位置太近，请点远一点'
       return
     }
     manualInitialPose.value = {
       ...manualInitialPose.value,
-      yaw: Number(Math.atan2(dy, dx).toFixed(4)),
+      yaw,
     }
     initialPoseHeadingTarget.value = clickedPose
     navError.value = '已设置初始朝向，可以下发初始定位'
     return
   }
-  waypoints.value.push(imagePointToWaypoint(imagePoint, geometry))
+  if (clickAction === 'inspect') {
+    if (inspectPoseStep.value === 'position' || !inspectedMapPoint.value) {
+      inspectedMapPoint.value = {
+        point: { ...clickedMapPoint, yaw: 0 },
+        sample: nearestMappingSample(clickedMapPoint),
+      }
+      inspectedHeadingTarget.value = null
+      inspectPoseStep.value = 'heading'
+      mapInteractionError.value = ''
+      selectedKeyframeIndex.value = inspectedMapPoint.value.sample?.index ?? null
+      return
+    }
+    const yaw = headingBetweenMapPoints(inspectedMapPoint.value.point, clickedMapPoint)
+    if (yaw === null) {
+      mapInteractionError.value = '方向点离选定位置太近，请移动后再点击'
+      return
+    }
+    inspectedMapPoint.value = {
+      ...inspectedMapPoint.value,
+      point: { ...inspectedMapPoint.value.point, yaw },
+    }
+    inspectedHeadingTarget.value = clickedMapPoint
+    inspectPoseStep.value = 'complete'
+    mapInteractionError.value = ''
+    return
+  }
+  resetInspectedMapPoint()
+  const waypoint = imagePointToWaypoint(imagePoint, geometry)
+  waypoints.value.push(waypoint)
   waypointNames.value.push(`点${waypoints.value.length}`)
+  waypointYawDrafts.value.push(waypointYawDegrees(waypoint).toFixed(1))
+  waypointYawErrors.value.push('')
+  waypointYawConfirmed.value.push(true)
+}
+
+function setMapClickMode(mode) {
+  const nextMode = mode === 'inspect' ? 'inspect' : 'waypoint'
+  if (mapClickMode.value === nextMode) return
+  mapClickMode.value = nextMode
+  resetInspectedMapPoint()
+}
+
+function resetInspectedMapPoint() {
+  inspectedMapPoint.value = null
+  inspectedHeadingTarget.value = null
+  inspectPoseStep.value = 'position'
+  mapInteractionError.value = ''
+  selectedKeyframeIndex.value = null
+}
+
+function mapModeHintText() {
+  if (mapClickMode.value === 'waypoint') return '点击地图直接添加途经点。'
+  if (inspectPoseStep.value === 'position') return '第1步：点击地图获得 XY 位置。'
+  if (inspectPoseStep.value === 'heading') return '第2步：移动到朝向位置并再次点击，确定方向。'
+  return '位置和方向已获取；可继续点击调整方向，或点击“重选位置”。'
 }
 
 function refreshImageGeometry() {
+  if (mapImageRef.value?.naturalWidth) mapImageNaturalWidth.value = mapImageRef.value.naturalWidth
   imageReadyTick.value += 1
 }
 
 function removeWaypoint(index) {
   waypoints.value.splice(index, 1)
   waypointNames.value.splice(index, 1)
+  waypointYawDrafts.value.splice(index, 1)
+  waypointYawErrors.value.splice(index, 1)
+  waypointYawConfirmed.value.splice(index, 1)
 }
 
 function setWaypointSpeech(index, templateId) {
@@ -234,10 +347,121 @@ function setWaypointSpeech(index, templateId) {
   }
 }
 
+function setWaypointLocalization(index, mode) {
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    localization_mode: mode === 'rtk' ? 'rtk' : 'ndt',
+  }
+}
+
+function resetWaypointYawEditors() {
+  waypointYawDrafts.value = waypoints.value.map(point => waypointYawDegrees(point).toFixed(1))
+  waypointYawErrors.value = waypoints.value.map(() => '')
+  waypointYawConfirmed.value = waypoints.value.map(() => true)
+}
+
+function setWaypointYawDraft(index, value) {
+  waypointYawDrafts.value[index] = value
+  waypointYawErrors.value[index] = ''
+  waypointYawConfirmed.value[index] = false
+}
+
+function confirmWaypointYaw(index) {
+  const normalizedDegrees = normalizeHeadingDegrees(waypointYawDrafts.value[index])
+  if (normalizedDegrees === null) {
+    waypointYawErrors.value[index] = '请输入有效方向角'
+    waypointYawConfirmed.value[index] = false
+    return
+  }
+  const yaw = headingDegreesToRadians(normalizedDegrees)
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    yaw,
+  }
+  waypointYawDrafts.value[index] = normalizedDegrees.toFixed(1)
+  waypointYawErrors.value[index] = ''
+  waypointYawConfirmed.value[index] = true
+}
+
+function waypointYawDegrees(point) {
+  return normalizeHeadingDegrees(Number(point?.yaw || 0) * 180 / Math.PI) ?? 0
+}
+
+function setWaypointBoolean(index, field, value) {
+  waypoints.value[index] = { ...waypoints.value[index], [field]: Boolean(value) }
+}
+
+async function adjustMapZoom(delta) {
+  const viewport = mapViewportRef.value
+  const centerX = viewport?.scrollWidth ? (viewport.scrollLeft + viewport.clientWidth / 2) / viewport.scrollWidth : 0.5
+  const centerY = viewport?.scrollHeight ? (viewport.scrollTop + viewport.clientHeight / 2) / viewport.scrollHeight : 0.5
+  mapZoom.value = clampMapZoom(mapZoom.value + delta)
+  await nextTick()
+  refreshImageGeometry()
+  if (viewport) {
+    viewport.scrollLeft = Math.max(0, centerX * viewport.scrollWidth - viewport.clientWidth / 2)
+    viewport.scrollTop = Math.max(0, centerY * viewport.scrollHeight - viewport.clientHeight / 2)
+  }
+}
+
+function resetMapZoom() {
+  mapZoom.value = 1
+  nextTick(refreshImageGeometry)
+}
+
+const mapImageLayerStyle = computed(() => {
+  const baseWidth = Math.min(1200, mapImageNaturalWidth.value || 1200)
+  return { width: `${Math.max(320, Math.round(baseWidth * mapZoom.value))}px` }
+})
+
+const keyframePageData = computed(() => paginateKeyframes(mappingTrace.value, keyframePage.value, KEYFRAME_PAGE_SIZE))
+
+function changeKeyframePage(delta) {
+  keyframePage.value = Math.min(
+    keyframePageData.value.pageCount,
+    Math.max(1, keyframePageData.value.page + delta),
+  )
+}
+
+async function selectKeyframe(sample, rowIndex) {
+  const slam = sample?.slam
+  if (!Number.isFinite(Number(slam?.x)) || !Number.isFinite(Number(slam?.y))) return
+  const absoluteIndex = keyframePageData.value.start + rowIndex
+  selectedKeyframeIndex.value = sample.index ?? absoluteIndex
+  inspectedMapPoint.value = {
+    point: normalizeStoredWaypoint({ x: Number(slam.x), y: Number(slam.y), yaw: Number(slam.yaw || 0) }),
+    sample: { ...sample, index: selectedKeyframeIndex.value, distance_m: 0 },
+  }
+  mapClickMode.value = 'inspect'
+  inspectPoseStep.value = 'complete'
+  inspectedHeadingTarget.value = null
+  mapInteractionError.value = ''
+  await nextTick()
+  centerMapOnPoint(slam)
+}
+
+function centerMapOnPoint(point) {
+  const viewport = mapViewportRef.value
+  const geometry = getMapGeometry()
+  if (!viewport || !geometry) return
+  const display = pointDisplayPositionFromMap(point.x, point.y, geometry)
+  if (!display) return
+  const imageRect = mapImageRef.value.getBoundingClientRect()
+  const viewportRect = viewport.getBoundingClientRect()
+  const targetX = imageRect.left - viewportRect.left + viewport.scrollLeft + display.x
+  const targetY = imageRect.top - viewportRect.top + viewport.scrollTop + display.y
+  viewport.scrollTo({
+    left: Math.max(0, targetX - viewport.clientWidth / 2),
+    top: Math.max(0, targetY - viewport.clientHeight / 2),
+    behavior: 'smooth',
+  })
+}
+
 function clearWaypoints() {
   stopDrill(false)
   waypoints.value = []
   waypointNames.value = []
+  resetWaypointYawEditors()
 }
 
 function drillDisplayPosition() {
@@ -483,6 +707,11 @@ async function handleSaveRoute() {
     alert('请选择地图并添加途经点')
     return
   }
+  const pendingYawIndex = waypointYawConfirmed.value.findIndex(confirmed => !confirmed)
+  if (pendingYawIndex >= 0) {
+    alert(`请先确认点${pendingYawIndex + 1}的方向`)
+    return
+  }
 
   const payload = {
     name: routeForm.value.name || `路线-${new Date().toLocaleString()}`,
@@ -513,17 +742,21 @@ async function handleSaveRoute() {
 
 async function handleLoadRoute(route) {
   selectedRoute.value = route
-  selectedMap.value = maps.value.find(m => String(m.id) === String(route.map_data)) || selectedMap.value
+  const routeMap = maps.value.find(m => String(m.id) === String(route.map_data)) || selectedMap.value
+  const mapChanged = String(routeMap?.id) !== String(selectedMap.value?.id)
+  selectedMap.value = routeMap
   waypoints.value = (route.waypoints || []).map(point => ({ ...point }))
   waypointNames.value = route.waypoint_names?.length
     ? [...route.waypoint_names]
     : waypoints.value.map((_, index) => `点${index + 1}`)
+  resetWaypointYawEditors()
   routeForm.value.name = route.name
   routeForm.value.description = route.description
   routeForm.value.robot = route.robot
   routeForm.value.map_data = route.map_data
   routeForm.value.map_set = route.map_set || null
   await nextTick()
+  if (mapChanged) await loadMappingTrace(routeMap)
   refreshImageGeometry()
   refreshNavigationStatus()
 }
@@ -544,6 +777,10 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     speech_template_id: point.speech_template_id || null,
     speech_template_name: point.speech_template_name || '',
     speech_text: point.speech_text || '',
+    localization_mode: point.localization_mode === 'rtk' ? 'rtk' : 'ndt',
+    avoidance_to_next: point.avoidance_to_next !== false,
+    require_yaw: point.require_yaw === true,
+    dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
   }
   const normalized = {
     x: Number(point.x),
@@ -593,6 +830,10 @@ function withWaypointYaw(points) {
       v: Number(current.v.toFixed(8)),
       speech_template_id: current.speech_template_id || null,
       speech_template_name: current.speech_template_name || '',
+      localization_mode: current.localization_mode === 'rtk' ? 'rtk' : 'ndt',
+      avoidance_to_next: current.avoidance_to_next !== false,
+      require_yaw: current.require_yaw === true,
+      dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
       speech_text: current.speech_text || '',
     }
   })
@@ -645,12 +886,78 @@ function poseTrailPoints() {
     .join(' ')
 }
 
+function mappingTracePoints() {
+  imageReadyTick.value
+  const geometry = getMapGeometry()
+  if (!geometry) return ''
+  return mappingTrace.value
+    .map(sample => pointDisplayPositionFromMap(sample.slam?.x, sample.slam?.y, geometry))
+    .filter(Boolean)
+    .map(point => `${point.x},${point.y}`)
+    .join(' ')
+}
+
+function nearestMappingSample(point) {
+  const x = Number(point?.x)
+  const y = Number(point?.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !mappingTrace.value.length) return null
+  let nearest = null
+  let nearestDistance = Number.POSITIVE_INFINITY
+  for (const sample of mappingTrace.value) {
+    const sx = Number(sample.slam?.x)
+    const sy = Number(sample.slam?.y)
+    if (!Number.isFinite(sx) || !Number.isFinite(sy)) continue
+    const distance = Math.hypot(sx - x, sy - y)
+    if (distance < nearestDistance) {
+      nearest = sample
+      nearestDistance = distance
+    }
+  }
+  return nearest ? { ...nearest, distance_m: nearestDistance } : null
+}
+
+const waypointMappingSamples = computed(() => waypoints.value.map(point => nearestMappingSample(point)))
+
+function poseText(pose) {
+  if (!pose || !Number.isFinite(Number(pose.x)) || !Number.isFinite(Number(pose.y))) return '无记录'
+  const yaw = Number.isFinite(Number(pose.yaw)) ? `${waypointYawDegrees(pose).toFixed(1)} deg` : '无方向'
+  return `${Number(pose.x).toFixed(2)}, ${Number(pose.y).toFixed(2)} / ${yaw}`
+}
+
+function rtkPoseText(rtk) {
+  const pose = poseText(rtk)
+  if (pose === '无记录') return rtk?.reason === 'not_recorded' ? '旧地图无记录' : '无有效记录'
+  const quality = { 2: '固定解', 1: '浮点解', 0: '单点解' }[Number(rtk.status)] || '状态未知'
+  const precision = Number.isFinite(Number(rtk.horizontal_std_m)) ? ` / 精度 ${Number(rtk.horizontal_std_m).toFixed(2)}m` : ''
+  return `${pose} / ${quality}${precision}`
+}
+
+function mappingSampleTime(sample) {
+  const stamp = Number(sample?.stamp)
+  if (!Number.isFinite(stamp) || stamp <= 0) return '旧地图无时间记录'
+  return new Date(stamp * 1000).toLocaleString()
+}
+
+function waypointHeadingStyle(point) {
+  return { transform: `rotate(${-Number(point?.yaw || 0)}rad)` }
+}
+
 function initialPoseHeadingLinePoints() {
   imageReadyTick.value
   const geometry = getMapGeometry()
   if (!geometry || !manualInitialPose.value || !initialPoseHeadingTarget.value) return ''
   const start = pointDisplayPositionFromMap(manualInitialPose.value.x, manualInitialPose.value.y, geometry)
   const end = pointDisplayPositionFromMap(initialPoseHeadingTarget.value.x, initialPoseHeadingTarget.value.y, geometry)
+  if (!start || !end) return ''
+  return `${start.x},${start.y} ${end.x},${end.y}`
+}
+
+function inspectedHeadingLinePoints() {
+  imageReadyTick.value
+  const geometry = getMapGeometry()
+  if (!geometry || !inspectedMapPoint.value || !inspectedHeadingTarget.value) return ''
+  const start = pointDisplayPositionFromMap(inspectedMapPoint.value.point.x, inspectedMapPoint.value.point.y, geometry)
+  const end = pointDisplayPositionFromMap(inspectedHeadingTarget.value.x, inspectedHeadingTarget.value.y, geometry)
   if (!start || !end) return ''
   return `${start.x},${start.y} ${end.x},${end.y}`
 }
@@ -1045,6 +1352,89 @@ function localizationQuality() {
   return navStatus.value?.status?.localization_quality || null
 }
 
+function localizationSourceLabel(source) {
+  const labels = {
+    ndt_imu: 'NDT + IMU',
+    rtk_imu: 'RTK + IMU',
+    imu_odom_bridge: 'IMU + 里程计桥接',
+    unavailable: '无可用定位源',
+  }
+  return labels[source] || source || '决策数据未上报'
+}
+
+function localizationStatusCodeLabel(code) {
+  const labels = {
+    0: '初始化中',
+    1: '全局重定位中',
+    2: '重定位完成',
+    3: '正常',
+    4: '定位丢失',
+  }
+  if (code === null || code === undefined || code === '') return '—'
+  return `${code}（${labels[Number(code)] || '未知状态'}）`
+}
+
+function rtkQualityLabel(quality) {
+  const labels = {
+    rtk_fixed: '固定解',
+    rtk_float: '浮点解',
+    standalone: '单点解',
+    invalid: '无效',
+  }
+  return labels[quality] || quality || '无数据'
+}
+
+function sensorOnlineLabel(sensor) {
+  if (!sensor) return '未上报'
+  return sensor.online ? '在线' : '离线'
+}
+
+function sensorFrequencyLabel(sensor) {
+  const hz = Number(sensor?.frequency_hz)
+  return Number.isFinite(hz) ? `${hz.toFixed(1)} Hz` : '—'
+}
+
+function sensorTimeOffsetLabel(sensor) {
+  const offset = Number(sensor?.measurement_time_offset_ms)
+  if (!Number.isFinite(offset)) return '—'
+  const validity = sensor?.measurement_time_valid === false ? '异常' : '正常'
+  return `${offset.toFixed(1)} ms（${validity}）`
+}
+
+function predictionErrorBySource(quality, source) {
+  const errors = Array.isArray(quality?.prediction_errors) ? quality.prediction_errors : []
+  const error = errors.find(item => String(item.label || '').toLowerCase().includes(source))
+  return error ? `${formatNumber(error.translation_m, 3)} m` : '—'
+}
+
+function localizationDecisionBasis(quality = localizationQuality()) {
+  const decision = quality?.decision || {}
+  const source = decision.active_source || ''
+  if (!source) return '定位决策数据未上报。'
+  const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
+  const rtkUsable = decision.rtk_usable === true
+  const rtkQuality = decision.rtk_quality || '无数据'
+  const score = Number(quality?.matching_error)
+  const ndtDetail = Number.isFinite(score) ? `NDT健康（分数 ${score.toFixed(3)}）` : 'NDT质量未上报'
+  const rtkDetail = `RTK ${rtkQuality}${rtkUsable ? '，可用' : '，不可用'}`
+
+  if (source === 'rtk_imu') {
+    return preferred === 'rtk'
+      ? `RTK优先，${rtkDetail}；采用RTK + IMU。`
+      : `NDT不健康，${rtkDetail}；切换RTK + IMU兜底。`
+  }
+  if (source === 'ndt_imu') {
+    return preferred === 'rtk' && !rtkUsable
+      ? `RTK优先但${rtkDetail}；${ndtDetail}，采用NDT + IMU。`
+      : `NDT优先，${ndtDetail}；${rtkDetail}。`
+  }
+  if (source === 'imu_odom_bridge') {
+    return `NDT不健康且${rtkDetail}；进入受限桥接 ${Number(decision.bridge_distance_m || 0).toFixed(2)}m / ${Number(decision.bridge_elapsed_s || 0).toFixed(1)}s。`
+  }
+  const rejection = decision.bridge_rejection_reason ? `桥接拒绝：${decision.bridge_rejection_reason}。` : ''
+  return `NDT不健康，${rtkDetail}；暂无绝对定位源。${rejection}`
+}
+
 function ndtQualityLabel(quality = localizationQuality()) {
   if (!quality) return '无数据'
   if (localizationQualityStale(quality)) return '已过期'
@@ -1096,19 +1486,44 @@ function localizationDebugRows() {
   const status = navStatus.value?.status || {}
   const command = navStatus.value?.command
   const quality = localizationQuality()
+  const decision = quality?.decision || {}
+  const sensors = status.sensors || {}
+  const rtk = sensors.rtk
+  const imu = sensors.imu
+  const odometry = sensors.odometry
   const qualityFresh = quality && !localizationQualityStale(quality)
   return [
     ['页面地图', selectedMap.value ? `${selectedMap.value.id} / ${selectedMap.value.name}` : '—'],
     ['机器人地图', `${status.map_id || navStatus.value?.current_map_id || '—'} / ${status.map_version || navStatus.value?.current_map_version || '—'}`],
     ['地图一致', mapMatchLabel()],
     ['定位状态', status.localization_status || navStatus.value?.localization_status || 'unknown'],
-    ['定位源状态', status.localization_source_status ?? '—'],
-    ['NDT质量', ndtQualityLabel(quality)],
-    ['NDT分数', qualityFresh ? formatNumber(quality.matching_error, 3) : (quality ? `已过期 ${formatNumber(quality.matching_error, 3)}` : '—')],
-    ['NDT收敛', qualityFresh ? ndtConvergedText(quality) : (quality ? '已过期' : '—')],
-    ['内点率', qualityFresh ? formatNumber(quality.inlier_fraction, 3) : (quality ? `已过期 ${formatNumber(quality.inlier_fraction, 3)}` : '—')],
-    ['匹配位移', qualityFresh ? `${formatNumber(quality.relative_translation_m, 3)} m` : '—'],
-    ['预测误差', qualityFresh ? predictionErrorText(quality) : '—'],
+    ['定位状态码', localizationStatusCodeLabel(status.localization_source_status)],
+    ['当前定位源', localizationSourceLabel(decision.active_source)],
+    ['定位决策依据', localizationDecisionBasis(quality)],
+    ['NDT · 质量', ndtQualityLabel(quality)],
+    ['NDT · 分数', qualityFresh ? formatNumber(quality.matching_error, 3) : (quality ? `已过期 ${formatNumber(quality.matching_error, 3)}` : '—')],
+    ['NDT · 收敛', qualityFresh ? ndtConvergedText(quality) : (quality ? '已过期' : '—')],
+    ['NDT · 内点率', qualityFresh ? formatNumber(quality.inlier_fraction, 3) : (quality ? `已过期 ${formatNumber(quality.inlier_fraction, 3)}` : '—')],
+    ['NDT · 匹配位移', qualityFresh ? `${formatNumber(quality.relative_translation_m, 3)} m` : '—'],
+    ['IMU · 状态', sensorOnlineLabel(imu)],
+    ['IMU · 频率', sensorFrequencyLabel(imu)],
+    ['IMU · 时间偏差', sensorTimeOffsetLabel(imu)],
+    ['IMU · 预测误差', qualityFresh ? predictionErrorBySource(quality, 'imu') : '—'],
+    ['RTK · 状态', sensorOnlineLabel(rtk)],
+    ['RTK · 解状态', rtkQualityLabel(decision.rtk_quality || rtk?.quality)],
+    ['RTK · 融合可用', decision.rtk_usable === true || rtk?.fusion_usable === true ? '是' : '否'],
+    ['RTK · 地图坐标', decision.rtk_usable || decision.rtk_x || decision.rtk_y ? `${formatNumber(decision.rtk_x)} / ${formatNumber(decision.rtk_y)}` : '—'],
+    ['RTK · 航向', decision.rtk_usable || decision.rtk_yaw ? `${formatNumber(decision.rtk_yaw)} rad` : '—'],
+    ['RTK · 水平误差', rtk?.horizontal_std_m === null || rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(rtk.horizontal_std_m, 2)} m`],
+    ['RTK · 时间偏差', sensorTimeOffsetLabel(rtk)],
+    ['里程计 · 状态', sensorOnlineLabel(odometry)],
+    ['里程计 · 频率', sensorFrequencyLabel(odometry)],
+    ['里程计 · 时间源', decision.odom_time_source || '—'],
+    ['里程计 · 预测误差', qualityFresh ? predictionErrorBySource(quality, 'odom') : '—'],
+    ['桥接 · 状态', decision.active_source === 'imu_odom_bridge' ? '当前使用' : (imu?.online && odometry?.online ? '待命' : '不可用')],
+    ['桥接 · 距离/时长', `${formatNumber(decision.bridge_distance_m, 2)} m / ${formatNumber(decision.bridge_elapsed_s, 1)} s`],
+    ['桥接 · 拒绝原因', decision.bridge_rejection_reason || '无'],
+    ['综合 · 预测误差', qualityFresh ? predictionErrorText(quality) : '—'],
     ['质量时间', quality ? formatDateTimeWithAge(quality.sampled_at) : '—'],
     ['初始化状态', localizationInitMessage.value || localizationInitState.value],
     ['导航栈', status.nav_ready ? 'ready' : 'not ready'],
@@ -1134,6 +1549,9 @@ function stateTone(state) {
 function stateMachineSteps() {
   const status = navStatus.value?.status || {}
   const quality = localizationQuality()
+  const decision = quality?.decision || {}
+  const sensors = status.sensors || {}
+  const activeSource = decision.active_source || ''
   const mapMatches = robotMapMatches()
   const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
   const connection = navStatus.value?.connection_status || 'unknown'
@@ -1143,6 +1561,11 @@ function stateMachineSteps() {
   const inlier = Number(quality?.inlier_fraction)
   const qualityStale = localizationQualityStale(quality)
   const goodNdt = !qualityStale && ndtQualityValid(quality) && Number.isFinite(ndtError) && ndtError <= 0.5 && (!Number.isFinite(inlier) || inlier >= 0.65)
+  const ndtHealthy = typeof decision.ndt_healthy === 'boolean' ? decision.ndt_healthy : goodNdt
+  const rtkOnline = sensors.rtk?.online === true
+  const rtkUsable = decision.rtk_usable === true || sensors.rtk?.fusion_usable === true
+  const bridgeReady = sensors.imu?.online === true && sensors.odometry?.online === true
+  const bridgeRejected = Boolean(decision.bridge_rejection_reason)
 
   return [
     {
@@ -1163,8 +1586,17 @@ function stateMachineSteps() {
       key: 'localization',
       title: '定位状态',
       value: localizationStatus,
-      detail: `源 ${status.localization_source_status ?? '—'} · ${robotPoseText()}`,
+      detail: `状态码 ${localizationStatusCodeLabel(status.localization_source_status)} · ${robotPoseText()}`,
       state: localizationStatus === 'normal' ? 'ok' : localizationStatus === 'lost' ? 'bad' : 'warn',
+    },
+    {
+      key: 'localization-decision',
+      title: '定位决策',
+      value: localizationSourceLabel(activeSource),
+      detail: localizationDecisionBasis(quality),
+      state: ['ndt_imu', 'rtk_imu'].includes(activeSource)
+        ? 'ok'
+        : activeSource === 'imu_odom_bridge' ? 'warn' : activeSource ? 'bad' : 'unknown',
     },
     {
       key: 'localization-init',
@@ -1176,9 +1608,25 @@ function stateMachineSteps() {
     {
       key: 'ndt',
       title: 'NDT匹配',
-      value: ndtQualityLabel(quality),
+      value: activeSource === 'ndt_imu' ? '当前使用' : (ndtHealthy ? '健康待命' : ndtQualityLabel(quality)),
       detail: quality ? `score ${formatNumber(quality.matching_error, 3)} · inlier ${formatNumber(quality.inlier_fraction, 3)} · ${formatDateTimeWithAge(quality.sampled_at)}` : '未收到 /status 质量上报',
-      state: goodNdt ? 'ok' : qualityStale ? 'warn' : quality ? 'bad' : 'warn',
+      state: ndtHealthy ? 'ok' : qualityStale ? 'warn' : quality ? 'bad' : 'warn',
+    },
+    {
+      key: 'rtk',
+      title: 'RTK定位',
+      value: activeSource === 'rtk_imu' ? '当前使用' : rtkUsable ? '可用待命' : rtkOnline ? '不可用于融合' : '离线',
+      detail: `${rtkQualityLabel(decision.rtk_quality || sensors.rtk?.quality)} · 水平误差 ${sensors.rtk?.horizontal_std_m === null || sensors.rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(sensors.rtk.horizontal_std_m, 2)} m`}`,
+      state: activeSource === 'rtk_imu' || rtkUsable ? 'ok' : rtkOnline ? 'warn' : 'bad',
+    },
+    {
+      key: 'bridge',
+      title: 'IMU+里程计桥接',
+      value: activeSource === 'imu_odom_bridge' ? '当前使用' : bridgeRejected ? '被拒绝' : bridgeReady ? '待命' : '不可用',
+      detail: bridgeRejected
+        ? decision.bridge_rejection_reason
+        : `${formatNumber(decision.bridge_distance_m, 2)} m / ${formatNumber(decision.bridge_elapsed_s, 1)} s · ${decision.odom_time_source || '时间源未上报'}`,
+      state: activeSource === 'imu_odom_bridge' ? 'warn' : bridgeRejected || !bridgeReady ? 'bad' : 'idle',
     },
     {
       key: 'ros',
@@ -1317,6 +1765,10 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     image_y: Number(imageY.toFixed(4)),
     u: Number((imageX / geometry.mapWidth).toFixed(8)),
     v: Number((imageY / geometry.mapHeight).toFixed(8)),
+    localization_mode: 'ndt',
+    avoidance_to_next: true,
+    require_yaw: false,
+    dwell_seconds: 0,
   }
 }
 
@@ -1420,6 +1872,46 @@ async function handleDeleteRoute(route) {
               <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
                 <div class="waypoint-main">
                   <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                  <div class="waypoint-pose-grid">
+                    <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
+                    <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
+                  </div>
+                  <label class="waypoint-heading-row">
+                    <span>方向</span>
+                    <div class="waypoint-heading-input">
+                      <input
+                        type="number"
+                        step="1"
+                        inputmode="decimal"
+                        :value="waypointYawDrafts[index]"
+                        @input="setWaypointYawDraft(index, $event.target.value)"
+                        @keydown.enter.prevent="confirmWaypointYaw(index)"
+                      />
+                      <span class="heading-unit">°</span>
+                      <button
+                        type="button"
+                        class="btn btn-sm heading-confirm-btn"
+                        :class="{ confirmed: waypointYawConfirmed[index] }"
+                        @click="confirmWaypointYaw(index)"
+                      >{{ waypointYawConfirmed[index] ? '已确认' : '确认' }}</button>
+                    </div>
+                  </label>
+                  <small v-if="waypointYawErrors[index]" class="waypoint-field-error">{{ waypointYawErrors[index] }}</small>
+                  <label class="waypoint-check">
+                    <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
+                    <span>到点转向</span>
+                  </label>
+                  <label v-if="index < waypoints.length - 1" class="waypoint-check">
+                    <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
+                    <span>到下个点避障</span>
+                  </label>
+                  <label>
+                    <span>定位方式</span>
+                    <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
+                      <option value="ndt">NDT（室内/特征区）</option>
+                      <option value="rtk">RTK（室外开阔区）</option>
+                    </select>
+                  </label>
                   <label>
                     <span>巡检智能播报</span>
                     <select :value="point.speech_template_id || ''" @change="setWaypointSpeech(index, $event.target.value)">
@@ -1611,48 +2103,132 @@ async function handleDeleteRoute(route) {
             <div v-if="!selectedMap" class="map-placeholder">
               请先选择地图
             </div>
-            <div v-else class="map-container">
-              <div v-if="selectedMap.thumbnail_url" class="map-image-layer">
-              <img ref="mapImageRef" :src="getFullUrl(selectedMap.thumbnail_url)" alt="地图预览" @load="refreshImageGeometry" @click="handleMapClick" />
-
-              <!-- 定位尾迹 -->
-              <svg v-if="showPoseTrail && poseHistory.length > 1" class="pose-trail-lines">
-                <polyline :points="poseTrailPoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-
-              <!-- 途经点标记 -->
-              <div class="waypoint-markers">
-                <div
-                  v-for="(point, index) in waypoints"
-                  :key="index"
-                  class="waypoint-marker"
-                  :class="{ 'drill-arrived': drillCurrentIndex === index && drillPosition }"
-                  :style="waypointDisplayPosition(point)"
-                >
-                  {{ index + 1 }}
+            <div v-else class="map-workspace">
+              <div class="map-toolbar" role="toolbar" aria-label="地图显示控制">
+                <div class="map-click-mode" aria-label="地图点击模式">
+                  <button type="button" :class="{ active: mapClickMode === 'waypoint' }" @click="setMapClickMode('waypoint')">添加途经点</button>
+                  <button type="button" :class="{ active: mapClickMode === 'inspect' }" @click="setMapClickMode('inspect')">查看位置</button>
                 </div>
-                <div v-if="drillDisplayPosition()" class="drill-robot-marker" :style="drillDisplayPosition()">
-                  <span class="drill-dog-icon">🐕</span>
-                  <strong>演练</strong>
-                </div>
-                <div v-if="robotDisplayPosition()" class="robot-marker" :style="robotDisplayPosition()">
-                  <span :style="robotHeadingStyle()"></span>
-                </div>
-                <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
-                  <span :style="initialPoseHeadingStyle()"></span>
+                <span class="mapping-trace-summary">
+                  {{ mappingTraceLoading ? '正在加载关键帧' : `关键帧 ${mappingTrace.length} 个` }}
+                </span>
+                <div class="map-display-controls">
+                  <button type="button" title="缩小" aria-label="缩小" :disabled="mapZoom <= MAP_ZOOM_MIN" @click="adjustMapZoom(-MAP_ZOOM_STEP)">−</button>
+                  <button type="button" class="map-zoom-value" title="恢复 100%" @click="resetMapZoom">{{ Math.round(mapZoom * 100) }}%</button>
+                  <button type="button" title="放大" aria-label="放大" :disabled="mapZoom >= MAP_ZOOM_MAX" @click="adjustMapZoom(MAP_ZOOM_STEP)">+</button>
+                  <button type="button" :class="{ active: showMappingTrace }" @click="showMappingTrace = !showMappingTrace">
+                    {{ showMappingTrace ? '隐藏轨迹' : '显示轨迹' }}
+                  </button>
                 </div>
               </div>
-
-              <svg v-if="initialPoseHeadingLinePoints()" class="initial-pose-heading-line">
-                <polyline :points="initialPoseHeadingLinePoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" />
-              </svg>
-
-              <!-- 路径连线 -->
-              <svg v-if="waypoints.length > 1" class="path-lines">
-                <polyline :points="pathPolylinePoints()" fill="none" stroke="#1976d2" stroke-width="2" />
-              </svg>
+              <div class="map-mode-hint" :class="{ error: mapInteractionError }">
+                <strong>当前模式：{{ mapClickMode === 'waypoint' ? '添加途经点' : '查看位置' }}</strong>
+                <span>{{ mapInteractionError || mapModeHintText() }}</span>
               </div>
-              <div v-else class="map-placeholder">地图预览不可用</div>
+              <div ref="mapViewportRef" class="map-container">
+                <div v-if="selectedMap.thumbnail_url" class="map-image-layer" :style="mapImageLayerStyle">
+                  <img ref="mapImageRef" :src="getFullUrl(selectedMap.thumbnail_url)" alt="地图预览" @load="refreshImageGeometry" @click="handleMapClick" />
+
+                  <svg v-if="showMappingTrace && mappingTrace.length > 1" class="mapping-trace-lines">
+                    <polyline :points="mappingTracePoints()" fill="none" stroke="#0f766e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+
+                  <svg v-if="showPoseTrail && poseHistory.length > 1" class="pose-trail-lines">
+                    <polyline :points="poseTrailPoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+
+                  <div class="waypoint-markers">
+                    <div
+                      v-for="(point, index) in waypoints"
+                      :key="index"
+                      class="waypoint-marker"
+                      :class="{ 'drill-arrived': drillCurrentIndex === index && drillPosition }"
+                      :style="waypointDisplayPosition(point)"
+                    >
+                      {{ index + 1 }}
+                      <span v-if="point.require_yaw === true" class="waypoint-heading-arrow" :style="waypointHeadingStyle(point)"></span>
+                    </div>
+                    <div v-if="drillDisplayPosition()" class="drill-robot-marker" :style="drillDisplayPosition()">
+                      <span class="drill-dog-icon">🐕</span>
+                      <strong>演练</strong>
+                    </div>
+                    <div v-if="robotDisplayPosition()" class="robot-marker" :style="robotDisplayPosition()">
+                      <span :style="robotHeadingStyle()"></span>
+                    </div>
+                    <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
+                      <span :style="initialPoseHeadingStyle()"></span>
+                    </div>
+                    <div v-if="inspectedMapPoint" class="inspected-map-marker" :style="waypointDisplayPosition(inspectedMapPoint.point)">
+                      <span v-if="inspectPoseStep === 'complete'" class="inspected-heading-arrow" :style="waypointHeadingStyle(inspectedMapPoint.point)"></span>
+                    </div>
+                  </div>
+
+                  <svg v-if="initialPoseHeadingLinePoints()" class="initial-pose-heading-line">
+                    <polyline :points="initialPoseHeadingLinePoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" />
+                  </svg>
+
+                  <svg v-if="inspectedHeadingLinePoints()" class="inspection-heading-line">
+                    <polyline :points="inspectedHeadingLinePoints()" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" />
+                  </svg>
+
+                  <svg v-if="waypoints.length > 1" class="path-lines">
+                    <polyline :points="pathPolylinePoints()" fill="none" stroke="#1976d2" stroke-width="2" />
+                  </svg>
+                </div>
+                <div v-else class="map-placeholder">地图预览不可用</div>
+              </div>
+              <div v-if="inspectedMapPoint" class="map-inspection-panel">
+                <strong>点击位置 {{ waypointDisplayText(inspectedMapPoint.point) }}</strong>
+                <span>方向：{{ waypointYawDegrees(inspectedMapPoint.point).toFixed(1) }}°</span>
+                <span>NDT：{{ poseText(inspectedMapPoint.sample?.slam) }}</span>
+                <span>RTK：{{ rtkPoseText(inspectedMapPoint.sample?.rtk) }}</span>
+                <small v-if="inspectedMapPoint.sample">距关键帧 {{ inspectedMapPoint.sample.distance_m.toFixed(2) }} m · {{ mappingSampleTime(inspectedMapPoint.sample) }}</small>
+                <small v-else>附近无建图轨迹记录</small>
+                <button type="button" class="btn btn-sm inspection-reset-btn" @click="resetInspectedMapPoint">重选位置</button>
+              </div>
+
+              <section v-if="selectedMap.thumbnail_url" class="keyframe-panel" :class="{ open: keyframePanelOpen }">
+                <button type="button" class="keyframe-panel-toggle" @click="keyframePanelOpen = !keyframePanelOpen">
+                  <span>建图关键帧（{{ mappingTrace.length }}）</span>
+                  <strong>{{ keyframePanelOpen ? '收起' : '展开' }}</strong>
+                </button>
+                <div v-if="keyframePanelOpen" class="keyframe-panel-body">
+                  <div v-if="mappingTraceLoading" class="keyframe-empty">正在加载关键帧</div>
+                  <div v-else-if="!mappingTrace.length" class="keyframe-empty">当前地图没有关键帧定位记录</div>
+                  <template v-else>
+                    <div class="keyframe-table-scroll">
+                      <table class="keyframe-table">
+                        <thead>
+                          <tr>
+                            <th>序号</th>
+                            <th>采样时间</th>
+                            <th>NDT x / y / yaw</th>
+                            <th>RTK x / y / yaw / 状态</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr
+                            v-for="(sample, rowIndex) in keyframePageData.rows"
+                            :key="sample.index ?? keyframePageData.start + rowIndex"
+                            :class="{ selected: selectedKeyframeIndex === (sample.index ?? keyframePageData.start + rowIndex) }"
+                            @click="selectKeyframe(sample, rowIndex)"
+                          >
+                            <td>{{ sample.index ?? keyframePageData.start + rowIndex + 1 }}</td>
+                            <td>{{ mappingSampleTime(sample) }}</td>
+                            <td>{{ poseText(sample.slam) }}</td>
+                            <td>{{ rtkPoseText(sample.rtk) }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="keyframe-pagination">
+                      <button type="button" class="btn btn-sm" :disabled="keyframePageData.page <= 1" @click="changeKeyframePage(-1)">上一页</button>
+                      <span>{{ keyframePageData.page }} / {{ keyframePageData.pageCount }}</span>
+                      <button type="button" class="btn btn-sm" :disabled="keyframePageData.page >= keyframePageData.pageCount" @click="changeKeyframePage(1)">下一页</button>
+                    </div>
+                  </template>
+                </div>
+              </section>
             </div>
 
             <aside class="drill-timeline-panel">
@@ -1691,9 +2267,6 @@ async function handleDeleteRoute(route) {
             </aside>
           </div>
 
-          <div class="map-hint" v-if="selectedMap">
-            点击地图添加途经点；设初始定位时先点机器狗位置，再点狗头朝向。
-          </div>
           <div v-if="drillMessage" class="drill-status" :class="{ active: drillRunning }">
             <span class="drill-status-dot"></span>
             {{ drillMessage }}
@@ -1838,6 +2411,74 @@ async function handleDeleteRoute(route) {
   gap: 0.5rem;
   color: #667085;
   font-size: 0.78rem;
+}
+
+.waypoint-pose-grid {
+  display: grid;
+  gap: 2px;
+  padding: 0.4rem 0.5rem;
+  border-left: 3px solid #0f766e;
+  background: #f0fdfa;
+}
+
+.waypoint-pose-grid small {
+  color: #475467;
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.waypoint-heading-input {
+  display: grid;
+  grid-template-columns: minmax(96px, 1fr) 18px auto;
+  align-items: center;
+  gap: 0.3rem;
+  width: 100%;
+}
+
+.waypoint-heading-input input {
+  width: 100%;
+  min-width: 96px;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+}
+
+.waypoint-main label.waypoint-heading-row {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  gap: 0.25rem;
+}
+
+.heading-unit {
+  color: #475467;
+  font-weight: 700;
+  text-align: center;
+}
+
+.heading-confirm-btn {
+  min-width: 54px;
+  white-space: nowrap;
+}
+
+.heading-confirm-btn.confirmed {
+  border-color: #86d5ad;
+  color: #027a48;
+  background: #ecfdf3;
+}
+
+.waypoint-field-error {
+  color: #b42318 !important;
+  white-space: normal !important;
+}
+
+.waypoint-check {
+  grid-template-columns: 18px minmax(0, 1fr) !important;
+}
+
+.waypoint-check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 
 .waypoint-main select {
@@ -2212,7 +2853,7 @@ async function handleDeleteRoute(route) {
   align-items: stretch;
   justify-content: flex-start;
   position: relative;
-  overflow: hidden;
+  overflow: auto;
 }
 
 .map-stage-layout {
@@ -2223,16 +2864,19 @@ async function handleDeleteRoute(route) {
   gap: 0.85rem;
 }
 
+.map-workspace {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
 .map-container {
-  flex: 1;
   position: relative;
   width: 100%;
-  min-height: 520px;
-  max-height: calc(100% - 40px);
+  height: min(62vh, 680px);
+  min-height: 420px;
   overflow: auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
   padding: 1rem;
   background:
     linear-gradient(45deg, #eef1f6 25%, transparent 25%),
@@ -2241,6 +2885,89 @@ async function handleDeleteRoute(route) {
     linear-gradient(-45deg, transparent 75%, #eef1f6 75%);
   background-size: 24px 24px;
   background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+}
+
+.map-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.map-toolbar button {
+  min-width: 34px;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #344054;
+  background: transparent;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.map-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.map-toolbar button:hover,
+.map-toolbar button.active {
+  border-color: #99d5ce;
+  color: #0f766e;
+  background: #f0fdfa;
+}
+
+.map-toolbar .map-zoom-value {
+  min-width: 54px;
+  font-size: 0.72rem;
+}
+
+.map-mode-hint {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid #bcd7ff;
+  border-radius: 5px;
+  color: #344054;
+  background: #f5f9ff;
+  font-size: 0.76rem;
+}
+
+.map-mode-hint strong {
+  flex: 0 0 auto;
+  color: #175cd3;
+}
+
+.map-mode-hint.error {
+  border-color: #fda29b;
+  color: #b42318;
+  background: #fff5f5;
+}
+
+.map-click-mode,
+.map-display-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.map-click-mode {
+  padding: 3px;
+  border: 1px solid #d0d5dd;
+  border-radius: 5px;
+  background: #f8fafc;
+}
+
+.map-click-mode button {
+  min-width: 90px;
 }
 
 .drill-timeline-panel {
@@ -2425,8 +3152,7 @@ async function handleDeleteRoute(route) {
 
 .map-image-layer {
   position: relative;
-  width: min(100%, 1200px);
-  min-width: 760px;
+  margin: 0 auto;
   background: #fff;
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.14);
 }
@@ -2470,6 +3196,188 @@ async function handleDeleteRoute(route) {
   font-weight: bold;
   transform: translate(-50%, -50%);
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.waypoint-heading-arrow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 20px;
+  height: 2px;
+  background: #dc2626;
+  transform-origin: 0 50%;
+}
+
+.waypoint-heading-arrow::after {
+  position: absolute;
+  top: -4px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid #dc2626;
+  content: '';
+}
+
+.mapping-trace-lines,
+.pose-trail-lines {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.inspected-map-marker {
+  position: absolute;
+  z-index: 15;
+  width: 14px;
+  height: 14px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #dc2626;
+  box-shadow: 0 0 0 2px #dc2626;
+  transform: translate(-50%, -50%);
+}
+
+.inspected-heading-arrow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 26px;
+  height: 3px;
+  background: #b42318;
+  transform-origin: 0 50%;
+}
+
+.inspected-heading-arrow::after {
+  position: absolute;
+  top: -5px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 8px solid #b42318;
+  content: '';
+}
+
+.mapping-trace-summary {
+  padding: 7px 10px;
+  border: 1px solid #99d5ce;
+  border-radius: 4px;
+  color: #115e59;
+  background: #f0fdfa;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.map-inspection-panel {
+  display: grid;
+  width: 100%;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  color: #344054;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18);
+  font-size: 0.72rem;
+}
+
+.map-inspection-panel strong { color: #991b1b; }
+.map-inspection-panel small { color: #667085; }
+
+.inspection-reset-btn {
+  justify-self: start;
+  margin-top: 0.25rem;
+}
+
+.keyframe-panel {
+  overflow: hidden;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.keyframe-panel-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.55rem 0.75rem;
+  border: 0;
+  color: #344054;
+  background: #f8fafc;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.keyframe-panel-toggle strong {
+  color: #0f766e;
+  font-size: 0.75rem;
+}
+
+.keyframe-panel-body {
+  border-top: 1px solid #e4e7ec;
+}
+
+.keyframe-table-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.keyframe-table {
+  width: 100%;
+  min-width: 780px;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+}
+
+.keyframe-table th,
+.keyframe-table td {
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid #eaecf0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.keyframe-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: #475467;
+  background: #f9fafb;
+}
+
+.keyframe-table tbody tr {
+  cursor: pointer;
+}
+
+.keyframe-table tbody tr:hover,
+.keyframe-table tbody tr.selected {
+  background: #ecfdf3;
+}
+
+.keyframe-empty {
+  padding: 1.2rem;
+  color: #667085;
+  text-align: center;
+  font-size: 0.78rem;
+}
+
+.keyframe-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  padding: 0.55rem 0.75rem;
+  color: #475467;
+  font-size: 0.75rem;
 }
 
 .waypoint-marker.drill-arrived {
@@ -2608,7 +3516,8 @@ async function handleDeleteRoute(route) {
 
 .pose-trail-lines,
 .path-lines,
-.initial-pose-heading-line {
+.initial-pose-heading-line,
+.inspection-heading-line {
   position: absolute;
   top: 0;
   left: 0;
@@ -2627,6 +3536,10 @@ async function handleDeleteRoute(route) {
 
 .initial-pose-heading-line {
   z-index: 5;
+}
+
+.inspection-heading-line {
+  z-index: 14;
 }
 
 .map-hint {

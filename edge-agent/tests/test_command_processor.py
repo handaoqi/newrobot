@@ -48,10 +48,59 @@ class FakeNavigation:
         self.teleop_actions.append(action)
         return {"topic": "/teleop_action", "action": action}
 
+    def confirmed_teleop_action(self, action, success_states, failure_states=None, timeout_seconds=4.0):
+        self.teleop_actions.append(action)
+        state = next(iter(success_states))
+        return {"topic": "/teleop_action", "action": action, "confirmed": True, "motion_state": state}
+
+    def release_to_remote_control(self, timeout_seconds=3.0):
+        self.teleop_actions.append("release_remote")
+        return {
+            "topic": "/teleop_action",
+            "action": "release_remote",
+            "confirmed": True,
+            "motion_state": "remote_control",
+        }
+
     def teleop_velocity(self, vx=0.0, vy=0.0, yaw_rate=0.0):
-        payload = {"topic": "/cmd_vel", "vx": vx, "vy": vy, "yaw_rate": yaw_rate}
+        payload = {"topic": "/teleop_cmd_vel", "vx": vx, "vy": vy, "yaw_rate": yaw_rate}
         self.teleop_velocities.append(payload)
         return payload
+
+
+class FakeTeleopControl:
+    def __init__(self):
+        self.stopped = False
+
+    def ensure_ready(self):
+        return {"action": "start", "returncode": 0}
+
+    def stop(self):
+        self.stopped = True
+        return {"action": "stop", "returncode": 0}
+
+
+class FakeMapActivation:
+    def activate(self, command):
+        return {
+            "map_id": command["map_id"],
+            "map_version": command["map_version"],
+            "current_map": {
+                "active_files": {
+                    "map.pcd": "/maps/selected/map.pcd",
+                    "map.yaml": "/maps/selected/map.yaml",
+                },
+            },
+        }
+
+
+class FakeNavigationStack:
+    def __init__(self):
+        self.reload_calls = []
+
+    def reload_map(self, pcd_path, yaml_path):
+        self.reload_calls.append((pcd_path, yaml_path))
+        return {"action": "reload_map", "returncode": 0}
 
 
 def test_task_start_rejects_transient_localization(tmp_path):
@@ -144,6 +193,46 @@ def test_task_progress_version_follows_start_ack_version(tmp_path):
     assert events[0][1]["state_version"] == 3
     assert events[-1][0] == "task.completed"
     assert events[-1][1]["state_version"] > acks[0]["payload"]["edge_state_version"]
+    store.close()
+
+
+def test_task_start_clears_manual_control_before_validation(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        nav_ready=True,
+        control_mode="manual_takeover",
+        current_map_id="site-a-main",
+        current_map_version="v1",
+    )
+    teleop_control = FakeTeleopControl()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        teleop_control_adapter=teleop_control,
+    )
+
+    ack, _ = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert state.control_mode == "autonomous"
+    assert teleop_control.stopped is True
+    assert navigation.teleop_velocities[-1] == {
+        "topic": "/teleop_cmd_vel", "vx": 0.0, "vy": 0.0, "yaw_rate": 0.0,
+    }
     store.close()
 
 
@@ -324,7 +413,49 @@ def test_teleop_move_is_dispatched_to_navigation_adapter(tmp_path):
     _, result = processor.handle_command(raw)
     assert navigation.teleop_velocities[-1]["vx"] == 0.2
     assert result["payload"]["status"] == "succeeded"
-    assert results[0]["payload"]["result"]["topic"] == "/cmd_vel"
+    assert results[0]["payload"]["result"]["topic"] == "/teleop_cmd_vel"
+    store.close()
+
+
+def test_takeover_exit_stops_and_returns_control_to_remote(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.takeover_exit"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True, control_mode="manual_takeover")
+    teleop_control = FakeTeleopControl()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        teleop_control_adapter=teleop_control,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert navigation.teleop_velocities[-1] == {
+        "topic": "/teleop_cmd_vel",
+        "vx": 0.0,
+        "vy": 0.0,
+        "yaw_rate": 0.0,
+    }
+    assert navigation.teleop_actions[-1] == "release_remote"
+    assert result["payload"]["result"]["confirmed"] is True
+    assert result["payload"]["result"]["teleop_bridge_stop"]["action"] == "stop"
+    assert teleop_control.stopped is True
+    assert state.control_mode == "autonomous"
     store.close()
 
 
@@ -355,10 +486,42 @@ def test_follow_velocity_is_combined_and_safety_limited(tmp_path):
     )
     _, result = processor.handle_command(raw)
     assert navigation.teleop_velocities[-1] == {
-        "topic": "/cmd_vel",
-        "vx": 0.2,
-        "vy": -0.15,
-        "yaw_rate": 0.35,
+        "topic": "/teleop_cmd_vel",
+        "vx": 0.5,
+        "vy": -0.5,
+        "yaw_rate": 0.5,
     }
     assert result["payload"]["status"] == "succeeded"
+    store.close()
+
+
+def test_map_activation_reloads_both_map_consumers_and_requires_reseed(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "map.activate"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"map_id": "95", "map_version": "selected-map"}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True)
+    stack = FakeNavigationStack()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store,
+            FakeNavigation(),
+            event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=stack,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert stack.reload_calls == [("/maps/selected/map.pcd", "/maps/selected/map.yaml")]
+    assert result["payload"]["result"]["localization_reset_required"] is True
+    assert state.localization_status == "initializing"
     store.close()

@@ -6,27 +6,38 @@ import {
   cancelDevelopmentTask,
   createDevelopmentTask,
   fetchDevelopmentAgents,
-  fetchDevelopmentTask,
+  fetchDevelopmentConversation,
   fetchDevelopmentTasks,
+  fetchVoiceRecognitions,
   fetchRobots,
 } from '../services/api'
 
 const robots = ref([])
 const agents = ref([])
 const tasks = ref([])
+const voiceRecognitions = ref([])
 const selectedTask = ref(null)
-const events = ref([])
+const turns = ref([])
+const conversationThreadId = ref('')
 const selectedRobotId = ref('')
 const workspace = ref('robot-main')
+const model = ref('gpt-5.6-terra')
 const prompt = ref('')
 const submitting = ref(false)
 const cancelling = ref(false)
 const error = ref('')
 const terminal = ref(null)
+const composer = ref(null)
+const autoFollowLatest = ref(true)
 let eventSource = null
 let refreshTimer = null
 
 const terminalStates = new Set(['succeeded', 'failed', 'cancelled', 'timed_out', 'rejected'])
+const modelOptions = [
+  { value: 'gpt-5.6-terra', label: 'Terra（默认 · 均衡）' },
+  { value: 'gpt-5.6-sol', label: 'Sol（复杂任务）' },
+  { value: 'gpt-5.6-luna', label: 'Luna（快速任务）' },
+]
 
 const selectedAgent = computed(() => (
   agents.value.find(item => String(item.robot) === String(selectedRobotId.value))
@@ -40,7 +51,9 @@ const activeTask = computed(() => (
   tasks.value.find(item => String(item.robot) === String(selectedRobotId.value) && !terminalStates.has(item.status))
 ))
 
-const statusText = computed(() => selectedTask.value?.status_label || '未执行')
+const statusText = computed(() => (
+  activeTask.value?.status_label || selectedTask.value?.status_label || '未执行'
+))
 
 function formatTime(value) {
   if (!value) return '--'
@@ -53,6 +66,9 @@ function eventDisplayText(event) {
     try {
       const parsed = JSON.parse(raw)
       const item = parsed.item || parsed
+      if (parsed.type === 'thread.started') return '已连接主会话，继续原有上下文'
+      if (parsed.type === 'turn.started') return 'Codex 开始处理本轮指令'
+      if (parsed.type === 'turn.completed') return '本轮指令处理完成'
       return item.text || item.message || item.command || raw
     } catch {
       return raw
@@ -68,9 +84,28 @@ function eventClass(event) {
   return 'stdout'
 }
 
-async function scrollTerminal() {
+function visibleEvents(events) {
+  return events.filter(event => !(
+    event.stream === 'stderr'
+    && event.text?.includes('codex_models_manager::cache: failed to load models cache:')
+    && event.text.includes('base_instructions')
+  ))
+}
+
+function updateAutoFollow() {
+  if (!terminal.value) return
+  const { scrollTop, scrollHeight, clientHeight } = terminal.value
+  autoFollowLatest.value = scrollHeight - scrollTop - clientHeight < 48
+}
+
+async function scrollTerminal(force = false) {
   await nextTick()
-  if (terminal.value) terminal.value.scrollTop = terminal.value.scrollHeight
+  await new Promise(resolve => window.requestAnimationFrame(resolve))
+  await new Promise(resolve => window.requestAnimationFrame(resolve))
+  if (terminal.value && (force || autoFollowLatest.value)) {
+    terminal.value.scrollTop = terminal.value.scrollHeight
+    autoFollowLatest.value = true
+  }
 }
 
 function closeStream() {
@@ -78,57 +113,97 @@ function closeStream() {
   eventSource = null
 }
 
+function turnForTask(taskId) {
+  return turns.value.find(turn => turn.task.id === taskId)
+}
+
+function eventKey(taskId, event) {
+  return `${taskId}:${event.sequence}`
+}
+
+function upsertTask(nextTask) {
+  const index = tasks.value.findIndex(item => item.id === nextTask.id)
+  if (index >= 0) tasks.value[index] = { ...tasks.value[index], ...nextTask }
+  else tasks.value.unshift(nextTask)
+  const turn = turnForTask(nextTask.id)
+  if (turn) turn.task = { ...turn.task, ...nextTask }
+  if (nextTask.codex_thread_id) conversationThreadId.value = nextTask.codex_thread_id
+  if (!selectedTask.value || selectedTask.value.id === nextTask.id || !terminalStates.has(nextTask.status)) {
+    selectedTask.value = { ...(selectedTask.value?.id === nextTask.id ? selectedTask.value : {}), ...nextTask }
+  }
+}
+
 function connectStream(task) {
   closeStream()
   if (!task || terminalStates.has(task.status) || typeof EventSource === 'undefined') return
   const token = localStorage.getItem('inspection_token') || ''
-  const lastSequence = events.value.at(-1)?.sequence || 0
+  const turn = turnForTask(task.id)
+  const lastSequence = turn?.events.at(-1)?.sequence || 0
   const url = `${API_BASE}/development/tasks/${task.id}/stream/?token=${encodeURIComponent(token)}&after=${lastSequence}`
   eventSource = new EventSource(url)
   eventSource.addEventListener('dev_output', (message) => {
     const event = JSON.parse(message.data)
-    if (!events.value.some(item => item.sequence === event.sequence)) events.value.push(event)
+    if (event.payload?.codex_thread_id) conversationThreadId.value = event.payload.codex_thread_id
+    let target = turnForTask(task.id)
+    if (!target) {
+      target = { task, events: [] }
+      turns.value.push(target)
+    }
+    if (!target.events.some(item => item.sequence === event.sequence)) target.events.push(event)
     scrollTerminal()
   })
   eventSource.addEventListener('dev_status', (message) => {
     const nextTask = JSON.parse(message.data)
-    selectedTask.value = { ...selectedTask.value, ...nextTask }
-    const index = tasks.value.findIndex(item => item.id === nextTask.id)
-    if (index >= 0) tasks.value[index] = { ...tasks.value[index], ...nextTask }
+    upsertTask(nextTask)
     if (terminalStates.has(nextTask.status)) {
       closeStream()
-      refreshTasks()
+      refreshConversation().catch(() => {})
     }
   })
 }
 
-async function selectTask(task) {
+async function refreshConversation() {
   error.value = ''
-  selectedTask.value = await fetchDevelopmentTask(task.id)
-  events.value = selectedTask.value.events || []
-  await scrollTerminal()
-  connectStream(selectedTask.value)
+  const result = await fetchDevelopmentConversation(selectedRobotId.value)
+  tasks.value = result.tasks || []
+  turns.value = result.turns || []
+  conversationThreadId.value = result.codex_thread_id || ''
+  selectedTask.value = activeTask.value || tasks.value[0] || null
+  await scrollTerminal(true)
+  if (activeTask.value) connectStream(activeTask.value)
 }
 
 async function refreshTasks() {
   const result = await fetchDevelopmentTasks(selectedRobotId.value)
-  tasks.value = result
-  if (selectedTask.value) {
-    const updated = result.find(item => item.id === selectedTask.value.id)
-    if (updated) selectedTask.value = { ...selectedTask.value, ...updated }
+  const visibleTaskIds = new Set(turns.value.map(turn => turn.task.id))
+  tasks.value = result.filter(item => visibleTaskIds.has(item.id) || !terminalStates.has(item.status))
+  for (const task of tasks.value) {
+    const turn = turnForTask(task.id)
+    if (turn) turn.task = { ...turn.task, ...task }
   }
+  selectedTask.value = activeTask.value || tasks.value[0] || null
+  if (!eventSource && activeTask.value) connectStream(activeTask.value)
 }
 
 async function refreshAgents() {
   agents.value = await fetchDevelopmentAgents()
 }
 
+async function refreshVoiceRecognitions() {
+  if (!selectedRobotId.value) {
+    voiceRecognitions.value = []
+    return
+  }
+  voiceRecognitions.value = await fetchVoiceRecognitions(selectedRobotId.value)
+}
+
 async function chooseRobot() {
   closeStream()
   selectedTask.value = null
-  events.value = []
-  await refreshTasks()
-  if (tasks.value[0]) await selectTask(tasks.value[0])
+  turns.value = []
+  conversationThreadId.value = ''
+  await Promise.all([refreshConversation(), refreshVoiceRecognitions()])
+  await scrollTerminal(true)
 }
 
 async function submitTask() {
@@ -139,16 +214,24 @@ async function submitTask() {
     const task = await createDevelopmentTask({
       robot: selectedRobotId.value,
       workspace: workspace.value,
+      model: model.value,
+      conversation_id: 'main',
       prompt: prompt.value.trim(),
     })
     prompt.value = ''
-    await refreshTasks()
-    await selectTask(task)
+    tasks.value.unshift(task)
+    turns.value.push({ task, events: [] })
+    selectedTask.value = task
+    connectStream(task)
+    await scrollTerminal(true)
   } catch (exc) {
     error.value = exc.message
     if (exc.payload?.active_task_id) {
       const task = tasks.value.find(item => item.id === exc.payload.active_task_id)
-      if (task) await selectTask(task)
+      if (task) {
+        selectedTask.value = task
+        connectStream(task)
+      }
     }
   } finally {
     submitting.value = false
@@ -156,11 +239,12 @@ async function submitTask() {
 }
 
 async function cancelTask() {
-  if (!selectedTask.value?.can_cancel) return
+  const task = activeTask.value
+  if (!task?.can_cancel) return
   cancelling.value = true
   error.value = ''
   try {
-    selectedTask.value = await cancelDevelopmentTask(selectedTask.value.id)
+    upsertTask(await cancelDevelopmentTask(task.id))
     await refreshTasks()
   } catch (exc) {
     error.value = exc.message
@@ -177,6 +261,7 @@ onMounted(async () => {
     refreshTimer = window.setInterval(() => {
       refreshAgents().catch(() => {})
       refreshTasks().catch(() => {})
+      refreshVoiceRecognitions().catch(() => {})
     }, 5000)
   } catch (exc) {
     error.value = exc.message
@@ -208,8 +293,8 @@ onBeforeUnmount(() => {
       <aside class="panel dev-history">
         <div class="panel-head compact">
           <div>
-            <h3>开发任务</h3>
-            <p>最近 {{ tasks.length }} 条</p>
+            <h3>主会话记录</h3>
+            <p>连续上下文 · 最近 {{ turns.length }} 轮</p>
           </div>
         </div>
         <div class="robot-field">
@@ -221,12 +306,11 @@ onBeforeUnmount(() => {
           </select>
         </div>
         <div class="task-list">
-          <button
+          <article
             v-for="task in tasks"
             :key="task.id"
             class="task-card"
-            :class="{ selected: selectedTask?.id === task.id }"
-            @click="selectTask(task)"
+            :class="{ active: !terminalStates.has(task.status) }"
           >
             <span class="task-card-top">
               <strong>{{ task.status_label }}</strong>
@@ -234,13 +318,77 @@ onBeforeUnmount(() => {
             </span>
             <span class="task-prompt">{{ task.prompt }}</span>
             <small>{{ task.workspace }}</small>
-          </button>
+          </article>
           <p v-if="!tasks.length" class="empty-copy">暂无远程开发任务</p>
         </div>
+        <section class="voice-history">
+          <div class="voice-history-head">
+            <div>
+              <h4>语音识别记录</h4>
+              <p>仅保存识别文本，不保存录音</p>
+            </div>
+            <small>最近 {{ voiceRecognitions.length }} 条</small>
+          </div>
+          <div class="voice-history-list">
+            <article v-for="item in voiceRecognitions" :key="item.id" class="voice-record">
+              <span class="voice-record-top">
+                <strong :class="item.outcome">{{ item.outcome_label }}</strong>
+                <small>{{ formatTime(item.created_at) }}</small>
+              </span>
+              <p>{{ item.transcript || '（未识别到有效语音）' }}</p>
+              <small>{{ item.asr_engine || '未知引擎' }}<template v-if="item.command"> · 指令：{{ item.command }}</template></small>
+            </article>
+            <p v-if="!voiceRecognitions.length" class="empty-copy">暂无语音识别记录</p>
+          </div>
+        </section>
       </aside>
 
       <main class="dev-main">
-        <section class="panel composer">
+        <section class="terminal-shell">
+          <header>
+            <div class="terminal-lights"><i></i><i></i><i></i></div>
+            <strong>Codex CLI 实时输出</strong>
+            <span>主会话 {{ conversationThreadId?.slice(0, 8) || '待创建' }}</span>
+          </header>
+          <div ref="terminal" class="terminal-body" @scroll="updateAutoFollow">
+            <div v-if="!turns.length" class="terminal-empty">
+              <strong>等待任务</strong>
+              <span>提交开发指令后，Codex 的分析、命令和结果会显示在这里。</span>
+            </div>
+            <section v-for="(turn, turnIndex) in turns" :key="turn.task.id" class="conversation-turn">
+              <div class="user-message">
+                <span class="message-role">你</span>
+                <div>
+                  <p>{{ turn.task.prompt }}</p>
+                  <small>
+                    第 {{ turnIndex + 1 }} 轮 · {{ formatTime(turn.task.created_at) }} · {{ turn.task.workspace }}
+                    · {{ turn.task.model || 'gpt-5.6-terra' }}
+                  </small>
+                </div>
+              </div>
+              <div v-if="!turn.events.length && !terminalStates.has(turn.task.status)" class="turn-pending">
+                Codex 正在接收并处理本轮指令…
+              </div>
+              <div
+                v-for="event in visibleEvents(turn.events)"
+                :key="eventKey(turn.task.id, event)"
+                class="terminal-line"
+                :class="eventClass(event)"
+              >
+                <span class="line-sequence">{{ String(event.sequence).padStart(4, '0') }}</span>
+                <span class="line-time">{{ formatTime(event.occurred_at) }}</span>
+                <pre>{{ eventDisplayText(event) }}</pre>
+              </div>
+            </section>
+          </div>
+          <footer v-if="selectedTask">
+            <span>开始：{{ formatTime(selectedTask.started_at) }}</span>
+            <span>结束：{{ formatTime(selectedTask.finished_at) }}</span>
+            <span>退出码：{{ selectedTask.exit_code ?? '--' }}</span>
+          </footer>
+        </section>
+
+        <section ref="composer" class="panel composer">
           <div class="composer-row">
             <label>
               <span>工作区</span>
@@ -248,6 +396,18 @@ onBeforeUnmount(() => {
                 <option value="robot-main">机器狗主工程</option>
                 <option value="cloud-platform">云端平台工程</option>
               </select>
+            </label>
+            <label>
+              <span>模型</span>
+              <select v-model="model">
+                <option v-for="item in modelOptions" :key="item.value" :value="item.value">
+                  {{ item.label }}
+                </option>
+              </select>
+            </label>
+            <label>
+              <span>Codex 对话</span>
+              <strong class="conversation-name">主会话 · 连续上下文</strong>
             </label>
             <div class="current-state">
               <span>当前状态</span>
@@ -258,8 +418,8 @@ onBeforeUnmount(() => {
             <span>开发指令</span>
             <textarea
               v-model="prompt"
-              rows="5"
-              placeholder="例如：检查导航模块的速度限制实现，修复问题并执行相关测试"
+              rows="4"
+              placeholder="输入新指令，继续当前 Codex 主会话"
               @keydown.ctrl.enter.prevent="submitTask"
             ></textarea>
           </label>
@@ -267,7 +427,7 @@ onBeforeUnmount(() => {
             <span v-if="error" class="dev-error">{{ error }}</span>
             <span v-else class="shortcut">Ctrl + Enter 发送</span>
             <button
-              v-if="selectedTask?.can_cancel"
+              v-if="activeTask?.can_cancel"
               class="danger-btn"
               :disabled="cancelling"
               @click="cancelTask"
@@ -277,39 +437,13 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </section>
-
-        <section class="terminal-shell">
-          <header>
-            <div class="terminal-lights"><i></i><i></i><i></i></div>
-            <strong>Codex CLI 实时输出</strong>
-            <span v-if="selectedTask">
-              对话 {{ selectedTask.codex_thread_id?.slice(0, 8) || '待创建' }} · 任务 {{ selectedTask.id.slice(0, 8) }}
-            </span>
-          </header>
-          <div ref="terminal" class="terminal-body">
-            <div v-if="!events.length" class="terminal-empty">
-              <strong>等待任务</strong>
-              <span>提交开发指令后，Codex 的分析、命令和结果会显示在这里。</span>
-            </div>
-            <div v-for="event in events" :key="event.sequence" class="terminal-line" :class="eventClass(event)">
-              <span class="line-sequence">{{ String(event.sequence).padStart(4, '0') }}</span>
-              <span class="line-time">{{ formatTime(event.occurred_at) }}</span>
-              <pre>{{ eventDisplayText(event) }}</pre>
-            </div>
-          </div>
-          <footer v-if="selectedTask">
-            <span>开始：{{ formatTime(selectedTask.started_at) }}</span>
-            <span>结束：{{ formatTime(selectedTask.finished_at) }}</span>
-            <span>退出码：{{ selectedTask.exit_code ?? '--' }}</span>
-          </footer>
-        </section>
       </main>
     </div>
   </section>
 </template>
 
 <style scoped>
-.dev-page { display: grid; gap: 18px; }
+.dev-page { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 18px; height: calc(100vh - 128px); min-height: 700px; }
 .dev-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 26px; }
 .dev-toolbar h3 { margin: 4px 0 5px; font-size: 24px; }
 .dev-toolbar p { margin: 0; color: var(--muted); }
@@ -318,7 +452,7 @@ onBeforeUnmount(() => {
 .agent-state i { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 12px var(--danger); }
 .agent-state.online i { background: var(--green); box-shadow: 0 0 12px var(--green); }
 .agent-state small { color: var(--muted); }
-.dev-grid { display: grid; grid-template-columns: minmax(250px, 320px) minmax(0, 1fr); gap: 18px; min-height: 680px; }
+.dev-grid { display: grid; grid-template-columns: minmax(250px, 320px) minmax(0, 1fr); gap: 18px; min-height: 0; }
 .dev-history { padding: 18px; min-height: 0; }
 .panel-head.compact { margin-bottom: 14px; }
 .panel-head.compact h3, .panel-head.compact p { margin: 0; }
@@ -327,15 +461,29 @@ onBeforeUnmount(() => {
 .robot-field select, .composer select { height: 42px; padding: 0 11px; }
 .task-list { display: grid; gap: 9px; max-height: 580px; overflow-y: auto; }
 .task-card { display: grid; gap: 7px; width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 14px; color: var(--text); text-align: left; background: var(--panel-soft); }
-.task-card.selected { border-color: var(--cyan); box-shadow: 0 0 0 2px color-mix(in srgb, var(--cyan) 16%, transparent); }
+.task-card.active { border-color: var(--cyan); box-shadow: 0 0 0 2px color-mix(in srgb, var(--cyan) 16%, transparent); }
 .task-card-top { display: flex; justify-content: space-between; gap: 8px; }
 .task-card small { color: var(--muted); }
 .task-prompt { overflow: hidden; color: var(--text); font-size: 13px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .empty-copy { color: var(--muted); text-align: center; }
-.dev-main { display: grid; grid-template-rows: auto minmax(420px, 1fr); gap: 18px; min-width: 0; }
+.voice-history { display: grid; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.voice-history-head, .voice-record-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.voice-history-head h4, .voice-history-head p { margin: 0; }
+.voice-history-head h4 { font-size: 14px; }
+.voice-history-head p, .voice-history-head > small, .voice-record small { color: var(--muted); font-size: 11px; }
+.voice-history-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; }
+.voice-record { display: grid; gap: 5px; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); }
+.voice-record p { margin: 0; overflow-wrap: anywhere; color: var(--text); font-size: 12px; line-height: 1.45; }
+.voice-record-top strong { font-size: 12px; }
+.voice-record-top strong.accepted { color: var(--green); }
+.voice-record-top strong.armed { color: var(--cyan); }
+.voice-record-top strong.busy { color: #ffc857; }
+.voice-record-top strong.ignored, .voice-record-top strong.no_speech { color: var(--muted); }
+.dev-main { display: grid; grid-template-rows: minmax(420px, 1fr) auto; gap: 18px; min-width: 0; }
 .composer { padding: 20px; }
-.composer-row { display: grid; grid-template-columns: minmax(180px, 280px) 1fr; gap: 16px; margin-bottom: 14px; }
+.composer-row { display: grid; grid-template-columns: minmax(145px, 210px) minmax(175px, 240px) minmax(160px, 230px) 1fr; gap: 16px; margin-bottom: 14px; }
 .composer label, .prompt-field { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
+.conversation-name { display: flex; align-items: center; min-height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--input-bg); font-size: 13px; }
 .current-state { display: flex; align-items: flex-end; justify-content: flex-end; gap: 9px; color: var(--muted); }
 .current-state strong { padding: 8px 12px; border-radius: 10px; color: var(--text); background: var(--chip-bg); }
 .current-state strong.running { color: var(--green); }
@@ -357,6 +505,13 @@ onBeforeUnmount(() => {
 .terminal-lights i:nth-child(3) { background: #38d996; }
 .terminal-body { min-height: 0; overflow: auto; padding: 14px 0; font: 12px/1.6 "SFMono-Regular", Consolas, monospace; }
 .terminal-empty { display: grid; place-content: center; gap: 8px; height: 100%; color: #7897b9; text-align: center; }
+.conversation-turn { padding: 8px 0 14px; border-bottom: 1px solid rgba(146, 197, 255, .1); }
+.conversation-turn:last-child { border-bottom: 0; }
+.user-message { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; margin: 4px 16px 10px; padding: 12px 14px; border: 1px solid rgba(67, 213, 255, .18); border-radius: 12px; background: rgba(67, 213, 255, .07); }
+.user-message p { margin: 0 0 4px; color: #ecf7ff; font: 13px/1.6 system-ui, sans-serif; white-space: pre-wrap; }
+.user-message small { color: #7897b9; font: 11px/1.4 system-ui, sans-serif; }
+.message-role { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; color: #03111d; background: #43d5ff; font: 700 12px/1 system-ui, sans-serif; }
+.turn-pending { margin: 8px 18px; color: #7ee8ff; }
 .terminal-line { display: grid; grid-template-columns: 48px 150px minmax(0, 1fr); gap: 10px; padding: 4px 16px; border-left: 2px solid transparent; }
 .terminal-line:hover { background: rgba(255,255,255,.035); }
 .terminal-line.stderr { border-left-color: #ff6b6b; color: #ff9b9b; }
@@ -367,10 +522,11 @@ onBeforeUnmount(() => {
 .line-time { color: #7897b9; }
 .terminal-shell footer { justify-content: flex-end; border-top: 1px solid rgba(146, 197, 255, .12); border-bottom: 0; color: #7897b9; font-size: 11px; }
 @media (max-width: 900px) {
+  .dev-page { height: auto; min-height: 0; }
   .dev-toolbar { align-items: flex-start; flex-direction: column; }
   .dev-grid { grid-template-columns: 1fr; }
   .dev-history { max-height: 300px; }
-  .dev-main { grid-template-rows: auto 560px; }
+  .dev-main { grid-template-rows: 560px auto; }
 }
 @media (max-width: 620px) {
   .composer-row { grid-template-columns: 1fr; }

@@ -1,0 +1,104 @@
+robot:
+  code: ZSL-1A-07
+  name: patrol-robot
+
+location:
+  name: patrol-area
+  latitude: 0.0
+  longitude: 0.0
+
+video:
+  source: rtsp://192.168.234.1:8554/test
+  width: 1280
+  height: 720
+  camera_id: front
+  stream_id: dog_ZSL-1A-07_front
+  play_urls:
+    flv: https://platform.example/live/dog_ZSL-1A-07_front.live.flv
+    hls: https://platform.example/live/dog_ZSL-1A-07_front/hls.m3u8
+  rtsp_transport: tcp
+  open_timeout_seconds: 8
+  read_timeout_seconds: 8
+  reconnect_interval_seconds: 3
+
+stream:
+  enable: true
+  ffmpeg_path: /usr/bin/ffmpeg
+  rtmp_url: rtmp://platform.example/live/dog_ZSL-1A-07_front
+  reconnect_interval_seconds: 5
+  video_codec: copy
+  audio_enabled: false
+  extra_args: []
+
+model:
+  path: models/yolo11n.onnx
+  backend: onnxruntime
+  confidence: 0.7
+  nms_iou_threshold: 0.45
+  image_size: 640
+  device: ""
+  classes: [person, bicycle]
+
+detection:
+  event_type: vehicle_illegal_parking
+  event_label: bicycle
+  risk_level: medium
+  event_cooldown_seconds: 10
+  min_box_area: 4000
+  tracking_enabled: true
+  tracker_iou_threshold: 0.3
+  track_ttl_seconds: 30
+  duplicate_alert_seconds: 10
+  event_classes: [bicycle]
+  person_detection_enabled: true
+  person_report_interval_seconds: 0.4
+
+telemetry:
+  endpoint: https://platform.example/api/telemetry/ingest/
+  media_upload_endpoint: https://platform.example/api/device/media/upload/
+  person_detection_endpoint: https://platform.example/api/device/person-detections/
+  timeout_seconds: 5
+  verify_tls: true
+  device_key: ""
+  heartbeat_interval_seconds: 5
+  status_interval_seconds: 2
+  heartbeat_enabled: true
+  status_enabled: true
+
+control:
+  enable: false
+  host: 0.0.0.0
+  port: 9100
+  dry_run: true
+  sdk_enabled: true
+  sdk_lib_path: /home/firefly/genisom_l1_sdk/lib/zsl-1/aarch64
+  local_ip: 127.0.0.1
+  local_port: 43988
+  robot_ip: 127.0.0.1
+
+snapshot:
+  directory: snapshots
+  public_base_url: ""
+  jpeg_quality: 90
+
+display:
+  enable: false
+  window_name: Bike Bot Detection
+  show_fps: true
+  max_width: 1280
+
+storage:
+  telemetry_log_path: data/telemetry/telemetry.jsonl
+  app_log_path: data/logs/bike-bot.log
+  run_stream_log_path: data/logs/run-stream.log
+  stream_log_path: data/logs/ffmpeg-stream.log
+
+runtime:
+  mode: auto
+  status: online
+  battery_level: 0
+  charging: false
+  signal_strength: 0
+  network_type: 5G
+  speed: 0.0
+  heading: 0.0

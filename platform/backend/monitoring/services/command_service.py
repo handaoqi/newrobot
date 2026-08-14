@@ -5,12 +5,14 @@ from datetime import timedelta
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from ..models import CommandEvent, RemoteCommand, Robot, TaskExecution
 from .task_service import TaskExecutionService, TaskStateError
 
 
 class CommandService:
+    LOW_BATTERY_PERCENT = 20
     COMMAND_TARGET_STATES = {
         "task.start": "dispatching",
         "task.pause": "pausing",
@@ -32,6 +34,11 @@ class CommandService:
             raise ValueError(f"unsupported command type: {command_type}")
         target = cls.COMMAND_TARGET_STATES[command_type]
         command_options = command_options or {}
+        cls._ensure_battery_allows(
+            execution.robot,
+            command_type,
+            allow_docking=bool((command_options.get("docking") or {}).get("enabled")),
+        )
         if command_type == "task.start":
             command_payload = {
                 "task_id": str(execution.task_id),
@@ -44,6 +51,7 @@ class CommandService:
                     "continue_on_disconnect": True,
                 },
                 "record_rosbag": bool(command_options.get("record_rosbag", False)),
+                "docking": dict(command_options.get("docking") or {}),
             }
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)
         elif command_type == "task.resume":
@@ -193,3 +201,19 @@ class CommandService:
             payload={"command_type": command_type},
         )
         return command
+
+    @classmethod
+    def _ensure_battery_allows(cls, robot: Robot, command_type: str, *, allow_docking: bool = False) -> None:
+        """Reject only a new non-docking patrol when the battery is critically low."""
+        latest = getattr(robot, "latest_status", None)
+        percent = None
+        if latest and latest.power_available and latest.battery_percent is not None:
+            percent = int(latest.battery_percent)
+        elif robot.battery_level is not None:
+            percent = int(robot.battery_level)
+        if percent is None or percent >= cls.LOW_BATTERY_PERCENT:
+            return
+        if command_type == "task.start" and not allow_docking:
+            raise PermissionDenied(
+                f"电量不足（当前 {percent}%），低于 {cls.LOW_BATTERY_PERCENT}% 时仅可执行一键回充任务。"
+            )

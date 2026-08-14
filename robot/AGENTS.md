@@ -231,3 +231,16 @@ source /home/robot/genisom_roamerx_open/install/setup.bash
 timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" -r 10
 ```
 
+## Python Tests
+
+The user Python environment provides `pytest>=8,<9` so it is compatible with
+the installed AnyIO pytest plugin. Run Python tests normally; do not disable
+plugin autoload:
+
+```bash
+cd /home/robot/genisom_roamerx_open/dev_agent
+python3 -m pytest -q
+
+cd /home/robot/genisom_roamerx_open/edge_agent
+python3 -m pytest -q
+```

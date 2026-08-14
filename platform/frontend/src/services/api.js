@@ -83,8 +83,22 @@ export async function fetchRobotPersonDetections(robotId) {
   return request(`/robots/${robotId}/person-detections/`)
 }
 
+export async function setRobotPersonDetection(robotId, enabled) {
+  return request(`/robots/${robotId}/person-detections/`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  })
+}
+
 export async function sendRobotCommand(robotId, payload) {
   return request(`/robots/${robotId}/commands/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function startRobotChargingDock(robotId, payload = {}) {
+  return request(`/robots/${robotId}/charging-dock/`, {
     method: 'POST',
     body: JSON.stringify(payload),
   })
@@ -366,6 +380,10 @@ export async function fetchMapDetail(mapId) {
   return request(`/maps/${mapId}/`)
 }
 
+export async function fetchMapMappingTrace(mapId) {
+  return request(`/maps/${mapId}/mapping-trace/`)
+}
+
 export async function createMap(payload) {
   const formData = new FormData()
   Object.keys(payload).forEach(key => {
@@ -517,9 +535,17 @@ export async function fetchDevelopmentAgents() {
   return request('/development/agents/')
 }
 
+export async function fetchVoiceRecognitions(robotId, limit = 80) {
+  return request(`/development/voice-recognitions/?robot=${encodeURIComponent(robotId)}&limit=${limit}`)
+}
+
 export async function fetchDevelopmentTasks(robotId = '') {
   const query = robotId ? `?robot=${encodeURIComponent(robotId)}` : ''
   return request(`/development/tasks/${query}`)
+}
+
+export async function fetchDevelopmentConversation(robotId) {
+  return request(`/development/conversations/main/?robot=${encodeURIComponent(robotId)}`)
 }
 
 export async function fetchDevelopmentTask(taskId) {

@@ -19,7 +19,7 @@ from .mapping_adapter import MappingAdapter
 from .media_client import MediaClient
 from .mqtt_client import EdgeMqttClient
 from .navigation_stack_adapter import NavigationStackAdapter
-from .protocol import build_envelope, now_iso
+from .protocol import ProtocolError, build_envelope, now_iso
 from .power_mode_controller import PowerModeController
 from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
 from .rosbag_recorder import RosbagRecorder
@@ -48,7 +48,11 @@ class EdgeAgentApplication:
         self.telemetry.configure_system_probe_staleness(
             config.telemetry.system_probe_stale_seconds
         )
-        self.system_telemetry = SystemTelemetryProbe(config.telemetry, self.telemetry)
+        self.system_telemetry = SystemTelemetryProbe(
+            config.telemetry,
+            self.telemetry,
+            config.charge_control,
+        )
         self.mqtt = EdgeMqttClient(config, self.store)
         self.media_client = MediaClient(config.media, config.robot.id)
         self.ros_runtime = None
@@ -95,6 +99,10 @@ class EdgeAgentApplication:
         self.sensor_control_adapter = SensorControlAdapter(config.sensor_control)
         self.power_mode_controller = PowerModeController(config.power_mode)
         self.charge_control_adapter = ChargeControlAdapter(config.charge_control, self.power_mode_controller)
+        self.charge_control_adapter.set_low_battery_handler(self._handle_low_battery_charge)
+        self._docking_undock_pending = False
+        self.charge_control_adapter.set_full_charge_handler(self._finish_docking_undock)
+        self.task_executor.docking_arrived_handler = self._start_docking_charge
         self.audio_control_adapter = AudioControlAdapter(config.audio_control)
         self.safety = SafetyPolicy(config.safety, self.safety_state)
         self.commands = CommandProcessor(
@@ -163,6 +171,52 @@ class EdgeAgentApplication:
         self.start()
         self.stop_event.wait()
 
+    def _start_docking_charge(self, docking: dict) -> None:
+        """Called only after the second docking waypoint has been reached."""
+        self.task_executor.report_docking_charge("task.docking_contact_checking", message="已到充电桩，正在检查蓝牙与极片")
+        passive = getattr(self.navigation, "confirmed_remote_teleop_action", None)
+        if callable(passive):
+            passive("passive", {"passive"}, {"passive_failed"}, timeout_seconds=5.0)
+        self._docking_undock_pending = True
+        retries = max(1, int(docking.get("charge_retries", 3)))
+        last_result = {}
+        for attempt in range(retries):
+            last_result = self.charge_control_adapter.start()
+            if last_result.get("dock_ready") or last_result.get("charge_stage") not in {"waiting_for_dock", "idle"}:
+                self.task_executor.report_docking_charge("task.docking_charge_started", message="充电条件通过，已发起充电", extra={"charge_stage": last_result.get("charge_stage"), "dock": last_result})
+                LOGGER.info("docking charge accepted on attempt %d", attempt + 1)
+                return
+            time.sleep(2)
+        self._docking_undock_pending = False
+        self.task_executor.report_docking_charge("task.docking_charge_failed", message="充电条件未满足", extra={"dock": last_result})
+        raise ProtocolError(
+            "DOCK_CONTACT_NOT_READY",
+            "充电桩蓝牙、极片或正负极未满足，已重试 3 次: " + str(last_result.get("missing") or "unknown"),
+        )
+
+    def _finish_docking_undock(self) -> None:
+        """Leave the dock only for a completed one-key docking operation."""
+        if not self._docking_undock_pending:
+            return
+        self._docking_undock_pending = False
+        snapshot = self.power_mode_controller.snapshot()
+        services = list((snapshot.get("services") or {}).values())
+        if snapshot.get("mode") != "normal" or snapshot.get("transition_state") != "ready" or not services or not all(service.get("matches_mode") for service in services):
+            LOGGER.error("full charge restored incompletely; refusing automatic undock: %s", snapshot)
+            return
+        remote_action = getattr(self.navigation, "remote_teleop_action", None)
+        velocity = getattr(self.navigation, "teleop_velocity", None)
+        if not callable(remote_action) or not callable(velocity):
+            LOGGER.error("automatic undock unavailable: remote teleop adapter missing")
+            return
+        remote_action("speed_micro")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            velocity(vx=-0.60)
+            time.sleep(0.15)
+        velocity()
+        LOGGER.info("full charge automatic undock completed")
+
     def _publish_online(self) -> None:
         self.mqtt.publish_presence(
             "presence.online",
@@ -189,6 +243,8 @@ class EdgeAgentApplication:
                     "sensor.restart",
                     "charge.start",
                     "charge.stop",
+                    "motion.start",
+                    "motion.stop",
                     "audio.volume",
                     "map.activate",
                     "map_set.v1",
@@ -196,6 +252,10 @@ class EdgeAgentApplication:
                     "teleop.takeover_exit",
                     "teleop.stand_up",
                     "teleop.lie_down",
+                    "teleop.speed_micro",
+                    "teleop.speed_slow",
+                    "teleop.speed_normal",
+                    "teleop.speed_fast",
                     "teleop.move_forward",
                     "teleop.move_backward",
                     "teleop.move_left",
@@ -205,6 +265,9 @@ class EdgeAgentApplication:
                     "teleop.move_velocity",
                     "teleop.move_stop",
                     "teleop.passive",
+                    "teleop.skill",
+                    "teleop.skill_status",
+                    "teleop.skill_cancel",
                     "map.uploaded",
                     "telemetry.pose",
                     "trajectory.batch",
@@ -318,11 +381,34 @@ class EdgeAgentApplication:
             self.mqtt.replay_outbox()
 
     def _system_telemetry_loop(self) -> None:
-        while not self.stop_event.wait(self.config.telemetry.system_probe_interval_seconds):
+        while True:
+            cooling = self.power_mode_controller.snapshot().get("mode") == "cooling_standby"
+            interval = (
+                self.config.telemetry.cooling_system_probe_interval_seconds
+                if cooling
+                else self.config.telemetry.system_probe_interval_seconds
+            )
+            if self.stop_event.wait(interval):
+                break
             self.system_telemetry.poll()
             power = self.telemetry.latest_power()
             self.charge_control_adapter.observe_power(power)
             self.power_mode_controller.refresh_service_status(power)
+
+    def _handle_low_battery_charge(self) -> None:
+        """Stop autonomous motion before waiting for an operator to dock the robot."""
+        if not self.task_executor.has_active_task():
+            return
+        context = self.task_executor.context
+        try:
+            self.task_executor.cancel_task(context.task_execution_id if context else "")
+            LOGGER.warning("low battery cancelled active navigation before charge preparation")
+        except Exception:
+            LOGGER.exception("graceful low-battery task cancellation failed; forcing local exit")
+            try:
+                self.task_executor.force_exit(context.task_execution_id if context else "")
+            except Exception:
+                LOGGER.exception("failed to force low-battery task exit")
 
     def _publish_start_result(self, command_id: str, status: str, result: dict, code: str, message: str) -> None:
         context = self.task_executor.context
