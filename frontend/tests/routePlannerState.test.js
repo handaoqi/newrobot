@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   clampMapZoom,
+  headingBetweenMapPoints,
   headingDegreesToRadians,
   normalizeHeadingDegrees,
   paginateKeyframes,
@@ -38,4 +39,10 @@ test('map click mode has one explicit action and initial pose takes precedence',
   assert.equal(resolveMapClickAction('waypoint'), 'waypoint')
   assert.equal(resolveMapClickAction('inspect'), 'inspect')
   assert.equal(resolveMapClickAction('waypoint', true), 'initial_pose')
+})
+
+test('two map points produce the same yaw convention used by initial pose', () => {
+  assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 2, y: 1 }), 0)
+  assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1, y: 2 }), Number((Math.PI / 2).toFixed(5)))
+  assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1.01, y: 1.01 }), null)
 })

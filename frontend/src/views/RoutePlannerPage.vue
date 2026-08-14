@@ -25,6 +25,7 @@ import {
   MAP_ZOOM_MIN,
   MAP_ZOOM_STEP,
   clampMapZoom,
+  headingBetweenMapPoints,
   headingDegreesToRadians,
   normalizeHeadingDegrees,
   paginateKeyframes,
@@ -72,6 +73,9 @@ const mappingTraceLoading = ref(false)
 const showMappingTrace = ref(true)
 const inspectedMapPoint = ref(null)
 const mapClickMode = ref('waypoint')
+const inspectPoseStep = ref('position')
+const inspectedHeadingTarget = ref(null)
+const mapInteractionError = ref('')
 const mapZoom = ref(1)
 const mapImageNaturalWidth = ref(0)
 const waypointYawDrafts = ref([])
@@ -191,6 +195,9 @@ async function handleMapSelect(map) {
   resetWaypointYawEditors()
   clearPoseHistory()
   inspectedMapPoint.value = null
+  inspectedHeadingTarget.value = null
+  inspectPoseStep.value = 'position'
+  mapInteractionError.value = ''
   selectedKeyframeIndex.value = null
   keyframePage.value = 1
   mapZoom.value = 1
@@ -246,36 +253,74 @@ function handleMapClick(event) {
       navError.value = '已设置初始位置，请再点击狗头朝向'
       return
     }
-    const dx = clickedPose.x - manualInitialPose.value.x
-    const dy = clickedPose.y - manualInitialPose.value.y
-    if (Math.hypot(dx, dy) < 0.05) {
+    const yaw = headingBetweenMapPoints(manualInitialPose.value, clickedPose)
+    if (yaw === null) {
       navError.value = '朝向点离初始位置太近，请点远一点'
       return
     }
     manualInitialPose.value = {
       ...manualInitialPose.value,
-      yaw: Number(Math.atan2(dy, dx).toFixed(4)),
+      yaw,
     }
     initialPoseHeadingTarget.value = clickedPose
     navError.value = '已设置初始朝向，可以下发初始定位'
     return
   }
   if (clickAction === 'inspect') {
-    inspectedMapPoint.value = {
-      point: clickedMapPoint,
-      sample: nearestMappingSample(clickedMapPoint),
+    if (inspectPoseStep.value === 'position' || !inspectedMapPoint.value) {
+      inspectedMapPoint.value = {
+        point: { ...clickedMapPoint, yaw: 0 },
+        sample: nearestMappingSample(clickedMapPoint),
+      }
+      inspectedHeadingTarget.value = null
+      inspectPoseStep.value = 'heading'
+      mapInteractionError.value = ''
+      selectedKeyframeIndex.value = inspectedMapPoint.value.sample?.index ?? null
+      return
     }
-    selectedKeyframeIndex.value = inspectedMapPoint.value.sample?.index ?? null
+    const yaw = headingBetweenMapPoints(inspectedMapPoint.value.point, clickedMapPoint)
+    if (yaw === null) {
+      mapInteractionError.value = '方向点离选定位置太近，请移动后再点击'
+      return
+    }
+    inspectedMapPoint.value = {
+      ...inspectedMapPoint.value,
+      point: { ...inspectedMapPoint.value.point, yaw },
+    }
+    inspectedHeadingTarget.value = clickedMapPoint
+    inspectPoseStep.value = 'complete'
+    mapInteractionError.value = ''
     return
   }
-  inspectedMapPoint.value = null
-  selectedKeyframeIndex.value = null
+  resetInspectedMapPoint()
   const waypoint = imagePointToWaypoint(imagePoint, geometry)
   waypoints.value.push(waypoint)
   waypointNames.value.push(`点${waypoints.value.length}`)
   waypointYawDrafts.value.push(waypointYawDegrees(waypoint).toFixed(1))
   waypointYawErrors.value.push('')
   waypointYawConfirmed.value.push(true)
+}
+
+function setMapClickMode(mode) {
+  const nextMode = mode === 'inspect' ? 'inspect' : 'waypoint'
+  if (mapClickMode.value === nextMode) return
+  mapClickMode.value = nextMode
+  resetInspectedMapPoint()
+}
+
+function resetInspectedMapPoint() {
+  inspectedMapPoint.value = null
+  inspectedHeadingTarget.value = null
+  inspectPoseStep.value = 'position'
+  mapInteractionError.value = ''
+  selectedKeyframeIndex.value = null
+}
+
+function mapModeHintText() {
+  if (mapClickMode.value === 'waypoint') return '点击地图直接添加途经点。'
+  if (inspectPoseStep.value === 'position') return '第1步：点击地图获得 XY 位置。'
+  if (inspectPoseStep.value === 'heading') return '第2步：移动到朝向位置并再次点击，确定方向。'
+  return '位置和方向已获取；可继续点击调整方向，或点击“重选位置”。'
 }
 
 function refreshImageGeometry() {
@@ -388,6 +433,9 @@ async function selectKeyframe(sample, rowIndex) {
     sample: { ...sample, index: selectedKeyframeIndex.value, distance_m: 0 },
   }
   mapClickMode.value = 'inspect'
+  inspectPoseStep.value = 'complete'
+  inspectedHeadingTarget.value = null
+  mapInteractionError.value = ''
   await nextTick()
   centerMapOnPoint(slam)
 }
@@ -900,6 +948,16 @@ function initialPoseHeadingLinePoints() {
   if (!geometry || !manualInitialPose.value || !initialPoseHeadingTarget.value) return ''
   const start = pointDisplayPositionFromMap(manualInitialPose.value.x, manualInitialPose.value.y, geometry)
   const end = pointDisplayPositionFromMap(initialPoseHeadingTarget.value.x, initialPoseHeadingTarget.value.y, geometry)
+  if (!start || !end) return ''
+  return `${start.x},${start.y} ${end.x},${end.y}`
+}
+
+function inspectedHeadingLinePoints() {
+  imageReadyTick.value
+  const geometry = getMapGeometry()
+  if (!geometry || !inspectedMapPoint.value || !inspectedHeadingTarget.value) return ''
+  const start = pointDisplayPositionFromMap(inspectedMapPoint.value.point.x, inspectedMapPoint.value.point.y, geometry)
+  const end = pointDisplayPositionFromMap(inspectedHeadingTarget.value.x, inspectedHeadingTarget.value.y, geometry)
   if (!start || !end) return ''
   return `${start.x},${start.y} ${end.x},${end.y}`
 }
@@ -2048,8 +2106,8 @@ async function handleDeleteRoute(route) {
             <div v-else class="map-workspace">
               <div class="map-toolbar" role="toolbar" aria-label="地图显示控制">
                 <div class="map-click-mode" aria-label="地图点击模式">
-                  <button type="button" :class="{ active: mapClickMode === 'waypoint' }" @click="mapClickMode = 'waypoint'">添加途经点</button>
-                  <button type="button" :class="{ active: mapClickMode === 'inspect' }" @click="mapClickMode = 'inspect'">查看位置</button>
+                  <button type="button" :class="{ active: mapClickMode === 'waypoint' }" @click="setMapClickMode('waypoint')">添加途经点</button>
+                  <button type="button" :class="{ active: mapClickMode === 'inspect' }" @click="setMapClickMode('inspect')">查看位置</button>
                 </div>
                 <span class="mapping-trace-summary">
                   {{ mappingTraceLoading ? '正在加载关键帧' : `关键帧 ${mappingTrace.length} 个` }}
@@ -2062,6 +2120,10 @@ async function handleDeleteRoute(route) {
                     {{ showMappingTrace ? '隐藏轨迹' : '显示轨迹' }}
                   </button>
                 </div>
+              </div>
+              <div class="map-mode-hint" :class="{ error: mapInteractionError }">
+                <strong>当前模式：{{ mapClickMode === 'waypoint' ? '添加途经点' : '查看位置' }}</strong>
+                <span>{{ mapInteractionError || mapModeHintText() }}</span>
               </div>
               <div ref="mapViewportRef" class="map-container">
                 <div v-if="selectedMap.thumbnail_url" class="map-image-layer" :style="mapImageLayerStyle">
@@ -2084,7 +2146,7 @@ async function handleDeleteRoute(route) {
                       :style="waypointDisplayPosition(point)"
                     >
                       {{ index + 1 }}
-                      <span class="waypoint-heading-arrow" :style="waypointHeadingStyle(point)"></span>
+                      <span v-if="point.require_yaw === true" class="waypoint-heading-arrow" :style="waypointHeadingStyle(point)"></span>
                     </div>
                     <div v-if="drillDisplayPosition()" class="drill-robot-marker" :style="drillDisplayPosition()">
                       <span class="drill-dog-icon">🐕</span>
@@ -2096,11 +2158,17 @@ async function handleDeleteRoute(route) {
                     <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
                       <span :style="initialPoseHeadingStyle()"></span>
                     </div>
-                    <div v-if="inspectedMapPoint" class="inspected-map-marker" :style="waypointDisplayPosition(inspectedMapPoint.point)"></div>
+                    <div v-if="inspectedMapPoint" class="inspected-map-marker" :style="waypointDisplayPosition(inspectedMapPoint.point)">
+                      <span v-if="inspectPoseStep === 'complete'" class="inspected-heading-arrow" :style="waypointHeadingStyle(inspectedMapPoint.point)"></span>
+                    </div>
                   </div>
 
                   <svg v-if="initialPoseHeadingLinePoints()" class="initial-pose-heading-line">
                     <polyline :points="initialPoseHeadingLinePoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" />
+                  </svg>
+
+                  <svg v-if="inspectedHeadingLinePoints()" class="inspection-heading-line">
+                    <polyline :points="inspectedHeadingLinePoints()" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" />
                   </svg>
 
                   <svg v-if="waypoints.length > 1" class="path-lines">
@@ -2111,10 +2179,12 @@ async function handleDeleteRoute(route) {
               </div>
               <div v-if="inspectedMapPoint" class="map-inspection-panel">
                 <strong>点击位置 {{ waypointDisplayText(inspectedMapPoint.point) }}</strong>
+                <span>方向：{{ waypointYawDegrees(inspectedMapPoint.point).toFixed(1) }}°</span>
                 <span>NDT：{{ poseText(inspectedMapPoint.sample?.slam) }}</span>
                 <span>RTK：{{ rtkPoseText(inspectedMapPoint.sample?.rtk) }}</span>
                 <small v-if="inspectedMapPoint.sample">距关键帧 {{ inspectedMapPoint.sample.distance_m.toFixed(2) }} m · {{ mappingSampleTime(inspectedMapPoint.sample) }}</small>
                 <small v-else>附近无建图轨迹记录</small>
+                <button type="button" class="btn btn-sm inspection-reset-btn" @click="resetInspectedMapPoint">重选位置</button>
               </div>
 
               <section v-if="selectedMap.thumbnail_url" class="keyframe-panel" :class="{ open: keyframePanelOpen }">
@@ -2197,9 +2267,6 @@ async function handleDeleteRoute(route) {
             </aside>
           </div>
 
-          <div class="map-hint" v-if="selectedMap">
-            当前模式：{{ mapClickMode === 'waypoint' ? '点击地图添加途经点' : '点击地图查看位置和最近关键帧' }}。
-          </div>
           <div v-if="drillMessage" class="drill-status" :class="{ active: drillRunning }">
             <span class="drill-status-dot"></span>
             {{ drillMessage }}
@@ -2861,6 +2928,30 @@ async function handleDeleteRoute(route) {
   font-size: 0.72rem;
 }
 
+.map-mode-hint {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid #bcd7ff;
+  border-radius: 5px;
+  color: #344054;
+  background: #f5f9ff;
+  font-size: 0.76rem;
+}
+
+.map-mode-hint strong {
+  flex: 0 0 auto;
+  color: #175cd3;
+}
+
+.map-mode-hint.error {
+  border-color: #fda29b;
+  color: #b42318;
+  background: #fff5f5;
+}
+
 .map-click-mode,
 .map-display-controls {
   display: flex;
@@ -3113,7 +3204,7 @@ async function handleDeleteRoute(route) {
   top: 50%;
   width: 20px;
   height: 2px;
-  background: #1d4ed8;
+  background: #dc2626;
   transform-origin: 0 50%;
 }
 
@@ -3125,7 +3216,7 @@ async function handleDeleteRoute(route) {
   height: 0;
   border-top: 5px solid transparent;
   border-bottom: 5px solid transparent;
-  border-left: 7px solid #1d4ed8;
+  border-left: 7px solid #dc2626;
   content: '';
 }
 
@@ -3149,6 +3240,28 @@ async function handleDeleteRoute(route) {
   background: #dc2626;
   box-shadow: 0 0 0 2px #dc2626;
   transform: translate(-50%, -50%);
+}
+
+.inspected-heading-arrow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 26px;
+  height: 3px;
+  background: #b42318;
+  transform-origin: 0 50%;
+}
+
+.inspected-heading-arrow::after {
+  position: absolute;
+  top: -5px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 8px solid #b42318;
+  content: '';
 }
 
 .mapping-trace-summary {
@@ -3177,6 +3290,11 @@ async function handleDeleteRoute(route) {
 
 .map-inspection-panel strong { color: #991b1b; }
 .map-inspection-panel small { color: #667085; }
+
+.inspection-reset-btn {
+  justify-self: start;
+  margin-top: 0.25rem;
+}
 
 .keyframe-panel {
   overflow: hidden;
@@ -3398,7 +3516,8 @@ async function handleDeleteRoute(route) {
 
 .pose-trail-lines,
 .path-lines,
-.initial-pose-heading-line {
+.initial-pose-heading-line,
+.inspection-heading-line {
   position: absolute;
   top: 0;
   left: 0;
@@ -3417,6 +3536,10 @@ async function handleDeleteRoute(route) {
 
 .initial-pose-heading-line {
   z-index: 5;
+}
+
+.inspection-heading-line {
+  z-index: 14;
 }
 
 .map-hint {

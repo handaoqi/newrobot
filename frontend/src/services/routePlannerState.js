@@ -39,3 +39,15 @@ export function resolveMapClickAction(mode, initialPoseMode = false) {
   if (initialPoseMode) return 'initial_pose'
   return mode === 'inspect' ? 'inspect' : 'waypoint'
 }
+
+export function headingBetweenMapPoints(from, to, minimumDistance = 0.05) {
+  const fromX = Number(from?.x)
+  const fromY = Number(from?.y)
+  const toX = Number(to?.x)
+  const toY = Number(to?.y)
+  if (![fromX, fromY, toX, toY].every(Number.isFinite)) return null
+  const dx = toX - fromX
+  const dy = toY - fromY
+  if (Math.hypot(dx, dy) < minimumDistance) return null
+  return Number(Math.atan2(dy, dx).toFixed(5))
+}
