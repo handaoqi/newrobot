@@ -22,11 +22,28 @@ from .services import asr_service, tts_service
 _VOICE_WAKE_UNTIL: dict[str, object] = {}
 LOGGER = logging.getLogger(__name__)
 # Wake matching remains anchored at the start of the utterance, but is based on
-# approximate Mandarin syllables instead of an exact ASR spelling.  This is
-# needed because the NX ASR has returned variants such as “小菜阳” and “要太阳”
-# for the spoken wake word “小太阳”.
+# Mandarin syllables instead of an exact ASR spelling.  The matcher deliberately
+# has no list of observed misspellings: any homophone (for example “晓太洋”)
+# is handled from its pinyin, and a single near-syllable is allowed without
+# permitting an unrelated phrase to create a development task.
 VOICE_WAKE_ALIASES = ("小太阳", "小太陽")
 VOICE_WAKE_PINYIN = ("xiao", "tai", "yang")
+_PINYIN_INITIALS = (
+    "zh", "ch", "sh",
+    "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
+    "j", "q", "x", "r", "z", "c", "s", "y", "w",
+)
+_NEAR_INITIAL_GROUPS = (
+    frozenset(("b", "p")),
+    frozenset(("d", "t")),
+    frozenset(("g", "k")),
+    frozenset(("n", "l")),
+    frozenset(("f", "h")),
+    frozenset(("j", "q", "x")),
+    frozenset(("z", "zh")),
+    frozenset(("c", "ch")),
+    frozenset(("s", "sh")),
+)
 VOICE_WAKE_WINDOW_SECONDS = 8
 LOCAL_ASR_ENGINE = "nx-sensevoice"
 # A task's final agent message is normally the user-facing Chinese result.
@@ -41,14 +58,48 @@ def _timestamp(value):
     return parsed or timezone.now()
 
 
-def _syllable_similarity(expected: str, actual: str) -> int:
+def _split_pinyin_syllable(syllable: str) -> tuple[str, str]:
+    """Return Mandarin initial and rime for a tone-free pinyin syllable."""
+    normalized = re.sub(r"[^a-zv]", "", syllable.lower().replace("ü", "v"))
+    for initial in _PINYIN_INITIALS:
+        if normalized.startswith(initial):
+            return initial, normalized[len(initial):]
+    return "", normalized
+
+
+def _initial_similarity(expected: str, actual: str) -> float:
     if expected == actual:
-        return 2
-    # SenseVoice often confuses an initial while retaining the pinyin final,
-    # e.g. tai/cai and xiao/yao.  Do not treat unrelated finals as a match.
-    if len(expected) >= 2 and len(actual) >= 2 and expected[-2:] == actual[-2:]:
-        return 1
-    return 0
+        return 1.0
+    if any(expected in group and actual in group for group in _NEAR_INITIAL_GROUPS):
+        return 0.5
+    return 0.0
+
+
+def _rime_similarity(expected: str, actual: str) -> float:
+    if expected == actual:
+        return 1.0
+    # A dropped glide is a common ASR variation: xiao/lao and xiao/yao keep
+    # the same "ao" rime.  Requiring at least two shared trailing letters
+    # keeps xiao/you ("ao" versus "ou") from being accepted.
+    if min(len(expected), len(actual)) >= 2 and (
+        expected.endswith(actual) or actual.endswith(expected)
+    ):
+        return 0.75
+    return 0.0
+
+
+def _syllable_similarity(expected: str, actual: str) -> float:
+    """Score one Mandarin syllable from 0.0 to 1.0 without variant tables."""
+    if expected == actual:
+        return 1.0
+    expected_initial, expected_rime = _split_pinyin_syllable(expected)
+    actual_initial, actual_rime = _split_pinyin_syllable(actual)
+    rime_score = _rime_similarity(expected_rime, actual_rime)
+    if not rime_score:
+        return 0.0
+    # The rime carries more acoustic information than the initial.  A close
+    # initial helps, but an ASR initial substitution alone is not a rejection.
+    return (0.75 * rime_score) + (0.25 * _initial_similarity(expected_initial, actual_initial))
 
 
 def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
@@ -67,16 +118,36 @@ def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
     syllables = tuple(lazy_pinyin(candidate, style=Style.NORMAL, errors="default"))
     if len(syllables) != len(VOICE_WAKE_PINYIN):
         return 0, ""
-    score = sum(
+    scores = tuple(
         _syllable_similarity(expected, actual)
         for expected, actual in zip(VOICE_WAKE_PINYIN, syllables)
     )
-    # At least two full syllables plus one near-syllable must agree (5/6).
-    # This accepts xiao-cai-yang and yao-tai-yang, but rejects unrelated
-    # phrases such as “有太阳” or “呃太阳”.
-    if score < 5:
+    # Require two high-confidence syllables and a strong combined score.  It
+    # admits homophones and one near-syllable, but not phrases sharing only
+    # “太阳”, such as “有太阳” or “狗太阳”.
+    if sum(scores) < 2.5 or sum(score >= 0.95 for score in scores) < 2:
         return 0, ""
     return len(candidate_match.group(1)) + len(candidate), candidate
+
+
+def _looks_like_short_wake_attempt(transcript: str) -> bool:
+    """Identify a garbled, short retry while the wake window is already open.
+
+    A wake-only request opens a short window so that the next utterance can be
+    used as the development command.  Without this guard, an ASR retry such as
+    “小要大呀” could be mistaken for that command.  It is safer to keep the
+    window open and ask for the command than to submit meaningless text to
+    Codex.  This deliberately applies only to short utterances beginning with
+    the first wake syllable; normal commands remain unchanged.
+    """
+    compact = re.sub(r"[\s，。,.!！?？]", "", transcript)
+    if len(compact) > 4:
+        return False
+    candidate_match = re.match(r"^[\u4e00-\u9fff]{3}", compact)
+    if not candidate_match:
+        return False
+    syllables = tuple(lazy_pinyin(candidate_match.group(), style=Style.NORMAL, errors="default"))
+    return bool(syllables) and _syllable_similarity(VOICE_WAKE_PINYIN[0], syllables[0]) >= 0.95
 
 
 def handle_dev_mqtt_message(topic: str, raw_payload: bytes | str | dict, publish=None) -> dict:
@@ -143,6 +214,11 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
         command = transcript[wake_end:].strip(" ，。,.!！?？")
         _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
     elif armed_until and armed_until >= now:
+        if _looks_like_short_wake_attempt(transcript):
+            _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
+            _publish_voice_ack(robot, publish, "我在，请说任务")
+            _record_voice_recognition(robot, payload, transcript, "armed")
+            return {"status": "armed", "transcript": transcript}
         command = transcript
     elif armed_until:
         _VOICE_WAKE_UNTIL.pop(robot.code, None)

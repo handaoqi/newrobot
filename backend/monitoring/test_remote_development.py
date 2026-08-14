@@ -7,7 +7,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .dev_message_handlers import handle_dev_mqtt_message
+from .dev_message_handlers import _VOICE_WAKE_UNTIL, handle_dev_mqtt_message
 from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot, VoiceRecognitionEvent
 
 
@@ -117,6 +117,7 @@ class RemoteDevelopmentApiTests(TestCase):
 
 class RemoteDevelopmentMqttTests(TestCase):
     def setUp(self):
+        _VOICE_WAKE_UNTIL.clear()
         self.robot = Robot.objects.create(code="rx-dev-mqtt", name="机器狗", location="现场", area="现场")
         self.task = DevelopmentTask.objects.create(
             robot=self.robot,
@@ -253,7 +254,11 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.task.status = "succeeded"
         self.task.save(update_fields=["status", "updated_at"])
 
-        for wake_word in ("小菜阳", "要太阳", "老太阳"):
+        # These are not aliases: the matcher derives their pinyin at runtime.
+        # The first two cases are homophones/near-initials not previously seen
+        # in the recognition history; the remaining values are observed ASR
+        # substitutions.
+        for wake_word in ("晓太洋", "小代阳", "小菜阳", "要太阳", "老太阳"):
             with self.subTest(wake_word=wake_word):
                 result = handle_dev_mqtt_message(
                     self.topic("voice/audio"),
@@ -272,7 +277,7 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.task.status = "succeeded"
         self.task.save(update_fields=["status", "updated_at"])
 
-        for transcript in ("有太阳创建测试任务", "呃太阳创建测试任务"):
+        for transcript in ("有太阳创建测试任务", "呃太阳创建测试任务", "狗太阳创建测试任务"):
             with self.subTest(transcript=transcript):
                 result = handle_dev_mqtt_message(
                     self.topic("voice/audio"),
@@ -305,3 +310,25 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.assertEqual(result["status"], "armed")
         self.assertEqual(DevelopmentTask.objects.filter(robot=self.robot).count(), 1)
         self.assertEqual(published[0][0], self.topic("voice/ack"))
+
+    def test_armed_window_keeps_short_garbled_wake_retry_out_of_codex(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+        published = []
+
+        with patch("monitoring.dev_message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/wake.mp3", False)):
+            first = handle_dev_mqtt_message(
+                self.topic("voice/audio"),
+                {"asr_engine": "nx-sensevoice", "transcript": "小太阳"},
+                publish=lambda *args: published.append(args),
+            )
+            retry = handle_dev_mqtt_message(
+                self.topic("voice/audio"),
+                {"asr_engine": "nx-sensevoice", "transcript": "小要大呀"},
+                publish=lambda *args: published.append(args),
+            )
+
+        self.assertEqual(first["status"], "armed")
+        self.assertEqual(retry["status"], "armed")
+        self.assertEqual(DevelopmentTask.objects.filter(robot=self.robot).count(), 1)
+        self.assertEqual(VoiceRecognitionEvent.objects.latest("id").outcome, "armed")
