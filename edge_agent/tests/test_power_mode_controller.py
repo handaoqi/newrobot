@@ -267,6 +267,53 @@ def test_low_battery_starts_charge_after_confirmation():
     assert calls == ["start"]
 
 
+def test_manual_disconnect_pauses_low_battery_auto_charge():
+    class FakePowerMode:
+        def __init__(self):
+            self.stage = "charging"
+
+        def snapshot(self):
+            return {"auto_charge_enabled": False, "charge_stage": self.stage}
+
+        def set_auto_charge_enabled(self, _enabled):
+            return None
+
+        def set_charge_stage(self, stage, _detail=""):
+            self.stage = stage
+
+        def restore_normal(self):
+            return {"mode": "normal"}
+
+    adapter = ChargeControlAdapter(
+        ChargeControlConfig(
+            low_battery_start_percent=20,
+            low_battery_confirmation_samples=2,
+            manual_disconnect_auto_charge_pause_seconds=300,
+        ),
+        FakePowerMode(),
+    )
+    adapter._stop_remote = lambda: {"disconnect_requested": True}
+    adapter.start_motion_control = lambda: {"motion_control": "running"}
+    adapter.stop()
+
+    calls = []
+    adapter.start = lambda: calls.append("start") or {"charge": {}}
+    sample = {"available": True, "percent": 20}
+    adapter.observe_power(sample)
+    adapter.observe_power(sample)
+    assert calls == []
+
+    adapter._manual_disconnect_inhibit_until = time.monotonic() - 1
+    adapter.observe_power(sample)
+    adapter.observe_power(sample)
+    for _ in range(50):
+        if calls:
+            break
+        time.sleep(0.01)
+
+    assert calls == ["start"]
+
+
 def test_charge_waits_for_dock_before_stopping_motion():
     class FakePowerMode:
         def __init__(self):

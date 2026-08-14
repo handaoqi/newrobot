@@ -163,6 +163,7 @@ class ChargeControlConfig:
     low_battery_start_percent: int = 20
     low_battery_confirmation_samples: int = 2
     low_battery_start_cooldown_seconds: float = 60.0
+    manual_disconnect_auto_charge_pause_seconds: float = 300.0
     cooling_stop_eggs: tuple[str, ...] = (
         "push_image", "spline_daemon", "motion_control", "dog_task",
         "imu_daemon", "ecal2ros", "monitor", "zenoh_route",

@@ -123,6 +123,8 @@ charge_control:
   full_confirmation_samples: 3
   low_battery_start_percent: 20
   low_battery_confirmation_samples: 2
+  low_battery_start_cooldown_seconds: 60
+  manual_disconnect_auto_charge_pause_seconds: 300
   cooling_stop_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
   normal_start_eggs: [arc_platform, monitor, time_sync, spline_daemon, motion_control, zenoh_route, dog_task, push_image, ecal2ros, imu_daemon]
   cooling_stop_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]

@@ -27,6 +27,7 @@ class ChargeControlAdapter:
         self._thermal_retry_thread: threading.Thread | None = None
         self._low_battery_samples = 0
         self._last_low_battery_start_at: float | None = None
+        self._manual_disconnect_inhibit_until = 0.0
         self._low_battery_start_thread: threading.Thread | None = None
         self._charge_begin_thread: threading.Thread | None = None
         self._latest_power: dict = {}
@@ -123,9 +124,18 @@ class ChargeControlAdapter:
         result = self._run("start", command)
         return result
 
-    def stop(self) -> dict:
+    def stop(self, *, manual: bool = True) -> dict:
         with self._lock:
             self._pending_charge = False
+            if manual:
+                self._low_battery_samples = 0
+                self._manual_disconnect_inhibit_until = (
+                    time.monotonic() + self.config.manual_disconnect_auto_charge_pause_seconds
+                )
+                LOGGER.info(
+                    "manual charge disconnect; automatic low-battery charge paused for %.0f seconds",
+                    self.config.manual_disconnect_auto_charge_pause_seconds,
+                )
         self.power_mode.set_auto_charge_enabled(False)
         self._set_charge_stage("stopping_charge", "正在断开充电并恢复运控")
         # The return command has already made the pile leave its charging
@@ -139,6 +149,11 @@ class ChargeControlAdapter:
         mode = self.power_mode.restore_normal()
         self._set_charge_stage("idle", "")
         motion = self.start_motion_control()
+        if manual:
+            with self._lock:
+                self._manual_disconnect_inhibit_until = (
+                    time.monotonic() + self.config.manual_disconnect_auto_charge_pause_seconds
+                )
         return {"charge": charge, "power_mode": mode, "motion": motion, "auto_restore_on_full": False}
 
     def _stop_remote(self) -> dict:
@@ -240,6 +255,9 @@ class ChargeControlAdapter:
         percent = int(power["percent"])
         now = time.monotonic()
         with self._lock:
+            if now < self._manual_disconnect_inhibit_until:
+                self._low_battery_samples = 0
+                return
             if percent > self.config.low_battery_start_percent:
                 self._low_battery_samples = 0
                 return
@@ -333,7 +351,7 @@ class ChargeControlAdapter:
     def _finish_full_charge(self) -> None:
         try:
             LOGGER.info("battery full confirmed; stopping charge and restoring normal mode")
-            self.stop()
+            self.stop(manual=False)
             if callable(self._full_charge_handler):
                 self._full_charge_handler()
         except Exception:
