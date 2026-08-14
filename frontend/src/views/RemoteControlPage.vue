@@ -7,9 +7,11 @@ import AppToast from '../components/AppToast.vue'
 import { useToast } from '../composables/useToast'
 import {
   fetchRobotDetail,
+  fetchRobotCommand,
   fetchRobotPersonDetections,
   fetchRobots,
   fetchRobotStatus,
+  setRobotPersonDetection,
   sendRobotCommand,
 } from '../services/api'
 
@@ -19,16 +21,16 @@ const liveStatus = ref(null)
 const loading = ref(true)
 const switchingRobot = ref(false)
 const commandSending = ref(false)
-const takeoverActive = ref(false)
 const streamUnavailable = ref(false)
 const activeHoldAction = ref('')
-const speedScale = ref(0.7)
+const speedMode = ref('medium')
 const commandFeedback = ref('')
 const videoRef = ref(null)
 const personDetectionState = ref({ detections: [] })
 const selectedPersonTrackId = ref('')
 const followActive = ref(false)
 const followStatus = ref('等待选择人员')
+const personDetectionChanging = ref(false)
 
 let flvPlayer = null
 let hlsPlayer = null
@@ -37,8 +39,6 @@ let personDetectionTimer = null
 let followTimer = null
 let followCommandInFlight = false
 let targetLostSince = 0
-// 操作员本地发起接管后的宽限截止时间戳；期内轮询不得把 takeoverActive 回退为 false。
-let takeoverHoldUntil = 0
 let holdTimer = null
 let holdAction = null
 let holdPointerId = null
@@ -46,7 +46,13 @@ let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
 
-const HOLD_REPEAT_MS = 300
+const HOLD_REPEAT_MS = 150
+const SPEED_MODES = [
+  { id: 'micro', action: 'speed_micro', label: '微速', scale: 1.75 },
+  { id: 'low', action: 'speed_slow', label: '低速', scale: 2.5 },
+  { id: 'medium', action: 'speed_normal', label: '中速', scale: 3.5 },
+  { id: 'high', action: 'speed_fast', label: '高速', scale: 5.0 },
+]
 const KEY_ACTIONS = {
   w: 'move_forward',
   ArrowUp: 'move_forward',
@@ -66,27 +72,82 @@ const livePlayUrls = computed(() => selectedRobot.value?.play_urls || {})
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 const status = computed(() => liveStatus.value?.status || {})
 const localizationQuality = computed(() => status.value?.localization_quality || {})
-const canControl = computed(() => takeoverActive.value && !followActive.value && selectedRobot.value?.id && !commandSending.value)
-const personDetections = computed(() => personDetectionState.value?.detections || [])
+const localizationDecision = computed(() => localizationQuality.value?.decision || {})
+const navigationStatus = computed(() => status.value?.navigation || {})
+const canControl = computed(() => !followActive.value && selectedRobot.value?.id && !commandSending.value)
+const motionControlState = computed(() => {
+  const service = liveStatus.value?.status?.power_mode?.services?.controller_motion
+  if (!service?.available) return '状态未知'
+  return service.active ? '运控已启动' : '运控已停止'
+})
+const personDetections = computed(() => (personDetectionState.value?.detections || []).filter(
+  (item) => String(item.label || '').toLowerCase() === 'person',
+))
 const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
+const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
 
 const motionActions = computed(() => [
-  { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.35) } },
-  { action: 'move_left', label: '左移', arrow: '←', className: 'left', payload: { vy: roundSpeed(0.25) } },
-  { action: 'move_right', label: '右移', arrow: '→', className: 'right', payload: { vy: -roundSpeed(0.25) } },
-  { action: 'move_backward', label: '后退', arrow: '↓', className: 'down', payload: { vx: -roundSpeed(0.30) } },
+  { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.60) } },
+  { action: 'move_left', label: '左移', arrow: '←', className: 'left', payload: { vy: roundSpeed(0.45) } },
+  { action: 'move_right', label: '右移', arrow: '→', className: 'right', payload: { vy: -roundSpeed(0.45) } },
+  { action: 'move_backward', label: '后退', arrow: '↓', className: 'down', payload: { vx: -roundSpeed(0.60) } },
 ])
 const turnActions = computed(() => [
-  { action: 'turn_left', label: '左转', arrow: '↶', className: 'left', payload: { yaw_rate: roundSpeed(0.45) } },
-  { action: 'turn_right', label: '右转', arrow: '↷', className: 'right', payload: { yaw_rate: -roundSpeed(0.45) } },
+  { action: 'turn_left', label: '左转', arrow: '↶', className: 'left', payload: { yaw_rate: roundSpeed(1.05) } },
+  { action: 'turn_right', label: '右转', arrow: '↷', className: 'right', payload: { yaw_rate: -roundSpeed(1.05) } },
 ])
 const actionByName = computed(() => {
   const actions = [...motionActions.value, ...turnActions.value]
   return Object.fromEntries(actions.map((item) => [item.action, item]))
 })
 
+const selectedSpeedMode = computed(() => SPEED_MODES.find((item) => item.id === speedMode.value) || SPEED_MODES[2])
+const speedModeLabel = computed(() => selectedSpeedMode.value.label)
+const speedScale = computed(() => selectedSpeedMode.value.scale)
+
 function roundSpeed(value) {
   return Number((value * speedScale.value).toFixed(3))
+}
+
+async function setSpeedMode(mode) {
+  const selected = SPEED_MODES.find((item) => item.id === mode)
+  if (!selected || !selectedRobot.value?.id || commandSending.value) return
+  commandSending.value = true
+  try {
+    const command = await dispatchRobotAction(selected.action, {}, 'remote_control_speed_mode')
+    await waitForRobotCommand(command, `${selected.label}档`)
+    speedMode.value = selected.id
+    showToast(`${selected.label}档已确认`)
+  } catch (error) {
+    commandFeedback.value = error.message || `${selected.label}档切换失败`
+    showToast(commandFeedback.value)
+  } finally {
+    commandSending.value = false
+  }
+}
+
+const expectedSpeedText = computed(() => {
+  return `前后 ${roundSpeed(0.60).toFixed(1)} m/s，横移 ${roundSpeed(0.45).toFixed(1)} m/s，转向 ${roundSpeed(1.05).toFixed(1)} rad/s`
+})
+const taskId = computed(() => status.value?.task_execution_id || liveStatus.value?.task_execution_id || '')
+const localizationSourceLabels = {
+  ndt_imu: 'NDT + IMU',
+  rtk_imu: 'RTK + IMU',
+  imu_odom_bridge: 'IMU + 里程计兜底',
+  unavailable: '定位不可用',
+}
+const localizationModeLabel = computed(() => {
+  const mode = String(localizationDecision.value?.preferred_source || '').toLowerCase()
+  return mode === 'rtk' ? 'RTK优先' : mode === 'ndt' ? 'NDT优先' : '未收到任务策略'
+})
+const activeLocalizationLabel = computed(() => (
+  localizationSourceLabels[localizationDecision.value?.active_source] || '未确定'
+))
+const rtkQualityLabel = computed(() => localizationDecision.value?.rtk_quality || '未知')
+
+function formatNumber(value, digits = 2, suffix = '') {
+  if (value === undefined || value === null || value === '' || Number.isNaN(Number(value))) return '--'
+  return `${Number(value).toFixed(digits)}${suffix}`
 }
 
 function statusText(value) {
@@ -128,38 +189,22 @@ async function dispatchRobotAction(action, payload = {}, source = 'remote_contro
   })
 }
 
-async function enterTakeover() {
-  if (!selectedRobot.value?.id || commandSending.value) return
-  commandSending.value = true
-  try {
-    const command = await dispatchRobotAction('takeover_enter', { note: 'Enter platform remote control page.' }, 'remote_control_enter')
-    takeoverActive.value = true
-    takeoverHoldUntil = Date.now() + 8000
-    commandFeedback.value = `接管指令已下发 · ${command?.status || 'created'}`
-    showToast('接管指令已下发')
-  } catch (error) {
-    showToast(error.message || '接管失败')
-  } finally {
-    commandSending.value = false
+async function waitForRobotCommand(command, label, timeoutMs = 12000) {
+  const robotId = selectedRobot.value?.id
+  if (!robotId || !command?.id) return command
+  const terminalStates = new Set(['succeeded', 'failed', 'rejected', 'cancelled', 'timed_out', 'expired'])
+  let result = command
+  const deadline = Date.now() + timeoutMs
+  while (!terminalStates.has(result?.status) && Date.now() < deadline) {
+    commandFeedback.value = `${label} · ${result?.status || '下发中'}`
+    await new Promise((resolve) => window.setTimeout(resolve, 300))
+    result = await fetchRobotCommand(robotId, command.id)
   }
-}
-
-async function exitTakeover() {
-  if (!selectedRobot.value?.id || commandSending.value) return
-  commandSending.value = true
-  try {
-    await stopFollowing('已释放接管')
-    await stopHoldAction()
-    const command = await dispatchRobotAction('takeover_exit', { passive: true, note: 'Exit platform remote control page.' }, 'remote_control_exit')
-    takeoverActive.value = false
-    takeoverHoldUntil = 0
-    commandFeedback.value = `释放指令已下发 · ${command?.status || 'created'}`
-    showToast('释放指令已下发')
-  } catch (error) {
-    showToast(error.message || '释放接管失败')
-  } finally {
-    commandSending.value = false
+  if (result?.status !== 'succeeded') {
+    throw new Error(result?.error_message || result?.ack_reason_message || `${label}未获设备确认`)
   }
+  commandFeedback.value = `${label} · 设备已确认`
+  return result
 }
 
 async function sendStop(source = 'remote_control_stop') {
@@ -177,6 +222,23 @@ async function refreshPersonDetections() {
     personDetectionState.value = await fetchRobotPersonDetections(selectedRobot.value.id)
   } catch {
     personDetectionState.value = { detections: [] }
+  }
+}
+
+async function togglePersonDetection() {
+  if (!selectedRobot.value?.id || personDetectionChanging.value || followActive.value) return
+  personDetectionChanging.value = true
+  const enabled = !personDetectionEnabled.value
+  try {
+    await setRobotPersonDetection(selectedRobot.value.id, enabled)
+    selectedPersonTrackId.value = ''
+    personDetectionState.value = { ...personDetectionState.value, enabled, detections: [] }
+    followStatus.value = enabled ? '人员模型启动中，请选择识别框' : '人员识别已关闭'
+    showToast(enabled ? '人员跟踪识别已开启' : '人员跟踪识别已关闭')
+  } catch (error) {
+    showToast(error.message || '人员识别状态切换失败')
+  } finally {
+    personDetectionChanging.value = false
   }
 }
 
@@ -236,15 +298,20 @@ async function followControlTick() {
   }
 }
 
+async function toggleFollowing() {
+  if (followActive.value) {
+    await stopFollowing('跟随已停止')
+    return
+  }
+  await startFollowing()
+}
+
 async function startFollowing() {
   if (!selectedPersonTrackId.value || followActive.value || commandSending.value) return
   commandSending.value = true
   try {
-    if (!takeoverActive.value) {
-      await dispatchRobotAction('takeover_enter', { note: 'Enter person follow mode.' }, 'person_follow_enter')
-      takeoverActive.value = true
-      takeoverHoldUntil = Date.now() + 8000
-    }
+    const command = await dispatchRobotAction('stand_up', {}, 'person_follow_enter')
+    await waitForRobotCommand(command, '起立')
     followActive.value = true
     targetLostSince = 0
     followStatus.value = '跟随已启动'
@@ -274,10 +341,24 @@ async function sendDiscreteAction(action, label) {
   commandSending.value = true
   try {
     const command = await dispatchRobotAction(action, {}, 'remote_control_action')
-    commandFeedback.value = `${label}指令已下发 · ${command?.status || 'created'}`
-    if (action === 'stand_up') { takeoverActive.value = true; takeoverHoldUntil = Date.now() + 8000 }
-    if (action === 'lie_down') { takeoverActive.value = false; takeoverHoldUntil = 0 }
-    showToast(`${label}指令已下发`)
+    await waitForRobotCommand(command, label)
+    showToast(`${label}已确认`)
+  } catch (error) {
+    commandFeedback.value = error.message || `${label}失败`
+    showToast(commandFeedback.value)
+  } finally {
+    commandSending.value = false
+  }
+}
+
+async function setMotionControl(action, label) {
+  if (!selectedRobot.value?.id || commandSending.value) return
+  commandSending.value = true
+  try {
+    const command = await dispatchRobotAction(action, {}, 'remote_motion_runtime')
+    await waitForRobotCommand(command, label, 30000)
+    await refreshStatus()
+    showToast(`${label}已确认`)
   } catch (error) {
     commandFeedback.value = error.message || `${label}失败`
     showToast(commandFeedback.value)
@@ -290,12 +371,14 @@ async function emergencyStop() {
   if (!selectedRobot.value?.id || commandSending.value) return
   commandSending.value = true
   try {
-    await stopFollowing('软急停已触发')
+    await stopFollowing('阻尼已触发')
     await stopHoldAction()
-    await dispatchRobotAction('passive', { note: 'Remote page emergency stop.' }, 'remote_control_emergency_stop')
-    showToast('已下发软急停')
+    const command = await dispatchRobotAction('passive', { note: 'Enter damping/passive mode.' }, 'remote_control_damping')
+    await waitForRobotCommand(command, '阻尼')
+    showToast('设备已进入阻尼')
   } catch (error) {
-    showToast(error.message || '急停失败')
+    commandFeedback.value = error.message || '阻尼失败'
+    showToast(commandFeedback.value)
   } finally {
     commandSending.value = false
   }
@@ -355,10 +438,8 @@ async function chooseRobot(robotId) {
   try {
     await stopHoldAction()
     await stopFollowing('已切换设备')
-    if (takeoverActive.value) {
-      await dispatchRobotAction('takeover_exit', { passive: true }, 'remote_control_switch_robot')
-      takeoverActive.value = false
-      takeoverHoldUntil = 0
+    if (personDetectionEnabled.value && selectedRobot.value?.id) {
+      await setRobotPersonDetection(selectedRobot.value.id, false).catch(() => {})
     }
     selectedRobot.value = await fetchRobotDetail(robotId)
     streamUnavailable.value = false
@@ -376,14 +457,6 @@ async function refreshStatus() {
   if (!selectedRobot.value?.id) return
   try {
     liveStatus.value = await fetchRobotStatus(selectedRobot.value.id)
-    const mode = liveStatus.value?.status?.control_mode
-    if (mode === 'manual_takeover') {
-      takeoverActive.value = true
-      takeoverHoldUntil = 0
-    } else if ((mode === 'autonomous' || mode === 'emergency_stop') && Date.now() >= takeoverHoldUntil) {
-      // 宽限期内不回退：机器人延迟上报 control_mode 时，避免 teleop 方向键被中途禁用。
-      takeoverActive.value = false
-    }
   } catch {}
 }
 
@@ -516,10 +589,10 @@ onBeforeUnmount(async () => {
   window.clearInterval(statusTimer)
   window.clearInterval(personDetectionTimer)
   await stopFollowing('页面关闭，跟随已停止')
-  if (takeoverActive.value) {
-    await stopHoldAction()
-    await dispatchRobotAction('takeover_exit', { passive: true }, 'remote_control_unmount').catch(() => {})
+  if (personDetectionEnabled.value && selectedRobot.value?.id) {
+    await setRobotPersonDetection(selectedRobot.value.id, false).catch(() => {})
   }
+  await stopHoldAction()
   destroyVideoPlayers()
 })
 
@@ -538,8 +611,8 @@ watch(livePlayUrls, () => {
             <h3>远程视频操控</h3>
             <p>按住方向键持续移动，松开立即停止；键盘支持 W/A/S/D 和 Q/E。</p>
           </div>
-          <span :class="['remote-state', takeoverActive ? 'ok' : 'idle']">
-            {{ takeoverActive ? '接管中' : '未接管' }}
+          <span class="remote-state ok">
+            遥控协议在线
           </span>
         </div>
 
@@ -576,13 +649,15 @@ watch(livePlayUrls, () => {
         <div class="person-follow-toolbar">
           <div>
             <strong>人员跟随</strong>
-            <span>{{ personDetectionState?.available ? `识别到 ${personDetections.length} 人` : '等待人形检测数据' }}</span>
+            <span>{{ personDetectionEnabled ? (personDetectionState?.available ? `识别到 ${personDetections.length} 人` : '人员模型启动中') : '人员模型未启用' }}</span>
             <small>{{ followStatus }}</small>
           </div>
-          <button class="follow-start-btn" type="button" :disabled="!selectedPerson || followActive || commandSending" @click="startFollowing">
-            {{ followActive ? '跟随中' : '开始跟随' }}
+          <button class="follow-start-btn" type="button" :disabled="personDetectionChanging || followActive" @click="togglePersonDetection">
+            {{ personDetectionEnabled ? '关闭识别' : '开启跟踪识别' }}
           </button>
-          <button class="danger-btn" type="button" :disabled="!followActive" @click="stopFollowing()">停止跟随</button>
+          <button class="follow-start-btn" type="button" :disabled="personDetectionChanging || commandSending || (!selectedPerson && !followActive)" @click="toggleFollowing">
+            {{ followActive ? '停止跟随' : '开始跟随' }}
+          </button>
         </div>
       </section>
 
@@ -610,7 +685,7 @@ watch(livePlayUrls, () => {
               v-for="item in turnActions"
               :key="item.action"
               type="button"
-              :class="['remote-turn-btn', { active: activeHoldAction === item.action }]"
+              :class="['remote-turn-btn', item.className, { active: activeHoldAction === item.action }]"
               :disabled="!canControl"
               @pointerdown.prevent="startHoldAction(item, $event)"
               @pointerup.prevent="stopHoldAction($event)"
@@ -619,38 +694,45 @@ watch(livePlayUrls, () => {
               @contextmenu.prevent
             >
               <span class="turn-glyph" aria-hidden="true"></span>
-              <span class="sr-only">{{ item.label }}</span>
+              <span class="turn-label">{{ item.label }}</span>
             </button>
           </div>
         </div>
 
         <div class="remote-controls">
-          <label>
-            <span>速度比例</span>
-            <strong>{{ Math.round(speedScale * 100) }}%</strong>
-            <input v-model.number="speedScale" type="range" min="0.3" max="1" step="0.1" :disabled="takeoverActive" />
-          </label>
+          <div class="speed-mode-control">
+            <span>速度档位</span>
+            <strong>{{ speedModeLabel }}</strong>
+            <div class="speed-mode-buttons" role="group" aria-label="速度档位">
+              <button
+                v-for="mode in SPEED_MODES"
+                :key="mode.id"
+                type="button"
+                :class="['speed-mode-button', { active: speedMode === mode.id }]"
+                :disabled="commandSending || !selectedRobot"
+                @click="setSpeedMode(mode.id)"
+              >
+                {{ mode.label }}
+              </button>
+            </div>
+            <small class="speed-estimate">预计速度：{{ expectedSpeedText }}</small>
+          </div>
           <div class="remote-actions">
-            <button class="takeover-btn" type="button" :disabled="commandSending || !selectedRobot" @click="enterTakeover">
-              {{ commandSending && !takeoverActive ? '接管中...' : '接管' }}
-            </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !takeoverActive" @click="exitTakeover">释放</button>
-            <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="emergencyStop">软急停</button>
+            <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="emergencyStop">阻尼</button>
+          </div>
+          <div class="remote-actions">
+            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="setMotionControl('motion_start', '启动运控')">启动运控</button>
+            <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="setMotionControl('motion_stop', '停止运控')">停止运控</button>
+            <span class="remote-feedback">{{ motionControlState }}</span>
           </div>
           <div class="remote-actions">
             <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('stand_up', '起立')">
               起立
             </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('lie_down', '趴下')">
-              趴下
-            </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="refreshStatus">
-              刷新状态
+            <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('lie_down', '匍匐')">
+              匍匐
             </button>
           </div>
-          <button class="remote-stop" type="button" :disabled="!selectedRobot" @click="sendStop()">
-            停止移动
-          </button>
           <small v-if="commandFeedback" class="remote-feedback">{{ commandFeedback }}</small>
         </div>
       </section>
@@ -661,7 +743,7 @@ watch(livePlayUrls, () => {
         <div class="panel-head">
           <div>
             <h3>设备选择</h3>
-            <p>{{ switchingRobot ? '正在切换设备...' : '切换设备前会释放当前接管' }}</p>
+            <p>{{ switchingRobot ? '正在切换设备...' : '切换后可直接发送遥控器指令' }}</p>
           </div>
         </div>
         <div class="robot-list compact">
@@ -708,6 +790,18 @@ watch(livePlayUrls, () => {
             <strong>{{ liveStatus?.nav_ready || status.nav_ready ? 'ready' : 'not ready' }}</strong>
           </div>
           <div>
+            <span>当前任务</span>
+            <strong :title="taskId || '无执行中任务'">{{ taskId ? `${taskId.slice(0, 8)}…` : '无执行中任务' }}</strong>
+          </div>
+          <div>
+            <span>任务定位策略</span>
+            <strong>{{ localizationModeLabel }}</strong>
+          </div>
+          <div>
+            <span>当前定位源</span>
+            <strong>{{ activeLocalizationLabel }}</strong>
+          </div>
+          <div>
             <span>控制</span>
             <strong>{{ statusText(status.control_mode || selectedRobot?.control_mode) }}</strong>
           </div>
@@ -722,6 +816,22 @@ watch(livePlayUrls, () => {
           <div>
             <span>内点率</span>
             <strong>{{ qualityValue('inlier_fraction') }}</strong>
+          </div>
+          <div>
+            <span>RTK质量 / XY</span>
+            <strong>{{ rtkQualityLabel }} · {{ formatNumber(localizationDecision.rtk_x) }}, {{ formatNumber(localizationDecision.rtk_y) }}</strong>
+          </div>
+          <div>
+            <span>RTK航向 / 稳定</span>
+            <strong>{{ formatNumber(localizationDecision.rtk_yaw, 3, ' rad') }} · {{ localizationDecision.absolute_stable ? '已稳定' : '未稳定' }}</strong>
+          </div>
+          <div>
+            <span>前方障碍</span>
+            <strong>{{ formatNumber(navigationStatus.front_obstacle_distance_m, 2, ' m') }}</strong>
+          </div>
+          <div>
+            <span>兜底状态</span>
+            <strong>{{ localizationDecision.bridge_rejection_reason || (localizationDecision.active_source === 'imu_odom_bridge' ? `${formatNumber(localizationDecision.bridge_distance_m)} m` : '未启用') }}</strong>
           </div>
           <div>
             <span>速度</span>
@@ -1017,8 +1127,10 @@ watch(livePlayUrls, () => {
   min-height: 54px;
   border-radius: 999px;
   padding: 0 16px;
-  display: grid;
+  display: inline-flex;
   place-items: center;
+  justify-content: center;
+  gap: 10px;
 }
 
 .turn-glyph {
@@ -1049,6 +1161,20 @@ watch(livePlayUrls, () => {
   transform: scaleX(-1);
 }
 
+.remote-turn-btn.left {
+  color: #46d7ff;
+}
+
+.remote-turn-btn.right {
+  color: #ffcc36;
+}
+
+.turn-label {
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -1066,7 +1192,7 @@ watch(livePlayUrls, () => {
   gap: 16px;
 }
 
-.remote-controls label {
+.speed-mode-control {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 8px 12px;
@@ -1074,13 +1200,41 @@ watch(livePlayUrls, () => {
   font-size: 13px;
 }
 
-.remote-controls label strong {
+.speed-mode-control strong {
   color: var(--text);
 }
 
-.remote-controls input {
+.speed-estimate {
   grid-column: 1 / -1;
-  width: 100%;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.speed-mode-buttons {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.speed-mode-button {
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+}
+
+.speed-mode-button.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: var(--text);
+}
+
+.speed-mode-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .remote-actions {

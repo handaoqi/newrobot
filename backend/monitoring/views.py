@@ -875,6 +875,10 @@ class RobotCommandView(APIView):
         "takeover_exit": "teleop.takeover_exit",
         "stand_up": "teleop.stand_up",
         "lie_down": "teleop.lie_down",
+        "speed_micro": "teleop.speed_micro",
+        "speed_slow": "teleop.speed_slow",
+        "speed_normal": "teleop.speed_normal",
+        "speed_fast": "teleop.speed_fast",
         "move_forward": "teleop.move_forward",
         "move_backward": "teleop.move_backward",
         "move_left": "teleop.move_left",
@@ -884,8 +888,13 @@ class RobotCommandView(APIView):
         "move_velocity": "teleop.move_velocity",
         "move_stop": "teleop.move_stop",
         "passive": "teleop.passive",
+        "skill": "teleop.skill",
+        "skill_status": "teleop.skill_status",
+        "skill_cancel": "teleop.skill_cancel",
         "charge_start": "charge.start",
         "charge_stop": "charge.stop",
+        "motion_start": "motion.start",
+        "motion_stop": "motion.stop",
         "audio_volume": "audio.volume",
     }
 
@@ -915,7 +924,7 @@ class RobotCommandView(APIView):
                 command_type=command_type,
                 payload=payload,
                 operator=request.user if request.user.is_authenticated else None,
-                expiry_seconds=30 if action in {"charge_start", "charge_stop"} else 10,
+                expiry_seconds=180 if action == "skill" else (30 if action in {"charge_start", "charge_stop", "motion_start", "motion_stop"} else 10),
             )
             return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
@@ -936,6 +945,148 @@ class RobotCommandView(APIView):
         command.save(update_fields=["sent_at", "response_payload", "error_message", "status", "updated_at"])
         response_status = status.HTTP_201_CREATED if command.status == "sent" else status.HTTP_502_BAD_GATEWAY
         return Response(RobotCommandSerializer(command).data, status=response_status)
+
+
+class RobotMcpTeleopView(APIView):
+    """Authenticated HTTP API backing the public RoamerX MCP tools."""
+
+    DIRECTION_ACTIONS = {
+        "forward": "move_forward",
+        "backward": "move_backward",
+        "left": "move_left",
+        "right": "move_right",
+        "turn_left": "turn_left",
+        "turn_right": "turn_right",
+        "stop": "move_stop",
+        "velocity": "move_velocity",
+    }
+    SPEED_ACTIONS = {
+        "micro": "speed_micro",
+        "low": "speed_slow",
+        "medium": "speed_normal",
+        "high": "speed_fast",
+    }
+    ACTIONS = {
+        "stand_up": "stand_up",
+        "prone": "lie_down",
+        "passive": "passive",
+        "motion_start": "motion_start",
+        "motion_stop": "motion_stop",
+    }
+
+    def post(self, request, robot_id, category):
+        ensure_demo_seed()
+        robot = get_object_or_404(Robot, id=robot_id)
+        data = request.data if isinstance(request.data, dict) else {}
+        if category == "skill-status":
+            command_id = data.get("command_id")
+            command = get_object_or_404(RemoteCommand, id=command_id, robot=robot, command_type="teleop.skill")
+            return Response(RemoteCommandSerializer(command).data)
+        if robot.effective_connection_status() != "online":
+            return Response({"detail": "机器狗 Edge Agent 当前离线，无法远程控制。"}, status=status.HTTP_409_CONFLICT)
+        action, command = self._resolve_action(category, data)
+        if not action:
+            return Response({"detail": "不支持的 MCP 工具参数"}, status=status.HTTP_400_BAD_REQUEST)
+        command_type = RobotCommandView.ACTION_TO_COMMAND_TYPE[action]
+        remote = CommandService.create_robot_command(
+            robot=robot,
+            command_type=command_type,
+            payload={"source": "mcp", **command},
+            operator=request.user,
+            expiry_seconds=180 if action == "skill" else 30,
+        )
+        return Response(RemoteCommandSerializer(remote).data, status=status.HTTP_202_ACCEPTED)
+
+    def _resolve_action(self, category, data):
+        if category == "direction":
+            action = self.DIRECTION_ACTIONS.get(str(data.get("direction") or ""))
+            return action, dict(data.get("command") or {})
+        if category == "speed":
+            return self.SPEED_ACTIONS.get(str(data.get("level") or "")), {}
+        if category == "action":
+            return self.ACTIONS.get(str(data.get("action") or "")), {}
+        if category == "skill":
+            command = {key: data[key] for key in ("preset", "steps", "description") if key in data}
+            return "skill", command
+        if category == "skill-cancel":
+            return "skill_cancel", {
+                "command_id": data.get("command_id"),
+            }
+        return None, {}
+
+
+class RobotChargingDockView(APIView):
+    """Persist a robot's dock route and dispatch the two-stage docking task."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        map_id = request.data.get("map_id") or robot.charging_map_id
+        route_id = request.data.get("route_id") or robot.charging_route_id
+        if not map_id or not route_id:
+            return Response({"detail": "请先选择充电地图和两点回充路线"}, status=status.HTTP_400_BAD_REQUEST)
+        map_data = get_object_or_404(MapData, pk=map_id)
+        route = get_object_or_404(PatrolRoute, pk=route_id, robot=robot, map_data=map_data)
+        if len(route.waypoints or []) != 2:
+            return Response({"detail": "回充路线必须固定为两个点"}, status=status.HTTP_400_BAD_REQUEST)
+        if robot.effective_connection_status() != "online":
+            return Response({"detail": "机器狗 Edge Agent 当前离线"}, status=status.HTTP_409_CONFLICT)
+        if robot.localization_status != "normal" or not robot.nav_ready:
+            return Response({"detail": "定位或导航栈未就绪，不能开始回充"}, status=status.HTTP_409_CONFLICT)
+
+        with transaction.atomic():
+            robot = Robot.objects.select_for_update().get(pk=robot.pk)
+            robot.charging_map = map_data
+            robot.charging_route = route
+            robot.save(update_fields=["charging_map", "charging_route", "updated_at"])
+            now = timezone.now()
+            task_name = f"一键回充 - {route.name}"
+            task, _ = PatrolTask.objects.get_or_create(
+                robot=robot,
+                route=route,
+                name=task_name,
+                defaults={
+                    "route_name": route.name,
+                    "scheduled_start": now,
+                    "scheduled_end": now + timedelta(hours=8),
+                    "enabled": True,
+                    "description": "机器人管理页面一键回充专用两点路线",
+                    "created_by": request.user if request.user.is_authenticated else None,
+                },
+            )
+            task.route_name = route.name
+            task.scheduled_start = now
+            task.scheduled_end = now + timedelta(hours=8)
+            task.enabled = True
+            task.save(update_fields=["route_name", "scheduled_start", "scheduled_end", "enabled", "updated_at"])
+            try:
+                execution = TaskExecutionService.create_execution(
+                    task, request.user if request.user.is_authenticated else None
+                )
+                command = CommandService.create(
+                    execution,
+                    "task.start",
+                    request.user if request.user.is_authenticated else None,
+                    command_options={
+                        "docking": {
+                            "enabled": True,
+                            "final_waypoint_index": 1,
+                            "charge_retries": 3,
+                            "undock_seconds": 3,
+                        }
+                    },
+                )
+            except TaskStateError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(
+            {
+                "charging_config": {"map_id": map_data.id, "map_name": map_data.name, "route_id": route.id, "route_name": route.name},
+                "execution": TaskExecutionSerializer(execution).data,
+                "command": RemoteCommandSerializer(command).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class RobotRemoteCommandDetailView(APIView):
@@ -1552,6 +1703,14 @@ class TelemetryIngestView(APIView):
 class DevicePersonDetectionView(APIView):
     permission_classes = [IsAuthenticatedOrDeviceCredential]
 
+    def get(self, request):
+        robot_code = str(request.query_params.get("robot_code") or "").strip()
+        robot = get_object_or_404(Robot, code=robot_code)
+        if hasattr(request, "device_robot") and request.device_robot.id != robot.id:
+            return Response({"detail": "设备凭证与 robot_code 不匹配"}, status=status.HTTP_403_FORBIDDEN)
+        state = RobotPersonDetectionState.objects.filter(robot=robot).first()
+        return Response({"robot_code": robot.code, "enabled": bool(state and state.enabled)})
+
     def post(self, request):
         serializer = PersonDetectionIngestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1570,7 +1729,7 @@ class DevicePersonDetectionView(APIView):
             },
         )
         return Response(
-            {"detail": "人形检测帧已更新", "count": len(state.detections)},
+            {"detail": "实时检测帧已更新", "count": len(state.detections)},
             status=status.HTTP_200_OK,
         )
 
@@ -1586,6 +1745,7 @@ class RobotPersonDetectionView(APIView):
                     "camera_id": robot.camera_id,
                     "available": False,
                     "stale": True,
+                    "enabled": False,
                     "detections": [],
                 }
             )
@@ -1596,12 +1756,26 @@ class RobotPersonDetectionView(APIView):
                 "camera_id": state.camera_id,
                 "available": not stale,
                 "stale": stale,
+                "enabled": state.enabled,
                 "frame_width": state.frame_width,
                 "frame_height": state.frame_height,
                 "captured_at": state.captured_at,
                 "detections": [] if stale else state.detections,
             }
         )
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        enabled = request.data.get("enabled")
+        if not isinstance(enabled, bool):
+            return Response({"detail": "enabled 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        state, _ = RobotPersonDetectionState.objects.get_or_create(robot=robot)
+        state.enabled = enabled
+        if not enabled:
+            state.detections = []
+            state.captured_at = timezone.now()
+        state.save(update_fields=["enabled", "detections", "captured_at", "updated_at"])
+        return Response({"robot_id": robot.id, "enabled": state.enabled})
 
 
 class MediaUploadView(APIView):
