@@ -107,9 +107,14 @@ class VoiceCommandListener:
                 LOGGER.warning("NX local ASR failed; using cloud ASR fallback: %s", exc)
             else:
                 if not transcript:
-                    LOGGER.info("discarded non-speech voice segment after NX local ASR")
+                    payload["transcript"] = ""
+                    payload["asr_engine"] = "nx-sensevoice"
+                    payload["asr_status"] = "no_speech"
+                    self.publish(payload)
+                    LOGGER.info("published no-speech result after NX local ASR id=%s", payload["voice_id"])
                     return
                 payload["transcript"] = transcript
                 payload["asr_engine"] = "nx-sensevoice"
+                LOGGER.info("NX local ASR transcript id=%s text=%r", payload["voice_id"], transcript[:500])
         self.publish(payload)
         LOGGER.info("published voice segment id=%s duration=%.2fs", payload["voice_id"], len(pcm) / 32000)

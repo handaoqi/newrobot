@@ -156,7 +156,13 @@ class DevAgentApplication:
             return
         if message.topic.endswith("/voice/ack"):
             try:
-                self.voice.suppress(3.0)
+                announcement_kind = str(payload.get("kind") or "")
+                try:
+                    suppress_seconds = float(payload.get("suppress_seconds", 3.0))
+                except (TypeError, ValueError):
+                    suppress_seconds = 3.0
+                maximum_suppression = 600.0 if announcement_kind == "task_summary" else 60.0
+                self.voice.suppress(min(maximum_suppression, max(0.0, suppress_seconds)))
                 self.voice_ack.play(str(payload.get("audio_url") or ""))
             except Exception:
                 LOGGER.exception("voice acknowledgement playback could not start")

@@ -3,6 +3,7 @@ import pytest
 
 from roamerx_dev_agent.config import VoiceConfig
 from roamerx_dev_agent.local_asr_client import LocalASRClient, LocalASRError
+from roamerx_dev_agent.voice_ack_player import VoiceAckPlayer
 from roamerx_dev_agent.voice_listener import VoiceCommandListener
 
 
@@ -66,11 +67,25 @@ def test_listener_marks_successful_local_transcript():
     assert published[0]["transcript"] == "小太阳检查导航"
 
 
-def test_listener_discards_empty_local_asr_result():
+def test_listener_publishes_empty_local_asr_result_for_the_web_history():
     published = []
     listener = VoiceCommandListener(VoiceConfig(), published.append)
     listener._local_asr = type("LocalASR", (), {"transcribe": lambda _self, _pcm: ""})()
 
     listener._publish(b"\x00\x00" * 160)
 
-    assert published == []
+    assert published[0]["asr_engine"] == "nx-sensevoice"
+    assert published[0]["transcript"] == ""
+    assert published[0]["asr_status"] == "no_speech"
+
+
+def test_local_alsa_ack_plays_on_nx_usb_audio_device():
+    command, options = VoiceAckPlayer(VoiceConfig(capture_mode="local_alsa", alsa_device="hw:0,0"))._command(
+        "http://example.test/ack.mp3"
+    )
+
+    assert command == [
+        "/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "warning", "http://example.test/ack.mp3"
+    ]
+    assert options["env"]["SDL_AUDIODRIVER"] == "alsa"
+    assert options["env"]["AUDIODEV"] == "plughw:0,0"
