@@ -12,7 +12,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot
+from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot, VoiceRecognitionEvent
 
 
 ALLOWED_WORKSPACES = {"robot-main", "cloud-platform"}
@@ -59,6 +59,20 @@ def serialize_task(task: DevelopmentTask, *, include_events: bool = False) -> di
     if include_events:
         data["events"] = [serialize_event(event) for event in task.events.order_by("sequence")[:2000]]
     return data
+
+
+def serialize_voice_recognition(event: VoiceRecognitionEvent) -> dict:
+    return {
+        "id": event.id,
+        "robot": event.robot_id,
+        "transcript": event.transcript,
+        "command": event.command,
+        "asr_engine": event.asr_engine,
+        "outcome": event.outcome,
+        "outcome_label": event.get_outcome_display(),
+        "task_id": str(event.task_id) if event.task_id else "",
+        "created_at": event.created_at,
+    }
 
 
 class DevelopmentTaskListCreateView(APIView):
@@ -209,6 +223,19 @@ class DevelopmentAgentListView(APIView):
                 "last_seen_at": item.last_seen_at,
             })
         return Response(result)
+
+
+class VoiceRecognitionListView(APIView):
+    def get(self, request):
+        robot_id = request.query_params.get("robot")
+        if not robot_id:
+            return Response({"detail": "请选择机器狗"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            limit = max(1, min(200, int(request.query_params.get("limit") or 80)))
+        except ValueError:
+            limit = 80
+        events = VoiceRecognitionEvent.objects.filter(robot_id=robot_id).select_related("task")[:limit]
+        return Response([serialize_voice_recognition(event) for event in events])
 
 
 def development_task_stream(request, task_id):

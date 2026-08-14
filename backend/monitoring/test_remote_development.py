@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .dev_message_handlers import handle_dev_mqtt_message
-from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot
+from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot, VoiceRecognitionEvent
 
 
 class RemoteDevelopmentApiTests(TestCase):
@@ -98,6 +98,22 @@ class RemoteDevelopmentApiTests(TestCase):
         ])
         self.assertEqual(response.data["turns"][0]["events"][0]["text"], "第一条输出")
 
+    def test_voice_recognition_history_returns_text_without_audio(self):
+        event = VoiceRecognitionEvent.objects.create(
+            robot=self.robot,
+            transcript="小菜阳检查导航服务",
+            command="检查导航服务",
+            asr_engine="nx-sensevoice",
+            outcome="ignored",
+        )
+
+        response = self.client.get(f"/api/development/voice-recognitions/?robot={self.robot.id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]["id"], event.id)
+        self.assertEqual(response.data[0]["transcript"], "小菜阳检查导航服务")
+        self.assertNotIn("audio", response.data[0])
+
 
 class RemoteDevelopmentMqttTests(TestCase):
     def setUp(self):
@@ -151,6 +167,55 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.assertEqual(self.task.codex_thread_id, "thread-123")
         self.assertEqual(self.task.events.count(), 2)
 
+    def test_terminal_result_broadcasts_compact_codex_summary_once(self):
+        self.task.status = "running"
+        self.task.save(update_fields=["status", "updated_at"])
+        agent_message = {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "已完成语音链路修复，服务运行正常。"},
+        }
+        handle_dev_mqtt_message(
+            self.topic(f"tasks/{self.task.id}/events"),
+            {
+                "task_id": str(self.task.id),
+                "sequence": 1,
+                "type": "output",
+                "stream": "stdout",
+                "text": json.dumps(agent_message, ensure_ascii=False),
+                "timestamp": timezone.now().isoformat(),
+            },
+        )
+        published = []
+        with patch(
+            "monitoring.dev_message_handlers.transaction.on_commit",
+            side_effect=lambda callback: callback(),
+        ), patch(
+            "monitoring.dev_message_handlers.tts_service.synthesize_speech",
+            return_value=("tts-audio/summary.mp3", False),
+        ) as synthesize:
+            result = handle_dev_mqtt_message(
+                self.topic(f"tasks/{self.task.id}/result"),
+                {
+                    "task_id": str(self.task.id),
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "timestamp": timezone.now().isoformat(),
+                },
+                publish=lambda *args: published.append(args),
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        synthesize.assert_called_once_with("Codex任务已完成。以下是本次执行结果。已完成语音链路修复，服务运行正常。")
+        self.assertEqual(published[0][0], self.topic("voice/ack"))
+        self.assertEqual(published[0][1]["kind"], "task_summary")
+        self.assertGreaterEqual(published[0][1]["suppress_seconds"], 6)
+
+        duplicate = handle_dev_mqtt_message(
+            self.topic(f"tasks/{self.task.id}/result"),
+            {"task_id": str(self.task.id), "status": "succeeded"},
+        )
+        self.assertTrue(duplicate["duplicate"])
+
     def test_nx_local_asr_transcript_creates_task_without_cloud_transcription(self):
         self.task.status = "succeeded"
         self.task.save(update_fields=["status", "updated_at"])
@@ -168,6 +233,53 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.assertFalse(cloud_asr.called)
         created = DevelopmentTask.objects.exclude(pk=self.task.pk).get()
         self.assertEqual(created.prompt, "检查导航服务")
+        recognition = VoiceRecognitionEvent.objects.get(robot=self.robot)
+        self.assertEqual(recognition.outcome, "accepted")
+        self.assertEqual(recognition.transcript, "小太阳，检查导航服务")
+        self.assertEqual(recognition.task, created)
+
+    def test_empty_nx_transcript_is_recorded_as_no_speech(self):
+        result = handle_dev_mqtt_message(
+            self.topic("voice/audio"),
+            {"asr_engine": "nx-sensevoice", "transcript": ""},
+        )
+
+        self.assertEqual(result["status"], "no_speech")
+        recognition = VoiceRecognitionEvent.objects.get(robot=self.robot)
+        self.assertEqual(recognition.outcome, "no_speech")
+        self.assertEqual(recognition.transcript, "")
+
+    def test_observed_nx_wake_word_substitutions_create_task(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+
+        for wake_word in ("小菜阳", "要太阳", "老太阳"):
+            with self.subTest(wake_word=wake_word):
+                result = handle_dev_mqtt_message(
+                    self.topic("voice/audio"),
+                    {
+                        "asr_engine": "nx-sensevoice",
+                        "transcript": f"{wake_word}，创建测试任务",
+                    },
+                )
+                self.assertEqual(result["status"], "accepted")
+                created = DevelopmentTask.objects.get(pk=result["task_id"])
+                self.assertEqual(created.prompt, "创建测试任务")
+                created.status = "succeeded"
+                created.save(update_fields=["status", "updated_at"])
+
+    def test_fuzzy_wake_word_rejects_unrelated_pinyin_finals(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+
+        for transcript in ("有太阳创建测试任务", "呃太阳创建测试任务"):
+            with self.subTest(transcript=transcript):
+                result = handle_dev_mqtt_message(
+                    self.topic("voice/audio"),
+                    {"asr_engine": "nx-sensevoice", "transcript": transcript},
+                )
+                self.assertEqual(result["status"], "ignored")
+        self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
 
     def test_short_alias_and_non_prefix_wake_phrase_do_not_create_task(self):
         self.task.status = "succeeded"

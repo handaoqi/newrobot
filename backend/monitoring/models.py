@@ -1168,3 +1168,34 @@ class DevelopmentTaskEvent(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["task", "sequence"], name="uniq_dev_task_event_sequence")
         ]
+
+
+class VoiceRecognitionEvent(BaseTimestampModel):
+    """Text-only audit trail for each development voice-recognition attempt."""
+
+    OUTCOME_CHOICES = [
+        ("accepted", "已创建开发任务"),
+        ("armed", "已唤醒，等待指令"),
+        ("busy", "已有开发任务执行中"),
+        ("ignored", "未命中唤醒词"),
+        ("no_speech", "未识别到有效语音"),
+    ]
+
+    robot = models.ForeignKey(Robot, related_name="voice_recognition_events", on_delete=models.CASCADE)
+    task = models.ForeignKey(
+        DevelopmentTask,
+        related_name="voice_recognition_events",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    transcript = models.TextField(blank=True)
+    command = models.TextField(blank=True)
+    asr_engine = models.CharField(max_length=64, blank=True)
+    outcome = models.CharField(max_length=16, choices=OUTCOME_CHOICES)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["robot", "-created_at"], name="voice_rec_robot_time_idx"),
+        ]

@@ -535,6 +535,10 @@ export async function fetchDevelopmentAgents() {
   return request('/development/agents/')
 }
 
+export async function fetchVoiceRecognitions(robotId, limit = 80) {
+  return request(`/development/voice-recognitions/?robot=${encodeURIComponent(robotId)}&limit=${limit}`)
+}
+
 export async function fetchDevelopmentTasks(robotId = '') {
   const query = robotId ? `?robot=${encodeURIComponent(robotId)}` : ''
   return request(`/development/tasks/${query}`)

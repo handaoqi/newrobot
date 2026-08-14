@@ -8,12 +8,14 @@ import {
   fetchDevelopmentAgents,
   fetchDevelopmentConversation,
   fetchDevelopmentTasks,
+  fetchVoiceRecognitions,
   fetchRobots,
 } from '../services/api'
 
 const robots = ref([])
 const agents = ref([])
 const tasks = ref([])
+const voiceRecognitions = ref([])
 const selectedTask = ref(null)
 const turns = ref([])
 const conversationThreadId = ref('')
@@ -187,12 +189,20 @@ async function refreshAgents() {
   agents.value = await fetchDevelopmentAgents()
 }
 
+async function refreshVoiceRecognitions() {
+  if (!selectedRobotId.value) {
+    voiceRecognitions.value = []
+    return
+  }
+  voiceRecognitions.value = await fetchVoiceRecognitions(selectedRobotId.value)
+}
+
 async function chooseRobot() {
   closeStream()
   selectedTask.value = null
   turns.value = []
   conversationThreadId.value = ''
-  await refreshConversation()
+  await Promise.all([refreshConversation(), refreshVoiceRecognitions()])
   await scrollTerminal(true)
 }
 
@@ -251,6 +261,7 @@ onMounted(async () => {
     refreshTimer = window.setInterval(() => {
       refreshAgents().catch(() => {})
       refreshTasks().catch(() => {})
+      refreshVoiceRecognitions().catch(() => {})
     }, 5000)
   } catch (exc) {
     error.value = exc.message
@@ -310,6 +321,26 @@ onBeforeUnmount(() => {
           </article>
           <p v-if="!tasks.length" class="empty-copy">暂无远程开发任务</p>
         </div>
+        <section class="voice-history">
+          <div class="voice-history-head">
+            <div>
+              <h4>语音识别记录</h4>
+              <p>仅保存识别文本，不保存录音</p>
+            </div>
+            <small>最近 {{ voiceRecognitions.length }} 条</small>
+          </div>
+          <div class="voice-history-list">
+            <article v-for="item in voiceRecognitions" :key="item.id" class="voice-record">
+              <span class="voice-record-top">
+                <strong :class="item.outcome">{{ item.outcome_label }}</strong>
+                <small>{{ formatTime(item.created_at) }}</small>
+              </span>
+              <p>{{ item.transcript || '（未识别到有效语音）' }}</p>
+              <small>{{ item.asr_engine || '未知引擎' }}<template v-if="item.command"> · 指令：{{ item.command }}</template></small>
+            </article>
+            <p v-if="!voiceRecognitions.length" class="empty-copy">暂无语音识别记录</p>
+          </div>
+        </section>
       </aside>
 
       <main class="dev-main">
@@ -435,6 +466,19 @@ onBeforeUnmount(() => {
 .task-card small { color: var(--muted); }
 .task-prompt { overflow: hidden; color: var(--text); font-size: 13px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .empty-copy { color: var(--muted); text-align: center; }
+.voice-history { display: grid; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.voice-history-head, .voice-record-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.voice-history-head h4, .voice-history-head p { margin: 0; }
+.voice-history-head h4 { font-size: 14px; }
+.voice-history-head p, .voice-history-head > small, .voice-record small { color: var(--muted); font-size: 11px; }
+.voice-history-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; }
+.voice-record { display: grid; gap: 5px; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); }
+.voice-record p { margin: 0; overflow-wrap: anywhere; color: var(--text); font-size: 12px; line-height: 1.45; }
+.voice-record-top strong { font-size: 12px; }
+.voice-record-top strong.accepted { color: var(--green); }
+.voice-record-top strong.armed { color: var(--cyan); }
+.voice-record-top strong.busy { color: #ffc857; }
+.voice-record-top strong.ignored, .voice-record-top strong.no_speech { color: var(--muted); }
 .dev-main { display: grid; grid-template-rows: minmax(420px, 1fr) auto; gap: 18px; min-width: 0; }
 .composer { padding: 20px; }
 .composer-row { display: grid; grid-template-columns: minmax(145px, 210px) minmax(175px, 240px) minmax(160px, 230px) 1fr; gap: 16px; margin-bottom: 14px; }
