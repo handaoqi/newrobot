@@ -9,6 +9,7 @@ from .local_store import LocalStore
 from .protocol import MessageEnvelope, ProtocolError, build_ack, build_result, decode_message, now_iso
 from .safety_policy import SafetyPolicy
 from .task_executor import TaskExecutor
+from .teleop_skill_executor import TeleopSkillExecutor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class CommandProcessor:
         self.publish_ack = publish_ack
         self.publish_result = publish_result
         self._navigation_command_lock = threading.Lock()
+        self.skill_executor = TeleopSkillExecutor(localization_adapter) if localization_adapter else None
 
     def handle_command(self, raw) -> tuple[dict, dict | None]:
         envelope = decode_message(raw)
@@ -71,7 +73,11 @@ class CommandProcessor:
             self._validate_expected_state(envelope)
             prepared_task_start = envelope.message_type == "task.start"
             if prepared_task_start:
+                self._release_manual_control_for_task()
                 self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
+                docking = ((envelope.payload.get("command") or {}).get("docking") or {})
+                if docking.get("enabled"):
+                    self._prepare_docking_map(envelope.payload["command"])
                 # The acknowledgement must carry the same task version sequence
                 # as task.started/task.progress.  Previously it reused a
                 # completed task's stale version, causing progress events to be
@@ -129,6 +135,30 @@ class CommandProcessor:
             self.publish_result(command_id, result)
             return ack if "ack" in dir() else {}, result
 
+    def _release_manual_control_for_task(self) -> None:
+        """Give a navigation task exclusive ownership of the motion endpoint."""
+        if self.safety.state.control_mode != "manual_takeover":
+            return
+        if self.localization_adapter:
+            self.localization_adapter.teleop_velocity(0.0, 0.0, 0.0)
+        if self.teleop_control_adapter:
+            self.teleop_control_adapter.stop()
+        self.safety.state.control_mode = "autonomous"
+        LOGGER.info("task.start cleared manual remote control; Nav2 SDK bridge owns motion")
+
+    def _prepare_docking_map(self, command: dict) -> None:
+        if not self.map_activation_adapter or not self.navigation_stack_adapter:
+            raise ProtocolError("DOCKING_UNAVAILABLE", "map activation or navigation stack is unavailable")
+        map_payload = dict(command.get("map") or {})
+        map_payload.setdefault("map_name", map_payload.get("map_version", ""))
+        if not map_payload.get("map_id") or not map_payload.get("map_version"):
+            raise ProtocolError("DOCKING_MAP_INVALID", "docking task has no map identity")
+        if map_payload.get("local_map_dir"):
+            map_payload["local_map_dir"] = map_payload["local_map_dir"]
+        activated = self.map_activation_adapter.activate(map_payload)
+        self.navigation_stack_adapter.switch_map()
+        LOGGER.info("docking map activated: %s", activated.get("map_id"))
+
     def _validate_expected_state(self, envelope: MessageEnvelope) -> None:
         # Task controls express an operator's current intent.  They must remain
         # usable while the centre and the edge are briefly out of sync (for
@@ -157,6 +187,8 @@ class CommandProcessor:
             return self._execute_sensor(envelope, started_at)
         if envelope.message_type.startswith("charge."):
             return self._execute_charge(envelope, started_at)
+        if envelope.message_type.startswith("motion."):
+            return self._execute_motion_control(envelope, started_at)
         if envelope.message_type.startswith("audio."):
             return self._execute_audio(envelope, started_at)
         execution_id = envelope.payload["task_execution_id"]
@@ -261,21 +293,44 @@ class CommandProcessor:
         command = envelope.payload.get("command") or {}
         action = envelope.message_type.removeprefix("teleop.")
         if action == "takeover_enter":
-            result_payload = teleop_adapter.teleop_action("stand_up")
+            result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
+            )
             self.safety.state.control_mode = "manual_takeover"
         elif action == "takeover_exit":
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
-            result_payload = teleop_adapter.teleop_action("passive")
+            result_payload = teleop_adapter.release_to_remote_control()
+            if self.teleop_control_adapter:
+                result_payload["teleop_bridge_stop"] = self.teleop_control_adapter.stop()
             self.safety.state.control_mode = "autonomous"
         elif action == "stand_up":
-            result_payload = teleop_adapter.teleop_action("stand_up")
+            result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
+            )
             self.safety.state.control_mode = "manual_takeover"
         elif action == "lie_down":
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
-            result_payload = teleop_adapter.teleop_action("lie_down")
+            result_payload = teleop_adapter.remote_teleop_action("lie_down")
             self.safety.state.control_mode = "autonomous"
         elif action == "move_stop":
             result_payload = teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+        elif action == "skill":
+            if not self.skill_executor:
+                raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
+            run = self.skill_executor.start(
+                envelope.payload["command_id"],
+                command,
+                lambda outcome: self._complete_skill(envelope, started_at, outcome),
+            )
+            return None
+        elif action == "skill_status":
+            if not self.skill_executor:
+                raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
+            result_payload = self.skill_executor.status(str(command.get("command_id") or ""))
+        elif action == "skill_cancel":
+            if not self.skill_executor:
+                raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
+            result_payload = self.skill_executor.cancel(str(command.get("command_id") or ""))
         elif action == "move_forward":
             result_payload = teleop_adapter.teleop_velocity(vx=float(command.get("vx", 0.35)))
         elif action == "move_backward":
@@ -289,12 +344,21 @@ class CommandProcessor:
         elif action == "turn_right":
             result_payload = teleop_adapter.teleop_velocity(yaw_rate=float(command.get("yaw_rate", -0.45)))
         elif action == "move_velocity":
-            vx = max(-0.2, min(0.2, float(command.get("vx", 0.0))))
-            vy = max(-0.15, min(0.15, float(command.get("vy", 0.0))))
-            yaw_rate = max(-0.35, min(0.35, float(command.get("yaw_rate", 0.0))))
+            vx = max(-0.5, min(0.5, float(command.get("vx", 0.0))))
+            vy = max(-0.5, min(0.5, float(command.get("vy", 0.0))))
+            yaw_rate = max(-0.5, min(0.5, float(command.get("yaw_rate", 0.0))))
             result_payload = teleop_adapter.teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        elif action in {"speed_micro", "speed_slow", "speed_normal", "speed_fast"}:
+            result_payload = teleop_adapter.remote_teleop_action(action)
         elif action == "passive":
-            result_payload = teleop_adapter.teleop_action("passive")
+            result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                "passive", {"passive"}, {"passive_failed"}
+            )
+            # Damping is a terminal manual-control action. Keep no SDK bridge
+            # alive afterwards: its heartbeat/control session can otherwise
+            # re-acquire the body shortly after passive() takes effect.
+            if self.teleop_control_adapter:
+                result_payload["teleop_bridge_stop"] = self.teleop_control_adapter.stop()
             self.safety.state.control_mode = "autonomous"
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
@@ -306,6 +370,21 @@ class CommandProcessor:
             result=result_payload,
             started_at=started_at,
         )
+
+    def _complete_skill(self, envelope: MessageEnvelope, started_at: str, outcome: dict) -> None:
+        """Publish the terminal result after the asynchronous local skill ends."""
+        status = outcome.pop("status", "failed")
+        result = build_result(
+            envelope,
+            status=status,
+            result=outcome,
+            started_at=started_at,
+            error_code=outcome.get("error_code", ""),
+            error_message=outcome.get("error_message", ""),
+        )
+        command_id = envelope.payload["command_id"]
+        self.store.save_command_result(command_id, result)
+        self.publish_result(command_id, result)
 
     def _execute_sensor(self, envelope: MessageEnvelope, started_at: str) -> dict:
         if not self.sensor_control_adapter:
@@ -329,6 +408,19 @@ class CommandProcessor:
             result_payload = self.charge_control_adapter.start()
         elif envelope.message_type == "charge.stop":
             result_payload = self.charge_control_adapter.stop()
+        else:
+            raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
+        return build_result(envelope, status="succeeded", result=result_payload, started_at=started_at)
+
+    def _execute_motion_control(self, envelope: MessageEnvelope, started_at: str) -> dict:
+        if not self.charge_control_adapter:
+            raise ProtocolError("MOTION_CONTROL_UNAVAILABLE", "charge control adapter is not configured")
+        if self.task_executor.has_active_task() and envelope.message_type == "motion.stop":
+            raise ProtocolError("TASK_ACTIVE", "cannot stop motion control while a navigation task is active")
+        if envelope.message_type == "motion.start":
+            result_payload = self.charge_control_adapter.start_motion_control()
+        elif envelope.message_type == "motion.stop":
+            result_payload = self.charge_control_adapter.stop_motion_control()
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
         return build_result(envelope, status="succeeded", result=result_payload, started_at=started_at)
@@ -372,6 +464,19 @@ class CommandProcessor:
         command = envelope.payload.get("command") or {}
         if envelope.message_type == "map.activate":
             result_payload = self.map_activation_adapter.activate(command)
+            if not self.navigation_stack_adapter:
+                raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")
+            active_files = result_payload["current_map"]["active_files"]
+            result_payload["map_reload"] = self.navigation_stack_adapter.reload_map(
+                active_files["map.pcd"],
+                active_files["map.yaml"],
+            )
+            # A map-local pose cannot be carried across maps.  The map is
+            # loaded now, but a fresh map-specific initial pose is required
+            # before task admission can consider localization usable.
+            self.safety.state.localization_status = "initializing"
+            self.safety.state.localization_normal_since_monotonic = 0.0
+            result_payload["localization_reset_required"] = True
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
         return build_result(
