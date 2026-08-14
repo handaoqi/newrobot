@@ -2,6 +2,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from .models import Robot
+from .serializers import RobotStatusSerializer
 from .services.telemetry_service import TelemetryService
 
 
@@ -44,3 +45,31 @@ class TelemetryServiceTests(TestCase):
         _, changed = TelemetryService.apply_status(robot, payload)
 
         self.assertFalse(changed)
+
+    def test_preserves_localization_source_decision_in_quality_details(self):
+        robot = Robot.objects.create(code="fusion-robot", name="Fusion Robot")
+        latest, _ = TelemetryService.apply_status(
+            robot,
+            {
+                "sampled_at": timezone.now().isoformat(),
+                "state_version": 1,
+                "localization": {
+                    "status": "normal",
+                    "quality": {"matching_error": 0.12},
+                    "decision": {
+                        "active_source": "rtk_imu",
+                        "rtk_x": 12.3,
+                        "rtk_y": 4.5,
+                        "rtk_yaw": 0.7,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(latest.localization_quality["decision"]["active_source"], "rtk_imu")
+        self.assertEqual(latest.localization_quality["decision"]["rtk_x"], 12.3)
+
+        serialized_quality = RobotStatusSerializer(latest).data["localization_quality"]
+        self.assertEqual(serialized_quality["matching_error"], 0.12)
+        self.assertEqual(serialized_quality["decision"]["active_source"], "rtk_imu")
+        self.assertEqual(serialized_quality["decision"]["rtk_yaw"], 0.7)

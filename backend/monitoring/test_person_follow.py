@@ -45,7 +45,13 @@ class PersonFollowApiTests(APITestCase):
                         "track_id": "person-7",
                         "confidence": 0.91,
                         "bbox": {"x": 320, "y": 80, "width": 240, "height": 520},
-                    }
+                    },
+                    {
+                        "track_id": "bike-8",
+                        "label": "bicycle",
+                        "confidence": 0.86,
+                        "bbox": {"x": 700, "y": 260, "width": 360, "height": 280},
+                    },
                 ],
             },
             format="json",
@@ -54,11 +60,30 @@ class PersonFollowApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         state = RobotPersonDetectionState.objects.get(robot=self.robot)
         self.assertEqual(state.detections[0]["track_id"], "person-7")
+        self.assertEqual(state.detections[1]["label"], "bicycle")
 
         response = self.web_client.get(f"/api/robots/{self.robot.id}/person-detections/")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data["available"])
         self.assertEqual(response.data["detections"][0]["bbox"]["height"], 520)
+        self.assertEqual(response.data["detections"][1]["track_id"], "bike-8")
+
+    def test_operator_can_toggle_person_detection_for_device(self):
+        response = self.web_client.post(
+            f"/api/robots/{self.robot.id}/person-detections/",
+            {"enabled": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["enabled"])
+
+        response = APIClient().get(
+            "/api/device/person-detections/",
+            {"robot_code": self.robot.code},
+            **self.device_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["enabled"])
 
     def test_follow_velocity_is_limited_before_mqtt_command_is_created(self):
         response = self.web_client.post(
@@ -75,4 +100,3 @@ class PersonFollowApiTests(APITestCase):
         self.assertEqual(command.payload["vx"], 0.2)
         self.assertEqual(command.payload["vy"], -0.15)
         self.assertEqual(command.payload["yaw_rate"], 0.35)
-

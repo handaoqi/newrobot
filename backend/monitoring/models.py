@@ -606,6 +606,8 @@ class MapData(BaseTimestampModel):
     pgm_file = models.FileField(upload_to='maps/', verbose_name="PGM地图文件", null=True, blank=True)
     yaml_file = models.FileField(upload_to='maps/', verbose_name="YAML配置文件", null=True, blank=True)
     thumbnail = models.ImageField(upload_to='maps/thumbnails/', null=True, blank=True, verbose_name="缩略图")
+    trajectory_file = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图轨迹")
+    mapping_trace = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图定位轨迹")
     resolution = models.FloatField(default=0.05, verbose_name="分辨率(m/像素)")
     width = models.IntegerField(default=0, verbose_name="宽度(像素)")
     height = models.IntegerField(default=0, verbose_name="高度(像素)")

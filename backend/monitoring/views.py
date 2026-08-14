@@ -1909,7 +1909,7 @@ class MapDataDetailView(APIView):
                     f"{name} {count} 个" for name, count in blocking.items()
                 )
                 return Response({"detail": detail, "references": blocking}, status=status.HTTP_409_CONFLICT)
-            files = [map_data.pgm_file, map_data.yaml_file, map_data.thumbnail]
+            files = [map_data.pgm_file, map_data.yaml_file, map_data.thumbnail, map_data.trajectory_file, map_data.mapping_trace]
             map_data.delete()
             for file_field in files:
                 if file_field:
@@ -1943,6 +1943,10 @@ class MapDataDownloadView(APIView):
                     zip_file.write(map_data.yaml_file.path, 'map.yaml')
                 if map_data.thumbnail:
                     zip_file.write(map_data.thumbnail.path, 'preview.png')
+                if map_data.trajectory_file:
+                    zip_file.write(map_data.trajectory_file.path, 'map.txt')
+                if map_data.mapping_trace:
+                    zip_file.write(map_data.mapping_trace.path, 'mapping_trace.json')
 
             zip_buffer.seek(0)
             response = HttpResponse(zip_buffer, content_type='application/zip')
@@ -2049,6 +2053,12 @@ class MapDataManualCleanView(APIView):
                 cleaned.pgm_file.save(f"{cleaned.id}_map.pgm", ContentFile(pgm_content), save=False)
                 with source.yaml_file.open("rb") as yaml_stream:
                     cleaned.yaml_file.save(f"{cleaned.id}_map.yaml", ContentFile(yaml_stream.read()), save=False)
+                if source.trajectory_file:
+                    with source.trajectory_file.open("rb") as trace_stream:
+                        cleaned.trajectory_file.save(f"{cleaned.id}_map.txt", ContentFile(trace_stream.read()), save=False)
+                if source.mapping_trace:
+                    with source.mapping_trace.open("rb") as trace_stream:
+                        cleaned.mapping_trace.save(f"{cleaned.id}_mapping_trace.json", ContentFile(trace_stream.read()), save=False)
                 cleaned.thumbnail.save(f"{cleaned.id}_preview.png", ContentFile(preview_content), save=False)
                 cleaned.active = True
                 cleaned.save()
@@ -2068,7 +2078,7 @@ class MapDataManualCleanView(APIView):
                 )
         except Exception:
             if cleaned:
-                for field in (cleaned.pgm_file, cleaned.yaml_file, cleaned.thumbnail):
+                for field in (cleaned.pgm_file, cleaned.yaml_file, cleaned.thumbnail, cleaned.trajectory_file, cleaned.mapping_trace):
                     if field:
                         field.delete(save=False)
             raise
@@ -2225,6 +2235,40 @@ class MapDataPreviewView(APIView):
         output = io.BytesIO()
         image.save(output, format="PNG")
         return output.getvalue()
+
+
+class MapDataMappingTraceView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        if map_data.mapping_trace:
+            try:
+                with map_data.mapping_trace.open("rb") as stream:
+                    return Response(json.loads(stream.read().decode("utf-8")))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return Response({"detail": "建图轨迹文件损坏"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        if map_data.trajectory_file:
+            samples = []
+            try:
+                with map_data.trajectory_file.open("rb") as stream:
+                    lines = stream.read().decode("utf-8").splitlines()
+                for index, line in enumerate(lines):
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    fields = line.split()
+                    if len(fields) < 3:
+                        continue
+                    samples.append({
+                        "index": index,
+                        "stamp": None,
+                        "slam": {"x": float(fields[0]), "y": float(fields[1]), "yaw": float(fields[2])},
+                        "rtk": {"valid": False, "reason": "not_recorded"},
+                    })
+            except (OSError, UnicodeDecodeError, ValueError):
+                return Response({"detail": "旧版建图轨迹文件损坏"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            return Response({"format": "roamerx.mapping-trace.legacy", "frame_id": "map", "alignment_locked": False, "samples": samples})
+        return Response({"format": "roamerx.mapping-trace.empty", "frame_id": "map", "alignment_locked": False, "samples": []})
 
 
 class RobotMappingStatusView(APIView):
@@ -2647,7 +2691,7 @@ class DeviceMapUploadView(APIView):
         try:
             with zipfile.ZipFile(io.BytesIO(package.read())) as archive:
                 for name in archive.namelist():
-                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml"}:
+                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json"}:
                         extracted[name] = archive.read(name)
                     elif name == "map_set/map_set_manifest.json":
                         map_set_manifest = json.loads(archive.read(name).decode("utf-8"))
@@ -2688,6 +2732,10 @@ class DeviceMapUploadView(APIView):
                 description=json.dumps(description, ensure_ascii=False),
             )
             map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
+            if extracted.get("map.txt"):
+                map_data.trajectory_file.save(f"{map_data.id}_map.txt", ContentFile(extracted["map.txt"]), save=False)
+            if extracted.get("mapping_trace.json"):
+                map_data.mapping_trace.save(f"{map_data.id}_mapping_trace.json", ContentFile(extracted["mapping_trace.json"]), save=False)
             map_data.pgm_file.save(f"{map_data.id}_map.pgm", ContentFile(extracted["map.pgm"]), save=False)
             preview = extracted.get("map_preview.png") or extracted.get("preview.png")
             if preview:

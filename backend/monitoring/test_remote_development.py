@@ -1,5 +1,6 @@
 import json
 import uuid
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -45,6 +46,57 @@ class RemoteDevelopmentApiTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 409)
+
+    def test_main_conversation_returns_one_thread_in_chronological_order(self):
+        old_thread_task = DevelopmentTask.objects.create(
+            robot=self.robot,
+            workspace="robot-main",
+            prompt="旧会话",
+            status="succeeded",
+            codex_thread_id="thread-old",
+            operator=self.user,
+        )
+        first = DevelopmentTask.objects.create(
+            robot=self.robot,
+            workspace="robot-main",
+            prompt="第一条连续指令",
+            status="succeeded",
+            codex_thread_id="thread-main",
+            operator=self.user,
+        )
+        second = DevelopmentTask.objects.create(
+            robot=self.robot,
+            workspace="robot-main",
+            prompt="第二条连续指令",
+            status="succeeded",
+            codex_thread_id="thread-main",
+            operator=self.user,
+        )
+        DevelopmentTaskEvent.objects.create(
+            task=first,
+            sequence=1,
+            event_type="output",
+            text="第一条输出",
+        )
+        DevelopmentTaskEvent.objects.create(
+            task=second,
+            sequence=1,
+            event_type="output",
+            text="第二条输出",
+        )
+
+        response = self.client.get(
+            f"/api/development/conversations/main/?robot={self.robot.id}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["codex_thread_id"], "thread-main")
+        prompts = [turn["task"]["prompt"] for turn in response.data["turns"]]
+        self.assertEqual(prompts, ["第一条连续指令", "第二条连续指令"])
+        self.assertNotIn(str(old_thread_task.id), [
+            turn["task"]["id"] for turn in response.data["turns"]
+        ])
+        self.assertEqual(response.data["turns"][0]["events"][0]["text"], "第一条输出")
 
 
 class RemoteDevelopmentMqttTests(TestCase):
@@ -98,3 +150,46 @@ class RemoteDevelopmentMqttTests(TestCase):
         self.assertEqual(self.task.exit_code, 0)
         self.assertEqual(self.task.codex_thread_id, "thread-123")
         self.assertEqual(self.task.events.count(), 2)
+
+    def test_nx_local_asr_transcript_creates_task_without_cloud_transcription(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+
+        with patch("monitoring.dev_message_handlers.asr_service.transcribe_audio") as cloud_asr:
+            result = handle_dev_mqtt_message(
+                self.topic("voice/audio"),
+                {
+                    "asr_engine": "nx-sensevoice",
+                    "transcript": "小太阳，检查导航服务",
+                },
+            )
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertFalse(cloud_asr.called)
+        created = DevelopmentTask.objects.exclude(pk=self.task.pk).get()
+        self.assertEqual(created.prompt, "检查导航服务")
+
+    def test_short_alias_and_non_prefix_wake_phrase_do_not_create_task(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+
+        for transcript in ("小泰检查导航", "请小太阳检查导航"):
+            result = handle_dev_mqtt_message(
+                self.topic("voice/audio"),
+                {"asr_engine": "nx-sensevoice", "transcript": transcript},
+            )
+            self.assertEqual(result["status"], "ignored")
+        self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
+
+    def test_wake_word_arms_and_acknowledges_without_creating_task(self):
+        published = []
+        with patch("monitoring.dev_message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/wake.mp3", False)):
+            result = handle_dev_mqtt_message(
+                self.topic("voice/audio"),
+                {"asr_engine": "nx-sensevoice", "transcript": "小太阳"},
+                publish=lambda *args: published.append(args),
+            )
+
+        self.assertEqual(result["status"], "armed")
+        self.assertEqual(DevelopmentTask.objects.filter(robot=self.robot).count(), 1)
+        self.assertEqual(published[0][0], self.topic("voice/ack"))

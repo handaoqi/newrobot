@@ -67,6 +67,21 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(waypoint["speech_template_id"], template.id)
         self.assertEqual(waypoint["speech_template_name"], "到点提醒")
 
+    def test_route_snapshot_preserves_heading_and_segment_avoidance(self):
+        self.route.waypoints = [{
+            "x": 1,
+            "y": 2,
+            "yaw": 1.25,
+            "require_yaw": True,
+            "avoidance_to_next": False,
+        }]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertEqual(waypoint["yaw"], 1.25)
+        self.assertIs(waypoint["require_yaw"], True)
+        self.assertIs(waypoint["avoidance_to_next"], False)
+
     def test_one_active_execution_per_robot(self):
         TaskExecutionService.create_execution(self.task, self.user)
         with self.assertRaises(TaskStateError):
@@ -112,6 +127,33 @@ class TaskExecutionTests(TestCase):
         )
         self.assertEqual(response.status_code, 201)
         self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_charging_dock_saves_default_and_dispatches_two_point_task(self):
+        self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/robots/{self.robot.id}/charging-dock/",
+            {"map_id": self.map.id, "route_id": self.route.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.robot.refresh_from_db()
+        self.assertEqual(self.robot.charging_map_id, self.map.id)
+        self.assertEqual(self.robot.charging_route_id, self.route.id)
+        command = RemoteCommand.objects.get(task_execution__isnull=False)
+        self.assertTrue(command.payload["docking"]["enabled"])
+
+    def test_charging_dock_rejects_non_two_point_route(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/robots/{self.robot.id}/charging-dock/",
+            {"map_id": self.map.id, "route_id": self.route.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_task_execute_rejects_invalid_navigation_rosbag_flag(self):
         client = APIClient()

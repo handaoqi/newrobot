@@ -45,6 +45,9 @@ if "$DEPLOY_FRONTEND"; then
   (cd "$PROJECT_DIR/frontend" && npm run build)
   echo "[deploy] Syncing frontend dist..."
   rsync -a "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
+  # The build workspace may use restrictive file permissions. Nginx must be
+  # able to traverse the directory and read every static asset after syncing.
+  ssh "$CLOUD_HOST" "chmod -R a+rX '$REMOTE_ROOT/frontend/dist'"
 fi
 
 if "$DEPLOY_BACKEND"; then

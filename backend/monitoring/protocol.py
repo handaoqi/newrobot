@@ -32,7 +32,13 @@ COMMAND_TYPES = {
     "sensor.restart",
     "charge.start",
     "charge.stop",
+    "motion.start",
+    "motion.stop",
     "audio.volume",
+    "teleop.speed_micro",
+    "teleop.speed_slow",
+    "teleop.speed_normal",
+    "teleop.speed_fast",
 }
 UPLINK_MESSAGE_TYPES = {
     "presence.online",
@@ -206,6 +212,9 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         for coordinate in ("x", "y", "yaw"):
             if isinstance(waypoint.get(coordinate), bool) or not isinstance(waypoint.get(coordinate), (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {coordinate} must be numeric")
+        for field in ("avoidance_to_next", "require_yaw"):
+            if field in waypoint and not isinstance(waypoint[field], bool):
+                raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
         actions = waypoint.get("actions", [])
         if not isinstance(actions, list) or any(action != "snapshot" for action in actions):
             raise ProtocolError("INVALID_MESSAGE", "P0 waypoint actions only support snapshot")

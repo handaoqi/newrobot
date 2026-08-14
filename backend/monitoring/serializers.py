@@ -620,7 +620,11 @@ class RobotCommandCreateSerializer(serializers.Serializer):
             return attrs
         payload = attrs.get("payload") or {}
         cleaned = dict(payload)
-        limits = {"vx": 0.5, "vy": 0.5, "yaw_rate": 0.5}
+        limits = (
+            {"vx": 0.2, "vy": 0.15, "yaw_rate": 0.35}
+            if payload.get("source") == "person_follow"
+            else {"vx": 0.5, "vy": 0.5, "yaw_rate": 0.5}
+        )
         for field, limit in limits.items():
             try:
                 value = float(payload.get(field, 0.0))
@@ -761,6 +765,7 @@ class MapDataSerializer(serializers.ModelSerializer):
     pgm_url = serializers.SerializerMethodField()
     yaml_url = serializers.SerializerMethodField()
     thumbnail_url = serializers.SerializerMethodField()
+    mapping_trace_url = serializers.SerializerMethodField()
     file_size = serializers.SerializerMethodField()
 
     class Meta:
@@ -777,6 +782,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "pgm_url",
             "yaml_url",
             "thumbnail_url",
+            "mapping_trace_url",
             "resolution",
             "width",
             "height",
@@ -812,6 +818,9 @@ class MapDataSerializer(serializers.ModelSerializer):
     def get_thumbnail_url(self, obj):
         # 返回相对路径，前端 getFullUrl() 会自动拼接正确的 base URL
         return f"/api/maps/{obj.id}/preview/"
+
+    def get_mapping_trace_url(self, obj):
+        return f"/api/maps/{obj.id}/mapping-trace/"
 
     def get_file_size(self, obj):
         size = 0
@@ -865,6 +874,12 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
 
     def validate_waypoints(self, value):
+        for index, point in enumerate(value):
+            if not isinstance(point, dict):
+                continue
+            for field in ("avoidance_to_next", "require_yaw"):
+                if field in point and not isinstance(point[field], bool):
+                    raise serializers.ValidationError(f"途经点 {index + 1} 的 {field} 必须是布尔值")
         invalid_modes = [
             point.get("localization_mode")
             for point in value

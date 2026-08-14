@@ -49,6 +49,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_template_id = raw.get("speech_template_id")
             speech_template_name = str(raw.get("speech_template_name") or "")
             speech_text = str(raw.get("speech_text") or "")
+            localization_mode = str(raw.get("localization_mode") or "ndt").lower()
+            avoidance_to_next = bool(raw.get("avoidance_to_next", True))
+            require_yaw = bool(raw.get("require_yaw", False))
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
             x, y = raw[0], raw[1]
             yaw = raw[2] if len(raw) >= 3 else 0.0
@@ -59,6 +62,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_template_id = None
             speech_template_name = ""
             speech_text = ""
+            localization_mode = "ndt"
+            avoidance_to_next = True
+            require_yaw = False
         else:
             raise TaskStateError(f"route waypoint {index} has invalid format")
         waypoint = {
@@ -70,6 +76,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "yaw": float(yaw),
                 "dwell_seconds": dwell_seconds,
                 "actions": actions,
+                "localization_mode": localization_mode if localization_mode in {"ndt", "rtk"} else "ndt",
+                "avoidance_to_next": avoidance_to_next,
+                "require_yaw": require_yaw,
             }
         if speech_template_id not in (None, ""):
             waypoint.update(
@@ -95,6 +104,8 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
             "map_id": str(map_data.id),
             "map_version": f"legacy-mapdata-{map_data.id}",
             "sha256": None,
+            "map_name": map_data.name,
+            "local_map_dir": _map_local_dir(map_data),
         },
         "waypoints": normalize_waypoints(route),
     }
@@ -123,6 +134,14 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
 def _member_local_map_dir(member) -> str:
     try:
         description = json.loads(member.map_data.description or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(description.get("source_map_dir") or "")
+
+
+def _map_local_dir(map_data: MapData) -> str:
+    try:
+        description = json.loads(map_data.description or "{}")
     except (TypeError, json.JSONDecodeError):
         return ""
     return str(description.get("source_map_dir") or "")

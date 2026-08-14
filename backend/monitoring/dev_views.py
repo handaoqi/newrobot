@@ -12,10 +12,14 @@ from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import DevelopmentAgentState, DevelopmentTask, Robot
+from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot
 
 
 ALLOWED_WORKSPACES = {"robot-main", "cloud-platform"}
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+ALLOWED_CODEX_MODELS = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+CONVERSATION_TASK_LIMIT = 50
+CONVERSATION_EVENT_LIMIT = 5000
 
 
 def serialize_event(event) -> dict:
@@ -37,6 +41,7 @@ def serialize_task(task: DevelopmentTask, *, include_events: bool = False) -> di
         "robot_code": task.robot.code,
         "robot_name": task.robot.name,
         "workspace": task.workspace,
+        "model": task.model,
         "prompt": task.prompt,
         "status": task.status,
         "status_label": task.get_status_display(),
@@ -68,12 +73,15 @@ class DevelopmentTaskListCreateView(APIView):
         robot = get_object_or_404(Robot, pk=request.data.get("robot"))
         workspace = str(request.data.get("workspace") or "robot-main").strip()
         prompt = str(request.data.get("prompt") or "").strip()
+        model = str(request.data.get("model") or DEFAULT_CODEX_MODEL).strip()
         if workspace not in ALLOWED_WORKSPACES:
             return Response({"detail": "不允许的工作目录"}, status=status.HTTP_400_BAD_REQUEST)
         if not prompt:
             return Response({"detail": "请输入开发指令"}, status=status.HTTP_400_BAD_REQUEST)
         if len(prompt) > 50000:
             return Response({"detail": "指令长度不能超过 50000 字符"}, status=status.HTTP_400_BAD_REQUEST)
+        if model not in ALLOWED_CODEX_MODELS:
+            return Response({"detail": "不支持的 Codex 模型"}, status=status.HTTP_400_BAD_REQUEST)
         active = DevelopmentTask.objects.filter(
             robot=robot,
             status__in=DevelopmentTask.ACTIVE_STATES,
@@ -86,6 +94,7 @@ class DevelopmentTaskListCreateView(APIView):
         task = DevelopmentTask.objects.create(
             robot=robot,
             workspace=workspace,
+            model=model,
             prompt=prompt,
             operator=request.user,
         )
@@ -99,6 +108,69 @@ class DevelopmentTaskDetailView(APIView):
             pk=task_id,
         )
         return Response(serialize_task(task, include_events=True))
+
+
+class DevelopmentConversationDetailView(APIView):
+    """Return the current main Codex thread as one chronological timeline."""
+
+    def get(self, request):
+        robot_id = request.query_params.get("robot")
+        if not robot_id:
+            return Response({"detail": "请选择机器狗"}, status=status.HTTP_400_BAD_REQUEST)
+        robot = get_object_or_404(Robot, pk=robot_id)
+        recent_tasks = list(
+            DevelopmentTask.objects.select_related("robot", "operator")
+            .filter(robot=robot)[:100]
+        )
+
+        current_thread_id = next(
+            (task.codex_thread_id for task in recent_tasks if task.codex_thread_id),
+            "",
+        )
+        if current_thread_id:
+            thread_anchor = next(
+                task.created_at for task in recent_tasks
+                if task.codex_thread_id == current_thread_id
+            )
+            relevant_tasks = [
+                task for task in recent_tasks
+                if task.codex_thread_id == current_thread_id
+                or (not task.codex_thread_id and task.created_at >= thread_anchor)
+            ]
+        else:
+            relevant_tasks = recent_tasks
+        relevant_tasks = relevant_tasks[:CONVERSATION_TASK_LIMIT]
+
+        events_by_task: dict[str, list[DevelopmentTaskEvent]] = {
+            str(task.id): [] for task in relevant_tasks
+        }
+        if relevant_tasks:
+            recent_events = list(
+                DevelopmentTaskEvent.objects.filter(
+                    task_id__in=[task.id for task in relevant_tasks]
+                ).order_by("-occurred_at", "-id")[:CONVERSATION_EVENT_LIMIT]
+            )
+            for event in reversed(recent_events):
+                events_by_task[str(event.task_id)].append(event)
+            for task_events in events_by_task.values():
+                task_events.sort(key=lambda item: item.sequence)
+
+        return Response({
+            "conversation_id": "main",
+            "name": "主会话",
+            "codex_thread_id": current_thread_id,
+            "tasks": [serialize_task(task) for task in relevant_tasks],
+            "turns": [
+                {
+                    "task": serialize_task(task),
+                    "events": [
+                        serialize_event(event)
+                        for event in events_by_task[str(task.id)]
+                    ],
+                }
+                for task in reversed(relevant_tasks)
+            ],
+        })
 
 
 class DevelopmentTaskCancelView(APIView):
