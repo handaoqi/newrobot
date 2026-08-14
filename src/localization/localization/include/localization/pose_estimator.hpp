@@ -77,7 +77,26 @@ public:
    * @param cloud   input cloud
    * @return cloud aligned to the globalmap
    */
-  pcl::PointCloud<PointT>::Ptr correct(const rclcpp::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud);
+  pcl::PointCloud<PointT>::Ptr correct(
+    const rclcpp::Time& stamp,
+    const pcl::PointCloud<PointT>::ConstPtr& cloud,
+    bool apply_observation = true);
+
+  void correct_absolute_pose(
+    const Eigen::Vector3f& position,
+    const Eigen::Quaternionf& orientation,
+    float horizontal_variance,
+    float vertical_variance,
+    float orientation_variance);
+
+  void begin_dead_reckoning_bridge();
+
+  void apply_body_odom_translation(
+    const Eigen::Matrix4f& odom_delta,
+    float translation_variance);
+
+  float horizontal_position_sigma() const;
+  float yaw_sigma() const;
 
   /* getters */
   rclcpp::Time last_correction_time() const;

@@ -1,0 +1,15 @@
+[Unit]
+Description=RoamerX charge pile Bluetooth controller
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states
+ExecStart=/usr/local/sbin/roamerx-charge-pile-controller
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

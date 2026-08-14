@@ -26,6 +26,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <pcl/filters/voxel_grid.h>
 
@@ -114,6 +115,20 @@ public:
     gnss_heading_max_std_deg_ = declare_parameter<double>("gnss_fusion.heading_max_std_deg", 5.0);
     gnss_heading_min_baseline_m_ = declare_parameter<double>("gnss_fusion.heading_min_baseline_m", 0.20);
     gnss_heading_max_age_ = declare_parameter<double>("gnss_fusion.heading_max_age", 1.5);
+    source_arbiter_enable_ = declare_parameter<bool>("source_arbiter.enable", true);
+    bridge_max_distance_m_ = declare_parameter<double>("source_arbiter.bridge_max_distance_m", 10.0);
+    bridge_max_seconds_ = declare_parameter<double>("source_arbiter.bridge_max_seconds", 20.0);
+    bridge_max_horizontal_sigma_m_ = declare_parameter<double>("source_arbiter.max_horizontal_sigma_m", 0.8);
+    bridge_max_yaw_sigma_rad_ = declare_parameter<double>("source_arbiter.max_yaw_sigma_deg", 15.0) * M_PI / 180.0;
+    bridge_translation_variance_per_m_ = declare_parameter<double>("source_arbiter.odom_translation_variance_per_m", 0.0025);
+    bridge_max_odom_speed_mps_ = declare_parameter<double>("source_arbiter.max_odom_speed_mps", 1.5);
+    bridge_max_odom_yaw_rate_rps_ = declare_parameter<double>("source_arbiter.max_odom_yaw_rate_rps", 2.0);
+    absolute_recovery_samples_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("source_arbiter.absolute_recovery_samples", 3)));
+    moving_ndt_stride_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("source_arbiter.moving_ndt_stride", 5)));
+    ndt_failure_hysteresis_frames_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("source_arbiter.ndt_failure_hysteresis_frames", 3)));
     std::vector<double> gnss_lever_arm = declare_parameter<std::vector<double>>("gnss_fusion.lever_arm_base", {-0.05, 0.0, 0.15});
     if (gnss_lever_arm.size() >= 3) {
       gnss_lever_arm_base_ << gnss_lever_arm[0], gnss_lever_arm[1], gnss_lever_arm[2];
@@ -269,6 +284,10 @@ public:
       "/localization/seed_from_rtk",
       std::bind(&HdlLocalizationNode::rtk_initial_pose_callback, this,
         std::placeholders::_1, std::placeholders::_2));
+    localization_policy_sub_ = create_subscription<std_msgs::msg::String>(
+      "/localization/policy", 10,
+      std::bind(&HdlLocalizationNode::localization_policy_callback, this, std::placeholders::_1));
+    localization_decision_pub_ = create_publisher<std_msgs::msg::String>("/localization/decision", 10);
 
     localization_lidar_info_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(100), // 10Hz 
@@ -398,6 +417,223 @@ private:
   }
 
 private:
+  struct RtkObservation {
+    bool usable = false;
+    bool heading_usable = false;
+    std::string quality = "invalid";
+    Eigen::Vector3f position = Eigen::Vector3f::Zero();
+    Eigen::Quaternionf orientation = Eigen::Quaternionf::Identity();
+    double horizontal_std_m = std::numeric_limits<double>::infinity();
+    double heading_std_rad = std::numeric_limits<double>::infinity();
+    double age_s = std::numeric_limits<double>::infinity();
+    int64_t stamp_ns = 0;
+  };
+
+  void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
+    const std::string command = msg->data;
+    if (command.find("rtk") != std::string::npos) {
+      preferred_source_ = "rtk";
+    } else if (command.find("ndt") != std::string::npos) {
+      preferred_source_ = "ndt";
+    }
+    motion_phase_ = command.find("moving") != std::string::npos ? "moving" : "stationary";
+    if (motion_phase_ == "stationary") {
+      bridge_active_ = false;
+      bridge_distance_m_ = 0.0;
+      absolute_stable_count_ = 0;
+      absolute_stable_ = false;
+      stable_source_.clear();
+    }
+  }
+
+  RtkObservation currentRtkObservation(const rclcpp::Time& stamp) {
+    RtkObservation observation;
+    if (!use_gnss_fusion_ || !gnss_map_origin_loaded_) {
+      return observation;
+    }
+    sensor_msgs::msg::NavSatFix gnss;
+    {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      if (!has_gnss_) {
+        return observation;
+      }
+      gnss = latest_gnss_;
+    }
+    observation.age_s = std::fabs((stamp - rclcpp::Time(gnss.header.stamp)).seconds());
+    observation.stamp_ns = rclcpp::Time(gnss.header.stamp).nanoseconds();
+    observation.horizontal_std_m = std::sqrt(std::max(
+      0.0, std::max(gnss.position_covariance[0], gnss.position_covariance[4])));
+    if (gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX) {
+      observation.quality = "fixed";
+    } else if (gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX) {
+      observation.quality = "float";
+    } else if (gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_FIX) {
+      observation.quality = "standalone";
+    }
+    observation.usable = observation.quality != "standalone" && observation.quality != "invalid" &&
+      std::isfinite(observation.horizontal_std_m) &&
+      observation.horizontal_std_m <= gnss_max_horizontal_std_ &&
+      observation.age_s <= gnss_max_age_ &&
+      std::fabs(gnss.latitude) > 1e-7 && std::fabs(gnss.longitude) > 1e-7;
+
+    observation.orientation = pose_estimator ? pose_estimator->quat() : last_init_quat_;
+    {
+      std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+      const double heading_age = has_gnss_heading_
+        ? (get_clock()->now() - latest_gnss_heading_receive_time_).seconds()
+        : std::numeric_limits<double>::infinity();
+      observation.heading_usable = has_gnss_heading_ && latest_gnss_heading_status_ == 0 &&
+        latest_gnss_heading_type_ > 0 &&
+        latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_ &&
+        latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_ &&
+        heading_age >= 0.0 && heading_age <= gnss_heading_max_age_;
+      if (observation.heading_usable) {
+        const double yaw_enu = M_PI / 2.0 - latest_gnss_heading_deg_ * M_PI / 180.0;
+        const double yaw_map = std::atan2(
+          std::sin(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_),
+          std::cos(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_));
+        observation.orientation = Eigen::AngleAxisf(
+          static_cast<float>(yaw_map), Eigen::Vector3f::UnitZ());
+        observation.heading_std_rad = latest_gnss_heading_std_deg_ * M_PI / 180.0;
+      }
+    }
+    const Eigen::Vector3f gps_map = llaToMap(gnss.latitude, gnss.longitude, gnss.altitude);
+    observation.position = gps_map - observation.orientation.toRotationMatrix() * gnss_lever_arm_base_;
+    if (!gnss_use_elevation_ && pose_estimator) {
+      observation.position.z() = pose_estimator->pos().z();
+    }
+    return observation;
+  }
+
+  bool applyRtkObservation(const RtkObservation& observation) {
+    if (!pose_estimator || !observation.usable) {
+      return false;
+    }
+    const float horizontal_variance = static_cast<float>(
+      observation.horizontal_std_m * observation.horizontal_std_m);
+    const float vertical_variance = gnss_use_elevation_ ? horizontal_variance * 4.0f : 1000.0f;
+    const float orientation_variance = observation.heading_usable
+      ? static_cast<float>(observation.heading_std_rad * observation.heading_std_rad)
+      : 1000.0f;
+    pose_estimator->correct_absolute_pose(
+      observation.position, observation.orientation,
+      horizontal_variance, vertical_variance, orientation_variance);
+    is_init_success_ = true;
+    init_match_count_ = 0;
+    last_rtk_map_position_ = observation.position;
+    last_rtk_map_yaw_ = std::atan2(
+      observation.orientation.toRotationMatrix()(1, 0),
+      observation.orientation.toRotationMatrix()(0, 0));
+    return true;
+  }
+
+  bool startBridge(const rclcpp::Time& stamp) {
+    if (!source_arbiter_enable_ || !enable_robot_odometry_prediction ||
+        !pose_estimator || !has_valid_pose_history_) {
+      return false;
+    }
+    double odom_age = std::numeric_limits<double>::infinity();
+    {
+      std::lock_guard<std::mutex> lock(robot_odom_mutex_);
+      odom_age = (get_clock()->now() - latest_robot_odom_receive_time_).seconds();
+    }
+    if (odom_age < 0.0 || odom_age > 0.5) {
+      return false;
+    }
+    bridge_active_ = true;
+    bridge_start_time_ = stamp;
+    bridge_distance_m_ = 0.0;
+    active_source_ = "imu_odom_bridge";
+    bridge_rejection_reason_.clear();
+    absolute_stable_count_ = 0;
+    absolute_stable_ = false;
+    stable_source_.clear();
+    pose_estimator->begin_dead_reckoning_bridge();
+    return true;
+  }
+
+  bool applyBridgeDelta(
+      const Eigen::Matrix4f& odom_delta,
+      double odom_dt_s,
+      bool odom_time_monotonic,
+      const rclcpp::Time& stamp) {
+    if (!bridge_active_ || !pose_estimator || !odom_delta.allFinite()) {
+      return false;
+    }
+    Eigen::Vector3f body_translation = odom_delta.block<3, 1>(0, 3);
+    body_translation.z() = 0.0f;
+    const double distance = body_translation.norm();
+    Eigen::Quaternionf delta_q(odom_delta.block<3, 3>(0, 0));
+    delta_q.normalize();
+    const double angle = Eigen::Quaternionf::Identity().angularDistance(delta_q);
+    const double speed = odom_dt_s > 1e-4 ? distance / odom_dt_s : std::numeric_limits<double>::infinity();
+    const double yaw_rate = odom_dt_s > 1e-4 ? angle / odom_dt_s : std::numeric_limits<double>::infinity();
+    if (!odom_time_monotonic || odom_dt_s > 0.5 || speed > bridge_max_odom_speed_mps_ ||
+        yaw_rate > bridge_max_odom_yaw_rate_rps_) {
+      bridge_active_ = false;
+      active_source_ = "unavailable";
+      bridge_rejection_reason_ = !odom_time_monotonic ? "odom_time_discontinuity" :
+        (speed > bridge_max_odom_speed_mps_ ? "odom_speed_jump" :
+        (yaw_rate > bridge_max_odom_yaw_rate_rps_ ? "odom_yaw_rate_jump" : "odom_stale"));
+      RCLCPP_ERROR(get_logger(),
+        "Reject bridge odometry: reason=%s dt=%.3fs speed=%.2fm/s yaw_rate=%.2frad/s",
+        bridge_rejection_reason_.c_str(), odom_dt_s, speed, yaw_rate);
+      return false;
+    }
+    bridge_distance_m_ += distance;
+    pose_estimator->apply_body_odom_translation(
+      odom_delta,
+      static_cast<float>(bridge_translation_variance_per_m_ * std::max(distance, 0.001)));
+    const double elapsed = (stamp - bridge_start_time_).seconds();
+    const bool within_limits = bridge_distance_m_ <= bridge_max_distance_m_ &&
+      elapsed <= bridge_max_seconds_ &&
+      pose_estimator->horizontal_position_sigma() <= bridge_max_horizontal_sigma_m_ &&
+      pose_estimator->yaw_sigma() <= bridge_max_yaw_sigma_rad_;
+    if (!within_limits) {
+      bridge_active_ = false;
+      active_source_ = "unavailable";
+      RCLCPP_ERROR(get_logger(),
+        "IMU+odometry bridge safety limit reached: distance=%.2fm elapsed=%.1fs sigma_xy=%.2fm sigma_yaw=%.1fdeg",
+        bridge_distance_m_, elapsed, pose_estimator->horizontal_position_sigma(),
+        pose_estimator->yaw_sigma() * 180.0 / M_PI);
+    }
+    return within_limits;
+  }
+
+  void publishLocalizationDecision(const rclcpp::Time& stamp) {
+    if (!localization_decision_pub_) {
+      return;
+    }
+    const RtkObservation rtk = currentRtkObservation(stamp);
+    std_msgs::msg::String message;
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << "{\"active_source\":\"" << active_source_
+        << "\",\"preferred_source\":\"" << preferred_source_
+        << "\",\"phase\":\"" << motion_phase_
+        << "\",\"ndt_healthy\":" << (last_ndt_healthy_ ? "true" : "false")
+        << ",\"ndt_score\":" << last_ndt_score_
+        << ",\"absolute_stable\":" << (absolute_stable_ ? "true" : "false")
+        << ",\"absolute_stable_samples\":" << absolute_stable_count_
+        << ",\"rtk_quality\":\"" << rtk.quality
+        << "\",\"rtk_usable\":" << (rtk.usable ? "true" : "false")
+        << ",\"rtk_x\":" << last_rtk_map_position_.x()
+        << ",\"rtk_y\":" << last_rtk_map_position_.y()
+        << ",\"rtk_yaw\":" << last_rtk_map_yaw_
+        << ",\"bridge_distance_m\":" << bridge_distance_m_
+        << ",\"bridge_elapsed_s\":"
+        << (bridge_active_ ? std::max(0.0, (stamp - bridge_start_time_).seconds()) : 0.0)
+        << ",\"bridge_rejection_reason\":\"" << bridge_rejection_reason_ << "\""
+        << ",\"odom_time_source\":\"" << odom_time_source_ << "\""
+        << ",\"position_sigma_m\":"
+        << (pose_estimator ? pose_estimator->horizontal_position_sigma() : -1.0f)
+        << ",\"yaw_sigma_deg\":"
+        << (pose_estimator ? pose_estimator->yaw_sigma() * 180.0 / M_PI : -1.0)
+        << "}";
+    message.data = out.str();
+    localization_decision_pub_->publish(message);
+  }
+
   void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(gnss_mutex_);
     latest_gnss_ = *msg;
@@ -720,6 +956,7 @@ private:
     std::lock_guard<std::mutex> lock(robot_odom_mutex_);
     latest_robot_odom_ = pose.cast<float>().matrix();
     latest_robot_odom_receive_time_ = get_clock()->now();
+    latest_robot_odom_source_stamp_ = rclcpp::Time(msg->header.stamp);
     ++latest_robot_odom_sequence_;
   }
 
@@ -869,7 +1106,15 @@ private:
           const auto& gyro = (*imu_iter)->angular_velocity;
           double acc_sign = invert_acc ? -1.0 : 1.0;
           double gyro_sign = invert_gyro ? -1.0 : 1.0;
-          pose_estimator->predict((*imu_iter)->header.stamp, acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
+          Eigen::Vector3f bridge_acceleration = Eigen::Vector3f::Zero();
+          if (!bridge_active_) {
+            bridge_acceleration =
+              static_cast<float>(acc_sign) * Eigen::Vector3f(acc.x, acc.y, acc.z);
+          }
+          pose_estimator->predict(
+            (*imu_iter)->header.stamp,
+            bridge_acceleration,
+            gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
         }
       }
       imu_data.erase(imu_data.begin(), imu_iter);
@@ -880,40 +1125,153 @@ private:
     // Use adjacent received odometry poses directly. The device header carries
     // controller uptime rather than ROS epoch time, so TF time queries are not
     // a reliable source of motion deltas on this platform.
+    Eigen::Matrix4f odom_delta = Eigen::Matrix4f::Identity();
+    bool has_odom_delta = false;
+    bool robot_odom_fresh = false;
+    bool odom_time_monotonic = false;
+    double odom_delta_dt_s = 0.0;
     if (enable_robot_odometry_prediction) {
-      Eigen::Matrix4f odom_delta = Eigen::Matrix4f::Identity();
-      bool has_odom_delta = false;
       {
         std::lock_guard<std::mutex> lock(robot_odom_mutex_);
         const double age = (get_clock()->now() - latest_robot_odom_receive_time_).seconds();
         if (latest_robot_odom_sequence_ > 0 && age >= 0.0 && age < 0.5) {
-          if (odom_prediction_initialized_ && latest_robot_odom_sequence_ != consumed_robot_odom_sequence_) {
+          robot_odom_fresh = true;
+          if (!odom_prediction_initialized_) {
+            previous_robot_odom_ = latest_robot_odom_;
+            previous_robot_odom_receive_time_ = latest_robot_odom_receive_time_;
+            previous_robot_odom_source_stamp_ = latest_robot_odom_source_stamp_;
+            odom_prediction_initialized_ = true;
+          } else if (latest_robot_odom_sequence_ != consumed_robot_odom_sequence_) {
+            const double receive_dt =
+              (latest_robot_odom_receive_time_ - previous_robot_odom_receive_time_).seconds();
             odom_delta = previous_robot_odom_.inverse() * latest_robot_odom_;
-            has_odom_delta = odom_delta.allFinite();
+            const Eigen::Vector3f translation = odom_delta.block<3, 1>(0, 3);
+            Eigen::Quaternionf rotation(odom_delta.block<3, 3>(0, 0));
+            rotation.normalize();
+            const bool pose_changed = translation.norm() > 1e-4f ||
+              Eigen::Quaternionf::Identity().angularDistance(rotation) > 1e-4f;
+
+            // The factory dog_task header stamp is a non-monotonic controller
+            // telemetry counter, not a usable ROS time base. It can repeat or
+            // roll back while the same state is republished. Integrate only
+            // changed poses, and measure their interval from ROS reception.
+            if (!pose_changed) {
+              odom_time_source_ = "duplicate_pose_ignored";
+            } else {
+              has_odom_delta = odom_delta.allFinite();
+              odom_delta_dt_s = receive_dt;
+              odom_time_monotonic = receive_dt > 0.0 && receive_dt <= 0.5;
+              odom_time_source_ = "ros_reception_monotonic";
+
+              previous_robot_odom_ = latest_robot_odom_;
+              previous_robot_odom_receive_time_ = latest_robot_odom_receive_time_;
+              previous_robot_odom_source_stamp_ = latest_robot_odom_source_stamp_;
+            }
           }
-          previous_robot_odom_ = latest_robot_odom_;
           consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
-          odom_prediction_initialized_ = true;
         }
       }
       // Wheel yaw remains useful for recovering from a transient NDT loss, but
       // must not perturb the operator-provided pose before initialization.
-      if (has_odom_delta && is_init_success_) {
+      if (has_odom_delta && is_init_success_ && !bridge_active_) {
         pose_estimator->predict_odom(odom_delta);
       }
     }
-    // correct
-    auto aligned = pose_estimator->correct(stamp, raw_points_ptr_);
-    publish_scan_matching_status(points_msg->header, aligned);
+    const RtkObservation rtk_observation = currentRtkObservation(rclcpp::Time(stamp));
+    const bool rtk_primary = source_arbiter_enable_ && preferred_source_ == "rtk" &&
+      rtk_observation.usable && !bridge_active_;
+    // Obstacle extraction remains on the independent 10 Hz laser scan chain.
+    // Scan matching is reduced to 2 Hz while moving and restored to every
+    // LiDAR frame while stationary or during initialization.
+    ++ndt_frame_counter_;
+    const bool run_ndt = motion_phase_ != "moving" || !is_init_success_ ||
+      (ndt_frame_counter_ % static_cast<uint64_t>(moving_ndt_stride_) == 0);
+    pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+    if (run_ndt) {
+      // When RTK is primary or a dead-reckoning segment is locked, NDT remains
+      // a shadow health check and cannot inject a discontinuous correction.
+      aligned = pose_estimator->correct(
+        stamp, raw_points_ptr_, !rtk_primary && !bridge_active_);
+      publish_scan_matching_status(points_msg->header, aligned);
+      const PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
+      last_ndt_score_ = match_result.fitness_score_;
+      // NDT is an absolute observation. Its health must be decided by the
+      // registration result, not by the uncertainty limits reserved for the
+      // IMU+wheel-odometry fallback bridge. Otherwise a good NDT correction
+      // can be discarded solely because the fallback yaw covariance is high.
+      const bool ndt_sample_healthy = match_result.is_converged_ &&
+        match_result.fitness_score_ < 0.5 && last_ndt_status_healthy_;
+      if (ndt_sample_healthy) {
+        ndt_unhealthy_frame_count_ = 0;
+        last_ndt_healthy_ = true;
+      } else {
+        ++ndt_unhealthy_frame_count_;
+        if (ndt_unhealthy_frame_count_ >= ndt_failure_hysteresis_frames_) {
+          last_ndt_healthy_ = false;
+        }
+      }
+      last_ndt_update_time_ = rclcpp::Time(stamp);
+    } else if ((rclcpp::Time(stamp) - last_ndt_update_time_).seconds() > 1.0) {
+      last_ndt_healthy_ = false;
+      ndt_unhealthy_frame_count_ = ndt_failure_hysteresis_frames_;
+    }
+    bool absolute_pose_valid = false;
+    bool bridge_pose_valid = false;
+    bool absolute_observation_updated = false;
+    if (bridge_active_) {
+      // Repeated controller poses are normal while the robot is stationary.
+      // Keep the bridge alive while the stream is fresh; only integrate an
+      // actual pose delta. A true source outage still fails robot_odom_fresh.
+      bridge_pose_valid = robot_odom_fresh && (!has_odom_delta || applyBridgeDelta(
+        odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp)));
+    } else if (rtk_primary) {
+      absolute_pose_valid = applyRtkObservation(rtk_observation);
+      active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
+      absolute_observation_updated = absolute_pose_valid &&
+        rtk_observation.stamp_ns != last_absolute_observation_stamp_ns_;
+      last_absolute_observation_stamp_ns_ = rtk_observation.stamp_ns;
+    } else if (last_ndt_healthy_) {
+      absolute_pose_valid = true;
+      active_source_ = "ndt_imu";
+      absolute_observation_updated = run_ndt;
+    } else if (rtk_observation.usable) {
+      absolute_pose_valid = applyRtkObservation(rtk_observation);
+      active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
+      absolute_observation_updated = absolute_pose_valid &&
+        rtk_observation.stamp_ns != last_absolute_observation_stamp_ns_;
+      last_absolute_observation_stamp_ns_ = rtk_observation.stamp_ns;
+    } else if (startBridge(rclcpp::Time(stamp))) {
+      bridge_pose_valid = !has_odom_delta || applyBridgeDelta(
+        odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp));
+    } else {
+      active_source_ = "unavailable";
+    }
 
-    PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
-    if (match_result.is_converged_ && match_result.fitness_score_ < 0.5) {
-      applyGnssCorrection(rclcpp::Time(stamp));
+    if (absolute_pose_valid) {
+      if (stable_source_ != active_source_) {
+        stable_source_ = active_source_;
+        absolute_stable_count_ = 0;
+      }
+      if (absolute_observation_updated) {
+        absolute_stable_count_++;
+      }
+      absolute_stable_ = absolute_stable_count_ >= absolute_recovery_samples_;
+    } else if (bridge_pose_valid || active_source_ == "unavailable") {
+      absolute_stable_count_ = 0;
+      absolute_stable_ = false;
+      stable_source_.clear();
+    }
+
+    if (absolute_pose_valid || bridge_pose_valid) {
       localization_state_ = 3;
       consecutive_match_failures_ = 0;
-      runtime_relocalization_attempted_ = false;
-      gnss_recovery_seed_pending_ = false;
-      RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!!");
+      if (absolute_pose_valid) {
+        runtime_relocalization_attempted_ = false;
+        gnss_recovery_seed_pending_ = false;
+      }
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Localization source=%s ndt_score=%.3f rtk=%s bridge=%.2fm",
+        active_source_.c_str(), last_ndt_score_, rtk_observation.quality.c_str(), bridge_distance_m_);
     } else {
       localization_state_ = 4;
       consecutive_match_failures_++;
@@ -926,7 +1284,7 @@ private:
       }
       is_extrapolating_ = true;
       current_confidence_ = 0.0;
-      if (is_init_success_ && has_valid_pose_history_ &&
+      if (!bridge_active_ && !rtk_observation.usable && is_init_success_ && has_valid_pose_history_ &&
           !runtime_relocalization_attempted_ &&
           consecutive_match_failures_ >= runtime_relocalization_failure_threshold_) {
         last_init_pos_ = last_pose_.block<3, 1>(0, 3);
@@ -961,7 +1319,7 @@ private:
       RCLCPP_INFO(get_logger(), "!!!point cloud callback time cost > 80ms, = %d ms\n", last_timeout_);
     }
 
-    if (aligned_pub->get_subscription_count()) {
+    if (run_ndt && aligned_pub->get_subscription_count()) {
       aligned->header.frame_id = "map";
       aligned->header.stamp = cloud->header.stamp;
       sensor_msgs::msg::PointCloud2 aligned_msg;
@@ -969,18 +1327,21 @@ private:
       aligned_pub->publish(aligned_msg);
     }
     // Update pose history for extrapolation
-    if (match_result.is_converged_ && match_result.fitness_score_ < 0.5) {
+    if (absolute_pose_valid || bridge_pose_valid) {
       Eigen::Matrix4f current_pose = pose_estimator->matrix();
       Eigen::Vector3f current_velocity = getCurrentVelocity(current_pose, points_msg->header.stamp);
       Eigen::Vector3f current_angular_velocity = getCurrentAngularVelocity(current_pose, points_msg->header.stamp);
       updatePoseHistory(current_pose, current_velocity, current_angular_velocity, points_msg->header.stamp);
       is_extrapolating_ = false;
-      current_confidence_ = 1.0;
+      current_confidence_ = bridge_pose_valid
+        ? std::max(0.0, 1.0 - bridge_distance_m_ / bridge_max_distance_m_)
+        : 1.0;
       last_confidence_update_time_ = points_msg->header.stamp;
     }
+    publishLocalizationDecision(rclcpp::Time(stamp));
     publish_odometry(
       points_msg->header.stamp,
-      match_result.is_converged_ && match_result.fitness_score_ < 0.5
+      (absolute_pose_valid || bridge_pose_valid)
         ? pose_estimator->matrix()
         : (has_valid_pose_history_ ? last_pose_ : pose_estimator->matrix()));
   }
@@ -1070,31 +1431,22 @@ private:
       localization_odom_frame_id.c_str(),
       pose(0, 3), pose(1, 3), pose(2, 3));
     if (send_tf_transforms) {
-      if (tf_buffer->canTransform(robot_odom_frame_id, odom_child_frame_id, rclcpp::Time((int64_t)0, get_clock()->get_clock_type()))) {
-        RCLCPP_DEBUG(
-          get_logger(),
-          "[publish_odometry] canTransform(%s <- %s) = true",
-          robot_odom_frame_id.c_str(), odom_child_frame_id.c_str());
-        geometry_msgs::msg::TransformStamped map_wrt_frame = tf2::eigenToTransform(Eigen::Isometry3d(pose.inverse().cast<double>()));
-        map_wrt_frame.header.stamp = tf_stamp;
-        map_wrt_frame.header.frame_id = odom_child_frame_id;
-        map_wrt_frame.child_frame_id = "map";
-
-        geometry_msgs::msg::TransformStamped frame_wrt_odom = tf_buffer->lookupTransform(
-          robot_odom_frame_id,
-          odom_child_frame_id,
-          rclcpp::Time((int64_t)0, get_clock()->get_clock_type()));
-        Eigen::Matrix4f frame2odom = tf2::transformToEigen(frame_wrt_odom).cast<float>().matrix();
-
-        geometry_msgs::msg::TransformStamped map_wrt_odom;
-        tf2::doTransform(map_wrt_frame, map_wrt_odom, frame_wrt_odom);
-
-        tf2::Transform odom_wrt_map;
-        tf2::fromMsg(map_wrt_odom.transform, odom_wrt_map);
-        odom_wrt_map = odom_wrt_map.inverse();
-
-        geometry_msgs::msg::TransformStamped odom_trans;
-        odom_trans.transform = tf2::toMsg(odom_wrt_map);
+      Eigen::Matrix4f robot_odom = Eigen::Matrix4f::Identity();
+      bool has_fresh_robot_odom = false;
+      {
+        std::lock_guard<std::mutex> lock(robot_odom_mutex_);
+        const double age = (get_clock()->now() - latest_robot_odom_receive_time_).seconds();
+        if (latest_robot_odom_sequence_ > 0 && age >= 0.0 && age < 0.5) {
+          robot_odom = latest_robot_odom_;
+          has_fresh_robot_odom = true;
+        }
+      }
+      if (has_fresh_robot_odom) {
+        // map_T_odom = map_T_base * inverse(odom_T_base). Computing this from
+        // the subscribed odometry avoids a startup cycle through the TF buffer.
+        const Eigen::Matrix4f map_to_odom = pose * robot_odom.inverse();
+        geometry_msgs::msg::TransformStamped odom_trans = tf2::eigenToTransform(
+          Eigen::Isometry3d(map_to_odom.cast<double>()));
         odom_trans.header.stamp = tf_stamp;
         odom_trans.header.frame_id = "map";
         odom_trans.child_frame_id = robot_odom_frame_id;
@@ -1107,8 +1459,8 @@ private:
       } else {
         RCLCPP_DEBUG(
           get_logger(),
-          "[publish_odometry] canTransform(%s <- %s) = false, fallback broadcast map -> %s directly",
-          robot_odom_frame_id.c_str(), odom_child_frame_id.c_str(), odom_child_frame_id.c_str());
+          "[publish_odometry] robot odometry unavailable, fallback broadcast map -> %s directly",
+          odom_child_frame_id.c_str());
         geometry_msgs::msg::TransformStamped odom_trans = tf2::eigenToTransform(Eigen::Isometry3d(pose.cast<double>()));
         odom_trans.header.stamp = tf_stamp;
         odom_trans.header.frame_id = "map";
@@ -1586,6 +1938,7 @@ private:
     status.relative_pose = tf2::eigenToTransform(
       Eigen::Isometry3d(relative_transform.cast<double>())).transform;
     if (!aligned || aligned->empty()) {
+      last_ndt_status_healthy_ = false;
       status.has_converged = false;
       status.inlier_fraction = 0.0f;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2.0,
@@ -1612,10 +1965,11 @@ private:
       }
     }
     status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
-    const bool score_valid = std::isfinite(status.matching_error) && status.matching_error < 100.0f;
+    const bool score_valid = std::isfinite(status.matching_error) && status.matching_error < 0.5f;
     const bool inliers_valid = status.inlier_fraction >= 0.05f;
-    const bool transform_valid = std::isfinite(relative_translation_m) && relative_translation_m < 20.0;
+    const bool transform_valid = std::isfinite(relative_translation_m) && relative_translation_m < 1.0;
     status.has_converged = registration->hasConverged() && score_valid && inliers_valid && transform_valid;
+    last_ndt_status_healthy_ = status.has_converged;
     if (registration->hasConverged() && !status.has_converged) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2.0,
                            "NDT convergence rejected: score=%.3f, inlier=%.3f, relative_translation=%.3f",
@@ -1952,6 +2306,8 @@ private:
   rclcpp::Publisher<localization::msg::ScanMatchingStatus>::SharedPtr status_pub;
   rclcpp::Publisher<robots_dog_msgs::msg::Localization>::SharedPtr    localization_info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         global_map_pub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr              localization_policy_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                 localization_decision_pub_;
 
   std::unique_ptr<tf2_ros::Buffer>               tf_buffer;
   std::shared_ptr<tf2_ros::TransformListener>    tf_listener;
@@ -1997,6 +2353,37 @@ private:
   rclcpp::Time latest_gnss_heading_receive_time_{0, 0, RCL_ROS_TIME};
   std::chrono::steady_clock::time_point last_gnss_recovery_attempt_{};
   bool gnss_recovery_seed_pending_ = false;
+  bool source_arbiter_enable_ = true;
+  std::string preferred_source_ = "ndt";
+  std::string active_source_ = "unavailable";
+  std::string motion_phase_ = "stationary";
+  bool bridge_active_ = false;
+  rclcpp::Time bridge_start_time_{0, 0, RCL_ROS_TIME};
+  double bridge_distance_m_ = 0.0;
+  double bridge_max_distance_m_ = 10.0;
+  double bridge_max_seconds_ = 20.0;
+  double bridge_max_horizontal_sigma_m_ = 0.8;
+  double bridge_max_yaw_sigma_rad_ = 15.0 * M_PI / 180.0;
+  double bridge_translation_variance_per_m_ = 0.0025;
+  double bridge_max_odom_speed_mps_ = 1.5;
+  double bridge_max_odom_yaw_rate_rps_ = 2.0;
+  int absolute_recovery_samples_ = 3;
+  int moving_ndt_stride_ = 5;
+  int ndt_failure_hysteresis_frames_ = 3;
+  int ndt_unhealthy_frame_count_ = 0;
+  uint64_t ndt_frame_counter_ = 0;
+  bool last_ndt_healthy_ = false;
+  bool last_ndt_status_healthy_ = false;
+  double last_ndt_score_ = std::numeric_limits<double>::infinity();
+  rclcpp::Time last_ndt_update_time_{0, 0, RCL_ROS_TIME};
+  Eigen::Vector3f last_rtk_map_position_ = Eigen::Vector3f::Zero();
+  double last_rtk_map_yaw_ = 0.0;
+  int absolute_stable_count_ = 0;
+  bool absolute_stable_ = false;
+  std::string stable_source_;
+  std::string bridge_rejection_reason_;
+  std::string odom_time_source_ = "unavailable";
+  int64_t last_absolute_observation_stamp_ns_ = 0;
   
   // transformation matrices 
   Eigen::Matrix3f init_rotation_matrix_ = Eigen::Matrix3f::Identity();
@@ -2082,6 +2469,9 @@ private:
   Eigen::Matrix4f latest_robot_odom_ = Eigen::Matrix4f::Identity();
   Eigen::Matrix4f previous_robot_odom_ = Eigen::Matrix4f::Identity();
   rclcpp::Time latest_robot_odom_receive_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time previous_robot_odom_receive_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time latest_robot_odom_source_stamp_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time previous_robot_odom_source_stamp_{0, 0, RCL_ROS_TIME};
   uint64_t latest_robot_odom_sequence_ = 0;
   uint64_t consumed_robot_odom_sequence_ = 0;
   bool odom_prediction_initialized_ = false;

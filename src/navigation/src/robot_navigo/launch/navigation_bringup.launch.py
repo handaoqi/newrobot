@@ -89,6 +89,12 @@ def generate_launch_description():
         description='platform of nav running on'
     )
 
+    declare_use_official_ukf_cmd = DeclareLaunchArgument(
+        'use_official_ukf',
+        default_value='false',
+        description='Use an already-running official robot_localization TF chain instead of odom_to_tf_broadcaster',
+    )
+
     declare_mc_controller_type_cmd = DeclareLaunchArgument(
         'mc_controller_type',
         default_value='NO_SPECIFIED',
@@ -212,7 +218,10 @@ def generate_launch_description():
     # )
 
     odom_tf_publisher_node = Node(
-        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('platform'), "' == 'NX_XG3588'"])),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('platform'), "' == 'NX_XG3588' and '",
+            LaunchConfiguration('use_official_ukf'), "' != 'true'"
+        ])),
         package='robot_navigo',
         executable='odom_to_tf_broadcaster',
         parameters=[{
@@ -361,6 +370,7 @@ def generate_launch_description():
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_robot_name_cmd)
     ld.add_action(declare_platform_cmd)
+    ld.add_action(declare_use_official_ukf_cmd)
     ld.add_action(declare_mc_controller_type_cmd)
     ld.add_action(declare_communication_type_cmd)
     ld.add_action(declare_tf_type_cmd)
@@ -388,7 +398,9 @@ def generate_launch_description():
     # The sensor conversion and health chain is started independently by
     # ensure_navigation_sensors.sh so a failed Nav2 restart cannot stop it.
     # ld.add_action(cmd_cel_lcm_publisher_node)
-    ld.add_action(load_vel_cmd_pub_node)
+    # The UDP velocity/remote bridge is owned by roamerx-teleop-bridge.service.
+    # Keeping it outside Nav2 prevents duplicate SDK socket owners across
+    # charging, localization, and navigation restarts.
     ld.add_action(mode_status_pub_node)
 
     # Add the actions to launch all of the navigation nodes

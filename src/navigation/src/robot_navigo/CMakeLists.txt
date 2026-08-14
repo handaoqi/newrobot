@@ -78,6 +78,12 @@ find_library(GENISOM_L1_SDK_LIB
     NO_DEFAULT_PATH
     REQUIRED
 )
+find_library(ZSIBOT_LIB
+    NAMES zsibot
+    PATHS /usr/local/lib
+    NO_DEFAULT_PATH
+    REQUIRED
+)
 
 #############################################################################
 # some exe lib
@@ -186,10 +192,12 @@ ament_target_dependencies(vel_cmd_udp_pub
         rclcpp)
 target_link_libraries(vel_cmd_udp_pub
         ${GENISOM_L1_SDK_LIB}
+        ${ZSIBOT_LIB}
 )
 target_include_directories(vel_cmd_udp_pub
   PRIVATE
     ${GENISOM_L1_SDK_ROOT}/include
+    /usr/local/include/zsibot/include
 )
 
 #==========================>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

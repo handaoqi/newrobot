@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -11,6 +13,8 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ class MappingAdapter:
     """
 
     REQUIRED_FILES = ("map.yaml", "map.pgm")
-    OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt", "gnss_origin.yaml")
+    OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt", "gnss_origin.yaml", "mapping_trace.json")
     SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
     SLAM_PROCESS_PATTERNS = (
         "robot_slam.*mapping",
@@ -687,12 +691,13 @@ class MappingAdapter:
             }
         else:
             filtered_base, dynamic_filter_result = self._filter_map_outputs(base)
+        trace_path = self._generate_mapping_trace(base, filtered_base)
         preview_path = self._generate_map_preview(filtered_base)
         version = time.strftime("%Y%m%d-%H%M%S")
         package_path = self.map_dir / f"map_package_{version}.zip"
         # Keep the ENU-to-map transform with the map package. Without this
         # file, an uploaded map cannot use RTK for initialization or fusion.
-        upload_files = ["map.yaml", "map.pgm", "map.txt", "gnss_origin.yaml"]
+        upload_files = ["map.yaml", "map.pgm", "map.txt", "gnss_origin.yaml", "mapping_trace.json"]
         if preview_path:
             upload_files.append(preview_path.name)
         if self.config.upload_point_cloud:
@@ -728,6 +733,74 @@ class MappingAdapter:
             "rescue": rescue_metadata,
         }
         return package_path, metadata
+
+    def _generate_mapping_trace(self, source: Path, output: Path) -> Path | None:
+        keyframe_csv = source / "keyframes" / "keyframes.csv"
+        if not keyframe_csv.exists():
+            return None
+        gnss_metadata = {}
+        gnss_path = source / "gnss_origin.yaml"
+        if gnss_path.exists():
+            gnss_metadata = yaml.safe_load(gnss_path.read_text(encoding="utf-8")) or {}
+        alignment_locked = bool(int(gnss_metadata.get("alignment_locked") or 0))
+        origin_lat = float(gnss_metadata.get("origin_latitude") or 0.0)
+        origin_lon = float(gnss_metadata.get("origin_longitude") or 0.0)
+        alignment_yaw = float(gnss_metadata.get("enu_to_map_yaw") or 0.0)
+        offset_x = float(gnss_metadata.get("map_offset_x") or 0.0)
+        offset_y = float(gnss_metadata.get("map_offset_y") or 0.0)
+        earth_radius_m = 6378137.0
+        samples = []
+        def optional_number(value, digits):
+            parsed = float(value or 0.0)
+            return round(parsed, digits) if math.isfinite(parsed) else None
+
+        with keyframe_csv.open(encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):
+                try:
+                    slam = {
+                        "x": round(float(row["x"]), 4),
+                        "y": round(float(row["y"]), 4),
+                        "yaw": round(float(row.get("yaw") or 0.0), 5),
+                    }
+                    rtk_valid = row.get("rtk_valid") == "1"
+                    latitude = float(row.get("rtk_latitude") or 0.0)
+                    longitude = float(row.get("rtk_longitude") or 0.0)
+                    rtk = {
+                        "valid": rtk_valid,
+                        "status": int(row.get("rtk_status") or -1),
+                        "horizontal_std_m": optional_number(row.get("rtk_horizontal_std"), 3),
+                        "age_s": optional_number(row.get("rtk_age_seconds"), 3),
+                        "heading_valid": row.get("rtk_heading_valid") == "1",
+                        "heading_deg": optional_number(row.get("rtk_heading_deg"), 3),
+                        "heading_std_deg": optional_number(row.get("rtk_heading_std_deg"), 3),
+                    }
+                    if rtk_valid and alignment_locked and abs(latitude) > 1e-7 and abs(longitude) > 1e-7:
+                        north = (latitude - origin_lat) * math.pi / 180.0 * earth_radius_m
+                        east = (longitude - origin_lon) * math.pi / 180.0 * math.cos(origin_lat * math.pi / 180.0) * earth_radius_m
+                        rtk["x"] = round(math.cos(alignment_yaw) * east - math.sin(alignment_yaw) * north + offset_x, 4)
+                        rtk["y"] = round(math.sin(alignment_yaw) * east + math.cos(alignment_yaw) * north + offset_y, 4)
+                        if rtk["heading_valid"]:
+                            yaw_enu = math.pi / 2.0 - math.radians(rtk["heading_deg"])
+                            rtk["yaw"] = round(math.atan2(math.sin(yaw_enu + alignment_yaw), math.cos(yaw_enu + alignment_yaw)), 5)
+                    samples.append({
+                        "index": int(row["index"]),
+                        "stamp": round(float(row["stamp"]), 6),
+                        "slam": slam,
+                        "rtk": rtk,
+                    })
+                except (KeyError, TypeError, ValueError):
+                    LOGGER.warning("Skipping malformed mapping trace row: %s", row)
+        if not samples:
+            return None
+        output.mkdir(parents=True, exist_ok=True)
+        trace_path = output / "mapping_trace.json"
+        trace_path.write_text(json.dumps({
+            "format": "roamerx.mapping-trace.v1",
+            "frame_id": "map",
+            "alignment_locked": alignment_locked,
+            "samples": samples,
+        }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        return trace_path
 
     def _generate_map_preview(self, base: Path) -> Path | None:
         pgm_path = base / "map.pgm"

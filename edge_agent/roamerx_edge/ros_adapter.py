@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import math
+import subprocess
 import threading
 import time
 from collections import deque
@@ -24,11 +25,11 @@ try:
     from rclpy.action import ActionClient
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import LaserScan
     from robots_dog_msgs.msg import Localization
     from localization.msg import ScanMatchingStatus
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from std_srvs.srv import Trigger
 
     ROS_AVAILABLE = True
@@ -76,7 +77,10 @@ class RosAdapter(Node):
         self._actual_turn_command = 0.0
         self._front_obstacle_distance_m = None
         self._robot_motion_state = "unknown"
+        self._robot_motion_state_sequence = 0
+        self._robot_motion_condition = threading.Condition()
         self._robot_standing_event = threading.Event()
+        self._remote_control_event = threading.Event()
         self.create_subscription(
             Localization,
             ros_config.localization_topic,
@@ -87,6 +91,7 @@ class RosAdapter(Node):
         self.create_subscription(Twist, ros_config.cmd_vel_topic, self._on_cmd_vel, 10)
         self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
+        self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
         if ros_config.scan_matching_status_topic:
             self.create_subscription(
                 ScanMatchingStatus,
@@ -98,13 +103,47 @@ class RosAdapter(Node):
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
         self._rtk_initial_pose_client = self.create_client(Trigger, "/localization/seed_from_rtk")
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self._teleop_cmd_vel_pub = self.create_publisher(Twist, "/teleop_cmd_vel", 10)
         self._teleop_action_pub = self.create_publisher(String, "/teleop_action", 10)
+        self._remote_teleop_action_pub = self.create_publisher(String, "/remote_teleop_action", 10)
+        self._localization_policy_pub = self.create_publisher(String, "/localization/policy", 10)
+        goal_yaw_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self._goal_yaw_required_pub = self.create_publisher(Bool, "/navigation/require_goal_yaw", goal_yaw_qos)
         self.create_subscription(String, "/robot_motion_state", self._on_robot_motion_state, 10)
 
     def _on_robot_motion_state(self, msg) -> None:
-        self._robot_motion_state = str(msg.data)
+        with self._robot_motion_condition:
+            self._robot_motion_state = str(msg.data)
+            self._robot_motion_state_sequence += 1
+            self._robot_motion_condition.notify_all()
         if self._robot_motion_state == "standing":
             self._robot_standing_event.set()
+        elif self._robot_motion_state == "remote_control":
+            self._remote_control_event.set()
+
+    def _on_localization_decision(self, msg) -> None:
+        try:
+            payload = json.loads(str(msg.data))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("invalid /localization/decision payload")
+            return
+        if isinstance(payload, dict):
+            self.telemetry.on_localization_decision(payload)
+
+    def set_localization_policy(self, source: str, phase: str) -> dict:
+        source = "rtk" if str(source).lower() == "rtk" else "ndt"
+        phase = "moving" if str(phase).lower() == "moving" else "stationary"
+        msg = String()
+        msg.data = f"{phase}:{source}"
+        self._localization_policy_pub.publish(msg)
+        return {"topic": "/localization/policy", "source": source, "phase": phase}
+
+    def localization_decision(self) -> dict:
+        return self.telemetry.localization_decision()
 
     def prepare_for_navigation(self, timeout_seconds: float = 12.0) -> bool:
         """Stand the robot and wait for the SDK bridge to confirm it is stable."""
@@ -345,9 +384,11 @@ class RosAdapter(Node):
         msg.linear.x = float(vx)
         msg.linear.y = float(vy)
         msg.angular.z = float(yaw_rate)
-        self._cmd_vel_pub.publish(msg)
+        # Manual remote control is intentionally isolated from Nav2 /cmd_vel.
+        # The remote-only bridge encodes this as the vendor remote joystick protocol.
+        self._teleop_cmd_vel_pub.publish(msg)
         return {
-            "topic": "/cmd_vel",
+            "topic": "/teleop_cmd_vel",
             "vx": msg.linear.x,
             "vy": msg.linear.y,
             "yaw_rate": msg.angular.z,
@@ -363,6 +404,86 @@ class RosAdapter(Node):
             self._teleop_action_pub.publish(msg)
             time.sleep(0.08)
         return {"topic": "/teleop_action", "action": msg.data, "publish_count": 3}
+
+    def remote_teleop_action(self, action: str) -> dict:
+        msg = String()
+        msg.data = str(action)
+        for _ in range(3):
+            self._remote_teleop_action_pub.publish(msg)
+            time.sleep(0.08)
+        return {"topic": "/remote_teleop_action", "action": msg.data, "publish_count": 3}
+
+    def confirmed_remote_teleop_action(
+        self,
+        action: str,
+        success_states: set[str],
+        failure_states: set[str] | None = None,
+        timeout_seconds: float = 4.0,
+    ) -> dict:
+        failure_states = failure_states or set()
+        with self._robot_motion_condition:
+            start_sequence = self._robot_motion_state_sequence
+        result = self.remote_teleop_action(action)
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self._robot_motion_condition:
+            while self._robot_motion_state_sequence <= start_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._robot_motion_condition.wait(timeout=remaining)
+            state = self._robot_motion_state
+        if state in failure_states:
+            raise ProtocolError("TELEOP_ACTION_FAILED", f"robot reported {state} while executing {action}")
+        if state not in success_states:
+            raise ProtocolError(
+                "TELEOP_ACTION_TIMEOUT",
+                f"robot did not confirm {action} within {timeout_seconds:.1f}s (last motion state={state})",
+            )
+        return {**result, "confirmed": True, "motion_state": state}
+
+    def confirmed_teleop_action(
+        self,
+        action: str,
+        success_states: set[str],
+        failure_states: set[str] | None = None,
+        timeout_seconds: float = 4.0,
+    ) -> dict:
+        failure_states = failure_states or set()
+        with self._robot_motion_condition:
+            start_sequence = self._robot_motion_state_sequence
+        result = self.teleop_action(action)
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self._robot_motion_condition:
+            while self._robot_motion_state_sequence <= start_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._robot_motion_condition.wait(timeout=remaining)
+            state = self._robot_motion_state
+        if state in failure_states:
+            raise ProtocolError(
+                "TELEOP_ACTION_FAILED",
+                f"robot reported {state} while executing {action}",
+            )
+        if state not in success_states:
+            raise ProtocolError(
+                "TELEOP_ACTION_TIMEOUT",
+                f"robot did not confirm {action} within {timeout_seconds:.1f}s "
+                f"(last motion state={state})",
+            )
+        return {**result, "confirmed": True, "motion_state": state}
+
+    def release_to_remote_control(self, timeout_seconds: float = 3.0) -> dict:
+        self._remote_control_event.clear()
+        result = self.teleop_action("release_remote")
+        confirmed = self._remote_control_event.wait(timeout=max(0.0, timeout_seconds))
+        if not confirmed:
+            raise ProtocolError(
+                "REMOTE_CONTROL_RELEASE_TIMEOUT",
+                f"robot did not confirm remote control within {timeout_seconds:.1f}s "
+                f"(last motion state={self._robot_motion_state})",
+            )
+        return {**result, "confirmed": True, "motion_state": self._robot_motion_state}
 
     def set_initial_pose(self, pose: dict) -> dict:
         yaw = float(pose.get("yaw", 0.0))
@@ -597,6 +718,35 @@ class RosAdapter(Node):
         for _ in range(5):
             self._cmd_vel_pub.publish(zero)
             time.sleep(0.05)
+
+    def set_docking_profile(self, *, final_approach: bool) -> None:
+        """Apply the speed cap used only for the dock contact leg."""
+        vx_max = "0.15" if final_approach else "0.5"
+        script = (
+            "source /opt/ros/humble/setup.bash; "
+            "source /home/robot/genisom_roamerx_open/install/setup.bash; "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
+            f"ros2 param set /controller_server FollowPath.vx_max {vx_max}"
+        )
+        completed = subprocess.run(["bash", "-lc", script], text=True, capture_output=True, timeout=20)
+        if completed.returncode != 0:
+            raise ProtocolError("DOCKING_PROFILE_FAILED", completed.stderr or completed.stdout)
+
+    def set_waypoint_profile(self, *, avoid_obstacles: bool, require_yaw: bool) -> None:
+        enabled = "true" if avoid_obstacles else "false"
+        yaw_message = Bool()
+        yaw_message.data = bool(require_yaw)
+        self._goal_yaw_required_pub.publish(yaw_message)
+        script = (
+            "set -e; source /opt/ros/humble/setup.bash; "
+            "source /home/robot/genisom_roamerx_open/install/setup.bash; "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
+            f"ros2 param set /local_costmap/local_costmap obstacle_layer.enabled {enabled}; "
+            f"ros2 param set /global_costmap/global_costmap obstacle_layer.enabled {enabled}"
+        )
+        completed = subprocess.run(["bash", "-lc", script], text=True, capture_output=True, timeout=20)
+        if completed.returncode != 0:
+            raise ProtocolError("WAYPOINT_PROFILE_FAILED", completed.stderr or completed.stdout)
 
     def is_robot_stopped(self) -> bool:
         deadline = time.monotonic() + self.safety_config.stop_confirmation_seconds + 3

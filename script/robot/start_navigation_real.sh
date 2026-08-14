@@ -11,6 +11,7 @@ if [ "${PLATFORM}" = "linux" ]; then
 fi
 MC_CONTROLLER_TYPE="${MC_CONTROLLER_TYPE:-RL_TRACK_VELOCITY}"
 COMMUNICATION_TYPE="${COMMUNICATION_TYPE:-UDP}"
+USE_OFFICIAL_UKF="${USE_OFFICIAL_UKF:-false}"
 LOCALIZATION_WAIT_SECONDS="${LOCALIZATION_WAIT_SECONDS:-60}"
 REQUIRE_RTK="${REQUIRE_RTK:-0}"
 RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
@@ -76,6 +77,11 @@ is_localization_running() {
 is_navigation_running() {
   pgrep -f "ros2 launch robot_navigo navigation_bringup.launch.py" >/dev/null 2>&1 || \
     pgrep -f "component_container_isolated.*navigo_container" >/dev/null 2>&1
+}
+
+is_rtk_running() {
+  pgrep -f "rtk_ntrip_bridge.py" >/dev/null 2>&1 && \
+    pgrep -f "sixents_gps_driver" >/dev/null 2>&1
 }
 
 is_running() {
@@ -187,8 +193,11 @@ localization_is_valid() {
 
 start_stack() {
   "${PROJECT_DIR}/script/robot/ensure_navigation_sensors.sh"
+  if ! is_rtk_running; then
+    ensure_rtk
+  fi
   if is_running; then
-    echo "Navigation and localization already appear to be running."
+    echo "RTK, navigation sensors, localization, and Nav2 already appear to be running."
     echo "Use '$0 restart' to stop and start again."
     return 0
   fi
@@ -201,8 +210,6 @@ start_stack() {
     echo "ERROR: PCD map not found: ${PCD_MAP}" >&2
     exit 1
   fi
-
-  ensure_rtk
 
   local localization_started=false
   if ! is_localization_running; then
@@ -229,8 +236,12 @@ start_stack() {
   if is_navigation_running; then
     echo "Nav2/Navigo already appears to be running."
   else
+    # A direct remote bridge uses the same fixed SDK UDP endpoint as Nav2's
+    # velocity bridge. Stop it before launching Nav2 so the two modes cannot
+    # silently bind-conflict.
+    kill_pattern "vel_cmd_udp_pub.*remote_control_only:=true"
     echo "Starting Nav2/Navigo..."
-    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' map:='${MAP_YAML}'" \
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' use_official_ukf:='${USE_OFFICIAL_UKF}' map:='${MAP_YAML}'" \
       >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
     start_navigation_diagnostics
   fi

@@ -161,6 +161,9 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("x", "y", "yaw"):
                 if isinstance(waypoint.get(field), bool) or not isinstance(waypoint.get(field), (int, float)):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be numeric")
+            for field in ("avoidance_to_next", "require_yaw"):
+                if field in waypoint and not isinstance(waypoint[field], bool):
+                    raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")

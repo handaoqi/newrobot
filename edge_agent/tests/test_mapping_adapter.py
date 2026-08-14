@@ -130,6 +130,33 @@ def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):
     assert "gnss_origin.yaml" in metadata["files"]
 
 
+def test_map_package_contains_lightweight_slam_and_rtk_trace(tmp_path, monkeypatch):
+    session = tmp_path / "20260715_122500_004"
+    keyframes = session / "keyframes"
+    keyframes.mkdir(parents=True)
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "map.txt").write_text("0 0 0\n")
+    (session / "gnss_origin.yaml").write_text(
+        "origin_latitude: 39.0\norigin_longitude: 116.0\nalignment_locked: 1\n"
+        "enu_to_map_yaw: 0.0\nmap_offset_x: 0.0\nmap_offset_y: 0.0\n"
+    )
+    (keyframes / "keyframes.csv").write_text(
+        "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,rtk_heading_age_seconds\n"
+        "0,100.0,1.0,2.0,0.0,0.5,10,1,2,39.0,116.0,0.0,0.02,0.1,1,90.0,0.5,0.1\n"
+    )
+    adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
+    monkeypatch.setattr(adapter, "_generate_map_preview", lambda _base: None)
+
+    package, metadata = adapter._package_map({}, session)
+
+    with zipfile.ZipFile(package) as archive:
+        trace = json.loads(archive.read("mapping_trace.json"))
+    assert "mapping_trace.json" in metadata["files"]
+    assert trace["samples"][0]["slam"] == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    assert trace["samples"][0]["rtk"]["yaw"] == pytest.approx(0.0)
+
+
 def test_finds_newest_incomplete_recoverable_session(tmp_path):
     recoverable = tmp_path / "20260715_130000_004"
     keyframes = recoverable / "keyframes"

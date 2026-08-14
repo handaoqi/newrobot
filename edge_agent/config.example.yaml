@@ -28,10 +28,13 @@ telemetry:
   trajectory_flush_seconds: 5
   trajectory_batch_size: 20
   system_probe_interval_seconds: 10
+  cooling_system_probe_interval_seconds: 15
   system_probe_stale_seconds: 30
   battery_ssh_host: "3588"
   modem_at_device: "/dev/ttyUSB2"
   charging_current_threshold_ma: 300
+  charging_overheat_threshold_c: 49
+  battery_rated_capacity_wh: 216
   charger_speaker_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
   nx_speaker_card: 2
   nx_speaker_control: "PCM"
@@ -113,11 +116,15 @@ charge_control:
   service_name: "roamerx-charge-pile"
   working_directory: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
   executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
-  command_timeout_seconds: 35
-  full_battery_percent: 100
+  return_executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_returning"
+  controller_service_name: "robot-launch.service"
+  command_timeout_seconds: 90
+  full_battery_percent: 95
   full_confirmation_samples: 3
+  low_battery_start_percent: 20
+  low_battery_confirmation_samples: 2
   cooling_stop_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
-  normal_start_eggs: [zenoh_route, imu_daemon, ecal2ros, motion_control, spline_daemon, dog_task, monitor, push_image]
+  normal_start_eggs: [arc_platform, monitor, time_sync, spline_daemon, motion_control, zenoh_route, dog_task, push_image, ecal2ros, imu_daemon]
   cooling_stop_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
   normal_start_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
 
@@ -126,13 +133,12 @@ power_mode:
   cooling_marker_path: /home/robot/edge_agent/data/cooling_standby
   monitoring_service: roamerx-bike-bot.service
   navigation_script: /home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh
-  sensor_start_script: /home/robot/genisom_roamerx_open/script/robot/ensure_navigation_sensors.sh
-  cooling_power_mode: 1
-  normal_power_mode: 0
-  normal_start_timeout_seconds: 120
-  reboot_delay_seconds: 12
+  normal_start_timeout_seconds: 240
+  always_on_services: [roamerx-dev-agent.service, roamerx-robot-mcp.service, roamerx-zenoh.service, roamerx-5g-share.service]
   controller_host: "3588"
-  controller_runtime_eggs: [push_image, spline_daemon, motion_control, dog_task, imu_daemon, ecal2ros, monitor, zenoh_route]
+  controller_always_eggs: [time_sync, power_daemon]
+  controller_runtime_eggs: [arc_platform, monitor, spline_daemon, motion_control, zenoh_route, dog_task, push_image, ecal2ros, imu_daemon]
+  controller_always_services: [robot-launch.service, roamerx-charge-pile.service]
   controller_runtime_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
 
 audio_control:

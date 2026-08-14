@@ -83,3 +83,30 @@ def test_activation_restores_cloud_gnss_metadata(tmp_path):
 
     assert (source / "gnss_origin.yaml").read_text() == metadata
     assert (tmp_path / "gnss_origin.yaml").resolve() == (source / "gnss_origin.yaml")
+
+
+def test_manual_activation_reuses_complete_cached_revision(tmp_path):
+    source = _source_map(tmp_path, "source")
+    config_path = tmp_path / "edge.yaml"
+    config_path.write_text("robot: {}\n")
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(map_dir=str(tmp_path)),
+        robot=SimpleNamespace(current_map_id="", current_map_version=""),
+    )
+    adapter = MapActivationAdapter(config, RuntimeSafetyState(), str(config_path))
+    cached = tmp_path / "manual_edits" / "map_95_revision"
+    cached.mkdir(parents=True)
+    for filename in ("map.yaml", "map.pgm", "map.pcd"):
+        (cached / filename).write_text(f"cached-{filename}")
+
+    result = adapter.activate({
+        "map_id": "95",
+        "map_version": "revision",
+        "local_map_dir": str(source),
+        "manual_edit": True,
+        "pgm_url": "http://unreachable/maps/95.pgm",
+        "yaml_url": "http://unreachable/maps/95.yaml",
+    })
+
+    assert result["manual_cleanup"] == {"reused_cached_revision": True}
+    assert (tmp_path / "map.pcd").resolve() == cached / "map.pcd"

@@ -2,7 +2,9 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-WAIT_SECONDS="${WAIT_SECONDS:-12}"
+# A MID-360 can need noticeably longer to resume UDP point output after a
+# charging-standby cycle. Avoid treating a healthy cold start as a failure.
+WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
 set +u
 source /opt/ros/humble/setup.bash
@@ -34,7 +36,9 @@ wait_for_message() {
   local label="$2"
   local deadline=$((SECONDS + WAIT_SECONDS))
   while (( SECONDS < deadline )); do
-    if timeout 2 ros2 topic echo "${topic}" --once \
+    # A fresh Zenoh ROS 2 subscriber needs several seconds for discovery;
+    # a two-second probe repeatedly timed out before it could receive data.
+    if timeout 6 ros2 topic echo "${topic}" --once \
         --qos-reliability best_effort >/dev/null 2>&1; then
       echo "${label} data OK: ${topic}"
       return 0

@@ -1,0 +1,20 @@
+[Unit]
+Description=RoamerX NX-local FunASR service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+Environment=HOME=/home/robot
+Environment=MODELSCOPE_CACHE=/home/robot/.local/share/roamerx-voice/models
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/robot/.local/share/roamerx-voice/venv/bin/funasr-server --host 127.0.0.1 --port 18080 --device cuda:0 --model sensevoice
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timezone
 
 import rclpy
 import serial
@@ -78,6 +79,7 @@ class NtripBridge(Node):
         self.position = RtkPosition()
         self.position_lock = threading.Lock()
         self.running = True
+        self.last_measurement_time_source = "none"
         self.status_pub = self.create_publisher(String, self.config["status_topic"], 10)
         self.gps_pub = self.create_publisher(Nmea, self.config["gps_topic"], 10)
         self.fix_pub = self.create_publisher(NavSatFix, self.config["fix_topic"], 10)
@@ -89,6 +91,41 @@ class NtripBridge(Node):
         )
         self.worker = threading.Thread(target=self.run_bridge, daemon=True)
         self.worker.start()
+
+    def measurement_stamp(self, msg: UniRtkPvh):
+        """Use the receiver measurement epoch; reception time is only a last-resort fallback."""
+        header_seconds = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        if header_seconds >= 946684800.0:
+            return msg.header.stamp, "receiver_header"
+
+        utc_value = float(msg.bestnav.utc_time_s)
+        if utc_value >= 946684800.0:
+            epoch_seconds = utc_value
+            source = "receiver_utc_epoch"
+        else:
+            now_utc = datetime.now(timezone.utc)
+            if 0.0 <= utc_value < 86400.0:
+                seconds_of_day = utc_value
+            elif 0.0 <= utc_value < 240000.0:
+                hours = int(utc_value // 10000)
+                minutes = int((utc_value % 10000) // 100)
+                seconds_of_day = hours * 3600 + minutes * 60 + (utc_value % 100)
+            else:
+                return self.get_clock().now().to_msg(), "ros_reception_fallback"
+            midnight = datetime.combine(now_utc.date(), datetime_time(), tzinfo=timezone.utc)
+            epoch_seconds = midnight.timestamp() + seconds_of_day
+            if epoch_seconds - now_utc.timestamp() > 43200.0:
+                epoch_seconds -= 86400.0
+            elif now_utc.timestamp() - epoch_seconds > 43200.0:
+                epoch_seconds += 86400.0
+            source = "receiver_utc_day"
+        stamp = self.get_clock().now().to_msg()
+        stamp.sec = int(epoch_seconds)
+        stamp.nanosec = int(round((epoch_seconds - stamp.sec) * 1e9))
+        if stamp.nanosec >= 1_000_000_000:
+            stamp.sec += 1
+            stamp.nanosec -= 1_000_000_000
+        return stamp, source
         self.timer = self.create_timer(2.0, self.publish_snapshot)
 
     def load_config(self, path: str) -> dict:
@@ -206,9 +243,7 @@ class NtripBridge(Node):
             )
         fix = NavSatFix()
         fix.header = msg.header
-        # The controller header may use device uptime. Downstream fusion needs
-        # the ROS reception time so LiDAR, IMU and GNSS age checks agree.
-        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.stamp, measurement_time_source = self.measurement_stamp(msg)
         fix.header.frame_id = self.config["gps_frame_id"]
         fix.status.status = {
             "rtk_fixed": NavSatStatus.STATUS_GBAS_FIX,
@@ -253,6 +288,7 @@ class NtripBridge(Node):
             ).strip()
         self.fix_pub.publish(fix)
         self.gps_pub.publish(nmea)
+        self.last_measurement_time_source = measurement_time_source
 
     def publish_status(self, state: str, **extra):
         payload = {"state": state, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
@@ -278,6 +314,7 @@ class NtripBridge(Node):
             position_type=pos.position_type,
             differential_age_s=round(pos.differential_age_s, 2) if math.isfinite(pos.differential_age_s) else None,
             age_sec=round(time.time() - pos.stamp, 1) if pos.stamp else None,
+            measurement_time_source=self.last_measurement_time_source,
         )
 
     def current_gga(self) -> str | None:

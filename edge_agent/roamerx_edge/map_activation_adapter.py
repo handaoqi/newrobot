@@ -43,17 +43,24 @@ class MapActivationAdapter:
             if command.get("manual_edit"):
                 safe_version = re.sub(r"[^A-Za-z0-9_.-]+", "_", map_version)[:96] or map_id
                 edited_dir = self.map_dir / "manual_edits" / f"map_{map_id}_{safe_version}"
-                try:
-                    cleanup_result = build_manual_cleanup_map(
-                        source_dir,
-                        edited_dir,
-                        pgm_url=str(command.get("pgm_url") or ""),
-                        yaml_url=str(command.get("yaml_url") or ""),
-                        pgm_sha256=str(command.get("pgm_sha256") or ""),
-                        yaml_sha256=str(command.get("yaml_sha256") or ""),
-                    )
-                except ManualMapCleanupError as exc:
-                    raise ProtocolError("MAP_MANUAL_CLEANUP_FAILED", str(exc)) from exc
+                cached_files = [edited_dir / name for name in self.REQUIRED_FILES]
+                if all(path.exists() for path in cached_files):
+                    # A manual revision is immutable for its map id/version.
+                    # Reuse its complete local copy when the robot is offline
+                    # from the cloud media host instead of rebuilding it.
+                    cleanup_result = {"reused_cached_revision": True}
+                else:
+                    try:
+                        cleanup_result = build_manual_cleanup_map(
+                            source_dir,
+                            edited_dir,
+                            pgm_url=str(command.get("pgm_url") or ""),
+                            yaml_url=str(command.get("yaml_url") or ""),
+                            pgm_sha256=str(command.get("pgm_sha256") or ""),
+                            yaml_sha256=str(command.get("yaml_sha256") or ""),
+                        )
+                    except ManualMapCleanupError as exc:
+                        raise ProtocolError("MAP_MANUAL_CLEANUP_FAILED", str(exc)) from exc
                 source_dir = edited_dir
             missing = [name for name in self.REQUIRED_FILES if not (source_dir / name).exists()]
             if missing:

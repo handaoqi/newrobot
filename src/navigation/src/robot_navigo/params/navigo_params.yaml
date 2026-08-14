@@ -95,7 +95,7 @@ behavior_server:
       plugin: "navigo_behaviors/AssistedTeleop"
     global_frame: odom
     robot_base_frame: base_link
-    transform_tolerance: 0.1
+    transform_tolerance: 0.30
     use_sim_time: false
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
@@ -239,6 +239,7 @@ controller_server:
       # Patrol routes use waypoints as pass-through points. Do not require the
       # robot to match each waypoint's yaw, otherwise it can stall while turning.
       yaw_goal_tolerance: 3.14
+      required_yaw_goal_tolerance: 0.25
     # MPPI parameters
     FollowPath:
       plugin: "navigo_mppi_controller::MPPIController"
@@ -261,7 +262,7 @@ controller_server:
       az_max: 2.0
       iteration_count: 1
       prune_distance: 2.0   #1.7
-      transform_tolerance: 0.1
+      transform_tolerance: 0.30
       temperature: 0.3
       gamma: 0.015 #0.015
       motion_model: "DiffDrive"

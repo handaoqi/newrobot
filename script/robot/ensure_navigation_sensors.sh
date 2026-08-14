@@ -2,7 +2,8 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-WAIT_SECONDS="${WAIT_SECONDS:-12}"
+# Keep this aligned with the LiDAR/IMU cold-start readiness window.
+WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
 "${PROJECT_DIR}/script/robot/ensure_mapping_sensors.sh"
 
@@ -40,7 +41,9 @@ fi
 scan_ready=false
 scan_deadline=$((SECONDS + WAIT_SECONDS))
 while (( SECONDS < scan_deadline )); do
-  if timeout 2 ros2 topic echo /laser_scan --once \
+  # Give a newly-created Zenoh subscriber enough time to discover the scan
+  # publisher before deciding the conversion chain is unavailable.
+  if timeout 6 ros2 topic echo /laser_scan --once \
       --qos-reliability best_effort >/dev/null 2>&1; then
     scan_ready=true
     break

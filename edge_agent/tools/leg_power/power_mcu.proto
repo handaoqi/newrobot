@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package power_mcu;
+
+message SbusRemoteInfo { repeated uint32 data = 1; uint32 flags = 2; }
+message BmsInfo {
+  uint32 capacity = 1;
+  uint32 volt = 2;
+  int32 current = 3;
+  uint32 temp = 4;
+  uint32 error = 5;
+  uint32 power = 6;
+}
+message TailLedControl { uint32 interval = 1; uint32 R = 2; uint32 G = 3; uint32 B = 4; }
+message TailLedControlCallback { uint32 result = 1; }
+message PowerControl {
+  enum PowerId {
+    POWER_ID_LEG = 0;
+    POWER_ID_VCC4V = 1;
+    POWER_ID_VCC5V = 2;
+    POWER_ID_BAT_FAN = 3;
+    POWER_ID_24V = 4;
+    POWER_ID_SELF = 5;
+  }
+  PowerId power_id = 1;
+  uint32 boot_cmd = 2;
+  uint32 delay = 3;
+}
+message PowerControlCallback { uint32 power_id = 1; uint32 result = 2; }

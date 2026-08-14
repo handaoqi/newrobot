@@ -46,11 +46,13 @@ class TelemetryConfig:
     trajectory_flush_seconds: float = 5
     trajectory_batch_size: int = 20
     system_probe_interval_seconds: float = 10
+    cooling_system_probe_interval_seconds: float = 15
     system_probe_stale_seconds: float = 30
     battery_ssh_host: str = "3588"
     modem_at_device: str = "/dev/ttyUSB2"
     charging_current_threshold_ma: int = 300
-    charging_overheat_threshold_c: float = 45.0
+    charging_overheat_threshold_c: float = 49.0
+    battery_rated_capacity_wh: float = 216.0
     charger_speaker_sink: str = "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
     nx_speaker_card: int = 2
     nx_speaker_control: str = "PCM"
@@ -151,16 +153,24 @@ class ChargeControlConfig:
     service_name: str = "roamerx-charge-pile"
     working_directory: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
     executable: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
-    command_timeout_seconds: int = 35
-    full_battery_percent: int = 100
+    return_executable: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_returning"
+    controller_service_name: str = "robot-launch.service"
+    command_timeout_seconds: int = 90
+    full_battery_percent: int = 95
     full_confirmation_samples: int = 3
+    thermal_recovery_delay_seconds: float = 10.0
+    thermal_retry_cooldown_seconds: float = 60.0
+    low_battery_start_percent: int = 20
+    low_battery_confirmation_samples: int = 2
+    low_battery_start_cooldown_seconds: float = 60.0
     cooling_stop_eggs: tuple[str, ...] = (
         "push_image", "spline_daemon", "motion_control", "dog_task",
         "imu_daemon", "ecal2ros", "monitor", "zenoh_route",
     )
     normal_start_eggs: tuple[str, ...] = (
-        "zenoh_route", "imu_daemon", "ecal2ros", "motion_control",
-        "spline_daemon", "dog_task", "monitor", "push_image",
+        "arc_platform", "monitor", "time_sync", "spline_daemon",
+        "motion_control", "zenoh_route", "dog_task", "push_image",
+        "ecal2ros", "imu_daemon",
     )
     cooling_stop_services: tuple[str, ...] = (
         "rkaiq_3A.service", "rknn_server.service", "lightdm.service",
@@ -175,16 +185,23 @@ class PowerModeConfig:
     state_path: str = "/home/robot/edge_agent/data/power_mode.json"
     cooling_marker_path: str = "/home/robot/edge_agent/data/cooling_standby"
     monitoring_service: str = "roamerx-bike-bot.service"
+    teleop_bridge_service: str = "roamerx-teleop-bridge.service"
     navigation_script: str = "/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh"
-    sensor_start_script: str = "/home/robot/genisom_roamerx_open/script/robot/ensure_navigation_sensors.sh"
-    cooling_power_mode: int = 1
-    normal_power_mode: int = 0
-    normal_start_timeout_seconds: int = 120
-    reboot_delay_seconds: int = 12
+    normal_start_timeout_seconds: int = 240
+    always_on_services: tuple[str, ...] = (
+        "roamerx-dev-agent.service", "roamerx-robot-mcp.service",
+        "roamerx-zenoh.service", "roamerx-5g-share.service",
+    )
     controller_host: str = "3588"
+    controller_always_eggs: tuple[str, ...] = (
+        "time_sync", "power_daemon",
+    )
     controller_runtime_eggs: tuple[str, ...] = (
-        "push_image", "spline_daemon", "motion_control", "dog_task",
-        "imu_daemon", "ecal2ros", "monitor", "zenoh_route",
+        "arc_platform", "monitor", "spline_daemon", "motion_control",
+        "zenoh_route", "dog_task", "push_image", "ecal2ros", "imu_daemon",
+    )
+    controller_always_services: tuple[str, ...] = (
+        "robot-launch.service", "roamerx-charge-pile.service",
     )
     controller_runtime_services: tuple[str, ...] = (
         "rkaiq_3A.service", "rknn_server.service", "lightdm.service",

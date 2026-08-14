@@ -163,6 +163,7 @@ namespace robot::slam
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<string>("common.gnss_topic", "/fix");
+        this->declare_parameter<string>("common.rtk_pvh_topic", "/rtk_pvh");
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
@@ -201,6 +202,9 @@ namespace robot::slam
         this->declare_parameter<double>("gnss_fusion.alignment_max_rms", 1.5);
         this->declare_parameter<double>("gnss_fusion.alignment_max_yaw_change_deg", 3.0);
         this->declare_parameter<int>("gnss_fusion.alignment_required_fits", 3);
+        this->declare_parameter<double>("gnss_fusion.heading_min_baseline_m", 0.20);
+        this->declare_parameter<double>("gnss_fusion.heading_max_std_deg", 5.0);
+        this->declare_parameter<double>("gnss_fusion.heading_max_age", 1.5);
         this->declare_parameter<bool>("odom_guard.enable", false);
         this->declare_parameter<string>("odom_guard.topic", "/odom/mc_odom");
         this->declare_parameter<double>("odom_guard.max_speed", 2.0);
@@ -279,6 +283,7 @@ namespace robot::slam
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
         this->get_parameter_or<string>("common.gnss_topic", gnss_topic, "/fix");
+        this->get_parameter_or<string>("common.rtk_pvh_topic", rtk_pvh_topic, "/rtk_pvh");
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
         this->get_parameter_or<double>("filter_size_surf", filter_size_surf_min, 0.5);
@@ -327,6 +332,9 @@ namespace robot::slam
         this->get_parameter_or<double>("gnss_fusion.alignment_max_yaw_change_deg", gnss_alignment_yaw_change_deg, 3.0);
         gnss_alignment_max_yaw_change_rad_ = gnss_alignment_yaw_change_deg * M_PI / 180.0;
         this->get_parameter_or<int>("gnss_fusion.alignment_required_fits", gnss_alignment_required_fits_, 3);
+        this->get_parameter_or<double>("gnss_fusion.heading_min_baseline_m", gnss_heading_min_baseline_m_, 0.20);
+        this->get_parameter_or<double>("gnss_fusion.heading_max_std_deg", gnss_heading_max_std_deg_, 5.0);
+        this->get_parameter_or<double>("gnss_fusion.heading_max_age", gnss_heading_max_age_s_, 1.5);
         this->get_parameter_or<bool>("odom_guard.enable", odom_guard_enable_, false);
         this->get_parameter_or<string>("odom_guard.topic", odom_guard_topic, "/odom/mc_odom");
         this->get_parameter_or<double>("odom_guard.max_speed", odom_guard_max_speed_mps_, 2.0);
@@ -394,6 +402,8 @@ namespace robot::slam
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
         sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
             gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+        sub_rtk_pvh_ptr_ = this->create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
+            rtk_pvh_topic, 20, std::bind(&MappingAlg::rtkPvhCallBack, this, std::placeholders::_1));
         if (odom_guard_enable_)
         {
             odom_guard_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -732,6 +742,18 @@ namespace robot::slam
         std::lock_guard<std::mutex> lock(gnss_mutex_);
         latest_gnss_ = *msg;
         has_gnss_    = true;
+    }
+
+    void MappingAlg::rtkPvhCallBack(const robots_dog_msgs::msg::UniRtkPvh::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+        latest_gnss_heading_deg_ = static_cast<double>(msg->heading.heading_deg);
+        latest_gnss_heading_std_deg_ = static_cast<double>(msg->heading.heading_std);
+        latest_gnss_heading_baseline_m_ = static_cast<double>(msg->heading.base_line);
+        latest_gnss_heading_status_ = static_cast<int>(msg->heading.sol_status);
+        latest_gnss_heading_type_ = static_cast<int>(msg->heading.heading_type);
+        latest_gnss_heading_receive_time_ = get_clock()->now();
+        has_gnss_heading_ = true;
     }
 
     void MappingAlg::odomGuardCallBack(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -1381,6 +1403,21 @@ namespace robot::slam
                     && metadata.rtk_horizontal_std <= gnss_max_horizontal_std_;
             }
         }
+        {
+            std::lock_guard<std::mutex> heading_lock(gnss_heading_mutex_);
+            const double age = has_gnss_heading_
+                ? std::max(0.0, (get_clock()->now() - latest_gnss_heading_receive_time_).seconds())
+                : std::numeric_limits<double>::infinity();
+            metadata.rtk_heading_valid = has_gnss_heading_
+                && latest_gnss_heading_status_ == 0
+                && latest_gnss_heading_type_ > 0
+                && latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_
+                && latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_
+                && age <= gnss_heading_max_age_s_;
+            metadata.rtk_heading_deg = latest_gnss_heading_deg_;
+            metadata.rtk_heading_std_deg = latest_gnss_heading_std_deg_;
+            metadata.rtk_heading_age_seconds = age;
+        }
 
         {
             std::lock_guard<std::mutex> writer_lock(keyframe_writer_mutex_);
@@ -1415,7 +1452,7 @@ namespace robot::slam
             std::ofstream poses(keyframe_dir / "keyframes.csv", std::ios::out | std::ios::trunc);
             if (!poses.is_open())
                 throw std::runtime_error("cannot create keyframes.csv");
-            poses << "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,rtk_horizontal_std,rtk_age_seconds\n";
+            poses << "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,rtk_heading_age_seconds\n";
             poses.close();
             startKeyframeWriter();
             writeSaveProgress("mapping", 0.0);
@@ -1514,6 +1551,10 @@ namespace robot::slam
                 keyframe.rtk_altitude = std::stod(field("rtk_altitude"));
                 keyframe.rtk_horizontal_std = std::stod(field("rtk_horizontal_std"));
                 keyframe.rtk_age_seconds = std::stod(field("rtk_age_seconds"));
+                keyframe.rtk_heading_valid = std::stoi(field("rtk_heading_valid")) != 0;
+                keyframe.rtk_heading_deg = std::stod(field("rtk_heading_deg"));
+                keyframe.rtk_heading_std_deg = std::stod(field("rtk_heading_std_deg"));
+                keyframe.rtk_heading_age_seconds = std::stod(field("rtk_heading_age_seconds"));
                 std::ostringstream file_name;
                 file_name << (latest_dir / "keyframes" / "scan_").string()
                           << std::setw(5) << std::setfill('0') << keyframe.index << ".pcd";
@@ -1635,7 +1676,9 @@ namespace robot::slam
                       << keyframe.point_count << ',' << (keyframe.rtk_valid ? 1 : 0) << ',' << keyframe.rtk_status << ','
                       << std::setprecision(10) << keyframe.rtk_latitude << ',' << keyframe.rtk_longitude << ','
                       << std::setprecision(4) << keyframe.rtk_altitude << ',' << keyframe.rtk_horizontal_std << ','
-                      << keyframe.rtk_age_seconds << '\n';
+                      << keyframe.rtk_age_seconds << ',' << (keyframe.rtk_heading_valid ? 1 : 0) << ','
+                      << keyframe.rtk_heading_deg << ',' << keyframe.rtk_heading_std_deg << ','
+                      << keyframe.rtk_heading_age_seconds << '\n';
             }
             catch (const std::exception& exc)
             {

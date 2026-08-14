@@ -10,6 +10,17 @@ def test_parse_task_request():
     task = DevTaskRequest.parse({"task_id": task_id, "prompt": "修改并测试", "workspace": "robot-main"})
     assert task.task_id == task_id
     assert task.prompt == "修改并测试"
+    assert task.model == "gpt-5.6-terra"
+
+
+def test_rejects_model_outside_allowlist():
+    with pytest.raises(TaskMessageError, match="model is not allowed"):
+        DevTaskRequest.parse({
+            "task_id": str(uuid.uuid4()),
+            "prompt": "修改并测试",
+            "workspace": "robot-main",
+            "model": "not-a-model",
+        })
 
 
 @pytest.mark.parametrize(

@@ -24,12 +24,12 @@ usage() {
 }
 
 is_bridge_running() {
-  pgrep -f "vel_cmd_udp_pub" >/dev/null 2>&1
+  pgrep -f "vel_cmd_udp_pub.*remote_control_only:=true" >/dev/null 2>&1
 }
 
 is_bridge_ros_ready() {
   ros2 topic info /teleop_action -v 2>/dev/null | grep -q "Node name: vel_cmd_udp_publisher" && \
-    ros2 topic info /cmd_vel -v 2>/dev/null | grep -q "Node name: vel_cmd_udp_publisher"
+    ros2 topic info /teleop_cmd_vel -v 2>/dev/null | grep -q "Node name: vel_cmd_udp_publisher"
 }
 
 kill_pattern() {
@@ -56,11 +56,11 @@ start_bridge() {
       return 0
     fi
     echo "Teleop control bridge process exists but ROS graph is not ready; restarting it..."
-    kill_pattern "vel_cmd_udp_pub"
+    kill_pattern "vel_cmd_udp_pub.*remote_control_only:=true"
   fi
 
   echo "Starting teleop control bridge without localization/Nav2..."
-  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 run robot_navigo vel_cmd_udp_pub --ros-args -p platform:='${PLATFORM}'" \
+  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 run robot_navigo vel_cmd_udp_pub --ros-args -p platform:='${PLATFORM}' -p remote_control_only:=true" \
     >"${LOG_DIR}/teleop_control.log" 2>&1 < /dev/null &
 
   for _ in $(seq 1 12); do
@@ -79,16 +79,16 @@ start_bridge() {
 
 stop_bridge() {
   echo "Stopping teleop control bridge..."
-  kill_pattern "vel_cmd_udp_pub"
+  kill_pattern "vel_cmd_udp_pub.*remote_control_only:=true"
   echo "Stopped."
 }
 
 status_bridge() {
   echo "Processes:"
-  pgrep -af "vel_cmd_udp_pub" || true
+  pgrep -af "vel_cmd_udp_pub.*remote_control_only:=true" || true
   echo
   echo "Topics:"
-  ros2 topic info /cmd_vel -v 2>/dev/null | sed -n '1,80p' || true
+  ros2 topic info /teleop_cmd_vel -v 2>/dev/null | sed -n '1,80p' || true
   ros2 topic info /teleop_action -v 2>/dev/null | sed -n '1,80p' || true
 }
 

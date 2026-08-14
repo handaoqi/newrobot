@@ -165,7 +165,10 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
  * @param cloud   input cloud
  * @return cloud aligned to the globalmap
  */
-pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp::Time& stamp, const pcl::PointCloud<PointT>::ConstPtr& cloud) {
+pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
+    const rclcpp::Time& stamp,
+    const pcl::PointCloud<PointT>::ConstPtr& cloud,
+    bool apply_observation) {
   Eigen::Matrix4f imu_guess = matrix();
   Eigen::Matrix4f init_guess = imu_guess;
   // Eigen::Matrix4f no_guess = last_observation;
@@ -228,6 +231,10 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   last_observation = trans;
 
   // wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
+
+  if (!apply_observation) {
+    return aligned;
+  }
 
   ukf->correct(observation);
   imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
@@ -329,6 +336,76 @@ void PoseEstimator::apply_position_correction(const Eigen::Vector3f& correction)
   if(odom_ukf) {
     odom_ukf->mean.middleRows(0, 3) += correction;
   }
+}
+
+void PoseEstimator::correct_absolute_pose(
+    const Eigen::Vector3f& position,
+    const Eigen::Quaternionf& orientation,
+    float horizontal_variance,
+    float vertical_variance,
+    float orientation_variance) {
+  if (!ukf) {
+    return;
+  }
+  Eigen::Quaternionf q = orientation.normalized();
+  if (quat().coeffs().dot(q.coeffs()) < 0.0f) {
+    q.coeffs() *= -1.0f;
+  }
+  Eigen::VectorXf observation(7);
+  observation.head<3>() = position;
+  observation.tail<4>() << q.w(), q.x(), q.y(), q.z();
+
+  const Eigen::MatrixXf previous_noise = ukf->getMeasurementNoiseCov();
+  Eigen::MatrixXf noise = Eigen::MatrixXf::Identity(7, 7);
+  noise(0, 0) = std::max(horizontal_variance, 1e-4f);
+  noise(1, 1) = std::max(horizontal_variance, 1e-4f);
+  noise(2, 2) = std::max(vertical_variance, 1e-4f);
+  noise.bottomRightCorner(4, 4) *= std::max(orientation_variance, 1e-5f);
+  ukf->setMeasurementNoiseCov(noise);
+  ukf->correct(observation);
+  ukf->setMeasurementNoiseCov(previous_noise);
+  last_observation = matrix();
+}
+
+void PoseEstimator::begin_dead_reckoning_bridge() {
+  if (ukf) {
+    ukf->mean.segment<3>(3).setZero();
+  }
+}
+
+void PoseEstimator::apply_body_odom_translation(
+    const Eigen::Matrix4f& odom_delta,
+    float translation_variance) {
+  if (!ukf || !odom_delta.allFinite()) {
+    return;
+  }
+  Eigen::Vector3f body_translation = odom_delta.block<3, 1>(0, 3);
+  body_translation.z() = 0.0f;
+  ukf->mean.head<3>() += quat().toRotationMatrix() * body_translation;
+  // Position is propagated exclusively by body odometry during the bridge.
+  // Keeping velocity at zero prevents IMU acceleration integration from
+  // adding a second translation estimate on the next prediction cycle.
+  ukf->mean.segment<3>(3).setZero();
+  Eigen::MatrixXf covariance = ukf->getCov();
+  const float translation_noise = std::max(translation_variance, 1e-6f);
+  covariance.block<3, 3>(0, 0).diagonal().array() += translation_noise;
+  ukf->setCov(covariance);
+}
+
+float PoseEstimator::horizontal_position_sigma() const {
+  if (!ukf) {
+    return std::numeric_limits<float>::infinity();
+  }
+  const auto& covariance = ukf->getCov();
+  return std::sqrt(std::max(0.0f, std::max(covariance(0, 0), covariance(1, 1))));
+}
+
+float PoseEstimator::yaw_sigma() const {
+  if (!ukf) {
+    return std::numeric_limits<float>::infinity();
+  }
+  const auto& covariance = ukf->getCov();
+  return 2.0f * std::sqrt(std::max(0.0f, covariance(9, 9)));
 }
 
 } 
