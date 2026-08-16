@@ -19,6 +19,7 @@ The token-protected platform API is under `/api/mcp/robots/<robot_id>/`.
 | `robot_direction` | `forward`, `backward`, `left`, `right`, turns, stop, or velocity vector |
 | `robot_speed` | `micro`, `low`, `medium`, `high` |
 | `robot_action` | stand up, prone, passive, start/stop motion control |
+| `robot_skill_list` | read the Edge-backed catalog of executable presets and their requirements |
 | `robot_skill_run` | start a preset or structured high-level skill |
 | `robot_skill_status` | return the source command lifecycle |
 | `robot_skill_cancel` | cancel a running local skill |
@@ -34,9 +35,9 @@ For `robot_person_follow`, provide an explicit `track_id`, or use `target="cente
 
 ## Skills
 
-Presets: `prone_forward_5s`, `micro_reverse_5s`, `turn_left_full_circle`, `left_two_steps_then_avoid_forward`, and `turn_left_and_forward_detour`.
+`robot_skill_list` is the source of truth for released presets. The current catalog includes timed prone/micro forward and backward movement, four 5-meter localization-closed movement variants, left/right full turns, left/right forward-avoid maneuvers, and four directional detours.
 
-AI clients may submit explicit `steps` for arbitrary sequences and retain the natural-language intent in `description`. The Edge Agent validates and executes structured steps only; it does not call an LLM. A velocity step is re-published every 150 ms. Every success, failure, or cancellation ends with a zero-velocity command. Turns and distance moves require live pose data; they fail rather than estimate by time when pose data is unavailable. Avoid-forward checks the front laser scan, stops at an obstacle, then performs the defined left-turn bypass.
+AI clients may submit explicit `steps` for arbitrary sequences and retain the natural-language intent in `description`. The Edge Agent validates and executes structured steps only; it does not call an LLM. A velocity step is re-published every 150 ms. Every success, failure, or cancellation ends with a zero-velocity command. Turns and distance moves require live pose data; they fail rather than estimate by time when pose data is unavailable. Avoid-forward checks the front laser scan. Backward presets are localization-closed but do not claim rear obstacle protection.
 
 ## Runtime
 

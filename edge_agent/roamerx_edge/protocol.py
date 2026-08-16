@@ -38,6 +38,7 @@ TELEOP_COMMAND_TYPES = {
     "teleop.move_stop",
     "teleop.passive",
     "teleop.skill",
+    "teleop.skill_list",
     "teleop.skill_status",
     "teleop.skill_cancel",
     "teleop.person_follow_start",

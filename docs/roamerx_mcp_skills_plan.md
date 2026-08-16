@@ -10,7 +10,7 @@
 | 基础遥控 | `robot_direction` | 前后左右、左右转、速度向量和停止 |
 | 速度档位 | `robot_speed` | 微速、低速、中速、高速 |
 | 姿态与运控 | `robot_action` | 起立、匍匐、阻尼、启动/停止运控 |
-| 组合动作 | `robot_skill_run` / `robot_skill_status` / `robot_skill_cancel` | 执行、查询、取消预设或受限步骤组合 |
+| 组合动作 | `robot_skill_list` / `robot_skill_run` / `robot_skill_status` / `robot_skill_cancel` | 列出 Edge 实际可执行预设，以及执行、查询、取消预设或受限步骤组合 |
 | 人员识别 | `robot_person_detection` / `robot_person_detection_status` | 开关人员检测并读取可选 `track_id` |
 | 持续人员跟随 | `robot_person_follow` / `robot_person_follow_status` / `robot_person_follow_stop` | 启动、查询和停止指定人员的本地视觉跟随 |
 | 技能清单 | `robot_remote_control_capabilities` | 只读返回上述已上线能力与安全提示 |
@@ -22,6 +22,7 @@
 ## 首期实现
 
 - MCP 技能注册表是面向用户的唯一已上线清单；所有工具均保留清晰的安全约束与云端审计链路。
+- `robot_skill_list` 通过 `teleop.skill_list` 从 Edge 读取单一预设目录，返回中文说明、类别、实时定位要求及避障范围。当前目录包含前后 5 秒动作、前后 5 米定位闭环动作、左右整圈、左右横移后的前向避障及四个方向绕行；后退动作不声明后向避障。
 - 持续人员跟随不再在 MCP 或云端轮询闭环。`roamerx-bike-bot` 对每帧人员轨迹原子写入 `/run/roamerx/person_detections.json`，Edge Agent 仅读取此本机快照并以 150ms 周期控制速度。
 - Edge `PersonFollowController` 一次只允许一个 `track_id` 会话；MCP 可使用明确 `track_id`，或在用户明确要求时由平台从最新人员框中选择最接近画面中心的人员。人员丢失、检测帧过期、前方障碍、停止命令、任务接管、阻尼、趴下或 Edge 关闭时，均先发布零速度后终止跟随。
 - 平台增加 `teleop.person_follow_start`、`teleop.person_follow_stop`、`teleop.person_follow_status` 三类 RemoteCommand；MCP 接口通过其创建、审计并等待 Edge 返回结果。
@@ -32,7 +33,7 @@
 - 已创建可安装的个人 Codex 插件 `roamerx-basic-teleop`，包含本机 `http://127.0.0.1:8095/mcp` 的 MCP 配置、基础遥控 Skill 和中文自然语言命令参考。插件不保存平台令牌或机器人 ID。
 - Skill 被交互式 Codex 和配置了共享 Codex Home 的 `roamerx-dev-agent` 共同加载；远程开发助手因此遵循与交互式会话一致的 MCP、明确命令与能力问答规则。
 - MCP 的 `robot_id` 可以省略。部署人员在 MCP 服务环境设置正数 `ROAMERX_DEFAULT_ROBOT_ID` 即可绑定默认机器狗；显式 `robot_id` 仍可用于多机器人场景并优先于默认值。
-- 用户询问技能或预设时先读取 `robot_remote_control_capabilities`，仅返回自然语言指南；不会因问答触发控制。所有实际控制在用户明确请求后直接执行，组合动作和人员跟随仍须提供明确的预设、步骤或目标。
+- 用户询问技能时先读取 `robot_remote_control_capabilities`；询问预设时再读取 `robot_skill_list`。两者均为只读，不会因问答触发控制。所有实际控制在用户明确请求后直接执行，组合动作和人员跟随仍须提供明确的预设、步骤或目标。
 - Dev Agent 的本地转写增加统一唤醒格式“小太阳，<操作命令>”。匹配时移除唤醒名并自动创建 `voice` 会话任务，使共享 Codex Home 中所有匹配的已安装 Skill 都可执行该命令，并为每次接受的命令发布 `dev/voice/wake` 审计事件。
 
 ## 后续阶段

@@ -108,7 +108,7 @@ MCP_SKILL_REGISTRY = {
         "切换微速/低速/中速/高速档、前后左右移动和左右转向，并可停止或进入阻尼。"
         "也可以查看平台已登记的设备及其平台 ID，以便明确选择目标机器狗。"
         "还可以开启人员识别、查看识别到的人员，针对指定 track_id 或画面中央人员执行持续本地视觉跟随，"
-        "也支持执行预设组合动作；两者均可查询或停止。"
+        "也支持列出并执行预设组合动作；两者均可查询或停止。"
     ),
     "safety": [
         "回答功能咨询时只说明能力，不发送控制命令。",
@@ -177,8 +177,9 @@ MCP_SKILL_REGISTRY = {
         },
         {
             "name": "组合动作",
-            "tools": ["robot_skill_run", "robot_skill_status", "robot_skill_cancel"],
+            "tools": ["robot_skill_list", "robot_skill_run", "robot_skill_status", "robot_skill_cancel"],
             "buttons": [
+                {"label": "列出预设组合动作", "read_only": True},
                 {"label": "执行预设或步骤组合"},
                 {"label": "查询组合动作状态", "read_only": True},
                 {"label": "取消组合动作"},
@@ -340,6 +341,13 @@ def robot_skill_run(
     if steps is not None:
         payload["steps"] = steps
     command = client.command(robot_id, "skill", payload)
+    return client.wait_for_command(robot_id, command, wait_seconds)
+
+
+@mcp.tool(name="robot_skill_list")
+def robot_skill_list(robot_id: int | None = None, wait_seconds: float = 5) -> dict:
+    """读取 Edge Agent 实际可执行的预设动作及其定位、避障要求；只读。"""
+    command = client.command(robot_id, "skill-list", {})
     return client.wait_for_command(robot_id, command, wait_seconds)
 
 

@@ -146,6 +146,16 @@ def test_capability_list_contains_read_only_platform_device_inventory():
     }
 
 
+def test_capability_list_contains_read_only_skill_catalog():
+    capabilities = mcp_module.robot_remote_control_capabilities()
+    skill_group = next(group for group in capabilities["groups"] if group["name"] == "组合动作")
+
+    assert skill_group["tools"] == [
+        "robot_skill_list", "robot_skill_run", "robot_skill_status", "robot_skill_cancel",
+    ]
+    assert skill_group["buttons"][0] == {"label": "列出预设组合动作", "read_only": True}
+
+
 def test_person_follow_tools_dispatch_lifecycle_commands(monkeypatch):
     client = FakePlatformClient()
     monkeypatch.setattr(mcp_module, "client", client)
@@ -202,6 +212,16 @@ def test_all_control_actions_dispatch_without_area_confirmation(monkeypatch):
         (1, "skill", {"description": "", "preset": "prone_forward_5s"}),
         (1, "person-follow-start", {"track_id": "person-7"}),
     ]
+
+
+def test_skill_list_uses_the_edge_backed_read_only_lifecycle(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+
+    result = mcp_module.robot_skill_list(1)
+
+    assert result["completed"] is True
+    assert client.calls == [(1, "skill-list", {})]
 
 
 def test_control_values_are_normalized_to_the_platform_contract(monkeypatch):

@@ -13,36 +13,164 @@ from .protocol import ProtocolError
 PRESET_SKILLS = {
     "prone_forward_5s": {
         "description": "匍匐前进 5 秒",
+        "category": "timed_motion",
+        "requires_live_pose": False,
+        "obstacle_protection": "none",
         "steps": [
             {"kind": "action", "action": "lie_down"},
             {"kind": "velocity", "vx": 0.35, "duration_seconds": 5.0},
         ],
     },
+    "prone_backward_5s": {
+        "description": "匍匐后退 5 秒",
+        "category": "timed_motion",
+        "requires_live_pose": False,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "action", "action": "lie_down"},
+            {"kind": "velocity", "vx": -0.35, "duration_seconds": 5.0},
+        ],
+    },
     "micro_reverse_5s": {
         "description": "微速后退 5 秒",
+        "category": "timed_motion",
+        "requires_live_pose": False,
+        "obstacle_protection": "none",
         "steps": [
             {"kind": "speed", "level": "micro"},
             {"kind": "velocity", "vx": -0.35, "duration_seconds": 5.0},
         ],
     },
+    "micro_forward_5s": {
+        "description": "微速前进 5 秒",
+        "category": "timed_motion",
+        "requires_live_pose": False,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "speed", "level": "micro"},
+            {"kind": "velocity", "vx": 0.35, "duration_seconds": 5.0},
+        ],
+    },
+    "prone_forward_5m": {
+        "description": "匍匐前进 5 米",
+        "category": "distance_motion",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "action", "action": "lie_down"},
+            {"kind": "distance", "axis": "forward", "distance_m": 5.0, "speed_mps": 0.35},
+        ],
+    },
+    "prone_backward_5m": {
+        "description": "匍匐后退 5 米",
+        "category": "distance_motion",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "action", "action": "lie_down"},
+            {"kind": "distance", "axis": "backward", "distance_m": 5.0, "speed_mps": 0.35},
+        ],
+    },
+    "micro_forward_5m": {
+        "description": "微速前进 5 米",
+        "category": "distance_motion",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "speed", "level": "micro"},
+            {"kind": "distance", "axis": "forward", "distance_m": 5.0, "speed_mps": 0.35},
+        ],
+    },
+    "micro_reverse_5m": {
+        "description": "微速后退 5 米",
+        "category": "distance_motion",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "speed", "level": "micro"},
+            {"kind": "distance", "axis": "backward", "distance_m": 5.0, "speed_mps": 0.35},
+        ],
+    },
     "turn_left_full_circle": {
         "description": "原地左转一圈",
+        "category": "turn",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
         "steps": [{"kind": "turn", "angle_rad": math.tau, "yaw_rate": 0.45}],
+    },
+    "turn_right_full_circle": {
+        "description": "原地右转一圈",
+        "category": "turn",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [{"kind": "turn", "angle_rad": -math.tau, "yaw_rate": 0.45}],
     },
     "left_two_steps_then_avoid_forward": {
         "description": "左移两步后避障前进",
+        "category": "front_avoidance",
+        "requires_live_pose": True,
+        "obstacle_protection": "front_only",
         "steps": [
             {"kind": "distance", "axis": "left", "distance_m": 0.4, "speed_mps": 0.35},
             {"kind": "avoid_forward", "duration_seconds": 3.0, "speed_mps": 0.35},
         ],
     },
+    "right_two_steps_then_avoid_forward": {
+        "description": "右移两步后避障前进",
+        "category": "front_avoidance",
+        "requires_live_pose": True,
+        "obstacle_protection": "front_only",
+        "steps": [
+            {"kind": "distance", "axis": "right", "distance_m": 0.4, "speed_mps": 0.35},
+            {"kind": "avoid_forward", "duration_seconds": 3.0, "speed_mps": 0.35},
+        ],
+    },
     "turn_left_and_forward_detour": {
         "description": "左转并前进绕行",
+        "category": "detour",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
         "steps": [
             {"kind": "turn", "angle_rad": math.pi / 2, "yaw_rate": 0.45},
             {"kind": "distance", "axis": "forward", "distance_m": 0.8, "speed_mps": 0.4},
             {"kind": "turn", "angle_rad": -math.pi / 2, "yaw_rate": 0.45},
             {"kind": "distance", "axis": "forward", "distance_m": 1.0, "speed_mps": 0.4},
+        ],
+    },
+    "turn_right_and_forward_detour": {
+        "description": "右转并前进绕行",
+        "category": "detour",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "turn", "angle_rad": -math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "forward", "distance_m": 0.8, "speed_mps": 0.4},
+            {"kind": "turn", "angle_rad": math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "forward", "distance_m": 1.0, "speed_mps": 0.4},
+        ],
+    },
+    "turn_left_and_backward_detour": {
+        "description": "左转并后退绕行（无后向避障）",
+        "category": "detour",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "turn", "angle_rad": math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "backward", "distance_m": 0.8, "speed_mps": 0.4},
+            {"kind": "turn", "angle_rad": -math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "backward", "distance_m": 1.0, "speed_mps": 0.4},
+        ],
+    },
+    "turn_right_and_backward_detour": {
+        "description": "右转并后退绕行（无后向避障）",
+        "category": "detour",
+        "requires_live_pose": True,
+        "obstacle_protection": "none",
+        "steps": [
+            {"kind": "turn", "angle_rad": -math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "backward", "distance_m": 0.8, "speed_mps": 0.4},
+            {"kind": "turn", "angle_rad": math.pi / 2, "yaw_rate": 0.45},
+            {"kind": "distance", "axis": "backward", "distance_m": 1.0, "speed_mps": 0.4},
         ],
     },
 }
@@ -111,6 +239,20 @@ class TeleopSkillExecutor:
                 raise ProtocolError("SKILL_NOT_FOUND", f"no skill run for command {command_id}")
             run.cancel_event.set()
             return run.snapshot()
+
+    @staticmethod
+    def list_presets() -> list[dict]:
+        """Return the executable preset catalog without exposing raw steps."""
+        return [
+            {
+                "name": name,
+                "description": template["description"],
+                "category": template["category"],
+                "requires_live_pose": template["requires_live_pose"],
+                "obstacle_protection": template["obstacle_protection"],
+            }
+            for name, template in PRESET_SKILLS.items()
+        ]
 
     def _normalize_plan(self, command: dict) -> dict:
         preset = str(command.get("preset") or "").strip()

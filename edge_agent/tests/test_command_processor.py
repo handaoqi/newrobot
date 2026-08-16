@@ -481,6 +481,36 @@ def test_person_follow_start_and_stop_are_dispatched_locally(tmp_path):
     store.close()
 
 
+def test_skill_list_returns_the_local_executable_catalog_without_starting_control(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.skill_list"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState(localization_status="normal", nav_ready=True)),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    presets = result["payload"]["result"]["presets"]
+    assert len(presets) == 16
+    assert any(item["name"] == "turn_right_full_circle" for item in presets)
+    assert navigation.teleop_actions == []
+    assert navigation.teleop_velocities == []
+    store.close()
+
+
 def test_takeover_exit_stops_and_returns_control_to_remote(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "teleop.takeover_exit"

@@ -293,7 +293,9 @@ class CommandProcessor:
             raise ProtocolError("TELEOP_UNAVAILABLE", "teleop adapter is not configured")
         action = envelope.message_type.removeprefix("teleop.")
         bridge_status = None
-        if self.teleop_control_adapter and action not in {"person_follow_status", "person_follow_stop"}:
+        if self.teleop_control_adapter and action not in {
+            "person_follow_status", "person_follow_stop", "skill_list", "skill_status", "skill_cancel",
+        }:
             bridge_status = self.teleop_control_adapter.ensure_ready()
         command = envelope.payload.get("command") or {}
         if self.person_follow_controller and action in {
@@ -357,6 +359,10 @@ class CommandProcessor:
                 lambda outcome: self._complete_skill(envelope, started_at, outcome),
             )
             return None
+        elif action == "skill_list":
+            if not self.skill_executor:
+                raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
+            result_payload = {"presets": self.skill_executor.list_presets()}
         elif action == "skill_status":
             if not self.skill_executor:
                 raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")

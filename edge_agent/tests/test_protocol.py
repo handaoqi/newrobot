@@ -75,3 +75,11 @@ def test_accepts_person_follow_commands():
     payload["payload"].pop("task_execution_id", None)
     payload["payload"]["command"] = {"track_id": "person-7"}
     assert decode_message(payload).message_type == "teleop.person_follow_start"
+
+
+def test_accepts_skill_list_command():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "teleop.skill_list"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {}
+    assert decode_message(payload).message_type == "teleop.skill_list"
