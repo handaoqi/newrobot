@@ -19,23 +19,48 @@ voice:
   enabled: true
   capture_mode: local_alsa
   # Type-C microphone/speaker attached directly to the NX board.
-  alsa_device: hw:0,0
-  # Physical microphone on the dog 3588. The listener publishes only speech
-  # segments; cloud ASR detects the wake phrase "小太阳".
+  # Use the same shared 48 kHz stereo capture as the RTMP pusher.  dsnoop
+  # prevents either process from monopolising the physical USB microphone.
+  alsa_device: dsnoop:CARD=Device,DEV=0,FORMAT=S16_LE,RATE=48000
+  # ``dsnoop`` is capture-only.  Send acknowledgement speech to the separate
+  # USB speaker playback PCM, with ALSA doing any needed format conversion.
+  playback_device: plughw:CARD=Device,DEV=0
+  # Physical microphone on the dog 3588. The listener publishes speech
+  # segments, and a local transcript starting with "小太阳" automatically
+  # becomes a Codex task after the wake name is removed.
   host: 192.168.234.1
   user: firefly
   identity_file: /home/robot/.ssh/id_rsa
   pulse_server: /run/user/1000/pulse/native
   source: alsa_input.usb-TTGK_Technology_USB_Audio_33022920230925-00.mono-fallback
-  # This USB microphone's idle level is about RMS 17; keep the threshold low
-  # enough to capture normal speech. The wake phrase is the final filter.
+  # RMS 18 is the absolute floor. The listener also learns a short rolling
+  # idle-noise floor and requires speech to exceed it by this multiplier. This
+  # prevents a noisy room from continuously producing empty ASR requests.
   rms_threshold: 18
-  # NX-local FunASR/SenseVoice uses the Orin GPU. A cloud ASR fallback keeps
+  noise_floor_chunks: 24
+  noise_rms_multiplier: 2.2
+  # Keep 750 ms immediately before speech starts. This prevents the manual
+  # capture VAD from losing the first syllable of "小太阳".
+  pre_roll_chunks: 3
+  # End the capture after 750 ms of silence. SenseVoice applies its own VAD
+  # again during transcription, so this lowers acknowledgement latency.
+  silence_chunks: 3
+  # NX-local Fun-ASR-Nano uses the Orin GPU. A cloud ASR fallback keeps
   # voice commands available during local model restart, but never replaces a
   # successful local (including empty/non-speech) result.
   local_asr_enabled: true
   local_asr_url: http://127.0.0.1:18080/v1/audio/transcriptions
-  local_asr_model: sensevoice
+  # The local funasr-server loads Fun-ASR-Nano from an explicit local model
+  # path, for which its OpenAI-compatible endpoint uses the `custom` selector.
+  local_asr_model: custom
+  # Keep the microphone array intact through capture/VAD, then choose the
+  # strongest physical channel for the mono Fun-ASR-Nano acoustic model.
+  asr_input_mode: array_best_channel
   local_asr_language: zh
   local_asr_timeout_seconds: 30
   local_asr_fallback_to_cloud: true
+  # "小太阳，<操作命令>" routes the command to all applicable installed Skills.
+  # The wake name itself never counts as a physical-safety confirmation.
+  wake_name: 小太阳
+  wake_workspace: robot-main
+  wake_conversation_id: voice

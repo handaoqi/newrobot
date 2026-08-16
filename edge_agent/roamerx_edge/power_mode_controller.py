@@ -78,7 +78,7 @@ class PowerModeController:
             probes.append((key, name, ["systemctl", "is-active", unit], True))
         probes.extend((
             ("detection_video", "NX · AI识别与视频", ["systemctl", "is-active", self.config.monitoring_service], not cooling),
-            ("teleop_bridge", "NX · 遥控运动桥", ["systemctl", "is-active", self.config.teleop_bridge_service], not cooling),
+            ("teleop_bridge", "NX · 遥控运动桥", ["systemctl", "is-active", self.config.teleop_bridge_service], True),
             ("lidar_imu", "NX · Livox LiDAR/IMU", ["pgrep", "-f", "[l]ivox_driver_node"], not cooling),
             ("rtk", "NX · RTK差分定位", ["pgrep", "-f", "[r]tk_ntrip_bridge.py"], not cooling),
             ("localization", "NX · 激光定位", ["pgrep", "-f", "[l]ocalization_node"], not cooling),
@@ -98,11 +98,14 @@ class PowerModeController:
                 "matches_mode": active == expected,
             }
         remote = self._remote_runtime_status()
+        legacy_charge_session = self._legacy_charge_session_active()
         for egg in (*self.config.controller_always_eggs, *self.config.controller_runtime_eggs):
             key = f"controller_egg_{self._safe_key(egg)}"
             available = remote is not None and egg in remote["eggs"]
             active = bool(available and remote["eggs"][egg])
             expected = True if egg in self.config.controller_always_eggs else not cooling
+            if egg == "arc_platform" and legacy_charge_session:
+                expected = False
             services[key] = {
                 "name": CONTROLLER_EGG_NAMES.get(egg, f"3588 · {egg}"),
                 "active": active,
@@ -131,22 +134,18 @@ class PowerModeController:
         if state.get("mode") == "cooling_standby":
             self._set_cooling_marker(True)
             self._run_optional(
-                ["sudo", "systemctl", "stop", self.config.teleop_bridge_service],
-                20,
-                allowed_returncodes={0, 1},
-            )
-            self._run_optional(
                 ["sudo", "systemctl", "disable", "--now", self.config.monitoring_service],
                 20,
                 allowed_returncodes={0, 1},
             )
             self._stop_sensor_processes()
+            self._stop_remote_cooling_services()
             with self._lock:
                 self._update(transition_state="ready", reboot_required=False, last_error="", last_warning="")
             return self.snapshot()
         self._set_cooling_marker(False)
         try:
-            return self._start_normal_services()
+            return self._start_normal_services(skip_arc=self._legacy_charge_session_active())
         except ProtocolError:
             # Keep Edge online so the platform can display the failure and retry.
             LOGGER.exception("failed to reconcile normal-mode services during startup")
@@ -158,10 +157,10 @@ class PowerModeController:
         try:
             self._set_cooling_marker(True)
             passive_confirmed = self._request_motor_passive()
-            self._run_required(["sudo", "systemctl", "stop", self.config.teleop_bridge_service], 15)
             self._run_required(["sudo", "systemctl", "disable", "--now", self.config.monitoring_service], 20)
             self._run_required([self.config.navigation_script, "full-stop"], 30)
             self._stop_sensor_processes()
+            self._stop_remote_cooling_services()
             with self._lock:
                 self._update(
                     mode="cooling_standby",
@@ -183,7 +182,7 @@ class PowerModeController:
         self._run_required(["sudo", "systemctl", "enable", self.config.monitoring_service], 20)
         return self._start_normal_services()
 
-    def _start_normal_services(self) -> dict:
+    def _start_normal_services(self, *, skip_arc: bool = False) -> dict:
         # Motion recovery after leaving the dock must not be held hostage by
         # localization readiness. Navigation exposes its own readiness state.
         try:
@@ -195,7 +194,7 @@ class PowerModeController:
             self._run_required(
                 ["sudo", "systemctl", "enable", "--now", *local_units], 30
             )
-            self._start_remote_normal_services()
+            self._start_remote_normal_services(skip_arc=skip_arc)
         except Exception as exc:
             message = str(exc)
             with self._lock:
@@ -228,9 +227,11 @@ class PowerModeController:
                 self._update(last_warning=warning)
         return self.snapshot()
 
-    def _start_remote_normal_services(self) -> None:
+    def _start_remote_normal_services(self, *, skip_arc: bool = False) -> None:
         services = (*self.config.controller_always_services, *self.config.controller_runtime_services)
         eggs = (*self.config.controller_always_eggs, *self.config.controller_runtime_eggs)
+        if skip_arc:
+            eggs = tuple(egg for egg in eggs if egg != "arc_platform")
         quoted_services = " ".join(shlex.quote(service) for service in services)
         quoted_eggs = " ".join(shlex.quote(egg) for egg in eggs)
         command = (
@@ -238,15 +239,47 @@ class PowerModeController:
             f"sudo systemctl start {quoted_services}; "
             f"for egg in {quoted_eggs}; do "
             "if ! robot-launch egg \"$egg\" 2>/dev/null | grep -q running; then "
+            "robot-launch stop \"$egg\" >/dev/null 2>&1 || true; sleep 1; "
             "robot-launch start \"$egg\" >/dev/null; fi; done; "
-            "sleep 3; "
             f"for service in {quoted_services}; do systemctl is-active --quiet \"$service\"; done; "
-            f"for egg in {quoted_eggs}; do robot-launch egg \"$egg\" 2>/dev/null | grep -q running; done"
+            "deadline=$((SECONDS + 30)); "
+            f"for egg in {quoted_eggs}; do "
+            "until robot-launch egg \"$egg\" 2>/dev/null | grep -q running; do "
+            "if [ \"$SECONDS\" -ge \"$deadline\" ]; then robot-launch egg \"$egg\" 2>/dev/null || true; exit 1; fi; "
+            "sleep 1; done; done"
         )
         self._run_required(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", self.config.controller_host, command],
             self.config.normal_start_timeout_seconds,
         )
+
+    def _stop_remote_cooling_services(self) -> None:
+        """Stop all non-charging 3588 workloads without touching BMS control."""
+        eggs = self.config.controller_runtime_eggs
+        services = self.config.controller_runtime_services
+        quoted_eggs = " ".join(shlex.quote(egg) for egg in eggs)
+        quoted_services = " ".join(shlex.quote(service) for service in services)
+        command = (
+            "set -e; "
+            f"for egg in {quoted_eggs}; do robot-launch stop \"$egg\" >/dev/null 2>&1 || true; done; "
+            f"sudo systemctl stop {quoted_services}; "
+            f"for egg in {quoted_eggs}; do "
+            "robot-launch egg \"$egg\" 2>/dev/null | grep -q stopped || exit 1; "
+            "done; "
+            f"for service in {quoted_services}; do "
+            "! systemctl is-active --quiet \"$service\"; "
+            "done"
+        )
+        self._run_required(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", self.config.controller_host, command],
+            90,
+        )
+
+    def _legacy_charge_session_active(self) -> bool:
+        state = self.snapshot()
+        return state.get("charge_stage") in {
+            "waiting_for_dock", "starting_charge", "waiting_current", "charging", "thermal_protection",
+        }
 
     def set_auto_charge_enabled(self, enabled: bool) -> None:
         with self._lock:

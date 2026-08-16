@@ -73,6 +73,17 @@ public:
   void predict_odom(const Eigen::Matrix4f& odom_delta);
 
   /**
+   * @brief Enable a scan-to-scan LiDAR odometry prior for NDT initialization.
+   *
+   * The node feeds this method only quality-gated relative LiDAR transforms.
+   * It is intentionally separate from controller odometry: controller odometry
+   * supplies a yaw-only prior while LiDAR odometry supplies a full SE(3) prior.
+   */
+  void enable_lidar_odometry_prediction();
+  void predict_lidar_odometry(const Eigen::Matrix4f& lidar_delta);
+  void invalidate_lidar_odometry_prediction();
+
+  /**
    * @brief correct
    * @param cloud   input cloud
    * @return cloud aligned to the globalmap
@@ -113,6 +124,7 @@ public:
   const boost::optional<Eigen::Matrix4f>& wo_prediction_error() const;
   const boost::optional<Eigen::Matrix4f>& imu_prediction_error() const;
   const boost::optional<Eigen::Matrix4f>& odom_prediction_error() const;
+  const boost::optional<Eigen::Matrix4f>& lidar_odometry_prediction_error() const;
 
   MatchResult GetMatchState() const; 
   Eigen::VectorXf GetCurrentUkfState(); 
@@ -134,11 +146,15 @@ private:
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>> odom_ukf;
   bool odom_orientation_initialized_ = false;
   Eigen::Quaternionf odom_orientation_prediction_ = Eigen::Quaternionf::Identity();
+  bool lidar_odometry_prediction_enabled_ = false;
+  bool lidar_odometry_prediction_initialized_ = false;
+  Eigen::Matrix4f lidar_odometry_prediction_ = Eigen::Matrix4f::Identity();
 
   Eigen::Matrix4f last_observation;
   boost::optional<Eigen::Matrix4f> wo_pred_error;
   boost::optional<Eigen::Matrix4f> imu_pred_error;
   boost::optional<Eigen::Matrix4f> odom_pred_error;
+  boost::optional<Eigen::Matrix4f> lidar_odom_pred_error;
 
   pcl::Registration<PointT, PointT>::Ptr registration;
 

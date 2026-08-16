@@ -67,6 +67,7 @@ class CodexRunner:
         workspace: str,
         session_id: str | None,
         model: str,
+        execution_mode: str = "execute",
         on_output: Callable[[str, str, dict | None], None],
     ) -> tuple[int, str, bool]:
         binary = Path(self.config.binary)
@@ -75,7 +76,12 @@ class CodexRunner:
 
         self.prepare_codex_home()
 
-        argv = self.build_argv(workspace=workspace, session_id=session_id, model=model)
+        argv = self.build_argv(
+            workspace=workspace,
+            session_id=session_id,
+            model=model,
+            execution_mode=execution_mode,
+        )
 
         env = os.environ.copy()
         env["HOME"] = "/home/robot"
@@ -250,17 +256,25 @@ class CodexRunner:
         self._terminate(process)
         return True
 
-    def build_argv(self, *, workspace: str, session_id: str | None, model: str) -> list[str]:
-        argv = [self.config.binary, "exec", "--model", model]
-        if session_id:
-            argv.append("resume")
-        argv.append("--json")
-        if self.config.yolo:
+    def build_argv(
+        self,
+        *,
+        workspace: str,
+        session_id: str | None,
+        model: str,
+        execution_mode: str = "execute",
+    ) -> list[str]:
+        # `resume` has its own option parser.  Global `exec` options must
+        # precede it, otherwise a resumed planning turn rejects `--sandbox`.
+        argv = [self.config.binary, "exec", "--model", model, "--json"]
+        if execution_mode == "plan":
+            argv.extend(["--sandbox", "read-only"])
+        elif self.config.yolo:
             argv.append("--dangerously-bypass-approvals-and-sandbox")
-        elif not session_id:
+        else:
             argv.extend(["--sandbox", "workspace-write"])
         if session_id:
-            argv.extend([session_id, "-"])
+            argv.extend(["resume", session_id, "-"])
         else:
             argv.extend(["-C", workspace, "-"])
         return argv

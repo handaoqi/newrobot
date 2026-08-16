@@ -32,7 +32,9 @@ class VoiceAckPlayer:
     def _command(self, audio_url: str) -> tuple[list[str], dict]:
         options = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE, "text": True}
         if self.config.capture_mode == "local_alsa":
-            device = self.config.alsa_device
+            # ``alsa_device`` may be a dsnoop capture endpoint.  It cannot
+            # play sound; acknowledgement playback needs the USB speaker PCM.
+            device = self.config.playback_device
             if device.startswith("hw:"):
                 device = f"plughw:{device.removeprefix('hw:')}"
             environment = os.environ.copy()

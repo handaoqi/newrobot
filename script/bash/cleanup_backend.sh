@@ -10,7 +10,7 @@ run_cleanup() {
 	# 1) graceful stop
 	pkill -f "ros2 launch robot_navigo navigation_bringup.launch.py" || true
 	pkill -f "component_container_isolated" || true
-	pkill -f "vel_cmd_udp_pub|mode_status_pub" || true
+	pkill -f "mode_status_pub" || true
 	pkill -f "custom_odom_baselink_node|odom_to_tf_broadcaster" || true
 	pkill -f "run_sim.sh|rviz2|gzserver|gzclient" || true
 	sleep 1
@@ -18,7 +18,7 @@ run_cleanup() {
 	# 2) force stop
 	pkill -9 -f "ros2 launch robot_navigo navigation_bringup.launch.py" || true
 	pkill -9 -f "component_container_isolated" || true
-	pkill -9 -f "vel_cmd_udp_pub|mode_status_pub" || true
+	pkill -9 -f "mode_status_pub" || true
 	pkill -9 -f "custom_odom_baselink_node|odom_to_tf_broadcaster" || true
 	pkill -9 -f "run_sim.sh|rviz2|gzserver|gzclient" || true
 
@@ -28,7 +28,7 @@ run_cleanup() {
 
 	# 4) verify (no output means clean)
 	echo "[cleanup] verify:"
-	ps -eo pid,ppid,stat,cmd | grep -E "navigation_bringup|component_container_isolated|vel_cmd_udp_pub|mode_status_pub|custom_odom_baselink_node|odom_to_tf_broadcaster|run_sim.sh|rviz2|gzserver|gzclient|ros2-daemon|\\[ros2\\] <defunct>" | grep -v grep || true
+	ps -eo pid,ppid,stat,cmd | grep -E "navigation_bringup|component_container_isolated|mode_status_pub|custom_odom_baselink_node|odom_to_tf_broadcaster|run_sim.sh|rviz2|gzserver|gzclient|ros2-daemon|\\[ros2\\] <defunct>" | grep -v grep || true
 }
 
 if [[ -f /.dockerenv ]]; then

@@ -5,6 +5,7 @@ import json
 import logging
 import ssl
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .codex_runner import (
 )
 from .config import DevAgentConfig
 from .conversation_store import ConversationStore
-from .protocol import DevTaskRequest, TaskMessageError
+from .protocol import DevTaskRequest, TaskMessageError, extract_wake_command
 from .voice_listener import VoiceCommandListener
 from .voice_ack_player import VoiceAckPlayer
 
@@ -29,20 +30,60 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def build_effective_prompt(*, workspace_path: str, prompt: str, session_id: str | None) -> str:
+def build_effective_prompt(
+    *, workspace_path: str, prompt: str, session_id: str | None, execution_mode: str = "execute",
+    wake_name: str = "",
+) -> str:
+    wake_context = ""
+    if wake_name:
+        wake_context = (
+            f"\n此指令由语音唤醒词“{wake_name}”加操作命令自动提交。唤醒词仅用于路由，"
+            "不代表现场安全确认；优先匹配并遵循所有适用的已安装 Skill，尤其不得绕过其安全门槛。\n"
+        )
+    if execution_mode == "plan":
+        return (
+            "当前处于远程开发的规划对话模式。你只能分析、阅读必要的代码并与用户澄清需求；"
+            "严禁修改任何文件、编译、启动/停止服务、执行机器人动作或提交代码。"
+            "请用中文给出简洁的方案、影响范围、风险和待确认项。"
+            "如果信息足够，输出可执行的分步计划，并明确提示用户在网页点击“确认并执行计划”后才会实施。\n"
+            f"本轮指定工作区：{workspace_path}{wake_context}\n"
+            f"用户消息：\n{prompt}"
+        )
     if session_id:
         return (
             "这是当前 Codex 主会话的后续指令，请沿用已有上下文继续处理。\n"
             "不要重新介绍会话，也不要重复读取已经加载的项目说明；"
             "仅在文件可能变化或本轮确有需要时重新检查。\n"
-            f"本轮指定工作区：{workspace_path}\n\n"
+            f"本轮指定工作区：{workspace_path}{wake_context}\n"
             f"用户新指令：\n{prompt}"
         )
     return (
         f"本轮远程开发指定工作区：{workspace_path}\n"
-        "执行前请进入该目录，并读取该目录适用的 AGENTS.md 等项目说明。\n\n"
+        f"执行前请进入该目录，并读取该目录适用的 AGENTS.md 等项目说明。{wake_context}\n"
         f"用户指令：\n{prompt}"
     )
+
+
+def build_wake_task_payload(
+    *, voice_id: str, transcript: str, wake_name: str, workspace: str, conversation_id: str,
+) -> dict | None:
+    """Convert an explicit wake utterance into a normal, auditable task payload."""
+    command = extract_wake_command(transcript, wake_name)
+    if command is None:
+        return None
+    try:
+        task_id = str(uuid.UUID(str(voice_id)))
+    except (TypeError, ValueError):
+        task_id = str(uuid.uuid4())
+    return {
+        "task_id": task_id,
+        "prompt": command,
+        "workspace": workspace,
+        "conversation_id": conversation_id,
+        "execution_mode": "execute",
+        "_wake_name": wake_name,
+        "_voice_id": str(voice_id),
+    }
 
 
 class DevAgentApplication:
@@ -124,6 +165,10 @@ class DevAgentApplication:
         LOGGER.info("connected to MQTT broker")
 
     def _publish_voice(self, payload: dict) -> None:
+        # The cloud owns the auditable voice-task lifecycle.  Sending every
+        # transcript there first records the task, publishes an immediate TTS
+        # acknowledgement, and lets the web console stream the same task that
+        # is later dispatched back to this Agent.
         self._publish(self._topic("dev/voice/audio"), payload)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
@@ -200,6 +245,8 @@ class DevAgentApplication:
                 workspace_path=workspace_path,
                 prompt=task.prompt,
                 session_id=session_id,
+                execution_mode=task.execution_mode,
+                wake_name=str(payload.get("_wake_name") or ""),
             )
             self._emit(
                 task.task_id,
@@ -211,6 +258,7 @@ class DevAgentApplication:
                 ),
                 codex_thread_id=session_id,
                 conversation_id=task.conversation_id,
+                execution_mode=task.execution_mode,
             )
             exit_code, last_message, cancelled = self.runner.run(
                 task_id=task.task_id,
@@ -218,6 +266,7 @@ class DevAgentApplication:
                 workspace=workspace_path,
                 session_id=session_id,
                 model=task.model,
+                execution_mode=task.execution_mode,
                 on_output=lambda stream, text, parsed: self._on_codex_output(
                     task.task_id, task.conversation_id, stream, text, parsed
                 ),
@@ -239,10 +288,13 @@ class DevAgentApplication:
                         workspace_path=workspace_path,
                         prompt=task.prompt,
                         session_id=None,
+                        execution_mode=task.execution_mode,
+                        wake_name=str(payload.get("_wake_name") or ""),
                     ),
                     workspace=workspace_path,
                     session_id=None,
                     model=task.model,
+                    execution_mode=task.execution_mode,
                     on_output=lambda stream, text, parsed: self._on_codex_output(
                         task.task_id, task.conversation_id, stream, text, parsed
                     ),

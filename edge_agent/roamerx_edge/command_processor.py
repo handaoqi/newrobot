@@ -138,17 +138,15 @@ class CommandProcessor:
             return ack if "ack" in dir() else {}, result
 
     def _release_manual_control_for_task(self) -> None:
-        """Give a navigation task exclusive ownership of the motion endpoint."""
+        """Clear manual input before a navigation task takes control."""
         if self.person_follow_controller:
             self.person_follow_controller.stop("task_takeover")
         if self.safety.state.control_mode != "manual_takeover":
             return
         if self.localization_adapter:
             self.localization_adapter.teleop_velocity(0.0, 0.0, 0.0)
-        if self.teleop_control_adapter:
-            self.teleop_control_adapter.stop()
         self.safety.state.control_mode = "autonomous"
-        LOGGER.info("task.start cleared manual remote control; Nav2 SDK bridge owns motion")
+        LOGGER.info("task.start cleared manual remote control; teleop bridge remains resident")
 
     def _prepare_docking_map(self, command: dict) -> None:
         if not self.map_activation_adapter or not self.navigation_stack_adapter:
@@ -311,8 +309,6 @@ class CommandProcessor:
         elif action == "takeover_exit":
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
             result_payload = teleop_adapter.release_to_remote_control()
-            if self.teleop_control_adapter:
-                result_payload["teleop_bridge_stop"] = self.teleop_control_adapter.stop()
             self.safety.state.control_mode = "autonomous"
         elif action == "stand_up":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
@@ -396,11 +392,8 @@ class CommandProcessor:
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "passive", {"passive"}, {"passive_failed"}
             )
-            # Damping is a terminal manual-control action. Keep no SDK bridge
-            # alive afterwards: its heartbeat/control session can otherwise
-            # re-acquire the body shortly after passive() takes effect.
-            if self.teleop_control_adapter:
-                result_payload["teleop_bridge_stop"] = self.teleop_control_adapter.stop()
+            # The bridge remains resident. Its remote passive handler clears
+            # the held stick command before issuing the vendor emergency stop.
             self.safety.state.control_mode = "autonomous"
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)

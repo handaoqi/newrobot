@@ -45,12 +45,22 @@ def test_resume_argv_uses_persisted_session(tmp_path: Path):
         "exec",
         "--model",
         "gpt-5.6-terra",
-        "resume",
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
+        "resume",
         "thread-123",
         "-",
     ]
+
+
+def test_plan_argv_is_read_only_even_when_execute_mode_uses_yolo(tmp_path: Path):
+    runner = CodexRunner(CodexConfig(binary="/opt/codex", home=str(tmp_path), yolo=True))
+    argv = runner.build_argv(
+        workspace="/workspace", session_id="thread-123", model="gpt-5.6-terra", execution_mode="plan",
+    )
+    assert argv.index("--sandbox") < argv.index("resume")
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
 
 def test_agent_codex_home_isolates_sessions_but_shares_credentials(tmp_path: Path):

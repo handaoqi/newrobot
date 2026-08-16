@@ -42,11 +42,6 @@ class TeleopControlAdapter:
     def status(self) -> dict:
         return self._systemctl("status", timeout_seconds=min(self.config.command_timeout_seconds, 10))
 
-    def stop(self) -> dict:
-        self._last_ready_at = 0.0
-        self._last_ready_payload = None
-        return self._systemctl("stop", timeout_seconds=self.config.command_timeout_seconds)
-
     def _systemctl(self, action: str, *, timeout_seconds: int) -> dict:
         completed = subprocess.run(
             ["sudo", "systemctl", action, self.SERVICE_NAME],

@@ -76,14 +76,11 @@ class FakeNavigation:
 
 class FakeTeleopControl:
     def __init__(self):
-        self.stopped = False
+        self.ready_calls = 0
 
     def ensure_ready(self):
+        self.ready_calls += 1
         return {"action": "start", "returncode": 0}
-
-    def stop(self):
-        self.stopped = True
-        return {"action": "stop", "returncode": 0}
 
 
 class FakePersonFollow:
@@ -252,7 +249,6 @@ def test_task_start_clears_manual_control_before_validation(tmp_path):
 
     assert ack["payload"]["ack"] == "accepted"
     assert state.control_mode == "autonomous"
-    assert teleop_control.stopped is True
     assert navigation.teleop_velocities[-1] == {
         "topic": "/teleop_cmd_vel", "vx": 0.0, "vy": 0.0, "yaw_rate": 0.0,
     }
@@ -511,7 +507,7 @@ def test_skill_list_returns_the_local_executable_catalog_without_starting_contro
     store.close()
 
 
-def test_takeover_exit_stops_and_returns_control_to_remote(tmp_path):
+def test_takeover_exit_keeps_bridge_and_returns_control_to_remote(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "teleop.takeover_exit"
     raw["payload"].pop("task_execution_id", None)
@@ -547,8 +543,42 @@ def test_takeover_exit_stops_and_returns_control_to_remote(tmp_path):
     }
     assert navigation.teleop_actions[-1] == "release_remote"
     assert result["payload"]["result"]["confirmed"] is True
-    assert result["payload"]["result"]["teleop_bridge_stop"]["action"] == "stop"
-    assert teleop_control.stopped is True
+    assert "teleop_bridge_stop" not in result["payload"]["result"]
+    assert state.control_mode == "autonomous"
+    store.close()
+
+
+def test_passive_keeps_bridge_resident(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.passive"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True, control_mode="manual_takeover")
+    teleop_control = FakeTeleopControl()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        teleop_control_adapter=teleop_control,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert teleop_control.ready_calls == 1
+    assert navigation.teleop_actions[-1] == "passive"
+    assert "teleop_bridge_stop" not in result["payload"]["result"]
     assert state.control_mode == "autonomous"
     store.close()
 

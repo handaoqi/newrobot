@@ -27,11 +27,15 @@ class LocalASRClient:
         self.language = config.local_asr_language
         self.timeout_seconds = config.local_asr_timeout_seconds
 
-    def transcribe(self, pcm: bytes) -> str:
+    def transcribe(self, pcm: bytes, *, channels: int = 1, sample_rate: int = 16000) -> str:
         if not pcm:
             return ""
+        if channels not in {1, 2}:
+            raise LocalASRError(f"unsupported local ASR channel count: {channels}")
+        if sample_rate != 16000:
+            raise LocalASRError(f"unsupported local ASR sample rate: {sample_rate}")
         boundary = f"----roamerx-{uuid.uuid4().hex}"
-        body = self._multipart_body(boundary, pcm)
+        body = self._multipart_body(boundary, pcm, channels=channels, sample_rate=sample_rate)
         request = Request(
             self.url,
             data=body,
@@ -57,12 +61,12 @@ class LocalASRClient:
             raise LocalASRError("NX local ASR transcript is unexpectedly long")
         return transcript
 
-    def _multipart_body(self, boundary: str, pcm: bytes) -> bytes:
+    def _multipart_body(self, boundary: str, pcm: bytes, *, channels: int, sample_rate: int) -> bytes:
         audio = io.BytesIO()
         with wave.open(audio, "wb") as output:
-            output.setnchannels(1)
+            output.setnchannels(channels)
             output.setsampwidth(2)
-            output.setframerate(16000)
+            output.setframerate(sample_rate)
             output.writeframes(pcm)
         separator = f"--{boundary}\r\n".encode("ascii")
         parts = [

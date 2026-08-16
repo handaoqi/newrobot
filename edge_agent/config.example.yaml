@@ -125,6 +125,16 @@ charge_control:
   executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
   return_executable: "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_returning"
   controller_service_name: "robot-launch.service"
+  arbiter_path: "/usr/local/sbin/roamerx-charge-pile-arbiter"
+  arc_platform_egg: "arc_platform"
+  ros_setup: "/opt/ros/humble/setup.bash"
+  ros_domain_id: 24
+  rmw_implementation: "rmw_zenoh_cpp"
+  arc_state_topic: "/arc/arc_state"
+  dock_state_topic: "/arc/dock_state"
+  pile_command_topic: "/arc/pile_ele_cmd"
+  pile_result_topic: "/arc/pile_ele_result"
+  arc_command_timeout_seconds: 18
   command_timeout_seconds: 90
   full_battery_percent: 95
   full_confirmation_samples: 3
@@ -145,9 +155,9 @@ power_mode:
   normal_start_timeout_seconds: 240
   always_on_services: [roamerx-dev-agent.service, roamerx-robot-mcp.service, roamerx-zenoh.service, roamerx-5g-share.service]
   controller_host: "3588"
-  controller_always_eggs: [time_sync, power_daemon]
-  controller_runtime_eggs: [arc_platform, monitor, spline_daemon, motion_control, zenoh_route, dog_task, push_image, ecal2ros, imu_daemon]
-  controller_always_services: [robot-launch.service, roamerx-charge-pile.service]
+  controller_always_eggs: [power_daemon]
+  controller_runtime_eggs: [time_sync, arc_platform, monitor, spline_daemon, motion_control, zenoh_route, dog_task, push_image, ecal2ros, imu_daemon]
+  controller_always_services: [robot-launch.service]
   controller_runtime_services: [rkaiq_3A.service, rknn_server.service, lightdm.service]
 
 audio_control:

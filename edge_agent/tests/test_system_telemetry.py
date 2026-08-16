@@ -46,9 +46,8 @@ def test_charger_state_reports_thermal_protection_when_hot_and_current_is_missin
     collector, probe = make_probe(
         [
             "power: 61\nvolt: 46358\ntemp: 49000\nerror: 1034\n"
-            "__CHARGE_SERVICE__\nactive\n__CHARGE_MODE__\nlying\n__CHARGE_STATE__\n"
-            "charge pin=1,c-adc=3.29,c+adc=1.70,c-status=1,c+status=1,tagid=65535\n"
-            "connected=yes\n",
+            "__ARC_PLATFORM__\nrunning\n__ARC_DOCK_STATE__\nstate: 2\nerror_msg: ''\n"
+            "__ARC_SERIAL_OWNER__\narc_platform\n",
             '+CSQ: 21,99\n+QNWINFO: "NR5G-SA"\n',
             "Volume: front-left: 65536 / 100% / 0.00 dB\nMute: no\n",
             "Front Left: Playback 6400 [56%] [on]\n",
@@ -63,17 +62,16 @@ def test_charger_state_reports_thermal_protection_when_hot_and_current_is_missin
     assert power["thermal_protection"] is True
     assert power["charging_overheat_threshold_c"] == 49.0
     assert power["current_a"] is None
-    assert power["bluetooth_connected"] is True
-    assert power["charge_pin"] == 1
+    assert power["bluetooth_connected"] is None
+    assert power["charge_pin"] is None
 
 
 def test_bms_error_1034_keeps_thermal_protection_latched_below_ui_threshold():
     collector, probe = make_probe(
         [
             "power: 89\nvolt: 48313\ntemp: 47000\nerror: 1034\n"
-            "__CHARGE_SERVICE__\nactive\n__CHARGE_MODE__\nlying\n__CHARGE_STATE__\n"
-            "charge pin=1,c-adc=3.29,c+adc=1.70,c-status=1,c+status=1,tagid=65535\n"
-            "connected=yes\n",
+            "__ARC_PLATFORM__\nrunning\n__ARC_DOCK_STATE__\nstate: 2\nerror_msg: ''\n"
+            "__ARC_SERIAL_OWNER__\narc_platform\n",
             '+CSQ: 21,99\n+QNWINFO: "NR5G-SA"\n',
             "Volume: front-left: 65536 / 100% / 0.00 dB\nMute: no\n",
             "Front Left: Playback 6400 [56%] [on]\n",
@@ -93,9 +91,8 @@ def test_persistent_charge_controller_is_ready_without_requesting_charge():
     collector, probe = make_probe(
         [
             "power: 61\nvolt: 46358\ncurrent: -1700\ntemp: 45000\nerror: 0\n"
-            "__CHARGE_SERVICE__\nactive\n__CHARGE_MODE__\nunknown\n__CHARGE_STATE__\n"
-            "charge pin=1,c-adc=3.29,c+adc=1.70,c-status=1,c+status=1,tagid=65535\n"
-            "connected=yes\n",
+            "__ARC_PLATFORM__\nrunning\n__ARC_DOCK_STATE__\nstate: 0\nerror_msg: ''\n"
+            "__ARC_SERIAL_OWNER__\narc_platform\n",
             '+CSQ: 21,99\n+QNWINFO: "NR5G-SA"\n',
             "Volume: front-left: 65536 / 100% / 0.00 dB\nMute: no\n",
             "Front Left: Playback 6400 [56%] [on]\n",

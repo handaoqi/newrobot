@@ -160,6 +160,27 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
   odom_ukf->predict(control);
 }
 
+void PoseEstimator::enable_lidar_odometry_prediction() {
+  lidar_odometry_prediction_enabled_ = true;
+}
+
+void PoseEstimator::predict_lidar_odometry(const Eigen::Matrix4f& lidar_delta) {
+  if (!lidar_odometry_prediction_enabled_ || !lidar_odometry_prediction_initialized_ ||
+      !lidar_delta.allFinite()) {
+    return;
+  }
+
+  lidar_odometry_prediction_ = lidar_odometry_prediction_ * lidar_delta;
+  if (!lidar_odometry_prediction_.allFinite()) {
+    invalidate_lidar_odometry_prediction();
+  }
+}
+
+void PoseEstimator::invalidate_lidar_odometry_prediction() {
+  lidar_odometry_prediction_initialized_ = false;
+  lidar_odom_pred_error = boost::none;
+}
+
 /**
  * @brief correct
  * @param cloud   input cloud
@@ -179,7 +200,11 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   // translation scale does not agree closely enough with lidar localization.
   // Use only the odometry rotation as the NDT seed and retain the IMU/NDT
   // position estimate.
-  if (odom_orientation_initialized_) {
+  const bool lidar_odometry_available =
+    lidar_odometry_prediction_enabled_ && lidar_odometry_prediction_initialized_;
+  if (lidar_odometry_available) {
+    init_guess = lidar_odometry_prediction_;
+  } else if (odom_orientation_initialized_) {
     odom_guess = odom_matrix();
     if (odom_orientation_prediction_.coeffs().allFinite()) {
       init_guess.block<3, 3>(0, 0) = odom_orientation_prediction_.toRotationMatrix();
@@ -238,6 +263,19 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
 
   ukf->correct(observation);
   imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
+
+  if (lidar_odometry_prediction_enabled_) {
+    if (lidar_odometry_available) {
+      lidar_odom_pred_error =
+        lidar_odometry_prediction_.inverse() * registration->getFinalTransformation();
+    } else {
+      lidar_odom_pred_error = boost::none;
+    }
+    // An accepted map match is the new absolute anchor. Subsequent accepted
+    // scan-to-scan deltas advance this anchor until the next NDT correction.
+    lidar_odometry_prediction_ = registration->getFinalTransformation();
+    lidar_odometry_prediction_initialized_ = true;
+  }
 
   if (odom_orientation_initialized_) {
     if (odom_orientation_prediction_.coeffs().dot(q.coeffs()) < 0.0f) {
@@ -310,6 +348,10 @@ const boost::optional<Eigen::Matrix4f>& PoseEstimator::imu_prediction_error() co
 
 const boost::optional<Eigen::Matrix4f>& PoseEstimator::odom_prediction_error() const {
   return odom_pred_error;
+}
+
+const boost::optional<Eigen::Matrix4f>& PoseEstimator::lidar_odometry_prediction_error() const {
+  return lidar_odom_pred_error;
 }
 
 PoseEstimator::MatchResult PoseEstimator::GetMatchState() const {

@@ -30,6 +30,7 @@ class ChargeControlAdapter:
         self._manual_disconnect_inhibit_until = 0.0
         self._low_battery_start_thread: threading.Thread | None = None
         self._charge_begin_thread: threading.Thread | None = None
+        self._state_recovery_thread: threading.Thread | None = None
         self._latest_power: dict = {}
         self._pending_charge = False
         self._low_battery_handler = None
@@ -47,9 +48,9 @@ class ChargeControlAdapter:
             self._previous_charge_state = None
             self._thermal_recovery_started_at = None
             self._pending_charge = True
-        # This only announces charging readiness to the pile.  It must not
-        # stop the 3588 runtime until the dock contacts are confirmed.
-        pile = self._set_charge_pile_state("lying")
+        # The arbiter stops ARC before enabling the vendor helper. The helper
+        # then provides per-pole feedback while the robot waits for contact.
+        pile = self._set_legacy_pile_state("lying")
         self._set_charge_stage("waiting_for_dock", self._dock_detail(self._latest_power))
         if self._charger_ready(self._latest_power):
             return self._begin_charge()
@@ -71,24 +72,30 @@ class ChargeControlAdapter:
 
     def _set_motion_control(self, action: str) -> dict:
         expected = "running" if action == "start" else "stopped"
-        command = (
-            "set -e; "
-            f"robot-launch {action} 3 4; sleep 2; "
-            "for egg in 3 4; do "
-            f"robot-launch egg \"$egg\" 2>/dev/null | grep -qi {expected}; "
-            "done"
-        )
+        if action == "start":
+            # `robot-launch start 3 4` exits non-zero when either component
+            # is already running.  Starting motion control must be idempotent:
+            # retain a healthy dog_task and start only a missing component.
+            command = (
+                "set -e; "
+                "for egg in 3 4; do "
+                "if ! robot-launch egg \"$egg\" 2>/dev/null | grep -qi running; then "
+                "robot-launch start \"$egg\"; fi; "
+                "done; sleep 2; "
+                "for egg in 3 4; do "
+                "robot-launch egg \"$egg\" 2>/dev/null | grep -qi running; "
+                "done"
+            )
+        else:
+            command = (
+                "set -e; "
+                "robot-launch stop 3 4; sleep 2; "
+                "for egg in 3 4; do "
+                "robot-launch egg \"$egg\" 2>/dev/null | grep -qi stopped; "
+                "done"
+            )
         result = self._run(f"motion_{action}", command)
         return {**result, "motion_control": expected}
-
-    def _set_charge_pile_state(self, state: str) -> dict:
-        unit = shlex.quote(self.config.service_name)
-        command = (
-            f"printf '{state}\\n' | sudo tee /var/lib/roamerx-charge-pile/state >/dev/null; "
-            f"sudo systemctl restart {unit}.service; sleep 2; "
-            f"systemctl is-active {unit}.service"
-        )
-        return self._run(f"pile_{state}", command)
 
     def _begin_charge(self) -> dict:
         with self._lock:
@@ -99,7 +106,7 @@ class ChargeControlAdapter:
         mode = self.power_mode.enter_cooling()
         motion = self.stop_motion_control()
         try:
-            charge = self._start_remote()
+            charge = self._legacy_lying_confirmed()
         except Exception:
             self.power_mode.set_auto_charge_enabled(False)
             self._set_charge_stage("error", "充电服务启动失败")
@@ -107,22 +114,6 @@ class ChargeControlAdapter:
         self.power_mode.set_auto_charge_enabled(True)
         self._set_charge_stage("waiting_current", "等待 BMS 上报充电电流")
         return {"power_mode": mode, "motion": motion, "charge": charge, "auto_restore_on_full": True}
-
-    def _start_remote(self) -> dict:
-        unit = shlex.quote(self.config.service_name)
-        cooling_eggs = " ".join(shlex.quote(egg) for egg in self.config.cooling_stop_eggs)
-        cooling_services = " ".join(shlex.quote(service) for service in self.config.cooling_stop_services)
-        command = (
-            f"sudo systemctl stop {cooling_services}; "
-            "robot-launch stop arc_platform >/dev/null 2>&1 || true; "
-            f"robot-launch stop {cooling_eggs} >/dev/null 2>&1 || true; sleep 4; "
-            "printf 'lying\n' | sudo tee /var/lib/roamerx-charge-pile/state >/dev/null; "
-            f"sudo systemctl restart {unit}.service; "
-            "sleep 3; "
-            f"systemctl is-active {unit}.service"
-        )
-        result = self._run("start", command)
-        return result
 
     def stop(self, *, manual: bool = True) -> dict:
         with self._lock:
@@ -138,14 +129,11 @@ class ChargeControlAdapter:
                 )
         self.power_mode.set_auto_charge_enabled(False)
         self._set_charge_stage("stopping_charge", "正在断开充电并恢复运控")
-        # The return command has already made the pile leave its charging
-        # state before its optional service/egg checks run.  Do not leave the
-        # whole robot in cooling_standby when one of those checks is late.
         try:
-            charge = self._stop_remote()
+            charge = self._return_legacy_and_restore_arc()
         except ProtocolError as exc:
-            LOGGER.warning("charge disconnect completed with diagnostics: %s", exc)
-            charge = {"warning": str(exc), "disconnect_requested": True}
+            self._set_charge_stage("error", "充电桩未确认断开")
+            raise exc
         mode = self.power_mode.restore_normal()
         self._set_charge_stage("idle", "")
         motion = self.start_motion_control()
@@ -156,44 +144,26 @@ class ChargeControlAdapter:
                 )
         return {"charge": charge, "power_mode": mode, "motion": motion, "auto_restore_on_full": False}
 
-    def _stop_remote(self) -> dict:
+    def _set_legacy_pile_state(self, state: str) -> dict:
+        if state not in {"lying", "unknown"}:
+            raise ProtocolError("CHARGE_STATE_INVALID", state)
+        action = "legacy-lying" if state == "lying" else "legacy-status"
+        return self._run(f"pile_{state}", f"sudo {shlex.quote(self.config.arbiter_path)} {action}")
+
+    def _legacy_lying_confirmed(self) -> dict:
         unit = shlex.quote(self.config.service_name)
-        return_executable = shlex.quote(self.config.return_executable)
-        controller_service = shlex.quote(self.config.controller_service_name)
-        normal_services = " ".join(shlex.quote(service) for service in self.config.normal_start_services)
-        required_eggs = (
-            "arc_platform", "spline_daemon", "motion_control",
-            "zenoh_route", "dog_task", "ecal2ros", "imu_daemon",
-        )
-        verify_eggs = " ".join(shlex.quote(egg) for egg in required_eggs)
         command = (
-            f"sudo systemctl stop {unit}.service 2>/dev/null || true; "
-            f"sudo chmod +x {return_executable}; "
-            f"sudo timeout --signal=TERM --kill-after=2 6 {return_executable} "
-            ">/tmp/roamerx-charge-return.log 2>&1 || true; "
-            "sudo pkill -KILL -x dog_returning 2>/dev/null || true; "
-            "printf 'unknown\n' | sudo tee /var/lib/roamerx-charge-pile/state >/dev/null; "
-            f"sudo systemctl start {unit}.service || true; sleep 2; "
-            "robot-launch stop push_image dog_task motion_control spline_daemon "
-            "ecal2ros imu_daemon monitor zenoh_route arc_platform >/dev/null 2>&1 || true; sleep 2; "
-            f"sudo systemctl start {normal_services} || true; "
-            f"sudo systemctl restart {controller_service} || true; sleep 15; "
-            "robot-launch start 3 4 >/dev/null 2>&1; sleep 2; "
-            "for egg in 3 4; do robot-launch egg \"$egg\" 2>/dev/null | grep -qi running || true; done; "
-            f"systemctl is-active --quiet {controller_service} || true; "
-            f"for egg in {verify_eggs}; do robot-launch egg \"$egg\" 2>/dev/null | grep -qi running || true; done; "
-            "mkdir -p /tmp/roamerx_ros_logs; "
-            ". /opt/ros/humble/setup.bash; "
-            "export ROS_LOG_DIR=/tmp/roamerx_ros_logs ROS_DOMAIN_ID=24 RMW_IMPLEMENTATION=rmw_zenoh_cpp; "
-            "mc_state=\"$(timeout 12 ros2 topic echo /arc/mc_state --once 2>/dev/null || true)\"; "
-            "printf '%s\\n' \"$mc_state\"; "
-            # Some controller builds do not publish this ROS topic. The dock
-            # return, pile reset, and egg checks above are authoritative; keep
-            # this output for diagnosis but do not leave charge state stuck.
-            "true"
+            f"systemctl is-active --quiet {unit}.service; "
+            "pgrep -f '[d]og_lying_down' >/dev/null"
         )
-        result = self._run("stop", command)
-        return result
+        return self._run("legacy_charge_confirm", command)
+
+    def _return_legacy_and_restore_arc(self) -> dict:
+        command = (
+            f"sudo {shlex.quote(self.config.arbiter_path)} legacy-return; "
+            f"robot-launch egg {shlex.quote(self.config.arc_platform_egg)} 2>/dev/null | grep -qi running"
+        )
+        return self._run("legacy_return", command)
 
     def observe_power(self, power: dict | None) -> None:
         power = power or {}
@@ -204,6 +174,20 @@ class ChargeControlAdapter:
             self._set_charge_stage("charging", "BMS 正在充电")
         elif snapshot.get("auto_charge_enabled") and power.get("thermal_protection"):
             self._set_charge_stage("thermal_protection", "BMS 温度保护")
+
+        # A persisted charging state must not keep the robot in cooling mode
+        # after a restart if ARC is back in normal mode and BMS is discharging.
+        if (
+            snapshot.get("auto_charge_enabled")
+            and not power.get("charging")
+            and power.get("charger_controller_mode") == "arc_platform"
+            and power.get("arc_dock_state") in {None, 0, 5}
+        ):
+            self.power_mode.set_auto_charge_enabled(False)
+            self._set_charge_stage("idle", "未检测到充电接触，已恢复正常工作模式")
+            if snapshot.get("mode") == "cooling_standby":
+                self._restore_after_stale_charge_async()
+            return
 
         if self._pending_charge and self._charger_ready(power):
             self._begin_charge_async()
@@ -343,7 +327,7 @@ class ChargeControlAdapter:
     def _retry_after_thermal_protection(self) -> None:
         try:
             LOGGER.warning("retrying charge start after thermal protection recovery")
-            result = self._start_remote()
+            result = self._set_legacy_pile_state("lying")
             LOGGER.info("charge retry completed: %s", result.get("stdout", "").strip()[-200:])
         except Exception:
             LOGGER.exception("automatic charge retry after thermal protection failed")
@@ -356,6 +340,23 @@ class ChargeControlAdapter:
                 self._full_charge_handler()
         except Exception:
             LOGGER.exception("automatic full-charge restore failed")
+
+    def _restore_after_stale_charge_async(self) -> None:
+        with self._lock:
+            if self._state_recovery_thread and self._state_recovery_thread.is_alive():
+                return
+            self._state_recovery_thread = threading.Thread(
+                target=self._restore_after_stale_charge,
+                daemon=True,
+                name="stale-charge-state-restore",
+            )
+            self._state_recovery_thread.start()
+
+    def _restore_after_stale_charge(self) -> None:
+        try:
+            self.power_mode.restore_normal()
+        except Exception:
+            LOGGER.exception("failed to restore normal mode after stale charge state")
 
     def _run(self, action: str, remote_command: str) -> dict:
         completed = subprocess.run(
@@ -379,7 +380,7 @@ class ChargeControlAdapter:
     @staticmethod
     def _charger_ready(power: dict) -> bool:
         return all((
-            power.get("charger_controller_active") is True,
+            power.get("charger_controller_mode") == "legacy",
             power.get("bluetooth_connected") is True,
             power.get("charge_pin") == 1,
             power.get("negative_contact") == 1,
@@ -389,13 +390,20 @@ class ChargeControlAdapter:
     @staticmethod
     def _missing_dock_conditions(power: dict) -> list[str]:
         checks = (
-            ("charger_controller_active", "充电桩控制器离线"),
+            ("charger_controller_mode", "旧版充电诊断未运行"),
             ("bluetooth_connected", "蓝牙未连接"),
             ("charge_pin", "充电极片未接触"),
             ("negative_contact", "负极异常"),
             ("positive_contact", "正极异常"),
         )
-        return [label for key, label in checks if power.get(key) is not True and power.get(key) != 1]
+        return [
+            label for key, label in checks
+            if (
+                power.get(key) != "legacy"
+                if key == "charger_controller_mode"
+                else power.get(key) is not True and power.get(key) != 1
+            )
+        ]
 
     def _dock_detail(self, power: dict) -> str:
         missing = self._missing_dock_conditions(power)

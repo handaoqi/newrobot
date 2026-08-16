@@ -53,6 +53,7 @@ class TelemetryConfig:
     charging_current_threshold_ma: int = 300
     charging_overheat_threshold_c: float = 49.0
     battery_rated_capacity_wh: float = 216.0
+    legacy_charge_status_interval_seconds: float = 12.0
     charger_speaker_sink: str = "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
     nx_speaker_card: int = 2
     nx_speaker_control: str = "PCM"
@@ -163,6 +164,16 @@ class ChargeControlConfig:
     executable: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_lying_down"
     return_executable: str = "/home/firefly/charge_pile_v1.0.3b/charge_pile_xg_lib_v1.0.3b/dog_send_three_states/dog_returning"
     controller_service_name: str = "robot-launch.service"
+    arbiter_path: str = "/usr/local/sbin/roamerx-charge-pile-arbiter"
+    arc_platform_egg: str = "arc_platform"
+    ros_setup: str = "/opt/ros/humble/setup.bash"
+    ros_domain_id: int = 24
+    rmw_implementation: str = "rmw_zenoh_cpp"
+    arc_state_topic: str = "/arc/arc_state"
+    dock_state_topic: str = "/arc/dock_state"
+    pile_command_topic: str = "/arc/pile_ele_cmd"
+    pile_result_topic: str = "/arc/pile_ele_result"
+    arc_command_timeout_seconds: int = 18
     command_timeout_seconds: int = 90
     full_battery_percent: int = 95
     full_confirmation_samples: int = 3
@@ -203,14 +214,16 @@ class PowerModeConfig:
     )
     controller_host: str = "3588"
     controller_always_eggs: tuple[str, ...] = (
-        "time_sync", "power_daemon",
+        # Keep only battery telemetry alive while charging. All sensor and
+        # motion related eggs are stopped in cooling standby.
+        "power_daemon",
     )
     controller_runtime_eggs: tuple[str, ...] = (
-        "arc_platform", "monitor", "spline_daemon", "motion_control",
+        "time_sync", "arc_platform", "monitor", "spline_daemon", "motion_control",
         "zenoh_route", "dog_task", "push_image", "ecal2ros", "imu_daemon",
     )
     controller_always_services: tuple[str, ...] = (
-        "robot-launch.service", "roamerx-charge-pile.service",
+        "robot-launch.service",
     )
     controller_runtime_services: tuple[str, ...] = (
         "rkaiq_3A.service", "rknn_server.service", "lightdm.service",

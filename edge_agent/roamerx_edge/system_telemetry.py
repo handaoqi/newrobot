@@ -4,6 +4,7 @@ import logging
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -43,6 +44,8 @@ class SystemTelemetryProbe:
         self.telemetry = telemetry
         self.charge_config = charge_config or ChargeControlConfig()
         self.runner = runner
+        self._last_legacy_status: dict[str, int | bool | None] = {}
+        self._last_legacy_status_at = 0.0
 
     def poll(self) -> None:
         try:
@@ -66,12 +69,18 @@ class SystemTelemetryProbe:
                 "-o", "ConnectTimeout=3",
                 self.config.battery_ssh_host,
                 "timeout 4 ecal_mon_cli --proto power_mcu/bms_info -c 1 2>/dev/null; "
-                "echo __CHARGE_SERVICE__; systemctl is-active roamerx-charge-pile.service 2>/dev/null || true; "
-                "echo __CHARGE_MODE__; cat /var/lib/roamerx-charge-pile/state 2>/dev/null || echo unknown; "
-                "echo __CHARGE_STATE__; sudo journalctl -u roamerx-charge-pile.service -n 80 --no-pager 2>/dev/null "
-                "| grep -E 'connected=|charge pin=' | tail -n 2",
+                "echo __ARC_PLATFORM__; if robot-launch egg arc_platform 2>/dev/null | grep -qi running; then echo running; else echo inactive; fi; "
+                "echo __ARC_DOCK_STATE__; "
+                "mkdir -p /tmp/roamerx_ros_logs; . /opt/ros/humble/setup.bash; "
+                "export ROS_LOG_DIR=/tmp/roamerx_ros_logs ROS_DOMAIN_ID=24 RMW_IMPLEMENTATION=rmw_zenoh_cpp; "
+                "timeout 2 ros2 topic echo /arc/dock_state --once 2>/dev/null || true; "
+                "echo __LEGACY_SERVICE__; if systemctl is-active --quiet roamerx-charge-pile.service; then echo active; else echo inactive; fi; "
+                "echo __LEGACY_MODE__; cat /var/lib/roamerx-charge-pile/state 2>/dev/null || echo unknown; "
+                "echo __LEGACY_MODULE__; cat /run/roamerx-charge-pile/module 2>/dev/null || echo unknown; "
+                "echo __LEGACY_STATUS__; sudo journalctl -u roamerx-charge-pile.service -n 40 --no-pager 2>/dev/null | grep -E 'connected=|charge pin=' | tail -n 4; "
+                "echo __ARC_SERIAL_OWNER__; sudo lsof -n -F c /dev/ttyUSB0 2>/dev/null | sed -n 's/^c//p' | head -n 1",
             ],
-            7,
+            12,
         )
         values = {
             key: int(value)
@@ -86,34 +95,72 @@ class SystemTelemetryProbe:
         current_ma = values.get("current")
         if current_ma is not None and current_ma >= 2**31:
             current_ma -= 2**32
-        connected_match = re.findall(r"connected=(yes|no)", result.stdout)
-        state_matches = re.findall(
-            r"charge pin=(\d+).*c-status=(\d+),c\+status=(\d+)",
+        arc_platform_active = "__ARC_PLATFORM__\nrunning" in result.stdout
+        dock_match = re.search(
+            r"__ARC_DOCK_STATE__\n(.*?)(?:__ARC_SERIAL_OWNER__|\Z)",
             result.stdout,
+            flags=re.DOTALL,
         )
-        bluetooth_connected = bool(connected_match and connected_match[-1] == "yes")
-        charge_pin = int(state_matches[-1][0]) if state_matches else None
-        negative_contact = int(state_matches[-1][1]) if state_matches else None
-        positive_contact = int(state_matches[-1][2]) if state_matches else None
-        if not bluetooth_connected:
-            charge_pin = None
-            negative_contact = None
-            positive_contact = None
-        controller_active = "__CHARGE_SERVICE__\nactive" in result.stdout
-        mode_match = re.search(r"__CHARGE_MODE__\n(lying|unknown)", result.stdout)
-        controller_mode = mode_match.group(1) if mode_match else "unknown"
-        charging_requested = controller_mode == "lying"
-        charger_confirmed = bool(
-            controller_active
-            and bluetooth_connected
-            and charge_pin == 1
-            and negative_contact == 1
-            and positive_contact == 1
+        dock_raw = dock_match.group(1) if dock_match else ""
+        dock_state_match = re.search(r"^state:\s*(\d+)", dock_raw, flags=re.MULTILINE)
+        dock_error_match = re.search(
+            r"^error_msg:\s*['\"]?(.*?)['\"]?\s*$", dock_raw, flags=re.MULTILINE
         )
+        arc_dock_state = int(dock_state_match.group(1)) if dock_state_match else None
+        arc_dock_error = dock_error_match.group(1).strip() if dock_error_match else ""
+        legacy_active = "__LEGACY_SERVICE__\nactive" in result.stdout
+        legacy_mode_match = re.search(r"__LEGACY_MODE__\n(lying|unknown|return)", result.stdout)
+        legacy_mode = legacy_mode_match.group(1) if legacy_mode_match else "unknown"
+        legacy_module_match = re.search(r"__LEGACY_MODULE__\n(lying|unknown|return)", result.stdout)
+        legacy_module = legacy_module_match.group(1) if legacy_module_match else "unknown"
+        legacy_match = re.search(
+            r"__LEGACY_STATUS__\n(.*?)(?:__ARC_SERIAL_OWNER__|\Z)",
+            result.stdout,
+            flags=re.DOTALL,
+        )
+        legacy_status = self._parse_legacy_status(legacy_match.group(1) if legacy_match else "")
+        serial_match = re.search(r"__ARC_SERIAL_OWNER__\n([^\n]*)", result.stdout)
+        serial_owner = serial_match.group(1).strip() if serial_match else ""
         charging = bool(
             current_ma is not None
             and current_ma >= self.config.charging_current_threshold_ma
         )
+        if legacy_active:
+            self._remember_legacy_status(legacy_status)
+        elif (
+            not charging
+            and values["power"] > self.charge_config.low_battery_start_percent
+            and arc_dock_state in {None, 0, 5}
+            and time.monotonic() - self._last_legacy_status_at
+            >= self.config.legacy_charge_status_interval_seconds
+        ):
+            self._probe_legacy_status()
+        if not legacy_status.get("available"):
+            legacy_status = dict(self._last_legacy_status)
+
+        dock_contact = arc_dock_state in {1, 2}
+        if legacy_active:
+            bluetooth_connected = legacy_status.get("bluetooth_connected")
+            charge_pin = legacy_status.get("charge_pin")
+            negative_contact = legacy_status.get("negative_contact")
+            positive_contact = legacy_status.get("positive_contact")
+            charger_confirmed = bool(
+                bluetooth_connected is True
+                and charge_pin == 1
+                and negative_contact == 1
+                and positive_contact == 1
+            )
+        else:
+            # ARC exposes only a combined contact state. The cached legacy
+            # probe is diagnostic data, not an ARC contact assertion.
+            bluetooth_connected = legacy_status.get("bluetooth_connected")
+            charge_pin = legacy_status.get("charge_pin")
+            negative_contact = legacy_status.get("negative_contact")
+            positive_contact = legacy_status.get("positive_contact")
+            charger_confirmed = bool(arc_platform_active and dock_contact and not arc_dock_error)
+        controller_active = legacy_active or arc_platform_active
+        controller_mode = "legacy" if legacy_active else "arc_platform"
+        charging_requested = (legacy_active and legacy_mode == "lying") or arc_dock_state in {1, 2}
         temperature_c = round(values["temp"] / 1000, 1) if "temp" in values else None
         bms_error_code = values.get("error")
         thermal_protection_by_bms = bms_error_code == 1034
@@ -133,7 +180,7 @@ class SystemTelemetryProbe:
             charge_state = "thermal_protection"
         elif charging_requested and charger_confirmed:
             charge_state = "waiting"
-        elif controller_active and bluetooth_connected:
+        elif controller_active:
             charge_state = "ready"
         else:
             charge_state = "disconnected"
@@ -151,6 +198,13 @@ class SystemTelemetryProbe:
             positive_contact=positive_contact,
             charger_controller_active=controller_active,
             charger_controller_mode=controller_mode,
+            charger_backend="legacy_helper" if legacy_active else "arc_platform",
+            legacy_charge_module=legacy_module,
+            arc_platform_active=arc_platform_active,
+            arc_dock_state=arc_dock_state,
+            arc_dock_error=arc_dock_error,
+            arc_dock_contact=dock_contact,
+            serial_owner=serial_owner,
             charging_requested=charging_requested,
             charge_state=charge_state,
             thermal_protection=thermal_protection,
@@ -169,6 +223,51 @@ class SystemTelemetryProbe:
             ),
             remaining_energy_estimated=True,
         )
+
+    def _probe_legacy_status(self) -> None:
+        try:
+            self.runner(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                    self.config.battery_ssh_host,
+                    f"sudo {shlex.quote(self.charge_config.arbiter_path)} legacy-status >/dev/null 2>&1 || true",
+                ],
+                22,
+            )
+            result = self.runner(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                    self.config.battery_ssh_host,
+                    "sudo cat /run/roamerx-charge-pile/legacy-status.txt 2>/dev/null || true",
+                ],
+                5,
+            )
+            self._remember_legacy_status(self._parse_legacy_status(result.stdout))
+        except Exception:
+            LOGGER.warning("legacy charge-pile diagnostic probe failed", exc_info=True)
+
+    def _remember_legacy_status(self, status: dict[str, int | bool | None]) -> None:
+        self._last_legacy_status_at = time.monotonic()
+        if status.get("available"):
+            self._last_legacy_status = dict(status)
+
+    @staticmethod
+    def _parse_legacy_status(raw: str) -> dict[str, int | bool | None]:
+        connected_match = re.findall(r"connected=(yes|no)", raw)
+        state_matches = re.findall(
+            r"charge pin=(\d+).*c-status=(\d+),c\+status=(\d+)", raw,
+        )
+        connected = bool(connected_match and connected_match[-1] == "yes")
+        if not connected:
+            return {"available": bool(connected_match), "bluetooth_connected": False,
+                    "charge_pin": None, "negative_contact": None, "positive_contact": None}
+        if not state_matches:
+            return {"available": True, "bluetooth_connected": True,
+                    "charge_pin": None, "negative_contact": None, "positive_contact": None}
+        charge_pin, negative, positive = state_matches[-1]
+        return {"available": True, "bluetooth_connected": True,
+                "charge_pin": int(charge_pin), "negative_contact": int(negative),
+                "positive_contact": int(positive)}
 
     def _poll_network(self) -> None:
         serial_script = (

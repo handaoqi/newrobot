@@ -14,7 +14,20 @@ localization:
     # The controller odometry uses device-uptime timestamps and its yaw drifts
     # against lidar SLAM. Keep it recorded for diagnostics, but do not seed NDT
     # until that clock/frame contract has been calibrated.
-    enable_robot_odometry_prediction: true
+    enable_robot_odometry_prediction: false
+    # Scan-to-scan FastGICP provides an independent short-term LiDAR motion
+    # prior to NDT. It has passed the recorded-bag A/B validation and never
+    # uses the controller odometry topic.
+    lidar_odometry_prediction:
+      enable: true
+      topic: "/odom/lidar_odom"
+      voxel_size: 0.40
+      max_correspondence_distance: 1.00
+      max_fitness_score: 0.50
+      max_translation_per_scan: 0.80
+      max_rotation_per_scan_rad: 0.70
+      min_points: 200
+      num_threads: 2
     send_tf_transforms: true
     tf_use_current_time: true
     # Keep map->odom available slightly ahead of Nav2 controller requests.

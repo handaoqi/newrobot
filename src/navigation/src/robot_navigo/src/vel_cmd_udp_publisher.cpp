@@ -430,16 +430,35 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           now - stand_start_time_);
       const auto ctrl_mode = sdk_highlevel_.getCurrentCtrlmode();
-      if ((ctrl_mode == 1 || ctrl_mode == 18) &&
-          elapsed >= std::chrono::milliseconds(standup_settle_ms_)) {
+      const bool sdk_reports_standing = ctrl_mode == 1 || ctrl_mode == 18;
+      // On NX_XG3588 the high-level command acknowledgement is reliable, but
+      // getCurrentCtrlmode() can remain at 0 after a successful standUp().
+      // Do not leave navigation blocked forever on that stale readback: after
+      // the normal settling interval, accept a successful stand-up command as
+      // a bounded fallback.  A failed command still retries and never reaches
+      // this branch.
+      const bool settled_successful_standup =
+          standup_command_accepted_ &&
+          elapsed >= std::chrono::milliseconds(standup_settle_ms_);
+      if ((sdk_reports_standing &&
+           elapsed >= std::chrono::milliseconds(standup_settle_ms_)) ||
+          settled_successful_standup) {
         standing_up_ = false;
         PublishMotionState("standing");
-        RCLCPP_INFO(this->get_logger(),
-                    "standUp confirmed by SDK, current_ctrlmode=%u", ctrl_mode);
+        if (sdk_reports_standing) {
+          RCLCPP_INFO(this->get_logger(),
+                      "standUp confirmed by SDK, current_ctrlmode=%u", ctrl_mode);
+        } else {
+          RCLCPP_WARN(this->get_logger(),
+                      "standUp settled after a successful SDK command, but "
+                      "current_ctrlmode remains %u; using bounded fallback",
+                      ctrl_mode);
+        }
       } else if (elapsed < std::chrono::milliseconds(standup_retry_ms_)) {
         return;
       } else {
         const auto ret = sdk_highlevel_.standUp();
+        standup_command_accepted_ = ret == 0;
         stand_start_time_ = now;
         RCLCPP_WARN(this->get_logger(),
                     "standUp not confirmed after %ldms (mode=%u); retry returned 0x%x",
@@ -507,6 +526,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
 
   void StartStandUp(const char* reason) {
     const auto ret = sdk_highlevel_.standUp();
+    standup_command_accepted_ = ret == 0;
     standing_up_ = true;
     stand_start_time_ = std::chrono::steady_clock::now();
     PublishMotionState(ret == 0 ? "standing_up" : "stand_up_retrying");
@@ -747,6 +767,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   std::shared_ptr<zsibot::ZsibotExecutor> remote_executor_;
   bool nav_active_ = false;
   bool standing_up_ = false;
+  bool standup_command_accepted_ = false;
   bool crawl_mode_ = false;
   bool manual_crawl_lock_ = false;
   bool low_posture_lock_ = false;

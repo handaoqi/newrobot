@@ -93,7 +93,6 @@ stop_navigation() {
   kill_pattern "ros2 bag record.*roamerx_nav_logs/diagnostics"
   kill_pattern "ros2 launch robot_navigo navigation_bringup.launch.py"
   kill_pattern "component_container_isolated.*navigo_container"
-  kill_pattern "vel_cmd_udp_pub"
   kill_pattern "vel_cmd_lcm_pub"
   kill_pattern "mode_status_pub"
   kill_pattern "odom_to_tf_broadcaster"
@@ -236,10 +235,8 @@ start_stack() {
   if is_navigation_running; then
     echo "Nav2/Navigo already appears to be running."
   else
-    # A direct remote bridge uses the same fixed SDK UDP endpoint as Nav2's
-    # velocity bridge. Stop it before launching Nav2 so the two modes cannot
-    # silently bind-conflict.
-    kill_pattern "vel_cmd_udp_pub.*remote_control_only:=true"
+    # The systemd-managed remote bridge is persistent. navigation_bringup
+    # intentionally does not create a second UDP velocity bridge.
     echo "Starting Nav2/Navigo..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' use_official_ukf:='${USE_OFFICIAL_UKF}' map:='${MAP_YAML}'" \
       >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &

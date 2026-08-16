@@ -31,6 +31,7 @@
 #include <pcl/filters/voxel_grid.h>
 
 #include <pclomp/ndt_omp.h>
+#include <fast_gicp/gicp/fast_gicp.hpp>
 #include <fast_gicp/ndt/ndt_cuda.hpp>
 
 #include <localization/pose_estimator.hpp>
@@ -69,6 +70,21 @@ public:
     ndt_neighbor_search_radius       = declare_parameter<double>("ndt_neighbor_search_radius", 2.0);
     ndt_resolution                   = declare_parameter<double>("ndt_resolution", 1.0);
     enable_robot_odometry_prediction = declare_parameter<bool>("enable_robot_odometry_prediction", false);
+    enable_lidar_odometry_prediction_ = declare_parameter<bool>("lidar_odometry_prediction.enable", false);
+    lidar_odom_voxel_size_ = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("lidar_odometry_prediction.voxel_size", 0.40)));
+    lidar_odom_max_correspondence_distance_ = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("lidar_odometry_prediction.max_correspondence_distance", 1.00)));
+    lidar_odom_max_fitness_score_ = static_cast<float>(std::max(
+      0.001, declare_parameter<double>("lidar_odometry_prediction.max_fitness_score", 0.50)));
+    lidar_odom_max_translation_per_scan_ = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("lidar_odometry_prediction.max_translation_per_scan", 0.80)));
+    lidar_odom_max_rotation_per_scan_rad_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>("lidar_odometry_prediction.max_rotation_per_scan_rad", 0.70)));
+    lidar_odom_min_points_ = static_cast<size_t>(std::max<int64_t>(
+      20, declare_parameter<int>("lidar_odometry_prediction.min_points", 200)));
+    lidar_odom_num_threads_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("lidar_odometry_prediction.num_threads", 2)));
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    invert_acc  = declare_parameter<bool>("invert_acc", false);
@@ -84,6 +100,7 @@ public:
     std::string points_topic            = declare_parameter<std::string>("points_topic", "/livox/lidar");
     std::string odom_topic              = declare_parameter<std::string>("odom_topic", "/odom/localization_odom");
     robot_odom_topic_                   = declare_parameter<std::string>("robot_odom_topic", "/odom/mc_odom");
+    lidar_odom_topic_                   = declare_parameter<std::string>("lidar_odometry_prediction.topic", "/odom/lidar_odom");
     std::string aligned_points_topic    = declare_parameter<std::string>("aligned_points_topic", "/aligned_points");
     std::string status_topic            = declare_parameter<std::string>("status_topic", "/status");
     std::string localization_info_topic = declare_parameter<std::string>("localization_info_topic", "/localization_info");
@@ -262,12 +279,14 @@ public:
         std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1));
     }
     points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
-    if (enable_robot_odometry_prediction) {
-      robot_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        robot_odom_topic_, rclcpp::QoS(100),
-        std::bind(&HdlLocalizationNode::robot_odom_callback, this, std::placeholders::_1));
-      RCLCPP_INFO(get_logger(), "Robot odometry prediction enabled, topic=%s", robot_odom_topic_.c_str());
-    }
+    // Keep controller odometry available for publishing map->odom even when it
+    // is deliberately excluded from the NDT prediction input.
+    robot_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      robot_odom_topic_, rclcpp::QoS(100),
+      std::bind(&HdlLocalizationNode::robot_odom_callback, this, std::placeholders::_1));
+    RCLCPP_INFO(
+      get_logger(), "Robot odometry subscribed for TF continuity; NDT prediction %s, topic=%s",
+      enable_robot_odometry_prediction ? "enabled" : "disabled", robot_odom_topic_.c_str());
     if (use_gnss_fusion_) {
       gnss_sub = create_subscription<sensor_msgs::msg::NavSatFix>(
         gnss_topic, 20, std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
@@ -296,6 +315,7 @@ public:
                 std::chrono::milliseconds(50), // 20Hz
                 std::bind(&HdlLocalizationNode::PublishOdomTimer, this));
     pose_pub    = create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
+    lidar_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(lidar_odom_topic_, 5);
     aligned_pub = create_publisher<sensor_msgs::msg::PointCloud2>(aligned_points_topic, 5);
     status_pub  = create_publisher<localization::msg::ScanMatchingStatus>(status_topic, 5);
 
@@ -310,6 +330,20 @@ public:
 
     initialize_params();
     raw_points_ptr_ = pcl::PointCloud<PointT>::Ptr(new pcl::PointCloud<PointT>());
+    if (enable_lidar_odometry_prediction_) {
+      lidar_odom_registration_ = std::make_unique<fast_gicp::FastGICP<PointT, PointT>>();
+      lidar_odom_registration_->setNumThreads(lidar_odom_num_threads_);
+      lidar_odom_registration_->setCorrespondenceRandomness(20);
+      lidar_odom_registration_->setMaximumIterations(20);
+      lidar_odom_registration_->setTransformationEpsilon(0.01);
+      lidar_odom_registration_->setMaxCorrespondenceDistance(lidar_odom_max_correspondence_distance_);
+      RCLCPP_INFO(
+        get_logger(),
+        "LiDAR odometry prediction enabled: topic=%s voxel=%.2fm max_score=%.2f max_delta=[%.2fm, %.1fdeg] threads=%d",
+        lidar_odom_topic_.c_str(), lidar_odom_voxel_size_, lidar_odom_max_fitness_score_,
+        lidar_odom_max_translation_per_scan_,
+        lidar_odom_max_rotation_per_scan_rad_ * 180.0 / M_PI, lidar_odom_num_threads_);
+    }
     // Initialize sensor data validity tracking
     last_lidar_data_time_ = get_clock()->now();
     last_imu_data_time_   = get_clock()->now();
@@ -812,6 +846,7 @@ private:
     }
     pose_estimator.reset(new localization::PoseEstimator(
       registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+    has_trusted_ndt_pose_ = false;
     is_init_success_ = false;
     init_match_count_ = 0;
     localization_state_ = 1;
@@ -1047,6 +1082,7 @@ private:
         RCLCPP_INFO(get_logger(), "Global localization successful! Using new initial pose.");
         pose_estimator.reset(new localization::PoseEstimator(
           registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+        has_trusted_ndt_pose_ = false;
         is_init_success_ = false;
         init_match_count_ = 0;
         localization_state_ = 1;
@@ -1122,6 +1158,12 @@ private:
       std::lock_guard<std::mutex> lock(imu_data_mutex);
       imu_data.clear();
     }
+
+    if (enable_lidar_odometry_prediction_ && pose_estimator) {
+      pose_estimator->enable_lidar_odometry_prediction();
+      updateLidarOdometryPrediction(raw_points_ptr_, rclcpp::Time(stamp));
+    }
+
     // Use adjacent received odometry poses directly. The device header carries
     // controller uptime rather than ROS epoch time, so TF time queries are not
     // a reliable source of motion deltas on this platform.
@@ -1344,6 +1386,7 @@ private:
       (absolute_pose_valid || bridge_pose_valid)
         ? pose_estimator->matrix()
         : (has_valid_pose_history_ ? last_pose_ : pose_estimator->matrix()));
+    syncLidarOdometryImuAnchor();
   }
 
   /**
@@ -1378,6 +1421,7 @@ private:
       last_pose_source_ = "Callback";   
       pose_estimator.reset(new localization::PoseEstimator(
         registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+      has_trusted_ndt_pose_ = false;
       // Restart verification and allow one bounded ICP refinement from the
       // operator-provided pose. Local NDT alone can only recover small pose
       // errors, while the manual pose is often only approximate.
@@ -1414,6 +1458,109 @@ private:
     voxel_filter_ptr_->filter(*filtered);
     filtered->header = cloud->header;
     return filtered;
+  }
+
+  void resetLidarOdometryState() {
+    previous_lidar_odom_cloud_.reset();
+    previous_lidar_imu_pose_.setIdentity();
+    lidar_odom_pose_.setIdentity();
+    lidar_odom_estimator_instance_ = pose_estimator.get();
+    if (pose_estimator) {
+      pose_estimator->invalidate_lidar_odometry_prediction();
+    }
+  }
+
+  void syncLidarOdometryImuAnchor() {
+    if (!enable_lidar_odometry_prediction_ || !pose_estimator ||
+        !previous_lidar_odom_cloud_) {
+      return;
+    }
+    previous_lidar_imu_pose_ = pose_estimator->matrix();
+  }
+
+  bool updateLidarOdometryPrediction(
+    const pcl::PointCloud<PointT>::ConstPtr& input_cloud,
+    const rclcpp::Time& stamp) {
+    if (!enable_lidar_odometry_prediction_ || !pose_estimator ||
+        !lidar_odom_registration_ || !input_cloud) {
+      return false;
+    }
+    if (lidar_odom_estimator_instance_ != pose_estimator.get()) {
+      resetLidarOdometryState();
+    }
+
+    lidar_odom_voxel_filter_.setLeafSize(
+      lidar_odom_voxel_size_, lidar_odom_voxel_size_, lidar_odom_voxel_size_);
+    lidar_odom_voxel_filter_.setInputCloud(input_cloud);
+    pcl::PointCloud<PointT>::Ptr current_cloud(new pcl::PointCloud<PointT>());
+    lidar_odom_voxel_filter_.filter(*current_cloud);
+    current_cloud->header = input_cloud->header;
+    if (current_cloud->size() < lidar_odom_min_points_) {
+      pose_estimator->invalidate_lidar_odometry_prediction();
+      previous_lidar_odom_cloud_ = current_cloud;
+      previous_lidar_imu_pose_ = pose_estimator->matrix();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2.0,
+        "LiDAR odometry rejected: only %zu points after %.2fm voxel filter (need %zu)",
+        current_cloud->size(), lidar_odom_voxel_size_, lidar_odom_min_points_);
+      return false;
+    }
+    if (!previous_lidar_odom_cloud_ ||
+        previous_lidar_odom_cloud_->size() < lidar_odom_min_points_) {
+      previous_lidar_odom_cloud_ = current_cloud;
+      previous_lidar_imu_pose_ = pose_estimator->matrix();
+      return false;
+    }
+
+    const Eigen::Matrix4f current_imu_pose = pose_estimator->matrix();
+    const Eigen::Matrix4f imu_delta =
+      previous_lidar_imu_pose_.inverse() * current_imu_pose;
+    pcl::PointCloud<PointT> aligned;
+    lidar_odom_registration_->setInputTarget(previous_lidar_odom_cloud_);
+    lidar_odom_registration_->setInputSource(current_cloud);
+    lidar_odom_registration_->align(aligned, imu_delta);
+    const Eigen::Matrix4f lidar_delta = lidar_odom_registration_->getFinalTransformation();
+    const float fitness_score = static_cast<float>(lidar_odom_registration_->getFitnessScore());
+    const bool finite = lidar_delta.allFinite() && std::isfinite(fitness_score);
+    Eigen::Quaternionf rotation = Eigen::Quaternionf::Identity();
+    if (finite) {
+      rotation = Eigen::Quaternionf(lidar_delta.block<3, 3>(0, 0));
+      rotation.normalize();
+    }
+    const float translation_m = finite ? lidar_delta.block<3, 1>(0, 3).norm()
+                                       : std::numeric_limits<float>::infinity();
+    const float rotation_rad = finite
+      ? Eigen::Quaternionf::Identity().angularDistance(rotation)
+      : std::numeric_limits<float>::infinity();
+    const bool valid = finite && lidar_odom_registration_->hasConverged() &&
+      fitness_score <= lidar_odom_max_fitness_score_ &&
+      translation_m <= lidar_odom_max_translation_per_scan_ &&
+      rotation_rad <= lidar_odom_max_rotation_per_scan_rad_;
+
+    previous_lidar_odom_cloud_ = current_cloud;
+    previous_lidar_imu_pose_ = current_imu_pose;
+    if (!valid) {
+      pose_estimator->invalidate_lidar_odometry_prediction();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1.0,
+        "LiDAR odometry rejected: converged=%d score=%.3f delta=[%.3fm, %.1fdeg]",
+        lidar_odom_registration_->hasConverged(), fitness_score, translation_m,
+        rotation_rad * 180.0 / M_PI);
+      return false;
+    }
+
+    pose_estimator->predict_lidar_odometry(lidar_delta);
+    lidar_odom_pose_ = lidar_odom_pose_ * lidar_delta;
+    nav_msgs::msg::Odometry lidar_odom;
+    lidar_odom.header.stamp = stamp;
+    lidar_odom.header.frame_id = "lidar_odom";
+    lidar_odom.child_frame_id = "livox_frame";
+    lidar_odom.pose.pose = tf2::toMsg(Eigen::Isometry3d(lidar_odom_pose_.cast<double>()));
+    lidar_odom.pose.covariance[0] = std::max(1e-4f, fitness_score);
+    lidar_odom.pose.covariance[7] = std::max(1e-4f, fitness_score);
+    lidar_odom.pose.covariance[35] = std::max(1e-4f, fitness_score);
+    lidar_odom_pub_->publish(lidar_odom);
+    return true;
   }
 
   void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose) {
@@ -1967,9 +2114,18 @@ private:
     status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
     const bool score_valid = std::isfinite(status.matching_error) && status.matching_error < 0.5f;
     const bool inliers_valid = status.inlier_fraction >= 0.05f;
-    const bool transform_valid = std::isfinite(relative_translation_m) && relative_translation_m < 1.0;
+    // The first NDT observation after a new initial pose is an acquisition,
+    // not a frame-to-frame motion. Comparing it to stale/extrapolated history
+    // can permanently reject an otherwise excellent match: history is then
+    // never advanced and all later scans see the same large delta. Once NDT
+    // has anchored this cycle, retain the 1 m continuity guard.
+    const bool transform_valid = std::isfinite(relative_translation_m) &&
+      (!has_trusted_ndt_pose_ || relative_translation_m < 1.0);
     status.has_converged = registration->hasConverged() && score_valid && inliers_valid && transform_valid;
     last_ndt_status_healthy_ = status.has_converged;
+    if (status.has_converged) {
+      has_trusted_ndt_pose_ = true;
+    }
     if (registration->hasConverged() && !status.has_converged) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2.0,
                            "NDT convergence rejected: score=%.3f, inlier=%.3f, relative_translation=%.3f",
@@ -1977,8 +2133,8 @@ private:
                            status.inlier_fraction,
                            relative_translation_m);
     }
-    status.prediction_labels.reserve(2);
-    status.prediction_errors.reserve(2);
+    status.prediction_labels.reserve(3);
+    status.prediction_errors.reserve(3);
     std::vector<double> errors(6, 0.0);
     if (pose_estimator->wo_prediction_error()) {
       status.prediction_labels.push_back(std_msgs::msg::String());
@@ -1994,6 +2150,11 @@ private:
       status.prediction_labels.push_back(std_msgs::msg::String());
       status.prediction_labels.back().data = "odom";
       status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->odom_prediction_error().get().cast<double>())).transform);
+    }
+    if (pose_estimator->lidar_odometry_prediction_error()) {
+      status.prediction_labels.push_back(std_msgs::msg::String());
+      status.prediction_labels.back().data = "lidar_odom";
+      status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->lidar_odometry_prediction_error().get().cast<double>())).transform);
     }
     status_pub->publish(status);
   }
@@ -2257,6 +2418,8 @@ private:
         seedPositionFromGnss(get_clock()->now(), "map initialization");
         pose_estimator.reset(new localization::PoseEstimator(
           registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+        has_trusted_ndt_pose_ = false;
+        resetLidarOdometryState();
         is_extrapolating_ = false;
         {
           std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
@@ -2280,6 +2443,7 @@ private:
   std::string robot_odom_frame_id;
   std::string odom_child_frame_id;
   std::string robot_odom_topic_;
+  std::string lidar_odom_topic_;
   std::string localization_odom_frame_id;
   bool send_tf_transforms;
   bool tf_use_current_time;
@@ -2301,6 +2465,7 @@ private:
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               pose_pub;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               lidar_odom_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            robot_odom_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         aligned_pub;
   rclcpp::Publisher<localization::msg::ScanMatchingStatus>::SharedPtr status_pub;
@@ -2452,6 +2617,12 @@ private:
   pcl::PointCloud<PointT>::Ptr global_map_points_ptr_;
   pcl::VoxelGrid<PointT>::Ptr  voxel_filter_ptr_ = pcl::VoxelGrid<PointT>::Ptr(new pcl::VoxelGrid<PointT>());
   pcl::PointCloud<PointT>::Ptr raw_points_ptr_ = nullptr;  ///< Raw point cloud pointer.
+  std::unique_ptr<fast_gicp::FastGICP<PointT, PointT>> lidar_odom_registration_;
+  pcl::VoxelGrid<PointT> lidar_odom_voxel_filter_;
+  pcl::PointCloud<PointT>::Ptr previous_lidar_odom_cloud_;
+  Eigen::Matrix4f previous_lidar_imu_pose_ = Eigen::Matrix4f::Identity();
+  Eigen::Matrix4f lidar_odom_pose_ = Eigen::Matrix4f::Identity();
+  const localization::PoseEstimator* lidar_odom_estimator_instance_ = nullptr;
   // pose estimator
   std::mutex pose_estimator_mutex;
   std::unique_ptr<localization::PoseEstimator> pose_estimator;
@@ -2465,6 +2636,14 @@ private:
   double ndt_neighbor_search_radius;
   double ndt_resolution;
   bool enable_robot_odometry_prediction;
+  bool enable_lidar_odometry_prediction_ = false;
+  float lidar_odom_voxel_size_ = 0.40f;
+  float lidar_odom_max_correspondence_distance_ = 1.00f;
+  float lidar_odom_max_fitness_score_ = 0.50f;
+  float lidar_odom_max_translation_per_scan_ = 0.80f;
+  float lidar_odom_max_rotation_per_scan_rad_ = 0.70f;
+  size_t lidar_odom_min_points_ = 200;
+  int lidar_odom_num_threads_ = 2;
   std::mutex robot_odom_mutex_;
   Eigen::Matrix4f latest_robot_odom_ = Eigen::Matrix4f::Identity();
   Eigen::Matrix4f previous_robot_odom_ = Eigen::Matrix4f::Identity();
@@ -2478,6 +2657,10 @@ private:
   int imu_data_filter_num_ = 5;  // Number of IMU data points to filter.
 
   bool is_init_success_ = false;
+  // Tracks a verified NDT anchor for the current initialization cycle. Generic
+  // pose history may contain an extrapolated/stale pose and is not suitable
+  // for deciding whether the first NDT acquisition is a discontinuity.
+  bool has_trusted_ndt_pose_ = false;
   bool is_use_map_coord_ = true;
   int localization_state_ = 0;   // 0: not init, 1: initing, 2: init success, 3: continuous localization, 4: continuous localization failed
   sensor_msgs::msg::Imu::SharedPtr correct_imu_data_ptr_;

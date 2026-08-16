@@ -10,6 +10,24 @@ def result(returncode=0, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def test_start_motion_control_is_idempotent_when_dog_task_is_running():
+    class FakePowerMode:
+        def snapshot(self):
+            return {"auto_charge_enabled": False, "charge_stage": "idle"}
+
+    adapter = ChargeControlAdapter(ChargeControlConfig(), FakePowerMode())
+    calls = []
+    adapter._run = lambda action, command: calls.append((action, command)) or {"action": action}
+
+    assert adapter.start_motion_control()["motion_control"] == "running"
+    assert calls[0][0] == "motion_start"
+    command = calls[0][1]
+    assert "robot-launch start 3 4" not in command
+    assert 'if ! robot-launch egg "$egg" 2>/dev/null | grep -qi running; then' in command
+    assert 'robot-launch start "$egg"' in command
+    assert 'robot-launch egg "$egg" 2>/dev/null | grep -qi running' in command
+
+
 def test_mode_transitions_run_expected_commands(tmp_path):
     commands = []
 
@@ -26,9 +44,14 @@ def test_mode_transitions_run_expected_commands(tmp_path):
     assert controller.enter_cooling()["mode"] == "cooling_standby"
     assert any(command[:2] == ["bash", "-lc"] and "/teleop_action" in command[-1] for command in commands)
     assert ["sleep", "2"] in commands
+    assert ["sudo", "systemctl", "stop", config.teleop_bridge_service] not in commands
     assert ["sudo", "systemctl", "disable", "--now", config.monitoring_service] in commands
     assert [config.navigation_script, "full-stop"] in commands
     assert ["sudo", "pkill", "-TERM", "-f", "[r]tk_ntrip_bridge.py|[s]ixents_gps_driver"] in commands
+    remote_stop = next(command for command in commands if command[0] == "ssh")
+    assert all(egg in remote_stop[-1] for egg in config.controller_runtime_eggs)
+    assert all(service in remote_stop[-1] for service in config.controller_runtime_services)
+    assert "power_daemon" not in remote_stop[-1]
     assert not any("nvpmodel" in " ".join(command) for command in commands)
 
     commands.clear()
@@ -123,7 +146,7 @@ def test_service_status_is_compared_with_current_mode(tmp_path):
     assert services["edge_agent"]["matches_mode"] is True
     assert services["dev_agent"]["matches_mode"] is True
     assert services["detection_video"]["matches_mode"] is True
-    assert services["controller_service_roamerx_charge_pile_service"]["matches_mode"] is True
+    assert "controller_service_roamerx_charge_pile_service" not in services
     assert "power_profile" not in services
     assert "leg_power" not in services
     assert services["controller_egg_time_sync"]["matches_mode"] is True
@@ -154,7 +177,7 @@ def test_normal_mode_reports_every_required_service_as_running(tmp_path):
     controller = PowerModeController(config, runner=runner)
     services = controller.refresh_service_status({"charger_controller_active": True})["services"]
 
-    assert len(services) == 27
+    assert len(services) == 26
     assert all(service["matches_mode"] for service in services.values())
 
 
@@ -189,7 +212,7 @@ def test_full_charge_stops_charger_and_restores_normal(tmp_path):
         controller,
     )
     calls = []
-    adapter._stop_remote = lambda: calls.append("stop")
+    adapter._return_legacy_and_restore_arc = lambda: calls.append("stop")
     controller.restore_normal = lambda: calls.append("normal")
     adapter.start_motion_control = lambda: calls.append("motion") or {"motion_control": "running"}
 
@@ -217,7 +240,7 @@ def test_thermal_recovery_retries_charge_once_after_delay(monkeypatch):
         FakePowerMode(),
     )
     calls = []
-    adapter._start_remote = lambda: calls.append("retry") or {"stdout": "active"}
+    adapter._set_legacy_pile_state = lambda _state: calls.append("retry") or {"stdout": "active"}
     clock = iter([100.0, 100.0, 109.9, 110.1, 111.0, 170.0])
     monkeypatch.setattr("roamerx_edge.charge_control_adapter.time.monotonic", lambda: next(clock))
 
@@ -330,12 +353,12 @@ def test_charge_waits_for_dock_before_stopping_motion():
 
     power_mode = FakePowerMode()
     adapter = ChargeControlAdapter(ChargeControlConfig(), power_mode)
-    adapter._set_charge_pile_state = lambda state: {"state": state}
+    adapter._set_legacy_pile_state = lambda _state: {"action": "legacy_lying"}
 
     result = adapter.start()
 
     assert result["charge_stage"] == "waiting_for_dock"
-    assert "蓝牙未连接" in result["missing"]
+    assert "旧版充电诊断未运行" in result["missing"]
     assert power_mode.stages[-1][0] == "waiting_for_dock"
 
 
@@ -364,7 +387,7 @@ def test_charge_commands_stop_and_restore_3588_runtime_eggs():
     commands = []
     adapter._run = lambda action, command: commands.append((action, command)) or {"action": action}
     adapter._latest_power = {
-        "charger_controller_active": True,
+        "charger_controller_mode": "legacy",
         "bluetooth_connected": True,
         "charge_pin": 1,
         "negative_contact": 1,
@@ -375,24 +398,12 @@ def test_charge_commands_stop_and_restore_3588_runtime_eggs():
     adapter.stop()
 
     assert commands[0][0] == "pile_lying"
+    assert "roamerx-charge-pile-arbiter legacy-lying" in commands[0][1]
     assert "robot-launch stop 3 4" in commands[1][1]
-    assert "robot-launch stop push_image spline_daemon motion_control dog_task" in commands[2][1]
-    assert "printf 'lying" in commands[2][1]
-    assert "systemctl restart roamerx-charge-pile.service" in commands[2][1]
-    assert "roamerx-leg-power" not in commands[2][1]
-    assert "systemctl stop rkaiq_3A.service rknn_server.service lightdm.service" in commands[2][1]
+    assert commands[2][0] == "legacy_charge_confirm"
+    assert "pgrep -f" in commands[2][1]
     restore = commands[3][1]
-    assert "dog_returning" in restore
-    assert "sudo timeout --signal=TERM --kill-after=2 6" in restore
-    assert "pkill -KILL -x dog_returning" in restore
-    assert "printf 'unknown" in restore
-    assert "systemctl start roamerx-charge-pile.service" in restore
-    assert "roamerx-leg-power" not in commands[1][1]
-    assert "systemctl start rkaiq_3A.service rknn_server.service lightdm.service" in restore
-    assert "systemctl restart robot-launch.service" in restore
-    assert "robot-launch start 3 4" in restore
-    assert "systemctl is-active --quiet robot-launch.service" in restore
-    assert "/arc/mc_state" in restore
-    assert "ros2 topic echo /arc/mc_state --once" in restore
-    assert "|| true" in restore
+    assert commands[3][0] == "legacy_return"
+    assert "roamerx-charge-pile-arbiter legacy-return" in restore
+    assert "arc_platform" in restore
     assert commands[4][0] == "motion_start"

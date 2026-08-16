@@ -2,6 +2,9 @@
 Description=RoamerX remote-control motion bridge
 After=network-online.target roamerx-zenoh.service
 Wants=network-online.target roamerx-zenoh.service
+# The bridge owns the sole virtual-remote session. It is intentionally
+# persistent across teleop, task, charging, and cooling commands.
+RefuseManualStop=yes
 
 [Service]
 Type=simple
@@ -9,7 +12,7 @@ User=robot
 Group=robot
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/robot/genisom_roamerx_open/install/setup.bash && exec ros2 run robot_navigo vel_cmd_udp_pub --ros-args -p platform:=NX_XG3588 -p remote_control_only:=true'
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/robot/genisom_roamerx_open/install/setup.bash && exec ros2 run robot_navigo vel_cmd_udp_pub --ros-args -p platform:=NX_XG3588 -p remote_control_only:=false'
 Restart=always
 RestartSec=3
 KillMode=control-group

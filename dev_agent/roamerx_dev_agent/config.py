@@ -31,7 +31,10 @@ class CodexConfig:
 class VoiceConfig:
     enabled: bool = True
     capture_mode: str = "local_alsa"
+    # Capture can use an ALSA sharing plug-in such as dsnoop, but playback
+    # must target a real output PCM.  Keep the two routes independent.
     alsa_device: str = "hw:0,0"
+    playback_device: str = "plughw:0,0"
     host: str = "192.168.234.1"
     port: int = 22
     user: str = "firefly"
@@ -39,15 +42,27 @@ class VoiceConfig:
     pulse_server: str = "/run/user/1000/pulse/native"
     source: str = "alsa_input.usb-TTGK_Technology_USB_Audio_33022920230925-00.mono-fallback"
     rms_threshold: int = 18
-    silence_chunks: int = 5
+    noise_floor_chunks: int = 24
+    noise_rms_multiplier: float = 2.2
+    # Retain audio before VAD opens the segment so the first syllable of the
+    # wake word is not lost at a 250 ms capture boundary.
+    pre_roll_chunks: int = 3
+    silence_chunks: int = 3
     min_chunks: int = 3
     max_chunks: int = 48
     local_asr_enabled: bool = True
     local_asr_url: str = "http://127.0.0.1:18080/v1/audio/transcriptions"
     local_asr_model: str = "sensevoice"
+    # A single-channel model can still benefit from the stereo microphone
+    # array: choose the stronger physical channel once per utterance instead
+    # of averaging both channels before ASR.
+    asr_input_mode: str = "mono"
     local_asr_language: str = "zh"
     local_asr_timeout_seconds: int = 30
     local_asr_fallback_to_cloud: bool = True
+    wake_name: str = "小太阳"
+    wake_workspace: str = "robot-main"
+    wake_conversation_id: str = "voice"
 
 
 @dataclass(frozen=True)
@@ -84,6 +99,14 @@ class DevAgentConfig:
         shared_codex_home = str(Path(codex.get("shared_home") or codex_home).expanduser())
         if not Path(shared_codex_home).is_dir():
             raise ValueError(f"shared Codex home does not exist: {shared_codex_home}")
+        voice_config = VoiceConfig(**voice)
+        if not voice_config.wake_name.strip():
+            raise ValueError("voice.wake_name must not be empty")
+        if voice_config.wake_workspace not in resolved_workspaces:
+            raise ValueError(f"voice.wake_workspace is not configured: {voice_config.wake_workspace}")
+        conversation_id = voice_config.wake_conversation_id
+        if not conversation_id.replace("_", "").replace("-", "").isalnum() or len(conversation_id) > 64:
+            raise ValueError("voice.wake_conversation_id is invalid")
         return cls(
             robot_id=str(edge["robot"]["id"]),
             mqtt=MqttConfig(
@@ -111,5 +134,5 @@ class DevAgentConfig:
                     or "data/conversation.json"
                 ).expanduser()
             ),
-            voice=VoiceConfig(**voice),
+            voice=voice_config,
         )
