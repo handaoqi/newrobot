@@ -14,6 +14,53 @@ from mcp.server.fastmcp import FastMCP
 PLATFORM_URL = os.environ.get("ROAMERX_PLATFORM_URL", "http://39.107.250.69:8088").rstrip("/")
 PLATFORM_TOKEN = os.environ.get("ROAMERX_PLATFORM_TOKEN", "")
 
+# Public MCP values are always converted to the platform's canonical command
+# vocabulary before the request leaves this process.  The Chinese and legacy
+# spellings keep natural-language callers from accidentally receiving a vague
+# "unsupported MCP parameter" response from the platform.
+CONTROL_VALUE_ALIASES = {
+    "direction": {
+        "forward": "forward", "前进": "forward", "前行": "forward",
+        "backward": "backward", "后退": "backward", "后移": "backward",
+        "left": "left", "左移": "left",
+        "right": "right", "右移": "right",
+        "turn_left": "turn_left", "左转": "turn_left", "向左转": "turn_left",
+        "turn_right": "turn_right", "右转": "turn_right", "向右转": "turn_right",
+        "stop": "stop", "停止": "stop", "停下": "stop",
+        "velocity": "velocity", "速度": "velocity", "速度控制": "velocity",
+    },
+    "speed": {
+        "micro": "micro", "微速": "micro", "微速档": "micro",
+        "low": "low", "低速": "low", "低速档": "low",
+        "medium": "medium", "中速": "medium", "中速档": "medium", "normal": "medium",
+        "high": "high", "高速": "high", "高速档": "high",
+    },
+    "action": {
+        "stand_up": "stand_up", "stand": "stand_up", "起立": "stand_up", "站立": "stand_up",
+        "prone": "prone", "lie_down": "prone", "趴下": "prone", "匍匐": "prone",
+        "passive": "passive", "damping": "passive", "阻尼": "passive", "软急停": "passive",
+        "motion_start": "motion_start", "启动运控": "motion_start", "启动运动": "motion_start",
+        "motion_stop": "motion_stop", "停止运控": "motion_stop", "停止运动": "motion_stop",
+    },
+}
+
+
+def canonical_control_value(category: str, value: str) -> str:
+    """Map a released MCP value to its single platform representation."""
+    raw = str(value or "").strip().lower()
+    resolved = CONTROL_VALUE_ALIASES[category].get(raw)
+    if resolved:
+        return resolved
+    supported = ", ".join(sorted(set(CONTROL_VALUE_ALIASES[category].values())))
+    raise ValueError(f"不支持的 {category} 参数 {value!r}；可用值：{supported}")
+
+
+def require_command_id(command_id: str, operation: str) -> str:
+    resolved = str(command_id or "").strip()
+    if not resolved:
+        raise ValueError(f"{operation} 需要 command_id")
+    return resolved
+
 
 def resolve_robot_id(robot_id: int | None) -> int:
     """Return an explicit robot ID or the installation-wide default.
@@ -250,8 +297,12 @@ def robot_direction(
     direction: str = "",
     command: dict[str, float] | None = None,
 ) -> dict:
-    """方向类；用户明确指定方向后直接执行。"""
-    return client.command(robot_id, "direction", {"direction": direction, "command": command or {}})
+    """方向类；支持前进、后退、左右移动、左右转向、停止及速度控制。"""
+    return client.command(
+        robot_id,
+        "direction",
+        {"direction": canonical_control_value("direction", direction), "command": command or {}},
+    )
 
 
 @mcp.tool(name="robot_list_platform_devices")
@@ -262,14 +313,14 @@ def robot_list_platform_devices() -> dict[str, Any]:
 
 @mcp.tool(name="robot_speed")
 def robot_speed(robot_id: int | None = None, level: str = "") -> dict:
-    """速度类：micro、low、medium、high；用户明确指定档位后直接执行。"""
-    return client.command(robot_id, "speed", {"level": level})
+    """速度类：micro、low、medium、high；也接受中文档位名称。"""
+    return client.command(robot_id, "speed", {"level": canonical_control_value("speed", level)})
 
 
 @mcp.tool(name="robot_action")
 def robot_action(robot_id: int | None = None, action: str = "") -> dict:
-    """行动类；用户明确指定姿态或运控动作后直接执行。"""
-    return client.command(robot_id, "action", {"action": action})
+    """行动类；支持起立、匍匐/趴下、阻尼、启动或停止运控。"""
+    return client.command(robot_id, "action", {"action": canonical_control_value("action", action)})
 
 
 @mcp.tool(name="robot_skill_run")
@@ -281,6 +332,8 @@ def robot_skill_run(
     wait_seconds: float = 10,
 ) -> dict:
     """高层技能：预置名称或 AI 翻译后的步骤；用户明确指定后直接执行。"""
+    if not preset.strip() and not steps:
+        raise ValueError("请提供 preset 或至少一个 steps 动作")
     payload: dict[str, Any] = {"description": description}
     if preset:
         payload["preset"] = preset
@@ -293,18 +346,20 @@ def robot_skill_run(
 @mcp.tool(name="robot_skill_status")
 def robot_skill_status(robot_id: int | None = None, command_id: str = "") -> dict:
     """读取异步技能执行状态。"""
-    return client.command(robot_id, "skill-status", {"command_id": command_id})
+    return client.command(robot_id, "skill-status", {"command_id": require_command_id(command_id, "查询组合动作")})
 
 
 @mcp.tool(name="robot_skill_cancel")
 def robot_skill_cancel(robot_id: int | None = None, command_id: str = "") -> dict:
     """取消异步技能；Edge Agent 会立即下发停止速度。"""
-    return client.command(robot_id, "skill-cancel", {"command_id": command_id})
+    return client.command(robot_id, "skill-cancel", {"command_id": require_command_id(command_id, "取消组合动作")})
 
 
 @mcp.tool(name="robot_person_detection")
 def robot_person_detection(robot_id: int | None = None, enabled: bool = False) -> dict:
     """开启或关闭远控页的人员跟踪识别；此操作不移动机器狗。"""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled 必须是布尔值")
     return client.command(robot_id, "person-detection", {"enabled": enabled})
 
 

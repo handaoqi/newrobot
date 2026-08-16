@@ -202,3 +202,43 @@ def test_all_control_actions_dispatch_without_area_confirmation(monkeypatch):
         (1, "skill", {"description": "", "preset": "prone_forward_5s"}),
         (1, "person-follow-start", {"track_id": "person-7"}),
     ]
+
+
+def test_control_values_are_normalized_to_the_platform_contract(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+
+    for direction in ("forward", "backward", "left", "right", "turn_left", "turn_right", "stop", "velocity"):
+        mcp_module.robot_direction(1, direction)
+    for level in ("micro", "low", "medium", "high"):
+        mcp_module.robot_speed(1, level)
+    for action in ("stand_up", "prone", "passive", "motion_start", "motion_stop"):
+        mcp_module.robot_action(1, action)
+    mcp_module.robot_action(1, "damping")
+    mcp_module.robot_action(1, "阻尼")
+    mcp_module.robot_direction(1, "前进")
+    mcp_module.robot_speed(1, "中速")
+
+    assert client.calls == [
+        *( (1, "direction", {"direction": direction, "command": {}}) for direction in
+           ("forward", "backward", "left", "right", "turn_left", "turn_right", "stop", "velocity") ),
+        *( (1, "speed", {"level": level}) for level in ("micro", "low", "medium", "high") ),
+        *( (1, "action", {"action": action}) for action in
+           ("stand_up", "prone", "passive", "motion_start", "motion_stop", "passive", "passive") ),
+        (1, "direction", {"direction": "forward", "command": {}}),
+        (1, "speed", {"level": "medium"}),
+    ]
+
+
+def test_invalid_control_values_fail_before_a_platform_request(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+
+    with pytest.raises(ValueError, match="不支持的 action 参数"):
+        mcp_module.robot_action(1, "hover")
+    with pytest.raises(ValueError, match="不支持的 direction 参数"):
+        mcp_module.robot_direction(1, "fly")
+    with pytest.raises(ValueError, match="需要 command_id"):
+        mcp_module.robot_skill_cancel(1)
+
+    assert client.calls == []
