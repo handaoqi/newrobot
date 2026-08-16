@@ -21,6 +21,7 @@ from .mqtt_client import EdgeMqttClient
 from .navigation_stack_adapter import NavigationStackAdapter
 from .protocol import ProtocolError, build_envelope, now_iso
 from .power_mode_controller import PowerModeController
+from .person_follow_controller import PersonFollowController
 from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
 from .rosbag_recorder import RosbagRecorder
 from .safety_policy import RuntimeSafetyState, SafetyPolicy
@@ -96,6 +97,7 @@ class EdgeAgentApplication:
             set_trusted_pose_callback(self._persist_last_trusted_pose)
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
         self.teleop_control_adapter = TeleopControlAdapter(config.teleop_control)
+        self.person_follow_controller = PersonFollowController(navigation, config.person_follow)
         self.sensor_control_adapter = SensorControlAdapter(config.sensor_control)
         self.power_mode_controller = PowerModeController(config.power_mode)
         self.charge_control_adapter = ChargeControlAdapter(config.charge_control, self.power_mode_controller)
@@ -117,6 +119,7 @@ class EdgeAgentApplication:
             navigation_stack_adapter=self.navigation_stack_adapter,
             localization_adapter=navigation,
             teleop_control_adapter=self.teleop_control_adapter,
+            person_follow_controller=self.person_follow_controller,
             sensor_control_adapter=self.sensor_control_adapter,
             charge_control_adapter=self.charge_control_adapter,
             audio_control_adapter=self.audio_control_adapter,
@@ -158,6 +161,7 @@ class EdgeAgentApplication:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.person_follow_controller.stop("edge_shutdown")
         self.task_executor.stop()
         for thread in self._threads:
             thread.join(timeout=3)

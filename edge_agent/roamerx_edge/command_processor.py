@@ -29,6 +29,7 @@ class CommandProcessor:
         navigation_stack_adapter=None,
         localization_adapter=None,
         teleop_control_adapter=None,
+        person_follow_controller=None,
         sensor_control_adapter=None,
         charge_control_adapter=None,
         audio_control_adapter=None,
@@ -42,6 +43,7 @@ class CommandProcessor:
         self.navigation_stack_adapter = navigation_stack_adapter
         self.localization_adapter = localization_adapter
         self.teleop_control_adapter = teleop_control_adapter
+        self.person_follow_controller = person_follow_controller
         self.sensor_control_adapter = sensor_control_adapter
         self.charge_control_adapter = charge_control_adapter
         self.audio_control_adapter = audio_control_adapter
@@ -137,6 +139,8 @@ class CommandProcessor:
 
     def _release_manual_control_for_task(self) -> None:
         """Give a navigation task exclusive ownership of the motion endpoint."""
+        if self.person_follow_controller:
+            self.person_follow_controller.stop("task_takeover")
         if self.safety.state.control_mode != "manual_takeover":
             return
         if self.localization_adapter:
@@ -287,11 +291,16 @@ class CommandProcessor:
         teleop_adapter = self.localization_adapter
         if not teleop_adapter:
             raise ProtocolError("TELEOP_UNAVAILABLE", "teleop adapter is not configured")
+        action = envelope.message_type.removeprefix("teleop.")
         bridge_status = None
-        if self.teleop_control_adapter:
+        if self.teleop_control_adapter and action not in {"person_follow_status", "person_follow_stop"}:
             bridge_status = self.teleop_control_adapter.ensure_ready()
         command = envelope.payload.get("command") or {}
-        action = envelope.message_type.removeprefix("teleop.")
+        if self.person_follow_controller and action in {
+            "takeover_enter", "takeover_exit", "move_forward", "move_backward", "move_left", "move_right",
+            "turn_left", "turn_right", "move_velocity", "skill",
+        }:
+            self.person_follow_controller.stop("manual_teleop_override")
         if action == "takeover_enter":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
@@ -309,11 +318,36 @@ class CommandProcessor:
             )
             self.safety.state.control_mode = "manual_takeover"
         elif action == "lie_down":
+            if self.person_follow_controller:
+                self.person_follow_controller.stop("lie_down")
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
             result_payload = teleop_adapter.remote_teleop_action("lie_down")
             self.safety.state.control_mode = "autonomous"
         elif action == "move_stop":
+            if self.person_follow_controller:
+                self.person_follow_controller.stop("move_stop")
             result_payload = teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+        elif action == "person_follow_start":
+            if not self.person_follow_controller:
+                raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "person follow controller is not configured")
+            if self.task_executor.has_active_task():
+                raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "cannot start person follow while a navigation task is active")
+            stand = teleop_adapter.confirmed_remote_teleop_action(
+                "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
+            )
+            result_payload = {
+                "follow": self.person_follow_controller.start(str(command.get("track_id") or "")),
+                "stand": stand,
+            }
+            self.safety.state.control_mode = "manual_takeover"
+        elif action == "person_follow_stop":
+            if not self.person_follow_controller:
+                raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "person follow controller is not configured")
+            result_payload = self.person_follow_controller.stop("operator_stop")
+        elif action == "person_follow_status":
+            if not self.person_follow_controller:
+                raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "person follow controller is not configured")
+            result_payload = self.person_follow_controller.status()
         elif action == "skill":
             if not self.skill_executor:
                 raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
@@ -351,6 +385,8 @@ class CommandProcessor:
         elif action in {"speed_micro", "speed_slow", "speed_normal", "speed_fast"}:
             result_payload = teleop_adapter.remote_teleop_action(action)
         elif action == "passive":
+            if self.person_follow_controller:
+                self.person_follow_controller.stop("passive")
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "passive", {"passive"}, {"passive_failed"}
             )

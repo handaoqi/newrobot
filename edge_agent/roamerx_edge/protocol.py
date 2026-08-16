@@ -40,6 +40,9 @@ TELEOP_COMMAND_TYPES = {
     "teleop.skill",
     "teleop.skill_status",
     "teleop.skill_cancel",
+    "teleop.person_follow_start",
+    "teleop.person_follow_stop",
+    "teleop.person_follow_status",
 }
 COMMAND_TYPES = (
     TASK_COMMAND_TYPES

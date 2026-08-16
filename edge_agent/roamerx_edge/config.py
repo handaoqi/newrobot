@@ -141,6 +141,14 @@ class TeleopControlConfig:
 
 
 @dataclass
+class PersonFollowConfig:
+    detection_snapshot_path: str = "/run/roamerx/person_detections.json"
+    detection_stale_seconds: float = 1.0
+    control_interval_seconds: float = 0.15
+    obstacle_stop_distance_m: float = 0.8
+
+
+@dataclass
 class SensorControlConfig:
     lidar_restart_script: str = "/home/robot/genisom_roamerx_open/script/robot/restart_livox_sensor.sh"
     rtk_restart_script: str = "/home/robot/genisom_roamerx_open/script/robot/start_rtk_ntrip.sh"
@@ -231,6 +239,7 @@ class EdgeConfig:
     mapping: MappingConfig
     navigation_stack: NavigationStackConfig
     teleop_control: TeleopControlConfig
+    person_follow: PersonFollowConfig
     sensor_control: SensorControlConfig
     charge_control: ChargeControlConfig
     power_mode: PowerModeConfig
@@ -251,6 +260,7 @@ class EdgeConfig:
             mapping=MappingConfig(**raw.get("mapping", {})),
             navigation_stack=NavigationStackConfig(**raw.get("navigation_stack", {})),
             teleop_control=TeleopControlConfig(**raw.get("teleop_control", {})),
+            person_follow=PersonFollowConfig(**raw.get("person_follow", {})),
             sensor_control=SensorControlConfig(**raw.get("sensor_control", {})),
             charge_control=ChargeControlConfig(**raw.get("charge_control", {})),
             power_mode=PowerModeConfig(**raw.get("power_mode", {})),

@@ -67,3 +67,11 @@ def test_nav_relocalize_rejects_partial_pose():
     with pytest.raises(ProtocolError) as exc:
         decode_message(payload)
     assert exc.value.code == "INVALID_MESSAGE"
+
+
+def test_accepts_person_follow_commands():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "teleop.person_follow_start"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"track_id": "person-7"}
+    assert decode_message(payload).message_type == "teleop.person_follow_start"

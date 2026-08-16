@@ -106,6 +106,13 @@ teleop_control:
   script_path: "/home/robot/genisom_roamerx_open/script/robot/start_teleop_control.sh"
   command_timeout_seconds: 20
 
+person_follow:
+  # Written atomically by roamerx-bike-bot; never read from the cloud in the control loop.
+  detection_snapshot_path: "/run/roamerx/person_detections.json"
+  detection_stale_seconds: 1.0
+  control_interval_seconds: 0.15
+  obstacle_stop_distance_m: 0.8
+
 sensor_control:
   lidar_restart_script: "/home/robot/genisom_roamerx_open/script/robot/restart_livox_sensor.sh"
   rtk_restart_script: "/home/robot/genisom_roamerx_open/script/robot/start_rtk_ntrip.sh"

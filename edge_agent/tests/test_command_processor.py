@@ -53,6 +53,9 @@ class FakeNavigation:
         state = next(iter(success_states))
         return {"topic": "/teleop_action", "action": action, "confirmed": True, "motion_state": state}
 
+    def confirmed_remote_teleop_action(self, action, success_states, failure_states=None, timeout_seconds=4.0):
+        return self.confirmed_teleop_action(action, success_states, failure_states, timeout_seconds)
+
     def release_to_remote_control(self, timeout_seconds=3.0):
         self.teleop_actions.append("release_remote")
         return {
@@ -67,6 +70,9 @@ class FakeNavigation:
         self.teleop_velocities.append(payload)
         return payload
 
+    def obstacle_monitor_snapshot(self):
+        return {}
+
 
 class FakeTeleopControl:
     def __init__(self):
@@ -78,6 +84,23 @@ class FakeTeleopControl:
     def stop(self):
         self.stopped = True
         return {"action": "stop", "returncode": 0}
+
+
+class FakePersonFollow:
+    def __init__(self):
+        self.calls = []
+
+    def start(self, track_id):
+        self.calls.append(("start", track_id))
+        return {"status": "running", "track_id": track_id}
+
+    def stop(self, reason):
+        self.calls.append(("stop", reason))
+        return {"status": "stopped", "reason": reason}
+
+    def status(self):
+        self.calls.append(("status",))
+        return {"status": "running"}
 
 
 class FakeMapActivation:
@@ -414,6 +437,47 @@ def test_teleop_move_is_dispatched_to_navigation_adapter(tmp_path):
     assert navigation.teleop_velocities[-1]["vx"] == 0.2
     assert result["payload"]["status"] == "succeeded"
     assert results[0]["payload"]["result"]["topic"] == "/teleop_cmd_vel"
+    store.close()
+
+
+def test_person_follow_start_and_stop_are_dispatched_locally(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.person_follow_start"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"track_id": "person-7"}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    follow = FakePersonFollow()
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True)
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        person_follow_controller=follow,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert follow.calls == [("start", "person-7")]
+    assert navigation.teleop_actions == ["stand_up"]
+    assert state.control_mode == "manual_takeover"
+    assert result["payload"]["result"]["follow"]["status"] == "running"
+
+    raw["message_id"] = "55555555-5555-4555-8555-555555555555"
+    raw["payload"]["command_id"] = "66666666-6666-4666-8666-666666666666"
+    raw["message_type"] = "teleop.person_follow_stop"
+    raw["payload"]["command"] = {}
+    _, result = processor.handle_command(raw)
+
+    assert follow.calls[-1] == ("stop", "operator_stop")
+    assert result["payload"]["result"]["status"] == "stopped"
     store.close()
 
 
