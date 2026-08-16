@@ -1,0 +1,32 @@
+from django.db import migrations, models
+
+
+REMOTE_COMMAND_CHOICES = [
+    ("task.start", "启动任务"), ("task.pause", "暂停任务"), ("task.resume", "继续任务"), ("task.cancel", "终止任务"), ("task.force_exit", "强制退出并清理任务"),
+    ("mapping.start", "开始建图"), ("mapping.save", "停止并保存地图"), ("mapping.cancel", "取消建图"), ("mapping.status", "查询建图状态"),
+    ("nav.status", "查询导航状态"), ("nav.start", "启动导航栈"), ("nav.restart", "重启导航栈"), ("nav.recover", "恢复导航栈"), ("nav.stop", "停止导航栈"), ("nav.initial_pose", "设置初始定位"), ("nav.relocalize", "主动重定位"),
+    ("map.activate", "切换活动地图"), ("sensor.restart", "重启传感器"), ("charge.start", "开始充电"), ("charge.stop", "断开充电"), ("motion.start", "启动运控"), ("motion.stop", "停止运控"), ("audio.volume", "调节扬声器音量"),
+    ("teleop.takeover_enter", "进入远程接管"), ("teleop.takeover_exit", "退出远程接管"), ("teleop.stand_up", "站立"), ("teleop.lie_down", "趴下"), ("teleop.crawl_forward", "匍匐前进"),
+    ("teleop.speed_micro", "微速档"), ("teleop.speed_slow", "低速档"), ("teleop.speed_normal", "中速档"), ("teleop.speed_fast", "高速档"),
+    ("teleop.move_forward", "前进"), ("teleop.move_backward", "后退"), ("teleop.move_left", "左移"), ("teleop.move_right", "右移"), ("teleop.turn_left", "左转"), ("teleop.turn_right", "右转"), ("teleop.move_velocity", "跟随速度"), ("teleop.move_stop", "停止移动"), ("teleop.passive", "软急停"),
+    ("teleop.skill", "执行遥控技能"), ("teleop.skill_status", "查询遥控技能"), ("teleop.skill_cancel", "取消遥控技能"),
+]
+
+ROBOT_COMMAND_CHOICES = [
+    ("shake_hand", "握手"), ("stand_up", "站立"), ("lie_down", "趴下"), ("crawl_forward", "匍匐前进"),
+    ("speed_micro", "微速档"), ("speed_slow", "低速档"), ("speed_normal", "中速档"), ("speed_fast", "高速档"),
+    ("move_forward", "前进"), ("move_backward", "后退"), ("move_left", "左移"), ("move_right", "右移"), ("turn_left", "左转"), ("turn_right", "右转"), ("move_velocity", "跟随速度"),
+    ("takeover_enter", "进入远程接管"), ("takeover_exit", "退出远程接管"), ("move_stop", "停止移动"), ("passive", "软急停"),
+    ("jump", "原地跳"), ("front_jump", "向前跳"), ("backflip", "后空翻"), ("two_leg_stand", "双腿站立"), ("cancel_two_leg_stand", "取消双腿站立"), ("attitude_control", "姿态控制"),
+    ("play_audio", "播放音频"), ("charge_start", "开始充电"), ("charge_stop", "断开充电"), ("motion_start", "启动运控"), ("motion_stop", "停止运控"), ("audio_volume", "调节音量"),
+    ("skill", "执行遥控技能"), ("skill_status", "查询遥控技能"), ("skill_cancel", "取消遥控技能"),
+]
+
+
+class Migration(migrations.Migration):
+    dependencies = [("monitoring", "0045_development_task_model")]
+
+    operations = [
+        migrations.AlterField(model_name="remotecommand", name="command_type", field=models.CharField(choices=REMOTE_COMMAND_CHOICES, max_length=32)),
+        migrations.AlterField(model_name="robotcommand", name="action", field=models.CharField(choices=ROBOT_COMMAND_CHOICES, max_length=32)),
+    ]

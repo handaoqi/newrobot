@@ -1,14 +1,24 @@
-build/
-install/
-log/
-.cache/
-
-# Python runtime artifacts
-__pycache__/
+**/__pycache__/
+**/.pytest_cache/
+**/node_modules/
+**/dist/
+**/build/
+**/install/
+**/log/
 *.py[cod]
-
-# Local CAD and vendor archives
-*.stp
-*.step
-*.rar
-*.orig
+*.secret.yaml
+*.secret.yml
+*.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.ppk
+id_rsa*
+id_ed25519*
+known_hosts*
+*.bag
+*.db3
+*.mcap
+*.log
+*.pid

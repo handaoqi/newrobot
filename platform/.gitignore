@@ -1,0 +1,58 @@
+.venv
+.python-deps/
+.vscode
+.codex
+.claude
+.agent
+.DS_Store
+
+# Python runtime artifacts
+__pycache__/
+backend/config/__pycache__/
+backend/monitoring/__pycache__/
+backend/monitoring/migrations/__pycache__/
+*.py[cod]
+
+# Local backend runtime state
+backend/db.sqlite3
+backend/media/
+backend/*.log
+backend/runserver.*.log
+
+# Frontend dependencies/build output
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Bot runtime artifacts
+bot-version/config.yaml
+bot-version/venv/
+bot-version/data/telemetry/
+bot-version/snapshots/
+bot-version/*.log
+bot-version/model/
+bot-version-test/.ssh/
+bot-version-test/__pycache__/
+bot-version-test/**/__pycache__/
+bot-version-test/data/
+bot-version-test/snapshots/
+bot-version-test/config*.yaml
+!bot-version-test/config.example.yaml
+bot-version-test/models/bike.onnx
+bot-version-test/*.bak-*
+bot-version-test/**/*.bak-*
+bot-version-audio-test/
+bot-version/config.yaml.bak-*
+*.bak-*
+
+# Local credentials and private keys
+.ssh/
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# test
+test_video/

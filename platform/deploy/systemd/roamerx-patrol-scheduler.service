@@ -1,0 +1,16 @@
+[Unit]
+Description=RoamerX Patrol Calendar Scheduler
+After=network.target roamerx-center-api.service roamerx-device-worker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/roamerx/current
+EnvironmentFile=/opt/roamerx/shared/center.env
+ExecStart=/root/miniconda/envs/py310/bin/python backend/manage.py run_patrol_scheduler --interval 10
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/roamerx/shared/logs/patrol-scheduler.log
+StandardError=append:/opt/roamerx/shared/logs/patrol-scheduler.err.log
+
+[Install]
+WantedBy=multi-user.target

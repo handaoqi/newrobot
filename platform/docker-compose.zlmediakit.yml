@@ -1,0 +1,14 @@
+services:
+  zlmediakit:
+    image: zlmediakit/zlmediakit:master
+    container_name: playground-zlmediakit
+    restart: unless-stopped
+    ports:
+      - "1935:1935"
+      - "8080:80"
+      - "8443:443"
+      - "8554:554"
+      - "10000:10000"
+      - "10000:10000/udp"
+      - "8000:8000/udp"
+      - "9000:9000/udp"

@@ -1,0 +1,184 @@
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, SpeechCategory, SpeechTemplate, TaskExecution
+from .services.command_service import CommandService
+from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
+
+
+class TaskExecutionTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("p0-user", password="secret")
+        self.robot = Robot.objects.create(
+            code="rx-001",
+            name="RX",
+            location="site",
+            area="site",
+            connection_status="online",
+            status="online",
+            last_seen_at=timezone.now(),
+            localization_status="normal",
+            ros_ready=True,
+            nav_ready=True,
+        )
+        self.map = MapData.objects.create(name="map", robot=self.robot)
+        self.route = PatrolRoute.objects.create(
+            name="route",
+            map_data=self.map,
+            robot=self.robot,
+            waypoints=[[1, 2, 0], [2, 3, 0.5], [3, 4, 1.0]],
+            waypoint_names=["A", "B", "C"],
+        )
+        now = timezone.now()
+        self.task = PatrolTask.objects.create(
+            name="task",
+            robot=self.robot,
+            route=self.route,
+            route_name=self.route.name,
+            scheduled_start=now,
+            scheduled_end=now + timezone.timedelta(hours=1),
+        )
+
+    def test_route_snapshot_is_immutable_copy(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.route.waypoints[0][0] = 99
+        self.route.save()
+        execution.refresh_from_db()
+        self.assertEqual(execution.route_snapshot["waypoints"][0]["x"], 1.0)
+
+    def test_route_snapshot_preserves_waypoint_speech_template(self):
+        category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")
+        template = SpeechTemplate.objects.create(name="到点提醒", text="已到达巡检点", category=category)
+        self.route.waypoints = [
+            {
+                "x": 1,
+                "y": 2,
+                "yaw": 0,
+                "speech_template_id": template.id,
+                "speech_template_name": template.name,
+                "speech_text": template.text,
+            }
+        ]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertEqual(waypoint["speech_template_id"], template.id)
+        self.assertEqual(waypoint["speech_template_name"], "到点提醒")
+
+    def test_route_snapshot_preserves_heading_and_segment_avoidance(self):
+        self.route.waypoints = [{
+            "x": 1,
+            "y": 2,
+            "yaw": 1.25,
+            "require_yaw": True,
+            "avoidance_to_next": False,
+        }]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertEqual(waypoint["yaw"], 1.25)
+        self.assertIs(waypoint["require_yaw"], True)
+        self.assertIs(waypoint["avoidance_to_next"], False)
+
+    def test_one_active_execution_per_robot(self):
+        TaskExecutionService.create_execution(self.task, self.user)
+        with self.assertRaises(TaskStateError):
+            TaskExecutionService.create_execution(self.task, self.user)
+
+    def test_invalid_terminal_resume_transition(self):
+        with self.assertRaises(TaskStateError):
+            assert_transition_allowed("completed", "resuming")
+
+    def test_command_lifecycle_starts_created(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        command = CommandService.create(execution, "task.start", self.user)
+        self.assertEqual(command.status, "created")
+        self.assertEqual(command.events.get().event_type, "created")
+        execution.refresh_from_db()
+        self.assertEqual(execution.state, "dispatching")
+
+    def test_force_exit_clears_active_execution_and_unblocks_next_task(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        command = CommandService.create(execution, "task.force_exit", self.user)
+        execution.refresh_from_db()
+        self.assertEqual(command.command_type, "task.force_exit")
+        self.assertEqual(execution.state, "cancelled")
+        next_execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.assertEqual(next_execution.state, "created")
+
+    def test_task_api_execute_and_busy_conflict(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
+        self.assertEqual(response.status_code, 201)
+        second = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(RemoteCommand.objects.count(), 1)
+
+    def test_task_execute_can_request_navigation_rosbag(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_charging_dock_saves_default_and_dispatches_two_point_task(self):
+        self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/robots/{self.robot.id}/charging-dock/",
+            {"map_id": self.map.id, "route_id": self.route.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.robot.refresh_from_db()
+        self.assertEqual(self.robot.charging_map_id, self.map.id)
+        self.assertEqual(self.robot.charging_route_id, self.route.id)
+        command = RemoteCommand.objects.get(task_execution__isnull=False)
+        self.assertTrue(command.payload["docking"]["enabled"])
+
+    def test_charging_dock_rejects_non_two_point_route(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/robots/{self.robot.id}/charging-dock/",
+            {"map_id": self.map.id, "route_id": self.route.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_task_execute_rejects_invalid_navigation_rosbag_flag(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": "yes"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_route_api_execute_creates_quick_task_and_command(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(f"/api/routes/{self.route.id}/execute/", {}, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["route"], self.route.id)
+        self.assertEqual(RemoteCommand.objects.count(), 1)
+        self.assertTrue(PatrolTask.objects.filter(route=self.route, name=f"路线快速执行 - {self.route.name}").exists())
+
+    def test_disabled_task_cannot_execute(self):
+        self.task.enabled = False
+        self.task.save(update_fields=["enabled", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("TASK_DISABLED", response.data["detail"])
