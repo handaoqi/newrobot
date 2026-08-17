@@ -23,6 +23,10 @@ class NavigationStackAdapter:
     def restart(self, command: dict | None = None) -> dict:
         return self._run("restart", timeout_seconds=max(self.config.command_timeout_seconds, 90))
 
+    def restart_localization(self) -> dict:
+        """Restart only localization so a paused task can reseed it safely."""
+        return self._run("restart-localization", timeout_seconds=max(self.config.command_timeout_seconds, 60))
+
     def recover(self, command: dict | None = None) -> dict:
         status_payload = self.status()
         if status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):

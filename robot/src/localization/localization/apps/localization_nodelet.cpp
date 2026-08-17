@@ -69,6 +69,8 @@ public:
     ndt_neighbor_search_method       = declare_parameter<std::string>("ndt_neighbor_search_method", "DIRECT7");
     ndt_neighbor_search_radius       = declare_parameter<double>("ndt_neighbor_search_radius", 2.0);
     ndt_resolution                   = declare_parameter<double>("ndt_resolution", 1.0);
+    ndt_max_fitness_score_ = static_cast<float>(std::max(
+      0.001, declare_parameter<double>("ndt_max_fitness_score", 9.00)));
     enable_robot_odometry_prediction = declare_parameter<bool>("enable_robot_odometry_prediction", false);
     enable_lidar_odometry_prediction_ = declare_parameter<bool>("lidar_odometry_prediction.enable", false);
     lidar_odom_voxel_size_ = static_cast<float>(std::max(
@@ -1242,7 +1244,7 @@ private:
       // IMU+wheel-odometry fallback bridge. Otherwise a good NDT correction
       // can be discarded solely because the fallback yaw covariance is high.
       const bool ndt_sample_healthy = match_result.is_converged_ &&
-        match_result.fitness_score_ < 0.5 && last_ndt_status_healthy_;
+        match_result.fitness_score_ < ndt_max_fitness_score_ && last_ndt_status_healthy_;
       if (ndt_sample_healthy) {
         ndt_unhealthy_frame_count_ = 0;
         last_ndt_healthy_ = true;
@@ -2112,7 +2114,8 @@ private:
       }
     }
     status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
-    const bool score_valid = std::isfinite(status.matching_error) && status.matching_error < 0.5f;
+    const bool score_valid = std::isfinite(status.matching_error) &&
+      status.matching_error < ndt_max_fitness_score_;
     const bool inliers_valid = status.inlier_fraction >= 0.05f;
     // The first NDT observation after a new initial pose is an acquisition,
     // not a frame-to-frame motion. Comparing it to stale/extrapolated history
@@ -2640,6 +2643,7 @@ private:
   float lidar_odom_voxel_size_ = 0.40f;
   float lidar_odom_max_correspondence_distance_ = 1.00f;
   float lidar_odom_max_fitness_score_ = 0.50f;
+  float ndt_max_fitness_score_ = 9.00f;
   float lidar_odom_max_translation_per_scan_ = 0.80f;
   float lidar_odom_max_rotation_per_scan_rad_ = 0.70f;
   size_t lidar_odom_min_points_ = 200;

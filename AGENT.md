@@ -2,7 +2,7 @@
 
 ## 本地开发基线
 
-- 所有后续本地开发均在 `/home/dogrobot` 进行；它是远端 `github-private/main` 的独立检出，当前提交为 `f65b8449c7bd66bb6523d2c14613f95559487b29`。
+- 所有后续本地开发均在 `/home/dogrobot` 进行；它是远端 `github-private/main` 的独立检出，并应保持跟踪远端 `main`。
 - 保持仓库原始结构，直接在 `/home/dogrobot/{robot,edge-agent,dev-agent,platform,...}` 中修改；不要再把开发源码放入旧的运行目录。
 - 常用命令：`cd /home/dogrobot && git pull --ff-only`、`git status`、`scripts/test_agents.sh`。
 - 全量构建、发布、数据恢复与验收流程见 [PROJECT_DEPLOYMENT_MANUAL.md](PROJECT_DEPLOYMENT_MANUAL.md)。
@@ -14,7 +14,7 @@
 | --- | --- | --- | --- |
 | `robot/` | 内容发布至 `/home/robot/genisom_roamerx_open/`；`robot/src/` 对应其 `src/` | 不发布完整 ROS 工作区 | 在 NX 构建产生 `{build,install,log}`。 |
 | `edge-agent/` | 当前服务目录 `/home/robot/edge_agent/`，保留 `config.yaml`、`data/` 和日志 | 不发布 | NX Edge Agent 通过 SSH 控制 3588。 |
-| `dev-agent/` | 当前服务目录 `/home/robot/genisom_roamerx_open/dev_agent/`（历史下划线名） | 不发布 | 无自动发布脚本；保留 `/home/robot/.local/state/roamerx-dev-agent/`。 |
+| `dev-agent/` | 当前服务目录 `/home/robot/genisom_roamerx_open/dev-agent/` | 不发布 | 无自动发布脚本；保留 `/home/robot/.local/state/roamerx-dev-agent/`。 |
 | `mcp_server/` | 顶层目录仅含测试，不发布运行代码 | 不发布 | 运行代码来自 `robot/mcp_server/`；现役 MCP service 从 `/home/dogrobot/robot/mcp_server/` 启动。 |
 | `platform/` | 不发布到 NX | 不发布 | 发布到云端 `/opt/roamerx/current/{backend,frontend}`。 |
 | `deploy/`、`scripts/` | 从 `/home/dogrobot` 执行，不常驻部署 | 不发布 | `deploy/robot/deploy.sh` 只发布 `robot/` 与 `edge-agent/`。 |

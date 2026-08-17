@@ -6,7 +6,8 @@ export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 set +u
 source /opt/ros/humble/setup.bash
-source /home/robot/genisom_roamerx_open/install/setup.bash
+PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+source "${PROJECT_DIR}/install/setup.bash"
 source /opt/robot-driver/install/setup.bash
 set -u
 
@@ -42,7 +43,7 @@ echo $! > "$LOG_DIR/rtk-sixents.pid"
 
 sleep 2
 
-setsid python3 /home/robot/genisom_roamerx_open/script/rtk_ntrip_bridge.py \
+setsid python3 "${PROJECT_DIR}/robot/script/rtk_ntrip_bridge.py" \
   --ros-args -p "config_path:=${CONFIG_PATH}" \
   >"$LOG_DIR/rtk-ntrip.stdout" 2>"$LOG_DIR/rtk-ntrip.stderr" </dev/null &
 echo $! > "$LOG_DIR/rtk-ntrip.pid"

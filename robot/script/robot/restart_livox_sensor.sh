@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 
 kill_matching() {
   local pattern="$1"
@@ -22,5 +23,5 @@ kill_matching "/opt/ros/humble/bin/ros2 launch livox_driver lidar.launch.py"
 kill_matching "/livox_driver/livox_driver_node"
 sleep 1
 
-"${PROJECT_DIR}/script/robot/ensure_navigation_sensors.sh"
+"${SCRIPT_DIR}/ensure_navigation_sensors.sh"
 echo "Livox LiDAR/IMU restarted and data verified."

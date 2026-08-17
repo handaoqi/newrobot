@@ -1090,11 +1090,10 @@ async function initializeLocalization() {
     const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
     localizationInitMessage.value = useFixedRtk
       ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
-      : 'RTK Fix 不可用，正在下发建图起点位姿'
+      : 'RTK Fix 不可用，正在回灌最后可信位姿'
     await sendRobotNavigationCommand(robotId, 'initial-pose', {
-      seed_source: useFixedRtk ? 'rtk' : 'mapping_start',
+      seed_source: useFixedRtk ? 'rtk' : 'last_trusted',
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
     })
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
@@ -1133,7 +1132,6 @@ async function activeRelocalize() {
     const payload = {
       seed_source: 'last_trusted',
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
     }
     if (manualInitialPose.value) {
       payload.x = Number(manualInitialPose.value.x)

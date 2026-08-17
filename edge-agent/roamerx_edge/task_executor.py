@@ -247,6 +247,14 @@ class TaskExecutor:
     def has_active_task(self) -> bool:
         return self.context is not None and self.context.state not in self.TERMINAL_STATES
 
+    def is_paused_for_localization(self) -> bool:
+        with self._lock:
+            return bool(
+                self.context
+                and self.context.state == "paused"
+                and self._paused_for_localization
+            )
+
     def on_localization_lost(self) -> None:
         """Pause active navigation when localization is continuously lost."""
         with self._lock:
@@ -455,7 +463,8 @@ class TaskExecutor:
             },
         )
         self.on_feedback(0)
-        self._start_obstacle_monitor()
+        if self._segment_avoidance_enabled:
+            self._start_obstacle_monitor()
 
     def _send_from(self, index: int) -> None:
         if not self.context:
@@ -482,7 +491,8 @@ class TaskExecutor:
             },
         )
         self.on_feedback(0)
-        self._start_obstacle_monitor()
+        if self._segment_avoidance_enabled:
+            self._start_obstacle_monitor()
 
     def _set_localization_policy(self, waypoint: dict, phase: str) -> None:
         setter = getattr(self.navigation, "set_localization_policy", None)
@@ -769,7 +779,11 @@ class TaskExecutor:
         waypoints = self.context.route_snapshot.get("waypoints") or []
         target = waypoints[waypoint_index]
         source = waypoints[waypoint_index - 1] if waypoint_index > 0 else None
-        avoid_obstacles = bool(source.get("avoidance_to_next", True)) if source else True
+        # The robot may start from anywhere before the first waypoint.  Treat
+        # the first waypoint's flag as the profile for that initial approach;
+        # for all later legs, the source point controls its "to next" leg.
+        profile_waypoint = source if source is not None else target
+        avoid_obstacles = bool(profile_waypoint.get("avoidance_to_next", True))
         if self._is_docking_task():
             final_index = int((self.context.docking or {}).get("final_waypoint_index", 1))
             if waypoint_index >= final_index:

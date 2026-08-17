@@ -2,10 +2,11 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 # Keep this aligned with the LiDAR/IMU cold-start readiness window.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
-"${PROJECT_DIR}/script/robot/ensure_mapping_sensors.sh"
+"${SCRIPT_DIR}/ensure_mapping_sensors.sh"
 
 set +u
 source /opt/ros/humble/setup.bash
@@ -25,8 +26,14 @@ if ! pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1; th
     >/tmp/pointcloud_to_laserscan.log 2>&1 < /dev/null &
 fi
 
+FILTER_SCRIPT="${PROJECT_DIR}/robot/src/navigation/src/robot_navigo/scripts/self_filter_scan.py"
+if [ ! -f "${FILTER_SCRIPT}" ]; then
+  echo "ERROR: self-filter script not found: ${FILTER_SCRIPT}" >&2
+  exit 1
+fi
+
 if ! pgrep -f 'self_filter_scan.py' >/dev/null 2>&1; then
-  setsid ros2 run robot_navigo self_filter_scan.py --ros-args \
+  setsid python3 "${FILTER_SCRIPT}" --ros-args \
     -r scan_in:=/laser_scan_raw -r scan_out:=/laser_scan \
     -p self_x_min:=0.10 -p self_x_max:=0.46 \
     -p self_y_min:=-0.19 -p self_y_max:=0.10 \

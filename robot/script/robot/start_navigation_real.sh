@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 MAP_YAML="${MAP_YAML:-/home/robot/.jszr/map/map.yaml}"
 PCD_MAP="${PCD_MAP:-}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_nav_logs}"
@@ -32,7 +33,7 @@ if [ -z "${PCD_MAP}" ]; then
   fi
 fi
 
-/home/robot/genisom_roamerx_open/script/robot/wait_for_valid_time.sh
+bash "${SCRIPT_DIR}/wait_for_valid_time.sh"
 
 set +u
 source /opt/ros/humble/setup.bash
@@ -42,7 +43,7 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|status|load-map|full-stop}"
+  echo "Usage: $0 {start|stop|restart|restart-localization|status|load-map|full-stop}"
   echo
   echo "Env:"
   echo "  PROJECT_DIR=${PROJECT_DIR}"
@@ -113,14 +114,18 @@ start_navigation_diagnostics() {
 
 stop_stack() {
   stop_navigation
-  echo "Stopping localization..."
-  kill_pattern "ros2 launch localization localization.launch.py"
-  kill_pattern "localization_node"
+  stop_localization
   kill_pattern "static_transform_publisher.*base_link livox_frame"
   kill_pattern "pointcloud_to_laserscan_node"
   kill_pattern "self_filter_scan.py"
   kill_pattern "sensor_health_monitor"
   echo "Full navigation stack stopped."
+}
+
+stop_localization() {
+  echo "Stopping localization..."
+  kill_pattern "ros2 launch localization localization.launch.py"
+  kill_pattern "localization_node"
 }
 
 wait_for_node() {
@@ -138,7 +143,7 @@ wait_for_node() {
 
 ensure_rtk() {
   echo "Starting RTK/NTRIP..."
-  "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
+  "${SCRIPT_DIR}/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
     cat /tmp/roamerx_rtk_start.log >&2
     return 1
   }
@@ -173,7 +178,7 @@ wait_for_localization() {
       return 1
     fi
     local status
-    status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+    status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true)"
     if [ "${status}" = "3" ]; then
       echo "Localization OK."
       return 0
@@ -186,12 +191,33 @@ wait_for_localization() {
 
 localization_is_valid() {
   local status
-  status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+  status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true)"
   [ "${status}" = "3" ]
 }
 
+restart_localization_only() {
+  # Used by the edge task-recovery path. Nav2 remains alive but has no active
+  # goal (the task executor cancelled it before invoking this action). Do not
+  # wait for status=3 here: the caller sends the last trusted initial pose only
+  # after this node and its map service are ready.
+  if [ ! -f "${PCD_MAP}" ]; then
+    echo "ERROR: PCD map not found: ${PCD_MAP}" >&2
+    return 1
+  fi
+  stop_localization
+  echo "Restarting localization only..."
+  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
+    >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
+  if ! wait_for_node "/localization" 15; then
+    echo "ERROR: localization node did not start." >&2
+    return 1
+  fi
+  load_pcd_map
+  echo "Localization restarted; waiting for trusted-pose recovery."
+}
+
 start_stack() {
-  "${PROJECT_DIR}/script/robot/ensure_navigation_sensors.sh"
+  "${SCRIPT_DIR}/ensure_navigation_sensors.sh"
   if ! is_rtk_running; then
     ensure_rtk
   fi
@@ -261,7 +287,7 @@ status_stack() {
   echo
   echo "Localization:"
   local status
-  status="$("${PROJECT_DIR}/script/robot/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+  status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true)"
   echo "status: ${status:-unavailable}"
   echo
   echo "cmd_vel:"
@@ -279,6 +305,9 @@ case "${MODE}" in
   restart)
     stop_navigation
     start_stack
+    ;;
+  restart-localization)
+    restart_localization_only
     ;;
   full-stop)
     stop_stack
