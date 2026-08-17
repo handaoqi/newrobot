@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 MAP_DIR="${MAP_DIR:-/home/robot/.jszr/map}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_mapping_logs}"
 SLAM_CONFIG="${SLAM_CONFIG:-${PROJECT_DIR}/install/robot_slam/share/robot_slam/config/config.yaml}"
@@ -60,7 +61,7 @@ wait_for_service() {
 ensure_rtk() {
   if ! pgrep -f 'rtk_ntrip_bridge.py' >/dev/null 2>&1; then
     echo "Starting RTK/NTRIP..."
-    "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
+    "${SCRIPT_DIR}/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1 || {
       cat /tmp/roamerx_rtk_start.log >&2
       if [ "${REQUIRE_RTK}" = "1" ]; then
         return 1
@@ -99,11 +100,11 @@ start_mapping() {
   fi
 
   # Mapping must exclusively own map TF and localization sensor consumers.
-  if [ -x "${PROJECT_DIR}/script/robot/start_navigation_real.sh" ]; then
-    "${PROJECT_DIR}/script/robot/start_navigation_real.sh" full-stop
+  if [ -x "${SCRIPT_DIR}/start_navigation_real.sh" ]; then
+    "${SCRIPT_DIR}/start_navigation_real.sh" full-stop
   fi
 
-  "${PROJECT_DIR}/script/robot/ensure_mapping_sensors.sh"
+  "${SCRIPT_DIR}/ensure_mapping_sensors.sh"
 
   ensure_rtk
 

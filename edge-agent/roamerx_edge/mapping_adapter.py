@@ -466,7 +466,7 @@ class MappingAdapter:
     def _stop_conflicting_navigation_stack(self) -> None:
         """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
         command = (
-            'script="$HOME/genisom_roamerx_open/script/robot/start_navigation_real.sh"; '
+            'script="$HOME/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh"; '
             'if [ -x "$script" ]; then "$script" full-stop; fi'
         )
         result = subprocess.run(

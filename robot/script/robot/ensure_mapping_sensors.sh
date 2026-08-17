@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 # A MID-360 can need noticeably longer to resume UDP point output after a
 # charging-standby cycle. Avoid treating a healthy cold start as a failure.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
@@ -57,7 +58,7 @@ wait_for_message /front_lidar/imu IMU
 # bridge must be running so every keyframe can record coordinates and quality.
 if ! pgrep -f 'rtk_ntrip_bridge.py' >/dev/null 2>&1; then
   echo "Starting optional RTK/GNSS recording chain..."
-  if ! "${PROJECT_DIR}/script/robot/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1; then
+  if ! "${SCRIPT_DIR}/start_rtk_ntrip.sh" >/tmp/roamerx_rtk_start.log 2>&1; then
     echo "WARNING: RTK/GNSS startup failed; mapping will use LiDAR+IMU only" >&2
     tail -n 20 /tmp/roamerx_rtk_start.log >&2 2>/dev/null || true
   fi

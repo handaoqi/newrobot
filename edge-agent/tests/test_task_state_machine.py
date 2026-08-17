@@ -189,7 +189,7 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     store.close()
 
 
-def test_waypoint_profile_uses_previous_point_for_next_segment(tmp_path):
+def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     envelope = command("task.start")
@@ -204,7 +204,7 @@ def test_waypoint_profile_uses_previous_point_for_next_segment(tmp_path):
     )
 
     executor.start_task(envelope)
-    assert nav.waypoint_profiles[0] == (True, False)
+    assert nav.waypoint_profiles[0] == (False, False)
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.waypoint_profiles[-1] == (False, True)
     store.close()

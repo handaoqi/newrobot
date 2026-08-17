@@ -742,7 +742,9 @@ class RosAdapter(Node):
             "source /home/robot/genisom_roamerx_open/install/setup.bash; "
             "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
             f"ros2 param set /local_costmap/local_costmap obstacle_layer.enabled {enabled}; "
-            f"ros2 param set /global_costmap/global_costmap obstacle_layer.enabled {enabled}"
+            f"ros2 param set /global_costmap/global_costmap obstacle_layer.enabled {enabled}; "
+            f"ros2 param set /collision_monitor PolygonStop.enabled {enabled}; "
+            f"ros2 param set /collision_monitor PolygonSlow.enabled {enabled}"
         )
         completed = subprocess.run(["bash", "-lc", script], text=True, capture_output=True, timeout=20)
         if completed.returncode != 0:

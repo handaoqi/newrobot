@@ -2,7 +2,8 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-CONFIG="${PROJECT_DIR}/script/robot/official_ukf_shadow.yaml"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
+CONFIG="${SCRIPT_DIR}/official_ukf_shadow.yaml"
 LOG_DIR="/tmp/roamerx_official_ukf"
 mkdir -p "${LOG_DIR}"
 set +u
@@ -15,14 +16,14 @@ PUBLISH_TF="${PUBLISH_TF:-false}"
 
 case "${1:-start}" in
   start)
-    if ! pgrep -f "[p]ython3 ${PROJECT_DIR}/script/robot/odom_stamp_sanitizer.py" >/dev/null; then
-      setsid python3 "${PROJECT_DIR}/script/robot/odom_stamp_sanitizer.py" >"${LOG_DIR}/sanitizer.log" 2>&1 < /dev/null &
+    if ! pgrep -f "[p]ython3 ${SCRIPT_DIR}/odom_stamp_sanitizer.py" >/dev/null; then
+      setsid python3 "${SCRIPT_DIR}/odom_stamp_sanitizer.py" >"${LOG_DIR}/sanitizer.log" 2>&1 < /dev/null &
     fi
-    if ! pgrep -f "[p]ython3 ${PROJECT_DIR}/script/robot/ndt_odom_sanitizer.py" >/dev/null; then
-      setsid python3 "${PROJECT_DIR}/script/robot/ndt_odom_sanitizer.py" >"${LOG_DIR}/ndt_sanitizer.log" 2>&1 < /dev/null &
+    if ! pgrep -f "[p]ython3 ${SCRIPT_DIR}/ndt_odom_sanitizer.py" >/dev/null; then
+      setsid python3 "${SCRIPT_DIR}/ndt_odom_sanitizer.py" >"${LOG_DIR}/ndt_sanitizer.log" 2>&1 < /dev/null &
     fi
-    if ! pgrep -f "[p]ython3 ${PROJECT_DIR}/script/robot/imu_covariance_sanitizer.py" >/dev/null; then
-      setsid python3 "${PROJECT_DIR}/script/robot/imu_covariance_sanitizer.py" >"${LOG_DIR}/imu_sanitizer.log" 2>&1 < /dev/null &
+    if ! pgrep -f "[p]ython3 ${SCRIPT_DIR}/imu_covariance_sanitizer.py" >/dev/null; then
+      setsid python3 "${SCRIPT_DIR}/imu_covariance_sanitizer.py" >"${LOG_DIR}/imu_sanitizer.log" 2>&1 < /dev/null &
     fi
     if ! pgrep -f '[u]kf_node --ros-args.*__node:=local_ukf' >/dev/null; then
       setsid ros2 run robot_localization ukf_node --ros-args -r __node:=local_ukf -r odometry/filtered:=/odometry/official_ukf_local -r diagnostics:=/diagnostics/official_ukf_local --params-file "${CONFIG}" -p publish_tf:="${PUBLISH_TF}" >"${LOG_DIR}/local_ukf.log" 2>&1 < /dev/null &
@@ -32,9 +33,9 @@ case "${1:-start}" in
     fi
     ;;
   stop)
-    pkill -f "[p]ython3 ${PROJECT_DIR}/script/robot/odom_stamp_sanitizer.py" || true
-    pkill -f "[p]ython3 ${PROJECT_DIR}/script/robot/ndt_odom_sanitizer.py" || true
-    pkill -f "[p]ython3 ${PROJECT_DIR}/script/robot/imu_covariance_sanitizer.py" || true
+    pkill -f "[p]ython3 ${SCRIPT_DIR}/odom_stamp_sanitizer.py" || true
+    pkill -f "[p]ython3 ${SCRIPT_DIR}/ndt_odom_sanitizer.py" || true
+    pkill -f "[p]ython3 ${SCRIPT_DIR}/imu_covariance_sanitizer.py" || true
     pkill -f '[u]kf_node --ros-args.*__node:=local_ukf' || true
     pkill -f '[u]kf_node --ros-args.*__node:=global_ukf' || true
     ;;

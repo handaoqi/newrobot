@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
 MAP_PCD="${MAP_PCD:-/home/robot/.jszr/map/map.pcd}"
 LOG_DIR="/tmp/roamerx_official_ukf"
 mkdir -p "${LOG_DIR}"
@@ -33,11 +34,11 @@ case "${1:-status}" in
     sleep 2
     timeout 25 ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \
       "{pcd_path: '${MAP_PCD}'}" >"${LOG_DIR}/load_map.log"
-    "${PROJECT_DIR}/script/robot/start_official_ukf_shadow.sh" stop
-    PUBLISH_TF=true "${PROJECT_DIR}/script/robot/start_official_ukf_shadow.sh" start
+    "${SCRIPT_DIR}/start_official_ukf_shadow.sh" stop
+    PUBLISH_TF=true "${SCRIPT_DIR}/start_official_ukf_shadow.sh" start
     ;;
   rollback)
-    "${PROJECT_DIR}/script/robot/start_official_ukf_shadow.sh" stop
+    "${SCRIPT_DIR}/start_official_ukf_shadow.sh" stop
     stop_legacy_localization
     setsid ros2 launch localization localization.launch.py >"${LOG_DIR}/legacy_localization.log" 2>&1 < /dev/null &
     sleep 2

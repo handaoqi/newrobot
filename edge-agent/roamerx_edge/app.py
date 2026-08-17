@@ -66,6 +66,7 @@ class EdgeAgentApplication:
         self.navigation = navigation
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
         self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
+        self._localization_recovery_lock = threading.Lock()
         self.map_set_coordinator = MapSetCoordinator(self.map_activation_adapter, self.navigation_stack_adapter)
         self.navigation_rosbag = RosbagRecorder(
             config.navigation_stack.rosbag_script,
@@ -86,7 +87,7 @@ class EdgeAgentApplication:
             navigation, "set_localization_failure_callback", None
         )
         if callable(set_localization_failure_callback):
-            set_localization_failure_callback(self.task_executor.on_localization_lost)
+            set_localization_failure_callback(self._handle_task_localization_loss)
         set_localization_recovery_callback = getattr(
             navigation, "set_localization_recovery_callback", None
         )
@@ -457,6 +458,48 @@ class EdgeAgentApplication:
                 "source": "last_trusted_localization",
             },
         )
+
+    def _handle_task_localization_loss(self) -> None:
+        """Pause a task, then reseed a fresh localization node from its last good pose."""
+        self.task_executor.on_localization_lost()
+        if not self.task_executor.is_paused_for_localization():
+            return
+        if not self._localization_recovery_lock.acquire(blocking=False):
+            return
+        threading.Thread(
+            target=self._recover_task_localization,
+            daemon=True,
+            name="task-localization-restart",
+        ).start()
+
+    def _recover_task_localization(self) -> None:
+        try:
+            pose = self.navigation.latest_trusted_pose()
+            if not pose:
+                pose = self.store.load_last_trusted_pose(
+                    str(self.config.robot.current_map_id or ""),
+                    str(self.config.robot.current_map_version or ""),
+                )
+            if not pose:
+                LOGGER.error("task localization recovery skipped: no trusted pose is available")
+                return
+            LOGGER.warning(
+                "task localization lost; restarting localization from trusted pose x=%.3f y=%.3f yaw=%.3f",
+                float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
+            )
+            self.navigation_stack_adapter.restart_localization()
+            self.navigation.set_initial_pose({
+                **pose,
+                "frame_id": "map",
+                "wait_seconds": 30.0,
+                "required_normal_samples": 3,
+            })
+        except Exception:
+            # The task remains in its safety-paused state. A later normal
+            # sample must never resume it unless a recovery actually succeeds.
+            LOGGER.exception("task localization recovery failed; task remains paused")
+        finally:
+            self._localization_recovery_lock.release()
 
 
 def main() -> None:
