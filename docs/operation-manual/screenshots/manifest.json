@@ -1,0 +1,148 @@
+[
+  {
+    "slug": "00-login",
+    "label": "登录",
+    "route": "/login",
+    "url": "https://39.107.250.69/login"
+  },
+  {
+    "slug": "01-guard-duty",
+    "label": "保安值守",
+    "route": "/dashboard/guard-duty",
+    "url": "https://39.107.250.69/dashboard/guard-duty",
+    "headings": [
+      "智能巡检平台",
+      "保安值守"
+    ]
+  },
+  {
+    "slug": "02-overview",
+    "label": "监测中心",
+    "route": "/dashboard/overview",
+    "url": "https://39.107.250.69/dashboard/overview",
+    "headings": [
+      "智能巡检平台",
+      "实时监测中心"
+    ]
+  },
+  {
+    "slug": "03-remote-control",
+    "label": "远程控制",
+    "route": "/dashboard/remote-control",
+    "url": "https://39.107.250.69/dashboard/remote-control",
+    "headings": [
+      "智能巡检平台",
+      "远程控制"
+    ]
+  },
+  {
+    "slug": "04-remote-development",
+    "label": "远程 AI 开发",
+    "route": "/dashboard/remote-development",
+    "url": "https://39.107.250.69/dashboard/remote-development",
+    "headings": [
+      "智能巡检平台",
+      "远程 AI 开发"
+    ]
+  },
+  {
+    "slug": "05-analytics",
+    "label": "统计分析",
+    "route": "/dashboard/analytics",
+    "url": "https://39.107.250.69/dashboard/analytics",
+    "headings": [
+      "智能巡检平台",
+      "统计分析中心"
+    ]
+  },
+  {
+    "slug": "06-events",
+    "label": "事件中心",
+    "route": "/dashboard/events",
+    "url": "https://39.107.250.69/dashboard/events",
+    "headings": [
+      "智能巡检平台",
+      "事件中心"
+    ]
+  },
+  {
+    "slug": "07-robots",
+    "label": "机器人管理",
+    "route": "/dashboard/robots",
+    "url": "https://39.107.250.69/dashboard/robots",
+    "headings": [
+      "智能巡检平台",
+      "机器人管理"
+    ]
+  },
+  {
+    "slug": "08-tasks",
+    "label": "任务列表",
+    "route": "/dashboard/tasks",
+    "url": "https://39.107.250.69/dashboard/tasks",
+    "headings": [
+      "智能巡检平台",
+      "巡检任务"
+    ]
+  },
+  {
+    "slug": "09-calendar",
+    "label": "巡检日历",
+    "route": "/dashboard/tasks/calendar",
+    "url": "https://39.107.250.69/dashboard/tasks/calendar",
+    "headings": [
+      "智能巡检平台",
+      "巡检日历"
+    ]
+  },
+  {
+    "slug": "10-maps",
+    "label": "地图管理",
+    "route": "/dashboard/tasks/maps",
+    "url": "https://39.107.250.69/dashboard/tasks/maps",
+    "headings": [
+      "智能巡检平台",
+      "地图管理",
+      "地图管理"
+    ]
+  },
+  {
+    "slug": "11-routes",
+    "label": "路径规划",
+    "route": "/dashboard/tasks/routes",
+    "url": "https://39.107.250.69/dashboard/tasks/routes",
+    "headings": [
+      "智能巡检平台",
+      "路径规划",
+      "路径规划"
+    ]
+  },
+  {
+    "slug": "12-zones",
+    "label": "禁区管理",
+    "route": "/dashboard/tasks/zones",
+    "url": "https://39.107.250.69/dashboard/tasks/zones",
+    "headings": [
+      "智能巡检平台",
+      "禁区管理",
+      "禁区管理"
+    ]
+  },
+  {
+    "slug": "13-tracks",
+    "label": "轨迹回放",
+    "route": "/dashboard/tasks/tracks",
+    "url": "https://39.107.250.69/dashboard/tasks/tracks",
+    "headings": [
+      "智能巡检平台",
+      "轨迹回放",
+      "轨迹记录"
+    ]
+  },
+  {
+    "slug": "14-task-execution-detail",
+    "label": "任务执行详情",
+    "route": "/dashboard/task-executions/c948a7ee-2fd4-4538-a7f1-770c36085f29",
+    "url": "https://39.107.250.69/dashboard/task-executions/c948a7ee-2fd4-4538-a7f1-770c36085f29"
+  }
+]

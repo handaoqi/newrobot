@@ -4,7 +4,11 @@ Project rules for RoamerX robot and cloud-platform work. Read this before making
 
 ## Scope
 
-- Robot workspace: `/home/robot/genisom_roamerx_open`
+- Canonical local development checkout: `/home/dogrobot` (preserve the repository's
+  top-level layout: `robot/`, `edge-agent/`, `dev-agent/`, `platform/`, etc.).
+- Deployed NX ROS workspace: `/home/robot/genisom_roamerx_open`. This remains
+  the live runtime path used by current services; do not move or delete it
+  while developing from `/home/dogrobot`.
 - ROS: Humble
 - Real robot platform: `NX_XG3588`
 - Robot code: `ZSL-1A-07`
