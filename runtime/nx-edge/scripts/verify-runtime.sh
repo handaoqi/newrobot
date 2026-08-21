@@ -8,7 +8,9 @@ for path in \
   "$ROOT/data/rosbags" \
   "$ROOT/data/edge-agent" \
   "$ROOT/conf/edge-agent.yaml" \
-  "$ROOT/install/genisom_l1_sdk"; do
+  "$ROOT/install/genisom_l1_sdk" \
+  "$ROOT/data/voice/venv/bin/funasr-server" \
+  "$ROOT/install/models/yolo11n.onnx"; do
   [[ -e "$path" ]] || { echo "Missing runtime asset: $path" >&2; exit 1; }
 done
 set +u
@@ -18,5 +20,13 @@ set -u
 ros2 pkg prefix localization
 ros2 pkg prefix robot_slam
 ros2 pkg prefix robot_navigo
-systemctl is-active roamerx-edge-agent roamerx-dev-agent roamerx-bike-bot roamerx-robot-mcp
+mode="$(sed -n 's/.*\"mode\": \"\([^\"]*\)\".*/\1/p' "$ROOT/data/edge-agent/power_mode.json")"
+if [[ "$mode" == "cooling_standby" ]]; then
+  echo "NX runtime is in cooling_standby; normal-work service verification is not applicable." >&2
+  exit 2
+fi
+systemctl is-active \
+  roamerx-edge-agent roamerx-dev-agent roamerx-bike-bot \
+  roamerx-robot-mcp roamerx-teleop-bridge roamerx-local-asr \
+  roamerx-zenoh roamerx-5g-share
 echo "NX runtime is healthy."

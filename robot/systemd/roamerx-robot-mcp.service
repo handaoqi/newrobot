@@ -1,0 +1,16 @@
+[Unit]
+Description=RoamerX Robot MCP
+After=network-online.target
+
+[Service]
+Type=simple
+User=robot
+WorkingDirectory=/home/dogrobot
+EnvironmentFile=-/etc/roamerx/robot-mcp.env
+Environment=ROAMERX_MCP_HOST=127.0.0.1
+Environment=ROAMERX_MCP_PORT=8095
+ExecStart=/usr/bin/python3 /home/dogrobot/robot/mcp_server/roamerx_robot_mcp.py --transport streamable-http
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

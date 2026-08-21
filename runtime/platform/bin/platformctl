@@ -31,14 +31,45 @@ compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
 
+preflight() {
+  require_docker
+  [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE; run init first." >&2; exit 1; }
+  [[ -s "$RUNTIME_ROOT/conf/mosquitto.passwd" ]] || {
+    echo "Missing conf/mosquitto.passwd; run scripts/prepare-mqtt-password.sh" >&2
+    exit 1
+  }
+  for key in DJANGO_SECRET_KEY DJANGO_ALLOWED_HOSTS DJANGO_CSRF_TRUSTED_ORIGINS PUBLIC_BASE_URL MQTT_PASSWORD; do
+    value="$(grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true)"
+    if [[ -z "$value" || "$value" =~ (change|example|replace|your_) ]]; then
+      echo "Invalid production value: $key" >&2
+      exit 1
+    fi
+  done
+  source_root="$(grep -E '^ROAMERX_SOURCE_ROOT=' "$ENV_FILE" | cut -d= -f2- || true)"
+  [[ -f "$source_root/platform/backend/Dockerfile" && -f "$source_root/platform/frontend/Dockerfile" ]] || {
+    echo "Missing platform source under $source_root" >&2
+    exit 1
+  }
+  free_kb="$(df -Pk "$RUNTIME_ROOT" | awk 'NR==2 {print $4}')"
+  min_free_gb="${ROAMERX_MIN_FREE_GB:-10}"
+  (( free_kb >= min_free_gb * 1024 * 1024 )) || {
+    echo "Insufficient disk space: need at least ${min_free_gb} GiB free." >&2
+    exit 1
+  }
+  if command -v systemctl >/dev/null && systemctl is-active --quiet roamerx-center-api.service 2>/dev/null; then
+    echo "Legacy platform services are active; stop them before Docker cutover." >&2
+    exit 1
+  fi
+  compose config --quiet
+  echo "Platform preflight passed."
+}
+
 case "${1:-help}" in
   init) init_runtime ;;
+  preflight) preflight ;;
   build) compose build --pull ;;
   up)
-    [[ -f "$RUNTIME_ROOT/conf/mosquitto.passwd" ]] || {
-      echo "Missing conf/mosquitto.passwd; run scripts/prepare-mqtt-password.sh" >&2
-      exit 1
-    }
+    preflight
     compose up -d --build
     ;;
   down) compose down ;;

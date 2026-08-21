@@ -8,6 +8,8 @@ SERVICES=(
   roamerx-robot-mcp.service
   roamerx-teleop-bridge.service
   roamerx-local-asr.service
+  roamerx-zenoh.service
+  roamerx-5g-share.service
 )
 
 case "${1:-status}" in
@@ -22,4 +24,3 @@ case "${1:-status}" in
     ;;
   *) echo "Usage: $0 {status|start|stop|restart|verify}" >&2; exit 2 ;;
 esac
-

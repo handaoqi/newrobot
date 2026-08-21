@@ -18,3 +18,18 @@ and machine-local configuration live here:
 The migration script leaves compatibility links under `/home/robot`, allowing
 older vendor binaries and historical map YAML files to continue resolving while
 new code uses the canonical runtime paths.
+
+## Service Installation And Verification
+
+Install or update all eight NX resident services from the canonical checkout:
+
+```bash
+deploy/robot/deploy.sh --install-service
+runtime/nx-edge/bin/nxctl status
+runtime/nx-edge/bin/nxctl verify
+```
+
+`verify` expects normal work mode. In `cooling_standby` it exits with a clear
+state message instead of reporting a false healthy result. Mapping and Nav2
+remain on-demand and are started by their dedicated `bin/mapping` and
+`bin/navigation` wrappers.

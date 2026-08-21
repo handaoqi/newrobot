@@ -10,6 +10,7 @@ sudo scripts/install-docker.sh
 bin/platformctl init
 # Edit conf/platform.env, then:
 scripts/prepare-mqtt-password.sh
+bin/platformctl preflight
 bin/platformctl up
 bin/platformctl verify
 ```
@@ -23,5 +24,7 @@ runtime/platform/scripts/deploy-cloud.sh
 runtime/platform/scripts/deploy-cloud.sh --start
 ```
 
-Do not run the legacy systemd and Compose platform stacks at the same time
-against the same database and MQTT identity.
+`preflight` checks credentials, source files, free disk, Compose syntax and the
+legacy systemd API before any container is started. Do not run the legacy
+systemd and Compose platform stacks at the same time against the same database
+and MQTT identity.

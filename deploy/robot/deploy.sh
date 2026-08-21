@@ -62,7 +62,23 @@ if "$BUILD"; then
 fi
 
 if "$INSTALL_SERVICE"; then
-  remote_exec "sudo install -m 0644 '$EDGE_SOURCE_DIR/systemd/roamerx-edge-agent.service' /etc/systemd/system/roamerx-edge-agent.service && sudo systemctl daemon-reload && sudo systemctl enable --now roamerx-edge-agent.service"
+  systemd_sources=(
+    edge-agent/systemd/roamerx-edge-agent.service
+    edge-agent/systemd/roamerx-teleop-bridge.service
+    edge-agent/systemd/roamerx-zenoh.service
+    edge-agent/systemd/roamerx-5g-share.service
+    dev-agent/systemd/roamerx-dev-agent.service
+    dev-agent/systemd/roamerx-local-asr.service
+    platform/bot-version-test/systemd/roamerx-bike-bot.service
+    robot/systemd/roamerx-robot-mcp.service
+  )
+  for source in "${systemd_sources[@]}"; do
+    filename="$(basename "$source")"
+    rsync -a "$REPO_ROOT/$source" "$(target_path "/tmp/$filename")"
+    remote_exec "sudo install -m 0644 '/tmp/$filename' '/etc/systemd/system/$filename'"
+  done
+  rsync -a "$REPO_ROOT/edge-agent/tools/roamerx-5g-share" "$(target_path /tmp/roamerx-5g-share)"
+  remote_exec "sudo install -m 0755 /tmp/roamerx-5g-share /usr/local/sbin/roamerx-5g-share && sudo systemctl daemon-reload && sudo systemctl enable roamerx-edge-agent roamerx-teleop-bridge roamerx-dev-agent roamerx-local-asr roamerx-bike-bot roamerx-robot-mcp roamerx-zenoh roamerx-5g-share"
 fi
 
 echo "Robot code deployed to ${ROBOT_HOST:+$ROBOT_HOST:}$ROBOT_PROJECT_DIR"

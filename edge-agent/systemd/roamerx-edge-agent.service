@@ -23,7 +23,10 @@ RestartSec=5
 # processes. Restarting the MQTT Edge process must not terminate them.
 KillMode=process
 TimeoutStopSec=15
-NoNewPrivileges=true
+# Power-mode transitions intentionally execute a constrained, passwordless
+# sudoers allowlist for systemctl and the robot safety helpers. NoNewPrivileges
+# prevents sudo from acquiring the permitted privilege and leaves transitions
+# half-applied, so this unit must not enable that sandbox flag.
 
 [Install]
 WantedBy=multi-user.target

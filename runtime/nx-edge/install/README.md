@@ -10,4 +10,6 @@
 
 Use `../scripts/install-system-deps.sh`; do not manually copy host Python
 site-packages between NX devices because JetPack/CUDA ABI versions must match.
-
+The installer refuses an apt transaction that would replace Jetson's NVIDIA
+OpenCV/ROS packages; review the transaction and use a JetPack-matched package
+set before explicitly overriding that guard.
