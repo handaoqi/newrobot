@@ -24,10 +24,14 @@ The active NX runtime is `/home/dogrobot/runtime/nx-edge`. The migration moved:
 | ROS logs/state | `data/ros-home` | 3.0 GB |
 | Vendor parameters/logs | `data/robot-state` | 301 MB |
 | Edge database/state | `data/edge-agent` | 22 MB |
+| Codex main sessions | `data/codex/sessions` | Runtime-dependent |
 | Genisom L1 SDK | `install/genisom_l1_sdk` | 17 MB |
 
 Legacy paths under `/home/robot` are compatibility symlinks. Edge Agent,
 Dev Agent, vision, local ASR, MCP and teleop services remain enabled and active.
+The current Codex main session is also retained under runtime data with a
+compatibility link from the original Codex session path. See
+`nx-edge/docs/CODEX_SESSION_BACKUP.md` for restore instructions.
 
 ## 3588 Motion
 
@@ -43,4 +47,3 @@ contexts are staged at `/opt/roamerx/source/platform`. Docker Compose resolves
 the six services successfully. The current systemd production stack remains
 active until a separately approved cutover migrates persistent data and stops
 the old writers.
-

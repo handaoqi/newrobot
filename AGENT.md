@@ -31,7 +31,7 @@
 | --- | --- | --- | --- |
 | `robot/` | 直接在 `/home/dogrobot/robot/` 构建和运行 | 不发布完整 ROS 工作区 | 构建产物位于 `robot/{build,install,log}`。 |
 | `edge-agent/` | 源码从 `/home/dogrobot/edge-agent/` 运行；配置和数据位于 `runtime/nx-edge/{conf,data}` | 不发布 | NX Edge Agent 通过 SSH 控制 3588。 |
-| `dev-agent/` | 源码从 `/home/dogrobot/dev-agent/` 运行 | 不发布 | Codex 会话仍是开发用户状态，不属于机器人 runtime 数据。 |
+| `dev-agent/` | 源码从 `/home/dogrobot/dev-agent/` 运行 | 不发布 | Codex 主会话归档在 `runtime/nx-edge/data/codex/sessions/`，恢复说明见 `runtime/nx-edge/docs/CODEX_SESSION_BACKUP.md`。 |
 | `mcp_server/` | 顶层目录仅含测试，不发布运行代码 | 不发布 | 运行代码来自 `robot/mcp_server/`；现役 MCP service 从 `/home/dogrobot/robot/mcp_server/` 启动。 |
 | `platform/` | 不发布到 NX | 不发布 | Docker 方式发布到云端 `/opt/roamerx/source/platform`，状态在 `/opt/roamerx/runtime/platform`。 |
 | `deploy/`、`scripts/` | 从 `/home/dogrobot` 执行，不常驻部署 | 不发布 | `deploy/robot/deploy.sh` 只发布 `robot/` 与 `edge-agent/`。 |
@@ -51,7 +51,7 @@
 ## 发布防护
 
 1. 开发、测试和提交只在 `/home/dogrobot`；发布时使用明确目标路径，绝不以目录名猜测目标。
-2. 不覆盖 `runtime/*/data`、真实 `runtime/*/conf`、地图、rosbag、模型缓存、密钥或 Codex 会话。
+2. 不覆盖 `runtime/*/data`、真实 `runtime/*/conf`、地图、rosbag、模型缓存、密钥或 Codex 会话；Codex 会话只能使用归档/恢复脚本迁移。
 3. 修改服务后，确保代码指向 `/home/dogrobot`，配置和状态指向对应 runtime，禁止重新写回旧 `/home/robot` 数据目录。
 4. 修改 3588 systemd unit 后，先核对目标文件，再执行 `systemctl daemon-reload`，只重启受影响服务。
 5. `roamerx-robot-mcp.service` 的本机 override 为 `/etc/systemd/system/roamerx-robot-mcp.service.d/override.conf`，将它指向 `/home/dogrobot/robot/mcp_server/roamerx_robot_mcp.py`，并仅监听 `127.0.0.1:8095`（MCP endpoint: `/mcp`）。
