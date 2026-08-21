@@ -196,18 +196,18 @@ POST /api/robots/<id>/navigation/stop/     -> nav.stop
 Dog-side edge_agent:
 
 ```text
-/home/robot/genisom_roamerx_open/edge_agent/roamerx_edge/navigation_stack_adapter.py
-/home/robot/genisom_roamerx_open/edge_agent/roamerx_edge/command_processor.py
-/home/robot/genisom_roamerx_open/edge_agent/roamerx_edge/protocol.py
-/home/robot/genisom_roamerx_open/edge_agent/roamerx_edge/app.py
-/home/robot/genisom_roamerx_open/edge_agent/roamerx_edge/config.py
+/home/dogrobot/edge-agent/roamerx_edge/navigation_stack_adapter.py
+/home/dogrobot/edge-agent/roamerx_edge/command_processor.py
+/home/dogrobot/edge-agent/roamerx_edge/protocol.py
+/home/dogrobot/edge-agent/roamerx_edge/app.py
+/home/dogrobot/edge-agent/roamerx_edge/config.py
 /home/robot/edge_agent/config.yaml
 ```
 
 Runtime behavior:
 
 - `nav.status/start/restart/stop` are real RemoteCommands over MQTT.
-- Edge executes `/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh <action>`.
+- Edge executes `/home/dogrobot/robot/script/robot/start_navigation_real.sh <action>`.
 - `nav.start` only starts localization/Nav2; it does not send route goals or move the dog.
 - Route execution still uses the existing patrol task path: cloud task -> MQTT `task.start` -> edge_agent -> `/follow_waypoints`.
 
@@ -272,7 +272,7 @@ Dog edge agent runtime:
 
 ```text
 /home/robot/edge_agent/config.yaml
-/home/robot/genisom_roamerx_open/edge_agent
+/home/dogrobot/edge-agent
 ```
 
 Expected map config in dog edge agent from prior work:
@@ -290,7 +290,7 @@ Because cloud active map is currently `id=1`, verify whether dog edge agent and 
 Robot status:
 
 ```bash
-cd /home/robot/genisom_roamerx_open
+cd /home/dogrobot/robot
 script/robot/start_navigation_real.sh status
 ps -ef | rg 'ros2 launch localization|robot_navigo|localization_node|planner_server|controller_server|bt_navigator|vel_cmd|mode_status'
 ```
@@ -299,7 +299,7 @@ ROS status without daemon:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/robot/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 ROS_DISABLE_DAEMON=1 ros2 node list
 ROS_DISABLE_DAEMON=1 ros2 lifecycle get /planner_server
 ROS_DISABLE_DAEMON=1 ros2 lifecycle get /controller_server

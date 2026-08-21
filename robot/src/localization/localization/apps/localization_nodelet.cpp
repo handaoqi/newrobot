@@ -281,14 +281,22 @@ public:
         std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1));
     }
     points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
-    // Keep controller odometry available for publishing map->odom even when it
-    // is deliberately excluded from the NDT prediction input.
-    robot_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      robot_odom_topic_, rclcpp::QoS(100),
-      std::bind(&HdlLocalizationNode::robot_odom_callback, this, std::placeholders::_1));
-    RCLCPP_INFO(
-      get_logger(), "Robot odometry subscribed for TF continuity; NDT prediction %s, topic=%s",
-      enable_robot_odometry_prediction ? "enabled" : "disabled", robot_odom_topic_.c_str());
+    // Subscribe to controller odometry only when it is explicitly needed for
+    // NDT prediction or this node owns the map->odom TF.  In the real
+    // navigation configuration both are disabled: Mid360 point matching and
+    // its built-in IMU are the sole source for the Nav2 odometry chain.
+    if (enable_robot_odometry_prediction || send_tf_transforms) {
+      robot_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        robot_odom_topic_, rclcpp::QoS(100),
+        std::bind(&HdlLocalizationNode::robot_odom_callback, this, std::placeholders::_1));
+      RCLCPP_INFO(
+        get_logger(), "Robot odometry subscribed; NDT prediction %s, TF publishing %s, topic=%s",
+        enable_robot_odometry_prediction ? "enabled" : "disabled",
+        send_tf_transforms ? "enabled" : "disabled", robot_odom_topic_.c_str());
+    } else {
+      RCLCPP_INFO(
+        get_logger(), "Controller odometry disabled for localization and Nav2 pose chains");
+    }
     if (use_gnss_fusion_) {
       gnss_sub = create_subscription<sensor_msgs::msg::NavSatFix>(
         gnss_topic, 20, std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));

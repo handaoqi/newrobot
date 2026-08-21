@@ -8,8 +8,8 @@ codex:
   timeout_seconds: 7200
 
 workspaces:
-  robot-main: /home/robot/genisom_roamerx_open
-  cloud-platform: /home/robot/yw/roamerx_analysis/center_platform/platform_server_code
+  robot-main: /home/dogrobot
+  cloud-platform: /home/dogrobot/platform
 
 storage:
   log_dir: /home/robot/.local/state/roamerx-dev-agent/tasks

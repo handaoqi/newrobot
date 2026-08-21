@@ -7,18 +7,20 @@ Wants=network-online.target chrony.service
 Type=simple
 User=robot
 Group=robot
-WorkingDirectory=/opt/roamerx/edge_agent
+WorkingDirectory=/home/dogrobot/edge-agent
 Environment=PYTHONUNBUFFERED=1
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ExecStart=/usr/bin/python3 /opt/roamerx/edge_agent/run_edge_agent.py --config /etc/roamerx/edge-agent.yaml
+Environment=PROJECT_DIR=/home/dogrobot/robot
+Environment=EDGE_SOURCE_DIR=/home/dogrobot/edge-agent
+Environment=EDGE_RUNTIME_DIR=/home/robot/edge_agent
+ExecStart=/home/dogrobot/edge-agent/start_edge.sh
 Restart=always
 RestartSec=5
 # Sensors, localization and Nav2 are independently managed long-running
 # processes. Restarting the MQTT Edge process must not terminate them.
 KillMode=process
 TimeoutStopSec=15
-StateDirectory=roamerx-edge
 NoNewPrivileges=true
 
 [Install]

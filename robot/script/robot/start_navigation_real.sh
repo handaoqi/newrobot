@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 MAP_YAML="${MAP_YAML:-/home/robot/.jszr/map/map.yaml}"
 PCD_MAP="${PCD_MAP:-}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_nav_logs}"

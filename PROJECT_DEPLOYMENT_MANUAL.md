@@ -53,9 +53,9 @@ Browser -> Django API -> device worker -> MQTT
 | `/home/dogrobot` 目录 | 发布目标 | 是否完整部署到 3588 |
 | --- | --- | --- |
 | `platform/` | 云端 `/opt/roamerx/current/{backend,frontend}` | 否 |
-| `robot/` | NX `/home/robot/genisom_roamerx_open/`（内容平铺） | 否 |
-| `edge-agent/` | NX Edge Agent 运行布局，见第 6 节兼容性说明 | 否 |
-| `dev-agent/` | NX `/home/robot/genisom_roamerx_open/dev_agent/`（历史下划线名） | 否 |
+| `robot/` | NX `/home/dogrobot/robot/`（原地构建和运行） | 否 |
+| `edge-agent/` | NX `/home/dogrobot/edge-agent/`，运行数据在 `/home/robot/edge_agent/` | 否 |
+| `dev-agent/` | NX `/home/dogrobot/dev-agent/`，会话状态在 `/home/robot/` | 否 |
 | `robot/mcp_server/` | NX `/home/dogrobot/robot/mcp_server/` | 否 |
 | `robot/third_party/charge_pile_3588/` | 3588 充电桩厂商包目录 | 是，仅此增量资产 |
 | `edge-agent/tools/leg_power/` | 3588 本机编译为 `/usr/local/bin/roamerx-leg-power` | 是，仅此增量组件 |
@@ -91,7 +91,7 @@ Browser -> Django API -> device worker -> MQTT
 在具备私有仓库 SSH 权限的 NX 或开发机执行：
 
 ```bash
-sudo install -d -o robot -g robot -m 0755 /home/dogrobot
+sudo install -d -o dogrobot -g robot -m 0755 /home/dogrobot
 git clone --branch main --single-branch \
   git@github.com:talent5978/dogrobot.git /home/dogrobot
 cd /home/dogrobot
@@ -295,10 +295,10 @@ ssh cloud 'set -e
 | 用途 | 路径 |
 | --- | --- |
 | 开发源 | `/home/dogrobot` |
-| ROS 运行工作区 | `/home/robot/genisom_roamerx_open` |
+| ROS 源码、构建与运行工作区 | `/home/dogrobot/robot` |
 | Edge 运行配置与状态 | `/home/robot/edge_agent/config.yaml`、`/home/robot/edge_agent/data/` |
 | 地图 | `/home/robot/.jszr/map/` |
-| Dev Agent 现役目录 | `/home/robot/genisom_roamerx_open/dev_agent/` |
+| Dev Agent 现役目录 | `/home/dogrobot/dev-agent/` |
 | Robot MCP 现役代码 | `/home/dogrobot/robot/mcp_server/` |
 | Robot MCP endpoint | `http://127.0.0.1:8095/mcp` |
 
@@ -338,39 +338,33 @@ python3 -m pip install -r /home/dogrobot/robot/mcp_server/requirements.txt
 
 ### 6.3 发布 ROS 工作区与构建
 
-运行工作区必须由 `/home/dogrobot/robot/` 发布，构建产物留在 NX 运行工作区：
+ROS 工作区直接在统一 Git 检出中构建，不再复制到第二套源码目录：
 
 ```bash
-rsync -a \
-  --exclude='build/' --exclude='install/' --exclude='log/' \
-  /home/dogrobot/robot/ /home/robot/genisom_roamerx_open/
-
-cd /home/robot/genisom_roamerx_open
+cd /home/dogrobot/robot
 source /opt/ros/humble/setup.bash
 ./build.sh all
 source install/setup.bash
 ```
 
-也可使用包装脚本：
+远程新机部署也可使用包装脚本；目标路径默认同样是 `/home/dogrobot`：
 
 ```bash
 cd /home/dogrobot
 deploy/robot/deploy.sh --host robot@<NX_IP> --build
 ```
 
-该脚本会保护地图、`config.yaml`、`data/`、构建产物和日志。但当前 Edge Agent 存在历史目录布局：现役 `start_edge.sh` 从 `/home/robot/edge_agent/` 启动，却会导入 `/home/robot/genisom_roamerx_open/edge_agent/`。因此，**首次重建或更新 Edge Agent 前必须先确认这两个目录的内容和 systemd 的实际 `ExecStart`，不能仅因仓库目录名为 `edge-agent/` 就覆盖任一目录。**
-
-当前兼容布局下，Edge 源码应由受控流程同步到 `.../edge_agent/`（下划线），配置和持久数据仍保留在 `/home/robot/edge_agent/`。完成迁移测试前，不要改用仓库样例中的 `/opt/roamerx/edge_agent` unit。
+源码和构建产物统一位于 `/home/dogrobot`。地图、rosbag、Edge 配置与数据、密钥、模型和会话仍位于 `/home/robot`，发布或拉取代码时不得覆盖这些运行数据。
 
 ### 6.4 NX 服务清单和启动顺序
 
 | 服务 | 职责 | 当前路径/要求 |
 | --- | --- | --- |
 | `roamerx-zenoh.service` | ROS 2 Zenoh 路由 | Edge 启动前必须可用。 |
-| `roamerx-edge-agent.service` | MQTT、任务、遥测、地图/充电协调 | 当前 `WorkingDirectory=/home/robot/edge_agent`，配置为 `config.yaml`。 |
+| `roamerx-edge-agent.service` | MQTT、任务、遥测、地图/充电协调 | 代码从 `/home/dogrobot/edge-agent` 加载，配置为 `/home/robot/edge_agent/config.yaml`。 |
 | `roamerx-teleop-bridge.service` | 常驻 SDK/虚拟遥控桥 | 使用 ROS 工作区的 `robot_navigo`；服务受保护，不能用普通停服务绕过安全设计。 |
 | `roamerx-local-asr.service` | NX 本地语音识别 | 本地监听 `127.0.0.1:18080`，使用语音模型缓存。 |
-| `roamerx-dev-agent.service` | 远程开发/语音任务桥 | 使用现役 `dev_agent` 目录与 Edge 配置。 |
+| `roamerx-dev-agent.service` | 远程开发/语音任务桥 | 使用 `/home/dogrobot/dev-agent` 与 Edge 运行配置。 |
 | `roamerx-robot-mcp.service` | 本机 Robot Control MCP | 通过 `/etc/systemd/system/roamerx-robot-mcp.service.d/override.conf` 从 `/home/dogrobot/robot/mcp_server/roamerx_robot_mcp.py` 启动，监听 `127.0.0.1:8095`。 |
 
 正常重建后的低风险检查顺序：
@@ -394,7 +388,7 @@ sudo ss -ltn | grep -E '127.0.0.1:(18080|8095)'
 导航/建图只使用下列已批准的运行脚本：
 
 ```bash
-cd /home/robot/genisom_roamerx_open
+cd /home/dogrobot/robot
 script/robot/start_navigation_real.sh status
 script/robot/start_navigation_real.sh start
 script/robot/start_mapping_real.sh start
@@ -530,7 +524,7 @@ systemctl is-active roamerx-zenoh roamerx-edge-agent \
   roamerx-local-asr roamerx-dev-agent roamerx-robot-mcp
 curl -fsS http://127.0.0.1:8095/mcp || true  # 仅确认本机 endpoint 可达
 source /opt/ros/humble/setup.bash
-source /home/robot/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 ros2 node list
 ros2 topic echo /localization_info --once
 ```
@@ -561,7 +555,7 @@ ssh 3588 'test -x /usr/local/sbin/roamerx-charge-pile-controller && echo charge-
 | --- | --- | --- |
 | 云端代码 | 前一 `/opt/roamerx/releases/<release>` | 在维护窗口将 `current` 切回已记录 release，重启 API/worker/scheduler，验证 HTTPS。 |
 | 云端数据 | SQLite 在线备份 + 媒体快照 | 停止写入者后按第 5.6 节恢复；数据迁移不可逆时先做兼容性评估。 |
-| NX 代码 | `/home/dogrobot` 的前一 SHA | 重新发布 `robot/`/Edge 代码到运行工作区，重新构建，再重启受影响服务。 |
+| NX 代码 | `/home/dogrobot` 的前一 SHA | 切换到已审查 SHA，在 `robot/` 重新构建，再重启受影响服务。 |
 | NX 配置/地图 | 私有备份 + 独立地图备份 | 临时目录比对后逐项恢复；绝不整包覆盖。 |
 | 3588 | 厂商镜像 + 私有配置归档 | 先恢复厂商基线，再逐项恢复充电桩/配置，不覆盖运行中的运控系统。 |
 
@@ -569,7 +563,7 @@ ssh 3588 'test -x /usr/local/sbin/roamerx-charge-pile-controller && echo charge-
 
 1. **云端 Node 缺失：** 当前云主机无 `node`/`npm`；前端应在 `/home/dogrobot` 或 CI 构建，再通过发布脚本同步。
 2. **MQTT 监管不一致：** 当前 :1884 有 Mosquitto 进程，但 `mosquitto.service` 是 inactive；先找出真实管理方式再修复，避免双 Broker 或端口冲突。
-3. **Edge Agent 双路径：** 仓库样例 `/opt/roamerx/edge_agent` 与现役 `/home/robot/edge_agent`/`.../edge_agent` 布局不同；未完成迁移验证前不要混用。
+3. **源码与运行数据分离：** Edge 源码在 `/home/dogrobot/edge-agent`，配置和持久数据在 `/home/robot/edge_agent`；不要把运行配置提交到 Git。
 4. **3588 不是 Git 可完全复现环境：** Git 只包含充电桩和腿部电源增量资产；完整低层环境依赖厂商镜像。
 5. **私有备份未随新检出完整携带：** `/home/dogrobot/backup/` 仅有可入库文件；NX/3588 配置归档须从安全备份介质或旧运行目录取得。
 6. **地图不在 NX 配置归档中：** 地图点云和图像需独立备份/恢复，并保证 symlink、yaml、pgm、pcd 一致。

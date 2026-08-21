@@ -127,23 +127,23 @@ class MappingConfig:
     auto_activate_uploaded_map: bool = True
     upload_point_cloud: bool = False
     preview_max_size: int = 1200
-    rosbag_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/mapping_rosbag.sh"
+    rosbag_script: str = "/home/dogrobot/robot/script/robot/mapping_rosbag.sh"
     rosbag_stop_timeout_seconds: int = 45
-    sensor_start_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/ensure_mapping_sensors.sh"
+    sensor_start_script: str = "/home/dogrobot/robot/script/robot/ensure_mapping_sensors.sh"
     sensor_start_timeout_seconds: int = 40
 
 
 @dataclass
 class NavigationStackConfig:
-    script_path: str = "/home/robot/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh"
+    script_path: str = "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
     command_timeout_seconds: int = 45
-    rosbag_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/navigation_rosbag.sh"
+    rosbag_script: str = "/home/dogrobot/robot/script/robot/navigation_rosbag.sh"
     rosbag_stop_timeout_seconds: int = 45
 
 
 @dataclass
 class TeleopControlConfig:
-    script_path: str = "/home/robot/genisom_roamerx_open/robot/script/robot/start_teleop_control.sh"
+    script_path: str = "/home/dogrobot/robot/script/robot/start_teleop_control.sh"
     command_timeout_seconds: int = 20
 
 
@@ -157,8 +157,8 @@ class PersonFollowConfig:
 
 @dataclass
 class SensorControlConfig:
-    lidar_restart_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/restart_livox_sensor.sh"
-    rtk_restart_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/start_rtk_ntrip.sh"
+    lidar_restart_script: str = "/home/dogrobot/robot/script/robot/restart_livox_sensor.sh"
+    rtk_restart_script: str = "/home/dogrobot/robot/script/robot/start_rtk_ntrip.sh"
     command_timeout_seconds: int = 30
 
 
@@ -212,7 +212,7 @@ class PowerModeConfig:
     cooling_marker_path: str = "/home/robot/edge_agent/data/cooling_standby"
     monitoring_service: str = "roamerx-bike-bot.service"
     teleop_bridge_service: str = "roamerx-teleop-bridge.service"
-    navigation_script: str = "/home/robot/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh"
+    navigation_script: str = "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
     normal_start_timeout_seconds: int = 240
     always_on_services: tuple[str, ...] = (
         "roamerx-dev-agent.service", "roamerx-robot-mcp.service",

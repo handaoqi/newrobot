@@ -225,9 +225,14 @@ def generate_launch_description():
         package='robot_navigo',
         executable='odom_to_tf_broadcaster',
         parameters=[{
-            'input_odom_topic': '/odom/mc_odom',
+            # /odom/localization_odom is the Mid360 point-matching and
+            # built-in-IMU fusion result.  Keep map and odom coincident so
+            # this node is the only publisher of the Nav2 TF chain.
+            'input_odom_topic': '/odom/localization_odom',
             'output_odom_topic': '/odom/nav2',
-            'publish_map_to_odom': False,
+            'output_odom_frame': 'odom',
+            'output_base_frame': 'base_link',
+            'publish_map_to_odom': True,
             'use_current_time': True,
         }],
         output='screen'

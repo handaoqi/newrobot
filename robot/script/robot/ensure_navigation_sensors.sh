@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 # Keep this aligned with the LiDAR/IMU cold-start readiness window.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
@@ -26,7 +26,7 @@ if ! pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1; th
     >/tmp/pointcloud_to_laserscan.log 2>&1 < /dev/null &
 fi
 
-FILTER_SCRIPT="${PROJECT_DIR}/robot/src/navigation/src/robot_navigo/scripts/self_filter_scan.py"
+FILTER_SCRIPT="${PROJECT_DIR}/src/navigation/src/robot_navigo/scripts/self_filter_scan.py"
 if [ ! -f "${FILTER_SCRIPT}" ]; then
   echo "ERROR: self-filter script not found: ${FILTER_SCRIPT}" >&2
   exit 1

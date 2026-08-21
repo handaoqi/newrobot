@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=robot
 Group=robot
-WorkingDirectory=/home/robot/genisom_roamerx_open/dev-agent
+WorkingDirectory=/home/dogrobot/dev-agent
 Environment=HOME=/home/robot
 Environment=CODEX_HOME=/home/robot/.codex
 Environment=PYTHONUNBUFFERED=1
@@ -15,7 +15,8 @@ Environment=http_proxy=http://127.0.0.1:7890
 Environment=https_proxy=http://127.0.0.1:7890
 Environment=NO_PROXY=127.0.0.1,localhost
 Environment=no_proxy=127.0.0.1,localhost
-ExecStart=/usr/bin/python3 /home/robot/genisom_roamerx_open/dev-agent/run_dev_agent.py --edge-config /home/robot/edge_agent/config.yaml --config /home/robot/genisom_roamerx_open/dev-agent/config.example.yaml
+ExecStart=/usr/bin/python3 /home/dogrobot/dev-agent/run_dev_agent.py --edge-config /home/robot/edge_agent/config.yaml --config /home/dogrobot/dev-agent/config.example.yaml
+UMask=0002
 Restart=always
 RestartSec=5
 KillMode=control-group

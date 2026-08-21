@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 
-MODULE_PATH = Path(__file__).parents[1] / "roamerx_robot_mcp.py"
+MODULE_PATH = Path(__file__).parents[2] / "robot" / "mcp_server" / "roamerx_robot_mcp.py"
 SPEC = importlib.util.spec_from_file_location("roamerx_robot_mcp_under_test", MODULE_PATH)
 mcp_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

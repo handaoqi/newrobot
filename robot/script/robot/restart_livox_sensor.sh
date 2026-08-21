@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 
 kill_matching() {
   local pattern="$1"

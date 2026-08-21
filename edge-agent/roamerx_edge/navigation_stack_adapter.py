@@ -57,7 +57,7 @@ class NavigationStackAdapter:
         """
         script = (
             "source /opt/ros/humble/setup.bash && "
-            "source /home/robot/genisom_roamerx_open/install/setup.bash && "
+            "source /home/dogrobot/robot/install/setup.bash && "
             "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} "
             "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
             "timeout 25 ros2 service call /load_map_service "

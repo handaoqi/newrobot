@@ -10,8 +10,10 @@ public:
     OdomToTFBroadcaster()
         : Node("odom_to_tf_broadcaster")
     {
-        input_odom_topic_ = this->declare_parameter<std::string>("input_odom_topic", "/odom/mc_odom");
+        input_odom_topic_ = this->declare_parameter<std::string>("input_odom_topic", "/odom/localization_odom");
         output_odom_topic_ = this->declare_parameter<std::string>("output_odom_topic", "/odom/nav2");
+        output_odom_frame_ = this->declare_parameter<std::string>("output_odom_frame", "odom");
+        output_base_frame_ = this->declare_parameter<std::string>("output_base_frame", "base_link");
         publish_map_to_odom_ = this->declare_parameter<bool>("publish_map_to_odom", false);
         use_current_time_ = this->declare_parameter<bool>("use_current_time", true);
 
@@ -24,19 +26,25 @@ public:
         odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(output_odom_topic_, 10);
 
         RCLCPP_INFO(this->get_logger(),
-                    "Odom to TF Broadcaster started, input=%s, output=%s, publish_map_to_odom=%s, use_current_time=%s",
-                    input_odom_topic_.c_str(), output_odom_topic_.c_str(), publish_map_to_odom_ ? "true" : "false",
+                    "Odom to TF Broadcaster started, input=%s, output=%s, frames=%s->%s, publish_map_to_odom=%s, use_current_time=%s",
+                    input_odom_topic_.c_str(), output_odom_topic_.c_str(),
+                    output_odom_frame_.c_str(), output_base_frame_.c_str(),
+                    publish_map_to_odom_ ? "true" : "false",
                     use_current_time_ ? "true" : "false");
     }
 
 private:
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        // The motor controller stamps odometry with its boot-monotonic clock.
-        // Nav2 requires ROS/system-clock timestamps for freshness checks.
+        // Nav2 requires fresh ROS/system-clock timestamps.  The input can be
+        // the global Mid360+IMU localization pose (frame map); when
+        // publish_map_to_odom is enabled, map and odom are intentionally
+        // coincident and this node is the only owner of both TF links.
         const auto stamp = use_current_time_ ? this->get_clock()->now() : rclcpp::Time(msg->header.stamp);
         auto nav2_odom = *msg;
         nav2_odom.header.stamp = stamp;
+        nav2_odom.header.frame_id = output_odom_frame_;
+        nav2_odom.child_frame_id = output_base_frame_;
         odom_publisher_->publish(nav2_odom);
 
         // Create a TransformStamped message
@@ -50,8 +58,8 @@ private:
         }
 
         // Set the frame IDs
-        t.header.frame_id = "odom";
-        t.child_frame_id  = "base_link";
+        t.header.frame_id = output_odom_frame_;
+        t.child_frame_id  = output_base_frame_;
 
         // Set the translation
         t.transform.translation.x = msg->pose.pose.position.x;
@@ -67,7 +75,7 @@ private:
             geometry_msgs::msg::TransformStamped t_map;
             t_map.header.stamp = stamp;
             t_map.header.frame_id = "map";
-            t_map.child_frame_id  = "odom";
+            t_map.child_frame_id  = output_odom_frame_;
             t_map.transform.translation.x = 0.0;
             t_map.transform.translation.y = 0.0;
             t_map.transform.translation.z = 0.0;
@@ -84,6 +92,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
     std::string input_odom_topic_;
     std::string output_odom_topic_;
+    std::string output_odom_frame_;
+    std::string output_base_frame_;
     bool publish_map_to_odom_;
     bool use_current_time_;
 };

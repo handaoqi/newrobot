@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 BAG_ROOT="${BAG_ROOT:-/home/robot/rosbags/mapping}"
 STATE_DIR="${STATE_DIR:-/tmp/roamerx_mapping_rosbag}"
 MIN_FREE_GB="${MIN_FREE_GB:-10}"

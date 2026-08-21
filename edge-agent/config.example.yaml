@@ -94,19 +94,19 @@ mapping:
   auto_activate_uploaded_map: true
   upload_point_cloud: false
   preview_max_size: 1200
-  rosbag_script: "/home/robot/genisom_roamerx_open/robot/script/robot/mapping_rosbag.sh"
+  rosbag_script: "/home/dogrobot/robot/script/robot/mapping_rosbag.sh"
   rosbag_stop_timeout_seconds: 45
-  sensor_start_script: "/home/robot/genisom_roamerx_open/robot/script/robot/ensure_mapping_sensors.sh"
+  sensor_start_script: "/home/dogrobot/robot/script/robot/ensure_mapping_sensors.sh"
   sensor_start_timeout_seconds: 40
 
 navigation_stack:
-  script_path: "/home/robot/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh"
+  script_path: "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
   command_timeout_seconds: 45
-  rosbag_script: "/home/robot/genisom_roamerx_open/robot/script/robot/navigation_rosbag.sh"
+  rosbag_script: "/home/dogrobot/robot/script/robot/navigation_rosbag.sh"
   rosbag_stop_timeout_seconds: 45
 
 teleop_control:
-  script_path: "/home/robot/genisom_roamerx_open/robot/script/robot/start_teleop_control.sh"
+  script_path: "/home/dogrobot/robot/script/robot/start_teleop_control.sh"
   command_timeout_seconds: 20
 
 person_follow:
@@ -117,8 +117,8 @@ person_follow:
   obstacle_stop_distance_m: 0.8
 
 sensor_control:
-  lidar_restart_script: "/home/robot/genisom_roamerx_open/robot/script/robot/restart_livox_sensor.sh"
-  rtk_restart_script: "/home/robot/genisom_roamerx_open/robot/script/robot/start_rtk_ntrip.sh"
+  lidar_restart_script: "/home/dogrobot/robot/script/robot/restart_livox_sensor.sh"
+  rtk_restart_script: "/home/dogrobot/robot/script/robot/start_rtk_ntrip.sh"
   command_timeout_seconds: 30
 
 charge_control:
@@ -154,7 +154,7 @@ power_mode:
   state_path: /home/robot/edge_agent/data/power_mode.json
   cooling_marker_path: /home/robot/edge_agent/data/cooling_standby
   monitoring_service: roamerx-bike-bot.service
-  navigation_script: /home/robot/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh
+  navigation_script: /home/dogrobot/robot/script/robot/start_navigation_real.sh
   normal_start_timeout_seconds: 240
   always_on_services: [roamerx-dev-agent.service, roamerx-robot-mcp.service, roamerx-zenoh.service, roamerx-5g-share.service]
   controller_host: "3588"

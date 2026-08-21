@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/robot/genisom_roamerx_open}"
-SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/robot/script/robot}"
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 # A MID-360 can need noticeably longer to resume UDP point output after a
 # charging-standby cycle. Avoid treating a healthy cold start as a failure.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"

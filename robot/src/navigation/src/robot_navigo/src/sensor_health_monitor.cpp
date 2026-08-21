@@ -27,7 +27,7 @@ class SensorHealthMonitor : public rclcpp::Node {
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         "/front_lidar/imu", qos, [this](const sensor_msgs::msg::Imu::SharedPtr msg) { mark(imu_, msg->header.stamp); });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        "/odom/mc_odom", qos, [this](const nav_msgs::msg::Odometry::SharedPtr msg) { mark(odom_, msg->header.stamp); });
+        "/odom/localization_odom", qos, [this](const nav_msgs::msg::Odometry::SharedPtr msg) { mark(odom_, msg->header.stamp); });
     rtk_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
         "/fix", qos, [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           rtk_fix_status_.store(static_cast<int>(msg->status.status), std::memory_order_relaxed);
@@ -108,7 +108,7 @@ class SensorHealthMonitor : public rclcpp::Node {
     out << ',';
     append_sensor(out, "imu", "/front_lidar/imu", imu_, elapsed, 0.5, timestamp_health(imu_));
     out << ',';
-    append_sensor(out, "odometry", "/odom/mc_odom", odom_, elapsed, 1.0);
+    append_sensor(out, "odometry", "/odom/localization_odom", odom_, elapsed, 1.0);
     out << ',';
     const int fix = rtk_fix_status_.load(std::memory_order_relaxed);
     const double horizontal_std = rtk_horizontal_std_m_.load(std::memory_order_relaxed);

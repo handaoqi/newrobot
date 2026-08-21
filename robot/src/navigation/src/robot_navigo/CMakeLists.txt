@@ -199,6 +199,10 @@ target_include_directories(vel_cmd_udp_pub
     ${GENISOM_L1_SDK_ROOT}/include
     /usr/local/include/zsibot/include
 )
+set_target_properties(vel_cmd_udp_pub PROPERTIES
+  BUILD_RPATH "${GENISOM_L1_SDK_ROOT}/lib/zsl-1/${GENISOM_L1_SDK_ARCH}"
+  INSTALL_RPATH "${GENISOM_L1_SDK_ROOT}/lib/zsl-1/${GENISOM_L1_SDK_ARCH}"
+)
 
 #==========================>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 add_executable(mode_status_pub

@@ -6,19 +6,19 @@ This file records the latest verified state so a later debugging session can con
 
 ## Machine And Workspace
 
-- Robot computer workspace: `/home/robot/genisom_roamerx_open`
+- Robot computer workspace: `/home/dogrobot/robot`
 - ROS: Humble
 - Real robot platform: `NX_XG3588`
 - Navigation communication: `UDP`
 - Motion controller mode used by Nav2: `RL_TRACK_VELOCITY`
-- Current map yaml used by Nav2: `/home/robot/genisom_roamerx_open/map/map.yaml`
+- Current map yaml used by Nav2: `/home/dogrobot/robot/map/map.yaml`
 - Current PCD map used by localization: `/home/robot/.jszr/map/map.pcd`
 - Current map symlinks point to: `/home/robot/.jszr/map/20260703_170635/`
 - Only usable local map as of 2026-07-03: `/home/robot/.jszr/map/20260703_170635/`
 - Deprecated local platform directory was removed:
 
 ```text
-/home/robot/genisom_roamerx_open/web_platform
+/home/dogrobot/robot/web_platform
 ```
 
 ## Current Verified Runtime State
@@ -199,8 +199,8 @@ The Nav2 `vel_cmd_udp_pub` may print `SDK checkConnect=false` at startup, but th
 Keep using only these real-robot scripts:
 
 ```bash
-/home/robot/genisom_roamerx_open/script/robot/start_navigation_real.sh
-/home/robot/genisom_roamerx_open/script/robot/start_mapping_real.sh
+/home/dogrobot/robot/script/robot/start_navigation_real.sh
+/home/dogrobot/robot/script/robot/start_mapping_real.sh
 ```
 
 Navigation:
@@ -250,7 +250,7 @@ Cloud server:
 ```
 
 The real platform is the cloud platform on `39.107.250.69`. Do not use or recreate the old local
-`/home/robot/genisom_roamerx_open/web_platform`; it was a stale demo platform and has been deleted.
+`/home/dogrobot/robot/web_platform`; it was a stale demo platform and has been deleted.
 
 SSH:
 
@@ -323,7 +323,7 @@ Dog-side Edge Agent runtime:
 systemd service: roamerx-edge-agent.service
 working dir: /home/robot/edge_agent
 runtime config: /home/robot/edge_agent/config.yaml
-repo source: /home/robot/genisom_roamerx_open/edge_agent
+repo source: /home/dogrobot/edge-agent
 robot id/code: ZSL-1A-07
 MQTT broker: 39.107.250.69:1884
 HTTP media upload: http://39.107.250.69:8088/api/device/media/upload/
@@ -547,7 +547,7 @@ Important compatibility note:
 1. Ensure real navigation stack is running on the dog:
 
    ```bash
-   cd /home/robot/genisom_roamerx_open
+   cd /home/dogrobot/robot
    script/robot/start_navigation_real.sh start
    script/robot/start_navigation_real.sh status
    ```
@@ -579,6 +579,6 @@ Before any platform goal test:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/robot/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" -r 10
 ```

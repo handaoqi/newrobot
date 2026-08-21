@@ -13,7 +13,13 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_definitions(-DROOT_DIR="$ENV{HOME}/.jszr")
+set(ROAMERX_DATA_ROOT "$ENV{ROAMERX_DATA_ROOT}" CACHE PATH
+    "Runtime directory containing RoamerX maps and device data")
+if(ROAMERX_DATA_ROOT STREQUAL "")
+  set(ROAMERX_DATA_ROOT "$ENV{HOME}/.jszr")
+endif()
+add_definitions(-DROOT_DIR="${ROAMERX_DATA_ROOT}")
+message(STATUS "RoamerX runtime data root: ${ROAMERX_DATA_ROOT}")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
   include(ProcessorCount)

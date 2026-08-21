@@ -14,7 +14,7 @@ ACC_COV=${5:-1.0}
 GYR_COV=${6:-0.2}
 SAVE_RESULT=${7:-0}
 ROS_DOMAIN_ID=${REPLAY_ROS_DOMAIN_ID:-77}
-WORKSPACE=${ROAMERX_WORKSPACE:-/home/robot/genisom_roamerx_open}
+WORKSPACE=${ROAMERX_WORKSPACE:-/home/dogrobot/robot}
 PARAMS_FILE="$WORKSPACE/install/robot_slam/share/robot_slam/config/config.yaml"
 MAPPING_BIN="$WORKSPACE/install/robot_slam/lib/robot_slam/mapping"
 

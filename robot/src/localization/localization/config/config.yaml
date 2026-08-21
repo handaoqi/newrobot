@@ -7,13 +7,10 @@ localization:
     localization_odom_frame_id: "base_link"
     robot_odom_frame_id: "odom"
     odom_child_frame_id: "base_link"
+    # The controller odometry is deliberately excluded from the localization
+    # and Nav2 pose chain.  Mid360 point matching plus its built-in IMU is the
+    # authoritative odometry source for /odom/localization_odom and /odom/nav2.
     robot_odom_topic: "/odom/mc_odom"
-    # Use the robot's high-rate odometry delta as the NDT initial guess. This
-    # keeps scan matching aligned during in-place turns where IMU-only UKF
-    # prediction can be pulled into a stale NDT local optimum.
-    # The controller odometry uses device-uptime timestamps and its yaw drifts
-    # against lidar SLAM. Keep it recorded for diagnostics, but do not seed NDT
-    # until that clock/frame contract has been calibrated.
     enable_robot_odometry_prediction: false
     # Scan-to-scan FastGICP provides an independent short-term LiDAR motion
     # prior to NDT. It has passed the recorded-bag A/B validation and never
@@ -28,7 +25,10 @@ localization:
       max_rotation_per_scan_rad: 0.70
       min_points: 200
       num_threads: 2
-    send_tf_transforms: true
+    # navigation_bringup's odom_to_tf_broadcaster is the sole owner of
+    # map->odom and odom->base_link.  It converts /odom/localization_odom to
+    # /odom/nav2, so do not also publish a controller-odometry TF chain here.
+    send_tf_transforms: false
     tf_use_current_time: true
     # Keep map->odom available slightly ahead of Nav2 controller requests.
     tf_future_offset: 0.25

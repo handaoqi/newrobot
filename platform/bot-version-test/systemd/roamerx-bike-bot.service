@@ -1,0 +1,23 @@
+[Unit]
+Description=RoamerX GPU Vision Edge Client
+After=network-online.target roamerx-edge-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+WorkingDirectory=/home/dogrobot/platform/bot-version-test
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/dogrobot/platform/bot-version-test/src
+Environment=BIKE_BOT_DEVICE_ID=ZSL-1A-07
+ExecStart=/usr/bin/python3 /home/dogrobot/platform/bot-version-test/run_edge.py --config /home/robot/.config/roamerx/bike-bot.yaml
+Restart=always
+RestartSec=5
+IOSchedulingPriority=7
+IOSchedulingClass=best-effort
+CPUQuota=200%
+Nice=0
+
+[Install]
+WantedBy=multi-user.target

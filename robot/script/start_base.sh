@@ -1,6 +1,6 @@
 #!/bin/bash
 # 启动机器人基础服务（雷达 + zenoh + 点云转激光）
-# 用法: bash /home/robot/genisom_roamerx_open/script/start_base.sh
+# 用法: bash /home/dogrobot/robot/script/start_base.sh
 
 set -e
 export ROS_DOMAIN_ID=24

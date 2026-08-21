@@ -4,6 +4,12 @@ set -e
 
 source /opt/ros/humble/setup.bash
 
+# Source/build ownership is independent from robot runtime data ownership.
+export ROAMERX_DATA_ROOT="${ROAMERX_DATA_ROOT:-/home/robot/.jszr}"
+BUILD_WORKERS="${ROAMERX_BUILD_WORKERS:-1}"
+BUILD_JOBS="${ROAMERX_BUILD_JOBS:-2}"
+export MAKEFLAGS="${MAKEFLAGS:--j${BUILD_JOBS}}"
+
 usage() {
   echo "Usage: $0 [clean] all [debug]"
   echo "./build.sh all             [build all project packages]"
@@ -76,7 +82,7 @@ all)
     fast_gicp \
     ndt_omp \
     localization \
-    robot_navigo  --parallel-workers 8
+    robot_navigo  --parallel-workers "${BUILD_WORKERS}"
   echo "[zsibot shell log] => "
   echo "[zsibot shell log] => OK"
   ;;

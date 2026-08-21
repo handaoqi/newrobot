@@ -6,9 +6,8 @@ Project rules for RoamerX robot and cloud-platform work. Read this before making
 
 - Canonical local development checkout: `/home/dogrobot` (preserve the repository's
   top-level layout: `robot/`, `edge-agent/`, `dev-agent/`, `platform/`, etc.).
-- Deployed NX ROS workspace: `/home/robot/genisom_roamerx_open`. This remains
-  the live runtime path used by current services; do not move or delete it
-  while developing from `/home/dogrobot`.
+- Deployed NX ROS workspace: `/home/dogrobot/robot`. Source, build output, and
+  systemd runtime code all use this canonical Git checkout.
 - ROS: Humble
 - Real robot platform: `NX_XG3588`
 - Robot code: `ZSL-1A-07`
@@ -20,7 +19,7 @@ codex --dangerously-bypass-approvals-and-sandbox
 
 ## Hard Rules
 
-- Do not use or recreate `/home/robot/genisom_roamerx_open/web_platform`; it was a stale local demo and has been removed.
+- Do not use or recreate a robot-side `web_platform`; it was a stale local demo and has been removed.
 - The real platform is the cloud server at `39.107.250.69`.
 - Do not store passwords or secrets in repo files. SSH key login to the cloud server from this robot computer is already configured.
 - Do not trigger physical motion unless explicitly requested and the path is confirmed clear.
@@ -39,7 +38,7 @@ codex --dangerously-bypass-approvals-and-sandbox
 Canonical navigation commands:
 
 ```bash
-cd /home/robot/genisom_roamerx_open
+cd /home/dogrobot/robot
 script/robot/start_navigation_real.sh start
 script/robot/start_navigation_real.sh status
 script/robot/start_navigation_real.sh stop
@@ -164,7 +163,7 @@ mosquitto
 Local copy of current platform code:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code
+/home/dogrobot/platform
 ```
 
 Important platform files:
@@ -207,9 +206,9 @@ Dog-side edge agent:
 
 ```text
 systemd service: roamerx-edge-agent.service
-working dir: /home/robot/edge_agent
+working dir: /home/dogrobot/edge-agent
 runtime config: /home/robot/edge_agent/config.yaml
-repo source: /home/robot/genisom_roamerx_open/edge_agent
+repo source: /home/dogrobot/edge-agent
 ```
 
 MQTT topics:
@@ -231,7 +230,7 @@ Emergency local stop command:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/robot/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" -r 10
 ```
 
@@ -242,9 +241,9 @@ the installed AnyIO pytest plugin. Run Python tests normally; do not disable
 plugin autoload:
 
 ```bash
-cd /home/robot/genisom_roamerx_open/dev_agent
+cd /home/dogrobot/dev-agent
 python3 -m pytest -q
 
-cd /home/robot/genisom_roamerx_open/edge_agent
+cd /home/dogrobot/edge-agent
 python3 -m pytest -q
 ```

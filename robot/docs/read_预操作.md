@@ -3,7 +3,7 @@
   先在机器人电脑新开一个终端，执行：
 
   source /opt/ros/humble/setup.bash
-  source /home/robot/genisom_roamerx_open/install/setup.bash
+  source /home/dogrobot/robot/install/setup.bash
 
   export ROS_DOMAIN_ID=24
   export RMW_IMPLEMENTATION=rmw_zenoh_cpp
@@ -13,7 +13,7 @@
     address:=192.168.234.234
 
   source /opt/ros/humble/setup.bash
-  source /home/robot/genisom_roamerx_open/install/setup.bash
+  source /home/dogrobot/robot/install/setup.bash
 
   export ROS_DOMAIN_ID=24
   export RMW_IMPLEMENTATION=rmw_zenoh_cpp
@@ -36,7 +36,7 @@
   排查“定位丢失”时，足够且推荐录这 11 个：
 
   source /opt/ros/humble/setup.bash
-  source /home/robot/genisom_roamerx_open/install/setup.bash
+  source /home/dogrobot/robot/install/setup.bash
 
   ros2 bag record -s mcap -o /home/robot/data/patrol_data \
     /front_lidar \
