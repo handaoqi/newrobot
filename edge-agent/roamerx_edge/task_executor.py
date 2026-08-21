@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from math import hypot, isfinite
+from math import atan2, cos, hypot, isfinite, sin
 from typing import Callable, Protocol
 
 from .local_store import LocalStore
@@ -25,6 +25,7 @@ class NavigationAdapter(Protocol):
     def latest_trusted_pose(self): ...
     def set_localization_policy(self, source: str, phase: str) -> dict: ...
     def localization_decision(self) -> dict: ...
+    def set_goal_precision(self, *, enabled: bool) -> None: ...
 
 
 @dataclass
@@ -51,6 +52,8 @@ class TaskExecutor:
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
         final_waypoint_tolerance_m: float = 0.35,
+        docking_goal_tolerance_m: float = 0.08,
+        docking_goal_yaw_tolerance_rad: float = 0.0872665,
         standup_confirmation_timeout_seconds: float = 12.0,
         map_set_coordinator=None,
         obstacle_speech=None,
@@ -62,6 +65,8 @@ class TaskExecutor:
         self.event_callback = event_callback
         self.start_result_callback = start_result_callback
         self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
+        self.docking_goal_tolerance_m = docking_goal_tolerance_m
+        self.docking_goal_yaw_tolerance_rad = docking_goal_yaw_tolerance_rad
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
         self.map_set_coordinator = map_set_coordinator
         self.obstacle_speech = obstacle_speech
@@ -354,12 +359,27 @@ class TaskExecutor:
         """Persist an accepted task before its command acknowledgement is sent."""
         with self._lock:
             command = envelope.payload["command"]
-            route = command["route_snapshot"]
+            route = dict(command["route_snapshot"])
+            route["waypoints"] = [dict(waypoint) for waypoint in route.get("waypoints") or []]
             docking = dict(command.get("docking") or {})
             # Docking is deliberately ordered: waypoint 0 establishes the
             # safe approach line and must never be skipped by nearest-point
             # task startup behavior.
             initial_waypoint_index = 0 if docking.get("enabled") else self._nearest_waypoint_index(route)
+            reverse_return = bool(
+                command.get("loop_execution")
+                and not docking.get("enabled")
+                and len(route["waypoints"]) > 1
+                and initial_waypoint_index == len(route["waypoints"]) - 1
+            )
+            if reverse_return:
+                route["waypoints"].reverse()
+                for sequence, waypoint in enumerate(route["waypoints"]):
+                    waypoint.setdefault("map_point_number", int(waypoint.get("sequence", 0)) + 1)
+                    waypoint["sequence"] = sequence
+                route["execution_order"] = "reverse_from_route_end"
+                route["initial_map_point_number"] = route["waypoints"][0].get("map_point_number")
+                initial_waypoint_index = 0
             self.context = TaskContext(
                 task_execution_id=envelope.payload["task_execution_id"],
                 state="accepted",
@@ -374,12 +394,18 @@ class TaskExecutor:
                 docking=docking,
             )
             self._persist()
-            LOGGER.info(
-                "task %s starts from nearest waypoint %d; %d earlier waypoints are complete",
-                self.context.task_execution_id,
-                initial_waypoint_index,
-                initial_waypoint_index,
-            )
+            if reverse_return:
+                LOGGER.info(
+                    "loop task %s starts at route end and returns through waypoints in reverse order",
+                    self.context.task_execution_id,
+                )
+            else:
+                LOGGER.info(
+                    "task %s starts from nearest waypoint %d; %d earlier waypoints are complete",
+                    self.context.task_execution_id,
+                    initial_waypoint_index,
+                    initial_waypoint_index,
+                )
 
     def _nearest_waypoint_index(self, route: dict) -> int:
         waypoints = route.get("waypoints") or []
@@ -460,9 +486,13 @@ class TaskExecutor:
             extra={
                 "initial_waypoint_index": goal_start_index,
                 "skipped_waypoints": goal_start_index,
+                "execution_waypoint_order": [
+                    point.get("map_point_number", int(point.get("sequence", 0)) + 1)
+                    for point in self.context.route_snapshot["waypoints"][goal_start_index:]
+                ],
             },
         )
-        self.on_feedback(0)
+        self.on_feedback(0, milestone="target_dispatched")
         if self._segment_avoidance_enabled:
             self._start_obstacle_monitor()
 
@@ -488,9 +518,13 @@ class TaskExecutor:
             extra={
                 "initial_waypoint_index": index,
                 "skipped_waypoints": index,
+                "execution_waypoint_order": [
+                    point.get("map_point_number", int(point.get("sequence", 0)) + 1)
+                    for point in self.context.route_snapshot["waypoints"][index:]
+                ],
             },
         )
-        self.on_feedback(0)
+        self.on_feedback(0, milestone="target_dispatched")
         if self._segment_avoidance_enabled:
             self._start_obstacle_monitor()
 
@@ -592,10 +626,17 @@ class TaskExecutor:
         with self._lock:
             self._stop_obstacle_monitor()
             self._stop_task_rosbag()
-            self._restore_navigation_profile()
             context = self.context
             if context:
-                self.navigation.cancel_navigation()
+                cancelled = self.navigation.cancel_navigation(timeout_seconds=8.0)
+                if not cancelled:
+                    LOGGER.error("force-exit could not confirm Nav2 goal cancellation")
+            # Stop command delivery before any potentially slow parameter
+            # restoration.  This prevents a force-exit from leaving Nav2
+            # velocity active while collision-monitor services are busy.
+            self.navigation.stop_motion()
+            self._restore_navigation_profile()
+            if context:
                 context.state = "cancelled"
                 context.state_version += 1
                 self._persist()
@@ -631,7 +672,14 @@ class TaskExecutor:
                 "robot_stopped": True,
             }
 
-    def on_feedback(self, current_waypoint_index: int, distance_remaining_m: float | None = None) -> None:
+    def on_feedback(
+        self,
+        current_waypoint_index: int,
+        distance_remaining_m: float | None = None,
+        *,
+        milestone: str = "",
+        completed_waypoints: int | None = None,
+    ) -> None:
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
@@ -640,6 +688,16 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             total = len(self.context.route_snapshot["waypoints"])
+            waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index] if current_waypoint_index < total else None
+            pose = self.navigation.latest_pose()
+            robot_pose = None
+            if pose is not None:
+                robot_pose = {
+                    "x": float(pose.x),
+                    "y": float(pose.y),
+                    "yaw": float(getattr(pose, "yaw", 0.0)),
+                    "sampled_at": getattr(pose, "sampled_at", None),
+                }
             self.event_callback(
                 "task.progress",
                 {
@@ -647,14 +705,26 @@ class TaskExecutor:
                     "state": "running",
                     "state_version": self.context.state_version,
                     "current_waypoint_index": current_waypoint_index,
-                    "current_waypoint_id": self.context.route_snapshot["waypoints"][current_waypoint_index]["waypoint_id"]
-                    if current_waypoint_index < total
-                    else "",
-                    "completed_waypoints": current_waypoint_index,
+                    "current_waypoint_id": waypoint["waypoint_id"] if waypoint else "",
+                    "completed_waypoints": current_waypoint_index if completed_waypoints is None else completed_waypoints,
                     "total_waypoints": total,
                     "distance_remaining_m": distance_remaining_m,
                     "estimated_time_remaining_s": None,
                     "reported_at": now_iso(),
+                    "milestone": milestone or None,
+                    "execution_waypoint_order": [
+                        point.get("map_point_number", int(point.get("sequence", 0)) + 1)
+                        for point in self.context.route_snapshot["waypoints"]
+                    ],
+                    "waypoint": {
+                        "waypoint_id": waypoint.get("waypoint_id"),
+                        "map_point_number": waypoint.get("map_point_number", int(waypoint.get("sequence", 0)) + 1),
+                        "name": waypoint.get("name") or "",
+                        "x": float(waypoint["x"]),
+                        "y": float(waypoint["y"]),
+                        "yaw": float(waypoint["yaw"]),
+                    } if waypoint else None,
+                    "robot_pose": robot_pose,
                 },
                 "",
             )
@@ -691,6 +761,13 @@ class TaskExecutor:
                     )
                     return
 
+                self.on_feedback(
+                    0,
+                    0.0,
+                    milestone="waypoint_reached",
+                    completed_waypoints=reached_index + 1,
+                )
+
                 next_waypoint_index = reached_index + 1
                 self.context.current_waypoint_index = next_waypoint_index
                 self.context.state_version += 1
@@ -712,20 +789,17 @@ class TaskExecutor:
                             return
                     self._send_from(next_waypoint_index)
                     return
-                if self._is_docking_task():
-                    self._restore_navigation_profile()
-                    if callable(self.docking_arrived_handler):
-                        try:
-                            self.docking_arrived_handler(dict(self.context.docking or {}))
-                        except Exception as exc:
-                            self._fail("DOCK_CHARGE_START_FAILED", str(exc))
-                            return
-                else:
-                    self._restore_navigation_profile()
+                self._restore_navigation_profile()
                 pose_error = self._final_pose_error()
                 if pose_error:
                     self._fail(*pose_error)
                     return
+                if self._is_docking_task() and callable(self.docking_arrived_handler):
+                    try:
+                        self.docking_arrived_handler(dict(self.context.docking or {}))
+                    except Exception as exc:
+                        self._fail("DOCK_CHARGE_START_FAILED", str(exc))
+                        return
                 self._stop_task_rosbag()
                 self._navigation_prepared = False
                 self.context.state = "completed"
@@ -784,14 +858,22 @@ class TaskExecutor:
         # for all later legs, the source point controls its "to next" leg.
         profile_waypoint = source if source is not None else target
         avoid_obstacles = bool(profile_waypoint.get("avoidance_to_next", True))
+        precision_goal = False
         if self._is_docking_task():
             final_index = int((self.context.docking or {}).get("final_waypoint_index", 1))
             if waypoint_index >= final_index:
                 avoid_obstacles = False
+            precision_goal = waypoint_index == final_index
         self._segment_avoidance_enabled = avoid_obstacles
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if callable(setter):
-            setter(avoid_obstacles=avoid_obstacles, require_yaw=bool(target.get("require_yaw", False)))
+            setter(
+                avoid_obstacles=avoid_obstacles,
+                require_yaw=bool(target.get("require_yaw", False)) or precision_goal,
+            )
+        precision_setter = getattr(self.navigation, "set_goal_precision", None)
+        if callable(precision_setter):
+            precision_setter(enabled=precision_goal)
         self._apply_docking_profile(waypoint_index)
         if not avoid_obstacles:
             self._stop_obstacle_monitor()
@@ -807,6 +889,9 @@ class TaskExecutor:
             setter = getattr(self.navigation, "set_waypoint_profile", None)
             if callable(setter):
                 setter(avoid_obstacles=True, require_yaw=False)
+            precision_setter = getattr(self.navigation, "set_goal_precision", None)
+            if callable(precision_setter):
+                precision_setter(enabled=False)
             self._restore_docking_profile()
         except Exception:
             LOGGER.exception("failed to restore default navigation profile")
@@ -866,14 +951,37 @@ class TaskExecutor:
             return ("FINAL_POSE_UNAVAILABLE", "latest robot pose is unavailable")
         final_waypoint = waypoints[-1]
         distance = hypot(float(pose.x) - float(final_waypoint["x"]), float(pose.y) - float(final_waypoint["y"]))
-        if distance > self.final_waypoint_tolerance_m:
+        tolerance = (
+            self.docking_goal_tolerance_m
+            if self._is_docking_task()
+            else self.final_waypoint_tolerance_m
+        )
+        if distance > tolerance:
             return (
                 "FINAL_POSE_OUT_OF_TOLERANCE",
                 (
                     f"final pose is {distance:.2f}m from last waypoint "
-                    f"(tolerance {self.final_waypoint_tolerance_m:.2f}m)"
+                    f"(tolerance {tolerance:.2f}m)"
                 ),
             )
+        if self._is_docking_task():
+            try:
+                yaw_error = abs(
+                    atan2(
+                        sin(float(pose.yaw) - float(final_waypoint["yaw"])),
+                        cos(float(pose.yaw) - float(final_waypoint["yaw"])),
+                    )
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return ("FINAL_YAW_UNAVAILABLE", "final docking heading is unavailable")
+            if yaw_error > self.docking_goal_yaw_tolerance_rad:
+                return (
+                    "FINAL_YAW_OUT_OF_TOLERANCE",
+                    (
+                        f"final heading is {yaw_error:.3f}rad from docking heading "
+                        f"(tolerance {self.docking_goal_yaw_tolerance_rad:.3f}rad)"
+                    ),
+                )
         return None
 
     def _fail(self, code: str, message: str) -> None:

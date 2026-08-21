@@ -216,8 +216,14 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   registration->align(*aligned, init_guess);
   double ndt_score = registration->getFitnessScore();
 
-  if (ndt_score > 0.5) {
-    RCLCPP_INFO(rclcpp::get_logger("PoseEstimator"), "ndt_score > 0.5, ndt_score: %f", ndt_score);
+  // Keep this acceptance gate aligned with the configured NDT fitness limit.
+  // The node-level health policy accepts scores below 9.0, but this former
+  // hard-coded 0.5 check silently discarded the aligned cloud first, making
+  // that policy unreachable during initialisation or relocalisation.
+  constexpr double kNdtMaxFitnessScore = 9.0;
+  if (ndt_score > kNdtMaxFitnessScore) {
+    RCLCPP_INFO(rclcpp::get_logger("PoseEstimator"), "ndt_score > %.1f, ndt_score: %f",
+                kNdtMaxFitnessScore, ndt_score);
   }
 
   Eigen::Matrix4f trans = registration->getFinalTransformation();
@@ -227,7 +233,7 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   const float correction_distance = correction.block<3, 1>(0, 3).norm();
   const bool transform_valid = trans.allFinite() && std::isfinite(correction_distance);
   const bool match_valid = registration->hasConverged() && std::isfinite(ndt_score) &&
-                           ndt_score < 0.5 && transform_valid && correction_distance < 5.0f;
+                           ndt_score < kNdtMaxFitnessScore && transform_valid && correction_distance < 5.0f;
   match_result_.is_converged_ = match_valid;
 
   if (!match_valid) {

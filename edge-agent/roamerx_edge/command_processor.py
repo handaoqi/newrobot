@@ -112,6 +112,15 @@ class CommandProcessor:
                 self.publish_ack(command_id, ack)
                 return ack, None
             # Once accepted, failures must be reported as a command result.
+            # A task.start is acknowledged before launch so the platform sees a
+            # strictly ordered lifecycle.  If launch then fails (for example,
+            # Nav2's costmap nodes are still appearing), do not retain the
+            # accepted context: it would reject every later task as ROBOT_BUSY.
+            if prepared_task_start:
+                try:
+                    self.task_executor.force_exit(envelope.payload["task_execution_id"])
+                except Exception:
+                    LOGGER.exception("failed to clear task after launch error")
             result = build_result(
                 envelope,
                 status="failed",
@@ -159,6 +168,12 @@ class CommandProcessor:
             map_payload["local_map_dir"] = map_payload["local_map_dir"]
         activated = self.map_activation_adapter.activate(map_payload)
         self.navigation_stack_adapter.switch_map()
+        navigation = self.task_executor.navigation
+        if not navigation.wait_until_ready(timeout_seconds=45):
+            raise ProtocolError(
+                "NAV_STACK_NOT_READY",
+                "Nav2 did not become active after switching the docking map",
+            )
         LOGGER.info("docking map activated: %s", activated.get("map_id"))
 
     def _validate_expected_state(self, envelope: MessageEnvelope) -> None:
@@ -289,16 +304,26 @@ class CommandProcessor:
         teleop_adapter = self.localization_adapter
         if not teleop_adapter:
             raise ProtocolError("TELEOP_UNAVAILABLE", "teleop adapter is not configured")
+        command = envelope.payload.get("command") or {}
         action = envelope.message_type.removeprefix("teleop.")
         bridge_status = None
-        if self.teleop_control_adapter and action not in {
-            "person_follow_status", "person_follow_stop", "skill_list", "skill_status", "skill_cancel",
-        }:
-            bridge_status = self.teleop_control_adapter.ensure_ready()
-        command = envelope.payload.get("command") or {}
+        bridge_free_actions = {
+            "person_follow_status", "person_follow_stop",
+            "skill_list", "skill_status", "skill_cancel",
+        }
+        if self.teleop_control_adapter and action not in bridge_free_actions:
+            velocity_actions = {
+                "move_forward", "move_backward", "move_left", "move_right",
+                "turn_left", "turn_right", "move_velocity", "move_stop",
+            }
+            bridge_status = (
+                self.teleop_control_adapter.recent_ready_status()
+                if action in velocity_actions
+                else self.teleop_control_adapter.ensure_ready()
+            )
         if self.person_follow_controller and action in {
-            "takeover_enter", "takeover_exit", "move_forward", "move_backward", "move_left", "move_right",
-            "turn_left", "turn_right", "move_velocity", "skill",
+            "takeover_enter", "takeover_exit", "move_forward", "move_backward",
+            "move_left", "move_right", "turn_left", "turn_right", "move_velocity", "skill",
         }:
             self.person_follow_controller.stop("manual_teleop_override")
         if action == "takeover_enter":

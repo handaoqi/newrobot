@@ -120,6 +120,17 @@ export async function sendRecordedAudioCommand(robotId, file, { title = '现场�
   })
 }
 
+export async function setRobotStreamAudioCapture(robotId, enabled) {
+  return request(`/robots/${robotId}/commands/stream-audio/`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export async function fetchRobotStreamAudioCommand(robotId, commandId) {
+  return request(`/robots/${robotId}/commands/stream-audio/${commandId}/`)
+}
+
 export async function fetchRecordedAudios() {
   return request('/recorded-audio/')
 }
@@ -212,10 +223,10 @@ export async function deletePatrolTask(taskId, { force = false } = {}) {
   return request(`/patrol-tasks/${taskId}/${force ? '?force=true' : ''}`, { method: 'DELETE' })
 }
 
-export async function executePatrolTask(taskId, { recordRosbag = false } = {}) {
+export async function executePatrolTask(taskId, { recordRosbag = false, loopExecution = false } = {}) {
   return request(`/patrol-tasks/${taskId}/execute/`, {
     method: 'POST',
-    body: JSON.stringify({ record_rosbag: recordRosbag }),
+    body: JSON.stringify({ record_rosbag: recordRosbag, loop_execution: loopExecution }),
   })
 }
 
@@ -536,7 +547,13 @@ export async function fetchDevelopmentAgents() {
 }
 
 export async function fetchVoiceRecognitions(robotId, limit = 80) {
-  return request(`/development/voice-recognitions/?robot=${encodeURIComponent(robotId)}&limit=${limit}`)
+  const query = new URLSearchParams({
+    robot: String(robotId),
+    limit: String(limit),
+    include_no_speech: 'true',
+    _: String(Date.now()),
+  })
+  return request(`/development/voice-recognitions/?${query.toString()}`, { cache: 'no-store' })
 }
 
 export async function fetchDevelopmentTasks(robotId = '') {
@@ -546,6 +563,17 @@ export async function fetchDevelopmentTasks(robotId = '') {
 
 export async function fetchDevelopmentConversation(robotId) {
   return request(`/development/conversations/main/?robot=${encodeURIComponent(robotId)}`)
+}
+
+export async function fetchDevelopmentConversationMode(robotId) {
+  return request(`/development/conversations/main/mode/?robot=${encodeURIComponent(robotId)}`)
+}
+
+export async function setDevelopmentConversationMode(payload) {
+  return request('/development/conversations/main/mode/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }
 
 export async function fetchDevelopmentTask(taskId) {

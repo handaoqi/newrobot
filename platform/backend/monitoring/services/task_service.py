@@ -44,6 +44,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             yaw = raw.get("yaw", 0.0)
             name = raw.get("name") or (names[index] if index < len(names) else f"航点 {index + 1}")
             waypoint_id = str(raw.get("waypoint_id") or f"wp-{index + 1}")
+            map_point_number = int(raw.get("map_point_number") or index + 1)
             dwell_seconds = int(raw.get("dwell_seconds", 0))
             actions = list(raw.get("actions") or [])
             speech_template_id = raw.get("speech_template_id")
@@ -57,6 +58,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             yaw = raw[2] if len(raw) >= 3 else 0.0
             name = names[index] if index < len(names) else f"航点 {index + 1}"
             waypoint_id = f"wp-{index + 1}"
+            map_point_number = index + 1
             dwell_seconds = 0
             actions = []
             speech_template_id = None
@@ -70,6 +72,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
         waypoint = {
                 "waypoint_id": waypoint_id,
                 "sequence": index,
+                "map_point_number": map_point_number,
                 "name": name,
                 "x": float(x),
                 "y": float(y),

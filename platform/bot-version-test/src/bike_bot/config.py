@@ -42,11 +42,22 @@ class StreamConfig:
     reconnect_interval_seconds: int = 5
     video_codec: str = "copy"
     audio_enabled: bool = False
+    # Audio capture is available to operators, but the live stream always
+    # starts video-only until an explicit field-listening command arrives.
+    audio_start_enabled: bool = False
     audio_mode: str = "input"
     audio_source: str = "@DEFAULT_SOURCE@"
+    # ALSA PCM device used when audio_mode is local_alsa.  Keep the default
+    # direct so existing installations retain their current behaviour; the
+    # test deployment explicitly uses the shared dsnoop device.
+    audio_device: str = "default"
     audio_sample_rate: int = 48000
     audio_channels: int = 1
     audio_bitrate: str = "64k"
+    audio_capture_card: int = 2
+    audio_capture_control: str = "Mic"
+    audio_capture_volume: str = "100%"
+    audio_control_state_path: str = "data/stream-audio-state"
     extra_args: list[str] | None = None
 
 
@@ -75,6 +86,7 @@ class DetectionConfig:
     event_classes: list[str] | None = None
     person_detection_enabled: bool = False
     person_report_interval_seconds: float = 0.4
+    person_track_hold_seconds: float = 0.75
 
 
 @dataclass
@@ -82,6 +94,7 @@ class TelemetryConfig:
     endpoint: str
     media_upload_endpoint: str = ""
     person_detection_endpoint: str = ""
+    local_person_detection_path: str = "/run/roamerx/person_detections.json"
     timeout_seconds: int = 5
     verify_tls: bool = False
     device_key: str = ""
@@ -93,6 +106,7 @@ class TelemetryConfig:
 
 @dataclass
 class AudioPlaybackConfig:
+    enabled: bool = False
     remote_host: str = ""
     remote_port: int = 22
     remote_user: str = ""

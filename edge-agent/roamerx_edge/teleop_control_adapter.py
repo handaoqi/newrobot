@@ -39,6 +39,18 @@ class TeleopControlAdapter:
             self._last_ready_payload = payload
             return payload
 
+    def recent_ready_status(self) -> dict:
+        """Return cached state without blocking a held velocity packet.
+
+        The bridge is a resident systemd service.  A 150 ms held control stream
+        must not serialize behind a subprocess health check, especially the
+        release/stop packet.
+        """
+        payload = self._last_ready_payload
+        if payload is not None:
+            return {**payload, "cached": True}
+        return {"action": "readiness_deferred", "cached": False}
+
     def status(self) -> dict:
         return self._systemctl("status", timeout_seconds=min(self.config.command_timeout_seconds, 10))
 

@@ -45,12 +45,12 @@ voice:
   # End the capture after 750 ms of silence. SenseVoice applies its own VAD
   # again during transcription, so this lowers acknowledgement latency.
   silence_chunks: 3
-  # NX-local Fun-ASR-Nano uses the Orin GPU. A cloud ASR fallback keeps
+  # NX-local SenseVoice uses the Orin GPU. A cloud ASR fallback keeps
   # voice commands available during local model restart, but never replaces a
   # successful local (including empty/non-speech) result.
   local_asr_enabled: true
   local_asr_url: http://127.0.0.1:18080/v1/audio/transcriptions
-  # The local funasr-server loads Fun-ASR-Nano from an explicit local model
+  # The local funasr-server loads SenseVoice from an explicit local model
   # path, for which its OpenAI-compatible endpoint uses the `custom` selector.
   local_asr_model: custom
   # Keep the microphone array intact through capture/VAD, then choose the

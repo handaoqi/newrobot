@@ -1,9 +1,8 @@
 <script setup>
-import Hls from 'hls.js'
-import mpegts from 'mpegts.js'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
+import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
 import {
   fetchRobotDetail,
@@ -25,15 +24,12 @@ const streamUnavailable = ref(false)
 const activeHoldAction = ref('')
 const speedMode = ref('medium')
 const commandFeedback = ref('')
-const videoRef = ref(null)
 const personDetectionState = ref({ detections: [] })
 const selectedPersonTrackId = ref('')
 const followActive = ref(false)
 const followStatus = ref('等待选择人员')
 const personDetectionChanging = ref(false)
 
-let flvPlayer = null
-let hlsPlayer = null
 let statusTimer = null
 let personDetectionTimer = null
 let followTimer = null
@@ -45,6 +41,7 @@ let holdPointerId = null
 let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
+let statusRefreshing = false
 
 const HOLD_REPEAT_MS = 150
 const SPEED_MODES = [
@@ -85,6 +82,10 @@ const personDetections = computed(() => (personDetectionState.value?.detections 
 ))
 const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
 const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
+
+function showVideoNotice({ message, variant }) {
+  showToast(message, variant ? { variant } : undefined)
+}
 
 const motionActions = computed(() => [
   { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.60) } },
@@ -233,7 +234,7 @@ async function togglePersonDetection() {
     await setRobotPersonDetection(selectedRobot.value.id, enabled)
     selectedPersonTrackId.value = ''
     personDetectionState.value = { ...personDetectionState.value, enabled, detections: [] }
-    followStatus.value = enabled ? '人员模型启动中，请选择识别框' : '人员识别已关闭'
+    followStatus.value = enabled ? '人员识别已开启，等待首个有效检测框' : '人员识别已关闭'
     showToast(enabled ? '人员跟踪识别已开启' : '人员跟踪识别已关闭')
   } catch (error) {
     showToast(error.message || '人员识别状态切换失败')
@@ -445,7 +446,6 @@ async function chooseRobot(robotId) {
     streamUnavailable.value = false
     await refreshStatus()
     await refreshPersonDetections()
-    if (!loading.value) setupLivePlayer()
   } catch (error) {
     showToast(error.message || '切换设备失败')
   } finally {
@@ -454,84 +454,17 @@ async function chooseRobot(robotId) {
 }
 
 async function refreshStatus() {
-  if (!selectedRobot.value?.id) return
+  if (!selectedRobot.value?.id || statusRefreshing) return
+  statusRefreshing = true
   try {
     liveStatus.value = await fetchRobotStatus(selectedRobot.value.id)
-  } catch {}
+  } catch {} finally {
+    statusRefreshing = false
+  }
 }
 
 function fallbackToSnapshot() {
   streamUnavailable.value = true
-  destroyVideoPlayers()
-}
-
-async function canReachStream(url) {
-  if (!url) return false
-  const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), 1800)
-  try {
-    await fetch(url, { method: 'GET', mode: 'no-cors', cache: 'no-store', signal: controller.signal })
-    return true
-  } catch {
-    return false
-  } finally {
-    window.clearTimeout(timeout)
-  }
-}
-
-function destroyVideoPlayers() {
-  if (flvPlayer) {
-    flvPlayer.destroy()
-    flvPlayer = null
-  }
-  if (hlsPlayer) {
-    hlsPlayer.destroy()
-    hlsPlayer = null
-  }
-  if (videoRef.value) {
-    videoRef.value.removeAttribute('src')
-    videoRef.value.load()
-  }
-}
-
-async function setupLivePlayer() {
-  await nextTick()
-  destroyVideoPlayers()
-  const element = videoRef.value
-  if (!element || !hasLiveStream.value) return
-  const { flv, hls } = livePlayUrls.value
-  const playableFlv = flv && mpegts.getFeatureList().mseLivePlayback && (await canReachStream(flv))
-  const playableHls = hls && (await canReachStream(hls))
-  if (!playableFlv && !playableHls) {
-    fallbackToSnapshot()
-    return
-  }
-
-  element.addEventListener('error', fallbackToSnapshot, { once: true })
-  if (playableFlv) {
-    flvPlayer = mpegts.createPlayer({ type: 'flv', isLive: true, url: flv })
-    flvPlayer.on(mpegts.Events.ERROR, fallbackToSnapshot)
-    flvPlayer.attachMediaElement(element)
-    flvPlayer.load()
-    flvPlayer.play().catch(fallbackToSnapshot)
-    return
-  }
-
-  if (playableHls && Hls.isSupported()) {
-    hlsPlayer = new Hls({ lowLatencyMode: true })
-    hlsPlayer.loadSource(hls)
-    hlsPlayer.attachMedia(element)
-    hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
-      if (data?.fatal) fallbackToSnapshot()
-    })
-    hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => element.play().catch(fallbackToSnapshot))
-    return
-  }
-
-  if (playableHls) {
-    element.src = hls
-    element.play().catch(fallbackToSnapshot)
-  }
 }
 
 function handleKeyDown(event) {
@@ -570,12 +503,11 @@ onMounted(async () => {
   try {
     robots.value = await fetchRobots()
     if (robots.value[0]?.id) await chooseRobot(robots.value[0].id)
-    statusTimer = window.setInterval(refreshStatus, 2000)
+    statusTimer = window.setInterval(refreshStatus, 1000)
     personDetectionTimer = window.setInterval(refreshPersonDetections, 350)
   } finally {
     loading.value = false
   }
-  setupLivePlayer()
 })
 
 onBeforeUnmount(async () => {
@@ -589,16 +521,11 @@ onBeforeUnmount(async () => {
   window.clearInterval(statusTimer)
   window.clearInterval(personDetectionTimer)
   await stopFollowing('页面关闭，跟随已停止')
-  if (personDetectionEnabled.value && selectedRobot.value?.id) {
-    await setRobotPersonDetection(selectedRobot.value.id, false).catch(() => {})
-  }
   await stopHoldAction()
-  destroyVideoPlayers()
 })
 
 watch(livePlayUrls, () => {
   streamUnavailable.value = false
-  setupLivePlayer()
 })
 </script>
 
@@ -617,39 +544,43 @@ watch(livePlayUrls, () => {
         </div>
 
         <div class="remote-video-stage">
-          <video
-            v-if="hasLiveStream"
-            ref="videoRef"
-            class="remote-video-source"
-            muted
-            playsinline
-            autoplay
-          ></video>
-          <div v-else class="remote-video-source remote-no-signal">
-            <strong>无视频流</strong>
-            <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
-          </div>
-          <button
-            v-for="person in personDetections"
-            :key="person.track_id"
-            type="button"
-            class="person-detection-box"
-            :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
-            :style="detectionStyle(person)"
-            :disabled="followActive"
-            @click="selectPerson(person)"
+          <LiveVideoPlayer
+            :play-urls="livePlayUrls"
+            :robot-id="selectedRobot?.id"
+            :available="hasLiveStream"
+            @notice="showVideoNotice"
+            @stream-error="fallbackToSnapshot"
           >
-            <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
-          </button>
-          <div class="remote-video-overlay">
-            <span>{{ selectedRobot?.code || '--' }}</span>
-            <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
-          </div>
+            <template #empty>
+              <div class="remote-video-source remote-no-signal">
+                <strong>无视频流</strong>
+                <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
+              </div>
+            </template>
+            <template #overlay>
+              <button
+                v-for="person in personDetections"
+                :key="person.track_id"
+                type="button"
+                class="person-detection-box"
+                :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
+                :style="detectionStyle(person)"
+                :disabled="followActive"
+                @click="selectPerson(person)"
+              >
+                <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
+              </button>
+              <div class="remote-video-overlay">
+                <span>{{ selectedRobot?.code || '--' }}</span>
+                <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
+              </div>
+            </template>
+          </LiveVideoPlayer>
         </div>
         <div class="person-follow-toolbar">
           <div>
             <strong>人员跟随</strong>
-            <span>{{ personDetectionEnabled ? (personDetectionState?.available ? `识别到 ${personDetections.length} 人` : '人员模型启动中') : '人员模型未启用' }}</span>
+            <span>{{ personDetectionEnabled ? (personDetectionState?.available ? `识别到 ${personDetections.length} 人` : (personDetectionState?.stale ? '人员识别数据延迟' : '等待人员识别首帧')) : '人员模型未启用' }}</span>
             <small>{{ followStatus }}</small>
           </div>
           <button class="follow-start-btn" type="button" :disabled="personDetectionChanging || followActive" @click="togglePersonDetection">

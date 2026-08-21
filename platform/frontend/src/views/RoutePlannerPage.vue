@@ -718,7 +718,10 @@ async function handleSaveRoute() {
     map_data: selectedMap.value.id,
     map_set: routeForm.value.map_set || null,
     robot: routeForm.value.robot || selectedMap.value.robot || 1,
-    waypoints: withWaypointYaw(waypoints.value),
+    waypoints: withWaypointYaw(waypoints.value).map((point, index) => ({
+      ...point,
+      map_point_number: index + 1,
+    })),
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
   }
@@ -1090,10 +1093,11 @@ async function initializeLocalization() {
     const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
     localizationInitMessage.value = useFixedRtk
       ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
-      : 'RTK Fix 不可用，正在回灌最后可信位姿'
+      : 'RTK Fix 不可用，正在下发建图起点位姿'
     await sendRobotNavigationCommand(robotId, 'initial-pose', {
-      seed_source: useFixedRtk ? 'rtk' : 'last_trusted',
+      seed_source: useFixedRtk ? 'rtk' : 'mapping_start',
       map_id: selectedMap.value?.id,
+      map_version: selectedMap.value?.description || '',
     })
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
@@ -1132,6 +1136,7 @@ async function activeRelocalize() {
     const payload = {
       seed_source: 'last_trusted',
       map_id: selectedMap.value?.id,
+      map_version: selectedMap.value?.description || '',
     }
     if (manualInitialPose.value) {
       payload.x = Number(manualInitialPose.value.x)
@@ -1161,14 +1166,6 @@ async function activeRelocalize() {
 async function handleExecuteRoute() {
   if (!selectedRoute.value?.id) {
     navError.value = '请先保存并选择一条路线'
-    return
-  }
-  if (navStatus.value?.connection_status !== 'online') {
-    navError.value = '机器人未在线'
-    return
-  }
-  if (!navStatus.value?.status?.nav_ready) {
-    navError.value = '导航栈未就绪，请先启动导航栈'
     return
   }
   if (!confirm(`确定执行路线 "${selectedRoute.value.name}" 吗？请确认现场路径安全。`)) return
@@ -3565,6 +3562,30 @@ async function handleDeleteRoute(route) {
     max-height: 420px;
   }
 
+}
+
+@media (max-width: 640px) {
+  .route-planner-layout { gap: 0.75rem; }
+  .side-panel { gap: 0.75rem; padding-right: 0; overflow: visible; }
+  .panel-section { padding: 0.75rem; }
+  .route-header-actions { width: 100%; flex-wrap: wrap; }
+  .route-header-actions .btn { flex: 1 1 140px; }
+  .map-container {
+    height: min(58vh, 460px);
+    min-height: 320px;
+    padding: 0.65rem;
+  }
+  .map-toolbar { align-items: stretch; }
+  .map-display-controls,
+  .map-click-mode { flex: 1 1 100%; justify-content: space-between; }
+  .map-click-mode button { flex: 1 1 0; min-width: 0; }
+  .map-mode-hint { align-items: flex-start; flex-direction: column; }
+  .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
+  .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
+  .waypoint-heading-input input { min-width: 0; }
+  .waypoint-list { max-height: none; }
+  .drill-timeline-panel { max-height: 360px; padding: 0.7rem; }
+  .keyframe-pagination { justify-content: space-between; gap: 0.4rem; }
 }
 
 .btn {

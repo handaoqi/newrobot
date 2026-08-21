@@ -70,7 +70,7 @@ public:
     ndt_neighbor_search_radius       = declare_parameter<double>("ndt_neighbor_search_radius", 2.0);
     ndt_resolution                   = declare_parameter<double>("ndt_resolution", 1.0);
     ndt_max_fitness_score_ = static_cast<float>(std::max(
-      0.001, declare_parameter<double>("ndt_max_fitness_score", 9.00)));
+      0.001, declare_parameter<double>("ndt_max_fitness_score", 0.50)));
     enable_robot_odometry_prediction = declare_parameter<bool>("enable_robot_odometry_prediction", false);
     enable_lidar_odometry_prediction_ = declare_parameter<bool>("lidar_odometry_prediction.enable", false);
     lidar_odom_voxel_size_ = static_cast<float>(std::max(
@@ -2643,7 +2643,7 @@ private:
   float lidar_odom_voxel_size_ = 0.40f;
   float lidar_odom_max_correspondence_distance_ = 1.00f;
   float lidar_odom_max_fitness_score_ = 0.50f;
-  float ndt_max_fitness_score_ = 9.00f;
+  float ndt_max_fitness_score_ = 0.50f;
   float lidar_odom_max_translation_per_scan_ = 0.80f;
   float lidar_odom_max_rotation_per_scan_rad_ = 0.70f;
   size_t lidar_odom_min_points_ = 200;

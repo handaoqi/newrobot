@@ -31,7 +31,7 @@ localization:
     send_tf_transforms: true
     tf_use_current_time: true
     # Keep map->odom available slightly ahead of Nav2 controller requests.
-    tf_future_offset: 0.10
+    tf_future_offset: 0.25
     
     # topic name
     odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom 
@@ -100,10 +100,9 @@ localization:
     ndt_neighbor_search_method: "DIRECT7"
     ndt_neighbor_search_radius: 1.0
     ndt_resolution: 0.5
-    # Upper mean squared point-to-map distance accepted by NDT. 9.0 is an
-    # RMS point residual of roughly 3 m; convergence, inlier, and continuity
-    # checks remain separate acceptance gates.
-    ndt_max_fitness_score: 9.00
+    # Upper mean squared point-to-map distance accepted by NDT.
+    # Inlier and transform-continuity checks remain separate acceptance gates.
+    ndt_max_fitness_score: 0.50
 
     # initial pose parameters
     specify_init_pose: true
@@ -122,7 +121,10 @@ localization:
 
     # initial pose initialization parameters 
     init_match_count_threshold: 2         
-    init_match_score_threshold: 0.45      
+    # Use the same upper mean-squared residual limit as normal NDT matching.
+    # A stricter stale initialisation-only gate would otherwise reject a match
+    # that the running localization policy considers valid.
+    init_match_score_threshold: 0.50
 
     # Global localization parameters
     use_global_localization_init: true

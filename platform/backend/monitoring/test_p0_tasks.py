@@ -128,6 +128,29 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
 
+    def test_task_execute_marks_loop_execution(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"loop_execution": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["loop_execution"], True)
+
+    def test_low_battery_task_execute_does_not_orphan_created_execution(self):
+        self.robot.battery_level = 19
+        self.robot.save(update_fields=["battery_level", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(TaskExecution.objects.count(), 0)
+        self.assertEqual(RemoteCommand.objects.count(), 0)
+
     def test_charging_dock_saves_default_and_dispatches_two_point_task(self):
         self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]
         self.route.save(update_fields=["waypoints", "updated_at"])
@@ -173,6 +196,19 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(response.data["route"], self.route.id)
         self.assertEqual(RemoteCommand.objects.count(), 1)
         self.assertTrue(PatrolTask.objects.filter(route=self.route, name=f"路线快速执行 - {self.route.name}").exists())
+
+    def test_low_battery_route_execute_is_rejected_before_quick_task_creation(self):
+        self.robot.battery_level = 19
+        self.robot.save(update_fields=["battery_level", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(f"/api/routes/{self.route.id}/execute/", {}, format="json")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(PatrolTask.objects.filter(name=f"路线快速执行 - {self.route.name}").exists())
+        self.assertEqual(TaskExecution.objects.count(), 0)
+        self.assertEqual(RemoteCommand.objects.count(), 0)
 
     def test_disabled_task_cannot_execute(self):
         self.task.enabled = False

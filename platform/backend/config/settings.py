@@ -86,6 +86,11 @@ else:
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": os.getenv("SQLITE_DB_PATH", BASE_DIR / "db.sqlite3"),
+            # The center receives frequent telemetry writes concurrently with
+            # task dispatch and scheduler updates.  Give a SQLite writer time
+            # to acquire the lock instead of failing a robot command at the
+            # default five-second timeout.
+            "OPTIONS": {"timeout": 30},
         }
     }
 

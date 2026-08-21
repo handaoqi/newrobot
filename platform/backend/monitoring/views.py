@@ -12,7 +12,7 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
 from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
@@ -93,6 +93,16 @@ from .serializers import (
     TrajectoryPointSerializer,
     ScheduleRunSerializer,
 )
+
+
+# A detection can spend time in model inference and network transport.  Online
+# status must therefore reflect when the platform last received a frame, not
+# the camera-side timestamp embedded in that frame.
+PERSON_DETECTION_STALE_SECONDS = 8
+
+
+def _person_detection_is_stale(state: RobotPersonDetectionState) -> bool:
+    return timezone.now() - state.updated_at > timedelta(seconds=PERSON_DETECTION_STALE_SECONDS)
 
 User = get_user_model()
 LOGGER = logging.getLogger(__name__)
@@ -889,8 +899,12 @@ class RobotCommandView(APIView):
         "move_stop": "teleop.move_stop",
         "passive": "teleop.passive",
         "skill": "teleop.skill",
+        "skill_list": "teleop.skill_list",
         "skill_status": "teleop.skill_status",
         "skill_cancel": "teleop.skill_cancel",
+        "person_follow_start": "teleop.person_follow_start",
+        "person_follow_stop": "teleop.person_follow_stop",
+        "person_follow_status": "teleop.person_follow_status",
         "charge_start": "charge.start",
         "charge_stop": "charge.stop",
         "motion_start": "motion.start",
@@ -973,6 +987,33 @@ class RobotMcpTeleopView(APIView):
         "motion_start": "motion_start",
         "motion_stop": "motion_stop",
     }
+    MCP_VALUE_ALIASES = {
+        "direction": {
+            "前进": "forward", "前行": "forward", "后退": "backward", "后移": "backward",
+            "左移": "left", "右移": "right", "左转": "turn_left", "向左转": "turn_left",
+            "右转": "turn_right", "向右转": "turn_right", "停止": "stop", "停下": "stop",
+            "速度": "velocity", "速度控制": "velocity",
+        },
+        "speed": {
+            "微速": "micro", "微速档": "micro", "低速": "low", "低速档": "low",
+            "中速": "medium", "中速档": "medium", "normal": "medium",
+            "高速": "high", "高速档": "high",
+        },
+        "action": {
+            "stand": "stand_up", "起立": "stand_up", "站立": "stand_up",
+            "lie_down": "prone", "趴下": "prone", "匍匐": "prone",
+            "damping": "passive", "阻尼": "passive", "软急停": "passive",
+            "启动运控": "motion_start", "启动运动": "motion_start",
+            "停止运控": "motion_stop", "停止运动": "motion_stop",
+        },
+    }
+    PERSON_FOLLOW_COMMANDS = {
+        "person-follow-start": "person_follow_start",
+        "person-follow-stop": "person_follow_stop",
+        "person-follow-status": "person_follow_status",
+    }
+    CENTER_TARGET = "center"
+    PERSON_LABELS = {"person", "human", "人"}
 
     def post(self, request, robot_id, category):
         ensure_demo_seed()
@@ -982,11 +1023,50 @@ class RobotMcpTeleopView(APIView):
             command_id = data.get("command_id")
             command = get_object_or_404(RemoteCommand, id=command_id, robot=robot, command_type="teleop.skill")
             return Response(RemoteCommandSerializer(command).data)
+        if category == "person-detection-status":
+            state = RobotPersonDetectionState.objects.filter(robot=robot).first()
+            if state is None:
+                return Response({"robot_id": robot.id, "available": False, "stale": True, "enabled": False, "detections": []})
+            stale = _person_detection_is_stale(state)
+            return Response({
+                "robot_id": robot.id,
+                "available": not stale,
+                "stale": stale,
+                "enabled": state.enabled,
+                "frame_width": state.frame_width,
+                "frame_height": state.frame_height,
+                "detections": [] if stale else state.detections,
+            })
+        if category == "person-detection":
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                return Response({"detail": "enabled 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+            state, _ = RobotPersonDetectionState.objects.get_or_create(robot=robot)
+            state.enabled = enabled
+            if not enabled:
+                state.detections = []
+                state.captured_at = timezone.now()
+            state.save(update_fields=["enabled", "detections", "captured_at", "updated_at"])
+            return Response({"robot_id": robot.id, "enabled": state.enabled})
+        if category == "person-follow-start" and data.get("target"):
+            target = str(data.get("target") or "").strip().lower()
+            if target != self.CENTER_TARGET or str(data.get("track_id") or "").strip():
+                return Response(
+                    {"detail": "target 仅支持 center，且不能与 track_id 同时使用"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            track_id = self._center_person_track_id(robot)
+            if not track_id:
+                return Response(
+                    {"detail": "没有可用于跟随的最新人员识别框"},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            data = {**data, "track_id": track_id}
         if robot.effective_connection_status() != "online":
             return Response({"detail": "机器狗 Edge Agent 当前离线，无法远程控制。"}, status=status.HTTP_409_CONFLICT)
         action, command = self._resolve_action(category, data)
         if not action:
-            return Response({"detail": "不支持的 MCP 工具参数"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(self._unsupported_parameter_response(category, data), status=status.HTTP_400_BAD_REQUEST)
         command_type = RobotCommandView.ACTION_TO_COMMAND_TYPE[action]
         remote = CommandService.create_robot_command(
             robot=robot,
@@ -999,20 +1079,91 @@ class RobotMcpTeleopView(APIView):
 
     def _resolve_action(self, category, data):
         if category == "direction":
-            action = self.DIRECTION_ACTIONS.get(str(data.get("direction") or ""))
+            action = self.DIRECTION_ACTIONS.get(self._canonical_value("direction", data.get("direction")))
             return action, dict(data.get("command") or {})
         if category == "speed":
-            return self.SPEED_ACTIONS.get(str(data.get("level") or "")), {}
+            return self.SPEED_ACTIONS.get(self._canonical_value("speed", data.get("level"))), {}
         if category == "action":
-            return self.ACTIONS.get(str(data.get("action") or "")), {}
+            return self.ACTIONS.get(self._canonical_value("action", data.get("action"))), {}
         if category == "skill":
             command = {key: data[key] for key in ("preset", "steps", "description") if key in data}
             return "skill", command
+        if category == "skill-list":
+            return "skill_list", {}
         if category == "skill-cancel":
             return "skill_cancel", {
                 "command_id": data.get("command_id"),
             }
+        follow_action = self.PERSON_FOLLOW_COMMANDS.get(category)
+        if follow_action == "person_follow_start":
+            track_id = str(data.get("track_id") or "").strip()
+            return (follow_action, {"track_id": track_id}) if track_id else (None, {})
+        if follow_action:
+            return follow_action, {}
         return None, {}
+
+    @classmethod
+    def _canonical_value(cls, category, value):
+        raw = str(value or "").strip().lower()
+        return cls.MCP_VALUE_ALIASES.get(category, {}).get(raw, raw)
+
+    @classmethod
+    def _unsupported_parameter_response(cls, category, data):
+        field, supported = {
+            "direction": ("direction", sorted(cls.DIRECTION_ACTIONS)),
+            "speed": ("level", sorted(cls.SPEED_ACTIONS)),
+            "action": ("action", sorted(cls.ACTIONS)),
+            "person-follow-start": ("track_id", ["non-empty track_id", "target=center"]),
+        }.get(category, ("category", sorted({"direction", "speed", "action", "skill", "skill-list", "skill-cancel", "person-follow-start", "person-follow-stop", "person-follow-status"})))
+        return {
+            "detail": "不支持的 MCP 工具参数",
+            "category": category,
+            "parameter": field,
+            "received": data.get(field),
+            "supported_values": supported,
+        }
+
+    @classmethod
+    def _center_person_track_id(cls, robot) -> str:
+        """Choose the fresh person box closest to the camera-frame center.
+
+        The cloud only resolves the target once.  The Edge Agent follows the
+        resulting stable ``track_id`` from its local, high-rate snapshot.
+        """
+        state = RobotPersonDetectionState.objects.filter(robot=robot, enabled=True).first()
+        if state is None or state.frame_width <= 0 or state.frame_height <= 0:
+            return ""
+        if _person_detection_is_stale(state):
+            return ""
+
+        frame_center_x = state.frame_width / 2
+        frame_center_y = state.frame_height / 2
+        candidates: list[tuple[float, float, float, str]] = []
+        for detection in state.detections:
+            if not isinstance(detection, dict):
+                continue
+            if str(detection.get("label") or "").strip().lower() not in cls.PERSON_LABELS:
+                continue
+            track_id = str(detection.get("track_id") or "").strip()
+            bbox = detection.get("bbox")
+            if not track_id or not isinstance(bbox, dict):
+                continue
+            try:
+                x = float(bbox.get("x"))
+                y = float(bbox.get("y"))
+                width = float(bbox.get("width"))
+                height = float(bbox.get("height"))
+                confidence = float(detection.get("confidence") or 0)
+            except (TypeError, ValueError):
+                continue
+            if width <= 0 or height <= 0:
+                continue
+            center_distance_squared = (x + width / 2 - frame_center_x) ** 2 + (
+                y + height / 2 - frame_center_y
+            ) ** 2
+            # Stable tie breaks favour a higher-confidence, larger person box.
+            candidates.append((center_distance_squared, -confidence, -(width * height), track_id))
+        return min(candidates)[-1] if candidates else ""
 
 
 class RobotChargingDockView(APIView):
@@ -1061,22 +1212,27 @@ class RobotChargingDockView(APIView):
             task.enabled = True
             task.save(update_fields=["route_name", "scheduled_start", "scheduled_end", "enabled", "updated_at"])
             try:
-                execution = TaskExecutionService.create_execution(
-                    task, request.user if request.user.is_authenticated else None
-                )
-                command = CommandService.create(
-                    execution,
-                    "task.start",
-                    request.user if request.user.is_authenticated else None,
-                    command_options={
-                        "docking": {
-                            "enabled": True,
-                            "final_waypoint_index": 1,
-                            "charge_retries": 3,
-                            "undock_seconds": 3,
-                        }
-                    },
-                )
+                # Creating an execution and its start command is one operation.
+                # CommandService can reject the dispatch (for example, low
+                # battery); do not commit a created execution with no command,
+                # because it blocks every retry as ROBOT_BUSY.
+                with transaction.atomic():
+                    execution = TaskExecutionService.create_execution(
+                        task, request.user if request.user.is_authenticated else None
+                    )
+                    command = CommandService.create(
+                        execution,
+                        "task.start",
+                        request.user if request.user.is_authenticated else None,
+                        command_options={
+                            "docking": {
+                                "enabled": True,
+                                "final_waypoint_index": 1,
+                                "charge_retries": 3,
+                                "undock_seconds": 3,
+                            }
+                        },
+                    )
             except TaskStateError as exc:
                 return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(
@@ -1181,6 +1337,31 @@ class RobotAudioRecordingCommandView(APIView):
         )
 
 
+class RobotStreamAudioCommandView(APIView):
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, id=robot_id)
+        enabled = request.data.get("enabled")
+        if not isinstance(enabled, bool):
+            return Response({"detail": "enabled 必须为布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        command = RobotCommand.objects.create(
+            robot=robot,
+            action="set_stream_audio",
+            payload={"enabled": enabled, "source": "guard_live_audio"},
+        )
+        return Response(RobotCommandSerializer(command).data, status=status.HTTP_201_CREATED)
+
+
+class RobotStreamAudioCommandDetailView(APIView):
+    def get(self, request, robot_id, command_id):
+        command = get_object_or_404(
+            RobotCommand,
+            id=command_id,
+            robot_id=robot_id,
+            action="set_stream_audio",
+        )
+        return Response(RobotCommandSerializer(command).data)
+
+
 class RecordedAudioListView(APIView):
     def get(self, request):
         recordings = RecordedAudio.objects.select_related("category").all()
@@ -1273,7 +1454,7 @@ class AlertSkillPreviewView(APIView):
 
         try:
             saved_path, cache_hit = tts_service.synthesize_speech(binding.template.text)
-        except Exception:
+        except IntegrityError:
             LOGGER.exception("alert skill preview synthesis failed skill=%s robot=%s", skill_key, robot.code)
             return Response({"detail": "试播语音生成失败，请稍后重试"}, status=status.HTTP_502_BAD_GATEWAY)
 
@@ -1360,6 +1541,7 @@ class RobotTTSCommandView(APIView):
                 "audio_name": audio_name,
                 "text": text,
                 "source": "dashboard_tts",
+                "output_target": "nx",
                 "content_type": "audio/mpeg",
                 "tts_cache_hit": cache_hit,
             },
@@ -1374,6 +1556,9 @@ class DeviceCommandPollView(APIView):
     permission_classes = [IsAudioDeviceCredential]
 
     def get(self, request):
+        requested_action = str(request.query_params.get("action") or "").strip()
+        if requested_action and requested_action not in {"play_audio", "set_stream_audio"}:
+            return Response({"detail": "unsupported command action"}, status=status.HTTP_400_BAD_REQUEST)
         requested_code = (
             request.query_params.get("robot_code")
             or request.headers.get("X-Device-Code")
@@ -1389,17 +1574,26 @@ class DeviceCommandPollView(APIView):
             robot = get_object_or_404(Robot, code=requested_code)
 
         with transaction.atomic():
-            command = (
-                RobotCommand.objects.select_for_update(skip_locked=True)
-                .filter(robot=robot, action="play_audio", status="queued")
-                .order_by("-created_at")
-                .first()
-            )
+            command = None
+            if requested_action != "play_audio":
+                command = (
+                    RobotCommand.objects.select_for_update(skip_locked=True)
+                    .filter(robot=robot, action="set_stream_audio", status="queued")
+                    .order_by("-created_at")
+                    .first()
+                )
+            if command is None and requested_action != "set_stream_audio":
+                command = (
+                    RobotCommand.objects.select_for_update(skip_locked=True)
+                    .filter(robot=robot, action="play_audio", status="queued")
+                    .order_by("-created_at")
+                    .first()
+                )
             if command is None:
                 return Response(status=status.HTTP_204_NO_CONTENT)
             RobotCommand.objects.filter(
                 robot=robot,
-                action="play_audio",
+                action=command.action,
                 status="queued",
                 created_at__lt=command.created_at,
             ).update(
@@ -1426,7 +1620,7 @@ class DeviceCommandReportView(APIView):
         command = get_object_or_404(
             RobotCommand.objects.select_related("robot"),
             id=command_id,
-            action="play_audio",
+            action__in=["play_audio", "set_stream_audio"],
         )
         credential_robot = getattr(request, "device_robot", None)
         if credential_robot and credential_robot.id != command.robot_id:
@@ -1718,18 +1912,51 @@ class DevicePersonDetectionView(APIView):
         robot = get_object_or_404(Robot, code=payload["robot_code"])
         if hasattr(request, "device_robot") and request.device_robot.id != robot.id:
             return Response({"detail": "设备凭证与 robot_code 不匹配"}, status=status.HTTP_403_FORBIDDEN)
-        state, _ = RobotPersonDetectionState.objects.update_or_create(
+        fields = {
+            "camera_id": payload["camera_id"],
+            "frame_width": payload["frame_width"],
+            "frame_height": payload["frame_height"],
+            "captured_at": payload["captured_at"],
+            "detections": payload["detections"],
+            "updated_at": timezone.now(),
+        }
+        # SQLite does not provide row-level locks.  A conditional UPDATE keeps
+        # the newest source frame and avoids holding a transaction while the
+        # remote-control page polls at high frequency.
+        if RobotPersonDetectionState.objects.filter(
             robot=robot,
-            defaults={
-                "camera_id": payload["camera_id"],
-                "frame_width": payload["frame_width"],
-                "frame_height": payload["frame_height"],
-                "captured_at": payload["captured_at"],
-                "detections": payload["detections"],
-            },
-        )
+            captured_at__lte=payload["captured_at"],
+        ).update(**fields):
+            return Response(
+                {"detail": "实时检测帧已更新", "count": len(payload["detections"]), "accepted": True},
+                status=status.HTTP_200_OK,
+            )
+
+        if RobotPersonDetectionState.objects.filter(robot=robot).exists():
+            return Response(
+                {
+                    "detail": "已忽略乱序的旧检测帧",
+                    "count": 0,
+                    "accepted": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        try:
+            RobotPersonDetectionState.objects.create(robot=robot, **fields)
+        except Exception:
+            # A concurrent first frame may have created the state.  Retry the
+            # same conditional update, which still rejects an older frame.
+            if not RobotPersonDetectionState.objects.filter(
+                robot=robot,
+                captured_at__lte=payload["captured_at"],
+            ).update(**fields):
+                return Response(
+                    {"detail": "已忽略乱序的旧检测帧", "count": 0, "accepted": False},
+                    status=status.HTTP_200_OK,
+                )
         return Response(
-            {"detail": "实时检测帧已更新", "count": len(state.detections)},
+            {"detail": "实时检测帧已更新", "count": len(payload["detections"]), "accepted": True},
             status=status.HTTP_200_OK,
         )
 
@@ -1749,7 +1976,7 @@ class RobotPersonDetectionView(APIView):
                     "detections": [],
                 }
             )
-        stale = timezone.now() - state.captured_at > timedelta(seconds=3)
+        stale = _person_detection_is_stale(state)
         return Response(
             {
                 "robot_id": robot.id,
@@ -1760,6 +1987,7 @@ class RobotPersonDetectionView(APIView):
                 "frame_width": state.frame_width,
                 "frame_height": state.frame_height,
                 "captured_at": state.captured_at,
+                "received_at": state.updated_at,
                 "detections": [] if stale else state.detections,
             }
         )
@@ -2862,6 +3090,7 @@ class PatrolRouteDetailView(APIView):
 
 
 def validate_task_execution_readiness(task: PatrolTask) -> Response | None:
+    CommandService.ensure_task_start_allowed(task.robot)
     if not task.enabled:
         return Response({"detail": "TASK_DISABLED"}, status=status.HTTP_409_CONFLICT)
     if task.route is None:
@@ -2885,12 +3114,16 @@ class PatrolRouteExecuteView(APIView):
 
     def post(self, request, pk):
         record_rosbag = request.data.get("record_rosbag", False)
+        loop_execution = request.data.get("loop_execution", False)
         if not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(loop_execution, bool):
+            return Response({"detail": "loop_execution 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         route = get_object_or_404(
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
         )
+        CommandService.ensure_task_start_allowed(route.robot)
         now = timezone.now()
         task_name = f"路线快速执行 - {route.name}"
         task = PatrolTask.objects.filter(route=route, name=task_name).first()
@@ -2919,16 +3152,23 @@ class PatrolRouteExecuteView(APIView):
             return readiness_error
 
         try:
-            execution = TaskExecutionService.create_execution(
-                task,
-                request.user if request.user.is_authenticated else None,
-            )
-            CommandService.create(
-                execution,
-                "task.start",
-                request.user if request.user.is_authenticated else None,
-                command_options={"record_rosbag": record_rosbag},
-            )
+            # Keep the execution and task.start command atomic. Without this,
+            # a dispatch precheck failure leaves an active `created` execution
+            # and makes the next operator attempt fail as ROBOT_BUSY.
+            with transaction.atomic():
+                execution = TaskExecutionService.create_execution(
+                    task,
+                    request.user if request.user.is_authenticated else None,
+                )
+                CommandService.create(
+                    execution,
+                    "task.start",
+                    request.user if request.user.is_authenticated else None,
+                    command_options={
+                        "record_rosbag": record_rosbag,
+                        "loop_execution": loop_execution,
+                    },
+                )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         execution.refresh_from_db()
@@ -3226,8 +3466,11 @@ class PatrolTaskExecuteView(APIView):
 
     def post(self, request, task_id):
         record_rosbag = request.data.get("record_rosbag", False)
+        loop_execution = request.data.get("loop_execution", False)
         if not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(loop_execution, bool):
+            return Response({"detail": "loop_execution 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         task = get_object_or_404(
             PatrolTask.objects.select_related("robot", "route", "route__map_data"),
             pk=task_id,
@@ -3237,13 +3480,19 @@ class PatrolTaskExecuteView(APIView):
             return readiness_error
         try:
             operator = request.user if request.user.is_authenticated else None
-            execution = TaskExecutionService.create_execution(task, operator)
-            CommandService.create(
-                execution,
-                "task.start",
-                operator,
-                command_options={"record_rosbag": record_rosbag},
-            )
+            # See the route execution endpoint: a rejected command must roll
+            # back the just-created execution rather than orphaning it.
+            with transaction.atomic():
+                execution = TaskExecutionService.create_execution(task, operator)
+                CommandService.create(
+                    execution,
+                    "task.start",
+                    operator,
+                    command_options={
+                        "record_rosbag": record_rosbag,
+                        "loop_execution": loop_execution,
+                    },
+                )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         execution.refresh_from_db()

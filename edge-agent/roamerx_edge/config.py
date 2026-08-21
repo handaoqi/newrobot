@@ -65,9 +65,15 @@ class SafetyConfig:
     stop_confirmation_seconds: float = 1.0
     localization_stable_seconds: float = 3.0
     localization_loss_samples: int = 5
+    ndt_failure_score: float = 0.5
+    ndt_failure_samples: int = 3
+    localization_recovery_attempts: int = 3
+    localization_recovery_retry_seconds: float = 5.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
     final_waypoint_tolerance_m: float = 0.35
+    docking_goal_tolerance_m: float = 0.08
+    docking_goal_yaw_tolerance_rad: float = 0.0872665
 
 
 @dataclass

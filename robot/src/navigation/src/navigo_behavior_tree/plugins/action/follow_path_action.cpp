@@ -13,12 +13,30 @@
 // limitations under the License.
 
 #include <memory>
+#include <cmath>
 #include <string>
 
 #include "navigo_behavior_tree/plugins/action/follow_path_action.hpp"
 
 namespace navigo_behavior_tree
 {
+
+namespace
+{
+bool pathMateriallyChanged(const nav_msgs::msg::Path & current, const nav_msgs::msg::Path & candidate)
+{
+  if (current.poses.size() != candidate.poses.size() || current.poses.empty()) {
+    return true;
+  }
+  const auto changed = [](const geometry_msgs::msg::PoseStamped & a,
+      const geometry_msgs::msg::PoseStamped & b) {
+      return std::hypot(a.pose.position.x - b.pose.position.x,
+          a.pose.position.y - b.pose.position.y) > 0.05;
+    };
+  return changed(current.poses.front(), candidate.poses.front()) ||
+         changed(current.poses.back(), candidate.poses.back());
+}
+}  // namespace
 
 FollowPathAction::FollowPathAction(
   const std::string & xml_tag_name,
@@ -43,7 +61,9 @@ void FollowPathAction::on_wait_for_result(
   getInput("path", new_path);
 
   // Check if it is not same with the current one
-  if (goal_.path != new_path && new_path != nav_msgs::msg::Path()) {
+  // Replanning stamps every path anew. Comparing full ROS messages makes a
+  // geometrically identical path cancel the active controller once per second.
+  if (new_path != nav_msgs::msg::Path() && pathMateriallyChanged(goal_.path, new_path)) {
     // the action server on the next loop iteration
     goal_.path = new_path;
     goal_updated_ = true;

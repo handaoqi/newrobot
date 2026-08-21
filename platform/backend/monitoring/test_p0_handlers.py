@@ -16,6 +16,7 @@ from .models import (
     SpeechCategory,
     SpeechTemplate,
     TaskExecution,
+    TaskExecutionEvent,
     TrajectoryPoint,
 )
 from .services.command_service import CommandService
@@ -159,6 +160,32 @@ class MessageHandlerTests(TestCase):
         handle_mqtt_message("robots/rx-001/events/task", stale)
         self.execution.refresh_from_db()
         self.assertEqual(self.execution.current_waypoint_index, 1)
+
+    def test_waypoint_milestone_is_persisted_for_guard_duty_timeline(self):
+        reported_at = timezone.now().isoformat()
+        progress = self.envelope(
+            "task.progress",
+            {
+                "task_execution_id": str(self.execution.id),
+                "state": "running",
+                "state_version": 4,
+                "current_waypoint_index": 0,
+                "current_waypoint_id": "wp-1",
+                "completed_waypoints": 0,
+                "total_waypoints": 2,
+                "reported_at": reported_at,
+                "milestone": "target_dispatched",
+                "waypoint": {"waypoint_id": "wp-1", "map_point_number": 1, "x": 1.0, "y": 2.0, "yaw": 0.2},
+                "robot_pose": {"x": 0.8, "y": 1.9, "yaw": 0.1, "sampled_at": reported_at},
+            },
+        )
+
+        handle_mqtt_message("robots/rx-001/events/task", progress)
+
+        event = TaskExecutionEvent.objects.get(task_execution=self.execution, state_version=4)
+        self.assertEqual(event.event_type, "task.target_dispatched")
+        self.assertEqual(event.payload["waypoint"]["map_point_number"], 1)
+        self.assertEqual(event.payload["robot_pose"]["x"], 0.8)
 
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/waypoint.mp3", True))
     def test_completed_waypoint_queues_selected_speech(self, synthesize_speech):

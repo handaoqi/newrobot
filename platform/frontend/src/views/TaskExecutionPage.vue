@@ -506,7 +506,7 @@ onBeforeUnmount(() => {
         <h3>航点状态</h3>
         <div class="execution-waypoints">
           <div v-for="(point, index) in waypoints" :key="point.waypoint_id || index" class="execution-waypoint" :class="waypointClass(index)">
-            <span>{{ index + 1 }}</span>
+            <span>{{ point.map_point_number ?? point.sequence + 1 }}</span>
             <div>
               <strong>{{ point.name || `点${index + 1}` }}</strong>
               <small>x {{ Number(point.x).toFixed(2) }} / y {{ Number(point.y).toFixed(2) }}</small>
@@ -550,7 +550,7 @@ onBeforeUnmount(() => {
               :class="waypointClass(index)"
               :style="displayPosition(point)"
             >
-              {{ index + 1 }}
+              {{ point.map_point_number ?? point.sequence + 1 }}
             </div>
             <div v-if="currentTarget" class="execution-marker target" :style="displayPosition(currentTarget)">目标</div>
             <div v-if="lastTrajectoryPoint()" class="execution-marker final" :style="displayPosition(lastTrajectoryPoint())">终点</div>
@@ -981,5 +981,17 @@ onBeforeUnmount(() => {
   .execution-map-layer {
     min-width: 680px;
   }
+}
+
+@media (max-width: 680px) {
+  .execution-page { gap: 14px; min-height: 0; }
+  .execution-sidebar { gap: 12px; }
+  .execution-map-panel { padding: 12px; }
+  .execution-map-head { align-items: flex-start; flex-direction: column; gap: 6px; }
+  .execution-map-stage { min-height: 380px; padding: 10px; }
+  .execution-map-layer { min-width: 600px; }
+  .localization-loss-list { top: 8px; right: 8px; width: min(280px, calc(100% - 16px)); }
+  .debug-row { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .debug-row strong { text-align: left; }
 }
 </style>

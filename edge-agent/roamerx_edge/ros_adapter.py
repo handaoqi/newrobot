@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import json
 import math
-import subprocess
 import threading
 import time
 from collections import deque
@@ -22,6 +21,8 @@ try:
     from geometry_msgs.msg import PoseWithCovarianceStamped
     from geometry_msgs.msg import Twist
     from nav2_msgs.action import FollowWaypoints
+    from action_msgs.srv import CancelGoal
+    from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
@@ -31,6 +32,8 @@ try:
     from localization.msg import ScanMatchingStatus
     from std_msgs.msg import Bool, String
     from std_srvs.srv import Trigger
+    from rcl_interfaces.msg import Parameter as ParameterMessage, ParameterType, ParameterValue
+    from rcl_interfaces.srv import SetParameters
 
     ROS_AVAILABLE = True
 except ImportError:
@@ -66,6 +69,8 @@ class RosAdapter(Node):
         self._localization_status_samples = deque(maxlen=100)
         self._localization_lost_count = 0
         self._localization_failure_notified = False
+        self._ndt_failure_count = 0
+        self._ndt_failure_notified = False
         self._localization_recovery_pending = False
         self._localization_recovery_armed = False
         self._latest_speed = 0.0
@@ -113,6 +118,7 @@ class RosAdapter(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self._goal_yaw_required_pub = self.create_publisher(Bool, "/navigation/require_goal_yaw", goal_yaw_qos)
+        self._fine_control_pub = self.create_publisher(Bool, "/navigation/fine_control", goal_yaw_qos)
         self.create_subscription(String, "/robot_motion_state", self._on_robot_motion_state, 10)
 
     def _on_robot_motion_state(self, msg) -> None:
@@ -180,7 +186,8 @@ class RosAdapter(Node):
             self._localization_lost_count = 0
             self._localization_failure_notified = False
             latest = self.telemetry.latest_pose()
-            if latest:
+            absolute_stable = self._absolute_localization_stable()
+            if latest and absolute_stable:
                 self._last_trusted_pose = {
                     "x": float(latest.x),
                     "y": float(latest.y),
@@ -192,6 +199,7 @@ class RosAdapter(Node):
             stable_for = time.monotonic() - self.safety_state.localization_normal_since_monotonic
             if (
                 self._trusted_pose_cb
+                and absolute_stable
                 and stable_for >= self.safety_config.localization_stable_seconds
                 and time.monotonic() - self._last_trusted_pose_report_monotonic >= 5.0
             ):
@@ -242,12 +250,12 @@ class RosAdapter(Node):
                     return
                 stable_for = time.monotonic() - self.safety_state.localization_normal_since_monotonic
                 remaining = self.safety_config.localization_stable_seconds - stable_for
-                if remaining <= 0.0:
+                if remaining <= 0.0 and self._absolute_localization_stable():
                     if self._localization_recovery_cb:
                         self._localization_recovery_cb()
                     self._localization_recovery_armed = False
                     return
-                time.sleep(min(0.2, remaining))
+                time.sleep(0.2 if remaining <= 0.0 else min(0.2, remaining))
         finally:
             self._localization_recovery_pending = False
 
@@ -259,6 +267,34 @@ class RosAdapter(Node):
             float(getattr(msg, "inlier_fraction", 0.0)),
         )
         self.telemetry.on_scan_matching_status(msg)
+        score = float(getattr(msg, "matching_error", float("inf")))
+        healthy = bool(getattr(msg, "has_converged", False)) and math.isfinite(score) and (
+            score <= self.safety_config.ndt_failure_score
+        )
+        if healthy:
+            self._ndt_failure_count = 0
+            self._ndt_failure_notified = False
+            return
+        self._ndt_failure_count += 1
+        if (
+            self._ndt_failure_count >= max(1, self.safety_config.ndt_failure_samples)
+            and not self._ndt_failure_notified
+            and self._localization_failure_cb
+        ):
+            self._ndt_failure_notified = True
+            self._localization_recovery_armed = True
+            threading.Thread(
+                target=self._localization_failure_cb,
+                daemon=True,
+                name="ndt-failure-handler",
+            ).start()
+
+    def _absolute_localization_stable(self) -> bool:
+        decision = self.telemetry.localization_decision()
+        return bool(
+            decision.get("active_source") in {"ndt_imu", "rtk_imu"}
+            and decision.get("absolute_stable")
+        )
 
     def _on_cmd_vel_raw(self, msg) -> None:
         self._raw_forward_command = float(msg.linear.x)
@@ -306,12 +342,57 @@ class RosAdapter(Node):
         }
 
     def wait_until_ready(self, timeout_seconds: float = 10.0) -> bool:
-        ready = self._action_client.wait_for_server(timeout_sec=timeout_seconds)
-        self.safety_state.nav_ready = bool(ready)
-        return bool(ready)
+        """Wait for Nav2's action server *and* all required lifecycle nodes.
+
+        ``wait_for_server`` alone is not sufficient after a map switch: ROS
+        discovery can still expose the previous FollowWaypoints server while
+        the replacement Nav2 stack is only configuring.  Such a goal is
+        accepted by discovery then immediately rejected by the action server.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        required_nodes = (
+            "/controller_server",
+            "/planner_server",
+            "/bt_navigator",
+            "/waypoint_follower",
+        )
+        # A zero timeout is used by the periodic health reporter.  It must
+        # still perform one non-blocking probe rather than immediately
+        # reporting Nav2 as unavailable.
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._action_client.wait_for_server(timeout_sec=min(0.5, remaining)):
+                ready = False
+            else:
+                ready = all(self._lifecycle_node_is_active(name) for name in required_nodes)
+            if ready:
+                self.safety_state.nav_ready = True
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+        self.safety_state.nav_ready = False
+        return False
+
+    def _lifecycle_node_is_active(self, node_name: str) -> bool:
+        client = self.create_client(GetState, f"{node_name}/get_state")
+        try:
+            if not client.wait_for_service(timeout_sec=0.25):
+                return False
+            future = client.call_async(GetState.Request())
+            completed = threading.Event()
+            future.add_done_callback(lambda _: completed.set())
+            if not completed.wait(timeout=0.75) or future.result() is None:
+                return False
+            # lifecycle_msgs/State.PRIMARY_STATE_ACTIVE == 3.
+            return int(future.result().current_state.id) == 3
+        except Exception:
+            return False
+        finally:
+            self.destroy_client(client)
 
     def send_waypoints(self, waypoints: list[dict], feedback_cb: Callable, result_cb: Callable) -> bool:
-        if not self.wait_until_ready(timeout_seconds=5):
+        if not self.wait_until_ready(timeout_seconds=30):
             return False
         goal = FollowWaypoints.Goal()
         for waypoint in waypoints:
@@ -515,7 +596,25 @@ class RosAdapter(Node):
             sample_sequence = self._localization_sample_sequence
         wait_seconds = float(pose.get("wait_seconds", 8.0))
         required_normal_samples = int(pose.get("required_normal_samples", 0))
-        if required_normal_samples > 0:
+        require_absolute = bool(pose.get("require_absolute", False))
+        if require_absolute:
+            deadline = time.monotonic() + wait_seconds
+            latest = self.telemetry.latest_pose()
+            while time.monotonic() < deadline:
+                latest = self.telemetry.latest_pose()
+                if (
+                    latest
+                    and latest.localization_status == "normal"
+                    and self._absolute_localization_stable()
+                ):
+                    break
+                time.sleep(0.2)
+            accepted = bool(
+                latest
+                and latest.localization_status == "normal"
+                and self._absolute_localization_stable()
+            )
+        elif required_normal_samples > 0:
             latest = self._wait_for_fresh_normal_samples(
                 after_sequence=sample_sequence,
                 required_samples=required_normal_samples,
@@ -649,6 +748,7 @@ class RosAdapter(Node):
                     "frame_id": "map",
                     "wait_seconds": 10.0,
                     "required_normal_samples": 3,
+                    "require_absolute": True,
                     "covariance_x": 1.0,
                     "covariance_y": 1.0,
                     "covariance_yaw": 0.274,
@@ -704,13 +804,27 @@ class RosAdapter(Node):
         return candidates
 
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool:
-        if self._goal_handle is None:
-            return True
-        future = self._goal_handle.cancel_goal_async()
+        if self._goal_handle is not None:
+            future = self._goal_handle.cancel_goal_async()
+        else:
+            # Edge may have restarted after it sent a goal. In that case the
+            # local handle is gone while Nav2 continues executing the goal.
+            # A default CancelGoal request cancels every goal on this action.
+            client = self.create_client(
+                CancelGoal, f"{self.ros_config.follow_waypoints_action}/_action/cancel_goal")
+            if not client.wait_for_service(timeout_sec=min(timeout_seconds, 2.0)):
+                self.destroy_client(client)
+                LOGGER.error("FollowWaypoints cancel service is unavailable")
+                return False
+            future = client.call_async(CancelGoal.Request())
         completed = threading.Event()
         future.add_done_callback(lambda _: completed.set())
         completed.wait(timeout=timeout_seconds)
-        return bool(future.done() and future.result() and future.result().goals_canceling)
+        response = future.result() if future.done() else None
+        cancelled = bool(response and response.goals_canceling)
+        if not cancelled:
+            LOGGER.error("FollowWaypoints cancellation was not acknowledged")
+        return cancelled
 
     def stop_motion(self) -> None:
         """Publish an explicit zero command after a navigation goal is cancelled."""
@@ -720,35 +834,102 @@ class RosAdapter(Node):
             time.sleep(0.05)
 
     def set_docking_profile(self, *, final_approach: bool) -> None:
-        """Apply the speed cap used only for the dock contact leg."""
-        vx_max = "0.15" if final_approach else "0.5"
-        script = (
-            "source /opt/ros/humble/setup.bash; "
-            "source /home/robot/genisom_roamerx_open/install/setup.bash; "
-            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
-            f"ros2 param set /controller_server FollowPath.vx_max {vx_max}"
+        """Apply the slow, fine-control profile used only for the dock contact leg."""
+        vx_max = 0.10 if final_approach else 0.5
+        vx_min = -0.10 if final_approach else -0.12
+        wz_max = 0.20 if final_approach else 0.5
+        fine_control = Bool()
+        fine_control.data = bool(final_approach)
+        self._fine_control_pub.publish(fine_control)
+        self._set_remote_parameters(
+            "/controller_server",
+            {
+                "FollowPath.vx_max": vx_max,
+                "FollowPath.vx_min": vx_min,
+                "FollowPath.wz_max": wz_max,
+            },
+            code="DOCKING_PROFILE_FAILED",
         )
-        completed = subprocess.run(["bash", "-lc", script], text=True, capture_output=True, timeout=20)
-        if completed.returncode != 0:
-            raise ProtocolError("DOCKING_PROFILE_FAILED", completed.stderr or completed.stdout)
+        LOGGER.info(
+            "docking fine-control=%s vx=[%s,%s] wz_max=%s",
+            final_approach, vx_min, vx_max, wz_max,
+        )
 
     def set_waypoint_profile(self, *, avoid_obstacles: bool, require_yaw: bool) -> None:
         enabled = "true" if avoid_obstacles else "false"
         yaw_message = Bool()
         yaw_message.data = bool(require_yaw)
         self._goal_yaw_required_pub.publish(yaw_message)
-        script = (
-            "set -e; source /opt/ros/humble/setup.bash; "
-            "source /home/robot/genisom_roamerx_open/install/setup.bash; "
-            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
-            f"ros2 param set /local_costmap/local_costmap obstacle_layer.enabled {enabled}; "
-            f"ros2 param set /global_costmap/global_costmap obstacle_layer.enabled {enabled}; "
-            f"ros2 param set /collision_monitor PolygonStop.enabled {enabled}; "
-            f"ros2 param set /collision_monitor PolygonSlow.enabled {enabled}"
+        for node_name, parameter_name in (
+            ("/local_costmap/local_costmap", "obstacle_layer.enabled"),
+            ("/global_costmap/global_costmap", "obstacle_layer.enabled"),
+            ("/collision_monitor", "PolygonStop.enabled"),
+            ("/collision_monitor", "PolygonSlow.enabled"),
+        ):
+            self._set_remote_parameters(
+                node_name,
+                {parameter_name: bool(avoid_obstacles)},
+                code="WAYPOINT_PROFILE_FAILED",
+            )
+
+    def set_goal_precision(self, *, enabled: bool) -> None:
+        """Select the tight pose tolerances used only for the dock contact point."""
+        xy_tolerance = (
+            self.safety_config.docking_goal_tolerance_m if enabled else 0.35
         )
-        completed = subprocess.run(["bash", "-lc", script], text=True, capture_output=True, timeout=20)
-        if completed.returncode != 0:
-            raise ProtocolError("WAYPOINT_PROFILE_FAILED", completed.stderr or completed.stdout)
+        yaw_tolerance = (
+            self.safety_config.docking_goal_yaw_tolerance_rad if enabled else 0.25
+        )
+        self._set_remote_parameters(
+            "/controller_server",
+            {
+                "general_goal_checker.xy_goal_tolerance": float(xy_tolerance),
+                "general_goal_checker.required_yaw_goal_tolerance": float(yaw_tolerance),
+            },
+            code="GOAL_PRECISION_PROFILE_FAILED",
+        )
+
+    def _set_remote_parameters(self, node_name: str, values: dict[str, bool | float], *, code: str) -> None:
+        """Set Nav2 parameters through its ROS service, without spawning ros2 CLI processes."""
+        last_error = ""
+        for _ in range(8):
+            client = self.create_client(SetParameters, f"{node_name}/set_parameters")
+            try:
+                if not client.wait_for_service(timeout_sec=0.75):
+                    last_error = f"{node_name} parameter service is unavailable"
+                else:
+                    request = SetParameters.Request()
+                    request.parameters = [self._parameter_message(name, value) for name, value in values.items()]
+                    future = client.call_async(request)
+                    completed = threading.Event()
+                    future.add_done_callback(lambda _: completed.set())
+                    if not completed.wait(timeout=1.5):
+                        last_error = f"{node_name} parameter request timed out"
+                    else:
+                        response = future.result()
+                        failures = [result.reason or "rejected" for result in response.results if not result.successful]
+                        if not failures:
+                            return
+                        last_error = "; ".join(failures)
+            except Exception as exc:
+                last_error = str(exc)
+            finally:
+                self.destroy_client(client)
+            time.sleep(0.25)
+        raise ProtocolError(code, last_error or f"unable to set parameters on {node_name}")
+
+    @staticmethod
+    def _parameter_message(name: str, value: bool | float) -> ParameterMessage:
+        parameter = ParameterMessage()
+        parameter.name = name
+        parameter.value = ParameterValue()
+        if isinstance(value, bool):
+            parameter.value.type = ParameterType.PARAMETER_BOOL
+            parameter.value.bool_value = value
+        else:
+            parameter.value.type = ParameterType.PARAMETER_DOUBLE
+            parameter.value.double_value = float(value)
+        return parameter
 
     def is_robot_stopped(self) -> bool:
         deadline = time.monotonic() + self.safety_config.stop_confirmation_seconds + 3

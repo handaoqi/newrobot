@@ -1,5 +1,5 @@
 [Unit]
-Description=RoamerX NX-local FunASR service
+Description=RoamerX NX-local SenseVoice ASR service
 After=network-online.target
 Wants=network-online.target
 
@@ -10,7 +10,7 @@ Group=robot
 Environment=HOME=/home/robot
 Environment=MODELSCOPE_CACHE=/home/robot/.local/share/roamerx-voice/models
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/robot/.local/share/roamerx-voice/venv/bin/funasr-server --host 127.0.0.1 --port 18080 --device cuda:0 --model sensevoice
+ExecStart=/home/robot/.local/share/roamerx-voice/venv/bin/funasr-server --host 127.0.0.1 --port 18080 --device cuda:0 --model sensevoice --model-path /home/robot/.local/share/roamerx-voice/models/models/iic--SenseVoiceSmall/snapshots/master
 Restart=always
 RestartSec=5
 TimeoutStartSec=180

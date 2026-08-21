@@ -51,6 +51,7 @@ class CommandService:
                     "continue_on_disconnect": True,
                 },
                 "record_rosbag": bool(command_options.get("record_rosbag", False)),
+                "loop_execution": bool(command_options.get("loop_execution", False)),
                 "docking": dict(command_options.get("docking") or {}),
             }
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)
@@ -201,6 +202,11 @@ class CommandService:
             payload={"command_type": command_type},
         )
         return command
+
+    @classmethod
+    def ensure_task_start_allowed(cls, robot: Robot, *, allow_docking: bool = False) -> None:
+        """Run admission checks that must happen before creating an execution."""
+        cls._ensure_battery_allows(robot, "task.start", allow_docking=allow_docking)
 
     @classmethod
     def _ensure_battery_allows(cls, robot: Robot, command_type: str, *, allow_docking: bool = False) -> None:

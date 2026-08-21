@@ -15,19 +15,32 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from pypinyin import Style, lazy_pinyin
 
-from .models import DevelopmentAgentState, DevelopmentTask, DevelopmentTaskEvent, Robot, VoiceRecognitionEvent
+from .models import (
+    DevelopmentAgentState,
+    DevelopmentConversationState,
+    DevelopmentTask,
+    DevelopmentTaskEvent,
+    Robot,
+    VoiceRecognitionEvent,
+)
 from .message_handlers import _public_media_url
 from .services import asr_service, tts_service
 
 _VOICE_WAKE_UNTIL: dict[str, object] = {}
+_VOICE_WAKE_COUNT: dict[str, tuple[object, int]] = {}
 LOGGER = logging.getLogger(__name__)
 # Wake matching remains anchored at the start of the utterance, but is based on
 # Mandarin syllables instead of an exact ASR spelling.  The matcher deliberately
 # has no list of observed misspellings: any homophone (for example “晓太洋”)
 # is handled from its pinyin, and a single near-syllable is allowed without
 # permitting an unrelated phrase to create a development task.
-VOICE_WAKE_ALIASES = ("小太阳", "小太陽")
+# “有太阳” is an intentional alternate wake phrase requested for the NX ASR:
+# its syllables are recognised more reliably in the current microphone setup.
+# Keep the original wake phrase available as well so existing commands remain
+# compatible.
+VOICE_WAKE_ALIASES = ("小太阳", "小太陽", "有太阳", "太阳", "太陽")
 VOICE_WAKE_PINYIN = ("xiao", "tai", "yang")
+VOICE_WAKE_SHORT_PINYIN = ("tai", "yang")
 _PINYIN_INITIALS = (
     "zh", "ch", "sh",
     "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
@@ -103,7 +116,7 @@ def _syllable_similarity(expected: str, actual: str) -> float:
 
 
 def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
-    """Return the prefix end and ASR spelling when it sounds like 小太阳."""
+    """Return the prefix end when its first two or three syllables are a wake."""
     exact = re.match(
         rf"^\s*({'|'.join(re.escape(item) for item in VOICE_WAKE_ALIASES)})",
         transcript,
@@ -111,23 +124,46 @@ def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
     if exact:
         return exact.end(), exact.group(1)
 
-    candidate_match = re.match(r"^(\s*)([\u4e00-\u9fff]{3})", transcript)
+    candidate_match = re.match(r"^(\s*)([\u4e00-\u9fff]{2,3})", transcript)
     if not candidate_match:
         return 0, ""
     candidate = candidate_match.group(2)
     syllables = tuple(lazy_pinyin(candidate, style=Style.NORMAL, errors="default"))
-    if len(syllables) != len(VOICE_WAKE_PINYIN):
-        return 0, ""
-    scores = tuple(
-        _syllable_similarity(expected, actual)
-        for expected, actual in zip(VOICE_WAKE_PINYIN, syllables)
-    )
-    # Require two high-confidence syllables and a strong combined score.  It
-    # admits homophones and one near-syllable, but not phrases sharing only
-    # “太阳”, such as “有太阳” or “狗太阳”.
-    if sum(scores) < 2.5 or sum(score >= 0.95 for score in scores) < 2:
-        return 0, ""
-    return len(candidate_match.group(1)) + len(candidate), candidate
+    if len(syllables) == 3:
+        scores = tuple(
+            _syllable_similarity(expected, actual)
+            for expected, actual in zip(VOICE_WAKE_PINYIN, syllables)
+        )
+        if sum(scores) >= 2.5 and sum(score >= 0.95 for score in scores) >= 2:
+            return len(candidate_match.group(1)) + len(candidate), candidate
+
+    # SenseVoice may alter or omit the first wake syllable.  For a three-byte
+    # Chinese prefix, treat only characters 2 and 3 as the wake core; the
+    # first character is deliberately unconstrained ("小太阳"/"有太阳"/…).
+    # With only two prefix characters, they themselves are the wake core.
+    cores = [(candidate[1:3], len(candidate))] if len(candidate) == 3 else []
+    cores.append((candidate[:2], 2))
+    for wake_core, consumed in cores:
+        wake_syllables = tuple(lazy_pinyin(wake_core, style=Style.NORMAL, errors="default"))
+        if len(wake_syllables) != 2:
+            continue
+        scores = tuple(
+            _syllable_similarity(expected, actual)
+            for expected, actual in zip(VOICE_WAKE_SHORT_PINYIN, wake_syllables)
+        )
+        if sum(scores) >= 1.5 and sum(score >= 0.95 for score in scores) >= 1:
+            return len(candidate_match.group(1)) + consumed, candidate[:consumed]
+    return 0, ""
+
+
+def _is_double_wake_phrase(transcript: str) -> bool:
+    """Recognise “小太阳小太阳” spoken as one utterance.
+
+    The normal matcher consumes one wake phrase only.  Detecting the repeated
+    form first prevents its second half from being treated as executable text.
+    """
+    compact = re.sub(r"[\s，。,.!！?？]", "", transcript)
+    return any(compact.startswith(alias + alias) for alias in VOICE_WAKE_ALIASES)
 
 
 def _looks_like_short_wake_attempt(transcript: str) -> bool:
@@ -206,6 +242,12 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
         _record_voice_recognition(robot, payload, transcript, "no_speech")
         return {"status": "no_speech", "transcript": transcript}
     now = timezone.now()
+    if _is_double_wake_phrase(transcript):
+        _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
+        _VOICE_WAKE_COUNT[robot.code] = (now, 2)
+        _publish_voice_ack(robot, publish, "在呢")
+        _record_voice_recognition(robot, payload, transcript, "armed")
+        return {"status": "armed", "transcript": transcript}
     wake_end, wake_phrase = _fuzzy_wake_match(transcript)
     wake_matched = bool(wake_phrase)
     command = ""
@@ -213,10 +255,18 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
     if wake_matched:
         command = transcript[wake_end:].strip(" ，。,.!！?？")
         _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
+        if not command:
+            previous = _VOICE_WAKE_COUNT.get(robot.code)
+            count = previous[1] + 1 if previous and now - previous[0] <= timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS) else 1
+            _VOICE_WAKE_COUNT[robot.code] = (now, count)
+            _publish_voice_ack(robot, publish, "在呢" if count >= 2 else "收到")
+            _record_voice_recognition(robot, payload, transcript, "armed")
+            return {"status": "armed", "transcript": transcript}
+        _VOICE_WAKE_COUNT.pop(robot.code, None)
     elif armed_until and armed_until >= now:
         if _looks_like_short_wake_attempt(transcript):
             _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
-            _publish_voice_ack(robot, publish, "我在，请说任务")
+            _publish_voice_ack(robot, publish, "在呢")
             _record_voice_recognition(robot, payload, transcript, "armed")
             return {"status": "armed", "transcript": transcript}
         command = transcript
@@ -231,12 +281,29 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
         _record_voice_recognition(robot, payload, transcript, outcome)
         return {"status": outcome, "transcript": transcript}
     _VOICE_WAKE_UNTIL.pop(robot.code, None)
+    _VOICE_WAKE_COUNT.pop(robot.code, None)
     if DevelopmentTask.objects.filter(robot=robot, status__in=DevelopmentTask.ACTIVE_STATES).exists():
+        # A voice command used to disappear silently while Codex was busy.
+        # Preserve the single-task safety boundary, but make the outcome
+        # audible so the operator knows the microphone and wake word worked.
+        _publish_voice_ack(robot, publish, "我正在处理上一条任务，请稍后再说")
         _record_voice_recognition(robot, payload, transcript, "busy", command=command)
         return {"status": "busy", "transcript": transcript}
-    task = DevelopmentTask.objects.create(robot=robot, workspace="robot-main", model="gpt-5.6-terra", prompt=command)
+    conversation_state, _ = DevelopmentConversationState.objects.get_or_create(robot=robot)
+    task = DevelopmentTask.objects.create(
+        robot=robot,
+        workspace=conversation_state.workspace,
+        model=conversation_state.model,
+        execution_mode=conversation_state.mode,
+        prompt=command,
+    )
     _record_voice_recognition(robot, payload, transcript, "accepted", command=command, task=task)
-    _publish_voice_ack(robot, publish, "收到", task_id=task.id)
+    _publish_voice_ack(
+        robot,
+        publish,
+        "收到",
+        task_id=task.id,
+    )
     return {"status": "accepted", "task_id": str(task.id), "transcript": transcript}
 
 
@@ -340,10 +407,16 @@ def _voice_transcript(payload: dict) -> str:
         raise ValueError("invalid voice audio") from exc
     if not pcm or len(pcm) > 800_000:
         raise ValueError("invalid voice audio size")
+    sample_rate = int(payload.get("sample_rate") or 16000)
+    channels = int(payload.get("channels") or 1)
+    if sample_rate != 16000 or channels not in {1, 2}:
+        raise ValueError("invalid voice audio format")
+    if len(pcm) % (2 * channels):
+        raise ValueError("invalid voice audio frame alignment")
     with tempfile.TemporaryDirectory(prefix="roamerx-voice-") as directory:
         audio_path = Path(directory) / "voice.wav"
         with wave.open(str(audio_path), "wb") as output:
-            output.setnchannels(1); output.setsampwidth(2); output.setframerate(16000); output.writeframes(pcm)
+            output.setnchannels(channels); output.setsampwidth(2); output.setframerate(sample_rate); output.writeframes(pcm)
         return asr_service.transcribe_audio(str(audio_path))
 
 

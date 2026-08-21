@@ -16,6 +16,7 @@ from .models import (
     RobotCommand,
     RobotSession,
     TaskExecution,
+    TaskExecutionEvent,
     SpeechTemplate,
     TrajectoryBatchReceipt,
     TrajectoryPoint,
@@ -449,6 +450,19 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
     if envelope.message_type == "task.progress":
         previous_completed_waypoints = execution.completed_waypoints
         execution = TaskExecutionService.apply_progress(execution, payload)
+        milestone = str(payload.get("milestone") or "")
+        if milestone in {"target_dispatched", "waypoint_reached"} and execution.state_version == int(payload["state_version"]):
+            TaskExecutionEvent.objects.get_or_create(
+                task_execution=execution,
+                state_version=execution.state_version,
+                defaults={
+                    "state": execution.state,
+                    "event_type": f"task.{milestone}",
+                    "occurred_at": _event_time(payload, "reported_at", "occurred_at"),
+                    "message_id": envelope.message_id,
+                    "payload": payload,
+                },
+            )
         if execution.completed_waypoints > previous_completed_waypoints:
             _queue_waypoint_speech(execution, robot, execution.completed_waypoints - 1)
     else:

@@ -78,6 +78,8 @@ class EdgeAgentApplication:
             event_callback=self.mqtt.publish_task_event,
             start_result_callback=self._publish_start_result,
             final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
+            docking_goal_tolerance_m=config.safety.docking_goal_tolerance_m,
+            docking_goal_yaw_tolerance_rad=config.safety.docking_goal_yaw_tolerance_rad,
             standup_confirmation_timeout_seconds=config.safety.standup_confirmation_timeout_seconds,
             map_set_coordinator=self.map_set_coordinator,
             obstacle_speech=config.obstacle_speech,
@@ -462,7 +464,7 @@ class EdgeAgentApplication:
     def _handle_task_localization_loss(self) -> None:
         """Pause a task, then reseed a fresh localization node from its last good pose."""
         self.task_executor.on_localization_lost()
-        if not self.task_executor.is_paused_for_localization():
+        if self.task_executor.has_active_task() and not self.task_executor.is_paused_for_localization():
             return
         if not self._localization_recovery_lock.acquire(blocking=False):
             return
@@ -487,13 +489,33 @@ class EdgeAgentApplication:
                 "task localization lost; restarting localization from trusted pose x=%.3f y=%.3f yaw=%.3f",
                 float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
             )
-            self.navigation_stack_adapter.restart_localization()
-            self.navigation.set_initial_pose({
-                **pose,
-                "frame_id": "map",
-                "wait_seconds": 30.0,
-                "required_normal_samples": 3,
-            })
+            attempts = max(1, int(self.config.safety.localization_recovery_attempts))
+            last_error = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    if attempt == 1:
+                        self.navigation_stack_adapter.restart_localization()
+                    self.navigation.set_initial_pose({
+                        **pose,
+                        "frame_id": "map",
+                        "wait_seconds": 30.0,
+                        "required_normal_samples": 3,
+                        "require_absolute": True,
+                    })
+                    LOGGER.info("localization recovery accepted on attempt %d/%d", attempt, attempts)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning(
+                        "localization recovery attempt %d/%d failed: %s",
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                    if attempt < attempts:
+                        time.sleep(max(0.5, self.config.safety.localization_recovery_retry_seconds))
+            if last_error:
+                raise last_error
         except Exception:
             # The task remains in its safety-paused state. A later normal
             # sample must never resume it unless a recovery actually succeeds.

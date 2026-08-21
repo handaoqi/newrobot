@@ -26,6 +26,7 @@ class FakeNavigation:
         self.stand_requests = 0
         self.localization_policies = []
         self.waypoint_profiles = []
+        self.goal_precisions = []
 
     def prepare_for_navigation(self, timeout_seconds=12):
         self.stand_requests += 1
@@ -61,6 +62,9 @@ class FakeNavigation:
 
     def set_docking_profile(self, *, final_approach):
         pass
+
+    def set_goal_precision(self, *, enabled):
+        self.goal_precisions.append(enabled)
 
     def localization_decision(self):
         return {"active_source": "ndt_imu", "absolute_stable": True}
@@ -207,6 +211,35 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     assert nav.waypoint_profiles[0] == (False, False)
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.waypoint_profiles[-1] == (False, True)
+    store.close()
+
+
+def test_docking_final_waypoint_requires_precise_position_and_heading(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["docking"] = {"enabled": True, "final_waypoint_index": 2}
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+        docking_goal_tolerance_m=0.08,
+        docking_goal_yaw_tolerance_rad=0.0872665,
+    )
+
+    executor.start_task(envelope)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert nav.goal_precisions[-1] is True
+    assert nav.waypoint_profiles[-1] == (False, True)
+
+    final = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
+    nav.pose = SimpleNamespace(x=final["x"] + 0.03, y=final["y"] - 0.02, yaw=final["yaw"] + 0.04)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert results[-1][1] == "succeeded"
     store.close()
 
 

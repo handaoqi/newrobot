@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "geometry_msgs/msg/twist.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "zsl-1/highlevel.h"
@@ -33,6 +34,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         this->create_publisher<std_msgs::msg::String>("/robot_motion_state", 10);
     control_mode_publisher_ =
         this->create_publisher<std_msgs::msg::Int32>("/robot_ctrl_mode", 10);
+    fine_control_subscriber_ =
+        this->create_subscription<std_msgs::msg::Bool>(
+            "/navigation/fine_control",
+            rclcpp::QoS(1).reliable().transient_local(),
+            [this](const std_msgs::msg::Bool::SharedPtr msg) {
+              std::lock_guard<std::mutex> lk(mutex_);
+              fine_control_ = msg->data;
+              RCLCPP_INFO(this->get_logger(),
+                          "navigation fine-control profile %s (minimum stick %.2f)",
+                          fine_control_ ? "enabled" : "disabled",
+                          fine_control_ ? remote_fine_min_stick_ : remote_min_stick_);
+            });
 
     this->declare_parameter("platform", rclcpp::ParameterValue(std::string("")));
     this->declare_parameter("client_ip", rclcpp::ParameterValue(std::string("")));
@@ -55,6 +68,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->declare_parameter("remote_full_scale_vx", 3.0);
     this->declare_parameter("remote_full_scale_vy", 2.25);
     this->declare_parameter("remote_full_scale_yaw_rate", 5.25);
+    // 0.25 remains inside the XG virtual-remote dead zone.  0.45 is the
+    // lowest observed responsive command while remaining below the normal
+    // navigation floor (0.55) for final docking corrections.
+    this->declare_parameter("remote_fine_min_stick", 0.45);
     this->declare_parameter("turn_linear_limit_yaw_rate", 0.35);
     this->declare_parameter("turn_max_linear_speed", 0.10);
     this->declare_parameter("manual_override_ms", 650);
@@ -75,6 +92,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->get_parameter("remote_full_scale_vx", remote_full_scale_vx_);
     this->get_parameter("remote_full_scale_vy", remote_full_scale_vy_);
     this->get_parameter("remote_full_scale_yaw_rate", remote_full_scale_yaw_rate_);
+    this->get_parameter("remote_fine_min_stick", remote_fine_min_stick_);
     this->get_parameter("turn_linear_limit_yaw_rate",
                         turn_linear_limit_yaw_rate_);
     this->get_parameter("turn_max_linear_speed", turn_max_linear_speed_);
@@ -124,13 +142,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
 
     if (!remote_control_only_) {
       sdk_highlevel_.initRobot(client_ip_, client_port_, server_ip_);
-      const bool connected = sdk_highlevel_.checkConnect();
+      sdk_connected_ = sdk_highlevel_.checkConnect();
       RCLCPP_INFO(this->get_logger(),
                   "vel_cmd_udp_publisher started via SDK %s:%d -> %s:%d",
                   client_ip_.c_str(), client_port_, server_ip_.c_str(),
                   server_port_);
       RCLCPP_INFO(this->get_logger(), "SDK checkConnect=%s",
-                  connected ? "true" : "false");
+                  sdk_connected_ ? "true" : "false");
+      if (!sdk_connected_) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Native SDK is unavailable; navigation will use the vendor "
+                    "virtual-remote transport after stand-up");
+      }
     } else {
       RCLCPP_INFO(this->get_logger(),
                   "remote-only control bridge started on %s via zsibot remote protocol",
@@ -151,6 +174,12 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   void HandleModeSwitchCallback(const std_msgs::msg::Int32::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(mutex_);
 
+    // Nav2's mode topic is also a periodic heartbeat.  It must never revoke
+    // a live browser remote-control session by putting the body into passive.
+    if (manual_teleop_active_) {
+      return;
+    }
+
     // A manual crawl is a body posture selected by the operator.  Nav2 keeps
     // publishing its mode heartbeat even when it has no goal, so it must not
     // convert that heartbeat into a stand-up command.  A later explicit
@@ -163,10 +192,13 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       if (crawl_mode_) {
         crawl_mode_ = false;
         StartStandUp("NAV ACTIVE after crawl");
-      } else if (!nav_active_) {
-        StartStandUp("NAV ACTIVE");
+        nav_active_ = true;
       }
-      nav_active_ = true;
+      // /mode_switch_cmd is a 60-second status heartbeat after the last
+      // Nav2 velocity message, not a request to move.  In particular after a
+      // task is cancelled it must not make a freshly restarted bridge stand
+      // the dog back up.  A non-zero /cmd_vel or explicit stand_up action is
+      // the only valid way to enter active motion from idle.
       return;
     }
 
@@ -182,7 +214,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       }
     }
 
-    const auto ret = sdk_highlevel_.passive();
+    const auto ret = sdk_connected_ ? sdk_highlevel_.passive() : 0;
+    if (!sdk_connected_) {
+      RemoteSetRemote({}, {});
+    }
     crawl_mode_ = false;
     nav_active_ = false;
     standing_up_ = false;
@@ -199,6 +234,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   void HandlePlannerVelCallback(
       const geometry_msgs::msg::Twist::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(mutex_);
+    if (!sdk_connected_ && emergency_stop_latched_) {
+      // Suppress queued Nav2/teleop velocity while the dog reports its
+      // hardware safety latch. Re-enable command handling only after the
+      // dog-side state itself has left CM_EMERGENCY_STOP.
+      if (!RemoteReady() || RemoteControlMode() ==
+                                static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP)) {
+        return;
+      }
+      emergency_stop_latched_ = false;
+      RCLCPP_INFO(this->get_logger(),
+                  "virtual remote emergency-stop latch cleared by dog-side state");
+    }
     if (!remote_control_only_ && manual_crawl_lock_) {
       return;
     }
@@ -211,6 +258,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         std::fabs(msg->linear.x) < 1e-6 &&
         std::fabs(msg->linear.y) < 1e-6 &&
         std::fabs(msg->angular.z) < 1e-6;
+
     if (!nav_active_ && is_zero_command) {
       return;
     }
@@ -313,7 +361,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     } else if (action == "passive") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      ret = sdk_highlevel_.passive();
+      ret = sdk_connected_ ? sdk_highlevel_.passive() : 0;
+      if (!sdk_connected_) {
+        RemoteSetRemote({}, {});
+      }
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
@@ -321,7 +372,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     } else if (action == "release_remote") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      ret = sdk_highlevel_.passive();
+      ret = sdk_connected_ ? sdk_highlevel_.passive() : 0;
+      if (!sdk_connected_) {
+        RemoteSetRemote({}, {});
+      }
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
@@ -355,11 +409,18 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   void HandleTeleopVelCallback(
       const geometry_msgs::msg::Twist::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(mutex_);
+    manual_teleop_active_ = true;
     last_cmd_ = *msg;
     last_cmd_time_ = std::chrono::steady_clock::now();
     manual_override_until_ = last_cmd_time_ +
         std::chrono::milliseconds(manual_override_ms_);
     if (!nav_active_) {
+      // The virtual remote accepts stand-up only after the remote-control
+      // function mode has been selected.  The former SDK/navigation path sent
+      // only CMD_STAND_UP, which left the dog in PASSIVE/idle safety mode.
+      RemoteSetRemote({}, {});
+      RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       RemoteSetCmd(zsibot::CmdCode::CMD_STAND_UP);
       standing_up_ = true;
       stand_start_time_ = last_cmd_time_;
@@ -421,7 +482,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
 
     const auto now = std::chrono::steady_clock::now();
 
-    if (remote_control_only_ || manual_crawl_lock_ || now < manual_override_until_) {
+    if (remote_control_only_ || manual_teleop_active_ || !sdk_connected_ ||
+        manual_crawl_lock_ || now < manual_override_until_) {
       PublishLatestRemoteVelocity(now);
       return;
     }
@@ -525,6 +587,30 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   }
 
   void StartStandUp(const char* reason) {
+    if (!sdk_connected_) {
+      // The robot may already be owned by the vendor SDK app. In that case
+      // HighLevel::standUp()/move() return 0x3007 even though Nav2 is healthy.
+      // The vendor virtual remote is a separate, supported command path and
+      // keeps the navigation bridge functional without a second SDK socket.
+      // This controller also reports CM_EMERGENCY_STOP while its virtual
+      // remote session has not yet selected a posture/motion mode.  It is not
+      // by itself evidence of a physical e-stop, so a user-requested stand-up
+      // is allowed to issue the documented zero-stick mode-selection sequence.
+      RemoteSetRemote({}, {});
+      RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      RemoteSetCmd(zsibot::CmdCode::CMD_STAND_UP);
+      emergency_stop_latched_ = false;
+      standup_command_accepted_ = true;
+      standing_up_ = true;
+      remote_move_mode_requested_ = false;
+      stand_start_time_ = std::chrono::steady_clock::now();
+      PublishMotionState("standing_up");
+      RCLCPP_WARN(this->get_logger(),
+                  "%s: native SDK unavailable; requested stand-up via virtual remote",
+                  reason);
+      return;
+    }
     const auto ret = sdk_highlevel_.standUp();
     standup_command_accepted_ = ret == 0;
     standing_up_ = true;
@@ -543,10 +629,14 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
     if (action == "stand_up") {
+      manual_teleop_active_ = true;
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
+      RemoteSetRemote({}, {});
       RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       RemoteSetCmd(zsibot::CmdCode::CMD_STAND_UP);
+      emergency_stop_latched_ = false;
       nav_active_ = true;
       standing_up_ = true;
       stand_start_time_ = std::chrono::steady_clock::now();
@@ -557,6 +647,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
     if (action == "crawl_forward") {
+      manual_teleop_active_ = true;
       // The vendor virtual-remote library rejects CMD_CRAWL_FORWARD on the
       // point-foot XG model. Do not claim that crawl is active: a following
       // joystick frame is otherwise interpreted as ordinary standing gait.
@@ -582,14 +673,19 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     }
     if (action == "passive") {
       RemoteSetRemote({}, {});
-      RemoteSetCmd(zsibot::CmdCode::CMD_EMERGENCY_STOP);
+      // "passive" is the routine stop used by task pauses, charging contact,
+      // and the UI. It must not turn into the vendor's latched emergency-stop
+      // state. A real hardware emergency stop remains dog-side only.
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
       low_posture_lock_ = false;
+      manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
       queued_stand_cmd_.reset();
+      emergency_stop_latched_ =
+          RemoteControlMode() == static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP);
       PublishMotionState("passive");
       return;
     }
@@ -599,6 +695,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
       low_posture_lock_ = true;
+      manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
@@ -612,6 +709,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
       low_posture_lock_ = false;
+      manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
       last_cmd_.reset();
@@ -657,7 +755,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           now - stand_start_time_);
       const auto ctrl_mode = RemoteControlMode();
-      if (ctrl_mode == 1 || elapsed >= std::chrono::milliseconds(standup_settle_ms_)) {
+      const bool remote_reports_ready =
+          ctrl_mode == static_cast<int32_t>(zsibot::ControlMode::CM_STAND_UP) ||
+          ctrl_mode == static_cast<int32_t>(zsibot::ControlMode::CM_MOVE_MODE);
+      if (remote_reports_ready) {
         standing_up_ = false;
         if (queued_stand_cmd_ &&
             now - queued_stand_cmd_time_ <= std::chrono::milliseconds(1500)) {
@@ -665,15 +766,88 @@ class VelCmdUdpPublisher : public rclcpp::Node {
           last_cmd_time_ = now;
         }
         queued_stand_cmd_.reset();
+        // On this platform CMD_STAND_UP leaves the virtual remote in
+        // emergency-stop mode. A stick frame is ignored until MOVE_MODE is
+        // selected, so make that transition before forwarding Nav2 velocity.
+        RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        RemoteSetCmd(zsibot::CmdCode::CMD_MOVE_MODE);
+        remote_move_mode_requested_ = true;
+        last_remote_move_mode_request_ = now;
         PublishMotionState("standing");
+        RCLCPP_INFO(this->get_logger(),
+                    "stand-up settled; requested virtual-remote MOVE_MODE before velocity control");
+        return;
       } else if (elapsed >= std::chrono::milliseconds(standup_retry_ms_)) {
+        if (ctrl_mode ==
+            static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP)) {
+          // For the vendor virtual remote this can be its idle mode after a
+          // stand-up request.  Keep the sticks at zero and retry the documented
+          // remote-control -> stand-up transition; a real hardware interlock
+          // will simply reject it and no velocity is ever sent here.
+          RemoteSetRemote({}, {});
+          RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          RemoteSetCmd(zsibot::CmdCode::CMD_STAND_UP);
+          emergency_stop_latched_ = false;
+          stand_start_time_ = now;
+          PublishMotionState("stand_up_retrying");
+          RCLCPP_WARN(this->get_logger(),
+                      "virtual remote is in its idle safety mode; re-requested "
+                      "remote-control and stand-up while holding zero");
+          return;
+        }
+        // The virtual remote may not have connected when the first stand-up
+        // request was made. Retry after the transport is available and keep
+        // all joystick outputs at zero meanwhile.
+        RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         RemoteSetCmd(zsibot::CmdCode::CMD_STAND_UP);
         stand_start_time_ = now;
+        RCLCPP_WARN(this->get_logger(),
+                    "virtual remote control mode=%d; re-requested stand-up and holding velocity",
+                    ctrl_mode);
         return;
       } else {
         return;
       }
     }
+
+    // Do not transmit virtual-stick velocity while the vendor controller is
+    // in an emergency-stop or posture state.
+    const auto remote_ctrl_mode = RemoteControlMode();
+    if (remote_ctrl_mode ==
+        static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP)) {
+      RemoteSetRemote({}, {});
+      emergency_stop_latched_ = true;
+      nav_active_ = false;
+      standing_up_ = false;
+      last_cmd_.reset();
+      queued_stand_cmd_.reset();
+      remote_move_mode_requested_ = false;
+      PublishMotionState("emergency_stop_latched");
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "virtual remote emergency stop is latched; "
+                            "holding zero and issuing no recovery commands");
+      return;
+    }
+    // For other posture states, retry MOVE_MODE at a bounded rate so a
+    // dropped command can recover without flooding the controller.
+    if (remote_ctrl_mode != static_cast<int32_t>(zsibot::ControlMode::CM_MOVE_MODE)) {
+      if (!remote_move_mode_requested_ ||
+          now - last_remote_move_mode_request_ >= std::chrono::seconds(1)) {
+        RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        RemoteSetCmd(zsibot::CmdCode::CMD_MOVE_MODE);
+        remote_move_mode_requested_ = true;
+        last_remote_move_mode_request_ = now;
+        RCLCPP_WARN(this->get_logger(),
+                    "virtual remote control mode=%d; requested MOVE_MODE and holding velocity",
+                    remote_ctrl_mode);
+      }
+      return;
+    }
+
     const auto cmd_age = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_cmd_time_);
     if (cmd_age > std::chrono::milliseconds(cmd_timeout_ms_)) {
@@ -687,8 +861,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       float stick = std::clamp(static_cast<float>(value / max_value), -1.0f, 1.0f);
       // The robot ignores small virtual-stick values. Keep a deliberate UI
       // direction above its dead zone while preserving an exact zero command.
-      if (std::fabs(stick) > 1e-4f && std::fabs(stick) < remote_min_stick_) {
-        stick = std::copysign(remote_min_stick_, stick);
+      // The dock-contact profile has its own much smaller floor so that Nav2
+      // can make a genuine low-speed pose correction.
+      const float min_stick = fine_control_ ? remote_fine_min_stick_ : remote_min_stick_;
+      if (std::fabs(stick) > 1e-4f && std::fabs(stick) < min_stick) {
+        stick = std::copysign(min_stick, stick);
       }
       return stick;
     };
@@ -744,9 +921,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   double remote_full_scale_vx_ = 3.0;
   double remote_full_scale_vy_ = 2.25;
   double remote_full_scale_yaw_rate_ = 5.25;
+  float remote_fine_min_stick_ = 0.45f;
   double turn_linear_limit_yaw_rate_ = 0.35;
   double turn_max_linear_speed_ = 0.10;
   float remote_min_stick_ = 0.55f;
+  bool sdk_connected_ = false;
   bool remote_control_only_ = false;
   std::mutex mutex_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
@@ -758,6 +937,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       teleop_action_subscriber_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
       remote_teleop_action_subscriber_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr fine_control_subscriber_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr motion_state_publisher_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr control_mode_publisher_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -766,9 +946,14 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   mc_sdk::zsl_1::HighLevel sdk_highlevel_;
   std::shared_ptr<zsibot::ZsibotExecutor> remote_executor_;
   bool nav_active_ = false;
+  bool manual_teleop_active_ = false;
   bool standing_up_ = false;
   bool standup_command_accepted_ = false;
   bool crawl_mode_ = false;
+  bool remote_move_mode_requested_ = false;
+  bool emergency_stop_latched_ = false;
+  bool fine_control_ = false;
+  std::chrono::steady_clock::time_point last_remote_move_mode_request_{};
   bool manual_crawl_lock_ = false;
   bool low_posture_lock_ = false;
   bool crawl_zero_sent_ = false;

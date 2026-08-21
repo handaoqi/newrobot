@@ -226,6 +226,7 @@ def generate_launch_description():
         executable='odom_to_tf_broadcaster',
         parameters=[{
             'input_odom_topic': '/odom/mc_odom',
+            'output_odom_topic': '/odom/nav2',
             'publish_map_to_odom': False,
             'use_current_time': True,
         }],
