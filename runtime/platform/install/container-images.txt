@@ -1,0 +1,6 @@
+python:3.10-slim
+node:22-alpine
+nginx:1.27-alpine
+eclipse-mosquitto:2
+zlmediakit/zlmediakit:master
+

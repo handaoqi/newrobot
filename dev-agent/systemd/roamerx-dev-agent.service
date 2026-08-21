@@ -15,7 +15,7 @@ Environment=http_proxy=http://127.0.0.1:7890
 Environment=https_proxy=http://127.0.0.1:7890
 Environment=NO_PROXY=127.0.0.1,localhost
 Environment=no_proxy=127.0.0.1,localhost
-ExecStart=/usr/bin/python3 /home/dogrobot/dev-agent/run_dev_agent.py --edge-config /home/robot/edge_agent/config.yaml --config /home/dogrobot/dev-agent/config.example.yaml
+ExecStart=/usr/bin/python3 /home/dogrobot/dev-agent/run_dev_agent.py --edge-config /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml --config /home/dogrobot/dev-agent/config.example.yaml
 UMask=0002
 Restart=always
 RestartSec=5

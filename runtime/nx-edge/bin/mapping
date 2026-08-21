@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /home/dogrobot/robot/script/robot/start_mapping_real.sh "${@:-status}"
+

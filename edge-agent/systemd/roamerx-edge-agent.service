@@ -13,7 +13,9 @@ Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
 Environment=PROJECT_DIR=/home/dogrobot/robot
 Environment=EDGE_SOURCE_DIR=/home/dogrobot/edge-agent
-Environment=EDGE_RUNTIME_DIR=/home/robot/edge_agent
+Environment=EDGE_RUNTIME_DIR=/home/dogrobot/runtime/nx-edge
+Environment=EDGE_DATA_DIR=/home/dogrobot/runtime/nx-edge/data/edge-agent
+Environment=EDGE_CONFIG=/home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 ExecStart=/home/dogrobot/edge-agent/start_edge.sh
 Restart=always
 RestartSec=5

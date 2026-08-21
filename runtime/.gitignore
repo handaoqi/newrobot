@@ -1,0 +1,11 @@
+# Runtime state, credentials, generated packages, and logs never belong in Git.
+**/data/*
+!**/data/.gitkeep
+**/conf/*
+!**/conf/README.md
+!**/conf/*.example
+!**/conf/*.example.*
+**/install/cache/
+**/install/downloads/
+**/install/genisom_l1_sdk/
+**/install/*.lock.local

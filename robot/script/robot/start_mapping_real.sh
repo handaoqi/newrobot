@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
-MAP_DIR="${MAP_DIR:-/home/robot/.jszr/map}"
+MAP_DIR="${MAP_DIR:-/home/dogrobot/runtime/nx-edge/data/jszr/map}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_mapping_logs}"
 SLAM_CONFIG="${SLAM_CONFIG:-${PROJECT_DIR}/install/robot_slam/share/robot_slam/config/config.yaml}"
 REQUIRE_RTK="${REQUIRE_RTK:-0}"

@@ -64,7 +64,7 @@ add_subdirectory(lcm-types/cpp)
 #############################################################################
 add_subdirectory(udp) 
 
-set(GENISOM_L1_SDK_ROOT "/home/robot/genisom_l1_sdk_old" CACHE PATH "GENISOM L1 SDK root")
+set(GENISOM_L1_SDK_ROOT "/home/dogrobot/runtime/nx-edge/install/genisom_l1_sdk" CACHE PATH "GENISOM L1 SDK root")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set(GENISOM_L1_SDK_ARCH "x86_64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")

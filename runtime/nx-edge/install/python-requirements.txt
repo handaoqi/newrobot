@@ -1,0 +1,4 @@
+-r ../../../edge-agent/requirements.txt
+-r ../../../dev-agent/requirements.txt
+-r ../../../robot/mcp_server/requirements.txt
+

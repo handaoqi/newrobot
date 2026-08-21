@@ -12,9 +12,9 @@ This file records the latest verified state so a later debugging session can con
 - Navigation communication: `UDP`
 - Motion controller mode used by Nav2: `RL_TRACK_VELOCITY`
 - Current map yaml used by Nav2: `/home/dogrobot/robot/map/map.yaml`
-- Current PCD map used by localization: `/home/robot/.jszr/map/map.pcd`
-- Current map symlinks point to: `/home/robot/.jszr/map/20260703_170635/`
-- Only usable local map as of 2026-07-03: `/home/robot/.jszr/map/20260703_170635/`
+- Current PCD map used by localization: `/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd`
+- Current map symlinks point to: `/home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/`
+- Only usable local map as of 2026-07-03: `/home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/`
 - Deprecated local platform directory was removed:
 
 ```text
@@ -60,14 +60,14 @@ At 2026-07-03 CST:
 - Current map symlinks were switched to:
 
 ```text
-/home/robot/.jszr/map/20260703_170635/
+/home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/
 ```
 
 - This map was built after updating the ROS `base_link -> livox_frame` TF from factory calibration.
 - Localization loaded:
 
 ```text
-/home/robot/.jszr/map/map.pcd -> /home/robot/.jszr/map/20260703_170635/map.pcd
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd -> /home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/map.pcd
 ```
 
 - Localization reached `status: 3` with LiDAR `10/10` and confidence `1.00`.
@@ -321,8 +321,8 @@ Dog-side Edge Agent runtime:
 
 ```text
 systemd service: roamerx-edge-agent.service
-working dir: /home/robot/edge_agent
-runtime config: /home/robot/edge_agent/config.yaml
+working dir: /home/dogrobot/edge-agent
+runtime config: /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 repo source: /home/dogrobot/edge-agent
 robot id/code: ZSL-1A-07
 MQTT broker: 39.107.250.69:1884
@@ -394,14 +394,14 @@ GET http://39.107.250.69:8088/api/maps/9/
 active: true
 ```
 
-Local map cleanup was performed: `/home/robot/.jszr/map` now only contains:
+Local map cleanup was performed: `/home/dogrobot/runtime/nx-edge/data/jszr/map` now only contains:
 
 ```text
-/home/robot/.jszr/map/20260703_170635/
-/home/robot/.jszr/map/map.yaml -> /home/robot/.jszr/map/20260703_170635/map.yaml
-/home/robot/.jszr/map/map.pgm  -> /home/robot/.jszr/map/20260703_170635/map.pgm
-/home/robot/.jszr/map/map.pcd  -> /home/robot/.jszr/map/20260703_170635/map.pcd
-/home/robot/.jszr/map/map.txt  -> /home/robot/.jszr/map/20260703_170635/map.txt
+/home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml -> /home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/map.yaml
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pgm  -> /home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/map.pgm
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd  -> /home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/map.pcd
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.txt  -> /home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/map.txt
 ```
 
 Dog-side runtime config was updated:
@@ -486,7 +486,7 @@ DJANGO_MEDIA_ROOT=/opt/roamerx/shared/media
 Robot-side connection evidence:
 
 ```text
-python3 run_edge_agent.py --config /home/robot/edge_agent/config.yaml
+python3 run_edge_agent.py --config /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 10.232.96.112:* -> 39.107.250.69:1884
 rtmp://39.107.250.69:1935/live/dog_ZSL-1A-07_front
 ```

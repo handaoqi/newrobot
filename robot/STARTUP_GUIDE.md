@@ -104,7 +104,7 @@ source ~/genisom_roamerx_open/install/setup.bash
 #   - 发布静态 TF: base_link → livox_frame（雷达安装位置）
 ros2 launch localization localization.launch.py platform:=NX_XG3588
 ```
-> **定位原理：** 使用预先构建的全局地图点云（`/home/robot/.jszr/map/map.pcd`）与实时激光点云进行 NDT 匹配，计算机器人在地图中的位姿，并通过 TF 发布 `map→odom` 变换。
+> **定位原理：** 使用预先构建的全局地图点云（`/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd`）与实时激光点云进行 NDT 匹配，计算机器人在地图中的位姿，并通过 TF 发布 `map→odom` 变换。
 
 ### 定位配置文件
 ```
@@ -129,12 +129,12 @@ source ~/genisom_roamerx_open/install/setup.bash
 #   platform:=NX_XG3588           — 目标平台标识
 #   mc_controller_type:=RL_TRACK_VELOCITY  — 控制器类型（速度跟踪）
 #   communication_type:=LCM       — 通信方式（LCM 组播）
-#   map:=/home/robot/.jszr/map/map.yaml  — 地图文件路径
+#   map:=/home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml  — 地图文件路径
 ros2 launch robot_navigo navigation_bringup.launch.py \
   platform:=NX_XG3588 \
   mc_controller_type:=RL_TRACK_VELOCITY \
   communication_type:=LCM \
-  map:=/home/robot/.jszr/map/map.yaml
+  map:=/home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml
 ```
 > **导航栈包含的节点：**
 > - `map_server` — 加载并发布栅格地图 `/map`
@@ -215,14 +215,14 @@ ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 3}"
 
 ### 5.3 保存地图
 ```bash
-# 地图自动保存到 /home/robot/.jszr/map/
+# 地图自动保存到 /home/dogrobot/runtime/nx-edge/data/jszr/map/
 # 通过服务调用保存地图（data: 5 = 保存地图）
 ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
 ```
 
 ### 5.4 地图文件说明
 ```
-/home/robot/.jszr/map/
+/home/dogrobot/runtime/nx-edge/data/jszr/map/
 ├── map.pcd         # 全局点云地图（约 170MB，用于 NDT 定位）
 ├── map.pgm         # 栅格地图（用于导航路径规划）
 ├── map.yaml        # 栅格地图配置文件
@@ -255,7 +255,7 @@ ros2 launch robot_navigo navigation_bringup.launch.py \
   platform:=NX_XG3588 \
   mc_controller_type:=RL_TRACK_VELOCITY \
   communication_type:=LCM \
-  map:=/home/robot/.jszr/map/map.yaml &
+  map:=/home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml &
 NAV_PID=$!
 echo "导航已启动 PID=$NAV_PID"
 
@@ -332,11 +332,11 @@ pkill -9 -f "component_container_isolated"
 ### 7.4 检查地图文件
 ```bash
 # 确认地图文件存在
-ls -la /home/robot/.jszr/map/
+ls -la /home/dogrobot/runtime/nx-edge/data/jszr/map/
 
 # 查看地图配置
-cat /home/robot/.jszr/map/map.yaml
-# 应包含: image: /home/robot/.jszr/map/map.pgm（绝对路径）
+cat /home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml
+# 应包含: image: /home/dogrobot/runtime/nx-edge/data/jszr/map/map.pgm（绝对路径）
 ```
 
 ---

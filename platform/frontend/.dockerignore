@@ -1,2 +1,5 @@
 node_modules/
-*.log
+dist/
+.env
+.env.*
+npm-debug.log*

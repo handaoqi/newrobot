@@ -4,6 +4,10 @@
 **/dist/
 **/build/
 **/install/
+!runtime/
+!runtime/*/
+!runtime/*/install/
+!runtime/*/install/**
 **/log/
 *.py[cod]
 *.secret.yaml

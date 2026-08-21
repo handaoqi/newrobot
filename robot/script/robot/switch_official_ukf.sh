@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
-MAP_PCD="${MAP_PCD:-/home/robot/.jszr/map/map.pcd}"
+MAP_PCD="${MAP_PCD:-/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd}"
 LOG_DIR="/tmp/roamerx_official_ukf"
 mkdir -p "${LOG_DIR}"
 set +u

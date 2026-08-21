@@ -12,7 +12,7 @@ Current handoff state as of 2026-07-03 19:55 CST.
 - Confirmed `roamerx_edge_agent` was running as a robot-owned process:
 
 ```text
-python3 run_edge_agent.py --config /home/robot/edge_agent/config.yaml
+python3 run_edge_agent.py --config /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 ```
 
 - Discussed the right architecture for Nav2 persistence:
@@ -201,7 +201,7 @@ Dog-side edge_agent:
 /home/dogrobot/edge-agent/roamerx_edge/protocol.py
 /home/dogrobot/edge-agent/roamerx_edge/app.py
 /home/dogrobot/edge-agent/roamerx_edge/config.py
-/home/robot/edge_agent/config.yaml
+/home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 ```
 
 Runtime behavior:
@@ -271,7 +271,7 @@ MQTT:
 Dog edge agent runtime:
 
 ```text
-/home/robot/edge_agent/config.yaml
+/home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 /home/dogrobot/edge-agent
 ```
 

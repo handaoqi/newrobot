@@ -100,7 +100,7 @@ class FakeRosbagRecorder:
         self.started.append(label)
         return {
             "running": True,
-            "bag_dir": f"/home/robot/rosbags/navigation/{label}",
+            "bag_dir": f"/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/{label}",
             "started_at_unix": 100,
             "size_bytes": 0,
         }
@@ -109,7 +109,7 @@ class FakeRosbagRecorder:
         self.stopped += 1
         return {
             "running": False,
-            "bag_dir": "/home/robot/rosbags/navigation/test",
+            "bag_dir": "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/test",
             "duration_seconds": 12,
             "size_bytes": 1024,
         }

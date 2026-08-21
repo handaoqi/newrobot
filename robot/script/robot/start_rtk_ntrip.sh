@@ -11,9 +11,9 @@ source "${PROJECT_DIR}/install/setup.bash"
 source /opt/robot-driver/install/setup.bash
 set -u
 
-CONFIG_PATH="${RTK_NTRIP_CONFIG:-/home/robot/edge_agent/rtk_ntrip.yaml}"
-export RTK_CONFIG_PATH="${RTK_CONFIG_PATH:-/home/robot/edge_agent/sixents_no_sdk.ini}"
-LOG_DIR="${RTK_NTRIP_LOG_DIR:-/home/robot/.robot_launch_logs}"
+CONFIG_PATH="${RTK_NTRIP_CONFIG:-/home/dogrobot/runtime/nx-edge/conf/rtk-ntrip.yaml}"
+export RTK_CONFIG_PATH="${RTK_CONFIG_PATH:-/home/dogrobot/runtime/nx-edge/conf/sixents-no-sdk.ini}"
+LOG_DIR="${RTK_NTRIP_LOG_DIR:-/home/dogrobot/runtime/nx-edge/data/logs/robot-launch}"
 mkdir -p "$LOG_DIR"
 
 kill_pattern() {

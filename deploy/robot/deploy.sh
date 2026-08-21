@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROBOT_HOST="${ROAMERX_ROBOT_HOST:-}"
 ROBOT_PROJECT_DIR="${ROAMERX_ROBOT_PROJECT_DIR:-/home/dogrobot/robot}"
 EDGE_SOURCE_DIR="${ROAMERX_EDGE_SOURCE_DIR:-/home/dogrobot/edge-agent}"
-EDGE_RUNTIME_DIR="${ROAMERX_EDGE_RUNTIME_DIR:-/home/robot/edge_agent}"
+EDGE_RUNTIME_DIR="${ROAMERX_EDGE_RUNTIME_DIR:-/home/dogrobot/runtime/nx-edge}"
 BUILD=false
 INSTALL_SERVICE=false
 
@@ -45,7 +45,7 @@ target_path() {
   fi
 }
 
-remote_exec "mkdir -p '$ROBOT_PROJECT_DIR' '$EDGE_SOURCE_DIR' '$EDGE_RUNTIME_DIR'"
+remote_exec "mkdir -p '$ROBOT_PROJECT_DIR' '$EDGE_SOURCE_DIR' '$EDGE_RUNTIME_DIR/data/edge-agent' '$EDGE_RUNTIME_DIR/conf'"
 if [[ -n "$ROBOT_HOST" || "$(readlink -f "$REPO_ROOT/robot")" != "$(readlink -f "$ROBOT_PROJECT_DIR")" ]]; then
   rsync -a \
     --exclude='build/' --exclude='install/' --exclude='log/' \

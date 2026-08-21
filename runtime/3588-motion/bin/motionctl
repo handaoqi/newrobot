@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-status}" in
+  status) robot-launch list ;;
+  start) shift; robot-launch start "$@" ;;
+  stop) shift; robot-launch stop "$@" ;;
+  *) echo "Usage: $0 {status|start EGG...|stop EGG...}" >&2; exit 2 ;;
+esac
+

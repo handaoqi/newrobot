@@ -187,16 +187,16 @@ class MapActivationPayloadTests(TestCase):
             robot=robot,
             description=json.dumps(
                 {
-                    "source_map_dir": "/home/robot/.jszr/map/source/filter_variants/candidate",
-                    "image": "/home/robot/.jszr/map/source/map.pgm",
+                    "source_map_dir": "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/filter_variants/candidate",
+                    "image": "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/map.pgm",
                 }
             ),
         )
 
         payload = _map_activation_payload(map_data, APIRequestFactory().post("/"))
 
-        self.assertEqual(payload["local_map_dir"], "/home/robot/.jszr/map/source/filter_variants/candidate")
-        self.assertEqual(payload["local_image_path"], "/home/robot/.jszr/map/source/filter_variants/candidate/map.pgm")
+        self.assertEqual(payload["local_map_dir"], "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/filter_variants/candidate")
+        self.assertEqual(payload["local_image_path"], "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/filter_variants/candidate/map.pgm")
 
 
 class ManualMapCleanupTests(TestCase):
@@ -224,7 +224,7 @@ class ManualMapCleanupTests(TestCase):
             width=4,
             height=3,
             origin=[0.0, 0.0, 0.0],
-            description=json.dumps({"source_map_dir": "/home/robot/.jszr/map/raw-map"}),
+            description=json.dumps({"source_map_dir": "/home/dogrobot/runtime/nx-edge/data/jszr/map/raw-map"}),
         )
         self.map.pgm_file.save("raw.pgm", ContentFile(b"P5\n4 3\n255\n" + bytes([0] * 12)), save=False)
         self.map.yaml_file.save(
@@ -260,5 +260,5 @@ class ManualMapCleanupTests(TestCase):
         self.assertEqual(self.route.map_data_id, cleaned.id)
         command = RemoteCommand.objects.get(id=response.data["activation_command"]["id"])
         self.assertTrue(command.payload["manual_edit"])
-        self.assertEqual(command.payload["local_map_dir"], "/home/robot/.jszr/map/raw-map")
+        self.assertEqual(command.payload["local_map_dir"], "/home/dogrobot/runtime/nx-edge/data/jszr/map/raw-map")
         self.assertEqual(len(command.payload["pgm_sha256"]), 64)

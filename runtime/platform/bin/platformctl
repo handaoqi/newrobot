@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNTIME_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="$RUNTIME_ROOT/compose.yaml"
+ENV_FILE="$RUNTIME_ROOT/conf/platform.env"
+
+require_docker() {
+  command -v docker >/dev/null || {
+    echo "Docker is missing. Run $RUNTIME_ROOT/scripts/install-docker.sh" >&2
+    exit 1
+  }
+  docker compose version >/dev/null
+}
+
+init_runtime() {
+  install -d "$RUNTIME_ROOT"/data/{backend/db,backend/media,backend/logs,mqtt,zlmediakit}
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cp "$RUNTIME_ROOT/conf/platform.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+  if [[ ! -f "$RUNTIME_ROOT/conf/mosquitto.conf" ]]; then
+    cp "$RUNTIME_ROOT/conf/mosquitto.conf.example" "$RUNTIME_ROOT/conf/mosquitto.conf"
+  fi
+  echo "Initialized $RUNTIME_ROOT. Edit $ENV_FILE before starting."
+}
+
+compose() {
+  require_docker
+  [[ -f "$ENV_FILE" ]] || init_runtime
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
+
+case "${1:-help}" in
+  init) init_runtime ;;
+  build) compose build --pull ;;
+  up)
+    [[ -f "$RUNTIME_ROOT/conf/mosquitto.passwd" ]] || {
+      echo "Missing conf/mosquitto.passwd; run scripts/prepare-mqtt-password.sh" >&2
+      exit 1
+    }
+    compose up -d --build
+    ;;
+  down) compose down ;;
+  restart) compose restart ;;
+  status) compose ps ;;
+  logs) shift; compose logs -f --tail=200 "$@" ;;
+  backup) "$RUNTIME_ROOT/scripts/backup.sh" ;;
+  verify) "$RUNTIME_ROOT/scripts/verify.sh" ;;
+  *) echo "Usage: $0 {init|build|up|down|restart|status|logs|backup|verify}" >&2; exit 2 ;;
+esac

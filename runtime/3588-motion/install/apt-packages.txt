@@ -1,0 +1,8 @@
+bluez
+build-essential
+cmake
+libprotobuf-dev
+protobuf-compiler
+pulseaudio-utils
+rsync
+

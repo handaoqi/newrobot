@@ -1,0 +1,100 @@
+name: ${COMPOSE_PROJECT_NAME:-roamerx-platform}
+
+x-backend: &backend
+  build:
+    context: ${ROAMERX_SOURCE_ROOT:-../..}/platform/backend
+  image: roamerx/platform-backend:local
+  env_file:
+    - ./conf/platform.env
+  environment:
+    SQLITE_DB_PATH: /runtime/db/db.sqlite3
+    DJANGO_MEDIA_ROOT: /runtime/media
+    MQTT_HOST: mqtt
+    MQTT_PORT: "1883"
+    MQTT_TLS_ENABLED: "false"
+  volumes:
+    - ./data/backend/db:/runtime/db
+    - ./data/backend/media:/runtime/media
+    - ./data/backend/logs:/runtime/logs
+  restart: unless-stopped
+
+services:
+  backend:
+    <<: *backend
+    container_name: roamerx-platform-api
+    command:
+      - sh
+      - -c
+      - >-
+        python manage.py migrate --noinput &&
+        gunicorn config.wsgi:application --bind 0.0.0.0:8000
+        --worker-class gthread --workers 3 --threads 8 --timeout 300
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/maps/', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 8
+      start_period: 30s
+
+  device-worker:
+    <<: *backend
+    container_name: roamerx-device-worker
+    command: ["python", "manage.py", "run_device_worker"]
+    depends_on:
+      mqtt:
+        condition: service_healthy
+
+  patrol-scheduler:
+    <<: *backend
+    container_name: roamerx-patrol-scheduler
+    command: ["python", "manage.py", "run_patrol_scheduler", "--interval", "10"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ${ROAMERX_SOURCE_ROOT:-../..}/platform/frontend
+    image: roamerx/platform-frontend:local
+    container_name: roamerx-platform-frontend
+    restart: unless-stopped
+    ports:
+      - "${PLATFORM_HTTP_PORT:-8088}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+      zlmediakit:
+        condition: service_started
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: roamerx-mqtt
+    restart: unless-stopped
+    env_file:
+      - ./conf/platform.env
+    ports:
+      - "${MQTT_EXTERNAL_PORT:-1884}:1883"
+    volumes:
+      - ./conf/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./conf/mosquitto.passwd:/mosquitto/config/passwd:ro
+      - ./data/mqtt:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t '$$SYS/broker/uptime' -C 1 -W 5 >/dev/null"]
+      interval: 15s
+      timeout: 8s
+      retries: 8
+
+  zlmediakit:
+    image: zlmediakit/zlmediakit:master
+    container_name: roamerx-zlmediakit
+    restart: unless-stopped
+    ports:
+      - "${RTMP_EXTERNAL_PORT:-1935}:1935"
+      - "${ZLM_HTTP_EXTERNAL_PORT:-8080}:80"
+      - "8554:554"
+      - "10000:10000/tcp"
+      - "10000:10000/udp"
+      - "8000:8000/udp"
+      - "9000:9000/udp"
+    volumes:
+      - ./data/zlmediakit:/opt/media/bin/www/record

@@ -8,7 +8,7 @@ cannot block navigation telemetry or command handling.
 
 ```bash
 python3 run_dev_agent.py \
-  --edge-config /home/robot/edge_agent/config.yaml \
+  --edge-config /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml \
   --config config.example.yaml
 ```
 

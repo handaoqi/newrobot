@@ -4,7 +4,9 @@ set -eo pipefail
 EDGE_SOURCE_DIR="${EDGE_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "${EDGE_SOURCE_DIR}/../robot" && pwd)}"
 SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
-EDGE_RUNTIME_DIR="${EDGE_RUNTIME_DIR:-/home/robot/edge_agent}"
+EDGE_RUNTIME_DIR="${EDGE_RUNTIME_DIR:-/home/dogrobot/runtime/nx-edge}"
+EDGE_DATA_DIR="${EDGE_DATA_DIR:-${EDGE_RUNTIME_DIR}/data/edge-agent}"
+EDGE_CONFIG="${EDGE_CONFIG:-${EDGE_RUNTIME_DIR}/conf/edge-agent.yaml}"
 
 bash "${SCRIPT_DIR}/wait_for_valid_time.sh"
 
@@ -24,7 +26,7 @@ if ! pgrep -x rmw_zenohd > /dev/null 2>&1; then
     exit 1
 fi
 
-COOLING_MARKER="${EDGE_RUNTIME_DIR}/data/cooling_standby"
+COOLING_MARKER="${EDGE_DATA_DIR}/cooling_standby"
 if [[ -f "$COOLING_MARKER" ]]; then
     echo "[start_edge] cooling standby active; sensor startup skipped"
 else
@@ -35,4 +37,4 @@ fi
 
 export PYTHONPATH="${EDGE_SOURCE_DIR}:${PYTHONPATH:-}"
 cd "${EDGE_SOURCE_DIR}"
-exec python3 "${EDGE_SOURCE_DIR}/run_edge_agent.py" --config "${EDGE_RUNTIME_DIR}/config.yaml"
+exec python3 "${EDGE_SOURCE_DIR}/run_edge_agent.py" --config "${EDGE_CONFIG}"

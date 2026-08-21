@@ -103,7 +103,7 @@ class MediaConfig:
 
 @dataclass
 class MappingConfig:
-    map_dir: str = "/home/robot/.jszr/map"
+    map_dir: str = "/home/dogrobot/runtime/nx-edge/data/jszr/map"
     log_dir: str = "/tmp/roamerx_mapping_logs"
     ros_setup: str = "/opt/ros/humble/setup.bash"
     workspace_setup: str = "~/genisom_roamerx_open/install/setup.bash"
@@ -208,8 +208,8 @@ class ChargeControlConfig:
 
 @dataclass
 class PowerModeConfig:
-    state_path: str = "/home/robot/edge_agent/data/power_mode.json"
-    cooling_marker_path: str = "/home/robot/edge_agent/data/cooling_standby"
+    state_path: str = "/home/dogrobot/runtime/nx-edge/data/edge-agent/power_mode.json"
+    cooling_marker_path: str = "/home/dogrobot/runtime/nx-edge/data/edge-agent/cooling_standby"
     monitoring_service: str = "roamerx-bike-bot.service"
     teleop_bridge_service: str = "roamerx-teleop-bridge.service"
     navigation_script: str = "/home/dogrobot/robot/script/robot/start_navigation_real.sh"

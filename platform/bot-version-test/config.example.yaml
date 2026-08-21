@@ -31,7 +31,7 @@ stream:
   extra_args: []
 
 model:
-  path: models/yolo11n.onnx
+  path: /home/dogrobot/runtime/nx-edge/install/models/yolo11n.onnx
   backend: onnxruntime
   confidence: 0.7
   nms_iou_threshold: 0.45
@@ -88,10 +88,10 @@ display:
   max_width: 1280
 
 storage:
-  telemetry_log_path: data/telemetry/telemetry.jsonl
-  app_log_path: data/logs/bike-bot.log
-  run_stream_log_path: data/logs/run-stream.log
-  stream_log_path: data/logs/ffmpeg-stream.log
+  telemetry_log_path: /home/dogrobot/runtime/nx-edge/data/vision/telemetry/telemetry.jsonl
+  app_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/bike-bot.log
+  run_stream_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/run-stream.log
+  stream_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/ffmpeg-stream.log
 
 runtime:
   mode: auto

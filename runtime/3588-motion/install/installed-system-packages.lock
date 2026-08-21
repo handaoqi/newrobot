@@ -1,0 +1,8 @@
+bluez	5.64-0ubuntu1.4	arm64
+build-essential	12.9ubuntu3	arm64
+cmake	3.22.1-1ubuntu1.22.04.2	arm64
+libprotobuf-dev	3.12.4-1ubuntu7.22.04.6	arm64
+protobuf-compiler	3.12.4-1ubuntu7.22.04.6	arm64
+pulseaudio-utils	1:15.99.1+dfsg1-1ubuntu2.2	arm64
+rsync	3.2.7-0ubuntu0.22.04.4	arm64
+

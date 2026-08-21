@@ -16,7 +16,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(ROAMERX_DATA_ROOT "$ENV{ROAMERX_DATA_ROOT}" CACHE PATH
     "Runtime directory containing RoamerX maps and device data")
 if(ROAMERX_DATA_ROOT STREQUAL "")
-  set(ROAMERX_DATA_ROOT "$ENV{HOME}/.jszr")
+  set(ROAMERX_DATA_ROOT "/home/dogrobot/runtime/nx-edge/data/jszr")
 endif()
 add_definitions(-DROOT_DIR="${ROAMERX_DATA_ROOT}")
 message(STATUS "RoamerX runtime data root: ${ROAMERX_DATA_ROOT}")

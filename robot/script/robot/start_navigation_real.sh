@@ -3,7 +3,8 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
-MAP_YAML="${MAP_YAML:-/home/robot/.jszr/map/map.yaml}"
+RUNTIME_DATA_ROOT="${ROAMERX_DATA_ROOT:-/home/dogrobot/runtime/nx-edge/data/jszr}"
+MAP_YAML="${MAP_YAML:-${RUNTIME_DATA_ROOT}/map/map.yaml}"
 PCD_MAP="${PCD_MAP:-}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_nav_logs}"
 PLATFORM="${PLATFORM:-NX_XG3588}"
@@ -24,12 +25,12 @@ mkdir -p "${LOG_DIR}"
 # for localization when it belongs to the same active map; allow PCD_MAP to
 # override this behavior for explicit operator experiments.
 if [ -z "${PCD_MAP}" ]; then
-  ACTIVE_PCD="$(readlink -f /home/robot/.jszr/map/map.pcd 2>/dev/null || true)"
+  ACTIVE_PCD="$(readlink -f "${RUNTIME_DATA_ROOT}/map/map.pcd" 2>/dev/null || true)"
   RAW_PCD="$(dirname "$(dirname "${ACTIVE_PCD}")")/map.raw_dynamic_unfiltered.pcd"
   if [ -f "${RAW_PCD}" ]; then
     PCD_MAP="${RAW_PCD}"
   else
-    PCD_MAP="/home/robot/.jszr/map/map.pcd"
+    PCD_MAP="${RUNTIME_DATA_ROOT}/map/map.pcd"
   fi
 fi
 

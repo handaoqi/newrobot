@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICES=(
+  roamerx-edge-agent.service
+  roamerx-dev-agent.service
+  roamerx-bike-bot.service
+  roamerx-robot-mcp.service
+  roamerx-teleop-bridge.service
+  roamerx-local-asr.service
+)
+
+case "${1:-status}" in
+  status)
+    systemctl --no-pager --full status "${SERVICES[@]}" || true
+    ;;
+  start|stop|restart)
+    sudo systemctl "$1" "${SERVICES[@]}"
+    ;;
+  verify)
+    "$(dirname "$0")/../scripts/verify-runtime.sh"
+    ;;
+  *) echo "Usage: $0 {status|start|stop|restart|verify}" >&2; exit 2 ;;
+esac
+

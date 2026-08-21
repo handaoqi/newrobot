@@ -52,6 +52,22 @@ scripts/deploy_cloud_platform.sh
 
 仅更新页面可用 `--frontend-only`；仅更新 Django 后端可用 `--backend-only`。脚本在本机构建 Vue，再同步到云端并检查服务状态；不会重启机器狗端 Edge Agent。
 
+### Docker 生产运行时
+
+`platform/docker-compose.yml` 仅用于本地 playground。生产 Compose、持久目录和操作脚本统一位于仓库根目录 `runtime/platform/`：
+
+```bash
+cd /home/dogrobot/runtime/platform
+sudo scripts/install-docker.sh
+bin/platformctl init
+# 填写 conf/platform.env
+scripts/prepare-mqtt-password.sh
+bin/platformctl up
+bin/platformctl verify
+```
+
+推送到云端使用 `runtime/platform/scripts/deploy-cloud.sh [--start]`。Docker 与旧 systemd 平台不可同时运行。
+
 ## 演示账号
 
 - 用户名：`operator`

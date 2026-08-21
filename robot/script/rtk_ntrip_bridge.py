@@ -74,7 +74,9 @@ class RtkPosition:
 class NtripBridge(Node):
     def __init__(self):
         super().__init__("rtk_ntrip_bridge")
-        config_path = self.declare_parameter("config_path", "/home/robot/edge_agent/rtk_ntrip.yaml").value
+        config_path = self.declare_parameter(
+            "config_path", "/home/dogrobot/runtime/nx-edge/conf/rtk-ntrip.yaml"
+        ).value
         self.config = self.load_config(config_path)
         self.position = RtkPosition()
         self.position_lock = threading.Lock()

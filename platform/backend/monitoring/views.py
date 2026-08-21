@@ -353,7 +353,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         # Older uploaded maps did not store the edge-local image path in
         # description. Their name is the edge session directory, e.g.
         # 20260703_170635, so infer the local source directory from it.
-        local_map_dir = f"/home/robot/.jszr/map/{map_data.name}"
+        local_map_dir = f"/home/dogrobot/runtime/nx-edge/data/jszr/map/{map_data.name}"
         local_image_path = f"{local_map_dir}/map.pgm"
     map_version = f"legacy-mapdata-{map_data.id}"
     edit_metadata = map_data.edit_metadata if isinstance(map_data.edit_metadata, dict) else {}
@@ -2242,7 +2242,7 @@ class MapDataManualCleanView(APIView):
         base_map_id = base_map_id or source.id
         source_map_dir = str(source_description.get("source_map_dir") or "")
         if not source_map_dir and source.name:
-            source_map_dir = f"/home/robot/.jszr/map/{source.name}"
+            source_map_dir = f"/home/dogrobot/runtime/nx-edge/data/jszr/map/{source.name}"
         edit_metadata = {
             "mode": "manual_cleanup",
             "base_map_id": base_map_id,

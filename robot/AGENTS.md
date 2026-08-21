@@ -68,16 +68,16 @@ When `/cmd_vel` stops for about 1 second, mode returns to `170` and `vel_cmd_udp
 Current local map symlinks should point to:
 
 ```text
-/home/robot/.jszr/map/20260703_170635/
+/home/dogrobot/runtime/nx-edge/data/jszr/map/20260703_170635/
 ```
 
 Important local files:
 
 ```text
-/home/robot/.jszr/map/map.yaml
-/home/robot/.jszr/map/map.pgm
-/home/robot/.jszr/map/map.pcd
-/home/robot/.jszr/map/map.txt
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.yaml
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pgm
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.pcd
+/home/dogrobot/runtime/nx-edge/data/jszr/map/map.txt
 ```
 
 ROS LiDAR TF currently uses the factory calibration inverse:
@@ -207,7 +207,7 @@ Dog-side edge agent:
 ```text
 systemd service: roamerx-edge-agent.service
 working dir: /home/dogrobot/edge-agent
-runtime config: /home/robot/edge_agent/config.yaml
+runtime config: /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 repo source: /home/dogrobot/edge-agent
 ```
 
