@@ -56,9 +56,13 @@ preflight() {
     echo "Insufficient disk space: need at least ${min_free_gb} GiB free." >&2
     exit 1
   }
-  if command -v systemctl >/dev/null && systemctl is-active --quiet roamerx-center-api.service 2>/dev/null; then
-    echo "Legacy platform services are active; stop them before Docker cutover." >&2
-    exit 1
+  if command -v systemctl >/dev/null; then
+    for legacy_unit in roamerx-center-api.service roamerx-device-worker.service roamerx-patrol-scheduler.service; do
+      if systemctl is-active --quiet "$legacy_unit" 2>/dev/null; then
+        echo "Legacy platform service is active: $legacy_unit; stop it before Docker cutover." >&2
+        exit 1
+      fi
+    done
   fi
   compose config --quiet
   echo "Platform preflight passed."
@@ -78,5 +82,5 @@ case "${1:-help}" in
   logs) shift; compose logs -f --tail=200 "$@" ;;
   backup) "$RUNTIME_ROOT/scripts/backup.sh" ;;
   verify) "$RUNTIME_ROOT/scripts/verify.sh" ;;
-  *) echo "Usage: $0 {init|build|up|down|restart|status|logs|backup|verify}" >&2; exit 2 ;;
+  *) echo "Usage: $0 {init|preflight|build|up|down|restart|status|logs|backup|verify}" >&2; exit 2 ;;
 esac
