@@ -2,6 +2,14 @@
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
 
+# Shared environment: keep these before the interactive-shell guard so login
+# shells that source .bashrc also receive the same values.
+export ROS_DOMAIN_ID=24
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export no_proxy=localhost,127.0.0.1,192.168.0.0/16
+
 # If not running interactively, don't do anything
 case $- in
     *i*) ;;
@@ -120,9 +128,6 @@ source /opt/ros/humble/setup.bash
 
 export PATH=$PATH:/usr/local/cuda/bin
 
-export ROS_DOMAIN_ID=24
-export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-
 source /home/dogrobot/robot/install/setup.bash
 
 # 自动设 DISPLAY（从 Windows SSH 过来时，把图形窗口传到 Windows 桌面）
@@ -132,6 +137,7 @@ fi
 
 # 自动启动机器人基础服务（雷达 + zenoh + 点云转激光）。
 # 冷却待机时禁止拉起；互斥锁避免多个登录会话重复启动。
+roamerx_lock_file="${XDG_RUNTIME_DIR:-/tmp}/roamerx-start-base-${UID}.lock"
 if [ ! -f /home/dogrobot/edge-agent/data/cooling_standby ]; then
     (
         flock -n 9 || exit 0
@@ -139,12 +145,9 @@ if [ ! -f /home/dogrobot/edge-agent/data/cooling_standby ]; then
             echo "[auto] 启动基础服务..."
             bash /home/dogrobot/robot/script/start_base.sh &>/dev/null
         fi
-    ) 9>/tmp/roamerx-start-base.lock &
+    ) 9>"$roamerx_lock_file" &
 fi
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
-export http_proxy=http://127.0.0.1:7890
-export https_proxy=http://127.0.0.1:7890
-export no_proxy=localhost,127.0.0.1,192.168.0.0/16
