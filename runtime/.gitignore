@@ -9,3 +9,9 @@
 **/install/downloads/
 **/install/genisom_l1_sdk/
 **/install/*.lock.local
+
+# Small legacy resources moved from the repository root remain reproducible.
+!nx-edge/data/jszr/legacy-robot-map/
+!nx-edge/data/jszr/legacy-robot-map/*
+!nx-edge/data/rosbags/legacy-patrol-data/
+!nx-edge/data/rosbags/legacy-patrol-data/*
