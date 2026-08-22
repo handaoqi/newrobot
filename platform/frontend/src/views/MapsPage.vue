@@ -57,7 +57,26 @@ const mappingForm = ref({
 })
 
 function setMappingStepFeedback(step, success, message) {
-  mappingStepFeedback.value = { step, success, message, at: Date.now() }
+  const outdoor = mappingForm.value.mapping_type === 'outdoor'
+  const stepNumbers = outdoor
+    ? {
+        '启动并检查': 2,
+        '启动 SLAM 并检查航向': 2,
+        '锁定 ENU 原点': 3,
+        '航向复核': 4,
+        '停止并保存地图': 5,
+      }
+    : {
+        '启动并检查': 2,
+        '检查确认': 3,
+        '停止并保存地图': 4,
+      }
+  const normalizedStep = stepNumbers[step]
+    ? `第${stepNumbers[step]}步：${step}命令`
+    : step === '取消建图'
+      ? '清理命令：取消建图'
+      : step
+  mappingStepFeedback.value = { step: normalizedStep, success, message, at: Date.now() }
 }
 let statusTimer = null
 let lastSlamAlert = ''
@@ -406,7 +425,10 @@ const canSaveMapping = computed(() => (
   !mappingCommandInFlight.value && (slamDiverged.value || (mappingState.value === 'mapping' && readyForSave.value))
 ))
 const canCancelMapping = computed(() => (
-  isActiveMapping.value || Boolean(mappingStatus.value?.result?.process_alive) || ['waiting_quality', 'quality_holding'].includes(originState.value)
+  isError.value
+  || isActiveMapping.value
+  || Boolean(mappingStatus.value?.result?.process_alive)
+  || ['waiting_quality', 'quality_holding', 'failed'].includes(originState.value)
 ))
 const showMappingReadiness = computed(() => (
   Boolean(mappingStatus.value?.result?.process_alive)
@@ -641,6 +663,10 @@ async function handleStartMapping() {
   }
   mappingBusy.value = true
   const prepareOrigin = isOutdoorMapping.value && !originLocked.value
+  const startStep = prepareOrigin
+    ? '启动并检查'
+    : (isOutdoorMapping.value ? '启动 SLAM 并检查航向' : '启动并检查')
+  setMappingStepFeedback(startStep, true, '正在下发命令，请等待 Edge Agent 响应…')
   try {
     const payload = {
       map_name: mappingForm.value.map_name,
@@ -656,13 +682,11 @@ async function handleStartMapping() {
       await startRobotMappingSlam(mappingForm.value.robot, payload)
     }
     await refreshMappingStatus()
-    setMappingStepFeedback(
-      prepareOrigin ? '启动并检查' : (isOutdoorMapping.value ? '启动 SLAM 并检查航向' : '启动并检查'),
-      true,
-      prepareOrigin ? '传感器检查完成，已停在“锁定原点”，等待点击锁定按钮' : '已进入下一检查步骤，等待人工确认后继续',
-    )
+    setMappingStepFeedback(startStep, true, prepareOrigin
+      ? '传感器检查完成，已停在“锁定原点”，等待点击锁定按钮'
+      : '已进入下一检查步骤，等待人工确认后继续')
   } catch (error) {
-    setMappingStepFeedback('启动并检查', false, error.message)
+    setMappingStepFeedback(startStep, false, error.message)
     alert(`开始建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -696,6 +720,7 @@ async function handleLockOrigin() {
     return
   }
   mappingBusy.value = true
+  setMappingStepFeedback('锁定 ENU 原点', true, '正在下发锁定原点命令，请等待 RTK 质量窗口…')
   try {
     await startRobotMappingOrigin(mappingForm.value.robot, {
       map_name: mappingForm.value.map_name,
@@ -721,19 +746,17 @@ async function handleBeginMapping() {
     : '确认 IMU 与 SLAM 位姿检查通过，并开始正式采集数据和关键帧？'
   if (!confirm(prompt)) return
   mappingBusy.value = true
+  const beginStep = isOutdoorMapping.value ? '航向复核' : '检查确认'
+  setMappingStepFeedback(beginStep, true, '正在下发开始建图命令，请等待 Edge Agent 响应…')
   try {
     await beginRobotMapping(mappingForm.value.robot, {
       mapping_session_id: workflowSessionId.value,
       heading_check_confirmed: isOutdoorMapping.value,
     })
     await refreshMappingStatus()
-    setMappingStepFeedback(
-      isOutdoorMapping.value ? '航向复核' : '检查确认',
-      true,
-      '人工确认已完成，正式关键帧采集已开始',
-    )
+    setMappingStepFeedback(beginStep, true, '人工确认已完成，正式关键帧采集已开始')
   } catch (error) {
-    setMappingStepFeedback(isOutdoorMapping.value ? '航向复核' : '检查确认', false, error.message)
+    setMappingStepFeedback(beginStep, false, error.message)
     alert(`开始正式建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -743,13 +766,45 @@ async function handleBeginMapping() {
 async function handleSaveMapping() {
   if (!mappingForm.value.robot) return
   mappingBusy.value = true
+  setMappingStepFeedback('停止并保存地图', true, '正在下发停止并保存命令，请等待地图打包完成…')
   try {
     await saveRobotMapping(mappingForm.value.robot, {
       map_name: mappingForm.value.map_name,
     })
-    await refreshMappingStatus()
+    // The save endpoint only queues the command. Keep polling through
+    // packaging/upload so the newly uploaded map is actually visible before
+    // returning the workflow to the configuration step.
+    const deadline = Date.now() + 15 * 60 * 1000
+    while (Date.now() < deadline) {
+      await refreshMappingStatus()
+      if (['failed', 'command_failed', 'command_rejected', 'command_timed_out'].includes(mappingState.value)) {
+        throw new Error(failureMessage.value)
+      }
+      if (!mappingCommandInFlight.value && ['exited', 'completed', 'cancelled', 'idle'].includes(mappingState.value)) break
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    if (mappingCommandInFlight.value || ['saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)) {
+      throw new Error('地图仍在上传，请稍后点击“刷新状态”查看结果')
+    }
+    const uploadedMapId = mappingStatus.value?.result?.upload_result?.id || mappingStatus.value?.latest_map?.id
     await loadMaps()
-    setMappingStepFeedback('停止并保存地图', true, '保存命令已执行，地图正在完成打包/上传')
+    if (uploadedMapId) {
+      selectedMapId.value = uploadedMapId
+      const syncDeadline = Date.now() + 60 * 1000
+      while (Date.now() < syncDeadline) {
+        await refreshMappingStatus()
+        if (robotCurrentMapId.value === String(uploadedMapId)) break
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
+    }
+    const synced = uploadedMapId && robotCurrentMapId.value === String(uploadedMapId)
+    setMappingStepFeedback(
+      '停止并保存地图',
+      true,
+      synced
+        ? `地图已上传平台并自动下发机器狗，平台/机器狗已同步（地图 #${uploadedMapId}）`
+        : '地图已上传平台，机器狗地图切换命令已下发；请刷新状态确认应用完成',
+    )
   } catch (error) {
     setMappingStepFeedback('停止并保存地图', false, error.message)
     alert(`停止并保存失败: ${error.message}`)
@@ -762,6 +817,7 @@ async function handleCancelMapping() {
   if (!mappingForm.value.robot) return
   if (!confirm('确定要取消本次建图吗？')) return
   mappingBusy.value = true
+  setMappingStepFeedback('取消建图', true, '正在下发取消建图命令，清理当前状态…')
   try {
     if (!mappingProcessAlive.value && ['ready', 'waiting_quality', 'quality_holding', 'locked'].includes(originState.value)) {
       await cancelRobotMappingOrigin(mappingForm.value.robot, { mapping_session_id: workflowSessionId.value })

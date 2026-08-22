@@ -1658,6 +1658,7 @@ a { color: inherit; }
   background: rgba(20, 82, 120, 0.66);
 }
 .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.robot-metrics-stack { grid-template-columns: 1fr; gap: 12px; margin-top: 20px; }
 .metric-card strong { display: block; font-size: 28px; }
 .metric-card small { display: block; margin-top: 8px; color: var(--muted); }
 .battery-metric-card {
@@ -1915,7 +1916,7 @@ a { color: inherit; }
 [data-theme="dark"] .event-thumb {
   filter: brightness(0.82) saturate(1.08);
 }
-.data-grid { display: grid; grid-template-columns: 480px minmax(0, 1fr); gap: 20px; }
+.data-grid { display: grid; grid-template-columns: 500px minmax(0, 1fr); gap: 20px; }
 .event-tools {
   display: grid;
   grid-template-columns: minmax(260px, 420px) 68px minmax(150px, 190px);
@@ -2200,13 +2201,12 @@ a { color: inherit; }
   flex: 0 1 82px;
 }
 .list-panel {
-  max-height: min(68vh, 650px);
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
   display: grid;
   gap: 14px;
   align-content: start;
-  padding-right: 14px;
-  scrollbar-gutter: stable;
+  padding-right: 22px;
 }
 .list-panel::-webkit-scrollbar {
   width: 10px;
@@ -2837,14 +2837,15 @@ a { color: inherit; }
   }
 
   .data-grid {
-    grid-template-columns: 430px minmax(0, 1fr);
+    grid-template-columns: 500px minmax(0, 1fr);
     gap: 16px;
   }
 
   .list-panel {
-    max-height: min(calc(100vh - 205px), 620px);
+    max-height: none;
+    overflow: visible;
     gap: 11px;
-    padding-right: 12px;
+    padding-right: 18px;
   }
 
   .list-panel .table-card {
