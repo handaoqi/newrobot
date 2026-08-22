@@ -452,6 +452,7 @@ const canLockOrigin = computed(() => (
 ))
 const canStartSlam = computed(() => (
   connectionStatus.value === 'online'
+  && !isError.value
   && !mappingProcessAlive.value
   && !mappingCommandInFlight.value
   && (!isOutdoorMapping.value || originLocked.value || ['idle', 'cancelled', 'failed'].includes(originState.value))
@@ -825,6 +826,10 @@ async function handleCancelMapping() {
       await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel', mapping_session_id: workflowSessionId.value })
     }
     await refreshMappingStatus()
+    // Cancellation is the only recovery path from a failed workflow. Clear
+    // the terminal snapshot so the operator is visibly returned to step one;
+    // the next status poll will repopulate the fresh idle state from Edge.
+    mappingStatus.value = null
     setMappingStepFeedback('取消建图', true, '建图流程已取消并停止')
   } catch (error) {
     setMappingStepFeedback('取消建图', false, error.message)
