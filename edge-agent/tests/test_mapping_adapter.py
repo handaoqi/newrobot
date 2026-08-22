@@ -6,6 +6,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from roamerx_edge.config import MappingConfig
 from roamerx_edge.mapping_adapter import MappingAdapter, MappingSession
@@ -55,6 +56,93 @@ def test_start_mapping_stops_rosbag_when_slam_fails(tmp_path, monkeypatch):
         adapter.start_mapping({"map_name": "park", "record_rosbag": True})
 
     assert calls == ["start_bag", "stop_bag"]
+
+
+def test_slam_warmup_does_not_enable_formal_capture(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda: calls.append("stop_nav"))
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors"))
+    monkeypatch.setattr(adapter, "_ensure_slam_process", lambda: calls.append("slam"))
+    monkeypatch.setattr(adapter, "_call_map_state", lambda data: calls.append(("state", data)))
+    monkeypatch.setattr(adapter, "_rosbag_status", lambda: {"running": False})
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "state": adapter.session.state,
+        "mapping_capture_enabled": adapter.session.mapping_capture_enabled,
+    })
+
+    result = adapter.start_slam_warmup({"map_name": "inside", "mapping_type": "indoor"})
+
+    assert result == {"state": "slam_warmup", "mapping_capture_enabled": False}
+    assert calls == ["stop_nav", "sensors", "slam", ("state", 7)]
+
+
+def test_outdoor_warmup_requires_locked_origin(tmp_path):
+    adapter = make_adapter(tmp_path)
+
+    with pytest.raises(ProtocolError) as error:
+        adapter.start_slam_warmup({"map_name": "outside", "mapping_type": "outdoor"})
+
+    assert error.value.code == "MAPPING_ORIGIN_REQUIRED"
+
+
+def test_indoor_warmup_rejects_outdoor_scene_scope(tmp_path):
+    adapter = make_adapter(tmp_path)
+
+    with pytest.raises(ProtocolError) as error:
+        adapter.start_slam_warmup({"mapping_type": "indoor", "scene_scope": "outdoor"})
+
+    assert error.value.code == "MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN"
+
+
+def test_origin_topic_sample_requires_position_and_heading_fixed(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    messages = {
+        "/fix": {"status": {"status": 2}, "latitude": 39.9, "longitude": 116.4, "altitude": 42.0},
+        "/rtk_pvh": {
+            "bestnav": {
+                "p_sol_status": 0, "pos_type": 48, "latitude_deg": 39.9,
+                "longitude_deg": 116.4, "altitude_m": 42.0, "lat_std": 0.008, "lon_std": 0.009,
+            },
+            "heading": {"sol_status": 0, "heading_type": 4, "base_line": 0.8, "heading_deg": 90.0, "heading_std": 0.4},
+        },
+        "/rtk/ntrip_status": {"data": "quality: rtk_fixed\nage_sec: 0.1"},
+    }
+    monkeypatch.setattr(adapter, "_echo_topic_once", lambda topic: messages[topic])
+
+    sample = adapter._sample_origin_topics()
+
+    assert sample.position_fixed is True
+    assert sample.heading_fixed is True
+    assert sample.horizontal_std_m == pytest.approx(0.009)
+
+
+def test_outdoor_export_merges_lock_evidence_with_slam_alignment(tmp_path):
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession(
+        "mapping-session", "outside", "", "saving", "now", "now",
+        scene_scope="outdoor", mapping_type="outdoor",
+    )
+    adapter._origin_file.write_text(yaml.safe_dump({
+        "alignment_locked": True,
+        "origin_lock_session_id": "origin-session",
+        "origin_latitude": 39.9,
+        "origin_longitude": 116.4,
+        "origin_altitude": 42.0,
+        "position_spread_m": 0.012,
+        "lock_duration_seconds": 60,
+    }))
+    work = tmp_path / "20260822_120000_001"
+    work.mkdir()
+    exported = work / "gnss_origin.yaml"
+    exported.write_text(yaml.safe_dump({"alignment_locked": 1, "enu_to_map_yaw": 0.25}))
+
+    adapter._merge_locked_origin_metadata(work)
+
+    merged = yaml.safe_load(exported.read_text())
+    assert merged["origin_lock_session_id"] == "origin-session"
+    assert merged["position_spread_m"] == pytest.approx(0.012)
+    assert merged["enu_to_map_yaw"] == pytest.approx(0.25)
 
 
 def test_status_prefers_active_progress_directory(tmp_path):

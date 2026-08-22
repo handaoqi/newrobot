@@ -16,6 +16,7 @@ namespace robot::slam
         STABLE,
         PASSIVE,
         READY,    // The SLAM system is ready to start processing.
+        WARMUP,   // Estimator runs, but formal keyframe capture stays closed.
         ACTIVE,   // The SLAM system is actively running and processing data.
         ERROR,    // The SLAM system encountered an error.
         SAVE,     // The SLAM system encountered an save.

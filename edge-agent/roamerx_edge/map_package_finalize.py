@@ -9,7 +9,13 @@ from typing import Any
 
 import yaml
 
-from .map_coordinate import SCHEMA_VERSION, MapConstraintError, new_map_constraints
+from .map_coordinate import (
+    MAP_RTK_ORIGIN_REQUIRED,
+    SCHEMA_VERSION,
+    MapConstraintError,
+    gnss_origin_is_fixed,
+    new_map_constraints,
+)
 from .map_loop_closure import finalize_loop_closure
 from .recording_manifest import write_recording_manifest
 
@@ -26,9 +32,13 @@ def finalize_map_package(
     root = Path(map_dir)
     root.mkdir(parents=True, exist_ok=True)
     gnss_origin = _load_yaml(root / "gnss_origin.yaml")
+    if requested_scene_scope in {"transition", "outdoor"} and not gnss_origin_is_fixed(gnss_origin):
+        raise MapConstraintError(MAP_RTK_ORIGIN_REQUIRED, "outdoor and transition maps require a locked GNSS origin")
     try:
         constraints = new_map_constraints(gnss_origin=gnss_origin, requested_scene_scope=requested_scene_scope)
     except MapConstraintError:
+        if requested_scene_scope != "indoor":
+            raise
         constraints = new_map_constraints(gnss_origin=gnss_origin, requested_scene_scope="indoor")
     recording = {}
     if bag_dir:
@@ -60,6 +70,10 @@ def finalize_map_package(
         "scene_scope": constraints["scene_scope"],
         "localization_mode": constraints["localization_mode"],
         "origin_status": constraints["origin_status"],
+        "mapping_type": "indoor" if constraints["scene_scope"] == "indoor" else "outdoor",
+        "origin_lock_session_id": gnss_origin.get("origin_lock_session_id", ""),
+        "origin_locked_at_unix": gnss_origin.get("locked_at_unix"),
+        "origin_position_spread_m": gnss_origin.get("position_spread_m"),
         "rtk_origin_required": constraints["rtk_origin_required"],
         "completeness": completeness,
         "frame_id": "map",

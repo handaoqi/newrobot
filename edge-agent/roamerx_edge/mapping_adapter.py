@@ -11,7 +11,7 @@ import subprocess
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
@@ -24,6 +24,7 @@ from .map_coordinate import MapConstraintError, SCENE_SCOPES, normalize_text
 from .map_package_finalize import finalize_map_package
 from .map_preview import generate_map_preview
 from .media_client import MediaClient
+from .origin_lock import OriginLockMonitor, OriginSample
 from .protocol import ProtocolError, now_iso
 
 
@@ -36,6 +37,9 @@ class MappingSession:
     started_at: str
     updated_at: str
     scene_scope: str = "indoor"
+    mapping_type: str = "indoor"
+    heading_check_confirmed: bool = False
+    mapping_capture_enabled: bool = False
 
 
 class MappingAdapter:
@@ -81,6 +85,24 @@ class MappingAdapter:
         self._record_rosbag = False
         self._rosbag_dir: str | None = None
         self._scene_scope = "indoor"
+        self._mapping_type = "indoor"
+        self._origin_file = Path(config.origin_file).expanduser() if config.origin_file else self.map_dir / "gnss_origin.yaml"
+        self._origin_state_file = (
+            Path(config.origin_state_file).expanduser()
+            if config.origin_state_file
+            else self.map_dir / "mapping_workflow.json"
+        )
+        self._origin_monitor = OriginLockMonitor(
+            self._sample_origin_topics,
+            str(self._origin_file),
+            duration_seconds=config.origin_lock_duration_seconds,
+            max_spread_m=config.origin_lock_max_spread_m,
+            sample_interval_seconds=config.origin_lock_sample_interval_seconds,
+            min_baseline_m=config.heading_min_baseline_m,
+            max_heading_std_deg=config.heading_max_std_deg,
+            max_age_seconds=config.heading_max_age_seconds,
+        )
+        self._restore_workflow_state()
 
     @property
     def _slam_process_alive(self) -> bool:
@@ -105,6 +127,16 @@ class MappingAdapter:
         if scene_scope not in SCENE_SCOPES:
             raise ProtocolError("MAP_CONSTRAINT_INVALID", "scene_scope must be indoor, transition, or outdoor")
         self._scene_scope = scene_scope
+        mapping_type = normalize_text(command.get("mapping_type"), "outdoor" if scene_scope != "indoor" else "indoor")
+        if mapping_type not in {"indoor", "outdoor"}:
+            raise ProtocolError("MAPPING_TYPE_REQUIRED", "mapping_type must be indoor or outdoor")
+        if mapping_type == "indoor" and scene_scope != "indoor":
+            raise ProtocolError("MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN", "indoor mapping cannot use an outdoor or transition scene scope")
+        if mapping_type == "outdoor" and scene_scope == "indoor":
+            raise ProtocolError("MAP_LOCAL_ONLY_TRANSITION_FORBIDDEN", "outdoor mapping cannot use indoor scene scope")
+        if mapping_type == "outdoor" and self._origin_monitor.status().get("origin_status") != "locked":
+            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor mapping must lock the ENU origin before SLAM starts")
+        self._mapping_type = mapping_type
         self.session = MappingSession(
             session_id=session_id,
             map_name=map_name,
@@ -113,6 +145,8 @@ class MappingAdapter:
             started_at=now_iso(),
             updated_at=now_iso(),
             scene_scope=scene_scope,
+            mapping_type=mapping_type,
+            mapping_capture_enabled=True,
         )
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self._stop_conflicting_navigation_stack()
@@ -122,10 +156,130 @@ class MappingAdapter:
             self._start_rosbag(map_name)
         try:
             self._ensure_slam_process()
+            if mapping_type == "outdoor":
+                self._call_map_state(self.config.warmup_data)
             self._call_map_state(self.config.start_data)
         except Exception:
             self._stop_rosbag()
             raise
+        self._set_state("mapping")
+        return self.status()
+
+    def start_origin_lock(self, command: dict) -> dict:
+        """Start outdoor sensors and the 60-second RTK anchor quality window."""
+        if self._any_slam_process_alive:
+            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "stop SLAM before locking a new ENU origin")
+        if self.session and self.session.state not in {"idle", "cancelled", "exited", "failed"}:
+            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping workflow is already active")
+        scene_scope = normalize_text(command.get("scene_scope"), "outdoor")
+        if scene_scope not in {"transition", "outdoor"}:
+            raise ProtocolError("MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN", "indoor mapping does not lock an ENU origin")
+        self._mapping_type = "outdoor"
+        self._scene_scope = scene_scope
+        self.session = MappingSession(
+            session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
+            map_name=command.get("map_name") or f"室外地图 {time.strftime('%Y%m%d-%H%M%S')}",
+            route_hint=command.get("route_hint", ""),
+            state="origin_starting",
+            started_at=now_iso(),
+            updated_at=now_iso(),
+            scene_scope=scene_scope,
+            mapping_type="outdoor",
+        )
+        self.map_dir.mkdir(parents=True, exist_ok=True)
+        self._stop_conflicting_navigation_stack()
+        self._ensure_mapping_sensors()
+        self._origin_monitor.start()
+        self._set_state("origin_waiting")
+        return self.status()
+
+    def cancel_origin_lock(self, command: dict) -> dict:
+        del command
+        origin = self._origin_monitor.cancel()
+        if self.session and self.session.state in {"origin_starting", "origin_waiting", "origin_locked"}:
+            self._set_state("cancelled")
+        result = self.status()
+        result["origin"] = origin
+        return result
+
+    def start_slam_warmup(self, command: dict) -> dict:
+        """Start FAST-LIO-SAM estimator while keeping formal keyframe capture closed."""
+        mapping_type = normalize_text(command.get("mapping_type"), self._mapping_type or "indoor")
+        default_scene_scope = self.session.scene_scope if self.session else mapping_type
+        scene_scope = normalize_text(command.get("scene_scope"), default_scene_scope)
+        if mapping_type not in {"indoor", "outdoor"}:
+            raise ProtocolError("MAPPING_TYPE_REQUIRED", "mapping_type must be indoor or outdoor")
+        if mapping_type == "indoor" and scene_scope != "indoor":
+            raise ProtocolError("MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN", "indoor mapping cannot use an outdoor or transition scene scope")
+        if mapping_type == "outdoor" and scene_scope == "indoor":
+            raise ProtocolError("MAP_LOCAL_ONLY_TRANSITION_FORBIDDEN", "outdoor mapping cannot use indoor scene scope")
+        if self.session and self.session.state in {"cancelled", "exited", "failed", "idle"}:
+            self.session = None
+        if self.session and self.session.state not in {"origin_waiting", "origin_locked"}:
+            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping workflow is already active")
+        if self.session and self.session.mapping_type != mapping_type:
+            raise ProtocolError("MAPPING_TYPE_REQUIRED", "mapping type cannot change inside an active workflow")
+        origin_status = self._origin_monitor.status()
+        if mapping_type == "outdoor" and origin_status.get("origin_status") != "locked":
+            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor mapping requires a valid locked ENU origin")
+        if mapping_type == "outdoor":
+            locked_at = float((origin_status.get("origin") or {}).get("locked_at_unix") or 0)
+            if locked_at and time.time() - locked_at > self.config.origin_lock_ttl_seconds:
+                raise ProtocolError("MAPPING_ORIGIN_EXPIRED", "locked ENU origin has expired; lock it again")
+            self._origin_monitor.resume()
+        if not self.session:
+            self.session = MappingSession(
+                session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
+                map_name=command.get("map_name") or f"现场地图 {time.strftime('%Y%m%d-%H%M%S')}",
+                route_hint=command.get("route_hint", ""),
+                state="starting",
+                started_at=now_iso(),
+                updated_at=now_iso(),
+                scene_scope=scene_scope,
+                mapping_type=mapping_type,
+            )
+            self._stop_conflicting_navigation_stack()
+            self._ensure_mapping_sensors()
+        self._mapping_type = mapping_type
+        self._scene_scope = scene_scope
+        self.session.mapping_type = mapping_type
+        self.session.scene_scope = scene_scope
+        self._record_rosbag = bool(command.get("record_rosbag", False))
+        if self._record_rosbag and not self._rosbag_status().get("running"):
+            self._start_rosbag(self.session.map_name)
+        self._set_state("slam_starting")
+        try:
+            self._ensure_slam_process()
+            self._call_map_state(
+                self.config.warmup_data if mapping_type == "outdoor" else self.config.indoor_warmup_data
+            )
+        except Exception:
+            self._stop_rosbag()
+            self._set_state("failed")
+            raise
+        self.session.mapping_capture_enabled = False
+        self._set_state("slam_warmup")
+        return self.status()
+
+    def begin_mapping(self, command: dict) -> dict:
+        if not self.session or self.session.state not in {"slam_warmup", "ready_to_map"}:
+            raise ProtocolError("MAPPING_NOT_READY", "start SLAM warmup before formal mapping")
+        status = self.status()
+        readiness = status.get("readiness") or {}
+        if not readiness.get("imu_initialized") or not readiness.get("slam_pose_ready"):
+            raise ProtocolError("MAPPING_NOT_READY", str(readiness.get("message") or "IMU or SLAM pose is not ready"))
+        if self.session.mapping_type == "outdoor":
+            origin = status.get("origin") or {}
+            if origin.get("origin_status") != "locked":
+                raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor ENU origin is no longer locked")
+            if not origin.get("heading_stable"):
+                raise ProtocolError("MAPPING_HEADING_NOT_CONFIRMED", "dual-antenna heading is not stable")
+            if not bool(command.get("heading_check_confirmed")):
+                raise ProtocolError("MAPPING_HEADING_NOT_CONFIRMED", "operator must confirm the heading check")
+            self.session.heading_check_confirmed = True
+        self._call_map_state(self.config.start_data)
+        self.session.mapping_capture_enabled = True
+        self._origin_monitor.stop()
         self._set_state("mapping")
         return self.status()
 
@@ -189,7 +343,7 @@ class MappingAdapter:
         progress = self._read_save_progress(progress_dir)
         readiness = self._mapping_readiness(progress, self._any_slam_process_alive)
         if not readiness["ready_for_save"]:
-            self._set_state("mapping" if self._any_slam_process_alive else "failed")
+            self._set_state(self.session.state if self._any_slam_process_alive and self.session else "failed")
             raise ProtocolError("MAPPING_NOT_READY", readiness["message"])
 
         # The diagnostic bag captures sensor input while the robot is mapping;
@@ -280,11 +434,16 @@ class MappingAdapter:
             self._set_state("cancelled")
         self._stop_rosbag()
         self._stop_slam_process()
+        if self.session and self.session.mapping_type == "outdoor":
+            self._origin_monitor.cancel()
+        else:
+            self._origin_monitor.stop()
         self._mark_progress_cancelled(progress_dir)
         return self.status()
 
     def status(self) -> dict:
         process_alive = self._any_slam_process_alive
+        origin = self._origin_monitor.status()
         complete_session_dir = self._find_latest_session_dir(require_complete=True)
         progress_session_dir = self._find_latest_progress_dir()
         latest_session_dir = (
@@ -322,8 +481,23 @@ class MappingAdapter:
                 "ready_for_save": readiness["ready_for_save"],
                 "files": files,
                 "rosbag": rosbag,
+                "origin": origin,
+                "origin_status": origin.get("origin_status", "idle"),
+                "mapping_type": self._mapping_type,
+                "slam_process_alive": process_alive,
+                "slam_warmup": False,
+                "mapping_capture_enabled": False,
+                "imu_initialized": bool(readiness.get("imu_initialized")),
+                "slam_pose_ready": bool(readiness.get("slam_pose_ready")),
+                "ready_for_mapping": bool(readiness.get("ready_for_mapping")),
             }
         state = self.session.state
+        if state == "origin_waiting" and origin.get("origin_status") == "locked":
+            self._set_state("origin_locked")
+            state = "origin_locked"
+        if state == "slam_warmup" and readiness.get("ready_for_mapping"):
+            self._set_state("ready_to_map")
+            state = "ready_to_map"
         if (
             progress.get("error_code") == "SLAM_DIVERGED"
             or progress.get("slam_health", {}).get("state") == "diverged"
@@ -333,6 +507,8 @@ class MappingAdapter:
             "mapping_session_id": self.session.session_id,
             "map_name": self.session.map_name,
             "route_hint": self.session.route_hint,
+            "mapping_type": self.session.mapping_type,
+            "scene_scope": self.session.scene_scope,
             "state": state,
             "started_at": self.session.started_at,
             "updated_at": self.session.updated_at,
@@ -340,6 +516,12 @@ class MappingAdapter:
             "active_map_dir": str(latest_session_dir or self.map_dir),
             "latest_session_dir": str(latest_session_dir) if latest_session_dir else None,
             "process_alive": process_alive,
+            "slam_process_alive": process_alive,
+            "slam_warmup": state in {"slam_starting", "slam_warmup", "ready_to_map"},
+            "heading_check_confirmed": self.session.heading_check_confirmed,
+            "mapping_capture_enabled": self.session.mapping_capture_enabled,
+            "imu_initialized": bool(readiness.get("imu_initialized")),
+            "slam_pose_ready": bool(readiness.get("slam_pose_ready")),
             "slam_pids": self._find_slam_process_pids(),
             "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
             "save_progress": progress,
@@ -348,6 +530,10 @@ class MappingAdapter:
             "ready_for_save": readiness["ready_for_save"],
             "files": files,
             "rosbag": rosbag,
+            "origin": origin,
+            "origin_status": origin.get("origin_status", "idle"),
+            "ready_for_mapping": bool(readiness.get("ready_for_mapping"))
+            and (self.session.mapping_type == "indoor" or origin.get("heading_stable") is True),
         }
 
     @staticmethod
@@ -359,6 +545,12 @@ class MappingAdapter:
         keyframe_count = max(
             int(progress.get("keyframe_count") or 0),
             int(progress.get("written_keyframes") or 0),
+        )
+        slam_pose_ready = bool(progress.get("slam_pose_ready") or health.get("slam_pose_ready") or keyframe_count > 0)
+        capture_enabled = bool(
+            progress.get("mapping_capture_enabled")
+            if "mapping_capture_enabled" in progress
+            else keyframe_count > 0
         )
         updated_at = float(progress.get("updated_at_unix") or 0)
         sample_age_seconds = max(0.0, time.time() - updated_at) if updated_at > 0 else None
@@ -382,9 +574,15 @@ class MappingAdapter:
             required = int(health.get("imu_required_samples") or 0)
             suffix = f"（{samples}/{required}）" if required else f"（已采样 {samples}）"
             message = f"IMU 初始化中{suffix}，请保持机器狗静止"
+        elif not slam_pose_ready:
+            state = "waiting_first_keyframe"
+            message = "IMU 已初始化，正在建立首个有效 SLAM 位姿，请继续保持静止"
+        elif not capture_enabled:
+            state = "ready"
+            message = "SLAM 预热检查通过，等待人工确认后开始正式采集关键帧"
         elif keyframe_count < 1 or stage == "waiting_first_keyframe":
             state = "waiting_first_keyframe"
-            message = "IMU 已初始化，正在建立首个有效关键帧，请继续保持静止"
+            message = "正式采集已开启，正在建立首个关键帧"
         else:
             state = "ready"
             message = "传感器和首个关键帧正常，可以开始移动建图"
@@ -396,9 +594,12 @@ class MappingAdapter:
             "imu_initialized": imu_initialized,
             "imu_samples": int(health.get("imu_samples") or 0),
             "imu_required_samples": int(health.get("imu_required_samples") or 0),
+            "slam_pose_ready": slam_pose_ready,
+            "mapping_capture_enabled": capture_enabled,
             "keyframe_count": keyframe_count,
             "sample_age_seconds": sample_age_seconds,
-            "ready_for_motion": state == "ready",
+            "ready_for_motion": state == "ready" and capture_enabled,
+            "ready_for_mapping": imu_initialized and slam_pose_ready and not diverged,
             "ready_for_save": keyframe_count > 0 or diverged,
         }
 
@@ -422,7 +623,49 @@ class MappingAdapter:
         """Kill orphaned SLAM process and reset session state."""
         self._stop_rosbag()
         self._stop_slam_process()
+        self._origin_monitor.stop()
         self.session = None
+
+    def _restore_workflow_state(self) -> None:
+        origin_restored = self._origin_monitor.restore(self.config.origin_lock_ttl_seconds)
+        if origin_restored:
+            self._mapping_type = "outdoor"
+            self._scene_scope = "outdoor"
+        if not origin_restored or not self._origin_state_file.is_file():
+            return
+        try:
+            payload = json.loads(self._origin_state_file.read_text(encoding="utf-8"))
+            raw = payload.get("session") or {}
+        except (OSError, ValueError, TypeError):
+            LOGGER.warning("Ignoring invalid mapping workflow state at %s", self._origin_state_file)
+            return
+        if raw.get("mapping_type") != "outdoor" or raw.get("state") not in {"origin_locked", "origin_waiting"}:
+            return
+        self.session = MappingSession(
+            session_id=str(raw.get("session_id") or uuid.uuid4()),
+            map_name=str(raw.get("map_name") or "恢复的室外地图"),
+            route_hint=str(raw.get("route_hint") or ""),
+            state="origin_locked",
+            started_at=str(raw.get("started_at") or now_iso()),
+            updated_at=now_iso(),
+            scene_scope=str(raw.get("scene_scope") or "outdoor"),
+            mapping_type="outdoor",
+        )
+        self._scene_scope = self.session.scene_scope
+
+    def _persist_workflow_state(self) -> None:
+        if not self.session:
+            return
+        self._origin_state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "roamerx.mapping-workflow.v2",
+            "session": asdict(self.session),
+            "origin_status": self._origin_monitor.status().get("origin_status"),
+            "updated_at": now_iso(),
+        }
+        temporary = self._origin_state_file.with_suffix(self._origin_state_file.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, self._origin_state_file)
 
     def _rosbag_command(self, action: str, label: str = "") -> dict:
         script = Path(self.config.rosbag_script).expanduser()
@@ -553,6 +796,64 @@ class MappingAdapter:
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "LiDAR/IMU startup failed").strip()
             raise ProtocolError("MAPPING_SENSOR_NOT_READY", message)
+
+    def _echo_topic_once(self, topic: str, timeout_seconds: int = 4) -> dict:
+        command = self._shell_prefix() + f"ros2 topic echo --once {topic}"
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{topic} 超时无数据") from exc
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or f"{topic} 读取失败").strip())
+        body = (result.stdout or "").split("---", 1)[0].strip()
+        payload = yaml.safe_load(body) if body else {}
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{topic} 消息格式无效")
+        return payload
+
+    def _sample_origin_topics(self) -> OriginSample:
+        fix = self._echo_topic_once(self.config.origin_fix_topic)
+        pvh = self._echo_topic_once(self.config.origin_rtk_topic)
+        ntrip_message = self._echo_topic_once(self.config.origin_ntrip_status_topic)
+        ntrip_data = ntrip_message.get("data") or ""
+        ntrip = yaml.safe_load(ntrip_data) if isinstance(ntrip_data, str) else ntrip_data
+        if not isinstance(ntrip, dict):
+            ntrip = {}
+        bestnav = pvh.get("bestnav") or {}
+        heading = pvh.get("heading") or {}
+        fix_status = int(((fix.get("status") or {}).get("status")) or -1)
+        position_type = int(bestnav.get("pos_type") or 0)
+        ntrip_quality = str(ntrip.get("quality") or "")
+        position_fixed = (
+            fix_status >= 2
+            and int(bestnav.get("p_sol_status", -1)) == 0
+            and position_type in {48, 49, 50}
+            and ntrip_quality == "rtk_fixed"
+        )
+        heading_fixed = int(heading.get("sol_status", -1)) == 0 and int(heading.get("heading_type") or 0) > 0
+        lat_std = float(bestnav.get("lat_std") or ntrip.get("horizontal_std_m") or math.inf)
+        lon_std = float(bestnav.get("lon_std") or ntrip.get("horizontal_std_m") or math.inf)
+        header_stamp = pvh.get("header", {}).get("stamp", {})
+        stamp_seconds = float(header_stamp.get("sec") or 0) + float(header_stamp.get("nanosec") or 0) / 1e9
+        header_age = max(0.0, time.time() - stamp_seconds) if stamp_seconds > 1_000_000_000 else 0.0
+        return OriginSample(
+            latitude=float(bestnav.get("latitude_deg") or fix.get("latitude") or math.nan),
+            longitude=float(bestnav.get("longitude_deg") or fix.get("longitude") or math.nan),
+            altitude=float(bestnav.get("altitude_m") or fix.get("altitude") or 0.0),
+            position_fixed=position_fixed,
+            heading_fixed=heading_fixed,
+            baseline_m=float(heading.get("base_line") or 0.0),
+            heading_deg=float(heading.get("heading_deg") or 0.0),
+            heading_std_deg=float(heading.get("heading_std") or math.inf),
+            horizontal_std_m=max(lat_std, lon_std),
+            age_seconds=max(float(ntrip.get("age_sec") or 0.0), header_age),
+            ntrip_quality=ntrip_quality,
+        )
 
     def _stop_conflicting_navigation_stack(self) -> None:
         """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
@@ -746,6 +1047,7 @@ class MappingAdapter:
             or self._scene_scope,
             "indoor",
         )
+        self._merge_locked_origin_metadata(work_dir)
         try:
             manifest = finalize_map_package(
                 work_dir,
@@ -771,6 +1073,32 @@ class MappingAdapter:
                 # while making the missing GTSAM handoff visible in logs.
                 LOGGER.warning("C++ GTSAM global optimization handoff failed: %s", exc)
         return manifest
+
+    def _merge_locked_origin_metadata(self, work_dir: Path) -> None:
+        if not self.session or self.session.mapping_type != "outdoor":
+            return
+        exported_path = work_dir / "gnss_origin.yaml"
+        if not self._origin_file.is_file() or not exported_path.is_file():
+            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor map export is missing locked GNSS origin metadata")
+        try:
+            locked = yaml.safe_load(self._origin_file.read_text(encoding="utf-8")) or {}
+            exported = yaml.safe_load(exported_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise ProtocolError("MAPPING_ORIGIN_LOCK_FAILED", f"cannot merge GNSS origin evidence: {exc}") from exc
+        evidence_fields = {
+            "schema", "origin_lock_session_id", "lock_duration_seconds", "position_spread_m",
+            "sample_count", "heading_deg", "heading_std_deg", "baseline_m", "locked_at_unix", "enu_axis",
+        }
+        for key in evidence_fields:
+            if key in locked:
+                exported[key] = locked[key]
+        # The lock-time coordinates are authoritative; SLAM adds ENU-map alignment fields.
+        for key in ("datum", "origin_latitude", "origin_longitude", "origin_altitude"):
+            if key in locked:
+                exported[key] = locked[key]
+        temporary = exported_path.with_suffix(exported_path.suffix + ".tmp")
+        temporary.write_text(yaml.safe_dump(exported, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.replace(temporary, exported_path)
 
     def _validate_map_files(self, work_dir: Path | None = None) -> None:
         base = work_dir or self.map_dir
@@ -1058,6 +1386,7 @@ class MappingAdapter:
         if self.session:
             self.session.state = state
             self.session.updated_at = now_iso()
+            self._persist_workflow_state()
 
     def _stop_slam_process(self) -> None:
         if self.config.mapping_unit:

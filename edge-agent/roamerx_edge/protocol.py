@@ -9,7 +9,10 @@ from typing import Any
 
 PROTOCOL_VERSION = "1.0"
 TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel", "task.force_exit"}
-MAPPING_COMMAND_TYPES = {"mapping.start", "mapping.save", "mapping.cancel", "mapping.status"}
+MAPPING_COMMAND_TYPES = {
+    "mapping.start", "mapping.save", "mapping.cancel", "mapping.status",
+    "mapping.origin_start", "mapping.origin_cancel", "mapping.slam_start", "mapping.begin",
+}
 NAV_COMMAND_TYPES = {
     "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",
     "nav.initial_pose", "nav.relocalize",
@@ -171,19 +174,19 @@ def validate_command(envelope: MessageEnvelope) -> None:
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
-    if envelope.message_type == "mapping.start":
+    if envelope.message_type in {"mapping.start", "mapping.origin_start", "mapping.slam_start"}:
         map_name = payload["command"].get("map_name")
         if map_name is not None and not isinstance(map_name, str):
-            raise ProtocolError("INVALID_MESSAGE", "mapping.start map_name must be string")
+            raise ProtocolError("INVALID_MESSAGE", f"{envelope.message_type} map_name must be string")
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "mapping.start record_rosbag must be boolean")
+        mapping_type = payload["command"].get("mapping_type")
+        if mapping_type is not None and mapping_type not in {"indoor", "outdoor"}:
+            raise ProtocolError("INVALID_MESSAGE", f"{envelope.message_type} mapping_type must be indoor or outdoor")
         scene_scope = payload["command"].get("scene_scope")
         if scene_scope is not None and scene_scope not in {"indoor", "transition", "outdoor"}:
-            raise ProtocolError("INVALID_MESSAGE", "mapping.start scene_scope must be indoor, transition, or outdoor")
-        scene_scope = payload["command"].get("scene_scope")
-        if scene_scope is not None and scene_scope not in {"indoor", "transition", "outdoor"}:
-            raise ProtocolError("INVALID_MESSAGE", "mapping.start scene_scope must be indoor, transition, or outdoor")
+            raise ProtocolError("INVALID_MESSAGE", f"{envelope.message_type} scene_scope must be indoor, transition, or outdoor")
     if envelope.message_type == "nav.initial_pose":
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]

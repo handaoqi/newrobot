@@ -22,6 +22,7 @@ from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -2669,12 +2670,79 @@ class RobotMappingStartView(RobotMappingCommandView):
 
     def build_payload(self, request, robot: Robot) -> dict:
         map_name = request.data.get("map_name") or f"{robot.name} 现场地图"
+        mapping_type = request.data.get("mapping_type") or "indoor"
+        scene_scope = request.data.get("scene_scope") or mapping_type
+        if mapping_type not in {"indoor", "outdoor"}:
+            raise ValidationError({"mapping_type": "必须是 indoor 或 outdoor"})
+        if (mapping_type == "indoor") != (scene_scope == "indoor"):
+            raise ValidationError({"scene_scope": "室内类型只能使用 indoor；室外类型只能使用 transition/outdoor"})
         return {
             "map_name": map_name,
             "route_hint": request.data.get("route_hint", ""),
             "operator_note": request.data.get("operator_note", ""),
             "record_rosbag": bool(request.data.get("record_rosbag", False)),
-            "scene_scope": request.data.get("scene_scope") or "indoor",
+            "scene_scope": scene_scope,
+            "mapping_type": mapping_type,
+        }
+
+
+class RobotMappingOriginStatusView(RobotMappingStatusView):
+    """Origin status is part of the unified mapping snapshot; keep a focused REST alias."""
+
+
+class RobotMappingOriginStartView(RobotMappingCommandView):
+    command_type = "mapping.origin_start"
+    expiry_seconds = 180
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        scene_scope = request.data.get("scene_scope") or "outdoor"
+        if scene_scope not in {"transition", "outdoor"}:
+            raise ValidationError({"scene_scope": "锁定原点仅支持 transition 或 outdoor"})
+        return {
+            "map_name": request.data.get("map_name") or f"{robot.name} 室外地图",
+            "route_hint": request.data.get("route_hint", ""),
+            "mapping_type": "outdoor",
+            "scene_scope": scene_scope,
+        }
+
+
+class RobotMappingOriginCancelView(RobotMappingCommandView):
+    command_type = "mapping.origin_cancel"
+    expiry_seconds = 60
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        return {"mapping_session_id": request.data.get("mapping_session_id", "")}
+
+
+class RobotMappingSlamStartView(RobotMappingCommandView):
+    command_type = "mapping.slam_start"
+    expiry_seconds = 180
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        mapping_type = request.data.get("mapping_type") or "indoor"
+        if mapping_type not in {"indoor", "outdoor"}:
+            raise ValidationError({"mapping_type": "必须是 indoor 或 outdoor"})
+        scene_scope = request.data.get("scene_scope") or mapping_type
+        if (mapping_type == "indoor") != (scene_scope == "indoor"):
+            raise ValidationError({"scene_scope": "室内类型只能使用 indoor；室外类型只能使用 transition/outdoor"})
+        return {
+            "map_name": request.data.get("map_name") or f"{robot.name} 现场地图",
+            "route_hint": request.data.get("route_hint", ""),
+            "record_rosbag": bool(request.data.get("record_rosbag", False)),
+            "mapping_type": mapping_type,
+            "scene_scope": scene_scope,
+            "mapping_session_id": request.data.get("mapping_session_id", ""),
+        }
+
+
+class RobotMappingBeginView(RobotMappingCommandView):
+    command_type = "mapping.begin"
+    expiry_seconds = 60
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        return {
+            "mapping_session_id": request.data.get("mapping_session_id", ""),
+            "heading_check_confirmed": bool(request.data.get("heading_check_confirmed", False)),
         }
 
 

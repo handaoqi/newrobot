@@ -227,6 +227,8 @@ namespace robot::slam
 
         void resetImuPreintegration(double start_timestamp);
 
+        bool loadLockedGnssOrigin();
+
         void writeSaveProgress(const std::string& stage, double progress_percent, const std::string& error = "") const;
 
         void pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body);
@@ -367,6 +369,7 @@ namespace robot::slam
         Vec3d                              gnss_map_offset_ = Zero3d;
         Vec3d                              gnss_lever_arm_base_ = Zero3d;
         bool                               use_gnss_fusion_ = false;
+        bool                               gnss_fusion_config_enabled_ = false;
         double                             gnss_fusion_gain_ = 0.03;
         double                             gnss_max_correction_step_ = 0.10;
         double                             gnss_max_residual_ = 5.0;
@@ -378,6 +381,8 @@ namespace robot::slam
         std::deque<GnssAlignmentSample>    gnss_alignment_samples_;
         bool                               gnss_alignment_locked_ = false;
         std::string                        gnss_alignment_source_;
+        std::string                        gnss_origin_file_;
+        bool                               gnss_origin_prelocked_ = false;
         double                             gnss_enu_to_map_yaw_ = 0.0;
         Eigen::Vector2d                    gnss_enu_to_map_translation_ = Eigen::Vector2d::Zero();
         double                             gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
@@ -434,6 +439,8 @@ namespace robot::slam
         int                                dynamic_filter_min_scan_observations_ = 1;
         std::size_t                        dynamic_filter_shard_count_ = 64;
         bool                               keyframe_record_enable_ = true;
+        bool                               mapping_capture_enabled_ = false;
+        bool                               slam_pose_ready_ = false;
         double                             keyframe_min_distance_m_ = 0.8;
         double                             keyframe_min_yaw_rad_ = 0.35;
         double                             keyframe_max_interval_s_ = 2.0;

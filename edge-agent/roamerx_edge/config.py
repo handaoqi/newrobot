@@ -143,6 +143,20 @@ class MappingConfig:
     rosbag_stop_timeout_seconds: int = 45
     sensor_start_script: str = "/home/dogrobot/robot/script/robot/ensure_mapping_sensors.sh"
     sensor_start_timeout_seconds: int = 40
+    warmup_data: int = 6
+    indoor_warmup_data: int = 7
+    origin_file: str = ""
+    origin_state_file: str = ""
+    origin_lock_duration_seconds: float = 60.0
+    origin_lock_max_spread_m: float = 0.02
+    origin_lock_sample_interval_seconds: float = 1.0
+    origin_lock_ttl_seconds: int = 1800
+    origin_fix_topic: str = "/fix"
+    origin_rtk_topic: str = "/rtk_pvh"
+    origin_ntrip_status_topic: str = "/rtk/ntrip_status"
+    heading_min_baseline_m: float = 0.20
+    heading_max_std_deg: float = 5.0
+    heading_max_age_seconds: float = 1.5
 
 
 @dataclass

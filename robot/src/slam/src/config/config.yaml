@@ -39,6 +39,9 @@ laser_mapping:
         # Only quality-gated RTK float/fixed fixes may alter LIO. Invalid GNSS
         # automatically falls back to LiDAR + IMU without resetting the pose.
         enable: true
+        # Edge Agent writes this atomically after the outdoor 60 s anchor lock.
+        # Indoor mapping safely ignores a missing file and uses its local frame.
+        origin_file: /home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml
         gain: 0.20
         max_correction_step: 0.30
         max_residual: 5.0

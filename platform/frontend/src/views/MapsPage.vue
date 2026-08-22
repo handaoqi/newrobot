@@ -10,7 +10,10 @@ import {
   manuallyCleanMap,
   createMap,
   fetchRobotMappingStatus,
-  startRobotMapping,
+  startRobotMappingOrigin,
+  cancelRobotMappingOrigin,
+  startRobotMappingSlam,
+  beginRobotMapping,
   saveRobotMapping,
   cancelRobotMapping,
   syncRobotMapping,
@@ -49,9 +52,15 @@ const mappingForm = ref({
   route_hint: '南门 → 主步道 → 牡丹园 → 活动广场',
   record_rosbag: true,
   scene_scope: 'indoor',
+  mapping_type: 'indoor',
 })
 let statusTimer = null
 let lastSlamAlert = ''
+
+watch(() => mappingForm.value.mapping_type, (mappingType) => {
+  if (mappingType === 'indoor') mappingForm.value.scene_scope = 'indoor'
+  else if (mappingForm.value.scene_scope === 'indoor') mappingForm.value.scene_scope = 'outdoor'
+})
 
 const uploadForm = ref({
   name: '',
@@ -196,8 +205,17 @@ const connectionClass = computed(() => {
 // 建图状态机
 const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle')
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
+const mappingCommandInFlight = computed(() => ['created', 'published', 'accepted', 'executing'].includes(commandStatus.value))
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
 const rosbagStatus = computed(() => mappingStatus.value?.result?.rosbag || {})
+const originStatus = computed(() => mappingStatus.value?.result?.origin || {})
+const originState = computed(() => originStatus.value.origin_status || 'idle')
+const isOutdoorMapping = computed(() => mappingForm.value.mapping_type === 'outdoor')
+const originLocked = computed(() => originState.value === 'locked')
+const originLockPercent = computed(() => {
+  const required = Number(originStatus.value.required_seconds || 60)
+  return required > 0 ? Math.min(100, Number(originStatus.value.continuous_seconds || 0) / required * 100) : 0
+})
 const slamHealth = computed(() => saveProgress.value.slam_health || {})
 const slamHealthState = computed(() => slamHealth.value.state || 'unknown')
 const slamDiverged = computed(() => (
@@ -284,20 +302,20 @@ const mappingTelemetryFresh = computed(() => (
 ))
 const mappingStartupChecks = computed(() => {
   const imuSamples = Number(mappingReadiness.value.imu_samples || slamHealth.value.imu_samples || 0)
-  const keyframeCount = Number(mappingReadiness.value.keyframe_count || saveProgress.value.keyframe_count || 0)
   return [
     { key: 'edge', label: 'Edge Agent', detail: connectionStatus.value === 'online' ? '已连接' : '未连接', ok: connectionStatus.value === 'online' },
     { key: 'slam', label: 'SLAM 进程', detail: mappingProcessAlive.value ? '运行中' : '等待启动', ok: mappingProcessAlive.value },
     { key: 'lidar', label: '激光雷达', detail: mappingTelemetryFresh.value ? '数据正常' : '等待实时数据', ok: mappingTelemetryFresh.value },
     { key: 'imu_stream', label: 'IMU 数据', detail: mappingTelemetryFresh.value && imuSamples > 0 ? `${imuSamples} 帧` : '等待实时数据', ok: mappingTelemetryFresh.value && imuSamples > 0 },
     { key: 'imu_init', label: 'IMU 初始化', detail: mappingReadiness.value.imu_initialized ? '已完成' : '请保持静止', ok: Boolean(mappingReadiness.value.imu_initialized) },
-    { key: 'keyframe', label: '首个关键帧', detail: keyframeCount > 0 ? `已建立（${keyframeCount}）` : '等待建立', ok: keyframeCount > 0 },
+    { key: 'pose', label: '有效 SLAM 位姿', detail: mappingReadiness.value.slam_pose_ready ? '已确认（未采集正式关键帧）' : '等待位姿稳定', ok: Boolean(mappingReadiness.value.slam_pose_ready) },
   ]
 })
 const mappingStartupReady = computed(() => mappingStartupChecks.value.every(item => item.ok))
 const saveStageLabels = {
   initializing_imu: 'IMU 初始化',
-  waiting_first_keyframe: '建立首个关键帧',
+  waiting_first_keyframe: '建立有效 SLAM 位姿',
+  ready_to_map: '等待人工确认正式采集',
   mapping: '采集关键帧',
   recovering: '恢复落盘关键帧',
   flushing_keyframes: '刷新关键帧',
@@ -319,32 +337,48 @@ const formatBytes = (value) => {
   return `${(bytes / (1024 ** index)).toFixed(index > 1 ? 1 : 0)} ${units[index]}`
 }
 
-const stateSteps = [
-  { key: 'idle', label: '空闲' },
+const stateSteps = computed(() => [
+  { key: 'idle', label: '配置' },
   { key: 'command_created', label: '已创建' },
   { key: 'command_published', label: '已下发' },
   { key: 'command_accepted', label: 'Edge确认' },
-  { key: 'starting', label: '启动中' },
+  ...(isOutdoorMapping.value ? [
+    { key: 'origin_starting', label: '启动RTK' },
+    { key: 'origin_waiting', label: '锁定原点' },
+    { key: 'origin_locked', label: '原点已锁' },
+  ] : []),
+  { key: 'slam_starting', label: '启动SLAM' },
+  { key: 'slam_warmup', label: 'SLAM预热' },
   { key: 'imu_initializing', label: 'IMU初始化' },
-  { key: 'waiting_first_keyframe', label: '首帧确认' },
-  { key: 'mapping', label: '建图中' },
+  { key: 'waiting_first_keyframe', label: '位姿确认' },
+  { key: 'ready_to_map', label: isOutdoorMapping.value ? '航向复核' : '等待确认' },
+  { key: 'mapping', label: '正式采集' },
   { key: 'saving', label: '保存中' },
   { key: 'packaging', label: '打包中' },
   { key: 'uploading', label: '上传中' },
   { key: 'stopping', label: '退出建图' },
   { key: 'exited', label: '已退出建图' },
-]
+])
 
 const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected', 'cancelled', 'completed', 'exited']
 const isTerminal = computed(() => terminalStates.includes(mappingState.value))
 const isError = computed(() => (
   slamDiverged.value
-  || readinessState.value === 'telemetry_stale'
+  || (mappingProcessAlive.value && readinessState.value === 'telemetry_stale')
   || ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value)
 ))
-const isActiveMapping = computed(() => ['starting', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value))
+const isActiveMapping = computed(() => [
+  'command_created', 'command_published', 'command_accepted', 'starting',
+  'origin_starting', 'origin_waiting', 'origin_locked', 'slam_starting', 'slam_warmup',
+  'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping',
+].includes(mappingState.value))
 const displayMappingState = computed(() => {
+  if (['slam_warmup', 'ready_to_map'].includes(mappingState.value)) {
+    if (['imu_initializing', 'waiting_first_keyframe'].includes(readinessState.value)) return readinessState.value
+    if (readinessState.value === 'ready') return 'ready_to_map'
+  }
   if (mappingState.value !== 'mapping') return mappingState.value
+  if (mappingStatus.value?.result?.mapping_capture_enabled) return 'mapping'
   if (readinessState.value === 'telemetry_stale') {
     if (!mappingReadiness.value.imu_initialized) return 'imu_initializing'
     return Number(mappingReadiness.value.keyframe_count || 0) > 0 ? 'mapping' : 'waiting_first_keyframe'
@@ -355,30 +389,64 @@ const displayMappingState = computed(() => {
   return mappingState.value
 })
 const canSaveMapping = computed(() => (
-  slamDiverged.value || (mappingState.value === 'mapping' && readyForSave.value)
+  !mappingCommandInFlight.value && (slamDiverged.value || (mappingState.value === 'mapping' && readyForSave.value))
 ))
 const canCancelMapping = computed(() => (
-  isActiveMapping.value || Boolean(mappingStatus.value?.result?.process_alive)
+  isActiveMapping.value || Boolean(mappingStatus.value?.result?.process_alive) || ['waiting_quality', 'quality_holding'].includes(originState.value)
 ))
 const showMappingReadiness = computed(() => (
-  isActiveMapping.value || Boolean(mappingStatus.value?.result?.process_alive)
+  Boolean(mappingStatus.value?.result?.process_alive)
+  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
+))
+const workflowSessionId = computed(() => mappingStatus.value?.result?.mapping_session_id || '')
+const canLockOrigin = computed(() => (
+  isOutdoorMapping.value
+  && connectionStatus.value === 'online'
+  && !mappingProcessAlive.value
+  && !originLocked.value
+  && !mappingCommandInFlight.value
+  && !['waiting_quality', 'quality_holding'].includes(originState.value)
+))
+const canStartSlam = computed(() => (
+  connectionStatus.value === 'online'
+  && !mappingProcessAlive.value
+  && !mappingCommandInFlight.value
+  && (!isOutdoorMapping.value || originLocked.value)
+))
+const canBeginMapping = computed(() => (
+  mappingProcessAlive.value
+  && !mappingCommandInFlight.value
+  && Boolean(mappingStatus.value?.result?.ready_for_mapping ?? mappingReadiness.value.ready_for_mapping)
+  && (!isOutdoorMapping.value || (originLocked.value && originStatus.value.heading_stable))
+  && !mappingStatus.value?.result?.mapping_capture_enabled
 ))
 
 const activeStepIndex = computed(() => {
-  if (slamDiverged.value) return stateSteps.findIndex(s => s.key === 'mapping')
+  if (slamDiverged.value) return stateSteps.value.findIndex(s => s.key === 'mapping')
+  if (['command_created', 'command_published', 'command_accepted'].includes(mappingState.value)) {
+    const targetByCommand = {
+      'mapping.slam_start': 'slam_starting',
+      'mapping.begin': 'ready_to_map',
+      'mapping.save': 'saving',
+      'mapping.cancel': 'stopping',
+      'mapping.origin_cancel': 'origin_waiting',
+    }
+    const target = targetByCommand[mappingStatus.value?.command_type]
+    if (target) return stateSteps.value.findIndex(step => step.key === target)
+  }
   if (
     mappingStatus.value?.command_type === 'mapping.save' &&
     ['command_created', 'command_published', 'command_accepted', 'command_failed', 'command_timed_out', 'command_rejected'].includes(mappingState.value)
   ) {
-    return stateSteps.findIndex(s => s.key === 'saving')
+    return stateSteps.value.findIndex(s => s.key === 'saving')
   }
-  const idx = stateSteps.findIndex(s => s.key === displayMappingState.value)
+  const idx = stateSteps.value.findIndex(s => s.key === displayMappingState.value)
   return idx >= 0 ? idx : -1
 })
 
 const isPastStep = (stepIdx) => {
   if (activeStepIndex.value < 0) return false
-  if (isTerminal.value && !isError.value && stepIdx <= stateSteps.length - 1) return true
+  if (isTerminal.value && !isError.value && stepIdx <= stateSteps.value.length - 1) return true
   if (isError.value) return stepIdx < activeStepIndex.value
   return stepIdx < activeStepIndex.value
 }
@@ -409,7 +477,7 @@ watch(slamAlertSignature, (signature) => {
 })
 
 const mappingStateLabel = computed(() => {
-  const step = stateSteps.find(s => s.key === displayMappingState.value)
+  const step = stateSteps.value.find(s => s.key === displayMappingState.value)
   if (step) return step.label
   if (mappingState.value === 'command_issued') return '等待Edge'
   if (mappingState.value === 'completed') return '已完成'
@@ -468,6 +536,10 @@ async function refreshMappingStatus() {
   if (!mappingForm.value.robot) return
   try {
     mappingStatus.value = await fetchRobotMappingStatus(mappingForm.value.robot)
+    const reportedType = mappingStatus.value?.result?.mapping_type
+    if (['indoor', 'outdoor'].includes(reportedType) && reportedType !== mappingForm.value.mapping_type) {
+      mappingForm.value.mapping_type = reportedType
+    }
   } catch (error) {
     console.error('获取建图状态失败:', error)
   }
@@ -493,15 +565,58 @@ async function handleStartMapping() {
   }
   mappingBusy.value = true
   try {
-    await startRobotMapping(mappingForm.value.robot, {
+    await startRobotMappingSlam(mappingForm.value.robot, {
       map_name: mappingForm.value.map_name,
       route_hint: mappingForm.value.route_hint,
       record_rosbag: mappingForm.value.record_rosbag,
       scene_scope: mappingForm.value.scene_scope,
+      mapping_type: mappingForm.value.mapping_type,
+      mapping_session_id: workflowSessionId.value,
     })
     await refreshMappingStatus()
   } catch (error) {
     alert(`开始建图失败: ${error.message}`)
+  } finally {
+    mappingBusy.value = false
+  }
+}
+
+async function handleLockOrigin() {
+  if (!mappingForm.value.robot || connectionStatus.value !== 'online') {
+    alert('请先选择已连接 Edge Agent 的机器狗')
+    return
+  }
+  mappingBusy.value = true
+  try {
+    await startRobotMappingOrigin(mappingForm.value.robot, {
+      map_name: mappingForm.value.map_name,
+      route_hint: mappingForm.value.route_hint,
+      scene_scope: mappingForm.value.scene_scope,
+      mapping_type: 'outdoor',
+    })
+    await refreshMappingStatus()
+  } catch (error) {
+    alert(`锁定原点启动失败: ${error.message}`)
+  } finally {
+    mappingBusy.value = false
+  }
+}
+
+async function handleBeginMapping() {
+  if (!mappingForm.value.robot) return
+  const prompt = isOutdoorMapping.value
+    ? '确认已原地小范围转动，双天线航向输出稳定，并开始正式采集数据和关键帧？'
+    : '确认 IMU 与 SLAM 位姿检查通过，并开始正式采集数据和关键帧？'
+  if (!confirm(prompt)) return
+  mappingBusy.value = true
+  try {
+    await beginRobotMapping(mappingForm.value.robot, {
+      mapping_session_id: workflowSessionId.value,
+      heading_check_confirmed: isOutdoorMapping.value,
+    })
+    await refreshMappingStatus()
+  } catch (error) {
+    alert(`开始正式建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
   }
@@ -528,7 +643,11 @@ async function handleCancelMapping() {
   if (!confirm('确定要取消本次建图吗？')) return
   mappingBusy.value = true
   try {
-    await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel' })
+    if (!mappingProcessAlive.value && ['waiting_quality', 'quality_holding', 'locked'].includes(originState.value)) {
+      await cancelRobotMappingOrigin(mappingForm.value.robot, { mapping_session_id: workflowSessionId.value })
+    } else {
+      await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel', mapping_session_id: workflowSessionId.value })
+    }
     await refreshMappingStatus()
   } catch (error) {
     alert(`取消建图失败: ${error.message}`)
@@ -1031,6 +1150,27 @@ async function saveCleaner() {
           </div>
         </div>
 
+        <div class="mapping-mode-switch" role="radiogroup" aria-label="建图模式">
+          <button
+            type="button"
+            :class="{ active: mappingForm.mapping_type === 'indoor' }"
+            :disabled="isActiveMapping"
+            @click="mappingForm.mapping_type = 'indoor'"
+          >
+            <strong>室内建图</strong>
+            <span>跳过 RTK 原点，完成 IMU 与位姿预热后开始</span>
+          </button>
+          <button
+            type="button"
+            :class="{ active: mappingForm.mapping_type === 'outdoor' }"
+            :disabled="isActiveMapping"
+            @click="mappingForm.mapping_type = 'outdoor'"
+          >
+            <strong>室外建图</strong>
+            <span>先锁定 ENU 原点，再复核双天线航向</span>
+          </button>
+        </div>
+
         <!-- 连接状态栏 -->
         <div class="connection-bar">
           <div class="connection-row">
@@ -1048,6 +1188,43 @@ async function saveCleaner() {
           </div>
         </div>
 
+        <section v-if="isOutdoorMapping" class="origin-quality-card" :class="`origin-${originState}`">
+          <div class="origin-quality-head">
+            <div>
+              <span class="origin-kicker">室外 ENU 锚点</span>
+              <strong>{{ originLocked ? '原点已锁定' : '60 秒连续质量窗' }}</strong>
+            </div>
+            <span class="origin-countdown">
+              {{ Math.floor(Number(originStatus.continuous_seconds || 0)) }} / {{ Number(originStatus.required_seconds || 60) }}s
+            </span>
+          </div>
+          <progress :value="originLockPercent" max="100"></progress>
+          <div class="origin-quality-grid">
+            <div :class="{ ok: originStatus.position_fixed }">
+              <span>{{ originStatus.position_fixed ? '✓' : '…' }}</span>
+              <div><strong>位置 FIX</strong><small>{{ originStatus.ntrip_quality || '等待 RTK FIX' }}</small></div>
+            </div>
+            <div :class="{ ok: originStatus.heading_fixed }">
+              <span>{{ originStatus.heading_fixed ? '✓' : '…' }}</span>
+              <div><strong>双天线航向 FIX</strong><small>基线 {{ Number(originStatus.baseline_m || 0).toFixed(2) }} m</small></div>
+            </div>
+            <div :class="{ ok: Number(originStatus.position_spread_m ?? 1) <= 0.02 }">
+              <span>{{ Number(originStatus.position_spread_m ?? 1) <= 0.02 ? '✓' : '…' }}</span>
+              <div><strong>位置波动 &lt; 2 cm</strong><small>{{ originStatus.position_spread_m == null ? '等待稳定窗口' : `${(Number(originStatus.position_spread_m) * 100).toFixed(1)} cm` }}</small></div>
+            </div>
+            <div :class="{ ok: originStatus.heading_stable }">
+              <span>{{ originStatus.heading_stable ? '✓' : '…' }}</span>
+              <div><strong>航向质量</strong><small>σ {{ Number(originStatus.heading_std_deg || 0).toFixed(2) }}° · 延迟 {{ Number(originStatus.age_seconds || 0).toFixed(1) }}s</small></div>
+            </div>
+          </div>
+          <p>{{ originStatus.message || '点击“锁定 ENU 原点”开始质量检测' }}</p>
+          <div v-if="originLocked" class="origin-coordinate">
+            <span>LAT {{ Number(originStatus.origin?.origin_latitude || originStatus.latitude).toFixed(10) }}</span>
+            <span>LON {{ Number(originStatus.origin?.origin_longitude || originStatus.longitude).toFixed(10) }}</span>
+            <span>航向 {{ Number(originStatus.heading_deg || 0).toFixed(2) }}°</span>
+          </div>
+        </section>
+
         <!-- 建图状态机 -->
         <div v-if="showMappingReadiness" class="mapping-readiness" :class="readinessClass" role="status">
           <div class="mapping-readiness-main">
@@ -1064,7 +1241,10 @@ async function saveCleaner() {
                 {{ mappingReadiness.imu_samples || 0 }}/{{ mappingReadiness.imu_required_samples }}
               </template>
             </span>
-            <span :class="{ ok: Number(mappingReadiness.keyframe_count || 0) > 0 }">
+            <span :class="{ ok: mappingStatus?.result?.mapping_capture_enabled }">
+              正式采集 {{ mappingStatus?.result?.mapping_capture_enabled ? '已开启' : '门控关闭' }}
+            </span>
+            <span v-if="mappingStatus?.result?.mapping_capture_enabled" :class="{ ok: Number(mappingReadiness.keyframe_count || 0) > 0 }">
               关键帧 {{ mappingReadiness.keyframe_count || 0 }}
             </span>
             <span v-if="readinessSampleAge !== null">状态延迟 {{ readinessSampleAge.toFixed(1) }}s</span>
@@ -1073,7 +1253,7 @@ async function saveCleaner() {
         <div v-if="showMappingReadiness" class="mapping-startup-checks" :class="{ 'is-ready': mappingStartupReady }">
           <div class="mapping-startup-checks-head">
             <strong>建图前置检查</strong>
-            <span>{{ mappingStartupReady ? '全部通过，可以移动建图' : '检查中，请保持机器狗静止' }}</span>
+            <span>{{ mappingStartupReady ? '全部通过，请人工确认后再移动' : '检查中，请保持机器狗静止' }}</span>
           </div>
           <div class="mapping-startup-check-grid">
             <div v-for="item in mappingStartupChecks" :key="item.key" class="mapping-startup-check" :class="{ ok: item.ok }">
@@ -1185,9 +1365,9 @@ async function saveCleaner() {
           <label>
             <span>场景范围</span>
             <select v-model="mappingForm.scene_scope" :disabled="isActiveMapping">
-              <option value="indoor">室内</option>
-              <option value="transition">室内外过渡</option>
-              <option value="outdoor">室外</option>
+              <option v-if="!isOutdoorMapping" value="indoor">室内</option>
+              <option v-if="isOutdoorMapping" value="transition">室内外过渡（按室外流程）</option>
+              <option v-if="isOutdoorMapping" value="outdoor">室外</option>
             </select>
           </label>
           <label class="mapping-record-option">
@@ -1200,8 +1380,14 @@ async function saveCleaner() {
         </div>
 
         <div class="mapping-actions">
-          <button class="btn btn-primary" :disabled="mappingBusy || isActiveMapping || !selectedRobot || connectionStatus !== 'online'" @click="handleStartMapping">
-            {{ mappingBusy ? '正在下发...' : '启动并检查' }}
+          <button v-if="isOutdoorMapping" class="btn btn-origin" :disabled="mappingBusy || !selectedRobot || !canLockOrigin" @click="handleLockOrigin">
+            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : '锁定 ENU 原点') }}
+          </button>
+          <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canStartSlam" @click="handleStartMapping">
+            {{ mappingBusy ? '正在下发...' : (isOutdoorMapping ? '启动 SLAM 并检查航向' : '启动并检查') }}
+          </button>
+          <button class="btn btn-confirm" :disabled="mappingBusy || !selectedRobot || !canBeginMapping" @click="handleBeginMapping">
+            {{ isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图' }}
           </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
             {{ slamDiverged ? '停止并生成救援地图' : '停止并保存地图' }}
@@ -1226,11 +1412,19 @@ async function saveCleaner() {
 
         <div class="mapping-guide">
           <strong>操作步骤：</strong>
-          <span>1. 确保 NX 板 edge_agent 已启动（连接状态显示"已连接"）</span>
-          <span>2. 点击"启动并检查" → Edge Agent 自动启动雷达、IMU 和 ROS2 SLAM</span>
-          <span>3. 等待六项前置检查全部通过，再用 Orche APP / 遥控器操控机器狗走场</span>
-          <span>4. 回到平台点击"停止并保存地图" → 自动打包上传</span>
-          <span>5. 上传完成后可在上方"选择地图"查看预览</span>
+          <template v-if="isOutdoorMapping">
+            <span>1. 将机器人开到预选开阔锚点，点击“锁定 ENU 原点”，随后保持静止</span>
+            <span>2. 等待位置 FIX、双天线航向 FIX、位置波动小于 2 cm 连续满足 60 秒</span>
+            <span>3. 原点锁定后点击“启动 SLAM 并检查航向”，IMU 使用 NX 板雷达内置 IMU 完成预热</span>
+            <span>4. 原地小范围转动，确认航向稳定后点击“确认航向稳定，开始建图”</span>
+            <span>5. 此时才正式采集数据和关键帧；走场结束后停止并保存地图</span>
+          </template>
+          <template v-else>
+            <span>1. 点击“启动并检查”，自动启动雷达内置 IMU 和 SLAM 预热</span>
+            <span>2. 保持静止，等待 IMU 初始化与有效 SLAM 位姿全部通过</span>
+            <span>3. 点击“确认检查通过，开始建图”，此时才正式采集数据和关键帧</span>
+            <span>4. 用 Orche APP / 遥控器走场，结束后停止并保存地图</span>
+          </template>
         </div>
       </div>
     </section>
@@ -1333,6 +1527,105 @@ async function saveCleaner() {
 </template>
 
 <style scoped>
+.mapping-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.mapping-mode-switch button {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid #d6dee9;
+  border-radius: 10px;
+  background: #fff;
+  color: #344054;
+  text-align: left;
+  transition: border-color 0.18s, box-shadow 0.18s, transform 0.18s;
+}
+
+.mapping-mode-switch button:not(:disabled):hover {
+  border-color: #66a6df;
+  transform: translateY(-1px);
+}
+
+.mapping-mode-switch button.active {
+  border-color: #1976d2;
+  background: linear-gradient(135deg, #eef7ff, #fff);
+  box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.12);
+}
+
+.mapping-mode-switch strong { font-size: 0.95rem; }
+.mapping-mode-switch span { color: #667085; font-size: 0.78rem; line-height: 1.45; }
+
+.origin-quality-card {
+  display: grid;
+  gap: 0.85rem;
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #f1c77b;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #fffbeb, #fff);
+}
+
+.origin-quality-card.origin-locked {
+  border-color: #6fcf97;
+  background: linear-gradient(145deg, #ecfdf3, #fff);
+}
+
+.origin-quality-head,
+.origin-coordinate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.origin-quality-head > div { display: grid; gap: 0.15rem; }
+.origin-kicker { color: #8a5a00; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.origin-countdown { font-variant-numeric: tabular-nums; font-size: 1.15rem; font-weight: 800; color: #8a5a00; }
+.origin-quality-card progress { width: 100%; height: 0.55rem; accent-color: #e4a11b; }
+.origin-locked progress { accent-color: #198754; }
+
+.origin-quality-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.origin-quality-grid > div {
+  display: flex;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.65rem;
+  border: 1px solid #e6e9ef;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.82);
+}
+
+.origin-quality-grid > div > span { color: #98a2b3; font-weight: 800; }
+.origin-quality-grid > div.ok > span { color: #198754; }
+.origin-quality-grid div div { display: grid; min-width: 0; gap: 0.15rem; }
+.origin-quality-grid strong { font-size: 0.78rem; }
+.origin-quality-grid small { overflow: hidden; color: #667085; font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
+.origin-quality-card p { margin: 0; color: #5f4b20; font-size: 0.8rem; }
+.origin-coordinate { padding-top: 0.65rem; border-top: 1px dashed #9ed6b5; color: #176b3a; font: 600 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.mapping-actions .btn-origin { border-color: #d99a19; color: #7a5100; background: #fff8e6; }
+.mapping-actions .btn-confirm { border-color: #198754; color: #fff; background: #198754; }
+.mapping-actions .btn-confirm:disabled { border-color: #b9c4cf; background: #b9c4cf; }
+
+@media (max-width: 900px) {
+  .origin-quality-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 620px) {
+  .mapping-mode-switch, .origin-quality-grid { grid-template-columns: 1fr; }
+}
+
 .map-full-preview {
   background: #f9f9f9;
   border-radius: 8px;

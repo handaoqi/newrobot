@@ -357,6 +357,34 @@ export async function startRobotMapping(robotId, payload) {
   })
 }
 
+export async function startRobotMappingOrigin(robotId, payload) {
+  return request(`/robots/${robotId}/mapping/origin/start/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function cancelRobotMappingOrigin(robotId, payload = {}) {
+  return request(`/robots/${robotId}/mapping/origin/cancel/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function startRobotMappingSlam(robotId, payload) {
+  return request(`/robots/${robotId}/mapping/slam/start/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function beginRobotMapping(robotId, payload = {}) {
+  return request(`/robots/${robotId}/mapping/begin/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function saveRobotMapping(robotId, payload) {
   return request(`/robots/${robotId}/mapping/save/`, {
     method: 'POST',

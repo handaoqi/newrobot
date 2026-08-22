@@ -91,7 +91,22 @@ mapping:
   save_service: "/slam/save_map"
   save_service_type: "std_srvs/srv/Trigger"
   start_data: 3
+  warmup_data: 6
+  indoor_warmup_data: 7
   save_data: 5
+  # Empty paths derive from map_dir, yielding gnss_origin.yaml and mapping_workflow.json.
+  origin_file: ""
+  origin_state_file: ""
+  origin_lock_duration_seconds: 60.0
+  origin_lock_max_spread_m: 0.02
+  origin_lock_sample_interval_seconds: 1.0
+  origin_lock_ttl_seconds: 1800
+  origin_fix_topic: "/fix"
+  origin_rtk_topic: "/rtk_pvh"
+  origin_ntrip_status_topic: "/rtk/ntrip_status"
+  heading_min_baseline_m: 0.20
+  heading_max_std_deg: 5.0
+  heading_max_age_seconds: 1.5
   command_timeout_seconds: 15
   save_wait_seconds: 7200
   dynamic_filter_enabled: false

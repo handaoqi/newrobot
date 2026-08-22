@@ -1,5 +1,8 @@
 import json
 
+import pytest
+
+from roamerx_edge.map_coordinate import MapConstraintError
 from roamerx_edge.map_package_finalize import finalize_map_package
 from roamerx_edge.recording_manifest import REQUIRED_TOPICS, write_recording_manifest
 
@@ -27,16 +30,42 @@ def test_finalize_local_only_map_writes_manifest_and_keeps_raw(tmp_path):
         "error_status": "no_previous_keyframe",
     }))
 
-    manifest = finalize_map_package(session, requested_scene_scope="outdoor")
+    manifest = finalize_map_package(session, requested_scene_scope="indoor")
 
     assert manifest["coordinate_mode"] == "local_only"
     assert manifest["scene_scope"] == "indoor"
+    assert manifest["mapping_type"] == "indoor"
     assert manifest["localization_mode"] == "ndt"
     assert manifest["quaternion_order"] == "xyzw"
     assert (session / "map_raw.pcd").read_bytes() == b"raw-pcd"
     assert (session / "trajectory_raw.csv").exists()
     assert (session / "trajectory_optimized.csv").exists()
     assert (session / "scan_context" / "index.json").exists()
+
+
+def test_finalize_rejects_outdoor_map_without_locked_origin(tmp_path):
+    with pytest.raises(MapConstraintError) as error:
+        finalize_map_package(tmp_path / "outdoor", requested_scene_scope="outdoor")
+
+    assert error.value.code == "MAP_RTK_ORIGIN_REQUIRED"
+
+
+def test_outdoor_manifest_carries_origin_lock_audit_fields(tmp_path):
+    session = tmp_path / "outdoor-fixed"
+    session.mkdir()
+    (session / "gnss_origin.yaml").write_text(
+        "alignment_locked: 1\n"
+        "origin_lock_session_id: origin-123\n"
+        "locked_at_unix: 1234.5\n"
+        "position_spread_m: 0.012\n"
+    )
+
+    manifest = finalize_map_package(session, requested_scene_scope="outdoor")
+
+    assert manifest["mapping_type"] == "outdoor"
+    assert manifest["coordinate_mode"] == "rtk_fixed"
+    assert manifest["origin_lock_session_id"] == "origin-123"
+    assert manifest["origin_position_spread_m"] == pytest.approx(0.012)
 
 
 def test_recording_manifest_lists_required_topics(tmp_path):

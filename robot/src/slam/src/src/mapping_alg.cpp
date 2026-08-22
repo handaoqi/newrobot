@@ -221,6 +221,7 @@ namespace robot::slam
         this->declare_parameter<double>("imu_init.max_acc_variance", 0.5);
         this->declare_parameter<double>("imu_init.max_gyro_variance", 0.05);
         this->declare_parameter<bool>("gnss_fusion.enable", false);
+        this->declare_parameter<string>("gnss_fusion.origin_file", "/home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml");
         this->declare_parameter<double>("gnss_fusion.gain", 0.03);
         this->declare_parameter<double>("gnss_fusion.max_correction_step", 0.10);
         this->declare_parameter<double>("gnss_fusion.max_residual", 5.0);
@@ -373,6 +374,8 @@ namespace robot::slam
         this->get_parameter_or<double>("imu_init.max_acc_variance", imu_init_max_acc_variance, 0.5);
         this->get_parameter_or<double>("imu_init.max_gyro_variance", imu_init_max_gyro_variance, 0.05);
         this->get_parameter_or<bool>("gnss_fusion.enable", use_gnss_fusion_, false);
+        gnss_fusion_config_enabled_ = use_gnss_fusion_;
+        this->get_parameter_or<string>("gnss_fusion.origin_file", gnss_origin_file_, "/home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml");
         this->get_parameter_or<double>("gnss_fusion.gain", gnss_fusion_gain_, 0.03);
         this->get_parameter_or<double>("gnss_fusion.max_correction_step", gnss_max_correction_step_, 0.10);
         this->get_parameter_or<double>("gnss_fusion.max_residual", gnss_max_residual_, 5.0);
@@ -541,7 +544,25 @@ namespace robot::slam
                 response->message = "Set READY State!!!!!!";
                 break;
             case 3:
-                reset();
+                if (state_.load() == SlamState::WARMUP)
+                {
+                    mapping_capture_enabled_ = true;
+                    has_last_keyframe_ = false;
+                    resetImuPreintegration(lidar_end_time);
+                    writeSaveProgress("waiting_first_keyframe", 0.0);
+                }
+                else
+                {
+                    reset();
+                    mapping_capture_enabled_ = true;
+                    // Legacy direct starts are indoor-compatible. Outdoor starts
+                    // enter WARMUP first, preserving the prelocked ENU origin here.
+                    use_gnss_fusion_ = false;
+                    gnss_origin_initialized_ = false;
+                    gnss_origin_prelocked_ = false;
+                    gnss_alignment_locked_ = false;
+                    gnss_alignment_source_.clear();
+                }
                 if (active_map_subdir_.empty())
                 {
                     state_.store(SlamState::ERROR);
@@ -551,8 +572,54 @@ namespace robot::slam
                 else
                 {
                     state_.store(SlamState::ACTIVE);
+                    writeSaveProgress(
+                        p_imu->initialization_ready() ? "waiting_first_keyframe" : "initializing_imu", 0.0);
                     response->success = true;
                     response->message = "Set ACTIVE State!!!!!!";
+                }
+                break;
+            case 6:
+                reset();
+                mapping_capture_enabled_ = false;
+                use_gnss_fusion_ = gnss_fusion_config_enabled_;
+                if (!gnss_origin_prelocked_)
+                {
+                    state_.store(SlamState::ERROR);
+                    response->success = false;
+                    response->message = "Outdoor SLAM warmup rejected: locked gnss_origin.yaml is missing or invalid.";
+                }
+                else if (active_map_subdir_.empty())
+                {
+                    state_.store(SlamState::ERROR);
+                    response->success = false;
+                    response->message = "Failed to initialize SLAM warmup session directory.";
+                }
+                else
+                {
+                    state_.store(SlamState::WARMUP);
+                    response->success = true;
+                    response->message = "Set WARMUP State; formal keyframe capture is disabled.";
+                }
+                break;
+            case 7:
+                reset();
+                mapping_capture_enabled_ = false;
+                use_gnss_fusion_ = false;
+                gnss_origin_initialized_ = false;
+                gnss_origin_prelocked_ = false;
+                gnss_alignment_locked_ = false;
+                gnss_alignment_source_.clear();
+                if (active_map_subdir_.empty())
+                {
+                    state_.store(SlamState::ERROR);
+                    response->success = false;
+                    response->message = "Failed to initialize indoor SLAM warmup session directory.";
+                }
+                else
+                {
+                    state_.store(SlamState::WARMUP);
+                    response->success = true;
+                    response->message = "Set indoor WARMUP State; GNSS origin and formal capture are disabled.";
                 }
                 break;
             case 4:
@@ -747,6 +814,8 @@ namespace robot::slam
         has_last_health_pose_ = false;
         last_health_stamp_ = 0.0;
         mapping_started_stamp_ = 0.0;
+        mapping_capture_enabled_ = false;
+        slam_pose_ready_ = false;
         mapping_keyframes_.clear();
         keyframe_write_queue_.clear();
         keyframe_writer_failed_ = false;
@@ -773,6 +842,61 @@ namespace robot::slam
 
         if (!initializeKeyframeSession())
             active_map_subdir_.clear();
+        loadLockedGnssOrigin();
+    }
+
+    bool MappingAlg::loadLockedGnssOrigin()
+    {
+        gnss_origin_prelocked_ = false;
+        if (gnss_origin_file_.empty())
+            return false;
+        std::ifstream input(gnss_origin_file_);
+        if (!input.is_open())
+            return false;
+        bool locked = false;
+        bool has_lat = false;
+        bool has_lon = false;
+        bool has_alt = false;
+        std::string line;
+        try
+        {
+            while (std::getline(input, line))
+            {
+                const auto separator = line.find(':');
+                if (separator == std::string::npos)
+                    continue;
+                const std::string key = line.substr(0, separator);
+                const std::string value = line.substr(separator + 1);
+                if (key == "origin_latitude")
+                {
+                    gnss_origin_lat_ = std::stod(value);
+                    has_lat = true;
+                }
+                else if (key == "origin_longitude")
+                {
+                    gnss_origin_lon_ = std::stod(value);
+                    has_lon = true;
+                }
+                else if (key == "origin_altitude")
+                {
+                    gnss_origin_alt_ = std::stod(value);
+                    has_alt = true;
+                }
+                else if (key == "alignment_locked")
+                    locked = value.find("true") != std::string::npos || value.find("True") != std::string::npos;
+            }
+        }
+        catch (const std::exception& exc)
+        {
+            RCLCPP_ERROR(get_logger(), "Invalid locked GNSS origin %s: %s", gnss_origin_file_.c_str(), exc.what());
+            return false;
+        }
+        gnss_origin_initialized_ = locked && has_lat && has_lon && has_alt;
+        gnss_origin_prelocked_ = gnss_origin_initialized_;
+        if (gnss_origin_prelocked_)
+            RCLCPP_INFO(get_logger(), "Loaded locked ENU origin %.10f, %.10f, %.3f from %s",
+                gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_, gnss_origin_file_.c_str());
+        return gnss_origin_prelocked_;
     }
 
 
@@ -1579,7 +1703,7 @@ namespace robot::slam
 
     void MappingAlg::recordKeyframe(const CloudPtr& cloud_world)
     {
-        if (slam_diverged_ || !keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
+        if (slam_diverged_ || !mapping_capture_enabled_ || !keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
             return;
         const Vec3d lidar_origin = state_point.rot * state_point.offset_T_L_I + state_point.pos;
         const Mat3d world_rotation = state_point.rot.toRotationMatrix();
@@ -2189,7 +2313,7 @@ namespace robot::slam
 
     void MappingAlg::run()
     {
-        if (state_.load() == SlamState::ACTIVE)
+        if (state_.load() == SlamState::ACTIVE || state_.load() == SlamState::WARMUP)
         {
 
             if (syncData(Measures))
@@ -2212,7 +2336,9 @@ namespace robot::slam
                 {
                     const char* stage = !p_imu->initialization_ready()
                         ? "initializing_imu"
-                        : (mapping_keyframes_.empty() ? "waiting_first_keyframe" : "mapping");
+                        : (!slam_pose_ready_ ? "waiting_first_keyframe"
+                            : (!mapping_capture_enabled_ ? "ready_to_map"
+                                : (mapping_keyframes_.empty() ? "waiting_first_keyframe" : "mapping")));
                     writeSaveProgress(stage, 0.0);
                     last_mapping_progress_stamp_ = Measures.lidar_end_time;
                 }
@@ -2294,6 +2420,7 @@ namespace robot::slam
                     return;
                 }
                 map_incremental();
+                slam_pose_ready_ = p_imu->initialization_ready() && ikdtree.Root_Node != nullptr;
 
                 publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
                 pubWorldPoints(pubLaserCloudFull_);
@@ -3264,6 +3391,8 @@ namespace robot::slam
                << "  \"written_points\": " << written_points << ",\n"
                << "  \"estimated_output_bytes\": " << written_points * sizeof(BinaryPcdPoint) << ",\n"
                << "  \"trajectory_m\": " << std::setprecision(3) << trajectory_m << ",\n"
+               << "  \"mapping_capture_enabled\": " << (mapping_capture_enabled_ ? "true" : "false") << ",\n"
+               << "  \"slam_pose_ready\": " << (slam_pose_ready_ ? "true" : "false") << ",\n"
                << "  \"rss_bytes\": " << residentSetBytes() << ",\n"
                << "  \"disk_free_bytes\": " << freeDiskBytes(active_map_subdir_) << ",\n"
                << "  \"rtk_quality\": {\"valid\": " << (latest.rtk_valid ? "true" : "false")
@@ -3278,6 +3407,7 @@ namespace robot::slam
                << ", \"fusion_enabled\": " << (use_gnss_fusion_ ? "true" : "false") << "},\n"
                << "  \"slam_health\": {\"state\": \"" << jsonEscape(slam_health_state_)
                << "\", \"imu_initialized\": " << (p_imu->initialization_ready() ? "true" : "false")
+               << ", \"slam_pose_ready\": " << (slam_pose_ready_ ? "true" : "false")
                << ", \"imu_samples\": " << p_imu->initialization_samples()
                << ", \"imu_required_samples\": " << p_imu->initialization_required_samples()
                << ", \"no_effective_points_streak\": " << no_effective_points_streak_

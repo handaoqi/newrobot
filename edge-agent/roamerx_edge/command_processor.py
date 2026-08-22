@@ -503,6 +503,14 @@ class CommandProcessor:
         command = envelope.payload.get("command") or {}
         if envelope.message_type == "mapping.start":
             result_payload = self.mapping_adapter.start_mapping(command)
+        elif envelope.message_type == "mapping.origin_start":
+            result_payload = self.mapping_adapter.start_origin_lock(command)
+        elif envelope.message_type == "mapping.origin_cancel":
+            result_payload = self.mapping_adapter.cancel_origin_lock(command)
+        elif envelope.message_type == "mapping.slam_start":
+            result_payload = self.mapping_adapter.start_slam_warmup(command)
+        elif envelope.message_type == "mapping.begin":
+            result_payload = self.mapping_adapter.begin_mapping(command)
         elif envelope.message_type == "mapping.save":
             result_payload = self.mapping_adapter.save_mapping(command)
         elif envelope.message_type == "mapping.cancel":

@@ -35,6 +35,16 @@ class ProtocolContractTests(SimpleTestCase):
         envelope = parse_message(payload)
         self.assertEqual(envelope.message_type, "nav.recover")
 
+    def test_accepts_mapping_origin_workflow_commands(self):
+        for command_type in (
+            "mapping.origin_start", "mapping.origin_cancel", "mapping.slam_start", "mapping.begin",
+        ):
+            payload = json.loads(self.fixture_path.read_text())
+            payload["message_type"] = command_type
+            payload["payload"].pop("task_execution_id", None)
+            payload["payload"]["command"] = {"mapping_type": "outdoor"}
+            self.assertEqual(parse_message(payload).message_type, command_type)
+
     def test_robot_command_omits_expected_state_without_task_execution(self):
         class Robot:
             code = "ZSL-1A-07"
