@@ -1,0 +1,14 @@
+[Unit]
+Description=RoamerX cloud TCP tunnel for RTMP and MQTT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dogrobot
+ExecStart=/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o "ProxyCommand=/usr/bin/nc -X connect -x 127.0.0.1:7888 %%h %%p" -L 127.0.0.1:11935:127.0.0.1:1935 -L 127.0.0.1:11884:127.0.0.1:1884 root@39.107.250.69
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

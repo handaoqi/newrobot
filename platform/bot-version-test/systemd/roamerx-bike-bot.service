@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=robot
+User=dogrobot
 Group=robot
 WorkingDirectory=/home/dogrobot/platform/bot-version-test
 Environment=PYTHONUNBUFFERED=1

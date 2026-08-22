@@ -7,7 +7,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=robot
+User=dogrobot
 Group=robot
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp

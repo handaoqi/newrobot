@@ -100,7 +100,7 @@ if [[ -f "$LEGACY_HOME/.config/roamerx/bike-bot.yaml" && ! -L "$LEGACY_HOME/.con
 fi
 ln -sfn "$CONF_ROOT/bike-bot.yaml" "$LEGACY_HOME/.config/roamerx/bike-bot.yaml"
 
-chown -R robot:robot "$DATA_ROOT"
+chown -R dogrobot:robot "$DATA_ROOT"
 chown -R dogrobot:robot "$CONF_ROOT"
 chmod 750 "$CONF_ROOT"
 find "$CONF_ROOT" -type f -exec chmod 640 {} +

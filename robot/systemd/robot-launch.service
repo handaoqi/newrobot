@@ -1,0 +1,18 @@
+[Unit]
+Description=robot launch
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+User=dogrobot
+WorkingDirectory=/home/dogrobot
+ExecStart=robot-launch server
+ExecStop=/usr/local/bin/robot_launch_stop.sh
+TimeoutStopSec=5s
+Environment="ROBOT_NET_INTERFACES=enP8p1s0"
+Environment="ROBOT_API_HOST=0.0.0.0"
+Environment="ROBOT_API_PORT=58787"
+
+[Install]
+WantedBy=multi-user.target

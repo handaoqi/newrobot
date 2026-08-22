@@ -4,11 +4,10 @@ After=network-online.target roamerx-zenoh.service
 Wants=network-online.target roamerx-zenoh.service
 # The bridge owns the sole virtual-remote session. It is intentionally
 # persistent across teleop, task, charging, and cooling commands.
-RefuseManualStop=yes
 
 [Service]
 Type=simple
-User=robot
+User=dogrobot
 Group=robot
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
