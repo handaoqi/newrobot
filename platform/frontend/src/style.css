@@ -750,15 +750,25 @@ a { color: inherit; }
   gap: 0.6rem;
 }
 
+/* The mapping-grid label rule uses display:grid; keep the checkbox and its
+   title aligned as one compact horizontal control. */
+.mapping-grid label.mapping-record-option {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+
 .mapping-record-option input {
   width: 1rem;
   height: 1rem;
+  flex: 0 0 auto;
   margin-top: 0.15rem;
 }
 
 .mapping-record-option span {
   display: grid;
   gap: 0.15rem;
+  min-width: 0;
 }
 
 .mapping-record-option small {
