@@ -1437,11 +1437,11 @@ async function saveCleaner() {
         </div>
 
         <div class="mapping-actions">
-          <button v-if="isOutdoorMapping" class="btn btn-origin" :disabled="mappingBusy || !selectedRobot || !canLockOrigin" @click="handleLockOrigin">
-            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : '锁定 ENU 原点') }}
-          </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canStartSlam" @click="handleStartMapping">
             {{ mappingBusy ? '正在下发...' : '启动并检查' }}
+          </button>
+          <button v-if="isOutdoorMapping" class="btn btn-origin" :disabled="mappingBusy || !selectedRobot || !canLockOrigin" @click="handleLockOrigin">
+            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : '锁定 ENU 原点') }}
           </button>
           <button class="btn btn-confirm" :disabled="mappingBusy || !selectedRobot || !canBeginMapping" @click="handleBeginMapping">
             {{ isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图' }}
