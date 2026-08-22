@@ -161,7 +161,7 @@ class MappingAdapter:
                 self._call_map_state(self.config.warmup_data)
             self._call_map_state(self.config.start_data)
         except Exception:
-            self._stop_rosbag()
+            self._cleanup()
             raise
         self._set_state("mapping")
         return self.status()
@@ -170,27 +170,37 @@ class MappingAdapter:
         """Start outdoor sensors, optionally stopping before the RTK quality window."""
         if self._any_slam_process_alive:
             raise ProtocolError("MAPPING_ALREADY_ACTIVE", "stop SLAM before locking a new ENU origin")
-        if self.session and self.session.state not in {"idle", "cancelled", "exited", "failed"}:
+        prepare_only = bool(command.get("prepare_only"))
+        existing_origin_session = bool(self.session and self.session.state == "origin_waiting")
+        if self.session and self.session.state not in {"idle", "cancelled", "exited", "failed", "origin_waiting"}:
             raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping workflow is already active")
+        if existing_origin_session and not prepare_only:
+            origin_state = self._origin_monitor.status().get("origin_status")
+            if origin_state in {"waiting_quality", "quality_holding"}:
+                raise ProtocolError("MAPPING_ALREADY_ACTIVE", "ENU origin lock is already running")
+            if origin_state == "locked":
+                return self.status()
         scene_scope = normalize_text(command.get("scene_scope"), "outdoor")
         if scene_scope not in {"transition", "outdoor"}:
             raise ProtocolError("MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN", "indoor mapping does not lock an ENU origin")
         self._mapping_type = "outdoor"
         self._scene_scope = scene_scope
-        self.session = MappingSession(
-            session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
-            map_name=command.get("map_name") or f"室外地图 {time.strftime('%Y%m%d-%H%M%S')}",
-            route_hint=command.get("route_hint", ""),
-            state="origin_starting",
-            started_at=now_iso(),
-            updated_at=now_iso(),
-            scene_scope=scene_scope,
-            mapping_type="outdoor",
-        )
+        if not existing_origin_session:
+            self.session = MappingSession(
+                session_id=command.get("mapping_session_id") or str(uuid.uuid4()),
+                map_name=command.get("map_name") or f"室外地图 {time.strftime('%Y%m%d-%H%M%S')}",
+                route_hint=command.get("route_hint", ""),
+                state="origin_starting",
+                started_at=now_iso(),
+                updated_at=now_iso(),
+                scene_scope=scene_scope,
+                mapping_type="outdoor",
+            )
         self.map_dir.mkdir(parents=True, exist_ok=True)
-        self._stop_conflicting_navigation_stack()
-        self._ensure_mapping_sensors()
-        if command.get("prepare_only"):
+        if not existing_origin_session:
+            self._stop_conflicting_navigation_stack()
+            self._ensure_mapping_sensors()
+        if prepare_only:
             self._origin_monitor.prepare()
         else:
             self._origin_monitor.start()
@@ -204,6 +214,8 @@ class MappingAdapter:
             self._set_state("cancelled")
         result = self.status()
         result["origin"] = origin
+        self._cleanup()
+        result.update(self.status())
         return result
 
     def start_slam_warmup(self, command: dict) -> dict:
@@ -249,8 +261,6 @@ class MappingAdapter:
         self.session.mapping_type = mapping_type
         self.session.scene_scope = scene_scope
         self._record_rosbag = bool(command.get("record_rosbag", False))
-        if self._record_rosbag and not self._rosbag_status().get("running"):
-            self._start_rosbag(self.session.map_name)
         self._set_state("slam_starting")
         try:
             self._ensure_slam_process()
@@ -260,6 +270,7 @@ class MappingAdapter:
         except Exception:
             self._stop_rosbag()
             self._set_state("failed")
+            self._cleanup()
             raise
         self.session.mapping_capture_enabled = False
         self._set_state("slam_warmup")
@@ -281,7 +292,15 @@ class MappingAdapter:
             if not bool(command.get("heading_check_confirmed")):
                 raise ProtocolError("MAPPING_HEADING_NOT_CONFIRMED", "operator must confirm the heading check")
             self.session.heading_check_confirmed = True
-        self._call_map_state(self.config.start_data)
+        # Diagnostic recording begins with formal keyframe capture, not during
+        # RTK/origin checks or SLAM warmup.
+        try:
+            if self._record_rosbag and not self._rosbag_status().get("running"):
+                self._start_rosbag(self.session.map_name)
+            self._call_map_state(self.config.start_data)
+        except Exception:
+            self._stop_rosbag()
+            raise
         self.session.mapping_capture_enabled = True
         self._origin_monitor.stop()
         self._set_state("mapping")
@@ -393,6 +412,12 @@ class MappingAdapter:
             self._stop_slam_process()
             self._set_state("exited")
         result.update(self.status())
+        # A completed export must not keep the previous mapping mode, session,
+        # or ENU lock alive.  The packaged metadata remains in ``result`` while
+        # the adapter is reset so the next run can choose indoor/outdoor again.
+        if should_stop:
+            self._cleanup()
+            result.update(self.status())
         return result
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:
@@ -430,6 +455,8 @@ class MappingAdapter:
             package_path=str(package_path),
             upload_result=upload_result,
         )
+        self._cleanup()
+        result.update(self.status())
         return result
 
     def cancel_mapping(self, command: dict) -> dict:
@@ -443,7 +470,10 @@ class MappingAdapter:
         else:
             self._origin_monitor.stop()
         self._mark_progress_cancelled(progress_dir)
-        return self.status()
+        result = self.status()
+        self._cleanup()
+        result.update(self.status())
+        return result
 
     def status(self) -> dict:
         process_alive = self._any_slam_process_alive
@@ -630,8 +660,15 @@ class MappingAdapter:
         """Kill orphaned SLAM process and reset session state."""
         self._stop_rosbag()
         self._stop_slam_process()
-        self._origin_monitor.stop()
+        # ``stop`` leaves a valid ENU origin on disk.  That is useful only
+        # while the current workflow is active; clear it when the workflow is
+        # terminal so a subsequent run starts with an explicit mode selection.
+        self._origin_monitor.cancel()
         self.session = None
+        self._mapping_type = "indoor"
+        self._scene_scope = "indoor"
+        self._record_rosbag = False
+        self._rosbag_dir = None
 
     def _restore_workflow_state(self) -> None:
         origin_restored = self._origin_monitor.restore(self.config.origin_lock_ttl_seconds)

@@ -108,6 +108,36 @@ def test_outdoor_start_can_prepare_sensors_before_origin_lock(tmp_path, monkeypa
     assert calls == ["stop_nav", "sensors"]
 
 
+def test_origin_lock_reuses_prepared_waiting_session(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda: calls.append("stop_nav"))
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors"))
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "state": adapter.session.state,
+        "origin": adapter._origin_monitor.status(),
+    })
+
+    adapter.start_origin_lock({
+        "map_name": "outside",
+        "scene_scope": "outdoor",
+        "mapping_type": "outdoor",
+        "prepare_only": True,
+    })
+    session_id = adapter.session.session_id
+    monkeypatch.setattr(adapter._origin_monitor, "start", lambda: adapter._origin_monitor.status())
+
+    result = adapter.start_origin_lock({
+        "mapping_session_id": session_id,
+        "scene_scope": "outdoor",
+        "mapping_type": "outdoor",
+    })
+
+    assert result["state"] == "origin_waiting"
+    assert adapter.session.session_id == session_id
+    assert calls == ["stop_nav", "sensors"]
+
+
 def test_indoor_warmup_rejects_outdoor_scene_scope(tmp_path):
     adapter = make_adapter(tmp_path)
 
