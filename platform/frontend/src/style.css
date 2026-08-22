@@ -377,6 +377,7 @@ a { color: inherit; }
 .header-user { text-align: right; }
 .header-actions { gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
 .page-grid { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(360px, 0.9fr); gap: 20px; }
+.overview-page { zoom: 0.8; }
 .p0-form, .form-grid { display: grid; gap: 14px; }
 .form-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .form-grid input, .form-grid select { border: 1px solid var(--line); border-radius: 14px; padding: 12px; color: var(--text); background: var(--input-bg); }
@@ -758,16 +759,35 @@ a { color: inherit; }
   min-width: 0;
 }
 
-.mapping-record-option input {
+.mapping-grid label.mapping-scene-option {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.mapping-grid label.mapping-scene-option > span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.mapping-grid label.mapping-scene-option select {
+  width: auto;
+  min-width: 10rem;
+  flex: 1 1 auto;
+}
+
+.mapping-grid label.mapping-record-option input {
   width: 1rem;
   height: 1rem;
   flex: 0 0 auto;
   margin-top: 0.15rem;
 }
 
-.mapping-record-option span {
+.mapping-grid label.mapping-record-option > span {
   display: grid;
   gap: 0.15rem;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -884,6 +904,8 @@ a { color: inherit; }
 }
 
 .mapping-error {
+  display: grid;
+  gap: 4px;
   padding: 12px 14px;
   border: 1px solid rgba(255, 107, 107, 0.35);
   border-radius: 14px;

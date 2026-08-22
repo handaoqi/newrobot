@@ -371,6 +371,8 @@ const terminalStates = ['command_timed_out', 'command_failed', 'command_rejected
 const isTerminal = computed(() => terminalStates.includes(mappingState.value))
 const isError = computed(() => (
   slamDiverged.value
+  || mappingState.value === 'failed'
+  || originState.value === 'failed'
   || (mappingProcessAlive.value && readinessState.value === 'telemetry_stale')
   || ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value)
 ))
@@ -435,6 +437,10 @@ const canBeginMapping = computed(() => (
 ))
 
 const activeStepIndex = computed(() => {
+  if (isError.value) {
+    const failedIndex = stateSteps.value.findIndex(step => step.key === failureStepKey.value)
+    if (failedIndex >= 0) return failedIndex
+  }
   if (slamDiverged.value) return stateSteps.value.findIndex(s => s.key === 'mapping')
   if (['command_created', 'command_published', 'command_accepted'].includes(mappingState.value)) {
     const targetByCommand = {
@@ -471,11 +477,48 @@ const errorLabel = computed(() => {
     command_timed_out: '命令超时',
     command_failed: '命令失败',
     command_rejected: '命令被拒',
+    failed: '状态机停止',
     cancelled: '已取消',
   }
   if (readinessState.value === 'telemetry_stale') return '传感器状态超时'
   return slamDiverged.value ? 'SLAM 发散' : (labels[mappingState.value] || '错误')
 })
+
+const failureStepKey = computed(() => {
+  if (originState.value === 'failed' || originStatus.value.error_code === 'RTK_SIGNAL_TIMEOUT') return 'origin_waiting'
+  const commandStepKeys = {
+    'mapping.origin_start': 'origin_waiting',
+    'mapping.slam_start': 'slam_starting',
+    'mapping.begin': 'ready_to_map',
+    'mapping.save': 'saving',
+    'mapping.cancel': 'stopping',
+  }
+  if (commandStepKeys[mappingStatus.value?.command_type]) return commandStepKeys[mappingStatus.value.command_type]
+  if (slamDiverged.value) return 'mapping'
+  if (['telemetry_stale', 'diverged'].includes(readinessState.value)) return displayMappingState.value
+  if (stateSteps.value.some(step => step.key === mappingState.value)) return mappingState.value
+  return 'idle'
+})
+
+const failureStepIndex = computed(() => stateSteps.value.findIndex(step => step.key === failureStepKey.value))
+const failureStepLabel = computed(() => (
+  failureStepIndex.value >= 0 ? stateSteps.value[failureStepIndex.value].label : failureStepKey.value
+))
+const failureMessage = computed(() => (
+  mappingStatus.value?.error_message
+  || mappingStatus.value?.last_command_error_message
+  || (originState.value === 'failed' ? originStatus.value.message : '')
+  || saveProgress.value.error
+  || slamHealthMessage.value
+  || '状态机在该步骤停止，未返回具体错误信息'
+))
+const failureCode = computed(() => (
+  mappingStatus.value?.error_code
+  || mappingStatus.value?.last_command_error_code
+  || originStatus.value.error_code
+  || saveProgress.value.error_code
+  || ''
+))
 
 const slamAlertSignature = computed(() => (
   slamDiverged.value
@@ -561,11 +604,7 @@ async function refreshMappingStatus() {
     // the operator has just selected outdoor mode. Keep that explicit user
     // choice so a missing RTK fix is shown in the origin panel instead of
     // silently switching the form back to indoor.
-    const shouldAdoptReportedType = (
-      reportedType === 'outdoor'
-      || mappingForm.value.mapping_type === 'indoor'
-      || activeReportedWorkflow
-    )
+    const shouldAdoptReportedType = activeReportedWorkflow
     if (['indoor', 'outdoor'].includes(reportedType)
       && reportedType !== mappingForm.value.mapping_type
       && shouldAdoptReportedType) {
@@ -1457,8 +1496,10 @@ async function saveCleaner() {
           </button>
         </div>
 
-        <div v-if="mappingStatus?.error_message" class="mapping-error">
-          错误: {{ mappingStatus.error_message }}
+        <div v-if="isError" class="mapping-error">
+          <strong>状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
+          <span v-if="failureCode">错误码：{{ failureCode }}</span>
+          <span>失败信息：{{ failureMessage }}</span>
         </div>
         <div
           v-else-if="mappingStatus?.last_command_error_message && ['failed', 'rejected', 'timed_out'].includes(commandStatus)"
@@ -1470,10 +1511,10 @@ async function saveCleaner() {
         <div class="mapping-guide">
           <strong>操作步骤：</strong>
           <template v-if="isOutdoorMapping">
-            <span>1. 将机器人开到预选开阔锚点，点击“锁定 ENU 原点”，随后保持静止</span>
-            <span>2. 等待位置 FIX、双天线航向 FIX、位置波动小于 2 cm 连续满足 60 秒</span>
-            <span>3. 原点锁定后点击“启动 SLAM 并检查航向”，IMU 使用 NX 板雷达内置 IMU 完成预热</span>
-            <span>4. 原地小范围转动，确认航向稳定后点击“确认航向稳定，开始建图”</span>
+            <span>1. 将机器人开到预选开阔锚点，点击“启动并检查”，完成传感器检查后停在锁定原点步骤</span>
+            <span>2. 点击“锁定 ENU 原点”，等待位置 FIX、双天线航向 FIX、位置波动小于 2 cm 连续满足 60 秒</span>
+            <span>3. 原点锁定后再次点击“启动并检查”，启动 SLAM 并完成 IMU、位姿预热</span>
+            <span>4. 状态机停在“航向复核”，原地小范围转动，确认航向稳定后点击“确认航向稳定，开始建图”</span>
             <span>5. 此时才正式采集数据和关键帧；走场结束后停止并保存地图</span>
           </template>
           <template v-else>

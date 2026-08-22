@@ -1627,7 +1627,7 @@ watch(playUrlKey, () => {
 .guard-loop-inline { grid-template-columns: 150px minmax(0, 1fr); align-items: end; border-right: 0; border-bottom: 0; border-left: 0; }
 .guard-loop-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .guard-loop-heading h2 { margin: 5px 0 0; font-size: 22px; }
-.guard-loop-controls { display: grid; grid-template-columns: minmax(300px, 1fr) 160px 150px; align-items: end; gap: 14px; }
+.guard-loop-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 150px) minmax(112px, 132px); align-items: end; gap: 10px; }
 .guard-loop-inline .guard-loop-settings { max-width: 460px; }
 .guard-loop-inline .guard-loop-toggle { height: 42px; min-height: 42px; }
 .guard-countdown-clock { display: grid; gap: 4px; }
@@ -1644,7 +1644,7 @@ watch(playUrlKey, () => {
 .guard-loop-settings label { display: grid; gap: 6px; color: #687a86; font-size: 12px; font-weight: 700; }
 .guard-loop-settings input { width: 100%; min-width: 0; height: 42px; box-sizing: border-box; padding: 0 10px; border: 1px solid #cad4da; background: #fff; color: #172b37; font: inherit; font-size: 15px; font-weight: 800; }
 .guard-loop-settings input:disabled { background: #edf1f3; color: #75858f; }
-.guard-loop-toggle { min-height: 48px; border: 0; color: #fff; background: #136fac; font: inherit; font-weight: 900; cursor: pointer; }
+.guard-loop-toggle { width: 100%; min-width: 0; min-height: 42px; padding: 0 10px; border: 0; color: #fff; background: #136fac; font: inherit; font-size: 14px; font-weight: 900; cursor: pointer; }
 .guard-loop-toggle.is-active { background: #a9402d; }
 .guard-loop-toggle:disabled { cursor: not-allowed; opacity: .45; }
 .guard-runtime-grid { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid #dce4e8; }
@@ -1721,7 +1721,8 @@ watch(playUrlKey, () => {
   .guard-task-bar { grid-template-columns: 1fr 1fr; }
   .guard-task-bar > div:first-child { grid-column: 1 / -1; }
   .guard-primary, .guard-secondary, .guard-danger { width: 100%; }
-  .guard-loop-controls { grid-template-columns: 1fr 1fr; }
+  .guard-loop-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .guard-loop-toggle { grid-column: 1 / -1; }
   .guard-loop-inline .guard-loop-settings { grid-column: 1 / -1; max-width: none; }
   .guard-loop-inline .guard-runtime-grid { grid-template-columns: 1fr 1fr; }
   .guard-loop-inline .guard-runtime-grid > div { border-right: 0; border-bottom: 1px solid #e5eaed; }

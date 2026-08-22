@@ -1037,7 +1037,7 @@ function handleVisibilityChange() {
 </script>
 
 <template>
-  <section v-if="!loading && overview" class="page-grid">
+  <section v-if="!loading && overview" class="page-grid overview-page">
     <div class="content-column">
       <section class="top-summary">
         <article class="status-pill online">
