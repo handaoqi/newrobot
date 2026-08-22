@@ -216,6 +216,13 @@ const originLockPercent = computed(() => {
   const required = Number(originStatus.value.required_seconds || 60)
   return required > 0 ? Math.min(100, Number(originStatus.value.continuous_seconds || 0) / required * 100) : 0
 })
+const originStatusMessage = computed(() => {
+  if (originStatus.value.message) return originStatus.value.message
+  if (!originStatus.value.position_fixed) return '等待 RTK 位置 FIX，暂不能锁定 ENU 原点'
+  if (!originStatus.value.heading_fixed) return '位置已 FIX，等待双天线航向 FIX'
+  if (!originStatus.value.heading_stable) return '位置和航向已接入，等待连续稳定质量窗'
+  return '质量条件满足后即可锁定 ENU 原点'
+})
 const slamHealth = computed(() => saveProgress.value.slam_health || {})
 const slamHealthState = computed(() => slamHealth.value.state || 'unknown')
 const slamDiverged = computed(() => (
@@ -399,6 +406,12 @@ const showMappingReadiness = computed(() => (
   || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
 ))
 const workflowSessionId = computed(() => mappingStatus.value?.result?.mapping_session_id || '')
+const mappingModeSwitchDisabled = computed(() => (
+  mappingBusy.value
+  || mappingCommandInFlight.value
+  || mappingProcessAlive.value
+  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
+))
 const canLockOrigin = computed(() => (
   isOutdoorMapping.value
   && connectionStatus.value === 'online'
@@ -411,7 +424,7 @@ const canStartSlam = computed(() => (
   connectionStatus.value === 'online'
   && !mappingProcessAlive.value
   && !mappingCommandInFlight.value
-  && (!isOutdoorMapping.value || originLocked.value)
+  && (!isOutdoorMapping.value || originLocked.value || ['idle', 'cancelled', 'failed'].includes(originState.value))
 ))
 const canBeginMapping = computed(() => (
   mappingProcessAlive.value
@@ -537,7 +550,25 @@ async function refreshMappingStatus() {
   try {
     mappingStatus.value = await fetchRobotMappingStatus(mappingForm.value.robot)
     const reportedType = mappingStatus.value?.result?.mapping_type
-    if (['indoor', 'outdoor'].includes(reportedType) && reportedType !== mappingForm.value.mapping_type) {
+    const reportedState = mappingStatus.value?.mapping_state || mappingStatus.value?.result?.state || 'idle'
+    const activeReportedWorkflow = [
+      'command_created', 'command_published', 'command_accepted', 'starting',
+    'origin_starting', 'origin_waiting', 'origin_locked', 'slam_starting',
+      'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging',
+      'uploading', 'stopping',
+    ].includes(reportedState)
+    // An idle Edge Agent reports its default indoor mapping type even when
+    // the operator has just selected outdoor mode. Keep that explicit user
+    // choice so a missing RTK fix is shown in the origin panel instead of
+    // silently switching the form back to indoor.
+    const shouldAdoptReportedType = (
+      reportedType === 'outdoor'
+      || mappingForm.value.mapping_type === 'indoor'
+      || activeReportedWorkflow
+    )
+    if (['indoor', 'outdoor'].includes(reportedType)
+      && reportedType !== mappingForm.value.mapping_type
+      && shouldAdoptReportedType) {
       mappingForm.value.mapping_type = reportedType
     }
   } catch (error) {
@@ -565,20 +596,45 @@ async function handleStartMapping() {
   }
   mappingBusy.value = true
   try {
-    await startRobotMappingSlam(mappingForm.value.robot, {
+    const payload = {
       map_name: mappingForm.value.map_name,
       route_hint: mappingForm.value.route_hint,
       record_rosbag: mappingForm.value.record_rosbag,
       scene_scope: mappingForm.value.scene_scope,
       mapping_type: mappingForm.value.mapping_type,
       mapping_session_id: workflowSessionId.value,
-    })
+    }
+    if (isOutdoorMapping.value && !originLocked.value) {
+      await startRobotMappingOrigin(mappingForm.value.robot, { ...payload, prepare_only: true })
+    } else {
+      await startRobotMappingSlam(mappingForm.value.robot, payload)
+    }
     await refreshMappingStatus()
   } catch (error) {
     alert(`开始建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
   }
+}
+
+async function handleMappingTypeChange(mappingType) {
+  if (mappingType === mappingForm.value.mapping_type) return
+  const originWorkflowActive = isOutdoorMapping.value
+    && ['origin_starting', 'origin_waiting', 'origin_locked'].includes(mappingState.value)
+  if (originWorkflowActive) {
+    if (!confirm('切换建图模式将取消当前室外原点流程，是否继续？')) return
+    mappingBusy.value = true
+    try {
+      await cancelRobotMappingOrigin(mappingForm.value.robot, { mapping_session_id: workflowSessionId.value })
+    } catch (error) {
+      alert(`取消室外原点流程失败: ${error.message}`)
+      return
+    } finally {
+      mappingBusy.value = false
+    }
+  }
+  mappingForm.value.mapping_type = mappingType
+  await refreshMappingStatus()
 }
 
 async function handleLockOrigin() {
@@ -593,6 +649,7 @@ async function handleLockOrigin() {
       route_hint: mappingForm.value.route_hint,
       scene_scope: mappingForm.value.scene_scope,
       mapping_type: 'outdoor',
+      mapping_session_id: workflowSessionId.value,
     })
     await refreshMappingStatus()
   } catch (error) {
@@ -643,7 +700,7 @@ async function handleCancelMapping() {
   if (!confirm('确定要取消本次建图吗？')) return
   mappingBusy.value = true
   try {
-    if (!mappingProcessAlive.value && ['waiting_quality', 'quality_holding', 'locked'].includes(originState.value)) {
+    if (!mappingProcessAlive.value && ['ready', 'waiting_quality', 'quality_holding', 'locked'].includes(originState.value)) {
       await cancelRobotMappingOrigin(mappingForm.value.robot, { mapping_session_id: workflowSessionId.value })
     } else {
       await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel', mapping_session_id: workflowSessionId.value })
@@ -1154,8 +1211,8 @@ async function saveCleaner() {
           <button
             type="button"
             :class="{ active: mappingForm.mapping_type === 'indoor' }"
-            :disabled="isActiveMapping"
-            @click="mappingForm.mapping_type = 'indoor'"
+            :disabled="mappingModeSwitchDisabled"
+            @click="handleMappingTypeChange('indoor')"
           >
             <strong>室内建图</strong>
             <span>跳过 RTK 原点，完成 IMU 与位姿预热后开始</span>
@@ -1163,8 +1220,8 @@ async function saveCleaner() {
           <button
             type="button"
             :class="{ active: mappingForm.mapping_type === 'outdoor' }"
-            :disabled="isActiveMapping"
-            @click="mappingForm.mapping_type = 'outdoor'"
+            :disabled="mappingModeSwitchDisabled"
+            @click="handleMappingTypeChange('outdoor')"
           >
             <strong>室外建图</strong>
             <span>先锁定 ENU 原点，再复核双天线航向</span>
@@ -1217,7 +1274,7 @@ async function saveCleaner() {
               <div><strong>航向质量</strong><small>σ {{ Number(originStatus.heading_std_deg || 0).toFixed(2) }}° · 延迟 {{ Number(originStatus.age_seconds || 0).toFixed(1) }}s</small></div>
             </div>
           </div>
-          <p>{{ originStatus.message || '点击“锁定 ENU 原点”开始质量检测' }}</p>
+          <p>{{ originStatusMessage }}</p>
           <div v-if="originLocked" class="origin-coordinate">
             <span>LAT {{ Number(originStatus.origin?.origin_latitude || originStatus.latitude).toFixed(10) }}</span>
             <span>LON {{ Number(originStatus.origin?.origin_longitude || originStatus.longitude).toFixed(10) }}</span>
@@ -1362,7 +1419,7 @@ async function saveCleaner() {
             <span>演示路线</span>
             <input v-model="mappingForm.route_hint" type="text" />
           </label>
-          <label>
+          <label class="mapping-scene-option">
             <span>场景范围</span>
             <select v-model="mappingForm.scene_scope" :disabled="isActiveMapping">
               <option v-if="!isOutdoorMapping" value="indoor">室内</option>
@@ -1384,7 +1441,7 @@ async function saveCleaner() {
             {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : '锁定 ENU 原点') }}
           </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canStartSlam" @click="handleStartMapping">
-            {{ mappingBusy ? '正在下发...' : (isOutdoorMapping ? '启动 SLAM 并检查航向' : '启动并检查') }}
+            {{ mappingBusy ? '正在下发...' : '启动并检查' }}
           </button>
           <button class="btn btn-confirm" :disabled="mappingBusy || !selectedRobot || !canBeginMapping" @click="handleBeginMapping">
             {{ isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图' }}

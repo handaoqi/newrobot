@@ -167,7 +167,7 @@ class MappingAdapter:
         return self.status()
 
     def start_origin_lock(self, command: dict) -> dict:
-        """Start outdoor sensors and the 60-second RTK anchor quality window."""
+        """Start outdoor sensors, optionally stopping before the RTK quality window."""
         if self._any_slam_process_alive:
             raise ProtocolError("MAPPING_ALREADY_ACTIVE", "stop SLAM before locking a new ENU origin")
         if self.session and self.session.state not in {"idle", "cancelled", "exited", "failed"}:
@@ -190,7 +190,10 @@ class MappingAdapter:
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self._stop_conflicting_navigation_stack()
         self._ensure_mapping_sensors()
-        self._origin_monitor.start()
+        if command.get("prepare_only"):
+            self._origin_monitor.prepare()
+        else:
+            self._origin_monitor.start()
         self._set_state("origin_waiting")
         return self.status()
 

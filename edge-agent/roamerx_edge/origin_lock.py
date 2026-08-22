@@ -110,6 +110,23 @@ class OriginLockMonitor:
         self._thread.start()
         return self.status()
 
+    def prepare(self) -> dict:
+        """Clear stale origin data without starting the quality timer."""
+        self.stop()
+        try:
+            self.origin_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        with self._lock:
+            self._status = self._empty_status()
+            self._status.update(
+                origin_status="ready",
+                required_seconds=self.duration_seconds,
+                max_spread_m=self.max_spread_m,
+                message="传感器检查完成，请点击“锁定 ENU 原点”开始 60 秒质量窗口",
+            )
+        return self.status()
+
     def stop(self) -> None:
         self._stop.set()
         self._generation += 1

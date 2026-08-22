@@ -86,6 +86,28 @@ def test_outdoor_warmup_requires_locked_origin(tmp_path):
     assert error.value.code == "MAPPING_ORIGIN_REQUIRED"
 
 
+def test_outdoor_start_can_prepare_sensors_before_origin_lock(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda: calls.append("stop_nav"))
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors"))
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "state": adapter.session.state,
+        "origin": adapter._origin_monitor.status(),
+    })
+
+    result = adapter.start_origin_lock({
+        "map_name": "outside",
+        "scene_scope": "outdoor",
+        "mapping_type": "outdoor",
+        "prepare_only": True,
+    })
+
+    assert result["state"] == "origin_waiting"
+    assert result["origin"]["origin_status"] == "ready"
+    assert calls == ["stop_nav", "sensors"]
+
+
 def test_indoor_warmup_rejects_outdoor_scene_scope(tmp_path):
     adapter = make_adapter(tmp_path)
 
