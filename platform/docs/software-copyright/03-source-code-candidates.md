@@ -4,11 +4,11 @@
 
 ## 公共中心平台根目录
 
-`/home/robot/yw/roamerx_analysis/center_platform/platform_server_code`
+`/home/dogrobot/platform`
 
 ## 公共机器人端根目录
 
-`/home/robot/genisom_roamerx_open/edge_agent`
+`/home/dogrobot/edge-agent`
 
 ## ZC-01 实时监测软件
 

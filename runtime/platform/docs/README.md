@@ -10,18 +10,25 @@ sudo scripts/install-docker.sh
 bin/platformctl init
 # Edit conf/platform.env, then:
 scripts/prepare-mqtt-password.sh
+bin/platformctl init-db
 bin/platformctl preflight
 bin/platformctl up
 bin/platformctl verify
 ```
 
-Cloud deployment keeps source in `/opt/roamerx/source` and persistent runtime
+Database ownership and table responsibilities are documented in
+[`docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md`](../../../docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md).
+Initialization and recovery steps are in
+[`docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md`](../../../docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md).
+
+Cloud deployment is driven from the repository-level `deploy/platform/` entry
+point. It keeps source in `/opt/roamerx/source` and persistent runtime
 state in `/opt/roamerx/runtime/platform`:
 
 ```bash
-runtime/platform/scripts/deploy-cloud.sh
+deploy/platform/deploy.sh
 # Edit cloud conf/platform.env and generate mosquitto.passwd once.
-runtime/platform/scripts/deploy-cloud.sh --start
+deploy/platform/deploy.sh --start
 ```
 
 `preflight` checks credentials, source files, free disk, Compose syntax and the

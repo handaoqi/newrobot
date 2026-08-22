@@ -88,11 +88,9 @@ start_recording() {
   local -a topics=(
     /front_lidar
     /front_lidar/imu
-    /odom/mc_odom
     /fix
-    /tf
+    /rtk_pvh
     /tf_static
-    /rosout
   )
   if [ -n "${ROSBAG_EXTRA_TOPICS}" ]; then
     local -a extra_topics

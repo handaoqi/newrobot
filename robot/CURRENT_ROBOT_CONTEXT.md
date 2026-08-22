@@ -173,7 +173,7 @@ install/localization/share/localization/launch/localization.launch.py
 Historical previous reasoning from system calibration, now superseded for the base_link TF:
 
 ```text
-/home/robot/.robot/param/arc_mapping/arc_mapping.yaml
+/home/dogrobot/runtime/nx-edge/data/robot-state/param/arc_mapping/arc_mapping.yaml
 extrinsic_T = [-0.011, -0.02329, 0.04412]
 imu2base_T = [-0.216, 0, 0]
 ```
@@ -254,19 +254,19 @@ The real platform is the cloud platform on `39.107.250.69`. Do not use or recrea
 
 SSH:
 
-- Root SSH key login from this robot computer is already working with `/home/robot/.ssh/id_rsa`.
+- Root SSH key login from this robot computer is already working with `/home/dogrobot/.ssh/id_rsa`.
 - Do not store the root password in this document.
 
 Current cloud platform code was copied from the server runtime directory into:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code
+/home/dogrobot/platform
 ```
 
 The previous local copy was backed up before replacement:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code.backup_20260703_172741
+/home/dogrobot/platform.backup_20260703_172741
 ```
 
 Important cloud platform API/code locations from that copy:

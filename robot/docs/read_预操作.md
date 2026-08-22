@@ -28,17 +28,20 @@
 
   - /front_lidar：原始点云，定位主输入
   - /front_lidar/imu：雷达 IMU，预测输入
-  - /odom/mc_odom：机体里程计预测输入
-  - /fix、/rtk_pvh：当前配置已启用 GNSS 和双天线航向融合
+  - /odom/lidar_odom：定位节点内部生成的激光短时运动预测输入
+  - /fix：RTK/GNSS 位置输入
+  - /rtk_pvh：RTK 双天线航向输入，定位节点订阅并参与 UKF 航向融合
   - /odom/localization_odom：定位算法输出里程计
   - /tf：运行时 map/odom/base_link 变换
+
+  /odom/mc_odom 仅为控制器原始里程计，当前不被定位节点订阅，不参与定位、TF 或 Nav2 位姿链路。
 
   排查“定位丢失”时，足够且推荐录这 11 个：
 
   source /opt/ros/humble/setup.bash
   source /home/dogrobot/robot/install/setup.bash
 
-  ros2 bag record -s mcap -o /home/robot/data/patrol_data \
+  ros2 bag record -s mcap -o /home/dogrobot/runtime/nx-edge/data/patrol-data \
     /front_lidar \
     /front_lidar/imu \
     /odom/mc_odom \

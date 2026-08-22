@@ -29,14 +29,14 @@ Implemented and deployed:
 - Backend file:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/views.py
+/home/dogrobot/platform/backend/monitoring/views.py
 /opt/roamerx/current/backend/monitoring/views.py
 ```
 
 - Frontend file:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/views/MapsPage.vue
+/home/dogrobot/platform/frontend/src/views/MapsPage.vue
 /opt/roamerx/current/frontend/src/views/MapsPage.vue
 ```
 
@@ -81,7 +81,7 @@ Implemented and deployed:
 - Frontend files:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/views/RoutePlannerPage.vue
+/home/dogrobot/platform/frontend/src/views/RoutePlannerPage.vue
 /opt/roamerx/current/frontend/src/views/RoutePlannerPage.vue
 ```
 
@@ -123,15 +123,15 @@ Implemented and deployed:
 - Backend:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/views.py
+/home/dogrobot/platform/backend/monitoring/views.py
 /opt/roamerx/current/backend/monitoring/views.py
 ```
 
 - Frontend:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/views/TasksPage.vue
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/services/api.js
+/home/dogrobot/platform/frontend/src/views/TasksPage.vue
+/home/dogrobot/platform/frontend/src/services/api.js
 /opt/roamerx/current/frontend/src/views/TasksPage.vue
 /opt/roamerx/current/frontend/src/services/api.js
 ```
@@ -160,8 +160,8 @@ Purpose:
 Frontend:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/views/RoutePlannerPage.vue
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/frontend/src/services/api.js
+/home/dogrobot/platform/frontend/src/views/RoutePlannerPage.vue
+/home/dogrobot/platform/frontend/src/services/api.js
 /opt/roamerx/current/frontend/src/views/RoutePlannerPage.vue
 /opt/roamerx/current/frontend/src/services/api.js
 ```
@@ -176,11 +176,11 @@ Current served frontend asset:
 Backend:
 
 ```text
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/models.py
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/protocol.py
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/urls.py
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/views.py
-/home/robot/yw/roamerx_analysis/center_platform/platform_server_code/backend/monitoring/services/telemetry_service.py
+/home/dogrobot/platform/backend/monitoring/models.py
+/home/dogrobot/platform/backend/monitoring/protocol.py
+/home/dogrobot/platform/backend/monitoring/urls.py
+/home/dogrobot/platform/backend/monitoring/views.py
+/home/dogrobot/platform/backend/monitoring/services/telemetry_service.py
 ```
 
 New cloud API:

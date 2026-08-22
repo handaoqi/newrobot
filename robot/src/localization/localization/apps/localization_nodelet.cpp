@@ -471,6 +471,7 @@ private:
     double heading_std_rad = std::numeric_limits<double>::infinity();
     double age_s = std::numeric_limits<double>::infinity();
     int64_t stamp_ns = 0;
+    int64_t heading_stamp_ns = 0;
   };
 
   void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
@@ -496,12 +497,43 @@ private:
       return observation;
     }
     sensor_msgs::msg::NavSatFix gnss;
+    bool have_gnss = false;
     {
       std::lock_guard<std::mutex> lock(gnss_mutex_);
-      if (!has_gnss_) {
-        return observation;
+      if (has_gnss_) {
+        gnss = latest_gnss_;
+        have_gnss = true;
       }
-      gnss = latest_gnss_;
+    }
+
+    observation.orientation = pose_estimator ? pose_estimator->quat() : last_init_quat_;
+    {
+      std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+      const rclcpp::Time heading_stamp = latest_gnss_heading_stamp_ns_ > 0
+        ? rclcpp::Time(latest_gnss_heading_stamp_ns_)
+        : latest_gnss_heading_receive_time_;
+      const double heading_age = has_gnss_heading_
+        ? (stamp - heading_stamp).seconds()
+        : std::numeric_limits<double>::infinity();
+      observation.heading_usable = has_gnss_heading_ && latest_gnss_heading_status_ == 0 &&
+        latest_gnss_heading_type_ > 0 &&
+        latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_ &&
+        latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_ &&
+        heading_age >= 0.0 && heading_age <= gnss_heading_max_age_;
+      observation.heading_stamp_ns = heading_stamp.nanoseconds();
+      if (observation.heading_usable) {
+        const double yaw_enu = M_PI / 2.0 - latest_gnss_heading_deg_ * M_PI / 180.0;
+        const double yaw_map = std::atan2(
+          std::sin(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_),
+          std::cos(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_));
+        observation.orientation = Eigen::AngleAxisf(
+          static_cast<float>(yaw_map), Eigen::Vector3f::UnitZ());
+        observation.heading_std_rad = latest_gnss_heading_std_deg_ * M_PI / 180.0;
+      }
+    }
+
+    if (!have_gnss) {
+      return observation;
     }
     observation.age_s = std::fabs((stamp - rclcpp::Time(gnss.header.stamp)).seconds());
     observation.stamp_ns = rclcpp::Time(gnss.header.stamp).nanoseconds();
@@ -520,27 +552,6 @@ private:
       observation.age_s <= gnss_max_age_ &&
       std::fabs(gnss.latitude) > 1e-7 && std::fabs(gnss.longitude) > 1e-7;
 
-    observation.orientation = pose_estimator ? pose_estimator->quat() : last_init_quat_;
-    {
-      std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
-      const double heading_age = has_gnss_heading_
-        ? (get_clock()->now() - latest_gnss_heading_receive_time_).seconds()
-        : std::numeric_limits<double>::infinity();
-      observation.heading_usable = has_gnss_heading_ && latest_gnss_heading_status_ == 0 &&
-        latest_gnss_heading_type_ > 0 &&
-        latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_ &&
-        latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_ &&
-        heading_age >= 0.0 && heading_age <= gnss_heading_max_age_;
-      if (observation.heading_usable) {
-        const double yaw_enu = M_PI / 2.0 - latest_gnss_heading_deg_ * M_PI / 180.0;
-        const double yaw_map = std::atan2(
-          std::sin(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_),
-          std::cos(yaw_enu + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_));
-        observation.orientation = Eigen::AngleAxisf(
-          static_cast<float>(yaw_map), Eigen::Vector3f::UnitZ());
-        observation.heading_std_rad = latest_gnss_heading_std_deg_ * M_PI / 180.0;
-      }
-    }
     const Eigen::Vector3f gps_map = llaToMap(gnss.latitude, gnss.longitude, gnss.altitude);
     observation.position = gps_map - observation.orientation.toRotationMatrix() * gnss_lever_arm_base_;
     if (!gnss_use_elevation_ && pose_estimator) {
@@ -568,6 +579,39 @@ private:
     last_rtk_map_yaw_ = std::atan2(
       observation.orientation.toRotationMatrix()(1, 0),
       observation.orientation.toRotationMatrix()(0, 0));
+    rtk_position_fused_this_frame_ = true;
+    if (observation.heading_usable) {
+      last_rtk_heading_fused_stamp_ns_ = observation.heading_stamp_ns;
+      rtk_heading_fused_this_frame_ = true;
+    }
+    return true;
+  }
+
+  bool applyRtkHeadingObservation(const RtkObservation& observation) {
+    if (!pose_estimator || !observation.heading_usable ||
+        observation.heading_stamp_ns <= 0 ||
+        observation.heading_stamp_ns == last_rtk_heading_fused_stamp_ns_) {
+      return false;
+    }
+
+    // Keep the current IMU roll/pitch and fuse only the absolute RTK yaw.
+    // The large position variances make this a heading-only observation while
+    // still using the existing 7D PoseEstimator UKF measurement path.
+    const Eigen::Vector3f current_rpy = quaternionToNormalizedRPY(pose_estimator->quat());
+    const float rtk_yaw = std::atan2(
+      observation.orientation.toRotationMatrix()(1, 0),
+      observation.orientation.toRotationMatrix()(0, 0));
+    const Eigen::Quaternionf heading_orientation =
+      Eigen::AngleAxisf(rtk_yaw, Eigen::Vector3f::UnitZ()) *
+      Eigen::AngleAxisf(current_rpy.y(), Eigen::Vector3f::UnitY()) *
+      Eigen::AngleAxisf(current_rpy.x(), Eigen::Vector3f::UnitX());
+    const float heading_variance = static_cast<float>(
+      std::max(observation.heading_std_rad * observation.heading_std_rad, 1e-5));
+    pose_estimator->correct_absolute_pose(
+      pose_estimator->pos(), heading_orientation, 1.0e6f, 1.0e6f, heading_variance);
+    last_rtk_heading_fused_stamp_ns_ = observation.heading_stamp_ns;
+    last_rtk_map_yaw_ = rtk_yaw;
+    rtk_heading_fused_this_frame_ = true;
     return true;
   }
 
@@ -661,6 +705,9 @@ private:
         << ",\"absolute_stable_samples\":" << absolute_stable_count_
         << ",\"rtk_quality\":\"" << rtk.quality
         << "\",\"rtk_usable\":" << (rtk.usable ? "true" : "false")
+        << ",\"rtk_heading_usable\":" << (rtk.heading_usable ? "true" : "false")
+        << ",\"rtk_heading_fused\":" << (rtk_heading_fused_this_frame_ ? "true" : "false")
+        << ",\"rtk_position_fused\":" << (rtk_position_fused_this_frame_ ? "true" : "false")
         << ",\"rtk_x\":" << last_rtk_map_position_.x()
         << ",\"rtk_y\":" << last_rtk_map_position_.y()
         << ",\"rtk_yaw\":" << last_rtk_map_yaw_
@@ -788,6 +835,10 @@ private:
     latest_gnss_heading_status_ = static_cast<int>(heading.sol_status);
     latest_gnss_heading_type_ = static_cast<int>(heading.heading_type);
     latest_gnss_heading_receive_time_ = get_clock()->now();
+    latest_gnss_heading_stamp_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
+    if (latest_gnss_heading_stamp_ns_ <= 0) {
+      latest_gnss_heading_stamp_ns_ = latest_gnss_heading_receive_time_.nanoseconds();
+    }
     has_gnss_heading_ = true;
   }
 
@@ -899,35 +950,38 @@ private:
     }
   }
 
-  void applyGnssCorrection(const rclcpp::Time& stamp) {
+  bool applyGnssCorrection(const rclcpp::Time& stamp) {
     if (!use_gnss_fusion_ || !pose_estimator || !gnss_map_origin_loaded_) {
-      return;
+      return false;
     }
 
     sensor_msgs::msg::NavSatFix gnss;
     {
       std::lock_guard<std::mutex> lock(gnss_mutex_);
       if (!has_gnss_) {
-        return;
+        return false;
       }
       gnss = latest_gnss_;
     }
 
     if (gnss.status.status < gnss_min_status_) {
-      return;
+      return false;
     }
     if (std::fabs(gnss.latitude) < 1e-7 || std::fabs(gnss.longitude) < 1e-7) {
-      return;
+      return false;
     }
     const double h_std = std::sqrt(std::max(gnss.position_covariance[0], gnss.position_covariance[4]));
-    if (h_std > gnss_max_horizontal_std_) {
-      return;
+    const int64_t gnss_stamp_ns = rclcpp::Time(gnss.header.stamp).nanoseconds();
+    if (!std::isfinite(h_std) || h_std > gnss_max_horizontal_std_ || gnss_stamp_ns <= 0 ||
+        gnss_stamp_ns == last_gnss_position_fused_stamp_ns_) {
+      return false;
     }
     const double age = std::fabs((stamp - rclcpp::Time(gnss.header.stamp)).seconds());
     if (age > gnss_max_age_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "Skip GNSS correction: age %.2fs exceeds %.2fs", age, gnss_max_age_);
-      return;
+      return false;
     }
+    last_gnss_position_fused_stamp_ns_ = gnss_stamp_ns;
 
     const Eigen::Matrix4f pose = pose_estimator->matrix();
     const Eigen::Vector3f estimated_gps = pose.block<3, 1>(0, 3) + pose.block<3, 3>(0, 0) * gnss_lever_arm_base_;
@@ -940,7 +994,7 @@ private:
     if (residual_norm > gnss_max_residual_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
         "Reject GNSS correction: residual %.2fm exceeds %.2fm", residual_norm, gnss_max_residual_);
-      return;
+      return false;
     }
 
     const double quality_gain = gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
@@ -951,7 +1005,7 @@ private:
       correction *= static_cast<float>(gnss_max_correction_step_ / correction_norm);
     }
     if (correction.norm() < 1e-4f) {
-      return;
+      return false;
     }
 
     pose_estimator->apply_position_correction(correction);
@@ -961,6 +1015,7 @@ private:
       gnss_correction_count_,
       gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX ? "rtk_primary" : "hybrid",
       residual_norm, correction.norm());
+    return true;
   }
 
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
@@ -1009,6 +1064,8 @@ private:
     auto start = std::chrono::high_resolution_clock::now();
     updateLidarStatus(true);
     std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex); 
+    rtk_heading_fused_this_frame_ = false;
+    rtk_position_fused_this_frame_ = false;
     if (use_imu && !static_imu_init_.InitSuccess()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5.0, "Radar CallBack Waiting for IMU Initial !!!");
       publishExtrapolatedOdom(points_msg->header.stamp);
@@ -1286,6 +1343,12 @@ private:
       absolute_pose_valid = true;
       active_source_ = "ndt_imu";
       absolute_observation_updated = run_ndt;
+      // Fuse valid dual-antenna RTK yaw while NDT continues to provide the
+      // map position and scan-matching observation.
+      applyRtkHeadingObservation(rtk_observation);
+      // Apply the latest accepted RTK XY sample as a bounded smooth
+      // correction; NDT remains the primary map-matching source.
+      rtk_position_fused_this_frame_ = applyGnssCorrection(rclcpp::Time(stamp));
     } else if (rtk_observation.usable) {
       absolute_pose_valid = applyRtkObservation(rtk_observation);
       active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
@@ -2527,6 +2590,11 @@ private:
   int latest_gnss_heading_status_ = -1;
   int latest_gnss_heading_type_ = 0;
   rclcpp::Time latest_gnss_heading_receive_time_{0, 0, RCL_ROS_TIME};
+  int64_t latest_gnss_heading_stamp_ns_ = 0;
+  int64_t last_rtk_heading_fused_stamp_ns_ = 0;
+  int64_t last_gnss_position_fused_stamp_ns_ = 0;
+  bool rtk_heading_fused_this_frame_ = false;
+  bool rtk_position_fused_this_frame_ = false;
   std::chrono::steady_clock::time_point last_gnss_recovery_attempt_{};
   bool gnss_recovery_seed_pending_ = false;
   bool source_arbiter_enable_ = true;

@@ -27,6 +27,7 @@ services:
       - -c
       - >-
         python manage.py migrate --noinput &&
+        python manage.py initialize_platform &&
         gunicorn config.wsgi:application --bind 0.0.0.0:8000
         --worker-class gthread --workers 3 --threads 8 --timeout 300
     healthcheck:
@@ -41,6 +42,8 @@ services:
     container_name: roamerx-device-worker
     command: ["python", "manage.py", "run_device_worker"]
     depends_on:
+      backend:
+        condition: service_healthy
       mqtt:
         condition: service_healthy
 

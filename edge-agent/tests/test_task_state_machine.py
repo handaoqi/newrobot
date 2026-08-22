@@ -54,6 +54,13 @@ class FakeNavigation:
     def latest_trusted_pose(self):
         return dict(self.trusted_pose)
 
+    def localization_diagnostics(self):
+        return {
+            "raw_pose": {"x": 5.0, "y": 6.0, "yaw": 0.8, "frame_id": "map"},
+            "quality": {"matching_error": 0.75, "has_converged": False},
+            "decision": {"active_source": "unavailable"},
+        }
+
     def set_localization_policy(self, source, phase):
         self.localization_policies.append((source, phase))
 
@@ -283,6 +290,10 @@ def test_localization_loss_pauses_active_navigation(tmp_path):
     assert nav.stop_commands == 1
     assert [event[0] for event in events[-2:]] == ["task.pausing", "task.paused"]
     assert events[-2][1]["last_trusted_pose"] == nav.trusted_pose
+    assert events[-2][1]["raw_pose"]["x"] == 5.0
+    assert events[-2][1]["localization_quality"]["matching_error"] == 0.75
+    assert events[-2][1]["current_waypoint"]["map_point_number"] == 1
+    assert events[-2][1]["map_id"] == "site-a-main"
     assert "last_trusted_pose" not in events[-1][1]
     assert events[-1][1]["reason_code"] == "LOCALIZATION_LOST"
     store.close()

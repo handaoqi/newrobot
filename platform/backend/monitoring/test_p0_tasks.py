@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
+import uuid
 
 from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, SpeechCategory, SpeechTemplate, TaskExecution
 from .services.command_service import CommandService
@@ -138,6 +139,39 @@ class TaskExecutionTests(TestCase):
         )
         self.assertEqual(response.status_code, 201)
         self.assertIs(RemoteCommand.objects.get().payload["loop_execution"], True)
+
+    def test_task_execute_persists_loop_session_and_round(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        session_id = uuid.uuid4()
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {
+                "loop_execution": True,
+                "loop_session_id": str(session_id),
+                "round_number": 4,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        execution = TaskExecution.objects.get()
+        self.assertEqual(execution.loop_session_id, session_id)
+        self.assertEqual(execution.round_number, 4)
+        self.assertEqual(response.data["round_number"], 4)
+        self.assertEqual(RemoteCommand.objects.get().payload["round_number"], 4)
+
+    def test_task_execute_rejects_invalid_loop_round(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"loop_execution": True, "round_number": 0},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(TaskExecution.objects.count(), 0)
 
     def test_low_battery_task_execute_does_not_orphan_created_execution(self):
         self.robot.battery_level = 19

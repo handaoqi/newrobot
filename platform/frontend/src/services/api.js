@@ -223,10 +223,20 @@ export async function deletePatrolTask(taskId, { force = false } = {}) {
   return request(`/patrol-tasks/${taskId}/${force ? '?force=true' : ''}`, { method: 'DELETE' })
 }
 
-export async function executePatrolTask(taskId, { recordRosbag = false, loopExecution = false } = {}) {
+export async function executePatrolTask(taskId, {
+  recordRosbag = false,
+  loopExecution = false,
+  loopSessionId = null,
+  roundNumber = 1,
+} = {}) {
   return request(`/patrol-tasks/${taskId}/execute/`, {
     method: 'POST',
-    body: JSON.stringify({ record_rosbag: recordRosbag, loop_execution: loopExecution }),
+    body: JSON.stringify({
+      record_rosbag: recordRosbag,
+      loop_execution: loopExecution,
+      loop_session_id: loopSessionId,
+      round_number: roundNumber,
+    }),
   })
 }
 
@@ -478,10 +488,20 @@ export async function deleteRoute(routeId) {
   })
 }
 
-export async function executeRoute(routeId, { recordRosbag = false } = {}) {
+export async function executeRoute(routeId, {
+  recordRosbag = false,
+  loopExecution = false,
+  loopSessionId = null,
+  roundNumber = 1,
+} = {}) {
   return request(`/routes/${routeId}/execute/`, {
     method: 'POST',
-    body: JSON.stringify({ record_rosbag: recordRosbag }),
+    body: JSON.stringify({
+      record_rosbag: recordRosbag,
+      loop_execution: loopExecution,
+      loop_session_id: loopSessionId,
+      round_number: roundNumber,
+    }),
   })
 }
 

@@ -9,6 +9,7 @@
 
 #pragma once
 #include "common/state_mode.h"
+#include "global_factor_graph.h"
 #include "ikd_tree/ikd_tree.h"
 #include "pcd2grid.h"
 #include "process/imu_process.h"
@@ -17,6 +18,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/SVD>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -46,6 +48,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <thread>
@@ -81,14 +84,40 @@ namespace robot::slam
         }
     };
 
+    struct ImuPreintegrationSnapshot
+    {
+        double      start_timestamp = 0.0;
+        double      end_timestamp = 0.0;
+        double      delta_t = 0.0;
+        double      delta_rotation_xyzw[4] = { 0.0, 0.0, 0.0, 1.0 };
+        Vec3d       delta_velocity = Zero3d;
+        Vec3d       delta_position = Zero3d;
+        Vec3d       linearized_accel_bias = Zero3d;
+        Vec3d       linearized_gyro_bias = Zero3d;
+        std::array<double, 225> covariance {};
+        int         imu_sample_count = 0;
+        std::string error_status;
+    };
+
     struct MappingKeyframe
     {
         std::size_t index = 0;
         double      stamp = 0.0;
+        Vec3d       world_origin = Zero3d;
+        double      world_qx = 0.0;
+        double      world_qy = 0.0;
+        double      world_qz = 0.0;
+        double      world_qw = 1.0;
         Vec3d       lidar_origin = Zero3d;
+        double      lidar_qx = 0.0;
+        double      lidar_qy = 0.0;
+        double      lidar_qz = 0.0;
+        double      lidar_qw = 1.0;
         double      yaw = 0.0;
         std::string file_path;
+        std::string preintegration_file;
         std::size_t point_count = 0;
+        std::size_t scan_context_index = 0;
         bool        rtk_valid = false;
         int         rtk_status = -1;
         double      rtk_latitude = 0.0;
@@ -100,6 +129,7 @@ namespace robot::slam
         double      rtk_heading_deg = 0.0;
         double      rtk_heading_std_deg = 0.0;
         double      rtk_heading_age_seconds = 0.0;
+        ImuPreintegrationSnapshot preint;
     };
 
     struct PendingKeyframe
@@ -179,6 +209,24 @@ namespace robot::slam
 
         bool writeTrajectoryAndGnssMetadata(const std::string& map_subdir);
 
+        bool optimizeHistoricalTrajectory(const std::string& map_subdir);
+
+        bool loadLoopClosures(const std::string& map_subdir,
+            std::vector<GlobalGraphLoopClosure>& loop_closures);
+
+        bool writeGlobalOptimizationOutputs(const std::string& map_subdir,
+            const std::vector<GlobalGraphLoopClosure>& loop_closures);
+
+        bool writeImuPreintegrationFile(const MappingKeyframe& keyframe) const;
+
+        bool writeMapManifest(const std::string& map_subdir);
+
+        void accumulateImuPreintegration(double timestamp, const Vec3d& acc, const Vec3d& gyro);
+
+        ImuPreintegrationSnapshot captureImuPreintegration(double keyframe_stamp);
+
+        void resetImuPreintegration(double start_timestamp);
+
         void writeSaveProgress(const std::string& stage, double progress_percent, const std::string& error = "") const;
 
         void pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body);
@@ -187,6 +235,18 @@ namespace robot::slam
 
         void stateCallBack(
             robots_dog_msgs::srv::MapState::Request::SharedPtr request, robots_dog_msgs::srv::MapState::Response::SharedPtr response);
+
+        void startMappingCallBack(
+            const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+            std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+
+        void saveMapCallBack(
+            const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+            std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+
+        void globalOptimizeCallBack(
+            const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+            std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
         void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
             std::unique_ptr<tf2_ros::TransformBroadcaster>&                               tf_br);
@@ -200,6 +260,10 @@ namespace robot::slam
         void collectGnssAlignment(double lidar_time);
 
         bool estimateGnssAlignment();
+
+        bool lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss);
+
+        bool gnssHeadingIsValid(double& heading_deg, double& heading_std_deg, double& age_s);
 
         bool gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos);
 
@@ -291,6 +355,8 @@ namespace robot::slam
         int                                latest_gnss_heading_status_ = -1;
         int                                latest_gnss_heading_type_ = 0;
         rclcpp::Time                       latest_gnss_heading_receive_time_ { 0, 0, RCL_ROS_TIME };
+        bool                               gnss_use_heading_ = true;
+        double                             gnss_heading_offset_rad_ = 0.0;
         double                             gnss_heading_min_baseline_m_ = 0.20;
         double                             gnss_heading_max_std_deg_ = 5.0;
         double                             gnss_heading_max_age_s_ = 1.5;
@@ -311,6 +377,7 @@ namespace robot::slam
         int                                gnss_correction_count_ = 0;
         std::deque<GnssAlignmentSample>    gnss_alignment_samples_;
         bool                               gnss_alignment_locked_ = false;
+        std::string                        gnss_alignment_source_;
         double                             gnss_enu_to_map_yaw_ = 0.0;
         Eigen::Vector2d                    gnss_enu_to_map_translation_ = Eigen::Vector2d::Zero();
         double                             gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
@@ -372,6 +439,14 @@ namespace robot::slam
         double                             keyframe_max_interval_s_ = 2.0;
         double                             keyframe_voxel_size_m_ = 0.25;
         std::size_t                        keyframe_max_queue_size_ = 8;
+        GlobalFactorGraphConfig            global_factor_graph_config_;
+        std::unique_ptr<GlobalFactorGraph> global_factor_graph_;
+        std::vector<gtsam::Pose3>           optimized_global_poses_;
+        std::vector<gtsam::Matrix6>         global_pose_covariances_;
+        GlobalFactorGraphResult             global_factor_graph_result_;
+        bool                               global_optimization_applied_ = false;
+        std::size_t                        scan_context_count_ = 0;
+        std::string                        loop_status_ = "skipped";
         std::vector<MappingKeyframe>       mapping_keyframes_;
         std::deque<PendingKeyframe>        keyframe_write_queue_;
         mutable std::mutex                 keyframe_writer_mutex_;
@@ -393,6 +468,21 @@ namespace robot::slam
         double                             last_keyframe_stamp_ = 0.0;
         bool                               has_last_keyframe_ = false;
         double                             last_mapping_progress_stamp_ = 0.0;
+        mutable std::mutex                 imu_preint_mutex_;
+        bool                               imu_preint_has_prev_keyframe_ = false;
+        bool                               imu_preint_has_sample_ = false;
+        double                             imu_preint_start_ = 0.0;
+        double                             imu_preint_last_t_ = 0.0;
+        Vec3d                              imu_preint_last_acc_ = Zero3d;
+        Vec3d                              imu_preint_last_gyro_ = Zero3d;
+        Mat3d                              imu_preint_dR_ = Eye3d;
+        Vec3d                              imu_preint_dv_ = Zero3d;
+        Vec3d                              imu_preint_dp_ = Zero3d;
+        Vec3d                              imu_preint_ba_ = Zero3d;
+        Vec3d                              imu_preint_bg_ = Zero3d;
+        Eigen::Matrix<double, 15, 15>      imu_preint_cov_ = Eigen::Matrix<double, 15, 15>::Zero();
+        int                                imu_preint_samples_ = 0;
+        std::string                        imu_preint_error_;
 
         CloudPtr featsFromMap     = CloudPtr(new PointCloudType());
         CloudPtr feats_undistort  = CloudPtr(new PointCloudType());
@@ -445,12 +535,18 @@ namespace robot::slam
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr    pubLaserCloudMap_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubOdomAftMapped_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubPath_;
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubGlobalOptimizedOdom_;
+        rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubGlobalOptimizedPath_;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubGlobalOptimizationStatus_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         sub_imu_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr   sub_gnss_ptr_;
         rclcpp::Subscription<robots_dog_msgs::msg::UniRtkPvh>::SharedPtr sub_rtk_pvh_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_ptr_;
 
         rclcpp::Service<robots_dog_msgs::srv::MapState>::SharedPtr state_service_;
+        rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_mapping_service_;
+        rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service_;
+        rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr global_optimize_service_;
 
         std::atomic<SlamState> state_{ SlamState::STABLE };
 

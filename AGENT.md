@@ -7,6 +7,7 @@
 - 常用命令：`cd /home/dogrobot && git pull --ff-only`、`git status`、`scripts/test_agents.sh`。
 - 全量构建、发布、数据恢复与验收流程见 [PROJECT_DEPLOYMENT_MANUAL.md](PROJECT_DEPLOYMENT_MANUAL.md)。
 - `/home/dogrobot` 是唯一源码、Git 检出和 ROS 构建目录。systemd 服务也必须从该目录加载代码。
+- 项目级架构分析和人工操作手册统一维护在 `/home/dogrobot/docs`；组件 README 只保留局部说明并链接到该目录。
 - 三端运行时统一由 `/home/dogrobot/runtime` 描述；NX 的地图、rosbag、模型、Edge 状态和设备配置实际存放在 `runtime/nx-edge/{data,conf,install}`。
 - `/home/robot` 仅保留厂商软件、开发用户状态和兼容软链接，不再作为本项目运行数据的主目录。
 

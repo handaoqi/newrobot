@@ -33,7 +33,7 @@ ASR fallback when needed.
 ## Conversation continuity
 
 The first task creates a Codex thread. Its thread ID is persisted in
-`/home/robot/.local/state/roamerx-dev-agent/conversation.json`; every later
+`/home/dogrobot/.local/state/roamerx-dev-agent/conversation.json`; every later
 task resumes that same thread, including after an agent or machine restart.
 Each request also names its target workspace and asks Codex to load the
 workspace's applicable `AGENTS.md` before acting.

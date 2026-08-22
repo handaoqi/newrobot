@@ -5,6 +5,15 @@ case "${1:-status}" in
   status) robot-launch list ;;
   start) shift; robot-launch start "$@" ;;
   stop) shift; robot-launch stop "$@" ;;
-  *) echo "Usage: $0 {status|start EGG...|stop EGG...}" >&2; exit 2 ;;
+  init-state)
+    state_file="${CHARGE_PILE_STATE_FILE:-/var/lib/roamerx-charge-pile/state}"
+    sudo install -d -m 0755 "$(dirname "$state_file")"
+    if [[ ! -e "$state_file" ]]; then
+      printf 'unknown\n' | sudo tee "$state_file" >/dev/null
+      echo "initialized charge state: $state_file=unknown"
+    else
+      echo "preserved charge state: $state_file=$(sudo cat "$state_file")"
+    fi
+    ;;
+  *) echo "Usage: $0 {status|start EGG...|stop EGG...|init-state}" >&2; exit 2 ;;
 esac
-

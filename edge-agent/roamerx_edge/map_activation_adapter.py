@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import re
 
 import yaml
 
 from .config import EdgeConfig
 from .manual_map_cleanup import ManualMapCleanupError, build_manual_cleanup_map
+from .map_coordinate import MapConstraintError, constraints_from_manifest, validate_map_constraints
+from .map_package_finalize import load_map_manifest
 from .protocol import ProtocolError
 from .safety_policy import RuntimeSafetyState
 
@@ -16,7 +19,7 @@ class MapActivationAdapter:
     """Switch the local map selected by the platform."""
 
     REQUIRED_FILES = ("map.yaml", "map.pgm", "map.pcd")
-    OPTIONAL_FILES = ("map.txt", "gnss_origin.yaml")
+    OPTIONAL_FILES = ("map.txt", "gnss_origin.yaml", "map_manifest.json")
 
     def __init__(self, config: EdgeConfig, safety_state: RuntimeSafetyState, config_path: str) -> None:
         self.config = config
@@ -68,6 +71,7 @@ class MapActivationAdapter:
                     "MAP_FILES_MISSING",
                     f"selected map is missing local files: {', '.join(missing)} in {source_dir}",
                 )
+            self._validate_map_constraints(source_dir, command)
 
             switched = {}
             for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
@@ -106,6 +110,45 @@ class MapActivationAdapter:
         if cleanup_result is not None:
             result["manual_cleanup"] = cleanup_result
         return result
+
+    def _validate_map_constraints(self, source_dir: Path, command: dict) -> dict:
+        manifest = load_map_manifest(source_dir)
+        if command.get("map_manifest") and isinstance(command.get("map_manifest"), dict) and not manifest:
+            manifest = dict(command["map_manifest"])
+            (source_dir / "map_manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        gnss_origin = {}
+        gnss_path = source_dir / "gnss_origin.yaml"
+        if gnss_path.exists():
+            try:
+                gnss_origin = yaml.safe_load(gnss_path.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError:
+                gnss_origin = {}
+        constraints = constraints_from_manifest(
+            manifest,
+            gnss_origin=gnss_origin if isinstance(gnss_origin, dict) else {},
+            requested_scene_scope=str(command.get("scene_scope") or ""),
+        )
+        try:
+            validate_map_constraints(constraints)
+        except MapConstraintError as exc:
+            raise ProtocolError(exc.code, exc.message) from exc
+        requested_mode = str(command.get("localization_mode") or "").strip().lower()
+        if constraints.get("coordinate_mode") == "local_only" and requested_mode in {"rtk", "rtk_ndt"}:
+            raise ProtocolError("MAP_LOCAL_ONLY_NDT_ONLY", "local_only maps can only use NDT localization")
+        if constraints.get("coordinate_mode") == "local_only" and str(command.get("scene_scope") or "").lower() in {
+            "outdoor",
+            "transition",
+        }:
+            code = (
+                "MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN"
+                if str(command.get("scene_scope")).lower() == "outdoor"
+                else "MAP_LOCAL_ONLY_TRANSITION_FORBIDDEN"
+            )
+            raise ProtocolError(code, "local_only maps cannot activate outdoor or transition scenes")
+        return constraints
 
     def status(self) -> dict:
         active_files = {}

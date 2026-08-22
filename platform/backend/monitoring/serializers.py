@@ -36,6 +36,8 @@ from .models import (
     ScheduleRun,
 )
 
+from .services.map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
+
 
 def _snapshot_path(snapshot_url: str) -> Path | None:
     if not snapshot_url:
@@ -312,6 +314,8 @@ class PatrolTaskSerializer(serializers.ModelSerializer):
             "id": str(execution.id),
             "state": execution.state,
             "state_version": execution.state_version,
+            "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
+            "round_number": execution.round_number,
             "created_at": execution.created_at,
         }
 
@@ -791,6 +795,11 @@ class MapDataSerializer(serializers.ModelSerializer):
             "description",
             "parent_map",
             "edit_metadata",
+            "coordinate_mode",
+            "scene_scope",
+            "localization_mode",
+            "origin_status",
+            "map_completeness",
             "file_size",
             "created_at",
             "updated_at",
@@ -869,6 +878,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             "waypoints",
             "waypoint_names",
             "description",
+            "scene_scope",
             "created_at",
             "updated_at",
         ]
@@ -907,6 +917,25 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         if valid_ids != template_ids:
             raise serializers.ValidationError("途经点只能选择“巡检智能播报”分类下的文案")
         return value
+
+    def validate(self, attrs):
+        map_data = attrs.get("map_data") or getattr(self.instance, "map_data", None)
+        waypoints = attrs.get("waypoints")
+        if waypoints is None and self.instance is not None:
+            waypoints = self.instance.waypoints
+        scene_scope = attrs.get("scene_scope")
+        if scene_scope is None and self.instance is not None:
+            scene_scope = self.instance.scene_scope
+        if map_data is not None:
+            try:
+                validate_route_against_map(
+                    constraints_from_map_data(map_data),
+                    scene_scope=str(scene_scope or map_data.scene_scope or "indoor"),
+                    waypoints=waypoints or [],
+                )
+            except MapConstraintError as exc:
+                raise serializers.ValidationError(exc.message) from exc
+        return attrs
 
 
 class ZoneSerializer(serializers.ModelSerializer):
@@ -1145,6 +1174,8 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
             "map_data",
             "map_name",
             "route_snapshot",
+            "loop_session_id",
+            "round_number",
             "state",
             "state_version",
             "current_waypoint_index",

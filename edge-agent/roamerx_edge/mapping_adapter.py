@@ -20,6 +20,8 @@ LOGGER = logging.getLogger(__name__)
 
 from .config import MappingConfig
 from .keyframe_visibility_filter import filter_with_keyframe_visibility
+from .map_coordinate import MapConstraintError, SCENE_SCOPES, normalize_text
+from .map_package_finalize import finalize_map_package
 from .map_preview import generate_map_preview
 from .media_client import MediaClient
 from .protocol import ProtocolError, now_iso
@@ -33,6 +35,7 @@ class MappingSession:
     state: str
     started_at: str
     updated_at: str
+    scene_scope: str = "indoor"
 
 
 class MappingAdapter:
@@ -45,7 +48,19 @@ class MappingAdapter:
     """
 
     REQUIRED_FILES = ("map.yaml", "map.pgm")
-    OPTIONAL_FILES = ("map.pcd", "map_preview.png", "preview.png", "map.txt", "gnss_origin.yaml", "mapping_trace.json")
+    OPTIONAL_FILES = (
+        "map.pcd",
+        "map_raw.pcd",
+        "map_preview.png",
+        "preview.png",
+        "map.txt",
+        "gnss_origin.yaml",
+        "mapping_trace.json",
+        "map_manifest.json",
+        "recording_manifest.yaml",
+        "trajectory_raw.csv",
+        "trajectory_optimized.csv",
+    )
     SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
     SLAM_PROCESS_PATTERNS = (
         "robot_slam.*mapping",
@@ -64,6 +79,8 @@ class MappingAdapter:
         self._slam_log_handle = None
         self._slam_log_path: Path | None = None
         self._record_rosbag = False
+        self._rosbag_dir: str | None = None
+        self._scene_scope = "indoor"
 
     @property
     def _slam_process_alive(self) -> bool:
@@ -71,7 +88,7 @@ class MappingAdapter:
 
     @property
     def _any_slam_process_alive(self) -> bool:
-        return self._slam_process_alive or bool(self._find_slam_process_pids())
+        return self._is_mapping_unit_active() or self._slam_process_alive or bool(self._find_slam_process_pids())
 
     def start_mapping(self, command: dict) -> dict:
         # 如果有残留 session 但 SLAM 进程已死（崩溃/中断），自动清理
@@ -84,6 +101,10 @@ class MappingAdapter:
             raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping process is already running")
         session_id = command.get("mapping_session_id") or str(uuid.uuid4())
         map_name = command.get("map_name") or f"现场地图 {time.strftime('%Y%m%d-%H%M%S')}"
+        scene_scope = normalize_text(command.get("scene_scope"), "indoor")
+        if scene_scope not in SCENE_SCOPES:
+            raise ProtocolError("MAP_CONSTRAINT_INVALID", "scene_scope must be indoor, transition, or outdoor")
+        self._scene_scope = scene_scope
         self.session = MappingSession(
             session_id=session_id,
             map_name=map_name,
@@ -91,6 +112,7 @@ class MappingAdapter:
             state="starting",
             started_at=now_iso(),
             updated_at=now_iso(),
+            scene_scope=scene_scope,
         )
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self._stop_conflicting_navigation_stack()
@@ -118,6 +140,7 @@ class MappingAdapter:
                     state="saving",
                     started_at=now_iso(),
                     updated_at=now_iso(),
+                    scene_scope=normalize_text(command.get("scene_scope"), "indoor"),
                 )
                 return self._save_active_mapping(command)
             recoverable_dir = self._find_latest_recoverable_dir()
@@ -134,6 +157,7 @@ class MappingAdapter:
                     state="saving",
                     started_at=now_iso(),
                     updated_at=now_iso(),
+                    scene_scope=normalize_text(command.get("scene_scope"), "indoor"),
                 )
                 self._ensure_slam_process()
                 return self._save_active_mapping(command)
@@ -144,6 +168,7 @@ class MappingAdapter:
                 raise ProtocolError("NO_MAP_FILES", "no previous complete mapping output found")
             work_dir = session_dir
             self._validate_map_files(work_dir)
+            self._finalize_session_package(work_dir, command)
             package_path, metadata = self._package_map(command, work_dir)
             upload_result = self.media_client.upload_map_package(str(package_path), metadata)
             result = self.status()
@@ -192,17 +217,24 @@ class MappingAdapter:
         # back to an older complete map directory.
         work_dir = self._wait_for_complete_map_dir(save_started_at)
         self._validate_map_files(work_dir)
-        self._set_state("packaging")
-        package_path, metadata = self._package_map(command, work_dir)
-        self._set_state("uploading")
-        upload_result = self.media_client.upload_map_package(str(package_path), metadata)
-        self._set_state("stopping")
-        self._stop_rosbag()
-        self._stop_slam_process()
-        self._set_state("exited")
+        self._finalize_session_package(work_dir, command)
+        should_upload = bool(command.get("upload", True))
+        should_package = bool(command.get("package", should_upload))
+        should_stop = bool(command.get("stop_process", True))
         result = self.status()
-        result["package_path"] = str(package_path)
-        result["upload_result"] = upload_result
+        if should_package:
+            self._set_state("packaging")
+            package_path, metadata = self._package_map(command, work_dir)
+            result["package_path"] = str(package_path)
+            if should_upload:
+                self._set_state("uploading")
+                result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
+        if should_stop:
+            self._set_state("stopping")
+            self._stop_rosbag()
+            self._stop_slam_process()
+            self._set_state("exited")
+        result.update(self.status())
         return result
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:
@@ -227,6 +259,7 @@ class MappingAdapter:
             f"{self.session.map_name}-发散救援" if self.session and self.session.map_name else f"{source_dir.name}-发散救援"
         )
         self._set_state("packaging")
+        self._finalize_session_package(output_dir, rescue_command)
         package_path, metadata = self._package_map(rescue_command, output_dir)
         self._set_state("uploading")
         upload_result = self.media_client.upload_map_package(str(package_path), metadata)
@@ -369,6 +402,22 @@ class MappingAdapter:
             "ready_for_save": keyframe_count > 0 or diverged,
         }
 
+    def wait_until_ready_for_motion(self, timeout_seconds: float = 90.0) -> dict:
+        deadline = time.monotonic() + max(5.0, float(timeout_seconds))
+        last = self.status()
+        while time.monotonic() < deadline:
+            last = self.status()
+            readiness = last.get("readiness") or {}
+            if readiness.get("ready_for_motion"):
+                return last
+            if readiness.get("state") in {"diverged", "offline"}:
+                raise ProtocolError("MAPPING_NOT_READY", str(readiness.get("message") or "mapping is not ready"))
+            time.sleep(1)
+        raise ProtocolError(
+            "MAPPING_NOT_READY",
+            str((last.get("readiness") or {}).get("message") or "timed out waiting for IMU initialization and the first keyframe"),
+        )
+
     def _cleanup(self) -> None:
         """Kill orphaned SLAM process and reset session state."""
         self._stop_rosbag()
@@ -407,14 +456,19 @@ class MappingAdapter:
         return payload
 
     def _start_rosbag(self, label: str) -> None:
-        self._rosbag_command("start", label)
+        status = self._rosbag_command("start", label)
+        self._rosbag_dir = status.get("bag_dir") or self._rosbag_dir
 
     def _stop_rosbag(self) -> None:
         status = self._rosbag_status()
+        if status.get("bag_dir"):
+            self._rosbag_dir = status.get("bag_dir")
         if not status.get("running"):
             return
         try:
-            self._rosbag_command("stop")
+            stopped = self._rosbag_command("stop")
+            if stopped.get("bag_dir"):
+                self._rosbag_dir = stopped.get("bag_dir")
         except ProtocolError:
             LOGGER.exception("failed to stop mapping rosbag recorder")
 
@@ -422,8 +476,21 @@ class MappingAdapter:
         return self._rosbag_command("status")
 
     def _ensure_slam_process(self) -> None:
-        if self._slam_process and self._slam_process.poll() is None:
+        if self._any_slam_process_alive:
             return
+        if self.config.mapping_unit:
+            try:
+                self._systemctl("start")
+            except ProtocolError:
+                LOGGER.warning("systemd start of %s failed; falling back to a direct mapping process", self.config.mapping_unit)
+            if self._is_mapping_unit_active():
+                self._wait_for_slam_services()
+                return
+            LOGGER.warning("mapping unit %s is not active; falling back to a direct mapping process", self.config.mapping_unit)
+        self._start_slam_subprocess()
+        self._wait_for_slam_services()
+
+    def _start_slam_subprocess(self) -> None:
         command = self._shell_prefix() + self.config.slam_command
         log_dir = Path(self.config.log_dir).expanduser()
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -434,7 +501,7 @@ class MappingAdapter:
             stdout=self._slam_log_handle,
             stderr=subprocess.STDOUT,
         )
-        time.sleep(5)
+        time.sleep(2)
         if self._slam_process.poll() is not None:
             return_code = self._slam_process.returncode
             self._slam_process = None
@@ -445,6 +512,30 @@ class MappingAdapter:
                 "MAPPING_SLAM_START_FAILED",
                 f"SLAM process exited during startup with code {return_code}; log={self._slam_log_path}",
             )
+
+    def _wait_for_slam_services(self) -> None:
+        deadline = time.monotonic() + max(20, int(self.config.command_timeout_seconds))
+        last_error = "SLAM mapping services did not appear"
+        while time.monotonic() < deadline:
+            if not self._any_slam_process_alive:
+                raise ProtocolError("MAPPING_SLAM_START_FAILED", "SLAM mapping process exited before services appeared")
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", self._shell_prefix() + "ros2 service list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+            except subprocess.TimeoutExpired:
+                last_error = "timed out listing ROS services"
+                time.sleep(1)
+                continue
+            services = set((result.stdout or "").split())
+            if self.config.start_service in services or self.config.service_name in services:
+                return
+            last_error = "waiting for /slam/start_mapping or /slam_state_service"
+            time.sleep(1)
+        raise ProtocolError("MAPPING_SLAM_START_FAILED", last_error)
 
     def _ensure_mapping_sensors(self) -> None:
         script = Path(self.config.sensor_start_script).expanduser()
@@ -465,12 +556,11 @@ class MappingAdapter:
 
     def _stop_conflicting_navigation_stack(self) -> None:
         """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
-        command = (
-            'script="$HOME/genisom_roamerx_open/robot/script/robot/start_navigation_real.sh"; '
-            'if [ -x "$script" ]; then "$script" full-stop; fi'
-        )
+        script = Path(self.config.navigation_script).expanduser()
+        if not script.is_file():
+            raise ProtocolError("MAPPING_STACK_STOP_FAILED", f"navigation script not found: {script}")
         result = subprocess.run(
-            ["bash", "-lc", command],
+            [str(script), "full-stop"],
             capture_output=True,
             text=True,
             timeout=max(15, self.config.command_timeout_seconds),
@@ -482,10 +572,25 @@ class MappingAdapter:
             )
 
     def _call_map_state(self, data: int) -> str:
-        payload = f'"{{data: {int(data)}}}"'
+        named = None
+        if data == self.config.start_data and self.config.start_service:
+            named = (self.config.start_service, self.config.start_service_type)
+        elif data == self.config.save_data and self.config.save_service:
+            named = (self.config.save_service, self.config.save_service_type)
+        if named:
+            try:
+                return self._call_ros_service(named[0], named[1], "{}")
+            except ProtocolError as exc:
+                if exc.code != "MAPPING_SERVICE_FAILED":
+                    raise
+                LOGGER.warning("named mapping service %s unavailable; falling back to MapState", named[0])
+        payload = "{data: %s}" % int(data)
+        return self._call_ros_service(self.config.service_name, self.config.service_type, payload)
+
+    def _call_ros_service(self, name: str, service_type: str, payload: str) -> str:
         command = (
             self._shell_prefix()
-            + f"ros2 service call {self.config.service_name} {self.config.service_type} {payload}"
+            + f"ros2 service call {name} {service_type} {payload!r}"
         )
         result = subprocess.run(
             ["bash", "-lc", command],
@@ -568,6 +673,16 @@ class MappingAdapter:
             LOGGER.exception("failed to read mapping progress %s", path)
             return {}
 
+    @staticmethod
+    def _read_json(path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     def _mark_progress_cancelled(self, base: Path | None) -> None:
         progress = self._read_save_progress(base)
         if not base or not progress or progress.get("stage") in {"completed", "failed"}:
@@ -623,6 +738,39 @@ class MappingAdapter:
             if path.exists():
                 mtimes.append(path.stat().st_mtime)
         return max(mtimes)
+
+    def _finalize_session_package(self, work_dir: Path, command: dict) -> dict:
+        scene_scope = normalize_text(
+            command.get("scene_scope")
+            or (self.session.scene_scope if self.session else "")
+            or self._scene_scope,
+            "indoor",
+        )
+        try:
+            manifest = finalize_map_package(
+                work_dir,
+                requested_scene_scope=scene_scope,
+                bag_dir=self._rosbag_dir,
+                raw_recording=str(self._rosbag_dir or ""),
+            )
+        except MapConstraintError as exc:
+            raise ProtocolError(exc.code, exc.message) from exc
+        # Scan-Context is generated after the SLAM save service returns. Feed
+        # accepted candidates back into the still-running C++ node so the
+        # authoritative GTSAM graph, rather than the Python SE2 fallback, owns
+        # the final trajectory and map.pcd.
+        if manifest.get("loop_status") == "accepted" and int(manifest.get("loop_closure_count") or 0) > 0:
+            try:
+                self._call_ros_service("/slam/global_optimize", "std_srvs/srv/Trigger", "{}")
+                refreshed = self._read_json(work_dir / "map_manifest.json")
+                if refreshed:
+                    manifest = refreshed
+            except ProtocolError as exc:
+                # finalize_loop_closure has already rebuilt map.pcd from its
+                # conservative SE2 result, so retain a usable offline fallback
+                # while making the missing GTSAM handoff visible in logs.
+                LOGGER.warning("C++ GTSAM global optimization handoff failed: %s", exc)
+        return manifest
 
     def _validate_map_files(self, work_dir: Path | None = None) -> None:
         base = work_dir or self.map_dir
@@ -697,14 +845,35 @@ class MappingAdapter:
         package_path = self.map_dir / f"map_package_{version}.zip"
         # Keep the ENU-to-map transform with the map package. Without this
         # file, an uploaded map cannot use RTK for initialization or fusion.
-        upload_files = ["map.yaml", "map.pgm", "map.txt", "gnss_origin.yaml", "mapping_trace.json"]
+        upload_files = [
+            "map.yaml",
+            "map.pgm",
+            "map.txt",
+            "gnss_origin.yaml",
+            "mapping_trace.json",
+            "map_manifest.json",
+            "recording_manifest.yaml",
+            "trajectory_raw.csv",
+            "trajectory_optimized.csv",
+            "trajectory_covariance.json",
+            "loop_closures.csv",
+        ]
         if preview_path:
             upload_files.append(preview_path.name)
         if self.config.upload_point_cloud:
             upload_files.append("map.pcd")
         files = []
+        extra_files = [
+            "scan_context/index.json",
+            "scan_context/loop_candidates.csv",
+        ]
         with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
             for name in upload_files:
+                path = filtered_base / name
+                if path.exists():
+                    archive.write(path, arcname=name)
+                    files.append(name)
+            for name in extra_files:
                 path = filtered_base / name
                 if path.exists():
                     archive.write(path, arcname=name)
@@ -713,6 +882,7 @@ class MappingAdapter:
         # navigation map. Normal saves retain the existing auto-activation flow.
         if not is_rescue:
             self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
+        map_manifest = self._read_json(filtered_base / "map_manifest.json")
         metadata = {
             "robot_code": self.media_client.robot_id,
             "mapping_session_id": self.session.session_id if self.session else str(uuid.uuid4()),
@@ -731,6 +901,11 @@ class MappingAdapter:
             "dynamic_filter": dynamic_filter_result,
             "slam_health": progress.get("slam_health") or {},
             "rescue": rescue_metadata,
+            "map_manifest": map_manifest,
+            "coordinate_mode": map_manifest.get("coordinate_mode", ""),
+            "scene_scope": map_manifest.get("scene_scope", ""),
+            "localization_mode": map_manifest.get("localization_mode", ""),
+            "origin_status": map_manifest.get("origin_status", ""),
         }
         return package_path, metadata
 
@@ -758,9 +933,14 @@ class MappingAdapter:
             for row in csv.DictReader(stream):
                 try:
                     slam = {
-                        "x": round(float(row["x"]), 4),
-                        "y": round(float(row["y"]), 4),
+                        "x": round(float(row.get("lidar_x") or row["x"]), 4),
+                        "y": round(float(row.get("lidar_y") or row["y"]), 4),
+                        "z": round(float(row.get("lidar_z") or row.get("z") or 0.0), 4),
                         "yaw": round(float(row.get("yaw") or 0.0), 5),
+                        "qx": round(float(row.get("lidar_qx") or row.get("world_qx") or 0.0), 7),
+                        "qy": round(float(row.get("lidar_qy") or row.get("world_qy") or 0.0), 7),
+                        "qz": round(float(row.get("lidar_qz") or 0.0), 7),
+                        "qw": round(float(row.get("lidar_qw") or 1.0), 7),
                     }
                     rtk_valid = row.get("rtk_valid") == "1"
                     latitude = float(row.get("rtk_latitude") or 0.0)
@@ -880,6 +1060,11 @@ class MappingAdapter:
             self.session.updated_at = now_iso()
 
     def _stop_slam_process(self) -> None:
+        if self.config.mapping_unit:
+            try:
+                self._systemctl("stop")
+            except ProtocolError:
+                LOGGER.warning("systemd stop of %s failed; stopping leftover mapping processes", self.config.mapping_unit)
         if self._slam_process and self._slam_process.poll() is None:
             self._slam_process.terminate()
             try:
@@ -891,6 +1076,35 @@ class MappingAdapter:
         if self._slam_log_handle:
             self._slam_log_handle.close()
             self._slam_log_handle = None
+
+    def _systemctl(self, action: str) -> dict:
+        completed = subprocess.run(
+            ["sudo", "systemctl", action, self.config.mapping_unit],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(15, int(self.config.command_timeout_seconds)),
+        )
+        payload = {
+            "action": action,
+            "returncode": completed.returncode,
+            "stdout": (completed.stdout or "")[-4000:],
+            "stderr": (completed.stderr or "")[-4000:],
+        }
+        if completed.returncode != 0:
+            raise ProtocolError("MAPPING_UNIT_FAILED", payload["stderr"] or payload["stdout"] or f"systemctl {action} failed")
+        return payload
+
+    def _is_mapping_unit_active(self) -> bool:
+        if not self.config.mapping_unit:
+            return False
+        process = subprocess.run(
+            ["systemctl", "is-active", "--quiet", self.config.mapping_unit],
+            check=False,
+            timeout=2,
+        )
+        return process.returncode == 0
 
     def _find_slam_process_pids(self) -> list[int]:
         try:

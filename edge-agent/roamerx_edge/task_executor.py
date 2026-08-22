@@ -9,6 +9,8 @@ from math import atan2, cos, hypot, isfinite, sin
 from typing import Callable, Protocol
 
 from .local_store import LocalStore
+from .map_coordinate import MapConstraintError, constraints_from_manifest, validate_route_against_map
+from .map_package_finalize import load_map_manifest
 from .protocol import MessageEnvelope, ProtocolError, now_iso
 
 
@@ -25,6 +27,7 @@ class NavigationAdapter(Protocol):
     def latest_trusted_pose(self): ...
     def set_localization_policy(self, source: str, phase: str) -> dict: ...
     def localization_decision(self) -> dict: ...
+    def localization_diagnostics(self) -> dict: ...
     def set_goal_precision(self, *, enabled: bool) -> None: ...
 
 
@@ -267,6 +270,17 @@ class TaskExecutor:
                 return
             trusted_pose_getter = getattr(self.navigation, "latest_trusted_pose", None)
             trusted_pose = trusted_pose_getter() if callable(trusted_pose_getter) else None
+            diagnostics_getter = getattr(self.navigation, "localization_diagnostics", None)
+            diagnostics = diagnostics_getter() if callable(diagnostics_getter) else {}
+            route_map = dict(self.context.route_snapshot.get("map") or {})
+            waypoints = self.context.route_snapshot.get("waypoints") or []
+            target = (
+                dict(waypoints[self.context.current_waypoint_index])
+                if self.context.current_waypoint_index < len(waypoints)
+                else None
+            )
+            if target is not None:
+                target.setdefault("map_point_number", self.context.current_waypoint_index + 1)
             self.context.state = "pausing"
             self.context.state_version += 1
             self._persist()
@@ -274,7 +288,20 @@ class TaskExecutor:
                 "task.pausing",
                 code="LOCALIZATION_LOST",
                 message="localization lost; pausing navigation for relocalization",
-                extra={"last_trusted_pose": trusted_pose} if trusted_pose else {},
+                extra={
+                    "last_trusted_pose": trusted_pose,
+                    "raw_pose": diagnostics.get("raw_pose"),
+                    "localization_quality": diagnostics.get("quality"),
+                    "localization_decision": diagnostics.get("decision"),
+                    "map_id": route_map.get("map_id"),
+                    "map_version": route_map.get("map_version"),
+                    "current_waypoint_index": self.context.current_waypoint_index,
+                    "current_waypoint": target,
+                    "recovery_policy": {
+                        "quick_attempts": 3,
+                        "continuous_retry": True,
+                    },
+                },
             )
 
             cancelled = self.navigation.cancel_navigation()
@@ -360,7 +387,9 @@ class TaskExecutor:
         with self._lock:
             command = envelope.payload["command"]
             route = dict(command["route_snapshot"])
+            route.setdefault("map", dict(command.get("map") or {}))
             route["waypoints"] = [dict(waypoint) for waypoint in route.get("waypoints") or []]
+            self._assert_map_constraints(route)
             docking = dict(command.get("docking") or {})
             # Docking is deliberately ordered: waypoint 0 establishes the
             # safe approach line and must never be skipped by nearest-point
@@ -406,6 +435,31 @@ class TaskExecutor:
                     initial_waypoint_index,
                     initial_waypoint_index,
                 )
+
+    def _assert_map_constraints(self, route: dict) -> None:
+        map_info = dict(route.get("map") or {})
+        local_dir = str(map_info.get("local_map_dir") or "")
+        manifest = load_map_manifest(local_dir) if local_dir else {}
+        if not manifest:
+            manifest = {
+                "coordinate_mode": map_info.get("coordinate_mode", ""),
+                "scene_scope": map_info.get("scene_scope", ""),
+                "localization_mode": map_info.get("localization_mode", ""),
+                "origin_status": map_info.get("origin_status", ""),
+                "completeness": map_info.get("completeness") or map_info.get("origin_status") or "",
+            }
+        constraints = constraints_from_manifest(
+            manifest,
+            requested_scene_scope=str(route.get("scene_scope") or map_info.get("scene_scope") or ""),
+        )
+        try:
+            validate_route_against_map(
+                constraints,
+                scene_scope=str(route.get("scene_scope") or constraints.get("scene_scope") or ""),
+                waypoints=route.get("waypoints") or [],
+            )
+        except MapConstraintError as exc:
+            raise ProtocolError(exc.code, exc.message) from exc
 
     def _nearest_waypoint_index(self, route: dict) -> int:
         waypoints = route.get("waypoints") or []

@@ -6,6 +6,8 @@ import {
   fetchMapSets,
   fetchRobotNavigationStatus,
   fetchRobotStatus,
+  fetchTaskExecution,
+  fetchTaskTrajectory,
   fetchRobots,
   fetchRoutes,
   fetchSpeechCategories,
@@ -31,6 +33,11 @@ import {
   paginateKeyframes,
   resolveMapClickAction,
 } from '../services/routePlannerState'
+import {
+  buildLocalizationLossMarkers,
+  currentRobotMapPose,
+  localizationRecoveryLabel,
+} from '../services/taskMapState'
 
 const maps = ref([])
 const mapSets = ref([])
@@ -60,6 +67,8 @@ const sensorCommandBusy = ref('')
 const navError = ref('')
 const routeExecuteBusy = ref(false)
 const lastExecution = ref(null)
+const taskMapExecution = ref(null)
+const taskMapTrajectory = ref([])
 const initialPoseMode = ref(false)
 const manualInitialPose = ref(null)
 const initialPoseStep = ref('position')
@@ -81,6 +90,11 @@ const mapImageNaturalWidth = ref(0)
 const waypointYawDrafts = ref([])
 const waypointYawErrors = ref([])
 const waypointYawConfirmed = ref([])
+const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
+  taskMapExecution.value,
+  taskMapTrajectory.value,
+  selectedMap.value?.id,
+))
 const keyframePanelOpen = ref(false)
 const keyframePage = ref(1)
 const selectedKeyframeIndex = ref(null)
@@ -107,6 +121,7 @@ const routeForm = ref({
   map_set: null,
   robot: null,
   description: '',
+  scene_scope: 'indoor',
 })
 
 onMounted(async () => {
@@ -207,6 +222,7 @@ async function handleMapSelect(map) {
     map_set: null,
     robot: map?.robot || 1,
     description: '',
+    scene_scope: map?.scene_scope || 'indoor',
   }
   refreshImageGeometry()
   refreshNavigationStatus()
@@ -348,11 +364,17 @@ function setWaypointSpeech(index, templateId) {
 }
 
 function setWaypointLocalization(index, mode) {
+  const allowed = mapIsLocalOnly.value ? 'ndt' : (mode === 'rtk' ? 'rtk' : 'ndt')
   waypoints.value[index] = {
     ...waypoints.value[index],
-    localization_mode: mode === 'rtk' ? 'rtk' : 'ndt',
+    localization_mode: allowed,
   }
 }
+
+const mapIsLocalOnly = computed(() => {
+  const mode = selectedMap.value?.coordinate_mode || ''
+  return mode === 'local_only'
+})
 
 function resetWaypointYawEditors() {
   waypointYawDrafts.value = waypoints.value.map(point => waypointYawDegrees(point).toFixed(1))
@@ -721,9 +743,11 @@ async function handleSaveRoute() {
     waypoints: withWaypointYaw(waypoints.value).map((point, index) => ({
       ...point,
       map_point_number: index + 1,
+      localization_mode: mapIsLocalOnly.value ? 'ndt' : (point.localization_mode === 'rtk' ? 'rtk' : 'ndt'),
     })),
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
+    scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
   }
 
   try {
@@ -758,6 +782,7 @@ async function handleLoadRoute(route) {
   routeForm.value.robot = route.robot
   routeForm.value.map_data = route.map_data
   routeForm.value.map_set = route.map_set || null
+  routeForm.value.scene_scope = route.scene_scope || selectedMap.value?.scene_scope || 'indoor'
   await nextTick()
   if (mapChanged) await loadMappingTrace(routeMap)
   refreshImageGeometry()
@@ -1014,11 +1039,31 @@ async function refreshNavigationStatus() {
       connection_status: status.connection_status || navigation.connection_status,
       last_seen_at: status.last_seen_at || navigation.last_seen_at,
     }
+    await refreshTaskMapExecution()
     recordPoseSample()
     navError.value = ''
     refreshImageGeometry()
   } catch (error) {
     navError.value = error.message || '导航状态获取失败'
+  }
+}
+
+async function refreshTaskMapExecution() {
+  const executionId = navStatus.value?.status?.task_execution_id || lastExecution.value?.id
+  if (!executionId) {
+    taskMapExecution.value = null
+    taskMapTrajectory.value = []
+    return
+  }
+  try {
+    const [detail, track] = await Promise.all([
+      fetchTaskExecution(executionId),
+      fetchTaskTrajectory(executionId),
+    ])
+    taskMapExecution.value = detail
+    taskMapTrajectory.value = track.points || []
+  } catch {
+    // Navigation status remains useful even if a historical execution was removed.
   }
 }
 
@@ -1173,6 +1218,8 @@ async function handleExecuteRoute() {
   navError.value = ''
   try {
     lastExecution.value = await executeRoute(selectedRoute.value.id)
+    taskMapExecution.value = lastExecution.value
+    taskMapTrajectory.value = []
     await refreshNavigationStatus()
   } catch (error) {
     navError.value = error.message || '路线执行失败'
@@ -1250,9 +1297,9 @@ function robotMapMatches() {
 
 function robotDisplayPosition() {
   imageReadyTick.value
-  const status = navStatus.value?.status
   const geometry = getMapGeometry()
-  if (!robotPoseUsable() || !status || !geometry || status.x === null || status.y === null || !robotMapMatches()) return null
+  const status = robotMapPoint()
+  if (!status || !geometry) return null
   const point = mapPointToImagePoint(Number(status.x), Number(status.y), geometry)
   return {
     left: `${point.imageX * (geometry.rect.width / geometry.mapWidth)}px`,
@@ -1260,9 +1307,29 @@ function robotDisplayPosition() {
   }
 }
 
+function robotMapPoint() {
+  return currentRobotMapPose(navStatus.value, selectedMap.value?.id, localizationLossMarkers.value)
+}
+
 function robotHeadingStyle() {
-  const yaw = Number(navStatus.value?.status?.yaw || 0)
+  const yaw = Number(robotMapPoint()?.yaw || 0)
   return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - yaw}rad)` }
+}
+
+function robotMarkerTitle() {
+  const point = robotMapPoint()
+  if (!point) return '暂无定位'
+  return `${point.trusted ? '机器狗当前定位' : '机器狗最新上报位置（定位不可信）'}\nx=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}, yaw=${Number(point.yaw || 0).toFixed(3)}`
+}
+
+function lossHeadingStyle(point) {
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(point?.yaw || 0)}rad)` }
+}
+
+function lossMarkerTitle(point) {
+  const score = Number(point.quality?.matching_error)
+  const target = point.waypoint?.map_point_number || (Number.isFinite(Number(point.waypointIndex)) ? Number(point.waypointIndex) + 1 : '—')
+  return `第 ${point.sequence} 次定位丢失\n最后可信位置 x=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}\n目标 ${target}号点 · NDT ${Number.isFinite(score) ? score.toFixed(3) : '—'}\n${localizationRecoveryLabel(point.recoveryState)}\n${formatDateTime(point.occurredAt)}`
 }
 
 function initialPoseHeadingStyle() {
@@ -1436,7 +1503,7 @@ function ndtQualityLabel(quality = localizationQuality()) {
   if (!ndtQualityValid(quality)) return '无效'
   const error = Number(quality.matching_error)
   if (!Number.isFinite(error)) return '无分数'
-  if (error <= 0.5 && quality.has_converged !== false) return '正常'
+  if (error < 0.5 && quality.has_converged !== false) return '正常'
   return '偏差大'
 }
 
@@ -1446,7 +1513,7 @@ function ndtQualityValid(quality = localizationQuality()) {
   const inlier = Number(quality.inlier_fraction)
   const translation = Number(quality.relative_translation_m)
   return Number.isFinite(error)
-    && error < 100
+    && error < 0.5
     && (!Number.isFinite(inlier) || inlier >= 0.05)
     && (!Number.isFinite(translation) || translation < 20)
 }
@@ -1455,18 +1522,6 @@ function ndtConvergedText(quality = localizationQuality()) {
   if (!quality) return '—'
   if (localizationQualityStale(quality)) return '已过期'
   return quality.has_converged && ndtQualityValid(quality) ? '是' : '否'
-}
-
-function robotPoseUsable() {
-  const status = navStatus.value?.status
-  if (!status) return false
-  const localizationStatus = status.localization_status || navStatus.value?.localization_status
-  return localizationStatus === 'normal'
-    && !localizationSampleStale()
-    && robotMapMatches()
-    && Boolean(localizationQuality())
-    && !localizationQualityStale()
-    && ndtQualityValid()
 }
 
 function predictionErrorText(quality = localizationQuality()) {
@@ -1555,7 +1610,7 @@ function stateMachineSteps() {
   const ndtError = Number(quality?.matching_error)
   const inlier = Number(quality?.inlier_fraction)
   const qualityStale = localizationQualityStale(quality)
-  const goodNdt = !qualityStale && ndtQualityValid(quality) && Number.isFinite(ndtError) && ndtError <= 0.5 && (!Number.isFinite(inlier) || inlier >= 0.65)
+  const goodNdt = !qualityStale && ndtQualityValid(quality) && Number.isFinite(ndtError) && ndtError < 0.5 && (!Number.isFinite(inlier) || inlier >= 0.65)
   const ndtHealthy = typeof decision.ndt_healthy === 'boolean' ? decision.ndt_healthy : goodNdt
   const rtkOnline = sensors.rtk?.online === true
   const rtkUsable = decision.rtk_usable === true || sensors.rtk?.fusion_usable === true
@@ -1697,7 +1752,7 @@ function sensorStateRows() {
   return [
     sensorRow('lidar', '激光雷达 /front_lidar', '等待 Edge Agent 实时频率上报', 'lidar_imu'),
     sensorRow('imu', 'IMU /front_lidar/imu', '等待 Edge Agent 实时频率上报', 'lidar_imu'),
-    sensorRow('odometry', '里程计 /odom/mc_odom', hasPose ? '已有位姿但无独立频率上报' : '等待里程计数据'),
+    sensorRow('odometry', '里程计 /odom/localization_odom', hasPose ? '定位里程计位姿已上报' : '等待定位里程计数据'),
     sensorRow('rtk', 'RTK/GNSS /fix', '未收到 GNSS 数据', 'rtk'),
     sensorRow('laser_scan', '避障扫描 /laser_scan', '点云转二维扫描链路无数据', 'lidar_imu'),
     {
@@ -1838,6 +1893,7 @@ async function handleDeleteRoute(route) {
               </option>
             </select>
           </div>
+          <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
 
           <div class="panel-section">
             <h3>2. 路线信息</h3>
@@ -1853,6 +1909,14 @@ async function handleDeleteRoute(route) {
             <div class="form-group">
               <label>路线名称</label>
               <input v-model="routeForm.name" type="text" placeholder="输入路线名称" />
+            </div>
+            <div class="form-group">
+              <label>场景范围</label>
+              <select v-model="routeForm.scene_scope" :disabled="mapIsLocalOnly">
+                <option value="indoor">室内</option>
+                <option value="transition" :disabled="mapIsLocalOnly">室内外过渡</option>
+                <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
+              </select>
             </div>
             <div class="form-group">
               <label>描述</label>
@@ -1904,7 +1968,7 @@ async function handleDeleteRoute(route) {
                     <span>定位方式</span>
                     <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
                       <option value="ndt">NDT（室内/特征区）</option>
-                      <option value="rtk">RTK（室外开阔区）</option>
+                      <option value="rtk" :disabled="mapIsLocalOnly">RTK（室外开阔区）</option>
                     </select>
                   </label>
                   <label>
@@ -2147,8 +2211,18 @@ async function handleDeleteRoute(route) {
                       <span class="drill-dog-icon">🐕</span>
                       <strong>演练</strong>
                     </div>
-                    <div v-if="robotDisplayPosition()" class="robot-marker" :style="robotDisplayPosition()">
+                    <div
+                      v-for="point in localizationLossMarkers"
+                      :key="`planner-loss-${point.eventId}`"
+                      class="planner-localization-loss"
+                      :style="waypointDisplayPosition(point)"
+                      :title="lossMarkerTitle(point)"
+                    >
+                      <i :style="lossHeadingStyle(point)"></i><small>{{ point.sequence }}</small>
+                    </div>
+                    <div v-if="robotDisplayPosition()" class="robot-marker" :class="{ untrusted: !robotMapPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
                       <span :style="robotHeadingStyle()"></span>
+                      <small>{{ robotMapPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
                     </div>
                     <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
                       <span :style="initialPoseHeadingStyle()"></span>
@@ -3478,6 +3552,71 @@ async function handleDeleteRoute(route) {
   border-bottom: 17px solid #065f46;
   transform-origin: 50% 72%;
   z-index: 4;
+}
+
+.robot-marker > small {
+  position: absolute;
+  top: 30px;
+  left: 50%;
+  min-width: max-content;
+  padding: 2px 5px;
+  color: #fff;
+  background: #065f46;
+  font-size: 10px;
+  transform: translateX(-50%);
+}
+
+.robot-marker.untrusted::before {
+  border-style: dashed;
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(220, 38, 38, .28);
+}
+
+.robot-marker.untrusted span { border-bottom-color: #b45309; }
+.robot-marker.untrusted > small { background: #b45309; }
+
+.planner-localization-loss {
+  position: absolute;
+  z-index: 4;
+  width: 28px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+}
+
+.planner-localization-loss::before {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #dc2626;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, .28);
+}
+
+.planner-localization-loss i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  width: 0;
+  height: 0;
+  border-right: 5px solid transparent;
+  border-bottom: 15px solid #7f1d1d;
+  border-left: 5px solid transparent;
+  transform-origin: 50% 100%;
+}
+
+.planner-localization-loss small {
+  position: absolute;
+  top: 26px;
+  left: 50%;
+  min-width: 16px;
+  padding: 1px 3px;
+  color: #fff;
+  background: #991b1b;
+  font-size: 9px;
+  text-align: center;
+  transform: translateX(-50%);
 }
 
 .initial-pose-marker {

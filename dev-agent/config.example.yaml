@@ -1,9 +1,9 @@
 codex:
-  binary: /home/robot/.nvm/versions/node/v22.22.3/bin/codex
+  binary: /home/dogrobot/.nvm/versions/node/v22.22.3/bin/codex
   # The Agent gets its own mutable cache. Auth, sessions and skills below are
   # linked from shared_home so the main conversation still resumes normally.
-  home: /home/robot/.codex-dev-agent
-  shared_home: /home/robot/.codex
+  home: /home/dogrobot/.codex-dev-agent
+  shared_home: /home/dogrobot/.codex
   yolo: true
   timeout_seconds: 7200
 
@@ -12,8 +12,8 @@ workspaces:
   cloud-platform: /home/dogrobot/platform
 
 storage:
-  log_dir: /home/robot/.local/state/roamerx-dev-agent/tasks
-  conversation_file: /home/robot/.local/state/roamerx-dev-agent/conversation.json
+  log_dir: /home/dogrobot/.local/state/roamerx-dev-agent/tasks
+  conversation_file: /home/dogrobot/.local/state/roamerx-dev-agent/conversation.json
 
 voice:
   enabled: true
@@ -30,7 +30,7 @@ voice:
   # becomes a Codex task after the wake name is removed.
   host: 192.168.234.1
   user: firefly
-  identity_file: /home/robot/.ssh/id_rsa
+  identity_file: /home/dogrobot/.ssh/id_rsa
   pulse_server: /run/user/1000/pulse/native
   source: alsa_input.usb-TTGK_Technology_USB_Audio_33022920230925-00.mono-fallback
   # RMS 18 is the absolute floor. The listener also learns a short rolling

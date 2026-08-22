@@ -11,6 +11,11 @@ import {
 } from '../services/api'
 import { API_BASE } from '../services/api'
 import { executionActions, powerLabel } from '../services/executionState'
+import {
+  buildLocalizationLossMarkers,
+  currentRobotMapPose,
+  localizationRecoveryLabel,
+} from '../services/taskMapState'
 
 const route = useRoute()
 const execution = ref(null)
@@ -32,19 +37,11 @@ const latestCommand = computed(() => {
 })
 const failureInfo = computed(() => buildFailureInfo())
 const failedWaypointIndexes = computed(() => failureInfo.value.waypointIndexes)
-const localizationLossMarkers = computed(() => (execution.value?.events || [])
-  .filter(event => event.reason_code === 'LOCALIZATION_LOST' && event.event_type === 'task.pausing')
-  .map((event, index) => {
-    const pose = trustedPoseForLossEvent(event)
-    return {
-      ...pose,
-      eventId: event.id,
-      sequence: index + 1,
-      occurredAt: event.occurred_at,
-      poseSource: event.payload?.last_trusted_pose ? 'edge' : 'trajectory',
-    }
-  })
-  .filter(point => Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y))))
+const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
+  execution.value,
+  trajectory.value,
+  mapData.value?.id,
+))
 const progress = computed(() => {
   if (!execution.value?.total_waypoints) return 0
   return Math.round(execution.value.completed_waypoints / execution.value.total_waypoints * 100)
@@ -143,9 +140,7 @@ function polylinePoints(points) {
 }
 
 function robotPoint() {
-  const status = robotStatus.value?.status
-  if (!robotPoseUsable() || !status || status.x === null || status.y === null) return null
-  return { x: Number(status.x), y: Number(status.y), yaw: Number(status.yaw || 0) }
+  return currentRobotMapPose(robotStatus.value, mapData.value?.id, localizationLossMarkers.value)
 }
 
 function robotDisplayPosition() {
@@ -156,29 +151,22 @@ function robotHeadingStyle() {
   return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(robotPoint()?.yaw || 0)}rad)` }
 }
 
+function robotMarkerTitle() {
+  const point = robotPoint()
+  if (!point) return '暂无定位'
+  return `${point.trusted ? '机器狗当前定位' : '机器狗最新上报位置（定位不可信）'}\nx=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}, yaw=${Number(point.yaw || 0).toFixed(3)}`
+}
+
 function lossHeadingStyle(point) {
   return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(point?.yaw || 0)}rad)` }
 }
 
 function lossMarkerTitle(point) {
   const time = point.occurredAt ? new Date(point.occurredAt).toLocaleString('zh-CN', { hour12: false }) : '—'
-  return `第 ${point.sequence} 次定位丢失\n最后可信位置 x=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}\n航向 ${Number(point.yaw || 0).toFixed(3)} rad\n${time}`
-}
-
-function trustedPoseForLossEvent(event) {
-  const reported = event?.payload?.last_trusted_pose
-  if (Number.isFinite(Number(reported?.x)) && Number.isFinite(Number(reported?.y))) return reported
-
-  const lossTime = new Date(event?.occurred_at || '').getTime()
-  if (!Number.isFinite(lossTime)) return null
-  return [...trajectory.value].reverse().find((point) => {
-    const sampleTime = new Date(point.sampled_at || point.received_at || '').getTime()
-    return point.localization_status === 'normal'
-      && Number.isFinite(sampleTime)
-      && sampleTime <= lossTime
-      && Number.isFinite(Number(point.x))
-      && Number.isFinite(Number(point.y))
-  }) || null
+  const score = Number(point.quality?.matching_error)
+  const scoreText = Number.isFinite(score) ? score.toFixed(3) : '—'
+  const target = point.waypoint?.map_point_number || (Number.isFinite(Number(point.waypointIndex)) ? Number(point.waypointIndex) + 1 : '—')
+  return `第 ${point.sequence} 次定位丢失\n最后可信位置 x=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}\n航向 ${Number(point.yaw || 0).toFixed(3)} rad\n目标 ${target}号点 · NDT ${scoreText}\n${localizationRecoveryLabel(point.recoveryState)}\n${time}`
 }
 
 function lossMarkerTime(point) {
@@ -199,7 +187,7 @@ function ndtQualityValid(quality) {
   const inlier = Number(quality.inlier_fraction)
   const translation = Number(quality.relative_translation_m)
   return Number.isFinite(error)
-    && error < 100
+    && error < 0.5
     && (!Number.isFinite(inlier) || inlier >= 0.05)
     && (!Number.isFinite(translation) || translation < 20)
 }
@@ -328,18 +316,6 @@ function buildFailureInfo() {
     waypointIndexes: [],
     suggestion: '',
   }
-}
-
-function robotPoseUsable() {
-  const status = robotStatus.value?.status
-  const quality = status?.localization_quality
-  if (!status) return false
-  if (status.localization_status !== 'normal') return false
-  if (sampleIsStale(status.sampled_at)) return false
-  if (quality?.sampled_at && sampleIsStale(quality.sampled_at)) return false
-  if (!ndtQualityValid(quality)) return false
-  if (mapData.value?.id && status.map_id && String(mapData.value.id) !== String(status.map_id)) return false
-  return true
 }
 
 function waypointClass(index) {
@@ -564,8 +540,9 @@ onBeforeUnmount(() => {
               <span class="localization-loss-heading" :style="lossHeadingStyle(point)"></span>
               <small>{{ point.sequence }}</small>
             </div>
-            <div v-if="robotDisplayPosition()" class="execution-robot" :style="robotDisplayPosition()">
+            <div v-if="robotDisplayPosition()" class="execution-robot" :class="{ untrusted: !robotPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
               <span :style="robotHeadingStyle()"></span>
+              <small>{{ robotPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
             </div>
           </div>
           <div v-if="localizationLossMarkers.length" class="localization-loss-list">
@@ -573,7 +550,7 @@ onBeforeUnmount(() => {
             <div v-for="point in localizationLossMarkers" :key="`localization-loss-detail-${point.eventId}`">
               <i></i>
               <span>#{{ point.sequence }} x {{ Number(point.x).toFixed(2) }} / y {{ Number(point.y).toFixed(2) }}</span>
-              <small>yaw {{ Number(point.yaw || 0).toFixed(3) }} rad · {{ lossMarkerTime(point) }}</small>
+              <small>yaw {{ Number(point.yaw || 0).toFixed(3) }} rad · {{ lossMarkerTime(point) }} · {{ localizationRecoveryLabel(point.recoveryState) }}</small>
             </div>
           </div>
         </div>
@@ -822,6 +799,28 @@ onBeforeUnmount(() => {
   transform-origin: 50% 72%;
   z-index: 9;
 }
+
+.execution-robot small {
+  position: absolute;
+  top: 34px;
+  left: 50%;
+  min-width: max-content;
+  padding: 2px 5px;
+  border-radius: 3px;
+  color: #fff;
+  background: #0f766e;
+  font-size: 10px;
+  transform: translateX(-50%);
+}
+
+.execution-robot.untrusted::before {
+  border-style: dashed;
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(220, 38, 38, .28);
+}
+
+.execution-robot.untrusted span { border-bottom-color: #b45309; }
+.execution-robot.untrusted small { background: #b45309; }
 
 .execution-waypoints {
   display: grid;

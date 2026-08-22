@@ -1,0 +1,92 @@
+import json
+
+from roamerx_edge.map_package_finalize import finalize_map_package
+from roamerx_edge.recording_manifest import REQUIRED_TOPICS, write_recording_manifest
+
+
+def test_finalize_local_only_map_writes_manifest_and_keeps_raw(tmp_path):
+    session = tmp_path / "20260821_180000_001"
+    keyframes = session / "keyframes"
+    keyframes.mkdir(parents=True)
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "map.pcd").write_bytes(b"raw-pcd")
+    (keyframes / "keyframes.csv").write_text(
+        "index,stamp,x,y,z,yaw,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw,"
+        "lidar_x,lidar_y,lidar_z,lidar_qx,lidar_qy,lidar_qz,lidar_qw,point_count,"
+        "preintegration_file,scan_context_index,rtk_valid\n"
+        "0,100.0,1.0,2.0,0.0,0.0,1.0,2.0,0.0,0.0,0.0,0.0,1.0,1.0,2.0,0.0,0.0,0.0,0.0,1.0,10,"
+        "imu_preintegration/preint_00000.json,0,0\n"
+    )
+    preint = session / "imu_preintegration"
+    preint.mkdir()
+    (preint / "preint_00000.json").write_text(json.dumps({
+        "schema_version": 1,
+        "keyframe_index": 0,
+        "delta_rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "error_status": "no_previous_keyframe",
+    }))
+
+    manifest = finalize_map_package(session, requested_scene_scope="outdoor")
+
+    assert manifest["coordinate_mode"] == "local_only"
+    assert manifest["scene_scope"] == "indoor"
+    assert manifest["localization_mode"] == "ndt"
+    assert manifest["quaternion_order"] == "xyzw"
+    assert (session / "map_raw.pcd").read_bytes() == b"raw-pcd"
+    assert (session / "trajectory_raw.csv").exists()
+    assert (session / "trajectory_optimized.csv").exists()
+    assert (session / "scan_context" / "index.json").exists()
+
+
+def test_recording_manifest_lists_required_topics(tmp_path):
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text(
+        """
+rosbag2_bagfile_information:
+  storage_identifier: sqlite3
+  starting_time:
+    nanoseconds_since_epoch: 1000000000
+  duration:
+    nanoseconds: 2000000000
+  message_count: 5
+  topics_with_message_count:
+    - topic_metadata:
+        name: /front_lidar
+        type: sensor_msgs/msg/PointCloud2
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /front_lidar/imu
+        type: sensor_msgs/msg/Imu
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /fix
+        type: sensor_msgs/msg/NavSatFix
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /rtk_pvh
+        type: robots_dog_msgs/msg/UniRtkPvh
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /tf_static
+        type: tf2_msgs/msg/TFMessage
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+"""
+    )
+
+    manifest = write_recording_manifest(bag, tmp_path / "recording_manifest.yaml")
+
+    assert manifest["missing_required_topics"] == []
+    assert {topic["name"] for topic in manifest["topics"]} == set(REQUIRED_TOPICS)
+    assert (tmp_path / "recording_manifest.yaml").exists()

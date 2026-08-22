@@ -1,5 +1,5 @@
-#! /bin/bash
-#需要source自定义消息setup.bash
-PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source $PACKAGE_DIR/install/setup.bash
-ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 3}"
+#!/bin/bash
+# Desktop helper only. On the NX robot use start_mapping_real.sh.
+source /opt/ros/humble/setup.bash
+source /home/dogrobot/robot/install/setup.bash
+ros2 service call /slam/start_mapping std_srvs/srv/Trigger

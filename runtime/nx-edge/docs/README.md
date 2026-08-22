@@ -19,12 +19,22 @@ The migration script leaves compatibility links under `/home/robot`, allowing
 older vendor binaries and historical map YAML files to continue resolving while
 new code uses the canonical runtime paths.
 
+Initialize or verify the Edge SQLite schema without replacing runtime data:
+
+```bash
+runtime/nx-edge/bin/nxctl init-db
+```
+
+See [`docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md`](../../../docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md)
+for the storage boundary and [`docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md`](../../../docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md)
+for initialization and recovery procedures.
+
 ## Service Installation And Verification
 
 Install or update all eight NX resident services from the canonical checkout:
 
 ```bash
-deploy/robot/deploy.sh --install-service
+deploy/nx-edge/deploy.sh --install-service
 runtime/nx-edge/bin/nxctl status
 runtime/nx-edge/bin/nxctl verify
 ```

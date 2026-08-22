@@ -89,8 +89,8 @@ localization:
 
     # numeric parameters
     imu_data_filter_num: 5
-    globalmap_voxel_size: 0.3
-    points_voxel_filter_size: 0.2
+    globalmap_voxel_size: 0.15
+    points_voxel_filter_size: 0.15
 
     # other parameters
     cool_time_duration: 0.5
@@ -99,7 +99,7 @@ localization:
     reg_method: "NDT_OMP"
     ndt_neighbor_search_method: "DIRECT7"
     ndt_neighbor_search_radius: 1.0
-    ndt_resolution: 0.5
+    ndt_resolution: 0.15
     # Upper mean squared point-to-map distance accepted by NDT.
     # Inlier and transform-continuity checks remain separate acceptance gates.
     ndt_max_fitness_score: 0.50

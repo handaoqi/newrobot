@@ -11,7 +11,7 @@ from .views import ensure_demo_seed
 
 class MonitoringApiTests(TestCase):
     def setUp(self):
-        ensure_demo_seed()
+        ensure_demo_seed(force=True)
         self.client = APIClient()
 
     def authenticate(self):

@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import math
+import uuid
 import zipfile
 from datetime import time as datetime_time, timedelta
 from urllib.error import HTTPError, URLError
@@ -374,6 +375,11 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "pgm_sha256": _file_sha256(map_data.pgm_file.path) if map_data.pgm_file else "",
         "yaml_sha256": _file_sha256(map_data.yaml_file.path) if map_data.yaml_file else "",
         "gnss_origin_yaml": description.get("gnss_origin_yaml", "") if isinstance(description, dict) else "",
+        "map_manifest": description.get("map_manifest", {}) if isinstance(description, dict) else {},
+        "coordinate_mode": map_data.coordinate_mode,
+        "scene_scope": map_data.scene_scope,
+        "localization_mode": map_data.localization_mode,
+        "origin_status": map_data.origin_status,
     }
 
 
@@ -632,7 +638,9 @@ def build_analytics_payload():
     }
 
 
-def ensure_demo_seed() -> None:
+def ensure_demo_seed(*, force: bool = False) -> None:
+    if not force and not settings.ENABLE_DEMO_SEED:
+        return
     if not User.objects.filter(username="operator").exists():
         User.objects.create_user(
             username="operator",
@@ -2666,6 +2674,7 @@ class RobotMappingStartView(RobotMappingCommandView):
             "route_hint": request.data.get("route_hint", ""),
             "operator_note": request.data.get("operator_note", ""),
             "record_rosbag": bool(request.data.get("record_rosbag", False)),
+            "scene_scope": request.data.get("scene_scope") or "indoor",
         }
 
 
@@ -2919,7 +2928,7 @@ class DeviceMapUploadView(APIView):
         try:
             with zipfile.ZipFile(io.BytesIO(package.read())) as archive:
                 for name in archive.namelist():
-                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json"}:
+                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json", "map_manifest.json", "trajectory_raw.csv", "trajectory_optimized.csv", "recording_manifest.yaml"}:
                         extracted[name] = archive.read(name)
                     elif name == "map_set/map_set_manifest.json":
                         map_set_manifest = json.loads(archive.read(name).decode("utf-8"))
@@ -2935,6 +2944,14 @@ class DeviceMapUploadView(APIView):
 
         yaml_metadata = _parse_simple_map_yaml(extracted["map.yaml"])
         width, height = _read_pgm_dimensions(extracted["map.pgm"])
+        map_manifest = metadata.get("map_manifest") if isinstance(metadata.get("map_manifest"), dict) else {}
+        if extracted.get("map_manifest.json"):
+            try:
+                parsed_manifest = json.loads(extracted["map_manifest.json"].decode("utf-8"))
+                if isinstance(parsed_manifest, dict):
+                    map_manifest = parsed_manifest
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
         description = {
             "source": "edge_mapping",
             "map_version": metadata.get("map_version", ""),
@@ -2947,6 +2964,11 @@ class DeviceMapUploadView(APIView):
             "files": metadata.get("files", []),
             "image": yaml_metadata.get("image", ""),
             "gnss_origin_yaml": extracted.get("gnss_origin.yaml", b"").decode("utf-8", errors="ignore")[:16384],
+            "map_manifest": map_manifest,
+            "coordinate_mode": map_manifest.get("coordinate_mode") or metadata.get("coordinate_mode", ""),
+            "scene_scope": map_manifest.get("scene_scope") or metadata.get("scene_scope", ""),
+            "localization_mode": map_manifest.get("localization_mode") or metadata.get("localization_mode", ""),
+            "origin_status": map_manifest.get("origin_status") or metadata.get("origin_status", ""),
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
@@ -2958,6 +2980,11 @@ class DeviceMapUploadView(APIView):
                 height=height,
                 origin=yaml_metadata.get("origin") or metadata.get("origin") or [],
                 description=json.dumps(description, ensure_ascii=False),
+                coordinate_mode=str(description.get("coordinate_mode") or ""),
+                scene_scope=str(description.get("scene_scope") or ""),
+                localization_mode=str(description.get("localization_mode") or ""),
+                origin_status=str(description.get("origin_status") or ""),
+                map_completeness=str(map_manifest.get("completeness") or ""),
             )
             map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
             if extracted.get("map.txt"):
@@ -3108,17 +3135,38 @@ def validate_task_execution_readiness(task: PatrolTask) -> Response | None:
     return None
 
 
+def parse_loop_execution_context(data) -> tuple[bool, uuid.UUID | None, int]:
+    loop_execution = data.get("loop_execution", False)
+    if not isinstance(loop_execution, bool):
+        raise ValueError("loop_execution 必须是布尔值")
+    if not loop_execution:
+        return False, None, 1
+    raw_session_id = data.get("loop_session_id")
+    try:
+        loop_session_id = uuid.UUID(str(raw_session_id)) if raw_session_id else uuid.uuid4()
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("loop_session_id 必须是 UUID") from exc
+    try:
+        round_number = int(data.get("round_number", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("round_number 必须是正整数") from exc
+    if round_number < 1:
+        raise ValueError("round_number 必须是正整数")
+    return True, loop_session_id, round_number
+
+
 class PatrolRouteExecuteView(APIView):
     """直接执行一条已保存路线。"""
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, pk):
         record_rosbag = request.data.get("record_rosbag", False)
-        loop_execution = request.data.get("loop_execution", False)
         if not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
-        if not isinstance(loop_execution, bool):
-            return Response({"detail": "loop_execution 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            loop_execution, loop_session_id, round_number = parse_loop_execution_context(request.data)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         route = get_object_or_404(
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
@@ -3159,6 +3207,8 @@ class PatrolRouteExecuteView(APIView):
                 execution = TaskExecutionService.create_execution(
                     task,
                     request.user if request.user.is_authenticated else None,
+                    loop_session_id=loop_session_id,
+                    round_number=round_number,
                 )
                 CommandService.create(
                     execution,
@@ -3466,11 +3516,12 @@ class PatrolTaskExecuteView(APIView):
 
     def post(self, request, task_id):
         record_rosbag = request.data.get("record_rosbag", False)
-        loop_execution = request.data.get("loop_execution", False)
         if not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
-        if not isinstance(loop_execution, bool):
-            return Response({"detail": "loop_execution 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            loop_execution, loop_session_id, round_number = parse_loop_execution_context(request.data)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         task = get_object_or_404(
             PatrolTask.objects.select_related("robot", "route", "route__map_data"),
             pk=task_id,
@@ -3483,7 +3534,12 @@ class PatrolTaskExecuteView(APIView):
             # See the route execution endpoint: a rejected command must roll
             # back the just-created execution rather than orphaning it.
             with transaction.atomic():
-                execution = TaskExecutionService.create_execution(task, operator)
+                execution = TaskExecutionService.create_execution(
+                    task,
+                    operator,
+                    loop_session_id=loop_session_id,
+                    round_number=round_number,
+                )
                 CommandService.create(
                     execution,
                     "task.start",

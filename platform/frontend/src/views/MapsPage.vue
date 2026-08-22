@@ -48,6 +48,7 @@ const mappingForm = ref({
   map_name: '太阳宫园区 V1',
   route_hint: '南门 → 主步道 → 牡丹园 → 活动广场',
   record_rosbag: true,
+  scene_scope: 'indoor',
 })
 let statusTimer = null
 let lastSlamAlert = ''
@@ -496,6 +497,7 @@ async function handleStartMapping() {
       map_name: mappingForm.value.map_name,
       route_hint: mappingForm.value.route_hint,
       record_rosbag: mappingForm.value.record_rosbag,
+      scene_scope: mappingForm.value.scene_scope,
     })
     await refreshMappingStatus()
   } catch (error) {
@@ -893,6 +895,13 @@ async function saveCleaner() {
               <div><strong>分辨率:</strong> {{ selectedMap.resolution }} m/像素</div>
               <div><strong>大小:</strong> {{ formatSize(selectedMap.file_size) }}</div>
               <div v-if="selectedMap.width"><strong>尺寸:</strong> {{ selectedMap.width }} × {{ selectedMap.height }}</div>
+              <div v-if="selectedMap.coordinate_mode || parseDescription(selectedMap.description).coordinate_mode">
+                <strong>坐标:</strong>
+                {{ (selectedMap.coordinate_mode || parseDescription(selectedMap.description).coordinate_mode) === 'local_only' ? '无 RTK 原点 / 仅室内 NDT' : 'RTK 原点' }}
+              </div>
+              <div v-if="selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope">
+                <strong>场景:</strong> {{ selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope }}
+              </div>
               <div v-if="parseDescription(selectedMap.description).rescue" class="rescue-map-label">
                 <strong>质量:</strong> 发散救援地图，启用前必须现场核对
               </div>
@@ -1172,6 +1181,14 @@ async function saveCleaner() {
           <label class="mapping-route">
             <span>演示路线</span>
             <input v-model="mappingForm.route_hint" type="text" />
+          </label>
+          <label>
+            <span>场景范围</span>
+            <select v-model="mappingForm.scene_scope" :disabled="isActiveMapping">
+              <option value="indoor">室内</option>
+              <option value="transition">室内外过渡</option>
+              <option value="outdoor">室外</option>
+            </select>
           </label>
           <label class="mapping-record-option">
             <input v-model="mappingForm.record_rosbag" type="checkbox" :disabled="isActiveMapping" />

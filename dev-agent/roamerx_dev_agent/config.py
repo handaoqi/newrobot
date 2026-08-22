@@ -38,7 +38,7 @@ class VoiceConfig:
     host: str = "192.168.234.1"
     port: int = 22
     user: str = "firefly"
-    identity_file: str = "/home/robot/.ssh/id_rsa"
+    identity_file: str = "/home/dogrobot/.ssh/id_rsa"
     pulse_server: str = "/run/user/1000/pulse/native"
     source: str = "alsa_input.usb-TTGK_Technology_USB_Audio_33022920230925-00.mono-fallback"
     rms_threshold: int = 18
@@ -95,7 +95,7 @@ class DevAgentConfig:
             if not path.is_dir():
                 raise ValueError(f"workspace does not exist: {name}={path}")
             resolved_workspaces[str(name)] = str(path)
-        codex_home = str(Path(codex.get("home") or "/home/robot/.codex").expanduser())
+        codex_home = str(Path(codex.get("home") or "/home/dogrobot/.codex").expanduser())
         shared_codex_home = str(Path(codex.get("shared_home") or codex_home).expanduser())
         if not Path(shared_codex_home).is_dir():
             raise ValueError(f"shared Codex home does not exist: {shared_codex_home}")

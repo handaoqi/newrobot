@@ -151,6 +151,9 @@ class RosAdapter(Node):
     def localization_decision(self) -> dict:
         return self.telemetry.localization_decision()
 
+    def localization_diagnostics(self) -> dict:
+        return self.telemetry.localization_diagnostics()
+
     def prepare_for_navigation(self, timeout_seconds: float = 12.0) -> bool:
         """Stand the robot and wait for the SDK bridge to confirm it is stable."""
         self._robot_standing_event.clear()
@@ -269,7 +272,7 @@ class RosAdapter(Node):
         self.telemetry.on_scan_matching_status(msg)
         score = float(getattr(msg, "matching_error", float("inf")))
         healthy = bool(getattr(msg, "has_converged", False)) and math.isfinite(score) and (
-            score <= self.safety_config.ndt_failure_score
+            score < self.safety_config.ndt_failure_score
         )
         if healthy:
             self._ndt_failure_count = 0

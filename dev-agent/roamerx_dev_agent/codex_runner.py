@@ -84,7 +84,7 @@ class CodexRunner:
         )
 
         env = os.environ.copy()
-        env["HOME"] = "/home/robot"
+        env["HOME"] = "/home/dogrobot"
         env["CODEX_HOME"] = self.config.home
         env.setdefault("PYTHONUNBUFFERED", "1")
         # The npm-installed Codex launcher uses `#!/usr/bin/env node`. systemd

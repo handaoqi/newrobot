@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=roamerx
-WorkingDirectory=/opt/roamerx/platform_server_code/backend
+WorkingDirectory=/opt/roamerx/current/backend
 EnvironmentFile=/etc/roamerx/center.env
 ExecStart=/opt/roamerx/venv/bin/python manage.py run_device_worker
 Restart=always

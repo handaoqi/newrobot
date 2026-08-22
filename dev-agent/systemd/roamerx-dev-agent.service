@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=robot
+User=dogrobot
 Group=robot
 WorkingDirectory=/home/dogrobot/dev-agent
-Environment=HOME=/home/robot
-Environment=CODEX_HOME=/home/robot/.codex
+Environment=HOME=/home/dogrobot
+Environment=CODEX_HOME=/home/dogrobot/.codex
 Environment=PYTHONUNBUFFERED=1
 Environment=http_proxy=http://127.0.0.1:7890
 Environment=https_proxy=http://127.0.0.1:7890

@@ -26,12 +26,15 @@ codex --dangerously-bypass-approvals-and-sandbox
 - If the requirement says "through cloud platform", do not send local ROS navigation goals as the final test. Use the cloud UI/API -> MQTT -> edge_agent -> Nav2 path.
 - Keep using the canonical real-robot scripts only:
   - `script/robot/start_navigation_real.sh`
-  - `script/robot/start_mapping_real.sh`
-- Avoid old/ambiguous entrypoints; they were intentionally removed:
+  - `script/robot/start_mapping_real.sh` (wraps `python3 -m roamerx_edge.mapping_cli`)
+- Avoid old/ambiguous entrypoints; they were intentionally removed or disabled:
   - `script/start_navigation.sh`
   - `script/bash/start_navigation.sh`
   - `script/bash/stop_navigation.sh`
   - `start_slam.sh`
+  - `ros2 launch robot_slam slam.launch.py` on the NX robot (starts RViz unless `use_rviz:=false`, and is not the mapping owner)
+  - `robot/src/slam/src/script/run_slam.sh`
+  - `robot/script/web_api/map_api_server.py`
 
 ## Navigation Stack
 
@@ -62,6 +65,20 @@ Nav2 -> /cmd_vel -> mode_status_publisher -> /mode_switch_cmd=171
 ```
 
 When `/cmd_vel` stops for about 1 second, mode returns to `170` and `vel_cmd_udp_pub` calls SDK `passive()`.
+
+## Mapping
+
+Canonical mapping commands:
+
+```bash
+cd /home/dogrobot/robot
+script/robot/start_mapping_real.sh start
+script/robot/start_mapping_real.sh status
+script/robot/start_mapping_real.sh save
+script/robot/start_mapping_real.sh stop
+```
+
+Cloud `mapping.start` and the local script both use Edge `MappingAdapter`. The mapping node runs as on-demand `roamerx-mapping.service`. Named ROS services are `/slam/start_mapping` and `/slam/save_map`; `/slam_state_service` remains as fallback. `start` waits until IMU init and the first keyframe succeed before reporting that the robot may move. Do not send motion commands unless the operator explicitly requests it.
 
 ## Localization And Map
 

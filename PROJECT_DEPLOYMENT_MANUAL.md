@@ -380,6 +380,7 @@ deploy/robot/deploy.sh --host robot@<NX_IP> --build
 | `roamerx-local-asr.service` | NX 本地语音识别 | 本地监听 `127.0.0.1:18080`，使用语音模型缓存。 |
 | `roamerx-dev-agent.service` | 远程开发/语音任务桥 | 使用 `/home/dogrobot/dev-agent` 与 Edge 运行配置。 |
 | `roamerx-robot-mcp.service` | 本机 Robot Control MCP | 通过 `/etc/systemd/system/roamerx-robot-mcp.service.d/override.conf` 从 `/home/dogrobot/robot/mcp_server/roamerx_robot_mcp.py` 启动，监听 `127.0.0.1:8095`。 |
+| `roamerx-mapping.service` | 按需 SLAM 建图节点 | 不随开机 enable。由 Edge `mapping.start` 或 `start_mapping_real.sh` 启动，保存/取消后停止。 |
 
 正常重建后的低风险检查顺序：
 
@@ -408,7 +409,7 @@ script/robot/start_navigation_real.sh start
 script/robot/start_mapping_real.sh start
 ```
 
-`start` 会影响实体机器人，必须在设备和场地均已确认安全时才执行；恢复验收优先运行 `status`、`ros2 node list`、`ros2 topic echo --once` 等只读命令。
+`start` 会影响实体机器人，必须在设备和场地均已确认安全时才执行；恢复验收优先运行 `status`、`ros2 node list`、`ros2 topic echo --once` 等只读命令。`start_mapping_real.sh` 与云端 `mapping.start` 使用同一套 MappingAdapter，建图进程由 `roamerx-mapping.service` 监管。
 
 ### 6.5 NX 数据恢复
 
@@ -591,6 +592,7 @@ ssh 3588 'test -x /usr/local/sbin/roamerx-charge-pile-controller && echo charge-
 - `/home/dogrobot/runtime/3588-motion/scripts/deploy.sh`：3588 管理覆盖层部署入口。
 - `/home/dogrobot/deploy/robot/deploy.sh`：NX 发布包装器。
 - `/home/dogrobot/deploy/controller/README.md`：3588 厂商镜像边界。
-- `/home/dogrobot/platform/docs/`：平台架构、API、数据和运维文档。
+- `/home/dogrobot/docs/`：统一的项目架构分析和人工操作手册入口。
+- `/home/dogrobot/platform/docs/`：平台组件级 API、数据字段和实现说明。
 - `/home/dogrobot/robot/AGENTS.md`、`robot/STARTUP_GUIDE.md`：真实机器人运行约束与 ROS 启动说明。
 - 旧运行工作区下的 `backup/nx_20260812_002113/` 与 `backup/3588_20260812_000539/`：私有配置恢复材料。

@@ -7,6 +7,7 @@ ASR_ENABLED = os.getenv("ASR_ENABLED", "true").lower() == "true"
 ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH", "/opt/roamerx/shared/models/faster-whisper-base")
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh")
 INSPECTION_SPEECH_CATEGORY_NAME = os.getenv("INSPECTION_SPEECH_CATEGORY_NAME", "巡检智能播报")
+ENABLE_DEMO_SEED = os.getenv("ENABLE_DEMO_SEED", "false").lower() == "true"
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-demo-inspection-platform-key")
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() == "true"

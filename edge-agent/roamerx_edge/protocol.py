@@ -178,6 +178,12 @@ def validate_command(envelope: MessageEnvelope) -> None:
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "mapping.start record_rosbag must be boolean")
+        scene_scope = payload["command"].get("scene_scope")
+        if scene_scope is not None and scene_scope not in {"indoor", "transition", "outdoor"}:
+            raise ProtocolError("INVALID_MESSAGE", "mapping.start scene_scope must be indoor, transition, or outdoor")
+        scene_scope = payload["command"].get("scene_scope")
+        if scene_scope is not None and scene_scope not in {"indoor", "transition", "outdoor"}:
+            raise ProtocolError("INVALID_MESSAGE", "mapping.start scene_scope must be indoor, transition, or outdoor")
     if envelope.message_type == "nav.initial_pose":
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]

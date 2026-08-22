@@ -73,6 +73,7 @@ set(dependencies
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+find_package(GTSAM REQUIRED)
 
 file(GLOB_RECURSE SLAM_SDK
      CONFIGURE_DEPENDS
@@ -90,7 +91,7 @@ add_executable(mapping ${SLAM_SDK} test/mapping_demo.cpp)
 
 add_executable(pcd2grid_streaming src/pcd2grid.cpp test/pcd2grid_streaming_cli.cpp)
 
-target_link_libraries(mapping ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+target_link_libraries(mapping ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
 target_link_libraries(pcd2grid_streaming ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 ament_target_dependencies(mapping ${dependencies})

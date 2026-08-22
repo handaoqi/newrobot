@@ -48,31 +48,30 @@ colcon build --packages-select robot_slam
 
 ## 运行（Run）
 
-```C++
-cd 工作空间
-source ./install/setup.bash
-ros2 launch robot_slam mapping.launch.py 或者 ./run_slam
+真机不要用 `ros2 launch robot_slam slam.launch.py` 或 `./run_slam`。NX 入口：
+
+```
+cd /home/dogrobot/robot
+script/robot/start_mapping_real.sh start
 ```
 
-
+桌面调试若必须用 launch，保持 `use_rviz:=false`，除非本机有显示器。
 
 ## 开始建图（Run Mapping）
 
 ```
-ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 3}"
+ros2 service call /slam/start_mapping std_srvs/srv/Trigger
 ```
 
-`注：默认输入雷达话题为: "/livox/lidar"，imu话题为: "/livox/imu"，qos均为best_effort,运行程序后，需要发布服务才能开始建图`
-
-
+旧接口 `/slam_state_service` `data: 3` 仍可用。输入话题为 `/front_lidar` 和 `/front_lidar/imu`。
 
 ## 保存建图（Save Map）
 
 ```
-ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
+ros2 service call /slam/save_map std_srvs/srv/Trigger
 ```
 
-`注：开始键图后，当建图完成时(终端会打印: "Save Map Success.")，需要发送服务保存地图（主要包括pcd点云地图、pgm占用地图和建图轨迹.txt; 默认保存在主目录下的.jszr/map目录下）`
+地图默认保存在 `/home/dogrobot/runtime/nx-edge/data/jszr/map/`（`storage.data_path`）。包含 pcd、pgm、yaml、轨迹 txt 和 keyframes。
 
 
 
@@ -117,3 +116,26 @@ ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
 | --pcd2pgm.map_resolution | double | 0.05 | 地图分辨率 |
 
 `注：发布map坐标系点云话题为: /world_points，qos为best_effort；发布body坐标系下点云话题为：/body_points，qos为reliable；发布路径话题为: /path，qos为reliable；发布odomtery话题为: /slam_odom，qos为reliable, tf随odom信息一起发布`
+
+## GTSAM 多帧全局优化
+
+保存地图时会对已写入的关键帧执行一次批量因子图优化；因子包括连续 NDT/LIO 位姿、关键帧 IMU 预积分、质量门控后的 RTK XY、RTK 双天线航向，以及可选回环约束。优化结果写入：
+
+- `trajectory_raw.csv`：原始增量轨迹
+- `trajectory_optimized.csv`：GTSAM 全局优化轨迹
+- `trajectory_covariance.json`：每个关键帧的全局 6x6 边缘协方差，顺序为 `rotation_xyz,translation_xyz`
+- `map_manifest.json`：因子数量、回环数量和轨迹来源
+
+可通过以下服务在当前会话中再次执行历史轨迹重优化：
+
+```bash
+ros2 service call /slam/global_optimize std_srvs/srv/Trigger
+```
+
+Edge 的 Scan-Context 会先生成 `scan_context/loop_candidates.csv`。地图包完成阶段仅保留 `accepted=true` 且 `geometric_verified=true` 的候选；适配器随后调用 `/slam/global_optimize`，C++ 自动转换并写入当前地图目录的 `loop_closures.csv`，格式为：
+
+```text
+from,to,tx,ty,tz,qx,qy,qz,qw,sigma_translation,sigma_rotation,score
+```
+
+其中相对位姿满足 `T_from_to`，四元数为 `xyzw`。节点会将这些约束与 RTK、NDT、IMU 放入同一图中，并使用 Huber 鲁棒核抑制 RTK 异常和错误回环。GTSAM 成功后会重新变换所有关键帧点云并重建 `map.pcd`/栅格；`map_raw.pcd` 始终保留为原始地图。运行期输出话题为 `/slam/global_optimized_path`、`/slam/global_optimized_odom` 和 `/slam/global_optimization_status`。

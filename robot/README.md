@@ -69,8 +69,8 @@ sudo apt install ros-humble-desktop
 
 ```bash
 # Clone the repository
-git clone https://github.com/zsibot/genisom_roamerx_open.git
-cd genisom_roamerx_open
+git clone https://github.com/zsibot/genisom_roamerx_open.git /home/dogrobot/robot
+cd /home/dogrobot/robot
 
 # Install all dependencies
 chmod +x script/dep/install_all.sh
@@ -128,14 +128,14 @@ cd matrix/
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 export ROS_DOMAIN_ID=89
 export SDK_CLIENT_IP=127.0.0.1
-cd /workspace/genisom_roamerx_open
+cd /home/dogrobot/robot
 bash script/bash/start_navigation.sh nav
 
 # Terminal 2
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 export ROS_DOMAIN_ID=89
 export SDK_CLIENT_IP=127.0.0.1
-cd /workspace/genisom_roamerx_open
+cd /home/dogrobot/robot
 bash script/bash/start_navigation.sh rviz
 ```
 

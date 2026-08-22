@@ -273,18 +273,23 @@ class RemoteDevelopmentMqttTests(TestCase):
                 created.status = "succeeded"
                 created.save(update_fields=["status", "updated_at"])
 
-    def test_fuzzy_wake_word_rejects_unrelated_pinyin_finals(self):
+    def test_fuzzy_wake_word_accepts_first_syllable_substitutions(self):
         self.task.status = "succeeded"
         self.task.save(update_fields=["status", "updated_at"])
 
+        # The matcher intentionally treats the first syllable as unreliable
+        # for SenseVoice and validates the “太阳” core instead.
         for transcript in ("有太阳创建测试任务", "呃太阳创建测试任务", "狗太阳创建测试任务"):
             with self.subTest(transcript=transcript):
                 result = handle_dev_mqtt_message(
                     self.topic("voice/audio"),
                     {"asr_engine": "nx-sensevoice", "transcript": transcript},
                 )
-                self.assertEqual(result["status"], "ignored")
-        self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
+                self.assertEqual(result["status"], "accepted")
+                created = DevelopmentTask.objects.get(pk=result["task_id"])
+                self.assertEqual(created.prompt, "创建测试任务")
+                created.status = "succeeded"
+                created.save(update_fields=["status", "updated_at"])
 
     def test_short_alias_and_non_prefix_wake_phrase_do_not_create_task(self):
         self.task.status = "succeeded"

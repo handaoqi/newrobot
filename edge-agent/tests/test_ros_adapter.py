@@ -71,6 +71,23 @@ def test_ndt_score_over_threshold_triggers_recovery_after_hysteresis():
     assert adapter._localization_recovery_armed is True
 
 
+def test_ndt_score_at_threshold_is_not_healthy():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry()
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.5, ndt_failure_samples=1)
+    adapter._ndt_failure_count = 0
+    adapter._ndt_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    adapter._localization_failure_cb = triggered.set
+
+    adapter._on_scan_matching_status(
+        SimpleNamespace(has_converged=True, matching_error=0.5, inlier_fraction=0.5)
+    )
+
+    assert triggered.wait(1.0)
+
+
 def test_only_absolute_ndt_or_rtk_decision_is_trusted():
     adapter = object.__new__(RosAdapter)
     adapter.telemetry = FakeTelemetry({"active_source": "imu_odom_bridge", "absolute_stable": False})

@@ -38,7 +38,7 @@ preflight() {
     echo "Missing conf/mosquitto.passwd; run scripts/prepare-mqtt-password.sh" >&2
     exit 1
   }
-  for key in DJANGO_SECRET_KEY DJANGO_ALLOWED_HOSTS DJANGO_CSRF_TRUSTED_ORIGINS PUBLIC_BASE_URL MQTT_PASSWORD; do
+  for key in DJANGO_SECRET_KEY DJANGO_ALLOWED_HOSTS DJANGO_CSRF_TRUSTED_ORIGINS PUBLIC_BASE_URL MQTT_PASSWORD PLATFORM_OPERATOR_PASSWORD; do
     value="$(grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true)"
     if [[ -z "$value" || "$value" =~ (change|example|replace|your_) ]]; then
       echo "Invalid production value: $key" >&2
@@ -70,6 +70,11 @@ preflight() {
 
 case "${1:-help}" in
   init) init_runtime ;;
+  init-db)
+    preflight
+    compose run --rm --no-deps --build backend sh -c \
+      'python manage.py migrate --noinput && python manage.py initialize_platform'
+    ;;
   preflight) preflight ;;
   build) compose build --pull ;;
   up)
@@ -82,5 +87,5 @@ case "${1:-help}" in
   logs) shift; compose logs -f --tail=200 "$@" ;;
   backup) "$RUNTIME_ROOT/scripts/backup.sh" ;;
   verify) "$RUNTIME_ROOT/scripts/verify.sh" ;;
-  *) echo "Usage: $0 {init|preflight|build|up|down|restart|status|logs|backup|verify}" >&2; exit 2 ;;
+  *) echo "Usage: $0 {init|init-db|preflight|build|up|down|restart|status|logs|backup|verify}" >&2; exit 2 ;;
 esac

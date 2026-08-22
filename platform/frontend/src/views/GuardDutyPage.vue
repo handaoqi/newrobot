@@ -26,6 +26,11 @@ import {
   sendTextToSpeechCommand,
 } from '../services/api'
 import { executionActions, isExecutionActive } from '../services/executionState'
+import {
+  buildLocalizationLossMarkers,
+  currentRobotMapPose,
+  localizationRecoveryLabel,
+} from '../services/taskMapState'
 
 const overview = ref(null)
 const robots = ref([])
@@ -53,6 +58,7 @@ const loopEndsAt = ref(0)
 const loopStoppedAt = ref(0)
 const loopRestUntil = ref(0)
 const loopRounds = ref(0)
+const loopSessionId = ref('')
 const loopAccumulatedDistance = ref(0)
 const loopCountedExecutionIds = ref([])
 const loopCurrentExecutionId = ref('')
@@ -147,11 +153,16 @@ const executionWaypointOrder = computed(() => {
 })
 const currentExecutionRound = computed(() => {
   if (!execution.value?.id) return 0
-  return String(execution.value.id) === String(loopCurrentExecutionId.value || '') ? Math.max(1, loopRounds.value) : 1
+  return Math.max(1, Number(execution.value.round_number || 1))
 })
 const latestTargetMilestone = computed(() => [...waypointMilestones.value]
   .reverse()
   .find((event) => event.event_type === 'task.target_dispatched') || null)
+const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
+  execution.value,
+  trajectory.value,
+  mapData.value?.id,
+))
 const currentExecutionDistance = computed(() => calculateTrajectoryDistance(trajectory.value))
 const currentMovementSpeed = computed(() => calculateCurrentSpeed(trajectory.value))
 const displayedTotalDistance = computed(() => {
@@ -207,6 +218,14 @@ const localizationInitLabel = computed(() => ({
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function createLoopSessionId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID()
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (token) => {
+    const value = Math.floor(Math.random() * 16)
+    return (token === 'x' ? value : ((value & 0x3) | 0x8)).toString(16)
+  })
 }
 
 function navigationReady(payload = navigationStatus.value) {
@@ -337,15 +356,27 @@ function polylinePoints(points) {
 }
 
 function robotPoint() {
-  const status = navigationStatus.value?.status
-  const mapId = status?.map_id || navigationStatus.value?.current_map_id
-  if (!status || status.localization_status !== 'normal' || String(mapId || '') !== String(mapData.value?.id || '')) return null
-  if (status.x === null || status.x === undefined || status.y === null || status.y === undefined) return null
-  return { x: Number(status.x), y: Number(status.y), yaw: Number(status.yaw || 0) }
+  return currentRobotMapPose(navigationStatus.value, mapData.value?.id, localizationLossMarkers.value)
 }
 
 function robotHeadingStyle() {
   return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(robotPoint()?.yaw || 0)}rad)` }
+}
+
+function robotMarkerTitle() {
+  const point = robotPoint()
+  if (!point) return '暂无定位'
+  return `${point.trusted ? '机器狗当前定位' : '机器狗最新上报位置（定位不可信）'}\nx=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}, yaw=${Number(point.yaw || 0).toFixed(3)}`
+}
+
+function lossHeadingStyle(point) {
+  return { transform: `translate(-50%, -50%) rotate(${Math.PI / 2 - Number(point?.yaw || 0)}rad)` }
+}
+
+function lossMarkerTitle(point) {
+  const score = Number(point.quality?.matching_error)
+  const target = point.waypoint?.map_point_number || (Number.isFinite(Number(point.waypointIndex)) ? Number(point.waypointIndex) + 1 : '—')
+  return `第 ${point.sequence} 次定位丢失\n最后可信位置 x=${Number(point.x).toFixed(2)}, y=${Number(point.y).toFixed(2)}\n目标 ${target}号点 · NDT ${Number.isFinite(score) ? score.toFixed(3) : '—'}\n${localizationRecoveryLabel(point.recoveryState)}\n${formatTime(point.occurredAt)}`
 }
 
 function waypointClass(index) {
@@ -557,7 +588,10 @@ async function refreshExecution() {
   if (!execution.value?.id) return
   try {
     execution.value = await fetchTaskExecution(execution.value.id)
-    await refreshExecutionVisual()
+    await Promise.all([
+      refreshExecutionVisual(),
+      refreshLocalizationStatus(),
+    ])
     if (!isRunning.value) {
       window.clearInterval(executionTimer)
       executionTimer = null
@@ -582,6 +616,7 @@ function persistLoopState() {
     stoppedAt: loopStoppedAt.value,
     restUntil: loopRestUntil.value,
     rounds: loopRounds.value,
+    sessionId: loopSessionId.value,
     accumulatedDistance: loopAccumulatedDistance.value,
     countedExecutionIds: loopCountedExecutionIds.value,
     currentExecutionId: loopCurrentExecutionId.value,
@@ -601,6 +636,7 @@ function restoreLoopState(robotId) {
     loopStoppedAt.value = Number(saved.stoppedAt || 0)
     loopRestUntil.value = Number(saved.restUntil || 0)
     loopRounds.value = Number(saved.rounds || 0)
+    loopSessionId.value = String(saved.sessionId || '')
     loopAccumulatedDistance.value = Number(saved.accumulatedDistance || 0)
     loopCountedExecutionIds.value = Array.isArray(saved.countedExecutionIds) ? saved.countedExecutionIds.map(String) : []
     loopCurrentExecutionId.value = String(saved.currentExecutionId || '')
@@ -648,11 +684,17 @@ async function launchTask({ fromLoop = false } = {}) {
   }
   busy.value = true
   try {
-    execution.value = await executePatrolTask(presetTask.value.id, { loopExecution: fromLoop })
+    const requestedRound = fromLoop ? loopRounds.value + 1 : 1
+    execution.value = await executePatrolTask(presetTask.value.id, {
+      loopExecution: fromLoop,
+      loopSessionId: fromLoop ? loopSessionId.value : null,
+      roundNumber: requestedRound,
+    })
     trajectory.value = []
     trajectoryExecutionId.value = String(execution.value.id)
     if (fromLoop) {
-      loopRounds.value += 1
+      loopRounds.value = Number(execution.value.round_number || requestedRound)
+      loopSessionId.value = String(execution.value.loop_session_id || loopSessionId.value)
       loopCurrentExecutionId.value = String(execution.value.id)
       loopState.value = 'running'
       loopMessage.value = `第 ${loopRounds.value} 轮巡检执行中`
@@ -662,6 +704,7 @@ async function launchTask({ fromLoop = false } = {}) {
       loopEndsAt.value = 0
       loopStoppedAt.value = 0
       loopRounds.value = 0
+      loopSessionId.value = ''
       loopAccumulatedDistance.value = 0
       loopCountedExecutionIds.value = []
       loopCurrentExecutionId.value = ''
@@ -773,6 +816,7 @@ async function toggleLoop() {
   loopStoppedAt.value = 0
   loopRestUntil.value = 0
   loopRounds.value = 0
+  loopSessionId.value = createLoopSessionId()
   loopAccumulatedDistance.value = 0
   loopCountedExecutionIds.value = []
   loopCurrentExecutionId.value = ''
@@ -1438,7 +1482,7 @@ watch(playUrlKey, () => {
                 <span class="guard-eyebrow">当前地图</span>
                 <h2>{{ mapData?.name || execution?.map_name || '地图预览' }}</h2>
               </div>
-              <small>{{ trajectory.length }} 个轨迹点</small>
+              <small>{{ trajectory.length }} 个轨迹点 · {{ robotPoint() ? `x ${Number(robotPoint().x).toFixed(2)} / y ${Number(robotPoint().y).toFixed(2)}` : '暂无定位' }}</small>
             </div>
             <div class="guard-map-stage">
               <div v-if="!mapData?.thumbnail_url" class="guard-map-empty">当前地图暂无缩略图</div>
@@ -1456,13 +1500,23 @@ watch(playUrlKey, () => {
                     :class="waypointClass(index)"
                     :style="displayPosition(point)"
                   >{{ point.map_point_number ?? point.sequence + 1 }}</span>
-                  <div v-if="robotPoint() && displayPosition(robotPoint())" class="guard-map-robot" :style="displayPosition(robotPoint())">
+                  <div
+                    v-for="point in localizationLossMarkers"
+                    :key="`guard-loss-${point.eventId}`"
+                    class="guard-localization-loss"
+                    :style="displayPosition(point)"
+                    :title="lossMarkerTitle(point)"
+                  >
+                    <i :style="lossHeadingStyle(point)"></i><small>{{ point.sequence }}</small>
+                  </div>
+                  <div v-if="robotPoint() && displayPosition(robotPoint())" class="guard-map-robot" :class="{ untrusted: !robotPoint()?.trusted }" :style="displayPosition(robotPoint())" :title="robotMarkerTitle()">
                     <i :style="robotHeadingStyle()"></i>
+                    <small>{{ robotPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
                   </div>
                 </div>
               </div>
             </div>
-            <div class="guard-map-legend"><span class="route">规划路线</span><span class="track">实际轨迹</span><span class="robot">机器狗</span></div>
+            <div class="guard-map-legend"><span class="route">规划路线</span><span class="track">实际轨迹</span><span class="robot">机器狗</span><span class="loss">定位丢失点 {{ localizationLossMarkers.length }}</span></div>
             <section class="guard-route-log">
               <div class="guard-route-summary">
                 <div><span>本次轮次</span><strong>第 {{ currentExecutionRound || 1 }} 轮</strong></div>
@@ -1615,10 +1669,19 @@ watch(playUrlKey, () => {
 .guard-map-robot { position: absolute; z-index: 5; width: 28px; height: 28px; transform: translate(-50%, -50%); }
 .guard-map-robot::before { content: ''; position: absolute; inset: 3px; border: 3px solid #fff; border-radius: 50%; background: #ec4a3f; box-shadow: 0 2px 8px rgba(236, 74, 63, .5); }
 .guard-map-robot i { position: absolute; left: 50%; top: 50%; z-index: 6; width: 0; height: 0; border-right: 5px solid transparent; border-bottom: 14px solid #8f2019; border-left: 5px solid transparent; transform-origin: 50% 70%; }
+.guard-map-robot > small { position: absolute; top: 28px; left: 50%; min-width: max-content; padding: 2px 5px; color: #fff; background: #8f2019; font-size: 9px; transform: translateX(-50%); }
+.guard-map-robot.untrusted::before { border-style: dashed; background: #f59e0b; box-shadow: 0 0 0 4px rgba(220, 38, 38, .28); }
+.guard-map-robot.untrusted i { border-bottom-color: #b45309; }
+.guard-map-robot.untrusted > small { background: #b45309; }
+.guard-localization-loss { position: absolute; z-index: 7; width: 28px; height: 28px; transform: translate(-50%, -50%); }
+.guard-localization-loss::before { content: ''; position: absolute; inset: 6px; border: 3px solid #fff; border-radius: 50%; background: #dc2626; box-shadow: 0 0 0 3px rgba(220, 38, 38, .28); }
+.guard-localization-loss i { position: absolute; left: 50%; top: 50%; z-index: 2; width: 0; height: 0; border-right: 5px solid transparent; border-bottom: 15px solid #7f1d1d; border-left: 5px solid transparent; transform-origin: 50% 100%; }
+.guard-localization-loss small { position: absolute; top: 26px; left: 50%; min-width: 16px; padding: 1px 3px; color: #fff; background: #991b1b; font-size: 9px; text-align: center; transform: translateX(-50%); }
 .guard-map-legend { display: flex; flex-wrap: wrap; gap: 14px; padding-top: 10px; color: #657681; font-size: 11px; }
 .guard-map-legend span::before { content: ''; display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; background: #2563eb; }
 .guard-map-legend .track::before { background: #10b981; }
 .guard-map-legend .robot::before { width: 8px; height: 8px; border-radius: 50%; background: #ec4a3f; }
+.guard-map-legend .loss::before { width: 8px; height: 8px; border-radius: 50%; background: #dc2626; }
 .guard-route-log { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #dde5e9; }
 .guard-route-summary { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; }
 .guard-route-summary > div { display: grid; gap: 2px; min-width: 0; }

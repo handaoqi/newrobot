@@ -464,7 +464,10 @@ class EdgeAgentApplication:
     def _handle_task_localization_loss(self) -> None:
         """Pause a task, then reseed a fresh localization node from its last good pose."""
         self.task_executor.on_localization_lost()
-        if self.task_executor.has_active_task() and not self.task_executor.is_paused_for_localization():
+        if (
+            not self.task_executor.has_active_task()
+            or not self.task_executor.is_paused_for_localization()
+        ):
             return
         if not self._localization_recovery_lock.acquire(blocking=False):
             return
@@ -476,50 +479,61 @@ class EdgeAgentApplication:
 
     def _recover_task_localization(self) -> None:
         try:
-            pose = self.navigation.latest_trusted_pose()
-            if not pose:
-                pose = self.store.load_last_trusted_pose(
-                    str(self.config.robot.current_map_id or ""),
-                    str(self.config.robot.current_map_version or ""),
-                )
-            if not pose:
-                LOGGER.error("task localization recovery skipped: no trusted pose is available")
-                return
-            LOGGER.warning(
-                "task localization lost; restarting localization from trusted pose x=%.3f y=%.3f yaw=%.3f",
-                float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
-            )
             attempts = max(1, int(self.config.safety.localization_recovery_attempts))
-            last_error = None
-            for attempt in range(1, attempts + 1):
-                try:
-                    if attempt == 1:
-                        self.navigation_stack_adapter.restart_localization()
-                    self.navigation.set_initial_pose({
-                        **pose,
-                        "frame_id": "map",
-                        "wait_seconds": 30.0,
-                        "required_normal_samples": 3,
-                        "require_absolute": True,
-                    })
-                    LOGGER.info("localization recovery accepted on attempt %d/%d", attempt, attempts)
-                    return
-                except Exception as exc:
-                    last_error = exc
-                    LOGGER.warning(
-                        "localization recovery attempt %d/%d failed: %s",
-                        attempt,
-                        attempts,
-                        exc,
+            quick_retry = max(0.5, self.config.safety.localization_recovery_retry_seconds)
+            cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
+            first_cycle = True
+            while first_cycle or self.task_executor.is_paused_for_localization():
+                first_cycle = False
+                pose = self.navigation.latest_trusted_pose()
+                if not pose:
+                    pose = self.store.load_last_trusted_pose(
+                        str(self.config.robot.current_map_id or ""),
+                        str(self.config.robot.current_map_version or ""),
                     )
-                    if attempt < attempts:
-                        time.sleep(max(0.5, self.config.safety.localization_recovery_retry_seconds))
-            if last_error:
-                raise last_error
+                if not pose:
+                    LOGGER.error(
+                        "localization recovery has no trusted pose; retrying in %.1fs",
+                        cycle_retry,
+                    )
+                else:
+                    LOGGER.warning(
+                        "localization lost; recovering from trusted pose x=%.3f y=%.3f yaw=%.3f",
+                        float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
+                    )
+                    for attempt in range(1, attempts + 1):
+                        if not self.task_executor.is_paused_for_localization():
+                            return
+                        try:
+                            if attempt == 1:
+                                self.navigation_stack_adapter.restart_localization()
+                            self.navigation.set_initial_pose({
+                                **pose,
+                                "frame_id": "map",
+                                "wait_seconds": 30.0,
+                                "required_normal_samples": 3,
+                                "require_absolute": True,
+                            })
+                            LOGGER.info("localization recovery accepted on attempt %d/%d", attempt, attempts)
+                            return
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "localization recovery attempt %d/%d failed: %s",
+                                attempt,
+                                attempts,
+                                exc,
+                            )
+                            if attempt < attempts:
+                                time.sleep(quick_retry)
+                if not self.task_executor.is_paused_for_localization():
+                    return
+                LOGGER.warning(
+                    "localization recovery cycle exhausted; task remains stopped and will retry in %.1fs",
+                    cycle_retry,
+                )
+                time.sleep(cycle_retry)
         except Exception:
-            # The task remains in its safety-paused state. A later normal
-            # sample must never resume it unless a recovery actually succeeds.
-            LOGGER.exception("task localization recovery failed; task remains paused")
+            LOGGER.exception("task localization recovery worker failed; task remains paused")
         finally:
             self._localization_recovery_lock.release()
 

@@ -623,6 +623,11 @@ class MapData(BaseTimestampModel):
         verbose_name="来源地图",
     )
     edit_metadata = models.JSONField(default=dict, blank=True, verbose_name="地图编辑记录")
+    coordinate_mode = models.CharField(max_length=32, blank=True, verbose_name="坐标模式")
+    scene_scope = models.CharField(max_length=32, blank=True, verbose_name="场景范围")
+    localization_mode = models.CharField(max_length=32, blank=True, verbose_name="定位模式")
+    origin_status = models.CharField(max_length=32, blank=True, verbose_name="原点状态")
+    map_completeness = models.CharField(max_length=32, blank=True, verbose_name="地图完整度")
 
     class Meta:
         verbose_name = "地图数据"
@@ -670,6 +675,7 @@ class PatrolRoute(BaseTimestampModel):
     waypoints = models.JSONField(default=list, verbose_name="途经点坐标数组")  # [[x1,y1],[x2,y2],...]
     waypoint_names = models.JSONField(default=list, verbose_name="途经点名称数组")
     description = models.TextField(blank=True, verbose_name="路线描述")
+    scene_scope = models.CharField(max_length=32, blank=True, default="indoor", verbose_name="场景范围")
 
     class Meta:
         verbose_name = "巡逻路线"
@@ -803,6 +809,8 @@ class TaskExecution(BaseTimestampModel):
     route = models.ForeignKey(PatrolRoute, related_name="executions", on_delete=models.SET_NULL, null=True, blank=True)
     map_data = models.ForeignKey(MapData, related_name="task_executions", on_delete=models.SET_NULL, null=True, blank=True)
     route_snapshot = models.JSONField(default=dict)
+    loop_session_id = models.UUIDField(null=True, blank=True, db_index=True)
+    round_number = models.PositiveIntegerField(default=1)
     state = models.CharField(max_length=24, choices=STATE_CHOICES, default="created")
     state_version = models.BigIntegerField(default=0)
     current_waypoint_index = models.PositiveIntegerField(null=True, blank=True)
@@ -920,8 +928,12 @@ class RemoteCommand(BaseTimestampModel):
         ("teleop.move_stop", "停止移动"),
         ("teleop.passive", "软急停"),
         ("teleop.skill", "执行遥控技能"),
+        ("teleop.skill_list", "列出遥控技能"),
         ("teleop.skill_status", "查询遥控技能"),
         ("teleop.skill_cancel", "取消遥控技能"),
+        ("teleop.person_follow_start", "启动人员跟随"),
+        ("teleop.person_follow_stop", "停止人员跟随"),
+        ("teleop.person_follow_status", "查询人员跟随"),
     ]
     STATUS_CHOICES = [
         ("created", "已创建"),
@@ -1107,6 +1119,23 @@ class DevelopmentAgentState(BaseTimestampModel):
     last_seen_at = models.DateTimeField(default=timezone.now)
 
 
+class DevelopmentConversationState(BaseTimestampModel):
+    MODE_CHOICES = [
+        ("execute", "执行模式"),
+        ("plan", "规划对话模式"),
+    ]
+
+    robot = models.OneToOneField(
+        Robot,
+        related_name="development_conversation_state",
+        primary_key=True,
+        on_delete=models.CASCADE,
+    )
+    mode = models.CharField(max_length=16, choices=MODE_CHOICES, default="execute")
+    workspace = models.CharField(max_length=64, default="robot-main")
+    model = models.CharField(max_length=64, default="gpt-5.6-terra")
+
+
 class DevelopmentTask(BaseTimestampModel):
     STATUS_CHOICES = [
         ("created", "待下发"),
@@ -1126,6 +1155,11 @@ class DevelopmentTask(BaseTimestampModel):
     robot = models.ForeignKey(Robot, related_name="development_tasks", on_delete=models.PROTECT)
     workspace = models.CharField(max_length=64)
     model = models.CharField(max_length=64, default="gpt-5.6-terra")
+    execution_mode = models.CharField(
+        max_length=16,
+        choices=[("plan", "规划对话"), ("execute", "执行任务")],
+        default="execute",
+    )
     prompt = models.TextField()
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="created")
     operator = models.ForeignKey(

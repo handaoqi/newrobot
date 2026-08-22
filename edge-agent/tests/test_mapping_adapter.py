@@ -1,4 +1,5 @@
 import json
+import math
 import subprocess
 import time
 import zipfile
@@ -18,6 +19,8 @@ class RunningProcess:
 
 def make_adapter(tmp_path, **overrides):
     overrides.setdefault("rosbag_script", str(tmp_path / "missing-rosbag-script"))
+    overrides.setdefault("mapping_unit", "")
+    overrides.setdefault("navigation_script", str(tmp_path / "missing-nav-script"))
     config = MappingConfig(map_dir=str(tmp_path), **overrides)
     media = SimpleNamespace(robot_id="test-dog")
     return MappingAdapter(config, media)
@@ -153,8 +156,45 @@ def test_map_package_contains_lightweight_slam_and_rtk_trace(tmp_path, monkeypat
     with zipfile.ZipFile(package) as archive:
         trace = json.loads(archive.read("mapping_trace.json"))
     assert "mapping_trace.json" in metadata["files"]
-    assert trace["samples"][0]["slam"] == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    assert trace["samples"][0]["slam"]["x"] == 1.0
+    assert trace["samples"][0]["slam"]["y"] == 2.0
+    assert trace["samples"][0]["slam"]["yaw"] == 0.5
     assert trace["samples"][0]["rtk"]["yaw"] == pytest.approx(0.0)
+
+
+def test_heading_locked_origin_writes_rtk_map_pose(tmp_path, monkeypatch):
+    session = tmp_path / "20260821_170000_001"
+    keyframes = session / "keyframes"
+    keyframes.mkdir(parents=True)
+    heading_deg = 223.17
+    slam_yaw = 0.0
+    yaw_enu = math.pi / 2.0 - math.radians(heading_deg)
+    alignment_yaw = math.atan2(math.sin(slam_yaw - yaw_enu), math.cos(slam_yaw - yaw_enu))
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "map.txt").write_text("0 0 0\n")
+    (session / "gnss_origin.yaml").write_text(
+        "origin_latitude: 39.9714186649\norigin_longitude: 116.4483795514\n"
+        f"alignment_locked: 1\nenu_to_map_yaw: {alignment_yaw}\n"
+        "map_offset_x: 0.0\nmap_offset_y: 0.0\n"
+    )
+    (keyframes / "keyframes.csv").write_text(
+        "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,"
+        "rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,rtk_heading_age_seconds\n"
+        f"0,100.0,-0.0154,-0.0447,0.04,{slam_yaw},10,1,2,39.9714186649,116.4483795514,39.7,0.03,0.08,1,{heading_deg},2.4,0.09\n"
+    )
+    adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
+    monkeypatch.setattr(adapter, "_generate_map_preview", lambda _base: None)
+
+    package, _metadata = adapter._package_map({}, session)
+
+    with zipfile.ZipFile(package) as archive:
+        trace = json.loads(archive.read("mapping_trace.json"))
+    sample = trace["samples"][0]
+    assert trace["alignment_locked"] is True
+    assert sample["rtk"]["x"] == pytest.approx(0.0, abs=0.02)
+    assert sample["rtk"]["y"] == pytest.approx(0.0, abs=0.02)
+    assert sample["rtk"]["yaw"] == pytest.approx(slam_yaw, abs=1e-4)
 
 
 def test_finds_newest_incomplete_recoverable_session(tmp_path):
@@ -324,3 +364,91 @@ def test_diverged_session_is_not_recovered_or_packaged(tmp_path):
     with pytest.raises(ProtocolError) as error:
         adapter._validate_map_files(session)
     assert error.value.code == "SLAM_DIVERGED"
+
+
+def test_stop_nav_uses_configured_script(tmp_path, monkeypatch):
+    script = tmp_path / "start_navigation_real.sh"
+    script.write_text("#!/bin/bash\nexit 0\n")
+    script.chmod(0o755)
+    adapter = make_adapter(tmp_path, navigation_script=str(script))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("roamerx_edge.mapping_adapter.subprocess.run", fake_run)
+    adapter._stop_conflicting_navigation_stack()
+    assert calls[0][:2] == [str(script), "full-stop"]
+
+
+def test_ensure_slam_starts_systemd_unit(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path, mapping_unit="roamerx-mapping.service")
+    calls = []
+    active = {"value": False}
+
+    def fake_systemctl(action):
+        calls.append(action)
+        if action == "start":
+            active["value"] = True
+        return {}
+
+    monkeypatch.setattr(adapter, "_systemctl", fake_systemctl)
+    monkeypatch.setattr(adapter, "_is_mapping_unit_active", lambda: active["value"])
+    monkeypatch.setattr(adapter, "_wait_for_slam_services", lambda: calls.append("wait"))
+    adapter._ensure_slam_process()
+    assert calls == ["start", "wait"]
+
+
+def test_wait_until_ready_for_motion(tmp_path):
+    active = tmp_path / "20260717_140000_001"
+    active.mkdir()
+    (active / "save_progress.json").write_text(
+        json.dumps(
+            {
+                "stage": "mapping",
+                "keyframe_count": 1,
+                "written_keyframes": 1,
+                "updated_at_unix": time.time(),
+                "slam_health": {"state": "healthy", "imu_initialized": True},
+            }
+        )
+    )
+    adapter = make_adapter(tmp_path)
+    adapter._slam_process = RunningProcess()
+    status = adapter.wait_until_ready_for_motion(timeout_seconds=1)
+    assert status["ready_for_motion"] is True
+
+
+def test_local_save_skips_upload_and_keeps_process(tmp_path, monkeypatch):
+    session = tmp_path / "20260717_150000_001"
+    session.mkdir()
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "save_progress.json").write_text(
+        json.dumps(
+            {
+                "stage": "mapping",
+                "keyframe_count": 2,
+                "written_keyframes": 2,
+                "updated_at_unix": time.time(),
+                "slam_health": {"state": "healthy", "imu_initialized": True},
+            }
+        )
+    )
+    adapter = make_adapter(tmp_path)
+    adapter._slam_process = RunningProcess()
+    adapter.session = MappingSession("session", "map", "", "mapping", "now", "now")
+    adapter.media_client = SimpleNamespace(
+        upload_map_package=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("upload"))
+    )
+    monkeypatch.setattr(adapter, "_call_map_state", lambda data: "ok")
+    monkeypatch.setattr(adapter, "_wait_for_complete_map_dir", lambda *_args, **_kwargs: session)
+    monkeypatch.setattr(
+        adapter,
+        "_stop_slam_process",
+        lambda: (_ for _ in ()).throw(AssertionError("stop")),
+    )
+    result = adapter._save_active_mapping({"upload": False, "package": False, "stop_process": False})
+    assert adapter.session.state == "saving"
+    assert "upload_result" not in result

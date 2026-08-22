@@ -22,5 +22,10 @@ case "${1:-status}" in
   verify)
     "$(dirname "$0")/../scripts/verify-runtime.sh"
     ;;
-  *) echo "Usage: $0 {status|start|stop|restart|verify}" >&2; exit 2 ;;
+  init-db)
+    cd /home/dogrobot/edge-agent
+    exec python3 -m roamerx_edge.init_db \
+      --config "${EDGE_CONFIG:-/home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml}"
+    ;;
+  *) echo "Usage: $0 {status|start|stop|restart|verify|init-db}" >&2; exit 2 ;;
 esac

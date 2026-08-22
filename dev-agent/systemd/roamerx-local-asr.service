@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=robot
+User=dogrobot
 Group=robot
-Environment=HOME=/home/robot
+Environment=HOME=/home/dogrobot
 Environment=MODELSCOPE_CACHE=/home/dogrobot/runtime/nx-edge/data/voice/models
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/dogrobot/runtime/nx-edge/data/voice/venv/bin/python3 /home/dogrobot/runtime/nx-edge/data/voice/venv/bin/funasr-server --host 127.0.0.1 --port 18080 --device cuda:0 --model sensevoice --model-path /home/dogrobot/runtime/nx-edge/data/voice/models/models/iic--SenseVoiceSmall/snapshots/master

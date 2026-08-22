@@ -2,11 +2,16 @@
 
 [返回文档中心](./project-docs-index.md)
 
+三端数据架构以
+[`docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md`](../../docs/architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md)
+为准；建库步骤见
+[`docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md`](../../docs/operation-manual/DATABASE_INITIALIZATION_MANUAL.md)。本文补充平台业务字段。
+
 ## 1. 存储组成
 
 | 类型 | 位置 | 说明 |
 | --- | --- | --- |
-| 业务数据库 | `backend/db.sqlite3` | Django SQLite 数据库，保存用户、Token、机器人、任务、事件、遥测、媒体元数据 |
+| 业务数据库 | `SQLITE_DB_PATH` 或 PostgreSQL 环境变量 | 当前生产为 `/opt/roamerx/shared/db.sqlite3`；Docker 默认为 `runtime/platform/data/backend/db/db.sqlite3` |
 | 迁移文件 | `backend/monitoring/migrations/` | 业务表结构版本 |
 | 媒体文件 | `backend/media/` | 板端上传的抓拍图/视频片段，以及后端生成的标注图 |
 | 前端静态资源 | `frontend/public/`、`frontend/src/` | 演示图片、样式、Vue 组件 |
@@ -133,7 +138,7 @@ erDiagram
 
 写入来源：
 
-- 登录或页面接口触发的 `ensure_demo_seed()` 会创建演示机器人。
+- 仅 `ENABLE_DEMO_SEED=true` 或显式使用 `--with-demo-data` 时创建演示机器人。
 - `POST /api/telemetry/ingest/` 会按 `robot_code` 创建或更新机器人。
 
 ## 4. PatrolTask 巡检任务表
@@ -255,19 +260,27 @@ backend/media/device-media/YYYY/MM/DD/<filename>
 4. 后端保存文件并返回 `url`。
 5. 板端把返回的 `url` 写入 detection 的 `snapshot_url`，再随遥测上报。
 
-## 8. 演示数据初始化
+## 8. 基础配置与演示数据
+
+正式初始化使用：
+
+```bash
+python manage.py migrate --noinput
+PLATFORM_OPERATOR_PASSWORD='<strong-password>' python manage.py initialize_platform
+```
+
+它创建基础播报/告警配置、操作员和机器人，但不创建伪地图、伪路线和伪任务。
 
 函数：`backend/monitoring/views.py` 中的 `ensure_demo_seed()`。
 
 触发时机：
 
-- 登录。
-- 获取监测中心、机器人列表、事件列表、任务列表等接口时。
-- 遥测上报时。
+- `ENABLE_DEMO_SEED=true` 时，登录及部分演示接口访问。
+- 显式执行 `python manage.py initialize_platform --with-demo-data`。
 
 初始化内容：
 
-- 用户：`operator / admin123456`。
+- 用户：仅演示环境使用的 `operator`；禁止在生产沿用演示密码。
 - 机器人：`ZSL-1A-07`，默认在线，位置为太阳宫公园南入口。
 - 任务：`公园主通道早间巡检`。
 - 默认视频流：`dog_ZSL-1A-07_front`。

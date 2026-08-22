@@ -1,5 +1,6 @@
-#! /bin/bash
-#source 目录需确定
-PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source $PACKAGE_DIR/install/setup.bash
-ros2 launch robot_slam slam.launch.py
+#!/bin/bash
+# Deprecated on the real robot. slam.launch.py can start RViz and is not the
+# NX mapping entrypoint.
+echo "Do not run this on the NX robot." >&2
+echo "Use: /home/dogrobot/robot/script/robot/start_mapping_real.sh start" >&2
+exit 2

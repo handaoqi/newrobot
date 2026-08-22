@@ -16,11 +16,13 @@ It is not the center platform and does not expose a public business HTTP server.
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
-python3 run_edge_agent.py --config config.yaml
+source /home/dogrobot/robot/install/setup.bash
+python3 run_edge_agent.py --config /home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 ```
 
 Recommended production deployment uses `systemd/roamerx-edge-agent.service`.
+
+On-robot mapping is owned by `MappingAdapter` and `roamerx-mapping.service`. Local operators should call `/home/dogrobot/robot/script/robot/start_mapping_real.sh` rather than launching `robot_slam` directly.
 
 ## P0 ROS interfaces
 

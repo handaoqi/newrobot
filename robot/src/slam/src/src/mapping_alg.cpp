@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <sys/statvfs.h>
 #include <unordered_set>
+#include <Eigen/Geometry>
 
 namespace robot::slam
 {
@@ -78,6 +79,37 @@ namespace robot::slam
                 }
             }
             return escaped.str();
+        }
+
+        Eigen::Quaterniond normalizedXyzw(double x, double y, double z, double w)
+        {
+            Eigen::Quaterniond quaternion(w, x, y, z);
+            const double norm = quaternion.norm();
+            if (norm > 1e-12)
+                quaternion.coeffs() /= norm;
+            else
+                quaternion = Eigen::Quaterniond::Identity();
+            return quaternion;
+        }
+
+        Eigen::Quaterniond rotationToXyzw(const Mat3d& rotation)
+        {
+            const Eigen::Quaterniond quaternion(rotation);
+            return normalizedXyzw(quaternion.x(), quaternion.y(), quaternion.z(), quaternion.w());
+        }
+
+        Eigen::Isometry3d optimizedLidarPose(const MappingKeyframe& keyframe,
+            const gtsam::Pose3& optimized_imu_pose)
+        {
+            const Eigen::Isometry3d raw_imu = Eigen::Translation3d(keyframe.world_origin)
+                * normalizedXyzw(keyframe.world_qx, keyframe.world_qy, keyframe.world_qz, keyframe.world_qw);
+            const Eigen::Isometry3d raw_lidar = Eigen::Translation3d(keyframe.lidar_origin)
+                * normalizedXyzw(keyframe.lidar_qx, keyframe.lidar_qy, keyframe.lidar_qz, keyframe.lidar_qw);
+            const auto q = optimized_imu_pose.rotation().toQuaternion();
+            const Eigen::Isometry3d optimized_imu = Eigen::Translation3d(
+                optimized_imu_pose.x(), optimized_imu_pose.y(), optimized_imu_pose.z())
+                * Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+            return optimized_imu * raw_imu.inverse() * raw_lidar;
         }
 
         std::uint64_t residentSetBytes()
@@ -202,6 +234,8 @@ namespace robot::slam
         this->declare_parameter<double>("gnss_fusion.alignment_max_rms", 1.5);
         this->declare_parameter<double>("gnss_fusion.alignment_max_yaw_change_deg", 3.0);
         this->declare_parameter<int>("gnss_fusion.alignment_required_fits", 3);
+        this->declare_parameter<bool>("gnss_fusion.use_heading", true);
+        this->declare_parameter<double>("gnss_fusion.heading_offset_deg", 0.0);
         this->declare_parameter<double>("gnss_fusion.heading_min_baseline_m", 0.20);
         this->declare_parameter<double>("gnss_fusion.heading_max_std_deg", 5.0);
         this->declare_parameter<double>("gnss_fusion.heading_max_age", 1.5);
@@ -241,6 +275,19 @@ namespace robot::slam
         this->declare_parameter<double>("keyframe_record.max_interval_s", 2.0);
         this->declare_parameter<double>("keyframe_record.voxel_size_m", 0.25);
         this->declare_parameter<int>("keyframe_record.max_queue_size", 8);
+        this->declare_parameter<bool>("global_optimization.enable", true);
+        this->declare_parameter<int>("global_optimization.max_iterations", 80);
+        this->declare_parameter<double>("global_optimization.prior_translation_sigma", 0.01);
+        this->declare_parameter<double>("global_optimization.prior_rotation_sigma_rad", 0.01);
+        this->declare_parameter<double>("global_optimization.ndt_translation_sigma", 0.15);
+        this->declare_parameter<double>("global_optimization.ndt_rotation_sigma_rad", 0.08);
+        this->declare_parameter<double>("global_optimization.imu_translation_sigma", 0.20);
+        this->declare_parameter<double>("global_optimization.imu_rotation_sigma_rad", 0.12);
+        this->declare_parameter<double>("global_optimization.rtk_position_sigma_floor", 0.20);
+        this->declare_parameter<double>("global_optimization.rtk_heading_sigma_floor_rad", 0.035);
+        this->declare_parameter<double>("global_optimization.loop_translation_sigma", 0.10);
+        this->declare_parameter<double>("global_optimization.loop_rotation_sigma_rad", 0.08);
+        this->declare_parameter<double>("global_optimization.robust_huber_k", 1.345);
         this->declare_parameter<string>("storage.data_path", "");
 
         this->get_parameter_or<string>("pcd2pgm.file_name", pcd2pgm_options_.file_name, "map");
@@ -272,6 +319,20 @@ namespace robot::slam
         int keyframe_max_queue_size = 8;
         this->get_parameter_or<int>("keyframe_record.max_queue_size", keyframe_max_queue_size, 8);
         keyframe_max_queue_size_ = static_cast<std::size_t>(std::max(1, keyframe_max_queue_size));
+        this->get_parameter_or<bool>("global_optimization.enable", global_factor_graph_config_.enable, true);
+        this->get_parameter_or<int>("global_optimization.max_iterations", global_factor_graph_config_.max_iterations, 80);
+        this->get_parameter_or<double>("global_optimization.prior_translation_sigma", global_factor_graph_config_.prior_translation_sigma, 0.01);
+        this->get_parameter_or<double>("global_optimization.prior_rotation_sigma_rad", global_factor_graph_config_.prior_rotation_sigma_rad, 0.01);
+        this->get_parameter_or<double>("global_optimization.ndt_translation_sigma", global_factor_graph_config_.ndt_translation_sigma, 0.15);
+        this->get_parameter_or<double>("global_optimization.ndt_rotation_sigma_rad", global_factor_graph_config_.ndt_rotation_sigma_rad, 0.08);
+        this->get_parameter_or<double>("global_optimization.imu_translation_sigma", global_factor_graph_config_.imu_translation_sigma, 0.20);
+        this->get_parameter_or<double>("global_optimization.imu_rotation_sigma_rad", global_factor_graph_config_.imu_rotation_sigma_rad, 0.12);
+        this->get_parameter_or<double>("global_optimization.rtk_position_sigma_floor", global_factor_graph_config_.rtk_position_sigma_floor, 0.20);
+        this->get_parameter_or<double>("global_optimization.rtk_heading_sigma_floor_rad", global_factor_graph_config_.rtk_heading_sigma_floor_rad, 0.035);
+        this->get_parameter_or<double>("global_optimization.loop_translation_sigma", global_factor_graph_config_.loop_translation_sigma, 0.10);
+        this->get_parameter_or<double>("global_optimization.loop_rotation_sigma_rad", global_factor_graph_config_.loop_rotation_sigma_rad, 0.08);
+        this->get_parameter_or<double>("global_optimization.robust_huber_k", global_factor_graph_config_.robust_huber_k, 1.345);
+        global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
         std::string configured_data_path;
         this->get_parameter_or<string>("storage.data_path", configured_data_path, "");
 
@@ -332,6 +393,10 @@ namespace robot::slam
         this->get_parameter_or<double>("gnss_fusion.alignment_max_yaw_change_deg", gnss_alignment_yaw_change_deg, 3.0);
         gnss_alignment_max_yaw_change_rad_ = gnss_alignment_yaw_change_deg * M_PI / 180.0;
         this->get_parameter_or<int>("gnss_fusion.alignment_required_fits", gnss_alignment_required_fits_, 3);
+        this->get_parameter_or<bool>("gnss_fusion.use_heading", gnss_use_heading_, true);
+        double gnss_heading_offset_deg = 0.0;
+        this->get_parameter_or<double>("gnss_fusion.heading_offset_deg", gnss_heading_offset_deg, 0.0);
+        gnss_heading_offset_rad_ = gnss_heading_offset_deg * M_PI / 180.0;
         this->get_parameter_or<double>("gnss_fusion.heading_min_baseline_m", gnss_heading_min_baseline_m_, 0.20);
         this->get_parameter_or<double>("gnss_fusion.heading_max_std_deg", gnss_heading_max_std_deg_, 5.0);
         this->get_parameter_or<double>("gnss_fusion.heading_max_age", gnss_heading_max_age_s_, 1.5);
@@ -410,8 +475,9 @@ namespace robot::slam
                 odom_guard_topic, rclcpp::QoS(100).best_effort(),
                 std::bind(&MappingAlg::odomGuardCallBack, this, std::placeholders::_1));
         }
-        RCLCPP_INFO(this->get_logger(), "GNSS collection enabled on %s; pose correction=%s", gnss_topic.c_str(),
-            use_gnss_fusion_ ? "enabled after alignment lock" : "disabled");
+        RCLCPP_INFO(this->get_logger(), "GNSS collection enabled on %s; pose correction=%s heading_lock=%s", gnss_topic.c_str(),
+            use_gnss_fusion_ ? "enabled after alignment lock" : "disabled",
+            gnss_use_heading_ ? "enabled" : "disabled");
         RCLCPP_INFO(this->get_logger(), "Odometry replay guard=%s topic=%s", odom_guard_enable_ ? "enabled" : "disabled",
             odom_guard_topic.c_str());
         pubLaserCloudFull_      = this->create_publisher<sensor_msgs::msg::PointCloud2>("/world_points", rclcpp::QoS(20).best_effort());
@@ -419,10 +485,21 @@ namespace robot::slam
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
         pubOdomAftMapped_       = this->create_publisher<nav_msgs::msg::Odometry>("/slam_odom", 20);
         pubPath_                = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubGlobalOptimizedOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/slam/global_optimized_odom", 20);
+        pubGlobalOptimizedPath_ = this->create_publisher<nav_msgs::msg::Path>("/slam/global_optimized_path", 10);
+        pubGlobalOptimizationStatus_ = this->create_publisher<std_msgs::msg::String>(
+            "/slam/global_optimization_status", rclcpp::QoS(1).transient_local());
         tf_broadcaster_         = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         state_service_ = this->create_service<robots_dog_msgs::srv::MapState>(
             "/slam_state_service", std::bind(&MappingAlg::stateCallBack, this, std::placeholders::_1, std::placeholders::_2));
+        start_mapping_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/slam/start_mapping", std::bind(&MappingAlg::startMappingCallBack, this, std::placeholders::_1, std::placeholders::_2));
+        save_map_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/slam/save_map", std::bind(&MappingAlg::saveMapCallBack, this, std::placeholders::_1, std::placeholders::_2));
+        global_optimize_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "/slam/global_optimize", std::bind(&MappingAlg::globalOptimizeCallBack, this,
+                std::placeholders::_1, std::placeholders::_2));
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&MappingAlg::map_publish_callback, this));
@@ -534,6 +611,82 @@ namespace robot::slam
         }
     }
 
+    void MappingAlg::startMappingCallBack(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        (void)request;
+        auto map_request = std::make_shared<robots_dog_msgs::srv::MapState::Request>();
+        auto map_response = std::make_shared<robots_dog_msgs::srv::MapState::Response>();
+        map_request->data = 3;
+        stateCallBack(map_request, map_response);
+        response->success = map_response->success;
+        response->message = map_response->message;
+    }
+
+    void MappingAlg::saveMapCallBack(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        (void)request;
+        auto map_request = std::make_shared<robots_dog_msgs::srv::MapState::Request>();
+        auto map_response = std::make_shared<robots_dog_msgs::srv::MapState::Response>();
+        map_request->data = 5;
+        stateCallBack(map_request, map_response);
+        response->success = map_response->success;
+        response->message = map_response->message;
+    }
+
+    void MappingAlg::globalOptimizeCallBack(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        (void)request;
+        if (active_map_subdir_.empty() || mapping_keyframes_.empty())
+        {
+            response->success = false;
+            response->message = "No active mapping session or keyframes.";
+            return;
+        }
+        bool success = optimizeHistoricalTrajectory(active_map_subdir_);
+        if (success && map_export_completed_ && global_optimization_applied_)
+        {
+            const auto map_pcd = std::filesystem::path(active_map_subdir_) / "map.pcd";
+            const auto map_raw = std::filesystem::path(active_map_subdir_) / "map_raw.pcd";
+            std::error_code filesystem_error;
+            if (!std::filesystem::exists(map_raw) && std::filesystem::exists(map_pcd))
+                std::filesystem::copy_file(map_pcd, map_raw,
+                    std::filesystem::copy_options::overwrite_existing, filesystem_error);
+            std::size_t written_points = 0;
+            success = streamMapFromKeyframes(active_map_subdir_, written_points);
+            if (success)
+            {
+                const auto grid_pcd = std::filesystem::path(active_map_subdir_) / ".map_grid_relative.pcd";
+                std::string grid_error;
+                Pcd2Grid grid_builder(pcd2pgm_options_);
+                success = grid_builder.runFromBinaryPcd(
+                    grid_pcd.string(), (std::filesystem::path(active_map_subdir_) / "map").string(),
+                    nullptr, &grid_error);
+                std::filesystem::remove(grid_pcd, filesystem_error);
+                if (!success)
+                    keyframe_writer_error_ = grid_error;
+            }
+            if (success)
+                success = writeTrajectoryAndGnssMetadata(active_map_subdir_);
+            if (!success && std::filesystem::exists(map_raw))
+            {
+                std::filesystem::copy_file(map_raw, map_pcd,
+                    std::filesystem::copy_options::overwrite_existing, filesystem_error);
+                RCLCPP_ERROR(get_logger(), "Optimized map rebuild failed; restored map_raw.pcd: %s",
+                    keyframe_writer_error_.c_str());
+            }
+        }
+        response->success = success;
+        response->message = success
+            ? "Historical GTSAM optimization and map rebuild completed."
+            : keyframe_writer_error_;
+    }
+
     void MappingAlg::reset()
     {
         stopKeyframeWriter(false);
@@ -555,11 +708,22 @@ namespace robot::slam
         }
         gnss_alignment_samples_.clear();
         gnss_alignment_locked_ = false;
+        gnss_alignment_source_.clear();
         gnss_enu_to_map_yaw_ = 0.0;
         gnss_enu_to_map_translation_.setZero();
         gnss_alignment_rms_ = std::numeric_limits<double>::infinity();
         gnss_last_alignment_stamp_ = -1.0;
         gnss_alignment_stable_fits_ = 0;
+        optimized_global_poses_.clear();
+        global_pose_covariances_.clear();
+        global_factor_graph_result_ = GlobalFactorGraphResult{};
+        global_optimization_applied_ = false;
+        scan_context_count_ = 0;
+        loop_status_ = "skipped";
+        {
+            std::lock_guard<std::mutex> heading_lock(gnss_heading_mutex_);
+            has_gnss_heading_ = false;
+        }
         {
             std::lock_guard<std::mutex> odom_lock(odom_guard_mutex_);
             has_odom_guard_ = false;
@@ -593,6 +757,7 @@ namespace robot::slam
         keyframe_trajectory_m_ = 0.0;
         active_map_subdir_.clear();
         map_export_completed_ = false;
+        resetImuPreintegration(0.0);
         pcl_wait_pub->clear();
         pcl_wait_save->clear();
         has_last_keyframe_ = false;
@@ -923,7 +1088,7 @@ namespace robot::slam
             gnss_origin_lon_ = gnss.longitude;
             gnss_origin_alt_ = gnss.altitude;
             gnss_origin_initialized_ = true;
-            RCLCPP_INFO(get_logger(), "GNSS origin collected lat=%.9f lon=%.9f alt=%.3f; waiting for ENU-map alignment",
+            RCLCPP_INFO(get_logger(), "GNSS origin collected lat=%.9f lon=%.9f alt=%.3f; waiting for heading or trajectory ENU-map alignment",
                 gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_);
         }
 
@@ -933,7 +1098,61 @@ namespace robot::slam
         gnss_last_alignment_stamp_ = gnss_time;
         while (gnss_alignment_samples_.size() > gnss_alignment_max_samples_)
             gnss_alignment_samples_.pop_front();
-        estimateGnssAlignment();
+        if (!lockGnssAlignmentFromHeading(gnss))
+            estimateGnssAlignment();
+    }
+
+    bool MappingAlg::gnssHeadingIsValid(double& heading_deg, double& heading_std_deg, double& age_s)
+    {
+        std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
+        age_s = has_gnss_heading_
+            ? std::max(0.0, (get_clock()->now() - latest_gnss_heading_receive_time_).seconds())
+            : std::numeric_limits<double>::infinity();
+        heading_deg = latest_gnss_heading_deg_;
+        heading_std_deg = latest_gnss_heading_std_deg_;
+        return has_gnss_heading_
+            && latest_gnss_heading_status_ == 0
+            && latest_gnss_heading_type_ > 0
+            && latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_
+            && latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_
+            && age_s <= gnss_heading_max_age_s_;
+    }
+
+    bool MappingAlg::lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss)
+    {
+        if (gnss_alignment_locked_ || !gnss_use_heading_ || !gnss_origin_initialized_)
+            return gnss_alignment_locked_;
+
+        double heading_deg = 0.0;
+        double heading_std_deg = 0.0;
+        double heading_age = 0.0;
+        if (!gnssHeadingIsValid(heading_deg, heading_std_deg, heading_age))
+            return false;
+
+        const auto rotation = state_point.rot.toRotationMatrix();
+        const double slam_yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+        const double yaw_enu = M_PI / 2.0 - heading_deg * M_PI / 180.0;
+        const double alignment_yaw = std::atan2(
+            std::sin(slam_yaw - yaw_enu - gnss_heading_offset_rad_),
+            std::cos(slam_yaw - yaw_enu - gnss_heading_offset_rad_));
+        const Vec3d enu = llaToEnu(gnss.latitude, gnss.longitude, gnss.altitude);
+        const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
+        const double cosine = std::cos(alignment_yaw);
+        const double sine = std::sin(alignment_yaw);
+        const Eigen::Vector2d rotated(cosine * enu(0) - sine * enu(1), sine * enu(0) + cosine * enu(1));
+
+        gnss_alignment_locked_ = true;
+        gnss_alignment_source_ = "heading";
+        gnss_enu_to_map_yaw_ = alignment_yaw;
+        gnss_enu_to_map_translation_ = estimated_gps.head<2>() - rotated;
+        gnss_map_offset_ << gnss_enu_to_map_translation_(0), gnss_enu_to_map_translation_(1), 0.0;
+        gnss_alignment_rms_ = 0.0;
+        RCLCPP_INFO(get_logger(),
+            "GNSS ENU-map alignment locked from dual-antenna heading: heading=%.2fdeg slam_yaw=%.2fdeg "
+            "enu_to_map_yaw=%.2fdeg offset=[%.2f, %.2f] heading_std=%.2fdeg age=%.2fs",
+            heading_deg, slam_yaw * 180.0 / M_PI, alignment_yaw * 180.0 / M_PI,
+            gnss_enu_to_map_translation_(0), gnss_enu_to_map_translation_(1), heading_std_deg, heading_age);
+        return true;
     }
 
     bool MappingAlg::estimateGnssAlignment()
@@ -1014,10 +1233,11 @@ namespace robot::slam
         if (!gnss_alignment_locked_ && gnss_alignment_stable_fits_ >= gnss_alignment_required_fits_)
         {
             gnss_alignment_locked_ = true;
+            gnss_alignment_source_ = "trajectory";
             gnss_enu_to_map_yaw_ = yaw;
             gnss_enu_to_map_translation_ = translation;
             gnss_map_offset_ << translation(0), translation(1), 0.0;
-            RCLCPP_INFO(get_logger(), "GNSS ENU-map alignment locked: yaw=%.2fdeg offset=[%.2f, %.2f] rms=%.2fm samples=%zu",
+            RCLCPP_INFO(get_logger(), "GNSS ENU-map alignment locked from trajectory: yaw=%.2fdeg offset=[%.2f, %.2f] rms=%.2fm samples=%zu",
                 yaw * 180.0 / M_PI, translation(0), translation(1), rms, inliers.size());
         }
         return gnss_alignment_locked_;
@@ -1225,6 +1445,7 @@ namespace robot::slam
 
         imu_buffer.push_back(imu_msg_ptr);
         mtx_buffer.unlock();
+        accumulateImuPreintegration(timestamp, imu_msg_ptr->acc, imu_msg_ptr->gyr);
         sig_buffer.notify_all();
     }
 
@@ -1361,8 +1582,11 @@ namespace robot::slam
         if (slam_diverged_ || !keyframe_record_enable_ || !cloud_world || cloud_world->empty() || active_map_subdir_.empty())
             return;
         const Vec3d lidar_origin = state_point.rot * state_point.offset_T_L_I + state_point.pos;
-        const auto rotation = state_point.rot.toRotationMatrix();
-        const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+        const Mat3d world_rotation = state_point.rot.toRotationMatrix();
+        const Mat3d lidar_rotation = (state_point.rot * state_point.offset_R_L_I).toRotationMatrix();
+        const Eigen::Quaterniond world_quat = rotationToXyzw(world_rotation);
+        const Eigen::Quaterniond lidar_quat = rotationToXyzw(lidar_rotation);
+        const double yaw = std::atan2(lidar_rotation(1, 0), lidar_rotation(0, 0));
         const double distance = has_last_keyframe_ ? (lidar_origin - last_keyframe_origin_).norm() : std::numeric_limits<double>::infinity();
         const double elapsed = has_last_keyframe_ ? lidar_end_time - last_keyframe_stamp_ : std::numeric_limits<double>::infinity();
         double yaw_delta = std::fabs(yaw - last_keyframe_yaw_);
@@ -1379,13 +1603,28 @@ namespace robot::slam
         MappingKeyframe metadata;
         metadata.index = mapping_keyframes_.size();
         metadata.stamp = lidar_end_time;
+        metadata.world_origin = state_point.pos;
+        metadata.world_qx = world_quat.x();
+        metadata.world_qy = world_quat.y();
+        metadata.world_qz = world_quat.z();
+        metadata.world_qw = world_quat.w();
         metadata.lidar_origin = lidar_origin;
+        metadata.lidar_qx = lidar_quat.x();
+        metadata.lidar_qy = lidar_quat.y();
+        metadata.lidar_qz = lidar_quat.z();
+        metadata.lidar_qw = lidar_quat.w();
         metadata.yaw = yaw;
         metadata.point_count = keyframe_cloud->size();
+        metadata.scan_context_index = metadata.index;
+        metadata.preint = captureImuPreintegration(lidar_end_time);
         std::ostringstream file_name;
         file_name << active_map_subdir_ << "/keyframes/scan_" << std::setw(5) << std::setfill('0')
                   << metadata.index << ".pcd";
         metadata.file_path = file_name.str();
+        std::ostringstream preint_name;
+        preint_name << active_map_subdir_ << "/imu_preintegration/preint_" << std::setw(5) << std::setfill('0')
+                    << metadata.index << ".json";
+        metadata.preintegration_file = preint_name.str();
         {
             std::lock_guard<std::mutex> gnss_lock(gnss_mutex_);
             if (has_gnss_)
@@ -1404,19 +1643,13 @@ namespace robot::slam
             }
         }
         {
-            std::lock_guard<std::mutex> heading_lock(gnss_heading_mutex_);
-            const double age = has_gnss_heading_
-                ? std::max(0.0, (get_clock()->now() - latest_gnss_heading_receive_time_).seconds())
-                : std::numeric_limits<double>::infinity();
-            metadata.rtk_heading_valid = has_gnss_heading_
-                && latest_gnss_heading_status_ == 0
-                && latest_gnss_heading_type_ > 0
-                && latest_gnss_heading_baseline_m_ >= gnss_heading_min_baseline_m_
-                && latest_gnss_heading_std_deg_ <= gnss_heading_max_std_deg_
-                && age <= gnss_heading_max_age_s_;
-            metadata.rtk_heading_deg = latest_gnss_heading_deg_;
-            metadata.rtk_heading_std_deg = latest_gnss_heading_std_deg_;
-            metadata.rtk_heading_age_seconds = age;
+            double heading_deg = 0.0;
+            double heading_std_deg = 0.0;
+            double heading_age = 0.0;
+            metadata.rtk_heading_valid = gnssHeadingIsValid(heading_deg, heading_std_deg, heading_age);
+            metadata.rtk_heading_deg = heading_deg;
+            metadata.rtk_heading_std_deg = heading_std_deg;
+            metadata.rtk_heading_age_seconds = heading_age;
         }
 
         {
@@ -1449,11 +1682,17 @@ namespace robot::slam
             active_map_subdir_ = makeMapSubdir(data_path_);
             const auto keyframe_dir = std::filesystem::path(active_map_subdir_) / "keyframes";
             std::filesystem::create_directories(keyframe_dir);
+            std::filesystem::create_directories(std::filesystem::path(active_map_subdir_) / "imu_preintegration");
             std::ofstream poses(keyframe_dir / "keyframes.csv", std::ios::out | std::ios::trunc);
             if (!poses.is_open())
                 throw std::runtime_error("cannot create keyframes.csv");
-            poses << "index,stamp,x,y,z,yaw,point_count,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,rtk_heading_age_seconds\n";
+            poses << "index,stamp,x,y,z,yaw,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw,"
+                     "lidar_x,lidar_y,lidar_z,lidar_qx,lidar_qy,lidar_qz,lidar_qw,point_count,preintegration_file,"
+                     "scan_context_index,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,"
+                     "rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,"
+                     "rtk_heading_age_seconds\n";
             poses.close();
+            resetImuPreintegration(0.0);
             startKeyframeWriter();
             writeSaveProgress("mapping", 0.0);
             RCLCPP_INFO(get_logger(), "Mapping session initialized at %s", active_map_subdir_.c_str());
@@ -1541,9 +1780,37 @@ namespace robot::slam
                 MappingKeyframe keyframe;
                 keyframe.index = static_cast<std::size_t>(std::stoull(field("index")));
                 keyframe.stamp = std::stod(field("stamp"));
-                keyframe.lidar_origin << std::stod(field("x")), std::stod(field("y")), std::stod(field("z"));
+                keyframe.lidar_origin << std::stod(field("lidar_x", field("x"))),
+                    std::stod(field("lidar_y", field("y"))), std::stod(field("lidar_z", field("z")));
                 keyframe.yaw = std::stod(field("yaw"));
+                const Eigen::Quaterniond recovered_yaw = normalizedXyzw(
+                    0.0, 0.0, std::sin(keyframe.yaw * 0.5), std::cos(keyframe.yaw * 0.5));
+                keyframe.world_origin << std::stod(field("world_x", field("lidar_x", field("x")))),
+                    std::stod(field("world_y", field("lidar_y", field("y")))),
+                    std::stod(field("world_z", field("lidar_z", field("z"))));
+                keyframe.world_qx = std::stod(field("world_qx", "0"));
+                keyframe.world_qy = std::stod(field("world_qy", "0"));
+                keyframe.world_qz = std::stod(field("world_qz", std::to_string(recovered_yaw.z())));
+                keyframe.world_qw = std::stod(field("world_qw", std::to_string(recovered_yaw.w())));
+                keyframe.lidar_qx = std::stod(field("lidar_qx", "0"));
+                keyframe.lidar_qy = std::stod(field("lidar_qy", "0"));
+                keyframe.lidar_qz = std::stod(field("lidar_qz", std::to_string(recovered_yaw.z())));
+                keyframe.lidar_qw = std::stod(field("lidar_qw", std::to_string(recovered_yaw.w())));
+                const Eigen::Quaterniond world_quat = normalizedXyzw(
+                    keyframe.world_qx, keyframe.world_qy, keyframe.world_qz, keyframe.world_qw);
+                const Eigen::Quaterniond lidar_quat = normalizedXyzw(
+                    keyframe.lidar_qx, keyframe.lidar_qy, keyframe.lidar_qz, keyframe.lidar_qw);
+                keyframe.world_qx = world_quat.x();
+                keyframe.world_qy = world_quat.y();
+                keyframe.world_qz = world_quat.z();
+                keyframe.world_qw = world_quat.w();
+                keyframe.lidar_qx = lidar_quat.x();
+                keyframe.lidar_qy = lidar_quat.y();
+                keyframe.lidar_qz = lidar_quat.z();
+                keyframe.lidar_qw = lidar_quat.w();
                 keyframe.point_count = static_cast<std::size_t>(std::stoull(field("point_count")));
+                keyframe.scan_context_index = static_cast<std::size_t>(std::stoull(field("scan_context_index", field("index"))));
+                keyframe.preintegration_file = field("preintegration_file", "");
                 keyframe.rtk_valid = std::stoi(field("rtk_valid")) != 0;
                 keyframe.rtk_status = std::stoi(field("rtk_status", "-1"));
                 keyframe.rtk_latitude = std::stod(field("rtk_latitude"));
@@ -1673,12 +1940,24 @@ namespace robot::slam
                 poses << keyframe.index << ',' << std::fixed << std::setprecision(6) << keyframe.stamp << ','
                       << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ',' << keyframe.lidar_origin(2) << ','
                       << keyframe.yaw << ','
-                      << keyframe.point_count << ',' << (keyframe.rtk_valid ? 1 : 0) << ',' << keyframe.rtk_status << ','
+                      << keyframe.world_origin(0) << ',' << keyframe.world_origin(1) << ',' << keyframe.world_origin(2) << ','
+                      << std::setprecision(7) << keyframe.world_qx << ',' << keyframe.world_qy << ','
+                      << keyframe.world_qz << ',' << keyframe.world_qw << ','
+                      << std::setprecision(6) << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ','
+                      << keyframe.lidar_origin(2) << ','
+                      << std::setprecision(7) << keyframe.lidar_qx << ',' << keyframe.lidar_qy << ','
+                      << keyframe.lidar_qz << ',' << keyframe.lidar_qw << ','
+                      << keyframe.point_count << ',' << keyframe.preintegration_file << ','
+                      << keyframe.scan_context_index << ','
+                      << (keyframe.rtk_valid ? 1 : 0) << ',' << keyframe.rtk_status << ','
                       << std::setprecision(10) << keyframe.rtk_latitude << ',' << keyframe.rtk_longitude << ','
                       << std::setprecision(4) << keyframe.rtk_altitude << ',' << keyframe.rtk_horizontal_std << ','
                       << keyframe.rtk_age_seconds << ',' << (keyframe.rtk_heading_valid ? 1 : 0) << ','
                       << keyframe.rtk_heading_deg << ',' << keyframe.rtk_heading_std_deg << ','
                       << keyframe.rtk_heading_age_seconds << '\n';
+                poses.close();
+                if (!writeImuPreintegrationFile(keyframe))
+                    throw std::runtime_error("cannot write " + keyframe.preintegration_file);
             }
             catch (const std::exception& exc)
             {
@@ -2112,6 +2391,17 @@ namespace robot::slam
             if (pcl::io::loadPCDFile<PointType>(keyframe.file_path, cloud) != 0)
                 return fail("cannot read keyframe: " + keyframe.file_path);
 
+            Eigen::Isometry3d raw_lidar = Eigen::Translation3d(keyframe.lidar_origin)
+                * normalizedXyzw(keyframe.lidar_qx, keyframe.lidar_qy, keyframe.lidar_qz, keyframe.lidar_qw);
+            Eigen::Isometry3d raw_to_optimized = Eigen::Isometry3d::Identity();
+            double optimized_reference_z = keyframe.lidar_origin.z();
+            if (global_optimization_applied_ && index < optimized_global_poses_.size())
+            {
+                const Eigen::Isometry3d optimized_lidar = optimizedLidarPose(keyframe, optimized_global_poses_[index]);
+                raw_to_optimized = optimized_lidar * raw_lidar.inverse();
+                optimized_reference_z = optimized_lidar.translation().z();
+            }
+
             std::unordered_set<DynamicFilterVoxelKey, DynamicFilterVoxelKeyHash> observed_in_keyframe;
             if (filter_enabled)
                 observed_in_keyframe.reserve(cloud.size());
@@ -2119,9 +2409,21 @@ namespace robot::slam
             {
                 if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
                     continue;
-                const auto key = makeDynamicFilterVoxelKey(point, dynamic_filter_voxel_size_);
+                const Eigen::Vector3d corrected = raw_to_optimized * Eigen::Vector3d(point.x, point.y, point.z);
+                BinaryPcdPoint corrected_point = packPoint(point);
+                corrected_point.x = static_cast<float>(corrected.x());
+                corrected_point.y = static_cast<float>(corrected.y());
+                corrected_point.z = static_cast<float>(corrected.z());
+                const PointType corrected_pcl = [&]() {
+                    PointType value = point;
+                    value.x = corrected_point.x;
+                    value.y = corrected_point.y;
+                    value.z = corrected_point.z;
+                    return value;
+                }();
+                const auto key = makeDynamicFilterVoxelKey(corrected_pcl, dynamic_filter_voxel_size_);
                 const std::size_t shard = filter_enabled ? key_hash(key) % shard_count : 0;
-                const ExportPointRecord packed{ packPoint(point), static_cast<float>(keyframe.lidar_origin.z()) };
+                const ExportPointRecord packed{ corrected_point, static_cast<float>(optimized_reference_z) };
                 point_shards[shard].write(
                     reinterpret_cast<const char*>(&packed), sizeof(ExportPointRecord));
                 if (!point_shards[shard].good())
@@ -2297,6 +2599,320 @@ namespace robot::slam
         return true;
     }
 
+    bool MappingAlg::loadLoopClosures(const std::string& map_subdir,
+        std::vector<GlobalGraphLoopClosure>& loop_closures)
+    {
+        loop_closures.clear();
+        scan_context_count_ = 0;
+        loop_status_ = "no_valid_loop";
+        const auto file = std::filesystem::path(map_subdir) / "loop_closures.csv";
+        std::ifstream input;
+        bool converting_scan_context_candidates = false;
+        std::ofstream converted;
+        if (std::filesystem::exists(file))
+        {
+            input.open(file);
+        }
+        else
+        {
+            const auto candidates_file = std::filesystem::path(map_subdir)
+                / "scan_context" / "loop_candidates.csv";
+            if (!std::filesystem::exists(candidates_file))
+                return true;
+            input.open(candidates_file);
+            converting_scan_context_candidates = true;
+            converted.open(file, std::ios::out | std::ios::trunc);
+            if (!converted.is_open())
+            {
+                keyframe_writer_error_ = "cannot create loop_closures.csv";
+                return false;
+            }
+            converted << "from,to,tx,ty,tz,qx,qy,qz,qw,sigma_translation,sigma_rotation,score\n";
+            scan_context_count_ = mapping_keyframes_.size();
+        }
+        if (!input.is_open())
+            return false;
+        std::string line;
+        std::size_t line_number = 0;
+        while (std::getline(input, line))
+        {
+            ++line_number;
+            if (line.empty() || line[0] == '#')
+                continue;
+            std::vector<std::string> fields;
+            std::stringstream stream(line);
+            std::string field;
+            while (std::getline(stream, field, ','))
+                fields.push_back(field);
+            if (fields.empty() || fields.front() == "from"
+                || fields.front() == "query_index")
+                continue;
+            if (fields.size() < 10)
+            {
+                RCLCPP_WARN(get_logger(), "Ignoring malformed loop closure line %zu", line_number);
+                continue;
+            }
+            try
+            {
+                GlobalGraphLoopClosure loop;
+                const double translation_sigma = converting_scan_context_candidates ? 0.50
+                    : std::max(0.01, std::stod(fields[9]));
+                const double rotation_sigma = converting_scan_context_candidates ? 0.15
+                    : (fields.size() > 10
+                        ? std::max(0.005, std::stod(fields[10]))
+                        : global_factor_graph_config_.loop_rotation_sigma_rad);
+                if (converting_scan_context_candidates)
+                {
+                    const auto accepted = fields.size() > 6 &&
+                        (fields[6] == "true" || fields[6] == "True" || fields[6] == "1");
+                    const auto geometrically_verified = fields.size() > 5 &&
+                        (fields[5] == "true" || fields[5] == "True" || fields[5] == "1");
+                    if (!accepted || !geometrically_verified)
+                        continue;
+                    loop.from = static_cast<std::size_t>(std::stoull(fields[0]));
+                    loop.to = static_cast<std::size_t>(std::stoull(fields[1]));
+                    const double tx = std::stod(fields[7]);
+                    const double ty = std::stod(fields[8]);
+                    const double yaw = std::stod(fields[4]);
+                    loop.relative_pose = gtsam::Pose3(
+                        gtsam::Rot3::Yaw(yaw), gtsam::Point3(tx, ty, 0.0));
+                    loop.score = 1.0 - std::clamp(std::stod(fields[3]), 0.0, 1.0);
+                    converted << loop.from << ',' << loop.to << ',' << tx << ',' << ty << ",0,"
+                              << "0,0," << std::sin(yaw / 2.0) << ',' << std::cos(yaw / 2.0) << ','
+                              << translation_sigma << ',' << rotation_sigma << ',' << loop.score << '\n';
+                }
+                else
+                {
+                    loop.from = static_cast<std::size_t>(std::stoull(fields[0]));
+                    loop.to = static_cast<std::size_t>(std::stoull(fields[1]));
+                    const double tx = std::stod(fields[2]);
+                    const double ty = std::stod(fields[3]);
+                    const double tz = std::stod(fields[4]);
+                    const double qx = std::stod(fields[5]);
+                    const double qy = std::stod(fields[6]);
+                    const double qz = std::stod(fields[7]);
+                    const double qw = std::stod(fields[8]);
+                    loop.relative_pose = gtsam::Pose3(
+                        gtsam::Rot3::Quaternion(qw, qx, qy, qz), gtsam::Point3(tx, ty, tz));
+                    loop.score = fields.size() > 11 ? std::stod(fields[11]) : 0.0;
+                }
+                loop.covariance.setZero();
+                loop.covariance.block<3, 3>(0, 0) = gtsam::Matrix3::Identity() * (rotation_sigma * rotation_sigma);
+                loop.covariance.block<3, 3>(3, 3) = gtsam::Matrix3::Identity() * (translation_sigma * translation_sigma);
+                loop_closures.push_back(loop);
+            }
+            catch (const std::exception& exception)
+            {
+                RCLCPP_WARN(get_logger(), "Ignoring loop_closures.csv line %zu: %s", line_number, exception.what());
+            }
+        }
+        if (converting_scan_context_candidates)
+        {
+            converted.close();
+            loop_status_ = loop_closures.empty() ? "no_valid_loop" : "accepted";
+        }
+        else if (!loop_closures.empty())
+        {
+            loop_status_ = "accepted";
+            scan_context_count_ = std::filesystem::exists(
+                std::filesystem::path(map_subdir) / "scan_context" / "index.json")
+                ? mapping_keyframes_.size() : 0;
+        }
+        return true;
+    }
+
+    bool MappingAlg::writeGlobalOptimizationOutputs(const std::string& map_subdir,
+        const std::vector<GlobalGraphLoopClosure>& loop_closures)
+    {
+        (void)loop_closures;
+        if (!global_optimization_applied_ || optimized_global_poses_.size() != mapping_keyframes_.size())
+            return true;
+
+        std::ofstream trajectory(map_subdir + "/trajectory_optimized.csv", std::ios::out | std::ios::trunc);
+        std::ofstream covariance(map_subdir + "/trajectory_covariance.json", std::ios::out | std::ios::trunc);
+        if (!trajectory.is_open() || !covariance.is_open())
+        {
+            keyframe_writer_error_ = "cannot create global optimization outputs";
+            return false;
+        }
+        trajectory << "index,timestamp,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw\n";
+        covariance << "{\n  \"schema_version\": 1,\n  \"ordering\": \"rotation_xyz,translation_xyz\",\n  \"poses\": [\n";
+        nav_msgs::msg::Path optimized_path;
+        optimized_path.header.frame_id = "map";
+        optimized_path.header.stamp = get_clock()->now();
+        for (std::size_t index = 0; index < optimized_global_poses_.size(); ++index)
+        {
+            const auto& pose = optimized_global_poses_[index];
+            const auto quaternion = pose.rotation().toQuaternion();
+            trajectory << mapping_keyframes_[index].index << ',' << std::fixed << std::setprecision(6)
+                       << mapping_keyframes_[index].stamp << ',' << pose.x() << ',' << pose.y() << ',' << pose.z()
+                       << ',' << std::setprecision(8) << quaternion.x() << ',' << quaternion.y() << ','
+                       << quaternion.z() << ',' << quaternion.w() << '\n';
+            const auto& matrix = global_pose_covariances_[index];
+            covariance << "    {\"index\": " << mapping_keyframes_[index].index << ", \"covariance\": [";
+            for (int row = 0; row < 6; ++row)
+                for (int col = 0; col < 6; ++col)
+                    covariance << (row || col ? ", " : "") << std::setprecision(10) << matrix(row, col);
+            covariance << "]}" << (index + 1 == optimized_global_poses_.size() ? "\n" : ",\n");
+
+            geometry_msgs::msg::PoseStamped pose_stamped;
+            pose_stamped.header = optimized_path.header;
+            pose_stamped.header.stamp = get_ros_time(mapping_keyframes_[index].stamp);
+            pose_stamped.pose.position.x = pose.x();
+            pose_stamped.pose.position.y = pose.y();
+            pose_stamped.pose.position.z = pose.z();
+            pose_stamped.pose.orientation.x = quaternion.x();
+            pose_stamped.pose.orientation.y = quaternion.y();
+            pose_stamped.pose.orientation.z = quaternion.z();
+            pose_stamped.pose.orientation.w = quaternion.w();
+            optimized_path.poses.push_back(pose_stamped);
+        }
+        covariance << "  ],\n  \"factor_count\": " << global_factor_graph_result_.factor_count
+                   << ",\n  \"ndt_factor_count\": " << global_factor_graph_result_.ndt_factor_count
+                   << ",\n  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count
+                   << ",\n  \"rtk_position_factor_count\": " << global_factor_graph_result_.rtk_position_factor_count
+                   << ",\n  \"rtk_heading_factor_count\": " << global_factor_graph_result_.rtk_heading_factor_count
+                   << ",\n  \"loop_closure_factor_count\": " << global_factor_graph_result_.loop_closure_factor_count
+                   << ",\n  \"error_before\": " << global_factor_graph_result_.error_before
+                   << ",\n  \"error_after\": " << global_factor_graph_result_.error_after << "\n}\n";
+
+        if (pubGlobalOptimizedPath_)
+            pubGlobalOptimizedPath_->publish(optimized_path);
+        if (pubGlobalOptimizedOdom_ && !optimized_global_poses_.empty())
+        {
+            const std::size_t last = optimized_global_poses_.size() - 1;
+            const auto& pose = optimized_global_poses_.back();
+            const auto quaternion = pose.rotation().toQuaternion();
+            nav_msgs::msg::Odometry odom;
+            odom.header = optimized_path.header;
+            odom.header.stamp = get_ros_time(mapping_keyframes_.back().stamp);
+            odom.child_frame_id = "base_link";
+            odom.pose.pose.position.x = pose.x();
+            odom.pose.pose.position.y = pose.y();
+            odom.pose.pose.position.z = pose.z();
+            odom.pose.pose.orientation.x = quaternion.x();
+            odom.pose.pose.orientation.y = quaternion.y();
+            odom.pose.pose.orientation.z = quaternion.z();
+            odom.pose.pose.orientation.w = quaternion.w();
+            for (int row = 0; row < 6; ++row)
+                for (int col = 0; col < 6; ++col)
+                {
+                    const int ros_row = row < 3 ? row + 3 : row - 3;
+                    const int ros_col = col < 3 ? col + 3 : col - 3;
+                    odom.pose.covariance[ros_row * 6 + ros_col] = global_pose_covariances_[last](row, col);
+                }
+            pubGlobalOptimizedOdom_->publish(odom);
+        }
+        if (pubGlobalOptimizationStatus_)
+        {
+            std_msgs::msg::String status;
+            std::ostringstream json;
+            json << "{\"success\":true,\"keyframe_count\":" << mapping_keyframes_.size()
+                 << ",\"factor_count\":" << global_factor_graph_result_.factor_count
+                 << ",\"loop_closure_count\":" << global_factor_graph_result_.loop_closure_factor_count
+                 << ",\"error_before\":" << global_factor_graph_result_.error_before
+                 << ",\"error_after\":" << global_factor_graph_result_.error_after << '}';
+            status.data = json.str();
+            pubGlobalOptimizationStatus_->publish(status);
+        }
+        return true;
+    }
+
+    bool MappingAlg::optimizeHistoricalTrajectory(const std::string& map_subdir)
+    {
+        optimized_global_poses_.clear();
+        global_pose_covariances_.clear();
+        global_optimization_applied_ = false;
+        if (!global_factor_graph_config_.enable || mapping_keyframes_.empty())
+            return true;
+
+        std::vector<GlobalGraphLoopClosure> loop_closures;
+        if (!loadLoopClosures(map_subdir, loop_closures))
+        {
+            keyframe_writer_error_ = "cannot read loop_closures.csv";
+            return false;
+        }
+        std::vector<GlobalGraphKeyframe> graph_keyframes;
+        graph_keyframes.reserve(mapping_keyframes_.size());
+        for (const auto& keyframe : mapping_keyframes_)
+        {
+            GlobalGraphKeyframe frame;
+            frame.index = graph_keyframes.size();
+            frame.stamp = keyframe.stamp;
+            frame.initial_pose = gtsam::Pose3(
+                gtsam::Rot3::Quaternion(keyframe.world_qw, keyframe.world_qx, keyframe.world_qy, keyframe.world_qz),
+                gtsam::Point3(keyframe.world_origin(0), keyframe.world_origin(1), keyframe.world_origin(2)));
+            if (keyframe.rtk_valid && gnss_origin_initialized_ && gnss_alignment_locked_)
+            {
+                sensor_msgs::msg::NavSatFix fix;
+                fix.status.status = keyframe.rtk_status;
+                fix.latitude = keyframe.rtk_latitude;
+                fix.longitude = keyframe.rtk_longitude;
+                fix.altitude = keyframe.rtk_altitude;
+                fix.position_covariance[0] = keyframe.rtk_horizontal_std * keyframe.rtk_horizontal_std;
+                fix.position_covariance[4] = fix.position_covariance[0];
+                Vec3d map_position;
+                if (gnssToMap(fix, map_position))
+                {
+                    frame.has_rtk_position = true;
+                    frame.rtk_position = gtsam::Point3(map_position(0), map_position(1), map_position(2));
+                    frame.rtk_position_sigma = std::max(0.05, keyframe.rtk_horizontal_std);
+                    frame.rtk_lever_arm = gtsam::Point3(gnss_lever_arm_base_(0), gnss_lever_arm_base_(1), gnss_lever_arm_base_(2));
+                }
+            }
+            if (keyframe.rtk_heading_valid && gnss_use_heading_)
+            {
+                frame.has_rtk_heading = true;
+                frame.rtk_heading_rad = M_PI / 2.0 - keyframe.rtk_heading_deg * M_PI / 180.0
+                    + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_;
+                frame.rtk_heading_sigma_rad = std::max(0.005, keyframe.rtk_heading_std_deg * M_PI / 180.0);
+            }
+            const auto& preint = keyframe.preint;
+            if (preint.imu_sample_count > 0 && preint.error_status.empty())
+            {
+                frame.has_imu_delta = true;
+                frame.imu_delta = gtsam::Pose3(
+                    gtsam::Rot3::Quaternion(preint.delta_rotation_xyzw[3], preint.delta_rotation_xyzw[0],
+                        preint.delta_rotation_xyzw[1], preint.delta_rotation_xyzw[2]),
+                    gtsam::Point3(preint.delta_position(0), preint.delta_position(1), preint.delta_position(2)));
+                frame.imu_covariance.setZero();
+                for (int row = 0; row < 3; ++row)
+                    for (int col = 0; col < 3; ++col)
+                    {
+                        frame.imu_covariance(row, col) = preint.covariance[static_cast<std::size_t>(row * 15 + col)];
+                        frame.imu_covariance(row + 3, col + 3) = preint.covariance[
+                            static_cast<std::size_t>((row + 6) * 15 + col + 6)];
+                    }
+            }
+            graph_keyframes.push_back(frame);
+        }
+        global_factor_graph_result_ = global_factor_graph_->optimize(graph_keyframes, loop_closures);
+        if (!global_factor_graph_result_.success)
+        {
+            keyframe_writer_error_ = "global factor graph failed: " + global_factor_graph_result_.error;
+            RCLCPP_ERROR(get_logger(), "%s", keyframe_writer_error_.c_str());
+            if (pubGlobalOptimizationStatus_)
+            {
+                std_msgs::msg::String status;
+                status.data = std::string("{\"success\":false,\"error\":\"")
+                    + jsonEscape(global_factor_graph_result_.error) + "\"}";
+                pubGlobalOptimizationStatus_->publish(status);
+            }
+            return false;
+        }
+        optimized_global_poses_ = global_factor_graph_result_.optimized_poses;
+        global_pose_covariances_ = global_factor_graph_result_.covariances;
+        global_optimization_applied_ = true;
+        RCLCPP_INFO(get_logger(),
+            "Historical GTSAM optimization completed: keyframes=%zu factors=%zu ndt=%zu imu=%zu rtk_xy=%zu rtk_heading=%zu loops=%zu error %.3f -> %.3f",
+            mapping_keyframes_.size(), global_factor_graph_result_.factor_count,
+            global_factor_graph_result_.ndt_factor_count, global_factor_graph_result_.imu_factor_count,
+            global_factor_graph_result_.rtk_position_factor_count, global_factor_graph_result_.rtk_heading_factor_count,
+            global_factor_graph_result_.loop_closure_factor_count,
+            global_factor_graph_result_.error_before, global_factor_graph_result_.error_after);
+        return writeGlobalOptimizationOutputs(map_subdir, loop_closures);
+    }
+
     bool MappingAlg::writeTrajectoryAndGnssMetadata(const std::string& map_subdir)
     {
         std::ofstream trajectory(map_subdir + "/map.txt", std::ios::out | std::ios::trunc);
@@ -2306,7 +2922,13 @@ namespace robot::slam
             return false;
         }
         trajectory << "# path\n";
-        if (!path.poses.empty())
+        if (global_optimization_applied_ && !optimized_global_poses_.empty())
+        {
+            for (const auto& pose : optimized_global_poses_)
+                trajectory << std::fixed << std::setprecision(2) << pose.x() << ' '
+                           << pose.y() << ' ' << pose.rotation().yaw() << '\n';
+        }
+        else if (!path.poses.empty())
         {
             for (const auto& pose : path.poses)
             {
@@ -2326,6 +2948,45 @@ namespace robot::slam
         }
         trajectory.close();
 
+        std::ofstream raw_trajectory(map_subdir + "/trajectory_raw.csv", std::ios::out | std::ios::trunc);
+        if (!raw_trajectory.is_open())
+        {
+            keyframe_writer_error_ = "cannot create trajectory_raw.csv";
+            return false;
+        }
+        raw_trajectory << "index,timestamp,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw,"
+                          "lidar_x,lidar_y,lidar_z,lidar_qx,lidar_qy,lidar_qz,lidar_qw\n";
+        for (const auto& keyframe : mapping_keyframes_)
+        {
+            raw_trajectory << keyframe.index << ',' << std::fixed << std::setprecision(6) << keyframe.stamp << ','
+                           << keyframe.world_origin(0) << ',' << keyframe.world_origin(1) << ',' << keyframe.world_origin(2) << ','
+                           << std::setprecision(7) << keyframe.world_qx << ',' << keyframe.world_qy << ','
+                           << keyframe.world_qz << ',' << keyframe.world_qw << ','
+                           << std::setprecision(6) << keyframe.lidar_origin(0) << ',' << keyframe.lidar_origin(1) << ','
+                           << keyframe.lidar_origin(2) << ','
+                           << std::setprecision(7) << keyframe.lidar_qx << ',' << keyframe.lidar_qy << ','
+                           << keyframe.lidar_qz << ',' << keyframe.lidar_qw << '\n';
+        }
+        raw_trajectory.close();
+        std::error_code copy_error;
+        if (!global_optimization_applied_)
+        {
+            std::filesystem::copy_file(map_subdir + "/trajectory_raw.csv", map_subdir + "/trajectory_optimized.csv",
+                std::filesystem::copy_options::overwrite_existing, copy_error);
+        }
+        if (copy_error)
+        {
+            keyframe_writer_error_ = "cannot create trajectory_optimized.csv";
+            return false;
+        }
+        const auto map_pcd = std::filesystem::path(map_subdir) / "map.pcd";
+        if (std::filesystem::exists(map_pcd)
+            && !std::filesystem::exists(std::filesystem::path(map_subdir) / "map_raw.pcd"))
+        {
+            std::filesystem::copy_file(map_pcd, std::filesystem::path(map_subdir) / "map_raw.pcd",
+                std::filesystem::copy_options::overwrite_existing, copy_error);
+        }
+
         if (gnss_origin_initialized_)
         {
             std::ofstream meta(map_subdir + "/gnss_origin.yaml", std::ios::out | std::ios::trunc);
@@ -2342,6 +3003,7 @@ namespace robot::slam
             meta << std::setprecision(4);
             meta << "origin_altitude: " << gnss_origin_alt_ << "\n";
             meta << "alignment_locked: " << (gnss_alignment_locked_ ? 1 : 0) << "\n";
+            meta << "alignment_source: " << (gnss_alignment_source_.empty() ? "none" : gnss_alignment_source_) << "\n";
             meta << "enu_to_map_yaw: " << gnss_enu_to_map_yaw_ << "\n";
             meta << "alignment_rms: " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0) << "\n";
             meta << "alignment_samples: " << gnss_alignment_samples_.size() << "\n";
@@ -2358,7 +3020,206 @@ namespace robot::slam
             meta << "  z: " << gnss_lever_arm_base_(2) << "\n";
             meta << "gnss_corrections: " << gnss_correction_count_ << "\n";
         }
+        return writeMapManifest(map_subdir);
+    }
+
+    bool MappingAlg::writeImuPreintegrationFile(const MappingKeyframe& keyframe) const
+    {
+        if (keyframe.preintegration_file.empty())
+            return true;
+        std::filesystem::create_directories(std::filesystem::path(keyframe.preintegration_file).parent_path());
+        std::ofstream output(keyframe.preintegration_file, std::ios::out | std::ios::trunc);
+        if (!output.is_open())
+            return false;
+        const auto& preint = keyframe.preint;
+        output << std::fixed;
+        output << "{\n"
+               << "  \"schema_version\": 1,\n"
+               << "  \"keyframe_index\": " << keyframe.index << ",\n"
+               << "  \"start_timestamp\": " << std::setprecision(6) << preint.start_timestamp << ",\n"
+               << "  \"end_timestamp\": " << preint.end_timestamp << ",\n"
+               << "  \"delta_t\": " << preint.delta_t << ",\n"
+               << "  \"delta_rotation_xyzw\": ["
+               << std::setprecision(7) << preint.delta_rotation_xyzw[0] << ", "
+               << preint.delta_rotation_xyzw[1] << ", " << preint.delta_rotation_xyzw[2] << ", "
+               << preint.delta_rotation_xyzw[3] << "],\n"
+               << "  \"delta_velocity\": [" << std::setprecision(6) << preint.delta_velocity(0) << ", "
+               << preint.delta_velocity(1) << ", " << preint.delta_velocity(2) << "],\n"
+               << "  \"delta_position\": [" << preint.delta_position(0) << ", "
+               << preint.delta_position(1) << ", " << preint.delta_position(2) << "],\n"
+               << "  \"linearized_accel_bias\": [" << preint.linearized_accel_bias(0) << ", "
+               << preint.linearized_accel_bias(1) << ", " << preint.linearized_accel_bias(2) << "],\n"
+               << "  \"linearized_gyro_bias\": [" << preint.linearized_gyro_bias(0) << ", "
+               << preint.linearized_gyro_bias(1) << ", " << preint.linearized_gyro_bias(2) << "],\n"
+               << "  \"covariance_15x15\": [";
+        for (std::size_t index = 0; index < preint.covariance.size(); ++index)
+        {
+            if (index)
+                output << ", ";
+            output << std::setprecision(8) << preint.covariance[index];
+        }
+        output << "],\n"
+               << "  \"imu_sample_count\": " << preint.imu_sample_count << ",\n"
+               << "  \"error_status\": \"" << jsonEscape(preint.error_status) << "\",\n"
+               << "  \"state_order\": \"dtheta,dv,dp,dba,dbg\"\n"
+               << "}\n";
         return true;
+    }
+
+    bool MappingAlg::writeMapManifest(const std::string& map_subdir)
+    {
+        const bool rtk_fixed = gnss_origin_initialized_ && gnss_alignment_locked_;
+        std::size_t preintegration_count = 0;
+        std::error_code filesystem_error;
+        const auto preint_dir = std::filesystem::path(map_subdir) / "imu_preintegration";
+        if (std::filesystem::is_directory(preint_dir, filesystem_error))
+        {
+            for (const auto& entry : std::filesystem::directory_iterator(preint_dir, filesystem_error))
+            {
+                if (!filesystem_error && entry.is_regular_file() && entry.path().extension() == ".json")
+                    ++preintegration_count;
+            }
+        }
+        std::ofstream output(map_subdir + "/map_manifest.json", std::ios::out | std::ios::trunc);
+        if (!output.is_open())
+        {
+            keyframe_writer_error_ = "cannot create map_manifest.json";
+            return false;
+        }
+        output << "{\n"
+               << "  \"schema_version\": 2,\n"
+               << "  \"coordinate_mode\": \"" << (rtk_fixed ? "rtk_fixed" : "local_only") << "\",\n"
+               << "  \"scene_scope\": \"" << (rtk_fixed ? "" : "indoor") << "\",\n"
+               << "  \"localization_mode\": \"" << (rtk_fixed ? "rtk_ndt" : "ndt") << "\",\n"
+               << "  \"origin_status\": \"" << (rtk_fixed ? "fixed" : "local_only") << "\",\n"
+               << "  \"rtk_origin_required\": " << (rtk_fixed ? "true" : "false") << ",\n"
+               << "  \"completeness\": \"complete\",\n"
+               << "  \"frame_id\": \"map\",\n"
+               << "  \"quaternion_order\": \"xyzw\",\n"
+               << "  \"keyframe_count\": " << mapping_keyframes_.size() << ",\n"
+               << "  \"point_cloud_count\": " << mapping_keyframes_.size() << ",\n"
+               << "  \"preintegration_count\": " << preintegration_count << ",\n"
+               << "  \"scan_context_count\": " << scan_context_count_ << ",\n"
+               << "  \"loop_closure_count\": " << global_factor_graph_result_.loop_closure_factor_count << ",\n"
+               << "  \"global_factor_count\": " << global_factor_graph_result_.factor_count << ",\n"
+               << "  \"trajectory_source\": \"" << (global_optimization_applied_ ? "gtsam_global_optimized" : "raw") << "\",\n"
+               << "  \"loop_status\": \"" << loop_status_ << "\"\n"
+               << "}\n";
+        return true;
+    }
+
+    void MappingAlg::accumulateImuPreintegration(double timestamp, const Vec3d& acc, const Vec3d& gyro)
+    {
+        std::lock_guard<std::mutex> lock(imu_preint_mutex_);
+        if (timestamp < imu_preint_last_t_ && imu_preint_has_sample_)
+        {
+            imu_preint_error_ = "time_rollback";
+            imu_preint_has_sample_ = false;
+            imu_preint_samples_ = 0;
+            imu_preint_dR_ = Eye3d;
+            imu_preint_dv_ = Zero3d;
+            imu_preint_dp_ = Zero3d;
+            imu_preint_cov_.setZero();
+            imu_preint_last_t_ = timestamp;
+            imu_preint_last_acc_ = acc;
+            imu_preint_last_gyro_ = gyro;
+            imu_preint_has_sample_ = true;
+            return;
+        }
+        if (!imu_preint_has_sample_)
+        {
+            imu_preint_start_ = imu_preint_start_ > 0.0 ? imu_preint_start_ : timestamp;
+            imu_preint_last_t_ = timestamp;
+            imu_preint_last_acc_ = acc;
+            imu_preint_last_gyro_ = gyro;
+            imu_preint_has_sample_ = true;
+            imu_preint_ba_ = Vec3d(state_point.ba(0), state_point.ba(1), state_point.ba(2));
+            imu_preint_bg_ = Vec3d(state_point.bg(0), state_point.bg(1), state_point.bg(2));
+            return;
+        }
+        const double dt = timestamp - imu_preint_last_t_;
+        if (dt <= 0.0)
+            return;
+        if (dt > 0.25)
+            imu_preint_error_ = imu_preint_error_.empty() ? "imu_gap" : imu_preint_error_;
+        const Vec3d unbiased_acc = imu_preint_last_acc_ - imu_preint_ba_;
+        const Vec3d unbiased_gyro = imu_preint_last_gyro_ - imu_preint_bg_;
+        imu_preint_dp_ += imu_preint_dv_ * dt + 0.5 * imu_preint_dR_ * unbiased_acc * dt * dt;
+        imu_preint_dv_ += imu_preint_dR_ * unbiased_acc * dt;
+        imu_preint_dR_ = imu_preint_dR_ * Exp(unbiased_gyro, dt);
+        const double acc_var = acc_cov * acc_cov * dt;
+        const double gyro_var = gyr_cov * gyr_cov * dt;
+        const double ba_var = b_acc_cov * b_acc_cov * dt;
+        const double bg_var = b_gyr_cov * b_gyr_cov * dt;
+        imu_preint_cov_.block<3, 3>(0, 0) += Mat3d::Identity() * gyro_var;
+        imu_preint_cov_.block<3, 3>(3, 3) += Mat3d::Identity() * acc_var;
+        imu_preint_cov_.block<3, 3>(6, 6) += Mat3d::Identity() * acc_var * dt * dt;
+        imu_preint_cov_.block<3, 3>(9, 9) += Mat3d::Identity() * ba_var;
+        imu_preint_cov_.block<3, 3>(12, 12) += Mat3d::Identity() * bg_var;
+        ++imu_preint_samples_;
+        imu_preint_last_t_ = timestamp;
+        imu_preint_last_acc_ = acc;
+        imu_preint_last_gyro_ = gyro;
+    }
+
+    ImuPreintegrationSnapshot MappingAlg::captureImuPreintegration(double keyframe_stamp)
+    {
+        std::lock_guard<std::mutex> lock(imu_preint_mutex_);
+        ImuPreintegrationSnapshot snapshot;
+        snapshot.start_timestamp = imu_preint_start_;
+        snapshot.end_timestamp = keyframe_stamp;
+        snapshot.delta_t = keyframe_stamp - imu_preint_start_;
+        const Eigen::Quaterniond delta_q = rotationToXyzw(imu_preint_dR_);
+        snapshot.delta_rotation_xyzw[0] = delta_q.x();
+        snapshot.delta_rotation_xyzw[1] = delta_q.y();
+        snapshot.delta_rotation_xyzw[2] = delta_q.z();
+        snapshot.delta_rotation_xyzw[3] = delta_q.w();
+        snapshot.delta_velocity = imu_preint_dv_;
+        snapshot.delta_position = imu_preint_dp_;
+        snapshot.linearized_accel_bias = imu_preint_ba_;
+        snapshot.linearized_gyro_bias = imu_preint_bg_;
+        snapshot.imu_sample_count = imu_preint_samples_;
+        for (int row = 0; row < 15; ++row)
+        {
+            for (int col = 0; col < 15; ++col)
+                snapshot.covariance[static_cast<std::size_t>(row * 15 + col)] = imu_preint_cov_(row, col);
+        }
+        if (!imu_preint_has_prev_keyframe_)
+            snapshot.error_status = "no_previous_keyframe";
+        else if (!imu_preint_error_.empty())
+            snapshot.error_status = imu_preint_error_;
+        else if (imu_preint_samples_ <= 0)
+            snapshot.error_status = "empty_interval";
+        imu_preint_has_prev_keyframe_ = true;
+        imu_preint_start_ = keyframe_stamp;
+        imu_preint_dR_ = Eye3d;
+        imu_preint_dv_ = Zero3d;
+        imu_preint_dp_ = Zero3d;
+        imu_preint_cov_.setZero();
+        imu_preint_samples_ = 0;
+        imu_preint_error_.clear();
+        imu_preint_ba_ = Vec3d(state_point.ba(0), state_point.ba(1), state_point.ba(2));
+        imu_preint_bg_ = Vec3d(state_point.bg(0), state_point.bg(1), state_point.bg(2));
+        return snapshot;
+    }
+
+    void MappingAlg::resetImuPreintegration(double start_timestamp)
+    {
+        std::lock_guard<std::mutex> lock(imu_preint_mutex_);
+        imu_preint_has_prev_keyframe_ = false;
+        imu_preint_has_sample_ = false;
+        imu_preint_start_ = start_timestamp;
+        imu_preint_last_t_ = start_timestamp;
+        imu_preint_last_acc_ = Zero3d;
+        imu_preint_last_gyro_ = Zero3d;
+        imu_preint_dR_ = Eye3d;
+        imu_preint_dv_ = Zero3d;
+        imu_preint_dp_ = Zero3d;
+        imu_preint_ba_ = Zero3d;
+        imu_preint_bg_ = Zero3d;
+        imu_preint_cov_.setZero();
+        imu_preint_samples_ = 0;
+        imu_preint_error_.clear();
     }
 
     void MappingAlg::writeSaveProgress(
@@ -2410,6 +3271,7 @@ namespace robot::slam
                << ", \"horizontal_std\": " << latest.rtk_horizontal_std
                << ", \"age_seconds\": " << latest.rtk_age_seconds << "},\n"
                << "  \"rtk_alignment\": {\"locked\": " << (gnss_alignment_locked_ ? "true" : "false")
+               << ", \"source\": \"" << jsonEscape(gnss_alignment_source_) << "\""
                << ", \"samples\": " << gnss_alignment_samples_.size()
                << ", \"rms\": " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0)
                << ", \"yaw_deg\": " << gnss_enu_to_map_yaw_ * 180.0 / M_PI
@@ -2461,7 +3323,18 @@ namespace robot::slam
             return false;
         }
         stopKeyframeWriter(true);
-        writeSaveProgress("filtering", 8.0);
+        writeSaveProgress("global_optimization", 8.0);
+        if (!optimizeHistoricalTrajectory(active_map_subdir_))
+        {
+            // Keep the map export recoverable when an external loop file or graph
+            // is invalid. Raw keyframes remain available for a later batch retry.
+            RCLCPP_WARN(get_logger(), "Global optimization unavailable; exporting raw trajectory: %s",
+                keyframe_writer_error_.c_str());
+            optimized_global_poses_.clear();
+            global_pose_covariances_.clear();
+            global_optimization_applied_ = false;
+        }
+        writeSaveProgress("filtering", 12.0);
 
         std::size_t written_points = 0;
         if (!streamMapFromKeyframes(active_map_subdir_, written_points))
@@ -2476,14 +3349,21 @@ namespace robot::slam
         if (!mapping_keyframes_.empty() && pcd2pgm_projection_padding_m_ > 0.0)
         {
             grid_options.use_xy_bounds = true;
-            grid_options.x_min = grid_options.x_max = mapping_keyframes_.front().lidar_origin.x();
-            grid_options.y_min = grid_options.y_max = mapping_keyframes_.front().lidar_origin.y();
-            for (const auto& keyframe : mapping_keyframes_)
+            const auto projected_lidar_position = [this](std::size_t index) -> Vec3d {
+                if (global_optimization_applied_ && index < optimized_global_poses_.size())
+                    return optimizedLidarPose(mapping_keyframes_[index], optimized_global_poses_[index]).translation().eval();
+                return mapping_keyframes_[index].lidar_origin;
+            };
+            const auto first_position = projected_lidar_position(0);
+            grid_options.x_min = grid_options.x_max = first_position.x();
+            grid_options.y_min = grid_options.y_max = first_position.y();
+            for (std::size_t index = 0; index < mapping_keyframes_.size(); ++index)
             {
-                grid_options.x_min = std::min(grid_options.x_min, keyframe.lidar_origin.x());
-                grid_options.x_max = std::max(grid_options.x_max, keyframe.lidar_origin.x());
-                grid_options.y_min = std::min(grid_options.y_min, keyframe.lidar_origin.y());
-                grid_options.y_max = std::max(grid_options.y_max, keyframe.lidar_origin.y());
+                const auto position = projected_lidar_position(index);
+                grid_options.x_min = std::min(grid_options.x_min, position.x());
+                grid_options.x_max = std::max(grid_options.x_max, position.x());
+                grid_options.y_min = std::min(grid_options.y_min, position.y());
+                grid_options.y_max = std::max(grid_options.y_max, position.y());
             }
             grid_options.x_min -= pcd2pgm_projection_padding_m_;
             grid_options.x_max += pcd2pgm_projection_padding_m_;

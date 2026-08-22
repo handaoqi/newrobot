@@ -54,7 +54,7 @@ ssh robot@192.168.234.234
 source /opt/ros/humble/setup.bash
 
 # 加载 RoamerX Lite 编译产物
-source ~/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 ```
 
 ---
@@ -94,7 +94,7 @@ ssh firefly@192.168.234.1
 ```bash
 # 加载 RoamerX Lite 环境
 source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 
 # 启动定位节点
 # 功能：
@@ -108,7 +108,7 @@ ros2 launch localization localization.launch.py platform:=NX_XG3588
 
 ### 定位配置文件
 ```
-~/genisom_roamerx_open/src/localization/localization/config/config.yaml
+/home/dogrobot/robot/src/localization/localization/config/config.yaml
 ```
 关键参数：
 - `send_tf_transforms: true` — 启用 TF 发布
@@ -122,7 +122,7 @@ ros2 launch localization localization.launch.py platform:=NX_XG3588
 ```bash
 # 加载 RoamerX Lite 环境
 source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 
 # 启动导航
 # 参数说明：
@@ -149,7 +149,7 @@ ros2 launch robot_navigo navigation_bringup.launch.py \
 
 ### 导航配置文件
 ```
-~/genisom_roamerx_open/install/robot_navigo/share/robot_navigo/params/navigo_params.yaml
+/home/dogrobot/robot/install/robot_navigo/share/robot_navigo/params/navigo_params.yaml
 ```
 关键参数：
 - `footprint: "[[0.35,0.25],[0.35,-0.25],[-0.35,-0.25],[-0.35,0.25]]"` — 机器人足迹 70cm×50cm
@@ -172,8 +172,8 @@ ssh -X robot@192.168.234.234
 
 # 启动 RViz
 source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
-ros2 run rviz2 rviz2 -d ~/genisom_roamerx_open/install/robot_navigo/share/robot_navigo/rviz/rviz2_config.rviz
+source /home/dogrobot/robot/install/setup.bash
+ros2 run rviz2 rviz2 -d /home/dogrobot/robot/install/robot_navigo/share/robot_navigo/rviz/rviz2_config.rviz
 ```
 > **RViz 操作：**
 > - 点击工具栏 **"2D Goal Pose"**（绿色箭头）设置导航目标
@@ -198,35 +198,40 @@ ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{
 
 ## 五、建图流程
 
+真机只走 Edge `MappingAdapter`，不要在 NX 上启动 `robot_slam/slam.launch.py`（默认虽已关闭 RViz，但仍不是进程主人）。
+
 ### 5.1 启动建图
-```bash
-source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
 
-# 启动 SLAM 建图
-ros2 launch robot_slam slam.launch.py platform:=NX_XG3588
+```bash
+cd /home/dogrobot/robot
+script/robot/start_mapping_real.sh start
 ```
 
-### 5.2 开始记录数据
+脚本会：停导航、确认 Mid-360 点云/IMU、`systemctl start roamerx-mapping`、调用 `/slam/start_mapping`，然后等到 IMU 初始化和首个关键帧完成才提示可以移动。
+
+云端等效命令是 `mapping.start`。
+
+### 5.2 保存地图
+
 ```bash
-# 通过服务调用开始建图（data: 3 = 开始建图）
-ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 3}"
+script/robot/start_mapping_real.sh save
+# 或
+ros2 service call /slam/save_map std_srvs/srv/Trigger
 ```
 
-### 5.3 保存地图
-```bash
-# 地图自动保存到 /home/dogrobot/runtime/nx-edge/data/jszr/map/
-# 通过服务调用保存地图（data: 5 = 保存地图）
-ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
-```
+地图写到 `/home/dogrobot/runtime/nx-edge/data/jszr/map/<session>/`。本机 `save` 不上传；云端 `mapping.save` 会打包上传。
 
-### 5.4 地图文件说明
+### 5.3 地图文件说明
+
 ```
 /home/dogrobot/runtime/nx-edge/data/jszr/map/
-├── map.pcd         # 全局点云地图（约 170MB，用于 NDT 定位）
-├── map.pgm         # 栅格地图（用于导航路径规划）
-├── map.yaml        # 栅格地图配置文件
-└── map_preview.png # 地图预览图
+├── <timestamp>/
+│   ├── map.pcd
+│   ├── map.pgm
+│   ├── map.yaml
+│   ├── map.txt
+│   └── keyframes/
+└── map.yaml -> <active session>/map.yaml
 ```
 
 ---
@@ -240,7 +245,7 @@ ros2 service call /slam_state_service robots_dog_msgs/srv/MapState "{data: 5}"
 
 # 1. 加载环境
 source /opt/ros/humble/setup.bash
-source ~/genisom_roamerx_open/install/setup.bash
+source /home/dogrobot/robot/install/setup.bash
 
 # 2. 启动定位（后台运行）
 ros2 launch localization localization.launch.py platform:=NX_XG3588 &
@@ -263,7 +268,7 @@ echo "导航已启动 PID=$NAV_PID"
 sleep 10
 
 # 6. 启动 RViz（前台运行，便于查看日志）
-ros2 run rviz2 rviz2 -d ~/genisom_roamerx_open/install/robot_navigo/share/robot_navigo/rviz/rviz2_config.rviz
+ros2 run rviz2 rviz2 -d /home/dogrobot/robot/install/robot_navigo/share/robot_navigo/rviz/rviz2_config.rviz
 
 # 7. RViz 关闭后清理后台进程
 kill $LOC_PID $NAV_PID 2>/dev/null

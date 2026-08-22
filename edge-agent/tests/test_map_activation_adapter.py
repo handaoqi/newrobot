@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+
 from roamerx_edge.map_activation_adapter import MapActivationAdapter
+from roamerx_edge.protocol import ProtocolError
 from roamerx_edge.safety_policy import RuntimeSafetyState
 
 
@@ -13,6 +16,30 @@ def _source_map(root, name, *, gnss=False):
         (source / "gnss_origin.yaml").write_text("origin_latitude: 1.0\n")
     (source / "map.txt").write_text("# path\n1.25 -2.50 0.75\n2.0 -2.0 0.8\n")
     return source
+
+
+def test_activation_rejects_local_only_outdoor_scene(tmp_path):
+    source = _source_map(tmp_path, "local-only")
+    (source / "map_manifest.json").write_text(
+        '{"schema_version": 2, "coordinate_mode": "local_only", "scene_scope": "indoor", '
+        '"localization_mode": "ndt", "origin_status": "local_only"}'
+    )
+    config_path = tmp_path / "edge.yaml"
+    config_path.write_text("robot: {}\n")
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(map_dir=str(tmp_path)),
+        robot=SimpleNamespace(current_map_id="", current_map_version=""),
+    )
+    adapter = MapActivationAdapter(config, RuntimeSafetyState(), str(config_path))
+
+    with pytest.raises(ProtocolError) as error:
+        adapter.activate({
+            "map_id": "9",
+            "map_version": "v9",
+            "local_map_dir": str(source),
+            "scene_scope": "outdoor",
+        })
+    assert error.value.code == "MAP_LOCAL_ONLY_OUTDOOR_FORBIDDEN"
 
 
 def test_activation_removes_stale_map_scoped_gnss_metadata(tmp_path):

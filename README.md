@@ -16,8 +16,10 @@ platform, edge control, and deployment tooling.
 - `deploy/`: stable entry points for robot, cloud, and RK3588 deployment.
 
 Runtime data and credentials are intentionally excluded. Maps live under
-`/home/robot/.jszr/map`, rosbags under `/home/robot/rosbags`, device settings
-under `/home/robot/edge_agent`, and cloud state under `/opt/roamerx/shared`.
+Runtime data is stored under `/home/dogrobot/runtime/nx-edge`, with maps in
+`/home/dogrobot/runtime/nx-edge/data/jszr/map` and rosbags in
+`/home/dogrobot/runtime/nx-edge/data/rosbags`. Cloud state remains on the
+cloud host under `/opt/roamerx/shared`.
 
 ## Common Commands
 
@@ -44,8 +46,10 @@ scripts/test_agents.sh
 Deploy using the stable wrappers:
 
 ```bash
-deploy/robot/deploy.sh --host robot@ROBOT_IP --build
-deploy/cloud/deploy.sh
+deploy/nx-edge/deploy.sh --host robot@ROBOT_IP --build
+deploy/platform/deploy.sh
+deploy/3588/deploy.sh
+deploy/backup/backup-all.sh
 ```
 
 The canonical branch is `main`. Pre-consolidation snapshots are retained as

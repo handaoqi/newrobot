@@ -43,6 +43,11 @@ safety:
   stop_speed_threshold_mps: 0.03
   localization_stable_seconds: 3.0
   localization_loss_samples: 5
+  ndt_failure_score: 0.5
+  ndt_failure_samples: 3
+  localization_recovery_attempts: 3
+  localization_recovery_retry_seconds: 5.0
+  localization_recovery_cycle_seconds: 30.0
   stop_confirmation_seconds: 1.0
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
@@ -73,10 +78,18 @@ mapping:
   log_dir: /tmp/roamerx_mapping_logs
   map_dir: "/home/dogrobot/runtime/nx-edge/data/jszr/map"
   ros_setup: "/opt/ros/humble/setup.bash"
-  workspace_setup: "~/genisom_roamerx_open/install/setup.bash"
-  slam_command: "ros2 run robot_slam mapping --ros-args --params-file $HOME/genisom_roamerx_open/install/robot_slam/share/robot_slam/config/config.yaml"
+  workspace_setup: "/home/dogrobot/robot/install/setup.bash"
+  slam_binary: "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping"
+  slam_params_file: "/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
+  slam_command: "exec /home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping --ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
+  mapping_unit: "roamerx-mapping.service"
+  navigation_script: "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
   service_name: "/slam_state_service"
   service_type: "robots_dog_msgs/srv/MapState"
+  start_service: "/slam/start_mapping"
+  start_service_type: "std_srvs/srv/Trigger"
+  save_service: "/slam/save_map"
+  save_service_type: "std_srvs/srv/Trigger"
   start_data: 3
   save_data: 5
   command_timeout_seconds: 15

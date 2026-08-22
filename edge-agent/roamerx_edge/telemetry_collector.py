@@ -173,6 +173,30 @@ class TelemetryCollector:
         with self._lock:
             return dict(self._localization_decision)
 
+    def localization_diagnostics(self) -> dict:
+        with self._lock:
+            pose = self._pose
+            quality = self._localization_quality
+            return {
+                "raw_pose": {
+                    "x": pose.x,
+                    "y": pose.y,
+                    "z": pose.z,
+                    "yaw": pose.yaw,
+                    "sampled_at": pose.sampled_at,
+                    "localization_status": pose.localization_status,
+                    "frame_id": "map",
+                } if pose else None,
+                "quality": {
+                    "sampled_at": quality.sampled_at,
+                    "has_converged": quality.has_converged,
+                    "matching_error": quality.matching_error,
+                    "inlier_fraction": quality.inlier_fraction,
+                    "relative_translation_m": quality.relative_translation_m,
+                } if quality else None,
+                "decision": dict(self._localization_decision),
+            }
+
     def configure_system_probe_staleness(self, stale_seconds: float) -> None:
         self._system_probe_stale_seconds = max(1.0, float(stale_seconds))
 

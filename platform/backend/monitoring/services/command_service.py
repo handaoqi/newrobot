@@ -52,6 +52,8 @@ class CommandService:
                 },
                 "record_rosbag": bool(command_options.get("record_rosbag", False)),
                 "loop_execution": bool(command_options.get("loop_execution", False)),
+                "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
+                "round_number": execution.round_number,
                 "docking": dict(command_options.get("docking") or {}),
             }
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)

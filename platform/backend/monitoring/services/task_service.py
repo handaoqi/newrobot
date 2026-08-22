@@ -8,6 +8,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from ..models import PatrolRoute, PatrolTask, Robot, TaskExecution, TaskExecutionEvent
+from .map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
 
 
 class TaskStateError(ValueError):
@@ -109,7 +110,13 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
             "sha256": None,
             "map_name": map_data.name,
             "local_map_dir": _map_local_dir(map_data),
+            "coordinate_mode": map_data.coordinate_mode,
+            "scene_scope": map_data.scene_scope,
+            "localization_mode": map_data.localization_mode,
+            "origin_status": map_data.origin_status,
+            "completeness": map_data.map_completeness,
         },
+        "scene_scope": getattr(route, "scene_scope", "") or map_data.scene_scope or "indoor",
         "waypoints": normalize_waypoints(route),
     }
     if route.map_set_id:
@@ -153,7 +160,13 @@ def _map_local_dir(map_data: MapData) -> str:
 class TaskExecutionService:
     @staticmethod
     @transaction.atomic
-    def create_execution(task: PatrolTask, operator=None) -> TaskExecution:
+    def create_execution(
+        task: PatrolTask,
+        operator=None,
+        *,
+        loop_session_id=None,
+        round_number: int = 1,
+    ) -> TaskExecution:
         robot = Robot.objects.select_for_update().get(pk=task.robot_id)
         if TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).exists():
             raise TaskStateError("ROBOT_BUSY")
@@ -162,6 +175,14 @@ class TaskExecutionService:
         route = task.route
         if route is None:
             raise TaskStateError("TASK_ROUTE_MISSING")
+        try:
+            validate_route_against_map(
+                constraints_from_map_data(route.map_data),
+                scene_scope=str(getattr(route, "scene_scope", "") or route.map_data.scene_scope or "indoor"),
+                waypoints=route.waypoints or [],
+            )
+        except MapConstraintError as exc:
+            raise TaskStateError(exc.code) from exc
         snapshot = build_route_snapshot(route)
         try:
             execution = TaskExecution.objects.create(
@@ -170,6 +191,8 @@ class TaskExecutionService:
                 route=route,
                 map_data=route.map_data,
                 route_snapshot=snapshot,
+                loop_session_id=loop_session_id,
+                round_number=max(1, int(round_number)),
                 total_waypoints=len(snapshot["waypoints"]),
                 created_by=operator,
             )
@@ -181,7 +204,11 @@ class TaskExecutionService:
             state_version=0,
             event_type="task.created",
             occurred_at=timezone.now(),
-            payload={"source": "center"},
+            payload={
+                "source": "center",
+                "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
+                "round_number": execution.round_number,
+            },
         )
         return execution
 

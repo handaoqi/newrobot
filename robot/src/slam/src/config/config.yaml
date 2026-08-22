@@ -3,8 +3,8 @@ laser_mapping:
     feature_extract_enable: false
     point_filter_num: 2
     max_iteration: 3
-    filter_size_surf: 0.2
-    filter_size_map: 0.2
+    filter_size_surf: 0.15
+    filter_size_map: 0.15
     cube_side_length: 1000.0
     common:
         lid_topic:  "/front_lidar"
@@ -52,6 +52,14 @@ laser_mapping:
         alignment_max_rms: 1.5
         alignment_max_yaw_change_deg: 3.0
         alignment_required_fits: 3
+        # Dual-antenna heading locks ENU-map yaw immediately so RTK fusion
+        # does not wait for a 15 m trajectory baseline. Trajectory fitting
+        # remains the fallback when heading is unavailable.
+        use_heading: true
+        heading_offset_deg: 0.0
+        heading_min_baseline_m: 0.20
+        heading_max_std_deg: 5.0
+        heading_max_age: 1.5
     odom_guard:
         # Disabled for live mapping until the lower-controller timestamp is fixed.
         # Offline rosbag replay enables this as a translation sanity constraint.
@@ -91,11 +99,30 @@ laser_mapping:
         voxel_size_m: 0.15
         # Bound the background disk writer so storage stalls cannot consume RAM.
         max_queue_size: 8
+    global_optimization:
+        # Batch optimize all saved keyframes before publishing the final map.
+        # NDT/LIO between factors, IMU preintegration, RTK XY/heading and
+        # optional loop_closures.csv constraints share one GTSAM graph.
+        enable: true
+        max_iterations: 80
+        prior_translation_sigma: 0.01
+        prior_rotation_sigma_rad: 0.01
+        ndt_translation_sigma: 0.15
+        ndt_rotation_sigma_rad: 0.08
+        imu_translation_sigma: 0.20
+        imu_rotation_sigma_rad: 0.12
+        rtk_position_sigma_floor: 0.20
+        rtk_heading_sigma_floor_rad: 0.035
+        loop_translation_sigma: 0.10
+        loop_rotation_sigma_rad: 0.08
+        robust_huber_k: 1.345
     publish:
         path_en: true                # true: publish Path
         map_en: false                 # true: publish Map cloud
         world_points_en:  true       # false: close all the point cloud output
         body_points_en: true  # true: output the point cloud scans in IMU-body-frame
+    storage:
+      data_path: "/home/dogrobot/runtime/nx-edge/data/jszr/map"
     pcd2pgm:
       file_name : "map"
       # 2D navigation map should only contain obstacles that can collide with the dog.
