@@ -55,7 +55,7 @@ class TelemetryConfig:
     battery_rated_capacity_wh: float = 216.0
     legacy_charge_status_interval_seconds: float = 12.0
     charger_speaker_sink: str = "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
-    nx_speaker_card: int = 2
+    nx_speaker_card: int = 0
     nx_speaker_control: str = "PCM"
 
 

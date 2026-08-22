@@ -33,7 +33,7 @@ class AudioControlAdapter:
             )
         elif target == "speaker_nx":
             command = (
-                "card=$(awk '/USB-Audio/{gsub(/[\\[\\]]/,\"\",$2); print $2; exit}' /proc/asound/cards); "
+                "card=$(awk '/USB-Audio/{print $1; exit}' /proc/asound/cards); "
                 "test -n \"$card\"; controls=$(amixer -c \"$card\" scontrols); "
                 "control=$(printf '%s\\n' \"$controls\" | sed -n \"s/^Simple mixer control '\\([^']*\\)'.*/\\1/p\" "
                 "| grep -E '^(PCM|Playback Feature Unit)$' | head -n1); "

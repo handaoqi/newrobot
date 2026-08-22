@@ -36,7 +36,7 @@ telemetry:
   charging_overheat_threshold_c: 49
   battery_rated_capacity_wh: 216
   charger_speaker_sink: "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
-  nx_speaker_card: 2
+  nx_speaker_card: 0
   nx_speaker_control: "PCM"
 
 safety:
