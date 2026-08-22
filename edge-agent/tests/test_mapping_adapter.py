@@ -108,7 +108,7 @@ def test_origin_topic_sample_requires_position_and_heading_fixed(tmp_path, monke
         },
         "/rtk/ntrip_status": {"data": "quality: rtk_fixed\nage_sec: 0.1"},
     }
-    monkeypatch.setattr(adapter, "_echo_topic_once", lambda topic: messages[topic])
+    monkeypatch.setattr(adapter, "_echo_topic_once", lambda topic, _timeout: messages[topic])
 
     sample = adapter._sample_origin_topics()
 

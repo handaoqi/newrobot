@@ -150,6 +150,8 @@ class MappingConfig:
     origin_lock_duration_seconds: float = 60.0
     origin_lock_max_spread_m: float = 0.02
     origin_lock_sample_interval_seconds: float = 1.0
+    origin_lock_no_signal_timeout_seconds: float = 3.0
+    origin_topic_timeout_seconds: float = 1.0
     origin_lock_ttl_seconds: int = 1800
     origin_fix_topic: str = "/fix"
     origin_rtk_topic: str = "/rtk_pvh"

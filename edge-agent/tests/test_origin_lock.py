@@ -1,4 +1,5 @@
 import yaml
+import time
 
 from roamerx_edge.origin_lock import OriginLockMonitor, OriginSample
 
@@ -55,3 +56,28 @@ def test_more_than_two_centimetres_resets_window(tmp_path):
     assert status["origin_status"] == "waiting_quality"
     assert status["reset_count"] == 1
     assert "2 cm" in status["message"]
+
+
+def test_missing_rtk_signal_fails_after_timeout(tmp_path):
+    def no_signal():
+        raise RuntimeError("/fix 超时无数据")
+
+    monitor = OriginLockMonitor(
+        no_signal,
+        str(tmp_path / "gnss_origin.yaml"),
+        sample_interval_seconds=0.01,
+        no_signal_timeout_seconds=0.05,
+    )
+    monitor.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        status = monitor.status()
+        while status["origin_status"] != "failed" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = monitor.status()
+    finally:
+        monitor.stop()
+
+    assert status["origin_status"] == "failed"
+    assert status["error_code"] == "RTK_SIGNAL_TIMEOUT"
+    assert "无信号" in status["message"]

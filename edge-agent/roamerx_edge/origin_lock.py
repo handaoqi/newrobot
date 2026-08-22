@@ -50,6 +50,7 @@ class OriginLockMonitor:
         min_baseline_m: float = 0.20,
         max_heading_std_deg: float = 5.0,
         max_age_seconds: float = 1.5,
+        no_signal_timeout_seconds: float = 3.0,
     ) -> None:
         self.sample_provider = sample_provider
         self.origin_file = Path(origin_file).expanduser()
@@ -59,6 +60,7 @@ class OriginLockMonitor:
         self.min_baseline_m = float(min_baseline_m)
         self.max_heading_std_deg = float(max_heading_std_deg)
         self.max_age_seconds = float(max_age_seconds)
+        self.no_signal_timeout_seconds = max(0.1, float(no_signal_timeout_seconds))
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -80,6 +82,8 @@ class OriginLockMonitor:
             "max_spread_m": 0.02,
             "sample_count": 0,
             "reset_count": 0,
+            "no_signal_seconds": 0.0,
+            "error_code": "",
             "message": "尚未开始锁定 ENU 原点",
         }
 
@@ -173,16 +177,28 @@ class OriginLockMonitor:
             return dict(self._status)
 
     def _run(self, generation: int) -> None:
+        no_signal_since: float | None = None
         while not self._stop.is_set() and generation == self._generation:
             try:
                 sample = self.sample_provider()
                 if self._stop.is_set() or generation != self._generation:
                     return
+                no_signal_since = None
                 self.ingest(sample)
             except Exception as exc:  # telemetry failure must remain visible, not kill the worker
                 if self._stop.is_set() or generation != self._generation:
                     return
                 with self._lock:
+                    now = time.monotonic()
+                    if no_signal_since is None:
+                        no_signal_since = now
+                    elapsed = now - no_signal_since
+                    if elapsed >= self.no_signal_timeout_seconds:
+                        self._fail_locked(
+                            f"RTK 连续 {self.no_signal_timeout_seconds:.1f} 秒无信号，原点锁定已停止"
+                        )
+                        return
+                    self._status["no_signal_seconds"] = elapsed
                     self._reset_window_locked(f"RTK 话题读取失败：{exc}")
             self._stop.wait(self.sample_interval_seconds)
 
@@ -214,6 +230,8 @@ class OriginLockMonitor:
                 age_seconds=sample.age_seconds,
                 ntrip_quality=sample.ntrip_quality,
                 last_sample_at=sample.sampled_at,
+                no_signal_seconds=0.0,
+                error_code="",
             )
             if self._status.get("origin_status") == "locked":
                 self._status["heading_stable"] = valid
@@ -271,6 +289,21 @@ class OriginLockMonitor:
             heading_stable=False,
             message=message,
         )
+
+    def _fail_locked(self, message: str) -> None:
+        self._samples.clear()
+        self._status.update(
+            origin_status="failed",
+            quality_started_at=None,
+            continuous_seconds=0.0,
+            position_spread_m=None,
+            sample_count=0,
+            heading_stable=False,
+            error_code="RTK_SIGNAL_TIMEOUT",
+            no_signal_seconds=self.no_signal_timeout_seconds,
+            message=message,
+        )
+        self._stop.set()
 
     @staticmethod
     def _spread_m(samples: deque[OriginSample]) -> float:

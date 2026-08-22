@@ -101,6 +101,7 @@ class MappingAdapter:
             min_baseline_m=config.heading_min_baseline_m,
             max_heading_std_deg=config.heading_max_std_deg,
             max_age_seconds=config.heading_max_age_seconds,
+            no_signal_timeout_seconds=config.origin_lock_no_signal_timeout_seconds,
         )
         self._restore_workflow_state()
 
@@ -495,6 +496,9 @@ class MappingAdapter:
         if state == "origin_waiting" and origin.get("origin_status") == "locked":
             self._set_state("origin_locked")
             state = "origin_locked"
+        if state in {"origin_starting", "origin_waiting"} and origin.get("origin_status") == "failed":
+            self._set_state("failed")
+            state = "failed"
         if state == "slam_warmup" and readiness.get("ready_for_mapping"):
             self._set_state("ready_to_map")
             state = "ready_to_map"
@@ -817,9 +821,10 @@ class MappingAdapter:
         return payload
 
     def _sample_origin_topics(self) -> OriginSample:
-        fix = self._echo_topic_once(self.config.origin_fix_topic)
-        pvh = self._echo_topic_once(self.config.origin_rtk_topic)
-        ntrip_message = self._echo_topic_once(self.config.origin_ntrip_status_topic)
+        timeout = self.config.origin_topic_timeout_seconds
+        fix = self._echo_topic_once(self.config.origin_fix_topic, timeout)
+        pvh = self._echo_topic_once(self.config.origin_rtk_topic, timeout)
+        ntrip_message = self._echo_topic_once(self.config.origin_ntrip_status_topic, timeout)
         ntrip_data = ntrip_message.get("data") or ""
         ntrip = yaml.safe_load(ntrip_data) if isinstance(ntrip_data, str) else ntrip_data
         if not isinstance(ntrip, dict):
