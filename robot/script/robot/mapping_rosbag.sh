@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 BAG_ROOT="${BAG_ROOT:-/home/dogrobot/runtime/nx-edge/data/rosbags/mapping}"
-STATE_DIR="${STATE_DIR:-/tmp/roamerx_mapping_rosbag}"
+STATE_DIR="${STATE_DIR:-/tmp/roamerx_mapping_rosbag-${UID:-$(id -u)}}"
 MIN_FREE_GB="${MIN_FREE_GB:-10}"
 PID_FILE="${STATE_DIR}/recorder.pid"
 SESSION_FILE="${STATE_DIR}/session.env"
@@ -11,6 +11,11 @@ LOG_FILE="${STATE_DIR}/recorder.log"
 ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-}"
 
 mkdir -p "${BAG_ROOT}" "${STATE_DIR}"
+if [ ! -w "${STATE_DIR}" ]; then
+  echo "ERROR: rosbag state directory is not writable by $(id -un): ${STATE_DIR}" >&2
+  echo "Set STATE_DIR to a writable per-user directory and retry." >&2
+  exit 1
+fi
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
