@@ -105,4 +105,9 @@ chown -R dogrobot:robot "$CONF_ROOT"
 chmod 750 "$CONF_ROOT"
 find "$CONF_ROOT" -type f -exec chmod 640 {} +
 find "$CONF_ROOT" -type f \( -name README.md -o -name '*.example' -o -name '*.example.*' \) -exec chmod 644 {} +
+# The Edge Agent runs as `robot` and persists the selected map in the runtime
+# config after a successful map activation. Keep only this operational config
+# group-writable; credentials and the remaining config files stay 0640.
+chmod 2770 "$CONF_ROOT"
+chmod 660 "$CONF_ROOT/edge-agent.yaml"
 echo "NX runtime data migrated to $RUNTIME_ROOT"
