@@ -417,6 +417,7 @@ const mappingModeSwitchDisabled = computed(() => (
 const canLockOrigin = computed(() => (
   isOutdoorMapping.value
   && connectionStatus.value === 'online'
+  && mappingState.value === 'origin_waiting'
   && !mappingProcessAlive.value
   && !originLocked.value
   && !mappingCommandInFlight.value
