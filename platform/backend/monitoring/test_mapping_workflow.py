@@ -31,6 +31,12 @@ class MappingWorkflowApiTests(TestCase):
         self.assertEqual(origin.command_type, "mapping.origin_start")
         self.assertEqual(origin.payload["mapping_type"], "outdoor")
 
+        prepare = self.command_for(
+            "origin/start",
+            {"map_name": "园区 A", "scene_scope": "outdoor", "prepare_only": True},
+        )
+        self.assertTrue(prepare.payload["prepare_only"])
+
         slam = self.command_for(
             "slam/start",
             {"map_name": "园区 A", "mapping_type": "outdoor", "record_rosbag": True},

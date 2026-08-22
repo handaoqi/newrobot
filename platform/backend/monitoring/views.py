@@ -2546,6 +2546,24 @@ class RobotMappingStatusView(APIView):
             command
             and command.status in {"created", "published", "accepted", "executing"}
         )
+        # Edge Agent may publish its terminal mapping snapshot before the
+        # command.result event reaches the cloud. Do not let the old command
+        # status keep the indoor/outdoor controls locked in that brief (or
+        # recovered) window.
+        live_mapping_state = str(live_mapping.get("state") or "")
+        live_mapping_terminal = bool(
+            live_mapping
+            and not live_mapping.get("process_alive")
+            and live_mapping_state in {"exited", "completed", "failed", "cancelled"}
+        )
+        effective_command_status = command.status if command else "idle"
+        if command_is_active and live_mapping_terminal:
+            command_is_active = False
+            effective_command_status = (
+                "failed" if live_mapping_state == "failed"
+                else "cancelled" if live_mapping_state == "cancelled"
+                else "succeeded"
+            )
         live_mapping_is_active = bool(
             live_mapping.get("process_alive")
             or live_mapping.get("state") not in {None, "idle"}
@@ -2612,7 +2630,7 @@ class RobotMappingStatusView(APIView):
                 "current_map_version": robot.current_map_version,
                 "command_type": command.command_type if command else None,
                 "mapping_state": mapping_state,
-                "command_status": command.status if command else "idle",
+                "command_status": effective_command_status,
                 "command_id": str(command.id) if command else None,
                 "issued_at": command.issued_at if command else None,
                 "acknowledged_at": command.acknowledged_at if command else None,
@@ -2703,6 +2721,9 @@ class RobotMappingOriginStartView(RobotMappingCommandView):
             "route_hint": request.data.get("route_hint", ""),
             "mapping_type": "outdoor",
             "scene_scope": scene_scope,
+            "mapping_session_id": request.data.get("mapping_session_id", ""),
+            "record_rosbag": bool(request.data.get("record_rosbag", False)),
+            "prepare_only": bool(request.data.get("prepare_only", False)),
         }
 
 

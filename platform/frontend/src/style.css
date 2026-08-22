@@ -913,6 +913,17 @@ a { color: inherit; }
   background: rgba(255, 107, 107, 0.1);
 }
 
+.mapping-step-feedback {
+  display: grid;
+  gap: 4px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(80, 167, 255, 0.1);
+}
+
+.mapping-step-feedback.is-success { color: #8ce0b1; border: 1px solid rgba(80, 210, 140, 0.35); }
+.mapping-step-feedback.is-error { color: #ff8b8b; border: 1px solid rgba(255, 107, 107, 0.35); }
+
 .mapping-actions .btn {
   min-height: 42px;
 }

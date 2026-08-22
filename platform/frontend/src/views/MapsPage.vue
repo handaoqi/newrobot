@@ -26,6 +26,7 @@ const loading = ref(false)
 const uploading = ref(false)
 const showUploadDialog = ref(false)
 const mappingBusy = ref(false)
+const mappingStepFeedback = ref(null)
 const mappingStatus = ref(null)
 const selectedMapId = ref(null)
 const mapImageError = ref({})
@@ -54,6 +55,10 @@ const mappingForm = ref({
   scene_scope: 'indoor',
   mapping_type: 'indoor',
 })
+
+function setMappingStepFeedback(step, success, message) {
+  mappingStepFeedback.value = { step, success, message, at: Date.now() }
+}
 let statusTimer = null
 let lastSlamAlert = ''
 
@@ -635,6 +640,7 @@ async function handleStartMapping() {
     return
   }
   mappingBusy.value = true
+  const prepareOrigin = isOutdoorMapping.value && !originLocked.value
   try {
     const payload = {
       map_name: mappingForm.value.map_name,
@@ -650,7 +656,13 @@ async function handleStartMapping() {
       await startRobotMappingSlam(mappingForm.value.robot, payload)
     }
     await refreshMappingStatus()
+    setMappingStepFeedback(
+      prepareOrigin ? '启动并检查' : (isOutdoorMapping.value ? '启动 SLAM 并检查航向' : '启动并检查'),
+      true,
+      prepareOrigin ? '传感器检查完成，已停在“锁定原点”，等待点击锁定按钮' : '已进入下一检查步骤，等待人工确认后继续',
+    )
   } catch (error) {
+    setMappingStepFeedback('启动并检查', false, error.message)
     alert(`开始建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -674,6 +686,7 @@ async function handleMappingTypeChange(mappingType) {
     }
   }
   mappingForm.value.mapping_type = mappingType
+  mappingStepFeedback.value = null
   await refreshMappingStatus()
 }
 
@@ -692,7 +705,9 @@ async function handleLockOrigin() {
       mapping_session_id: workflowSessionId.value,
     })
     await refreshMappingStatus()
+    setMappingStepFeedback('锁定 ENU 原点', true, '原点质量窗口已启动，等待 60 秒连续质量检查')
   } catch (error) {
+    setMappingStepFeedback('锁定 ENU 原点', false, error.message)
     alert(`锁定原点启动失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -712,7 +727,13 @@ async function handleBeginMapping() {
       heading_check_confirmed: isOutdoorMapping.value,
     })
     await refreshMappingStatus()
+    setMappingStepFeedback(
+      isOutdoorMapping.value ? '航向复核' : '检查确认',
+      true,
+      '人工确认已完成，正式关键帧采集已开始',
+    )
   } catch (error) {
+    setMappingStepFeedback(isOutdoorMapping.value ? '航向复核' : '检查确认', false, error.message)
     alert(`开始正式建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -728,7 +749,9 @@ async function handleSaveMapping() {
     })
     await refreshMappingStatus()
     await loadMaps()
+    setMappingStepFeedback('停止并保存地图', true, '保存命令已执行，地图正在完成打包/上传')
   } catch (error) {
+    setMappingStepFeedback('停止并保存地图', false, error.message)
     alert(`停止并保存失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -746,7 +769,9 @@ async function handleCancelMapping() {
       await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel', mapping_session_id: workflowSessionId.value })
     }
     await refreshMappingStatus()
+    setMappingStepFeedback('取消建图', true, '建图流程已取消并停止')
   } catch (error) {
+    setMappingStepFeedback('取消建图', false, error.message)
     alert(`取消建图失败: ${error.message}`)
   } finally {
     mappingBusy.value = false
@@ -1497,10 +1522,24 @@ async function saveCleaner() {
           </button>
         </div>
 
-        <div v-if="isError" class="mapping-error">
-          <strong>状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
+        <div v-if="mappingStepFeedback" class="mapping-step-feedback" :class="mappingStepFeedback.success ? 'is-success' : 'is-error'">
+          <strong>{{ mappingStepFeedback.success ? '✓' : '✕' }} {{ mappingStepFeedback.step }}</strong>
+          <span>{{ mappingStepFeedback.message }}</span>
+        </div>
+
+        <div v-if="isError && isOutdoorMapping" class="mapping-error mapping-error-outdoor">
+          <strong>室外建图状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
           <span v-if="failureCode">错误码：{{ failureCode }}</span>
           <span>失败信息：{{ failureMessage }}</span>
+        </div>
+        <div v-else-if="isError" class="mapping-error mapping-error-indoor">
+          <strong>室内建图状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
+          <span v-if="failureCode">错误码：{{ failureCode }}</span>
+          <span>失败信息：{{ failureMessage }}</span>
+        </div>
+        <div v-else-if="mappingStatus?.error_message" class="mapping-error">
+          <strong>{{ isOutdoorMapping ? '室外建图错误' : '室内建图错误' }}</strong>
+          <span>{{ mappingStatus.error_message }}</span>
         </div>
         <div
           v-else-if="mappingStatus?.last_command_error_message && ['failed', 'rejected', 'timed_out'].includes(commandStatus)"
