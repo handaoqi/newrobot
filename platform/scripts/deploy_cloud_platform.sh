@@ -44,10 +44,25 @@ if "$DEPLOY_FRONTEND"; then
   echo "[deploy] Building frontend locally..."
   (cd "$PROJECT_DIR/frontend" && npm run build)
   echo "[deploy] Syncing frontend dist..."
-  rsync -a "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
+  # Publish the build as a mirror so stale content-hashed bundles cannot be
+  # selected by an old cached index or left behind after a build changes.
+  rsync -a --delete "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
   # The build workspace may use restrictive file permissions. Nginx must be
   # able to traverse the directory and read every static asset after syncing.
   ssh "$CLOUD_HOST" "chmod -R a+rX '$REMOTE_ROOT/frontend/dist'"
+  local_index_sha="$(sha256sum "$PROJECT_DIR/frontend/dist/index.html" | awk '{print $1}')"
+  remote_index_sha="$(ssh "$CLOUD_HOST" "sha256sum '$REMOTE_ROOT/frontend/dist/index.html'" | awk '{print $1}')"
+  if [[ -z "$local_index_sha" || "$local_index_sha" != "$remote_index_sha" ]]; then
+    echo "[deploy] Frontend index verification failed (local=$local_index_sha remote=$remote_index_sha)" >&2
+    exit 1
+  fi
+  echo "[deploy] Frontend index verified: $local_index_sha"
+  public_index_sha="$(curl --noproxy '*' --fail --silent --show-error --max-time 15 "$BASE_URL/" | sha256sum | awk '{print $1}')"
+  if [[ -z "$public_index_sha" || "$local_index_sha" != "$public_index_sha" ]]; then
+    echo "[deploy] Public frontend verification failed (local=$local_index_sha public=$public_index_sha url=$BASE_URL/)" >&2
+    exit 1
+  fi
+  echo "[deploy] Public frontend verified: $public_index_sha"
 fi
 
 if "$DEPLOY_BACKEND"; then
