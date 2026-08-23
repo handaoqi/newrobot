@@ -9,6 +9,7 @@ const props = defineProps({
   playUrls: { type: Object, default: () => ({}) },
   robotId: { type: [Number, String], default: null },
   available: { type: Boolean, default: true },
+  loading: { type: Boolean, default: false },
   objectFit: { type: String, default: 'cover' },
 })
 
@@ -16,6 +17,7 @@ const emit = defineEmits(['notice', 'stream-error'])
 
 const videoRef = ref(null)
 const streamUnavailable = ref(false)
+const streamLoading = ref(false)
 const liveAudioEnabled = ref(false)
 const browserAudioMuted = ref(true)
 const browserAudioVolume = ref(1)
@@ -153,6 +155,7 @@ function destroyPlayers() {
 
 function markStreamUnavailable() {
   streamUnavailable.value = true
+  streamLoading.value = false
   destroyPlayers()
   emit('stream-error')
 }
@@ -254,11 +257,15 @@ function handleVideoPlay() {
 
 async function setupPlayer() {
   const version = ++setupVersion
+  streamLoading.value = true
   await nextTick()
   if (version !== setupVersion) return
   destroyPlayers()
   const element = videoRef.value
-  if (!element || !hasStream.value) return
+  if (!element || !hasStream.value) {
+    streamLoading.value = false
+    return
+  }
   applyBrowserAudio(element, { muted: true, volume: browserAudioVolume.value })
   const { flv, hls } = playUrls.value
   try {
@@ -280,6 +287,7 @@ async function setupPlayer() {
       await element.play()
       applyBrowserAudio(element)
       startLiveGuard()
+      streamLoading.value = false
       return
     }
     if (hls && Hls.isSupported()) {
@@ -298,7 +306,8 @@ async function setupPlayer() {
       })
       hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
         if (frozen) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { streamLoading.value = false }).catch(markStreamUnavailable)
+        if (frozen) streamLoading.value = false
       })
       hlsPlayer.loadSource(hlsSource)
       hlsPlayer.attachMedia(element)
@@ -308,7 +317,8 @@ async function setupPlayer() {
       element.src = isFrozenPlayback.value ? await freezeHistoryManifest(hls) : hls
       element.addEventListener('loadedmetadata', () => {
         if (isFrozenPlayback.value) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { streamLoading.value = false }).catch(markStreamUnavailable)
+        if (isFrozenPlayback.value) streamLoading.value = false
       }, { once: true })
       return
     }
@@ -350,7 +360,7 @@ defineExpose({ returnToLive })
 <template>
   <div class="live-video-player">
     <video
-      v-if="hasStream"
+      v-if="hasStream && !loading && !streamLoading"
       ref="videoRef"
       class="live-video-player__video"
       :style="{ objectFit }"
@@ -361,6 +371,12 @@ defineExpose({ returnToLive })
       @play="handleVideoPlay"
       @volumechange="handleBrowserAudioChange"
     ></video>
+    <slot v-else-if="loading || streamLoading" name="loading">
+      <div class="live-video-player__empty">
+        <strong>正在加载视频流</strong>
+        <span>页面已就绪，正在连接现场画面</span>
+      </div>
+    </slot>
     <slot v-else name="empty">
       <div class="live-video-player__empty">
         <strong>视频暂不可用</strong>
@@ -370,7 +386,7 @@ defineExpose({ returnToLive })
     <slot name="overlay"></slot>
 
     <button
-      v-if="hasStream"
+      v-if="hasStream && !loading && !streamLoading"
       type="button"
       class="live-video-player__listen-toggle"
       :class="{ active: liveAudioEnabled }"
@@ -379,7 +395,7 @@ defineExpose({ returnToLive })
       {{ liveAudioEnabled ? '关闭现场收音' : '开启现场收音' }}
     </button>
 
-    <div v-if="hasStream" class="live-video-player__playback-controls" aria-label="视频播放控制">
+    <div v-if="hasStream && !loading && !streamLoading" class="live-video-player__playback-controls" aria-label="视频播放控制">
       <button :class="{ active: playbackMode === 'live' }" @click="returnToLive">直播</button>
       <button :class="{ active: playbackMode === 'paused' }" :disabled="!hasHistoryStream" @click="pauseLivePlayback">暂停</button>
       <button :class="{ active: isHistoryPlayback }" :disabled="!hasHistoryStream" @click="startHistoryPlayback()">回放</button>

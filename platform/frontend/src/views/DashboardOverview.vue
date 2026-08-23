@@ -31,11 +31,28 @@ import {
   updateAlertSkill,
 } from '../services/api'
 
-const overview = ref(null)
+const overview = ref({
+  header: {
+    device_code: '--',
+    today_alerts: 0,
+    current_location: '正在获取',
+    today_patrol_minutes: 0,
+  },
+  summary: {
+    online_robot_count: 0,
+    pending_event_count: 0,
+    resolved_event_count: 0,
+    today_alert_count: 0,
+  },
+  latest_robot: null,
+  live_event: null,
+})
 const robots = ref([])
 const selectedRobot = ref(null)
-const loading = ref(true)
+const loading = ref(false)
+const dataLoading = ref(true)
 const loadError = ref('')
+const videoLoading = ref(true)
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
@@ -876,6 +893,7 @@ async function refreshAudioStatus() {
 
 function fallbackToSnapshot() {
   streamUnavailable.value = true
+  videoLoading.value = false
   destroyVideoPlayers()
 }
 
@@ -899,10 +917,14 @@ async function canReachStream(url) {
 }
 
 async function setupLivePlayer() {
+  videoLoading.value = true
   await nextTick()
   destroyVideoPlayers()
   const element = videoRef.value
-  if (!element || !hasLiveStream.value) return
+  if (!element || !hasLiveStream.value) {
+    videoLoading.value = false
+    return
+  }
 
   const { flv, hls } = livePlayUrls.value
   const playableFlv = flv && mpegts.getFeatureList().mseLivePlayback && (await canReachStream(flv))
@@ -931,6 +953,7 @@ async function setupLivePlayer() {
     flvPlayer.load()
     flvPlayer.play().catch(fallbackToSnapshot)
     startLiveGuard()
+    videoLoading.value = false
     return
   }
 
@@ -949,6 +972,7 @@ async function setupLivePlayer() {
     hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
       element.play().catch(fallbackToSnapshot)
       startLiveGuard()
+      videoLoading.value = false
     })
     return
   }
@@ -957,6 +981,7 @@ async function setupLivePlayer() {
     element.src = hls
     element.play().catch(fallbackToSnapshot)
     startLiveGuard()
+    videoLoading.value = false
   }
 }
 
@@ -989,7 +1014,7 @@ onMounted(async () => {
   } catch (error) {
     loadError.value = error?.message || '未能获取监测数据，请稍后重试。'
   } finally {
-    loading.value = false
+    dataLoading.value = false
   }
 
   setupLivePlayer()
@@ -1058,8 +1083,12 @@ function handleVisibilityChange() {
         </div>
 
         <div ref="videoStageRef" class="video-stage">
+          <div v-if="dataLoading || videoLoading" class="video-source no-signal video-loading" role="status" aria-live="polite">
+            <strong>正在加载视频流</strong>
+            <span>页面已就绪，正在连接现场画面</span>
+          </div>
           <video
-            v-if="hasLiveStream"
+            v-else-if="hasLiveStream"
             ref="videoRef"
             class="video-source"
             muted
@@ -1075,6 +1104,8 @@ function handleVisibilityChange() {
             <strong>无信号</strong>
             <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
           </div>
+
+          <div v-if="loadError" class="overview-data-notice" role="alert">{{ loadError }}</div>
 
           <div
             v-for="detection in bicycleDetections"

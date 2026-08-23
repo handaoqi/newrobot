@@ -37,7 +37,8 @@ const robots = ref([])
 const tasks = ref([])
 const selectedRobot = ref(null)
 const execution = ref(null)
-const loading = ref(true)
+const loading = ref(false)
+const dataLoading = ref(true)
 const busy = ref(false)
 const localizationBusy = ref(false)
 const navigationStatus = ref(null)
@@ -1277,7 +1278,7 @@ onMounted(async () => {
   } catch (error) {
     showToast(error.message || '加载值守页面失败', { variant: 'alert' })
   } finally {
-    loading.value = false
+    dataLoading.value = false
   }
   if (loaded) {
     refreshTimer = window.setInterval(refreshGuardState, 5000)
@@ -1327,6 +1328,7 @@ watch(playUrlKey, () => {
               :play-urls="playUrls"
               :robot-id="latestRobot?.id"
               :available="hasStream"
+              :loading="dataLoading"
               object-fit="contain"
               @notice="showVideoNotice"
               @stream-error="streamUnavailable = true"

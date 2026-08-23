@@ -1368,6 +1368,25 @@ a { color: inherit; }
   color: rgba(212, 232, 247, 0.72);
   font-size: 13px;
 }
+.video-loading {
+  animation: video-loading-pulse 1.8s ease-in-out infinite;
+}
+.overview-data-notice {
+  position: absolute;
+  z-index: 6;
+  right: 18px;
+  bottom: 18px;
+  max-width: min(520px, calc(100% - 36px));
+  padding: 10px 14px;
+  border: 1px solid rgba(255, 177, 66, 0.52);
+  color: var(--warning);
+  background: var(--overlay-bg);
+  font-size: 12px;
+}
+@keyframes video-loading-pulse {
+  0%, 100% { opacity: .72; }
+  50% { opacity: 1; }
+}
 .video-overlay { position: absolute; z-index: 3; left: 20px; right: 20px; }
 .video-overlay { top: 20px; display: flex; gap: 12px; }
 .overlay-card { background: var(--overlay-bg); border: 1px solid rgba(146, 197, 255, 0.16); border-radius: 18px; padding: 14px 16px; }
