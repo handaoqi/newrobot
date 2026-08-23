@@ -3248,8 +3248,8 @@ a { color: inherit; }
   column-gap: 0;
 }
 .robot-management-list-panel .robot-card-side {
-  min-width: 44px;
-  width: 44px;
+  min-width: 35px;
+  width: 35px;
 }
 .robot-management-list-panel .robot-table-card {
   padding-right: 6px;
