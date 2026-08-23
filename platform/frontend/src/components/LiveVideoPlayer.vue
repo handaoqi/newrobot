@@ -19,6 +19,8 @@ const videoRef = ref(null)
 const streamUnavailable = ref(false)
 const streamLoading = ref(false)
 const liveAudioEnabled = ref(false)
+const streamAudioDetected = ref(false)
+const audioDetectionSuppressed = ref(false)
 const browserAudioMuted = ref(true)
 const browserAudioVolume = ref(1)
 const playbackMode = ref('live')
@@ -43,6 +45,7 @@ const hasHistoryStream = computed(() => Boolean(playUrls.value.hls))
 const hasStream = computed(() => props.available && !streamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
 const isHistoryPlayback = computed(() => playbackMode.value === 'history')
 const isFrozenPlayback = computed(() => playbackMode.value === 'paused' || isHistoryPlayback.value)
+const audioToggleActive = computed(() => liveAudioEnabled.value || (streamAudioDetected.value && !audioDetectionSuppressed.value))
 const historyPlaybackStatus = computed(() => {
   if (isHistoryPlayback.value) return historyPlaybackPaused.value ? '历史回放已暂停' : '历史回放 · 00:00 起播'
   if (playbackMode.value === 'paused') return historyPlaybackPaused.value ? '直播已暂停，可拖动播放条' : '暂停片段播放中，可拖动播放条'
@@ -68,6 +71,13 @@ function handleBrowserAudioChange(event) {
   browserAudioVolume.value = element.volume
 }
 
+function detectStreamAudio(event) {
+  const element = event.currentTarget
+  const hasAudioTrack = Boolean(element.audioTracks?.length)
+  const hasDecodedAudio = Number(element.webkitAudioDecodedByteCount || 0) > 0
+  if (hasAudioTrack || hasDecodedAudio) streamAudioDetected.value = true
+}
+
 async function setLiveAudio(enabled) {
   if (!props.robotId) {
     notify('当前没有可控制的机器人音频采集', 'alert')
@@ -85,6 +95,8 @@ async function setLiveAudio(enabled) {
       }
     }
     liveAudioEnabled.value = enabled
+    audioDetectionSuppressed.value = !enabled
+    if (!enabled) streamAudioDetected.value = false
     notify(enabled ? '已请求开启 NX 现场音频采集' : '已请求关闭 NX 现场音频采集')
   } catch (error) {
     notify(error.message || 'NX 现场音频采集控制失败', 'alert')
@@ -420,6 +432,8 @@ watch(() => props.available, (available) => {
 
 watch(() => props.robotId, () => {
   liveAudioEnabled.value = false
+  streamAudioDetected.value = false
+  audioDetectionSuppressed.value = false
 })
 
 onMounted(() => { void setupPlayer() })
@@ -440,6 +454,8 @@ defineExpose({ returnToLive })
       controls
       @pause="handleVideoPause"
       @play="handleVideoPlay"
+      @loadedmetadata="detectStreamAudio"
+      @timeupdate="detectStreamAudio"
       @volumechange="handleBrowserAudioChange"
     ></video>
     <div v-if="loading || streamLoading" class="live-video-player__loading">
@@ -462,10 +478,10 @@ defineExpose({ returnToLive })
       v-if="hasStream && !loading && !streamLoading"
       type="button"
       class="live-video-player__listen-toggle"
-      :class="{ active: liveAudioEnabled }"
-      @click="setLiveAudio(!liveAudioEnabled)"
+      :class="{ active: audioToggleActive }"
+      @click="setLiveAudio(!audioToggleActive)"
     >
-      {{ liveAudioEnabled ? '关闭现场收音' : '开启现场收音' }}
+      {{ audioToggleActive ? '关闭现场收音' : '开启现场收音' }}
     </button>
 
     <div v-if="hasStream && !loading && !streamLoading" class="live-video-player__playback-controls" aria-label="视频播放控制">
