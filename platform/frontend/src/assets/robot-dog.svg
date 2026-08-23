@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">机器狗</title>
+  <desc id="desc">四足机器狗轮廓图标</desc>
+  <g fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="6">
+    <path d="M27 40 20 29l7-9 12 7 18-3 11-10 10 8-5 12 6 8-5 13-13 4-11-7-15 3-12-7-3-12Z" fill="#fff" stroke="none"/>
+    <path d="m34 59-3 17m18-19 1 19m15-22 5 19m-31-6h-9m25 9h-9m24-4h-8"/>
+    <path d="m20 29 7-9 12 7m29-3 11-10 10 8-5 12"/>
+    <circle cx="63" cy="34" r="3" fill="#fff" stroke="none"/>
+    <path d="M73 46h8" stroke="#fff"/>
+  </g>
+</svg>

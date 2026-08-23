@@ -21,6 +21,7 @@ import {
   synthesizeSpeech,
 } from '../services/api'
 import { API_BASE } from '../services/api'
+import RobotDogIcon from '../components/RobotDogIcon.vue'
 import {
   KEYFRAME_PAGE_SIZE,
   MAP_ZOOM_MAX,
@@ -123,6 +124,7 @@ const routeForm = ref({
   description: '',
   scene_scope: 'indoor',
 })
+const expandedRouteSteps = ref({ 1: true, 2: true, 3: true, 4: true })
 
 onMounted(async () => {
   await loadData()
@@ -182,6 +184,10 @@ const selectedRobot = computed(() => {
     code: selectedRoute.value?.robot_code || selectedMap.value?.robot_code || String(robotId),
   }
 })
+
+function toggleRouteStep(step) {
+  expandedRouteSteps.value[step] = !expandedRouteSteps.value[step]
+}
 
 const inspectionSpeechCategory = computed(() => speechCategories.value.find(item => item.name === '巡检智能播报') || null)
 const inspectionSpeechTemplates = computed(() => {
@@ -1865,7 +1871,6 @@ async function handleDeleteRoute(route) {
   <section class="page-section">
     <section class="panel detail-panel">
       <div class="panel-header">
-        <h2>路径规划</h2>
         <div class="route-header-actions">
           <button
             class="btn drill-btn"
@@ -1884,19 +1889,32 @@ async function handleDeleteRoute(route) {
       <div class="route-planner-layout">
         <!-- 左侧面板 -->
         <div class="side-panel">
-          <div class="panel-section">
-            <h3>1. 选择地图</h3>
+          <div class="panel-section route-step-panel route-step-1">
+            <div class="route-step-heading">
+              <h3>1. 选择地图</h3>
+              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[1]" @click="toggleRouteStep(1)">
+                {{ expandedRouteSteps[1] ? '收起' : '展开' }}
+              </button>
+            </div>
+            <div v-if="expandedRouteSteps[1]" class="route-step-content">
             <select v-model="selectedMap" @change="handleMapSelect(selectedMap)">
               <option :value="null">请选择地图</option>
               <option v-for="map in maps" :key="map.id" :value="map">
                 {{ map.name }} {{ map.active ? '(活动)' : '' }}
               </option>
             </select>
+            <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
+            </div>
           </div>
-          <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
 
-          <div class="panel-section">
-            <h3>2. 路线信息</h3>
+          <div class="panel-section route-step-panel route-step-2">
+            <div class="route-step-heading">
+              <h3>2. 路线信息</h3>
+              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[2]" @click="toggleRouteStep(2)">
+                {{ expandedRouteSteps[2] ? '收起' : '展开' }}
+              </button>
+            </div>
+            <div v-if="expandedRouteSteps[2]" class="route-step-content">
             <div class="form-group" v-if="mapSets.length">
               <label>跨图地图集</label>
               <select v-model="routeForm.map_set">
@@ -1922,10 +1940,17 @@ async function handleDeleteRoute(route) {
               <label>描述</label>
               <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
             </div>
+            </div>
           </div>
 
-          <div class="panel-section">
-            <h3>3. 途经点列表</h3>
+          <div class="panel-section route-step-panel route-step-3">
+            <div class="route-step-heading">
+              <h3>3. 途经点列表</h3>
+              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[3]" @click="toggleRouteStep(3)">
+                {{ expandedRouteSteps[3] ? '收起' : '展开' }}
+              </button>
+            </div>
+            <div v-if="expandedRouteSteps[3]" class="route-step-content">
             <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
             <div v-else class="waypoint-list">
               <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
@@ -1985,16 +2010,23 @@ async function handleDeleteRoute(route) {
                     “巡检智能播报”分类下暂无文案
                   </small>
                 </div>
-                <button class="btn-close" @click="removeWaypoint(index)">×</button>
+                <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
               </div>
             </div>
             <div class="waypoint-actions">
               <button class="btn btn-sm" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
             </div>
+            </div>
           </div>
 
-          <div class="panel-section">
-            <h3>4. 已保存路线</h3>
+          <div class="panel-section route-step-panel route-step-4">
+            <div class="route-step-heading">
+              <h3>4. 已保存路线</h3>
+              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[4]" @click="toggleRouteStep(4)">
+                {{ expandedRouteSteps[4] ? '收起' : '展开' }}
+              </button>
+            </div>
+            <div v-if="expandedRouteSteps[4]" class="route-step-content">
             <div v-if="routes.length === 0" class="empty-hint">暂无保存的路线</div>
             <div v-else class="route-list">
               <div v-for="route in routes" :key="route.id" class="route-item" :class="{ active: selectedRoute?.id === route.id }">
@@ -2017,9 +2049,10 @@ async function handleDeleteRoute(route) {
                 {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”
               </small>
             </div>
+            </div>
           </div>
 
-          <div class="panel-section">
+          <div class="panel-section route-step-panel route-step-5">
             <h3>5. 导航测试</h3>
             <div class="status-grid">
               <div>
@@ -2208,7 +2241,7 @@ async function handleDeleteRoute(route) {
                       <span v-if="point.require_yaw === true" class="waypoint-heading-arrow" :style="waypointHeadingStyle(point)"></span>
                     </div>
                     <div v-if="drillDisplayPosition()" class="drill-robot-marker" :style="drillDisplayPosition()">
-                      <span class="drill-dog-icon">🐕</span>
+                      <RobotDogIcon class="drill-dog-icon" :size="24" />
                       <strong>演练</strong>
                     </div>
                     <div
@@ -2221,6 +2254,7 @@ async function handleDeleteRoute(route) {
                       <i :style="lossHeadingStyle(point)"></i><small>{{ point.sequence }}</small>
                     </div>
                     <div v-if="robotDisplayPosition()" class="robot-marker" :class="{ untrusted: !robotMapPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
+                      <RobotDogIcon :size="28" />
                       <span :style="robotHeadingStyle()"></span>
                       <small>{{ robotMapPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
                     </div>
@@ -2393,19 +2427,65 @@ async function handleDeleteRoute(route) {
 
 .route-planner-layout {
   display: grid;
-  grid-template-columns: 300px 1fr;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-rows: repeat(4, auto) minmax(0, 1fr);
   gap: 1rem;
   height: calc(100vh - 200px);
 }
 
 .side-panel {
-  display: flex;
-  width: 100%;
+  display: contents;
+}
+
+.route-step-panel {
+  grid-column: 1 / -1;
   min-width: 0;
-  flex-direction: column;
+}
+
+.route-step-1 { grid-row: 1; }
+.route-step-2 { grid-row: 2; }
+.route-step-3 { grid-row: 3; }
+.route-step-4 { grid-row: 4; }
+.route-step-5 {
+  grid-column: 2;
+  grid-row: 5;
+  align-self: end;
+  max-height: 100%;
+  overflow: auto;
+}
+
+.route-step-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 1rem;
-  overflow-y: auto;
-  padding-right: 0.5rem;
+}
+
+.route-step-heading h3 {
+  margin-bottom: 0;
+}
+
+.route-step-toggle {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #99d5ce;
+  border-radius: 5px;
+  color: #0f766e;
+  background: #f0fdfa;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.route-step-toggle:hover {
+  color: #fff;
+  background: #0f766e;
+}
+
+.route-step-content {
+  margin-top: 0.75rem;
 }
 
 .panel-section {
@@ -2914,6 +2994,9 @@ async function handleDeleteRoute(route) {
 }
 
 .map-preview-area {
+  grid-column: 1;
+  grid-row: 5;
+  min-width: 0;
   background: #f5f5f5;
   border-radius: 4px;
   padding: 1rem;
@@ -2927,7 +3010,7 @@ async function handleDeleteRoute(route) {
 
 .map-stage-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-columns: minmax(0, 1fr) 280px;
   min-height: 0;
   flex: 1;
   gap: 0.85rem;
@@ -2943,7 +3026,7 @@ async function handleDeleteRoute(route) {
 .map-container {
   position: relative;
   width: 100%;
-  height: min(62vh, 680px);
+  height: min(68vh, 760px);
   min-height: 420px;
   overflow: auto;
   padding: 1rem;
@@ -3472,8 +3555,10 @@ async function handleDeleteRoute(route) {
 }
 
 .drill-dog-icon {
-  font-size: 22px;
-  line-height: 1;
+  position: relative;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
 }
 
@@ -3541,6 +3626,12 @@ async function handleDeleteRoute(route) {
   box-shadow: 0 3px 8px rgba(16, 185, 129, 0.35);
 }
 
+.robot-marker > .robot-dog-icon {
+  position: absolute;
+  inset: 1px;
+  z-index: 4;
+}
+
 .robot-marker span {
   position: absolute;
   left: 50%;
@@ -3551,7 +3642,7 @@ async function handleDeleteRoute(route) {
   border-right: 6px solid transparent;
   border-bottom: 17px solid #065f46;
   transform-origin: 50% 72%;
-  z-index: 4;
+  z-index: 5;
 }
 
 .robot-marker > small {
@@ -3686,7 +3777,15 @@ async function handleDeleteRoute(route) {
 @media (max-width: 1100px) {
   .route-planner-layout {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
     height: auto;
+  }
+
+  .route-step-panel,
+  .route-step-5,
+  .map-preview-area {
+    grid-column: 1;
+    grid-row: auto;
   }
 
   .map-container {
@@ -3705,7 +3804,6 @@ async function handleDeleteRoute(route) {
 
 @media (max-width: 640px) {
   .route-planner-layout { gap: 0.75rem; }
-  .side-panel { gap: 0.75rem; padding-right: 0; overflow: visible; }
   .panel-section { padding: 0.75rem; }
   .route-header-actions { width: 100%; flex-wrap: wrap; }
   .route-header-actions .btn { flex: 1 1 140px; }

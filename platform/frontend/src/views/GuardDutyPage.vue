@@ -6,6 +6,7 @@ import { useRouter } from 'vue-router'
 
 import AppToast from '../components/AppToast.vue'
 import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
+import RobotDogIcon from '../components/RobotDogIcon.vue'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -1512,6 +1513,7 @@ watch(playUrlKey, () => {
                     <i :style="lossHeadingStyle(point)"></i><small>{{ point.sequence }}</small>
                   </div>
                   <div v-if="robotPoint() && displayPosition(robotPoint())" class="guard-map-robot" :class="{ untrusted: !robotPoint()?.trusted }" :style="displayPosition(robotPoint())" :title="robotMarkerTitle()">
+                    <RobotDogIcon :size="26" />
                     <i :style="robotHeadingStyle()"></i>
                     <small>{{ robotPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
                   </div>
@@ -1670,6 +1672,7 @@ watch(playUrlKey, () => {
 .guard-map-waypoint.current { background: #f59e0b; }
 .guard-map-robot { position: absolute; z-index: 5; width: 28px; height: 28px; transform: translate(-50%, -50%); }
 .guard-map-robot::before { content: ''; position: absolute; inset: 3px; border: 3px solid #fff; border-radius: 50%; background: #ec4a3f; box-shadow: 0 2px 8px rgba(236, 74, 63, .5); }
+.guard-map-robot > .robot-dog-icon { position: absolute; inset: 1px; z-index: 6; }
 .guard-map-robot i { position: absolute; left: 50%; top: 50%; z-index: 6; width: 0; height: 0; border-right: 5px solid transparent; border-bottom: 14px solid #8f2019; border-left: 5px solid transparent; transform-origin: 50% 70%; }
 .guard-map-robot > small { position: absolute; top: 28px; left: 50%; min-width: max-content; padding: 2px 5px; color: #fff; background: #8f2019; font-size: 9px; transform: translateX(-50%); }
 .guard-map-robot.untrusted::before { border-style: dashed; background: #f59e0b; box-shadow: 0 0 0 4px rgba(220, 38, 38, .28); }

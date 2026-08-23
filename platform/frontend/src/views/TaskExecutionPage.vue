@@ -10,6 +10,7 @@ import {
   sendTaskExecutionAction,
 } from '../services/api'
 import { API_BASE } from '../services/api'
+import RobotDogIcon from '../components/RobotDogIcon.vue'
 import { executionActions, powerLabel } from '../services/executionState'
 import {
   buildLocalizationLossMarkers,
@@ -541,6 +542,7 @@ onBeforeUnmount(() => {
               <small>{{ point.sequence }}</small>
             </div>
             <div v-if="robotDisplayPosition()" class="execution-robot" :class="{ untrusted: !robotPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
+              <RobotDogIcon :size="28" />
               <span :style="robotHeadingStyle()"></span>
               <small>{{ robotPoint()?.trusted ? '机器狗' : '定位不可信' }}</small>
             </div>
@@ -786,6 +788,7 @@ onBeforeUnmount(() => {
   border: 3px solid #fff;
   box-shadow: 0 3px 10px rgba(20, 184, 166, 0.42);
 }
+.execution-robot > .robot-dog-icon { position: absolute; inset: 1px; z-index: 5; }
 
 .execution-robot span {
   position: absolute;
