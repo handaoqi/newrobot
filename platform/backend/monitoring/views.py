@@ -951,6 +951,8 @@ class RobotCommandView(APIView):
         "takeover_exit": "teleop.takeover_exit",
         "stand_up": "teleop.stand_up",
         "lie_down": "teleop.lie_down",
+        "shake_hand": "teleop.shake_hand",
+        "two_leg_stand": "teleop.two_leg_stand",
         "speed_micro": "teleop.speed_micro",
         "speed_slow": "teleop.speed_slow",
         "speed_normal": "teleop.speed_normal",

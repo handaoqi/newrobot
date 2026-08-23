@@ -664,6 +664,12 @@ watch(livePlayUrls, () => {
             <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('lie_down', '匍匐')">
               匍匐
             </button>
+            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('two_leg_stand', '双腿站立')">
+              双腿站立
+            </button>
+            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('shake_hand', '打招呼')">
+              打招呼
+            </button>
           </div>
           <small v-if="commandFeedback" class="remote-feedback">{{ commandFeedback }}</small>
         </div>

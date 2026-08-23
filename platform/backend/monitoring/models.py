@@ -920,6 +920,8 @@ class RemoteCommand(BaseTimestampModel):
         ("teleop.takeover_exit", "退出远程接管"),
         ("teleop.stand_up", "站立"),
         ("teleop.lie_down", "趴下"),
+        ("teleop.shake_hand", "打招呼"),
+        ("teleop.two_leg_stand", "双腿站立"),
         ("teleop.crawl_forward", "匍匐前进"),
         ("teleop.speed_micro", "微速档"),
         ("teleop.speed_slow", "低速档"),

@@ -324,6 +324,7 @@ class CommandProcessor:
         if self.person_follow_controller and action in {
             "takeover_enter", "takeover_exit", "move_forward", "move_backward",
             "move_left", "move_right", "turn_left", "turn_right", "move_velocity", "skill",
+            "shake_hand", "two_leg_stand",
         }:
             self.person_follow_controller.stop("manual_teleop_override")
         if action == "takeover_enter":
@@ -346,6 +347,16 @@ class CommandProcessor:
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
             result_payload = teleop_adapter.remote_teleop_action("lie_down")
             self.safety.state.control_mode = "autonomous"
+        elif action == "shake_hand":
+            result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                "shake_hand", {"greeting"}
+            )
+            self.safety.state.control_mode = "manual_takeover"
+        elif action == "two_leg_stand":
+            result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                "two_leg_stand", {"two_leg_standing"}
+            )
+            self.safety.state.control_mode = "manual_takeover"
         elif action == "move_stop":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("move_stop")

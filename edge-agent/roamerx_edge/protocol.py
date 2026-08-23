@@ -27,6 +27,8 @@ TELEOP_COMMAND_TYPES = {
     "teleop.takeover_exit",
     "teleop.stand_up",
     "teleop.lie_down",
+    "teleop.shake_hand",
+    "teleop.two_leg_stand",
     "teleop.speed_micro",
     "teleop.speed_slow",
     "teleop.speed_normal",

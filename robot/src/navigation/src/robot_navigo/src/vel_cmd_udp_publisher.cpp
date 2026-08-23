@@ -646,6 +646,27 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       PublishMotionState("standing_up");
       return;
     }
+    if (action == "two_leg_stand" || action == "shake_hand") {
+      const bool two_leg_stand = action == "two_leg_stand";
+      manual_teleop_active_ = true;
+      crawl_mode_ = false;
+      manual_crawl_lock_ = false;
+      low_posture_lock_ = false;
+      RemoteSetRemote({}, {});
+      RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      RemoteSetCmd(two_leg_stand ? zsibot::CmdCode::CMD_TWO_LEG_STAND
+                                 : zsibot::CmdCode::CMD_GREET);
+      emergency_stop_latched_ = false;
+      nav_active_ = false;
+      standing_up_ = false;
+      last_cmd_.reset();
+      queued_stand_cmd_.reset();
+      PublishMotionState(two_leg_stand ? "two_leg_standing" : "greeting");
+      RCLCPP_INFO(this->get_logger(), "remote %s requested via vendor command",
+                  two_leg_stand ? "two-leg stand" : "greet");
+      return;
+    }
     if (action == "crawl_forward") {
       manual_teleop_active_ = true;
       // The vendor virtual-remote library rejects CMD_CRAWL_FORWARD on the
@@ -673,9 +694,12 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     }
     if (action == "passive") {
       RemoteSetRemote({}, {});
-      // "passive" is the routine stop used by task pauses, charging contact,
-      // and the UI. It must not turn into the vendor's latched emergency-stop
-      // state. A real hardware emergency stop remains dog-side only.
+      // Keep passive on the same vendor virtual-remote path as stand_up and
+      // lie_down. A zero joystick frame only releases the current velocity;
+      // it does not change the controller mode. CMD_EMERGENCY_STOP is the
+      // vendor remote's motor-free/passive safety state (CM_EMERGENCY_STOP),
+      // which is also the state observed after the normal remote idle timeout.
+      RemoteSetCmd(zsibot::CmdCode::CMD_EMERGENCY_STOP);
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
       low_posture_lock_ = false;
@@ -684,9 +708,10 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       standing_up_ = false;
       last_cmd_.reset();
       queued_stand_cmd_.reset();
-      emergency_stop_latched_ =
-          RemoteControlMode() == static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP);
+      emergency_stop_latched_ = true;
       PublishMotionState("passive");
+      RCLCPP_INFO(this->get_logger(),
+                  "remote passive requested via CMD_EMERGENCY_STOP");
       return;
     }
     if (action == "lie_down") {

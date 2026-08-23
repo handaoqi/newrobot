@@ -436,6 +436,45 @@ def test_teleop_move_is_dispatched_to_navigation_adapter(tmp_path):
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("message_type", "action", "motion_state"),
+    [
+        ("teleop.shake_hand", "shake_hand", "greeting"),
+        ("teleop.two_leg_stand", "two_leg_stand", "two_leg_standing"),
+    ],
+)
+def test_remote_trick_actions_use_the_remote_bridge(tmp_path, message_type, action, motion_state):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = message_type
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True)
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert navigation.teleop_actions == [action]
+    assert result["payload"]["result"]["motion_state"] == motion_state
+    assert state.control_mode == "manual_takeover"
+    store.close()
+
+
 def test_person_follow_start_and_stop_are_dispatched_locally(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "teleop.person_follow_start"

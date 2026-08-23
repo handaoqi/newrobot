@@ -492,10 +492,14 @@ class RosAdapter(Node):
     def remote_teleop_action(self, action: str) -> dict:
         msg = String()
         msg.data = str(action)
-        for _ in range(3):
+        # One-shot vendor motions must not be repeated: the remote bridge
+        # interprets each SetCmd as a new action (especially GREET).
+        publish_count = 1 if action in {"shake_hand", "two_leg_stand"} else 3
+        for _ in range(publish_count):
             self._remote_teleop_action_pub.publish(msg)
-            time.sleep(0.08)
-        return {"topic": "/remote_teleop_action", "action": msg.data, "publish_count": 3}
+            if publish_count > 1:
+                time.sleep(0.08)
+        return {"topic": "/remote_teleop_action", "action": msg.data, "publish_count": publish_count}
 
     def confirmed_remote_teleop_action(
         self,
