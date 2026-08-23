@@ -108,6 +108,7 @@ const AUDIO_COMMAND_COOLDOWN_MS = 3000
 const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
+const streamConnectTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
 const speaker3588Status = computed(() => robotAudioStatus.value?.speaker_3588 || null)
 const speakerNxStatus = computed(() => robotAudioStatus.value?.speaker_nx || null)
@@ -900,7 +901,7 @@ function fallbackToSnapshot() {
 async function canReachStream(url) {
   if (!url) return false
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), 1800)
+  const timeout = window.setTimeout(() => controller.abort(), streamConnectTimeoutMs)
   try {
     await fetch(url, {
       method: 'GET',
