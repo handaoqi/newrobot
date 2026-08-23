@@ -1932,10 +1932,6 @@ async function handleDeleteRoute(route) {
                 <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
               </select>
             </label>
-            <label class="route-description-field">
-              <span>描述</span>
-              <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
-            </label>
           </div>
           <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
         </section>
@@ -2038,13 +2034,14 @@ async function handleDeleteRoute(route) {
               </button>
               <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
             </div>
+            <label class="route-description-under-waypoints">
+              <span>描述</span>
+              <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
+            </label>
             </div>
           </div>
 
           <div class="panel-section route-step-panel route-step-4">
-            <div class="route-step-heading">
-              <h3>路线选择</h3>
-            </div>
             <div class="route-step-content route-select-content">
               <select class="route-selector" :value="selectedRoute?.id || ''" @change="handleRouteSelect($event.target.value)">
                 <option value="">请选择已保存路线</option>
@@ -2458,7 +2455,8 @@ async function handleDeleteRoute(route) {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
   grid-template-rows: auto minmax(620px, auto) auto auto;
-  gap: 1rem;
+  column-gap: 1rem;
+  row-gap: 0.45rem;
   height: auto;
   min-height: calc(100vh - 200px);
 }
@@ -2513,6 +2511,30 @@ async function handleDeleteRoute(route) {
   grid-column: 1 / -1;
 }
 
+.route-description-under-waypoints {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.65rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.route-description-under-waypoints textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 56px;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--input-bg);
+  font: inherit;
+  font-weight: 400;
+  resize: vertical;
+}
+
 .route-config-panel .empty-hint {
   margin: 0.5rem 0 0;
   padding: 0;
@@ -2555,9 +2577,9 @@ async function handleDeleteRoute(route) {
 .route-step-3 {
   grid-column: 4;
   grid-row: 2;
-  align-self: start;
-  height: 230px;
-  max-height: 230px;
+  align-self: stretch;
+  height: auto;
+  max-height: none;
 }
 
 .route-step-4 {
@@ -2629,7 +2651,7 @@ async function handleDeleteRoute(route) {
 .route-step-3 .waypoint-list {
   height: auto;
   flex: 1;
-  min-height: 0;
+  min-height: 360px;
   overflow-y: auto;
 }
 
@@ -3215,7 +3237,7 @@ async function handleDeleteRoute(route) {
 
 .map-preview-area {
   grid-column: 1 / span 3;
-  grid-row: 2 / span 2;
+  grid-row: 2;
   min-width: 0;
   min-height: calc(100vh - 320px);
   height: auto;
