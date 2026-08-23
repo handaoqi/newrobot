@@ -28,6 +28,7 @@ const dockSubmitting = ref(false)
 const dockMessage = ref('')
 const dockExecution = ref(null)
 const dockRunning = ref(false)
+const batterySamples = ref([])
 let chargeRefreshTimer = null
 let dockProgressTimer = null
 const volumeDebounceTimers = {}
@@ -102,6 +103,30 @@ const chargeText = computed(() => {
   return '未充电'
 })
 
+const chargingEtaText = computed(() => {
+  if (!power.value?.charging || power.value?.thermal_protection) return ''
+  const percent = Number(power.value?.percent)
+  if (!Number.isFinite(percent)) return '预计时间未知'
+  if (percent >= 95) return '已达到 95%'
+  const samples = batterySamples.value
+  if (samples.length < 2) return '充电速率采集中'
+  const first = samples[0]
+  const latest = samples[samples.length - 1]
+  const elapsedMinutes = (latest.timestamp - first.timestamp) / 60000
+  const growth = latest.percent - first.percent
+  if (elapsedMinutes < 1 || growth <= 0) return '充电速率采集中'
+  const growthPerMinute = growth / elapsedMinutes
+  const remainingMinutes = Math.ceil((95 - percent) / growthPerMinute)
+  return `预计 ${Math.max(1, remainingMinutes)} 分钟到 95%（+${growthPerMinute.toFixed(2)}%/分钟）`
+})
+
+const chargingEtaShortText = computed(() => chargingEtaText.value.replace(/\s*（.*$/, ''))
+const chargingDetailText = computed(() => (
+  power.value?.charging && !power.value?.thermal_protection
+    ? `充电状态 · ${chargingEtaShortText.value}`
+    : '充电状态'
+))
+
 const batteryCurrentText = computed(() => {
   const current = Number(power.value?.current_a)
   if (!Number.isFinite(current)) {
@@ -166,12 +191,28 @@ const statusSampleTime = computed(() => {
   return `更新于 ${date.toLocaleTimeString('zh-CN', { hour12: false })}`
 })
 
+function recordBatterySample(powerSnapshot, sampledAt) {
+  const percent = Number(powerSnapshot?.percent)
+  if (!powerSnapshot?.available || !powerSnapshot?.charging || !Number.isFinite(percent)) {
+    if (!powerSnapshot?.charging) batterySamples.value = []
+    return
+  }
+  const timestamp = new Date(sampledAt || Date.now()).getTime()
+  if (!Number.isFinite(timestamp)) return
+  const samples = batterySamples.value.filter((sample) => sample.timestamp < timestamp)
+  samples.push({ timestamp, percent })
+  const cutoff = timestamp - 15 * 60 * 1000
+  batterySamples.value = samples.filter((sample) => sample.timestamp >= cutoff)
+}
+
 async function chooseRobot(robotId) {
+  if (String(selectedRobot.value?.id || '') !== String(robotId || '')) batterySamples.value = []
   selectedRobot.value = await fetchRobotDetail(robotId)
   ;[liveStatus.value, sessions.value] = await Promise.all([
     fetchRobotStatus(robotId),
     fetchRobotSessions(robotId),
   ])
+  recordBatterySample(liveStatus.value?.status?.power, liveStatus.value?.status?.sampled_at)
   const liveAudio = liveStatus.value?.status?.audio
   if (liveAudio?.speaker_3588?.volume_percent != null) {
     speaker3588Volume.value = liveAudio.speaker_3588.volume_percent
@@ -194,6 +235,7 @@ async function refreshRobotCard(robotId) {
         fetchRobotStatus(robotId),
         fetchRobotSessions(robotId),
       ])
+      recordBatterySample(liveStatus.value?.status?.power, liveStatus.value?.status?.sampled_at)
     }
   } finally {
     refreshingRobotId.value = null
@@ -216,6 +258,7 @@ async function refreshChargeStatus() {
         power_mode: latest.status.power_mode,
       },
     }
+    recordBatterySample(latest.status.power, latest.status.sampled_at)
     return { power: latest.status.power, powerMode: latest.status.power_mode }
   } catch (_error) {
     // Keep the last valid sample; the freshness timestamp exposes stale data.
@@ -563,7 +606,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="metric-card" :class="{ 'metric-card-warning': power?.thermal_protection }">
             <strong>{{ chargeText }}</strong>
-            <span>充电状态</span>
+            <span>{{ chargingDetailText }}</span>
             <small v-if="power?.available">
               {{ batteryCurrentText }} · 电池 {{ power.temperature_c != null ? `${power.temperature_c} °C` : '温度未知' }}
             </small>
@@ -599,7 +642,7 @@ onBeforeUnmount(() => {
           {{ statusSampleTime }} · 数据源：机器狗实时遥测
         </p>
 
-        <div class="detail-card management-control-card">
+          <div class="detail-card management-control-card">
           <div class="detail-card-head">
             <strong>充电与充电桩</strong>
             <span :class="['state-chip', { ok: power?.charging, warning: power?.thermal_protection }]">{{ chargeText }}</span>

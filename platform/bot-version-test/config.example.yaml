@@ -37,6 +37,9 @@ model:
   nms_iou_threshold: 0.45
   image_size: 640
   device: ""
+  tensorrt_enabled: true
+  tensorrt_fp16: true
+  tensorrt_engine_cache_path: data/trt-cache/yolo11n
   classes: [person, bicycle]
 
 detection:

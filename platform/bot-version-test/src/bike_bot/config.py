@@ -70,6 +70,9 @@ class ModelConfig:
     image_size: int = 960
     device: str = ""
     classes: list[str] | None = None
+    tensorrt_enabled: bool = True
+    tensorrt_fp16: bool = True
+    tensorrt_engine_cache_path: str = "data/trt-cache/yolo11n"
 
 
 @dataclass
@@ -226,3 +229,9 @@ class AppConfig:
         Path(self.storage.app_log_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.storage.stream_log_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.storage.run_stream_log_path).parent.mkdir(parents=True, exist_ok=True)
+        cache_path = self.model.tensorrt_engine_cache_path
+        if cache_path:
+            try:
+                Path(cache_path).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass

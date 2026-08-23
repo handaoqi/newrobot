@@ -10,12 +10,16 @@ from typing import Any
 from uuid import uuid4
 
 import cv2
+import numpy as np
 
 from .config import AppConfig, ModelConfig
 from .models import BoundingBox, DetectionPayload, now_iso
 from .tracking import IoUTracker, TrackingDetection
 
 LOGGER = logging.getLogger(__name__)
+CUDA_PROVIDER = "CUDAExecutionProvider"
+CPU_PROVIDER = "CPUExecutionProvider"
+TENSORRT_PROVIDER = "TensorrtExecutionProvider"
 
 
 def letterbox(frame, image_size: int) -> tuple[Any, float, int, int]:
@@ -39,6 +43,116 @@ def letterbox(frame, image_size: int) -> tuple[Any, float, int, int]:
         value=(114, 114, 114),
     )
     return padded, scale, pad_x, pad_y
+
+
+@dataclass
+class InferenceTiming:
+    preprocess_seconds: float = 0.0
+    session_run_seconds: float = 0.0
+    parse_seconds: float = 0.0
+    providers: str = ""
+
+
+def _nms_keep_indices(keep) -> list[int]:
+    if keep is None or len(keep) == 0:
+        return []
+    indices: list[int] = []
+    for item in keep:
+        if isinstance(item, (list, tuple)):
+            item = item[0]
+        elif hasattr(item, "item"):
+            item = item.item()
+        indices.append(int(item))
+    return indices
+
+
+def parse_yolo_predictions(
+    predictions,
+    *,
+    frame_h: int,
+    frame_w: int,
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+    confidence: float,
+    nms_iou_threshold: float,
+    class_names: list[str],
+) -> list[RawDetection]:
+    array = np.asarray(predictions, dtype=np.float32)
+    while array.ndim > 2 and array.shape[0] == 1:
+        array = array.reshape(array.shape[1:])
+    if array.ndim != 2:
+        return []
+    row_looks_like_features = 5 <= array.shape[0] <= 256
+    col_looks_like_features = 5 <= array.shape[1] <= 256
+    if row_looks_like_features and not col_looks_like_features:
+        array = array.T
+    elif row_looks_like_features and col_looks_like_features and array.shape[0] < array.shape[1]:
+        array = array.T
+    if array.shape[1] < 5:
+        return []
+
+    xywh = array[:, :4]
+    class_scores = array[:, 4:]
+    if class_scores.shape[1] <= 1:
+        class_ids = np.zeros(array.shape[0], dtype=np.int32)
+        scores = class_scores[:, 0] if class_scores.shape[1] == 1 else np.zeros(array.shape[0], dtype=np.float32)
+    else:
+        class_ids = np.argmax(class_scores, axis=1).astype(np.int32)
+        scores = class_scores[np.arange(class_scores.shape[0]), class_ids]
+
+    keep_mask = scores >= confidence
+    if not np.any(keep_mask):
+        return []
+
+    xywh = xywh[keep_mask]
+    scores = scores[keep_mask]
+    class_ids = class_ids[keep_mask]
+
+    cx = xywh[:, 0]
+    cy = xywh[:, 1]
+    box_w = xywh[:, 2]
+    box_h = xywh[:, 3]
+    x1 = np.rint((cx - box_w / 2.0 - pad_x) / scale).astype(np.int32)
+    y1 = np.rint((cy - box_h / 2.0 - pad_y) / scale).astype(np.int32)
+    width = np.rint(box_w / scale).astype(np.int32)
+    height = np.rint(box_h / scale).astype(np.int32)
+
+    x1 = np.clip(x1, 0, frame_w - 1)
+    y1 = np.clip(y1, 0, frame_h - 1)
+    width = np.minimum(np.maximum(width, 0), frame_w - x1)
+    height = np.minimum(np.maximum(height, 0), frame_h - y1)
+
+    valid = (width > 0) & (height > 0)
+    if not np.any(valid):
+        return []
+    boxes = np.stack([x1[valid], y1[valid], width[valid], height[valid]], axis=1)
+    scores = scores[valid]
+    class_ids = class_ids[valid]
+
+    keep = cv2.dnn.NMSBoxes(
+        boxes.tolist(),
+        scores.astype(float).tolist(),
+        confidence,
+        nms_iou_threshold,
+    )
+    keep_indices = _nms_keep_indices(keep)
+    if not keep_indices:
+        return []
+
+    raw_detections: list[RawDetection] = []
+    for index in keep_indices:
+        class_id = int(class_ids[index])
+        label = class_names[class_id] if class_id < len(class_names) else str(class_id)
+        box = boxes[index]
+        raw_detections.append(
+            RawDetection(
+                label=label,
+                bbox=(int(box[0]), int(box[1]), int(box[2]), int(box[3])),
+                confidence=float(scores[index]),
+            )
+        )
+    return raw_detections
 
 
 @dataclass
@@ -147,6 +261,8 @@ class YoloDetector:
         self.emit_events = emit_events
         self.class_names = [item.lower() for item in classes]
         self.model_backend = self._resolve_backend(self.model_config.backend, self.model_config.path)
+        self.last_timing = InferenceTiming()
+        self._onnx_providers_label = ""
         self.model = self._load_model()
         self.snapshot_manager = SnapshotManager(
             config.snapshot.directory,
@@ -190,16 +306,34 @@ class YoloDetector:
             session_options.intra_op_num_threads = 2
             session_options.inter_op_num_threads = 1
             session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            session = ort.InferenceSession(
-                self.model_config.path,
-                sess_options=session_options,
-                providers=providers,
-            )
+            providers = self._onnxruntime_providers(ort)
+            try:
+                session = ort.InferenceSession(
+                    self.model_config.path,
+                    sess_options=session_options,
+                    providers=providers,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "onnxruntime session failed with requested providers=%s, falling back to CUDA/CPU",
+                    providers,
+                )
+                session = self._onnxruntime_session_with_fallback(ort, session_options)
+            self._onnx_providers_label = ",".join(session.get_providers())
+            if (
+                self.model_config.tensorrt_enabled
+                and TENSORRT_PROVIDER not in session.get_providers()
+            ):
+                LOGGER.error(
+                    "TensorRT was requested but is not active, session providers=%s",
+                    session.get_providers(),
+                )
             LOGGER.info(
-                "loaded ONNX model with onnxruntime: %s providers=%s",
+                "loaded ONNX model with onnxruntime: %s providers=%s tensorrt_enabled=%s cache=%s",
                 self.model_config.path,
                 session.get_providers(),
+                self.model_config.tensorrt_enabled,
+                self.model_config.tensorrt_engine_cache_path,
             )
             return session
 
@@ -210,6 +344,63 @@ class YoloDetector:
             return YOLO(self.model_config.path)
 
         raise ValueError(f"unsupported model backend: {self.model_backend}")
+
+    def _cuda_cpu_providers(self, ort) -> list[str]:
+        available = set(ort.get_available_providers())
+        providers: list[str] = []
+        if CUDA_PROVIDER in available:
+            providers.append(CUDA_PROVIDER)
+        providers.append(CPU_PROVIDER)
+        return providers
+
+    def _onnxruntime_providers(self, ort) -> list:
+        fallback = self._cuda_cpu_providers(ort)
+        if not self.model_config.tensorrt_enabled:
+            LOGGER.info("TensorRT disabled by config, using providers=%s", fallback)
+            return fallback
+        available = set(ort.get_available_providers())
+        if TENSORRT_PROVIDER not in available:
+            LOGGER.error(
+                "TensorRT requested but %s is unavailable, falling back to %s",
+                TENSORRT_PROVIDER,
+                fallback,
+            )
+            return fallback
+        cache_path = Path(self.model_config.tensorrt_engine_cache_path)
+        try:
+            cache_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            LOGGER.error(
+                "cannot create TensorRT cache path=%s error=%s; falling back to %s",
+                cache_path,
+                exc,
+                fallback,
+            )
+            return fallback
+        LOGGER.info(
+            "loading TensorRT engine cache=%s fp16=%s (first run may take several minutes)",
+            cache_path,
+            self.model_config.tensorrt_fp16,
+        )
+        return [
+            (
+                TENSORRT_PROVIDER,
+                {
+                    "device_id": 0,
+                    "trt_fp16_enable": bool(self.model_config.tensorrt_fp16),
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": str(cache_path),
+                },
+            ),
+            *fallback,
+        ]
+
+    def _onnxruntime_session_with_fallback(self, ort, session_options):
+        return ort.InferenceSession(
+            self.model_config.path,
+            sess_options=session_options,
+            providers=self._cuda_cpu_providers(ort),
+        )
 
     def open_capture(self) -> cv2.VideoCapture:
         source = self.config.video.source
@@ -370,9 +561,11 @@ class YoloDetector:
             raw_detections.append(
                 RawDetection(label=label, bbox=(x1, y1, width, height), confidence=confidence)
             )
+        self.last_timing = InferenceTiming(providers="ultralytics")
         return raw_detections
 
     def _predict_opencv_dnn(self, frame) -> list[RawDetection]:
+        preprocess_started = time.perf_counter()
         input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
             input_image,
@@ -381,12 +574,24 @@ class YoloDetector:
             swapRB=True,
             crop=False,
         )
+        preprocess_seconds = time.perf_counter() - preprocess_started
+        run_started = time.perf_counter()
         self.model.setInput(blob)
         outputs = self.model.forward()
+        session_run_seconds = time.perf_counter() - run_started
         predictions = outputs[0] if isinstance(outputs, tuple) else outputs
-        return self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        parse_started = time.perf_counter()
+        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        self.last_timing = InferenceTiming(
+            preprocess_seconds=preprocess_seconds,
+            session_run_seconds=session_run_seconds,
+            parse_seconds=time.perf_counter() - parse_started,
+            providers="opencv_dnn",
+        )
+        return detections
 
     def _predict_onnxruntime(self, frame) -> list[RawDetection]:
+        preprocess_started = time.perf_counter()
         input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
             input_image,
@@ -395,82 +600,35 @@ class YoloDetector:
             swapRB=True,
             crop=False,
         )
+        preprocess_seconds = time.perf_counter() - preprocess_started
+        run_started = time.perf_counter()
         input_name = self.model.get_inputs()[0].name
         output_name = self.model.get_outputs()[0].name
         predictions = self.model.run([output_name], {input_name: blob})[0]
-        return self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        session_run_seconds = time.perf_counter() - run_started
+        parse_started = time.perf_counter()
+        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        self.last_timing = InferenceTiming(
+            preprocess_seconds=preprocess_seconds,
+            session_run_seconds=session_run_seconds,
+            parse_seconds=time.perf_counter() - parse_started,
+            providers=self._onnx_providers_label,
+        )
+        return detections
 
     def _parse_yolo_predictions(self, predictions, frame, scale: float, pad_x: int, pad_y: int) -> list[RawDetection]:
-        predictions = predictions.squeeze()
-        if predictions.ndim != 2:
-            return []
-        if predictions.shape[0] < predictions.shape[1] and predictions.shape[0] <= 256:
-            predictions = predictions.transpose()
-
         frame_h, frame_w = frame.shape[:2]
-        boxes: list[list[int]] = []
-        scores: list[float] = []
-        class_ids: list[int] = []
-        class_count = max(1, predictions.shape[1] - 4)
-
-        for prediction in predictions:
-            values = prediction.tolist()
-            if len(values) < 5:
-                continue
-            cx, cy, box_w, box_h = values[:4]
-            class_scores = values[4:]
-            if class_count == 1:
-                class_id = 0
-                confidence = float(class_scores[0])
-            else:
-                class_id = max(range(len(class_scores)), key=lambda index: class_scores[index])
-                confidence = float(class_scores[class_id])
-            if confidence < self.model_config.confidence:
-                continue
-
-            x1 = int(round((cx - box_w / 2 - pad_x) / scale))
-            y1 = int(round((cy - box_h / 2 - pad_y) / scale))
-            width = int(round(box_w / scale))
-            height = int(round(box_h / scale))
-            x1 = max(0, min(frame_w - 1, x1))
-            y1 = max(0, min(frame_h - 1, y1))
-            width = max(0, min(frame_w - x1, width))
-            height = max(0, min(frame_h - y1, height))
-            if width <= 0 or height <= 0:
-                continue
-            boxes.append([x1, y1, width, height])
-            scores.append(confidence)
-            class_ids.append(class_id)
-
-        keep = cv2.dnn.NMSBoxes(
-            boxes,
-            scores,
-            self.model_config.confidence,
-            self.model_config.nms_iou_threshold,
+        return parse_yolo_predictions(
+            predictions,
+            frame_h=frame_h,
+            frame_w=frame_w,
+            scale=scale,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            confidence=self.model_config.confidence,
+            nms_iou_threshold=self.model_config.nms_iou_threshold,
+            class_names=self.class_names,
         )
-        if len(keep) == 0:
-            return []
-
-        keep_indices = []
-        for item in keep:
-            if isinstance(item, (list, tuple)):
-                item = item[0]
-            elif hasattr(item, "item"):
-                item = item.item()
-            keep_indices.append(int(item))
-
-        raw_detections: list[RawDetection] = []
-        for index in keep_indices:
-            class_id = class_ids[index]
-            label = self.class_names[class_id] if class_id < len(self.class_names) else str(class_id)
-            raw_detections.append(
-                RawDetection(
-                    label=label,
-                    bbox=tuple(boxes[index]),
-                    confidence=scores[index],
-                )
-            )
-        return raw_detections
 
     def enrich_with_snapshot(self, event: FrameEvent) -> FrameEvent:
         snapshot = self.snapshot_manager.save(event.frame)

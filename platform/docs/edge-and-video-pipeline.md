@@ -2,6 +2,8 @@
 
 [返回文档中心](./project-docs-index.md)
 
+现场检测帧率、CPU 占用和 CUDA/TensorRT 关系见仓库文档 [YOLO_GPU_INFERENCE_PLAN.md](../../docs/YOLO_GPU_INFERENCE_PLAN.md)，不要在本文件重复维护优化方案。
+
 ## 1. 模块目标
 
 `bot-version` 是机器人板端最小可用项目，负责把摄像头/RTSP 源转换为平台可消费的数据：
@@ -132,11 +134,14 @@ stream:
 ```yaml
 model:
   path: "models/bike.onnx"
-  backend: "opencv_dnn"
+  backend: "onnxruntime"
   confidence: 0.55
   nms_iou_threshold: 0.45
   image_size: 960
   device: ""
+  tensorrt_enabled: true
+  tensorrt_fp16: true
+  tensorrt_engine_cache_path: data/trt-cache/yolo11n
   classes:
     - "bicycle"
     - "bike"
@@ -145,8 +150,10 @@ model:
 
 说明：
 
-- 板端推荐 `opencv_dnn`，避免部署 PyTorch。
-- 开发机可使用 `ultralytics` 后端，具体取决于依赖安装。
+- 现场 `bot-version-test` 默认 `onnxruntime`，优先 `TensorrtExecutionProvider` FP16，失败则回退 CUDA/CPU。
+- `tensorrt_enabled: false` 可关掉 TensorRT，不必改代码。
+- `device` 只对 Ultralytics 后端有效。
+- 检测和直播仍是两条链：直播保持 `video_codec=copy`，检测框不画进 RTMP。
 - `classes` 用于筛选目标类别。
 
 ### 4.6 detection
