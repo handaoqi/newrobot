@@ -1,6 +1,4 @@
 <script setup>
-import Hls from 'hls.js'
-import mpegts from 'mpegts.js'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -22,7 +20,6 @@ import {
   fetchTaskTrajectory,
   sendRecordedAudioCommand,
   sendRobotNavigationCommand,
-  setRobotStreamAudioCapture,
   sendTaskExecutionAction,
   sendTextToSpeechCommand,
 } from '../services/api'
@@ -66,26 +63,15 @@ const loopCountedExecutionIds = ref([])
 const loopCurrentExecutionId = ref('')
 const loopMessage = ref('未启动循环巡检')
 const nowMs = ref(Date.now())
-const liveAudioEnabled = ref(false)
-const browserAudioMuted = ref(true)
-const browserAudioVolume = ref(1)
-const playbackMode = ref('live')
-const historyPlaybackPaused = ref(false)
-const historyOffsetSeconds = ref(30)
 const liveSpeechOpen = ref(false)
 const liveSpeechText = ref('')
 const liveSpeechSending = ref(false)
 const liveRecording = ref(false)
 const liveRecordingSeconds = ref(0)
 const streamUnavailable = ref(false)
-const videoRef = ref(null)
-const videoStageRef = ref(null)
 const { toastMessage, toastVariant, visible, showToast } = useToast()
 const router = useRouter()
 
-let flvPlayer = null
-let hlsPlayer = null
-let liveGuardTimer = null
 let alertEventSource = null
 let refreshTimer = null
 let executionTimer = null
@@ -96,26 +82,14 @@ let liveMediaRecorder = null
 let liveRecordingStream = null
 let liveRecordingTimer = null
 let liveRecordingChunks = []
-let historySeekTimer = null
-let playerResetInProgress = false
-let historyManifestUrl = ''
-let applyingBrowserAudio = false
 
 const failedCommandStatuses = new Set(['rejected', 'failed', 'cancelled', 'timed_out', 'expired'])
 const activeCommandStatuses = new Set(['created', 'published', 'accepted', 'executing'])
-const HISTORY_BUFFER_SECONDS = 30 * 60
 
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
 const playUrls = computed(() => latestRobot.value?.play_urls || {})
 const playUrlKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
 const hasStream = computed(() => !streamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
-const isHistoryPlayback = computed(() => playbackMode.value === 'history')
-const isFrozenPlayback = computed(() => playbackMode.value === 'paused' || isHistoryPlayback.value)
-const historyPlaybackStatus = computed(() => {
-  if (isHistoryPlayback.value) return historyPlaybackPaused.value ? '历史回放已暂停' : '历史回放 · 00:00 起播'
-  if (playbackMode.value === 'paused') return historyPlaybackPaused.value ? '直播已暂停，可拖动播放条' : '暂停片段播放中，可拖动播放条'
-  return '实时直播'
-})
 const robotTasks = computed(() => {
   if (!latestRobot.value?.id) return tasks.value
   return tasks.value.filter((task) => String(task.robot) === String(latestRobot.value.id))
@@ -859,41 +833,6 @@ async function forceExitTask() {
   }
 }
 
-async function setLiveAudio(enabled, { notify = true } = {}) {
-  const robot = latestRobot.value
-  if (!robot?.id) {
-    if (notify) showToast('当前没有可控制的机器人音频采集', { variant: 'alert' })
-    return false
-  }
-  try {
-    await setRobotStreamAudioCapture(robot.id, enabled)
-    liveAudioEnabled.value = enabled
-    if (notify) showToast(enabled ? '已请求开启 NX 现场音频采集' : '已请求关闭 NX 现场音频采集')
-    return true
-  } catch (error) {
-    if (notify) showToast(error.message || 'NX 现场音频采集控制失败', { variant: 'alert' })
-    return false
-  }
-}
-
-async function toggleLiveAudio() {
-  await setLiveAudio(!liveAudioEnabled.value)
-}
-
-function applyBrowserAudio(element, { muted = browserAudioMuted.value, volume = browserAudioVolume.value } = {}) {
-  applyingBrowserAudio = true
-  element.muted = muted
-  element.volume = volume
-  applyingBrowserAudio = false
-}
-
-function handleBrowserAudioChange(event) {
-  if (applyingBrowserAudio) return
-  const element = event.currentTarget
-  browserAudioMuted.value = element.muted
-  browserAudioVolume.value = element.volume
-}
-
 function liveRecordingDurationLabel() {
   const minutes = String(Math.floor(liveRecordingSeconds.value / 60)).padStart(2, '0')
   const seconds = String(liveRecordingSeconds.value % 60).padStart(2, '0')
@@ -1011,265 +950,6 @@ function showVideoNotice({ message, variant }) {
   showToast(message, variant ? { variant } : undefined)
 }
 
-function releaseHistoryManifest() {
-  if (!historyManifestUrl) return
-  URL.revokeObjectURL(historyManifestUrl)
-  historyManifestUrl = ''
-}
-
-function destroyPlayers() {
-  if (historySeekTimer) {
-    window.clearTimeout(historySeekTimer)
-    historySeekTimer = null
-  }
-  stopLiveGuard()
-  const element = videoRef.value
-  const replacingAttachedPlayer = Boolean(element && (flvPlayer || hlsPlayer || element.currentSrc))
-  if (replacingAttachedPlayer) playerResetInProgress = true
-  flvPlayer?.destroy()
-  hlsPlayer?.destroy()
-  flvPlayer = null
-  hlsPlayer = null
-  releaseHistoryManifest()
-  if (element) {
-    element.removeAttribute('src')
-    element.load()
-  }
-  if (replacingAttachedPlayer) {
-    window.setTimeout(() => { playerResetInProgress = false }, 250)
-  }
-}
-
-function markStreamUnavailable() {
-  streamUnavailable.value = true
-  destroyPlayers()
-}
-
-function seekLatestFrame() {
-  const element = videoRef.value
-  if (!element) return
-  const ranges = element.buffered
-  if (ranges?.length) {
-    const liveEnd = ranges.end(ranges.length - 1)
-    if (Number.isFinite(liveEnd) && liveEnd - element.currentTime > 0.8) {
-      element.currentTime = Math.max(0, liveEnd - 0.12)
-    }
-  } else if (Number.isFinite(element.duration) && element.duration > 0 && element.duration - element.currentTime > 0.8) {
-    element.currentTime = Math.max(0, element.duration - 0.12)
-  }
-}
-
-function keepLivePlaying() {
-  if (playbackMode.value !== 'live') return
-  const element = videoRef.value
-  if (!element) return
-  // Do not force mute here: this page exposes an operator-controlled live-audio toggle.
-  seekLatestFrame()
-  if (element.paused) element.play().catch(() => {})
-}
-
-function startLiveGuard() {
-  if (playbackMode.value !== 'live') return
-  stopLiveGuard()
-  keepLivePlaying()
-  liveGuardTimer = window.setInterval(keepLivePlaying, 800)
-}
-
-function stopLiveGuard() {
-  if (liveGuardTimer) {
-    window.clearInterval(liveGuardTimer)
-    liveGuardTimer = null
-  }
-}
-
-function playbackRange(element) {
-  const ranges = element?.seekable?.length ? element.seekable : element?.buffered
-  if (!ranges?.length) return null
-  const start = ranges.start(0)
-  const end = ranges.end(ranges.length - 1)
-  return Number.isFinite(start) && Number.isFinite(end) && end > start ? { start, end } : null
-}
-
-async function freezeHistoryManifest(hlsUrl) {
-  const response = await fetch(hlsUrl, { cache: 'no-store' })
-  if (!response.ok) throw new Error(`历史播放清单读取失败（${response.status}）`)
-  const playlist = await response.text()
-  const lines = playlist
-    .split(/\r?\n/)
-    .map((line) => (line && !line.startsWith('#') ? new URL(line, hlsUrl).href : line))
-    .filter((line) => line !== '')
-  if (!lines.includes('#EXT-X-ENDLIST')) lines.push('#EXT-X-ENDLIST')
-
-  const blob = new Blob([`${lines.join('\n')}\n`], { type: 'application/vnd.apple.mpegurl' })
-  historyManifestUrl = URL.createObjectURL(blob)
-  return historyManifestUrl
-}
-
-function applyHistoryPosition(element, attempts = 0) {
-  if (!isFrozenPlayback.value || !element) return
-  const range = playbackRange(element)
-  if (!range) {
-    if (attempts < 12) {
-      historySeekTimer = window.setTimeout(() => applyHistoryPosition(element, attempts + 1), 250)
-    }
-    return
-  }
-
-  const target = historyOffsetSeconds.value >= HISTORY_BUFFER_SECONDS
-    ? range.start
-    : Math.max(range.start, range.end - historyOffsetSeconds.value)
-  historyOffsetSeconds.value = Math.max(0, Math.round(range.end - target))
-  // Hls.js does not otherwise fetch an older segment while it is following
-  // the live edge.  Starting at the requested media time keeps audio/video
-  // aligned in the retained HLS window.
-  hlsPlayer?.startLoad?.(target)
-  element.currentTime = target
-
-  if (playbackMode.value === 'paused' || historyPlaybackPaused.value) {
-    const pauseAfterFrame = () => element.pause()
-    element.addEventListener('canplay', pauseAfterFrame, { once: true })
-    element.play().then(() => applyBrowserAudio(element)).catch(() => {})
-  } else {
-    element.play().then(() => applyBrowserAudio(element)).catch(() => {})
-  }
-}
-
-async function startHistoryPlayback(offsetSeconds = 30, { paused = false } = {}) {
-  if (!playUrls.value.hls) {
-    showToast('历史回放需要 HLS 视频流', { variant: 'alert' })
-    return
-  }
-  historyOffsetSeconds.value = Math.min(HISTORY_BUFFER_SECONDS, Math.max(0, Number(offsetSeconds) || 0))
-  historyPlaybackPaused.value = paused
-  playbackMode.value = 'history'
-  await setupPlayer()
-}
-
-async function pauseLivePlayback({ notify = true } = {}) {
-  if (!playUrls.value.hls) {
-    if (notify) showToast('暂停需要 HLS 视频流', { variant: 'alert' })
-    return
-  }
-  if (playbackMode.value === 'paused') return
-  stopLiveGuard()
-  historyOffsetSeconds.value = 0
-  historyPlaybackPaused.value = true
-  playbackMode.value = 'paused'
-  await setupPlayer()
-  if (notify) showToast('直播已暂停，片段已冻结，可拖动播放条')
-}
-
-async function replayHistoryFromBeginning() {
-  await startHistoryPlayback(HISTORY_BUFFER_SECONDS)
-  showToast('正在从历史 00:00 开始回放')
-}
-
-async function returnToLive() {
-  if (playbackMode.value === 'live') return
-  playbackMode.value = 'live'
-  historyPlaybackPaused.value = false
-  await setupPlayer()
-  showToast('已返回实时画面')
-}
-
-function handleVideoPause() {
-  if (playerResetInProgress) return
-  if (isFrozenPlayback.value) {
-    historyPlaybackPaused.value = true
-    return
-  }
-  if (playbackMode.value === 'live') {
-    void pauseLivePlayback({ notify: false })
-  }
-}
-
-function handleVideoPlay() {
-  if (isFrozenPlayback.value) {
-    historyPlaybackPaused.value = false
-    return
-  }
-  if (playbackMode.value === 'live') {
-    startLiveGuard()
-  }
-}
-
-async function setupPlayer() {
-  await nextTick()
-  destroyPlayers()
-  const element = videoRef.value
-  if (!element || !hasStream.value) return
-  // Start muted for autoplay, then restore the browser player's own audio
-  // state. NX capture is controlled only by the field-audio button.
-  applyBrowserAudio(element, { muted: true, volume: browserAudioVolume.value })
-  const { flv, hls } = playUrls.value
-  try {
-    // Keep low-latency FLV for real-time duty.  A paused/history session uses
-    // the retained HLS playlist so it never gets pulled back to the live edge.
-    if (!isFrozenPlayback.value && flv && mpegts.getFeatureList().mseLivePlayback) {
-      flvPlayer = mpegts.createPlayer({ type: 'flv', isLive: true, url: flv }, {
-        enableStashBuffer: false,
-        lazyLoad: false,
-        liveSync: true,
-        liveSyncMaxLatency: 1.0,
-        liveSyncTargetLatency: 0.35,
-        liveSyncPlaybackRate: 1.75,
-        liveBufferLatencyChasing: true,
-        liveBufferLatencyMaxLatency: 3.0,
-        liveBufferLatencyMinRemain: 0.35,
-      })
-      flvPlayer.on(mpegts.Events.ERROR, markStreamUnavailable)
-      flvPlayer.attachMediaElement(element)
-      flvPlayer.load()
-      await element.play()
-      applyBrowserAudio(element)
-      startLiveGuard()
-      return
-    }
-    if (hls && Hls.isSupported()) {
-      const frozen = isFrozenPlayback.value
-      const hlsSource = frozen ? await freezeHistoryManifest(hls) : hls
-      hlsPlayer = new Hls({
-        lowLatencyMode: !frozen,
-        startPosition: frozen ? 0 : -1,
-        liveSyncDurationCount: 1,
-        liveMaxLatencyDurationCount: 2,
-        maxLiveSyncPlaybackRate: 1.75,
-        backBufferLength: frozen ? HISTORY_BUFFER_SECONDS : 15,
-      })
-      hlsPlayer.loadSource(hlsSource)
-      hlsPlayer.attachMedia(element)
-      hlsPlayer.on(Hls.Events.ERROR, (_event, data) => data?.fatal && markStreamUnavailable())
-      hlsPlayer.on(Hls.Events.MANIFEST_PARSED, async () => {
-        if (isFrozenPlayback.value) {
-          applyHistoryPosition(element)
-          return
-        }
-        try {
-          await element.play()
-          applyBrowserAudio(element)
-          startLiveGuard()
-        } catch {
-          markStreamUnavailable()
-        }
-      })
-      return
-    }
-    if (hls && element.canPlayType('application/vnd.apple.mpegurl')) {
-      element.src = isFrozenPlayback.value ? await freezeHistoryManifest(hls) : hls
-      if (isFrozenPlayback.value) {
-        element.addEventListener('loadedmetadata', () => applyHistoryPosition(element), { once: true })
-      } else {
-        await element.play()
-        applyBrowserAudio(element)
-        startLiveGuard()
-      }
-      return
-    }
-  } catch {
-    markStreamUnavailable()
-  }
-}
-
 onMounted(async () => {
   let loaded = false
   try {
@@ -1324,7 +1004,7 @@ watch(playUrlKey, () => {
 
       <main class="guard-grid">
         <section class="guard-video-panel">
-          <div ref="videoStageRef" class="guard-video-stage">
+          <div class="guard-video-stage">
             <LiveVideoPlayer
               :play-urls="playUrls"
               :robot-id="latestRobot?.id"

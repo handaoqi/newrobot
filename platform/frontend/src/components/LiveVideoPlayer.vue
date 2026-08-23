@@ -28,6 +28,7 @@ const historyOffsetSeconds = ref(30)
 let flvPlayer = null
 let hlsPlayer = null
 let liveGuardTimer = null
+let streamStartupTimer = null
 let historySeekTimer = null
 let historyManifestUrl = ''
 let playerResetInProgress = false
@@ -35,6 +36,7 @@ let applyingBrowserAudio = false
 let setupVersion = 0
 
 const HISTORY_BUFFER_SECONDS = 30 * 60
+const streamConnectTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
 const playUrls = computed(() => props.playUrls || {})
 const sourceKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
 const hasHistoryStream = computed(() => Boolean(playUrls.value.hls))
@@ -101,6 +103,22 @@ function stopLiveGuard() {
   liveGuardTimer = null
 }
 
+function clearStreamStartupTimer() {
+  if (!streamStartupTimer) return
+  window.clearTimeout(streamStartupTimer)
+  streamStartupTimer = null
+}
+
+function armStreamStartupTimer(version, { fallbackToHls = false } = {}) {
+  clearStreamStartupTimer()
+  streamStartupTimer = window.setTimeout(() => {
+    streamStartupTimer = null
+    if (version !== setupVersion || !streamLoading.value) return
+    if (fallbackToHls && playUrls.value.hls) void setupPlayer({ preferHls: true })
+    else markStreamUnavailable()
+  }, streamConnectTimeoutMs)
+}
+
 function seekLatestFrame() {
   const element = videoRef.value
   if (!element) return
@@ -131,6 +149,7 @@ function startLiveGuard() {
 }
 
 function destroyPlayers() {
+  clearStreamStartupTimer()
   if (historySeekTimer) {
     window.clearTimeout(historySeekTimer)
     historySeekTimer = null
@@ -158,6 +177,25 @@ function markStreamUnavailable() {
   streamLoading.value = false
   destroyPlayers()
   emit('stream-error')
+}
+
+async function canReachStream(url) {
+  if (!url) return false
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), streamConnectTimeoutMs)
+  try {
+    await fetch(url, {
+      method: 'GET',
+      mode: 'no-cors',
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+    return true
+  } catch {
+    return false
+  } finally {
+    window.clearTimeout(timeout)
+  }
 }
 
 function playbackRange(element) {
@@ -255,7 +293,7 @@ function handleVideoPlay() {
   if (playbackMode.value === 'live') startLiveGuard()
 }
 
-async function setupPlayer() {
+async function setupPlayer({ preferHls = false } = {}) {
   const version = ++setupVersion
   streamLoading.value = true
   await nextTick()
@@ -269,7 +307,13 @@ async function setupPlayer() {
   applyBrowserAudio(element, { muted: true, volume: browserAudioVolume.value })
   const { flv, hls } = playUrls.value
   try {
-    if (!isFrozenPlayback.value && flv && mpegts.getFeatureList().mseLivePlayback) {
+    const flvSupported = !isFrozenPlayback.value && !preferHls && flv && mpegts.getFeatureList().mseLivePlayback
+    const playableFlv = flvSupported ? await canReachStream(flv) : false
+    const playableHls = !playableFlv && hls
+      ? (isFrozenPlayback.value ? true : await canReachStream(hls))
+      : false
+    if (version !== setupVersion) return
+    if (playableFlv) {
       flvPlayer = mpegts.createPlayer({ type: 'flv', isLive: true, url: flv }, {
         enableStashBuffer: false,
         lazyLoad: false,
@@ -281,16 +325,25 @@ async function setupPlayer() {
         liveBufferLatencyMaxLatency: 3.0,
         liveBufferLatencyMinRemain: 0.35,
       })
-      flvPlayer.on(mpegts.Events.ERROR, markStreamUnavailable)
+      flvPlayer.on(mpegts.Events.ERROR, () => {
+        if (version === setupVersion) void setupPlayer({ preferHls: true })
+      })
       flvPlayer.attachMediaElement(element)
       flvPlayer.load()
-      await element.play()
+      armStreamStartupTimer(version, { fallbackToHls: Boolean(hls) })
+      try {
+        await element.play()
+      } catch {
+        if (version === setupVersion) void setupPlayer({ preferHls: true })
+        return
+      }
       applyBrowserAudio(element)
       startLiveGuard()
+      clearStreamStartupTimer()
       streamLoading.value = false
       return
     }
-    if (hls && Hls.isSupported()) {
+    if (hls && playableHls && Hls.isSupported()) {
       const frozen = isFrozenPlayback.value
       const hlsSource = frozen ? await freezeHistoryManifest(hls) : hls
       if (version !== setupVersion) return
@@ -306,20 +359,22 @@ async function setupPlayer() {
       })
       hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
         if (frozen) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { streamLoading.value = false }).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamLoading.value = false }).catch(markStreamUnavailable)
         if (frozen) streamLoading.value = false
       })
       hlsPlayer.loadSource(hlsSource)
       hlsPlayer.attachMedia(element)
+      armStreamStartupTimer(version)
       return
     }
-    if (hls) {
+    if (hls && playableHls) {
       element.src = isFrozenPlayback.value ? await freezeHistoryManifest(hls) : hls
       element.addEventListener('loadedmetadata', () => {
         if (isFrozenPlayback.value) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { streamLoading.value = false }).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamLoading.value = false }).catch(markStreamUnavailable)
         if (isFrozenPlayback.value) streamLoading.value = false
       }, { once: true })
+      armStreamStartupTimer(version)
       return
     }
     markStreamUnavailable()
@@ -339,8 +394,24 @@ watch(sourceKey, (nextSource, previousSource) => {
   void setupPlayer()
 })
 
+watch(() => props.loading, (isLoading, wasLoading) => {
+  if (isLoading) {
+    setupVersion += 1
+    destroyPlayers()
+    streamLoading.value = false
+    return
+  }
+  if (wasLoading && !isLoading) {
+    streamUnavailable.value = false
+    void setupPlayer()
+  }
+})
+
 watch(() => props.available, (available) => {
-  if (!available) destroyPlayers()
+  if (!available) {
+    streamLoading.value = false
+    destroyPlayers()
+  }
   else {
     streamUnavailable.value = false
     void setupPlayer()
@@ -360,7 +431,7 @@ defineExpose({ returnToLive })
 <template>
   <div class="live-video-player">
     <video
-      v-if="hasStream && !loading && !streamLoading"
+      v-if="hasStream && !loading"
       ref="videoRef"
       class="live-video-player__video"
       :style="{ objectFit }"
@@ -371,17 +442,19 @@ defineExpose({ returnToLive })
       @play="handleVideoPlay"
       @volumechange="handleBrowserAudioChange"
     ></video>
-    <slot v-else-if="loading || streamLoading" name="loading">
-      <div class="live-video-player__empty">
-        <strong>正在加载视频流</strong>
-        <span>页面已就绪，正在连接现场画面</span>
-      </div>
-    </slot>
-    <slot v-else name="empty">
-      <div class="live-video-player__empty">
+    <div v-if="loading || streamLoading" class="live-video-player__loading">
+      <slot name="loading">
+        <div class="live-video-player__empty">
+          <strong>正在加载视频流</strong>
+          <span>页面已就绪，正在连接现场画面</span>
+        </div>
+      </slot>
+    </div>
+    <div v-else-if="!hasStream" class="live-video-player__empty">
+      <slot name="empty">
         <strong>视频暂不可用</strong>
-      </div>
-    </slot>
+      </slot>
+    </div>
 
     <slot name="overlay"></slot>
 
@@ -406,7 +479,8 @@ defineExpose({ returnToLive })
 
 <style scoped>
 .live-video-player { position: absolute; inset: 0; overflow: hidden; }
-.live-video-player__video, .live-video-player__empty { display: block; width: 100%; height: 100%; }
+.live-video-player__video, .live-video-player__empty, .live-video-player__loading { display: block; width: 100%; height: 100%; }
+.live-video-player__loading { position: absolute; inset: 0; z-index: 10; }
 .live-video-player__video { background: #06111f; }
 .live-video-player__empty { display: grid; place-content: center; gap: 8px; color: #d7e0e6; text-align: center; background: #152633; }
 .live-video-player__listen-toggle { position: absolute; z-index: 12; top: 18px; right: 18px; min-height: 42px; padding: 0 16px; border: 1px solid rgba(255, 255, 255, .4); color: #fff; background: rgba(10, 29, 41, .82); font: inherit; font-weight: 800; cursor: pointer; }
