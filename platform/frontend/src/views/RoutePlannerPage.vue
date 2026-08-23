@@ -105,6 +105,7 @@ const drillPosition = ref(null)
 const drillCurrentIndex = ref(null)
 const drillMessage = ref('')
 const drillTimeline = ref([])
+const drillTimelineOpen = ref(false)
 const drillElapsedSeconds = ref(0)
 const drillCurrentSpeed = ref(0)
 let navTimer = null
@@ -543,6 +544,7 @@ function stopDrillClock() {
 function clearDrillTimeline() {
   if (drillRunning.value) return
   drillTimeline.value = []
+  drillTimelineOpen.value = false
   drillElapsedSeconds.value = 0
   drillMessage.value = ''
   drillStartedAt = null
@@ -673,6 +675,7 @@ async function startDrill() {
   }
   drillCancelled = false
   drillTimeline.value = []
+  drillTimelineOpen.value = true
   drillEventSequence = 0
   drillStartedAt = Date.now()
   drillElapsedSeconds.value = 0
@@ -1955,7 +1958,10 @@ async function handleDeleteRoute(route) {
             <div v-else class="waypoint-list">
               <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
                 <div class="waypoint-main">
-                  <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                  <div class="waypoint-title-row">
+                    <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                    <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
+                  </div>
                   <div class="waypoint-pose-grid">
                     <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
                     <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
@@ -2010,7 +2016,6 @@ async function handleDeleteRoute(route) {
                     “巡检智能播报”分类下暂无文案
                   </small>
                 </div>
-                <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
               </div>
             </div>
             <div class="waypoint-actions">
@@ -2334,13 +2339,16 @@ async function handleDeleteRoute(route) {
               </section>
             </div>
 
-            <aside class="drill-timeline-panel">
+            <aside v-if="drillTimelineOpen" class="drill-timeline-panel">
               <div class="drill-timeline-header">
                 <div>
                   <span>演练记录</span>
                   <strong>时间轴</strong>
                 </div>
-                <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
+                <div class="drill-timeline-actions">
+                  <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
+                  <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">关闭</button>
+                </div>
               </div>
               <div class="drill-timeline-summary">
                 <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
@@ -2369,6 +2377,15 @@ async function handleDeleteRoute(route) {
               </div>
             </aside>
           </div>
+
+          <button
+            v-if="!drillTimelineOpen && (drillRunning || drillTimeline.length)"
+            type="button"
+            class="btn btn-sm drill-timeline-reopen"
+            @click="drillTimelineOpen = true"
+          >
+            显示演练记录
+          </button>
 
           <div v-if="drillMessage" class="drill-status" :class="{ active: drillRunning }">
             <span class="drill-status-dot"></span>
@@ -2440,6 +2457,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-panel {
   grid-row: 1;
+  align-self: stretch;
   min-width: 0;
   min-height: 0;
 }
@@ -2534,14 +2552,12 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-list {
-  max-height: 360px;
+  height: 360px;
   overflow-y: auto;
 }
 
 .waypoint-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  display: block;
   padding: 0.5rem;
   background: #fff;
   border-radius: 4px;
@@ -2554,6 +2570,24 @@ async function handleDeleteRoute(route) {
   min-width: 0;
   flex: 1;
   gap: 0.45rem;
+}
+
+.waypoint-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.waypoint-title-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.waypoint-delete-btn {
+  flex: 0 0 auto;
 }
 
 .waypoint-main label {
@@ -3000,8 +3034,8 @@ async function handleDeleteRoute(route) {
   grid-column: 1 / span 3;
   grid-row: 2;
   min-width: 0;
-  min-height: 0;
-  height: 100%;
+  min-height: calc(100vh - 320px);
+  height: auto;
   background: var(--panel-soft);
   border-radius: 4px;
   padding: 1rem;
@@ -3010,7 +3044,7 @@ async function handleDeleteRoute(route) {
   align-items: stretch;
   justify-content: flex-start;
   position: relative;
-  overflow: auto;
+  overflow: visible;
 }
 
 .map-stage-layout {
@@ -3137,6 +3171,17 @@ async function handleDeleteRoute(route) {
   flex-direction: column;
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 12px 30px rgba(124, 45, 18, 0.12);
+}
+
+.drill-timeline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.drill-timeline-reopen {
+  align-self: flex-end;
+  margin-top: 0.65rem;
 }
 
 .drill-timeline-header {
@@ -3898,6 +3943,42 @@ async function handleDeleteRoute(route) {
   background: rgba(67, 213, 255, 0.1);
 }
 
+[data-theme="dark"] .drill-timeline-panel {
+  color: var(--text);
+  border-color: rgba(255, 196, 92, 0.42);
+  background: var(--panel);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+}
+
+[data-theme="dark"] .drill-timeline-header span,
+[data-theme="dark"] .drill-timeline-summary span {
+  color: #ffd58a;
+}
+
+[data-theme="dark"] .drill-timeline-header strong,
+[data-theme="dark"] .drill-timeline-summary strong {
+  color: #ffe7bd;
+}
+
+[data-theme="dark"] .drill-timeline-summary div {
+  background: rgba(255, 196, 92, 0.12);
+}
+
+[data-theme="dark"] .drill-timeline-empty,
+[data-theme="dark"] .timeline-time,
+[data-theme="dark"] .timeline-content p {
+  color: #d8c4ac;
+}
+
+[data-theme="dark"] .timeline-time em,
+[data-theme="dark"] .timeline-meta span {
+  color: #ffd58a;
+}
+
+[data-theme="dark"] .timeline-meta span {
+  background: rgba(255, 196, 92, 0.14);
+}
+
 @media (max-width: 640px) {
   .route-planner-layout { gap: 0.75rem; }
   .panel-section { padding: 0.75rem; }
@@ -3916,7 +3997,7 @@ async function handleDeleteRoute(route) {
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
   .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
   .waypoint-heading-input input { min-width: 0; }
-  .waypoint-list { max-height: none; }
+  .waypoint-list { height: auto; }
   .drill-timeline-panel { max-height: 360px; padding: 0.7rem; }
   .keyframe-pagination { justify-content: space-between; gap: 0.4rem; }
 }
