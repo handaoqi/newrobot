@@ -2227,6 +2227,13 @@ a { color: inherit; }
   align-content: start;
   padding-right: 22px;
 }
+.robot-management-list-panel {
+  width: calc(100% * 2 / 3);
+  justify-self: start;
+}
+.robot-management-list-panel .robot-table-card {
+  width: 100%;
+}
 .list-panel::-webkit-scrollbar {
   width: 10px;
 }
@@ -2867,6 +2874,10 @@ a { color: inherit; }
     overflow: visible;
     gap: 11px;
     padding-right: 18px;
+  }
+
+  .robot-management-list-panel {
+    width: calc(100% * 2 / 3);
   }
 
   .list-panel .table-card {

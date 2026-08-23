@@ -484,7 +484,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="page-section">
     <div class="data-grid">
-      <section class="panel list-panel">
+      <section class="panel list-panel robot-management-list-panel">
         <div class="panel-head robot-list-head">
           <div>
             <h3>机器人</h3>
