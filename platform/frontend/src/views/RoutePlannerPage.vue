@@ -2474,14 +2474,14 @@ async function handleDeleteRoute(route) {
 }
 
 .route-config-panel {
-  grid-column: 1 / span 2;
+  grid-column: 2 / span 2;
   grid-row: 1;
   min-width: 0;
 }
 
 .route-config-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.65rem;
 }
 
@@ -2521,7 +2521,7 @@ async function handleDeleteRoute(route) {
 
 .route-drill-panel {
   display: flex;
-  grid-column: 3;
+  grid-column: 4;
   grid-row: 1;
   min-width: 0;
   align-items: center;
@@ -2561,7 +2561,7 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-4 {
-  grid-column: 4;
+  grid-column: 1;
   grid-row: 1;
   align-self: stretch;
 }
@@ -3215,7 +3215,7 @@ async function handleDeleteRoute(route) {
 
 .map-preview-area {
   grid-column: 1 / span 3;
-  grid-row: 2;
+  grid-row: 2 / span 2;
   min-width: 0;
   min-height: calc(100vh - 320px);
   height: auto;
@@ -4034,6 +4034,10 @@ async function handleDeleteRoute(route) {
   .route-timeline-column {
     grid-column: 1;
     grid-row: auto;
+  }
+
+  .route-step-3 {
+    max-height: none;
   }
 
   .map-container {
