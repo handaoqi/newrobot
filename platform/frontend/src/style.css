@@ -2365,6 +2365,8 @@ a { color: inherit; }
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
   min-height: 96px;
+  width: calc(100% * 2 / 3);
+  justify-self: start;
 }
 .robot-dock-button {
   flex: 0 0 auto;
@@ -2858,6 +2860,7 @@ a { color: inherit; }
   .list-panel .robot-table-card {
     grid-template-columns: minmax(0, 1fr) auto;
     min-height: 84px;
+    width: 100%;
   }
 
   .robot-card-side {
