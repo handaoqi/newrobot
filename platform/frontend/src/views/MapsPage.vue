@@ -30,6 +30,9 @@ const showUploadDialog = ref(false)
 const mappingBusy = ref(false)
 const mappingStepFeedback = ref(null)
 const mappingStatus = ref(null)
+const mappingResult = ref({})
+const mappingResultMapId = ref('')
+const mappingResultRobotId = ref('')
 const selectedMapId = ref(null)
 const mapImageError = ref({})
 const syncing = ref(false)
@@ -105,6 +108,7 @@ const uploadForm = ref({
 onMounted(async () => {
   await loadMaps()
   await loadRobots()
+  restorePendingMappingResult(mappingForm.value.robot)
   if (mappingForm.value.robot) await refreshMappingStatus()
   statusTimer = setInterval(() => {
     if (mappingForm.value.robot) refreshMappingStatus()
@@ -132,6 +136,72 @@ const selectedRobot = computed(() => {
     code: mappingStatus.value?.robot_code || selectedMap.value?.robot_code || `#${mappingForm.value.robot}`,
   }
 })
+
+function mappingResultStorageKey(robotId) {
+  return `roamerx.mapping-result:${String(robotId || '')}`
+}
+
+function restorePendingMappingResult(robotId) {
+  mappingResultRobotId.value = String(robotId || '')
+  mappingResultMapId.value = ''
+  mappingResult.value = {}
+  if (!robotId || typeof window === 'undefined') return
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(mappingResultStorageKey(robotId)) || 'null')
+    if (!saved || typeof saved !== 'object' || !saved.metrics || typeof saved.metrics !== 'object') return
+    mappingResultMapId.value = String(saved.map_id || '')
+    mappingResult.value = {
+      ...saved.metrics,
+      completion_step: Number(saved.completion_step || 0),
+      mapping_type: saved.mapping_type || '',
+    }
+  } catch (error) {
+    console.warn('恢复本次建图结果失败:', error)
+  }
+}
+
+function publishPendingMappingResult(mapId, metrics) {
+  if (!metrics || typeof metrics !== 'object' || !Object.keys(metrics).length) return
+  const robotId = mappingForm.value.robot
+  const completionStep = mappingForm.value.mapping_type === 'outdoor' ? 15 : 12
+  mappingResultRobotId.value = String(robotId || '')
+  mappingResultMapId.value = String(mapId || '')
+  mappingResult.value = {
+    ...metrics,
+    completion_step: completionStep,
+    mapping_type: mappingForm.value.mapping_type,
+  }
+  if (!robotId || typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(mappingResultStorageKey(robotId), JSON.stringify({
+      map_id: mappingResultMapId.value,
+      metrics,
+      completion_step: completionStep,
+      mapping_type: mappingForm.value.mapping_type,
+      created_at: new Date().toISOString(),
+    }))
+  } catch (error) {
+    console.warn('保存本次建图结果失败:', error)
+  }
+}
+
+function clearPendingMappingResult() {
+  const robotId = mappingResultRobotId.value || mappingForm.value.robot
+  if (robotId && typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(mappingResultStorageKey(robotId))
+    } catch (error) {
+      console.warn('清除本次建图结果失败:', error)
+    }
+  }
+  mappingResultMapId.value = ''
+  mappingResult.value = {}
+}
+
+watch(() => mappingForm.value.robot, (robot, previousRobot) => {
+  if (String(robot || '') !== String(previousRobot || '')) restorePendingMappingResult(robot)
+})
+
 const selectedMap = computed(() => maps.value.find(m => m.id === selectedMapId.value))
 const mapGroups = computed(() => {
   const groups = new Map()
@@ -312,10 +382,10 @@ const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle'
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
 const mappingCommandInFlight = computed(() => ['created', 'published', 'accepted', 'executing'].includes(commandStatus.value))
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
-const mappingMetrics = computed(() => {
-  const resultMetrics = mappingStatus.value?.result?.mapping_metrics || saveProgress.value.mapping_metrics || {}
-  return Object.keys(resultMetrics).length ? resultMetrics : selectedMapMetrics.value
-})
+// Runtime result is intentionally independent from the selected map. It is
+// published only after the package has been uploaded, and is cleared by the
+// next successful startup/check command.
+const mappingMetrics = computed(() => mappingResult.value)
 const rosbagStatus = computed(() => mappingStatus.value?.result?.rosbag || {})
 const originStatus = computed(() => mappingStatus.value?.result?.origin || {})
 const originState = computed(() => originStatus.value.origin_status || 'idle')
@@ -782,6 +852,9 @@ async function handleStartMapping() {
       await startRobotMappingSlam(mappingForm.value.robot, payload)
     }
     await refreshMappingStatus()
+    // Keep the previous package result visible while the new command is
+    // being accepted; hide it only after the next startup/check succeeds.
+    clearPendingMappingResult()
     setMappingStepFeedback(startStep, true, prepareOrigin
       ? '传感器检查完成，已停在“锁定原点”，等待点击锁定按钮'
       : '已进入下一检查步骤，等待人工确认后继续')
@@ -887,6 +960,7 @@ async function handleSaveMapping() {
       throw new Error('地图仍在上传，请稍后点击“刷新状态”查看结果')
     }
     const uploadedMapId = mappingStatus.value?.result?.upload_result?.id || mappingStatus.value?.latest_map?.id
+    const commandMetrics = mappingStatus.value?.result?.mapping_metrics || {}
     await loadMaps()
     if (uploadedMapId) {
       selectedMapId.value = uploadedMapId
@@ -896,6 +970,16 @@ async function handleSaveMapping() {
         if (robotCurrentMapId.value === String(uploadedMapId)) break
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
+    }
+    const uploadedMap = maps.value.find(map => String(map.id) === String(uploadedMapId))
+    const completedMetrics = uploadedMap?.mapping_metrics && Object.keys(uploadedMap.mapping_metrics).length
+      ? uploadedMap.mapping_metrics
+      : commandMetrics
+    // A map row with metrics is created only after the complete package has
+    // been built and accepted by the cloud upload endpoint. This is the
+    // indoor step 12 / outdoor step 15 completion boundary.
+    if (uploadedMapId && Object.keys(completedMetrics).length) {
+      publishPendingMappingResult(uploadedMapId, completedMetrics)
     }
     const synced = uploadedMapId && robotCurrentMapId.value === String(uploadedMapId)
     setMappingStepFeedback(
@@ -1696,7 +1780,10 @@ async function saveCleaner() {
             <div v-if="saveProgress.error" class="mapping-progress-error">{{ saveProgress.error }}</div>
           </div>
           <div v-if="Object.keys(mappingMetrics).length" class="mapping-metrics-panel mapping-metrics-runtime">
-            <div class="map-artifact-head"><strong>本次建图结果</strong><span>已上传指标</span></div>
+            <div class="map-artifact-head">
+              <strong>本次建图结果</strong>
+              <span>第{{ mappingMetrics.completion_step || (mappingMetrics.mapping_type === 'outdoor' ? 15 : 12) }}步打包完成</span>
+            </div>
             <div class="mapping-metrics-grid">
               <span>ZIP 包大小<strong>{{ formatBytes(mappingMetrics.package_size_bytes) }}</strong></span>
               <span>机器狗目录<strong>{{ formatBytes(mappingMetrics.robot_directory_size_bytes) }}</strong></span>
