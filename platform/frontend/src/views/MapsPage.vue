@@ -422,7 +422,11 @@ const displayMappingState = computed(() => {
   return mappingState.value
 })
 const canSaveMapping = computed(() => (
-  !mappingCommandInFlight.value && (slamDiverged.value || (mappingState.value === 'mapping' && readyForSave.value))
+  !mappingCommandInFlight.value && (
+    slamDiverged.value
+    || (mappingState.value === 'mapping' && readyForSave.value)
+    || (isError.value && ['mapping', 'saving'].includes(failureStepKey.value))
+  )
 ))
 const canCancelMapping = computed(() => (
   isError.value
@@ -444,7 +448,7 @@ const mappingModeSwitchDisabled = computed(() => (
 const canLockOrigin = computed(() => (
   isOutdoorMapping.value
   && connectionStatus.value === 'online'
-  && mappingState.value === 'origin_waiting'
+  && (mappingState.value === 'origin_waiting' || (isError.value && failureStepKey.value === 'origin_waiting'))
   && !mappingProcessAlive.value
   && !originLocked.value
   && !mappingCommandInFlight.value
@@ -452,7 +456,7 @@ const canLockOrigin = computed(() => (
 ))
 const canStartSlam = computed(() => (
   connectionStatus.value === 'online'
-  && !isError.value
+  && (!isError.value || ['slam_starting', 'slam_warmup', 'imu_initializing', 'waiting_first_keyframe'].includes(failureStepKey.value))
   && !mappingProcessAlive.value
   && !mappingCommandInFlight.value
   && (!isOutdoorMapping.value || originLocked.value || ['idle', 'cancelled', 'failed'].includes(originState.value))
@@ -463,6 +467,7 @@ const canBeginMapping = computed(() => (
   && Boolean(mappingStatus.value?.result?.ready_for_mapping ?? mappingReadiness.value.ready_for_mapping)
   && (!isOutdoorMapping.value || (originLocked.value && originStatus.value.heading_stable))
   && !mappingStatus.value?.result?.mapping_capture_enabled
+  && (!isError.value || failureStepKey.value === 'ready_to_map')
 ))
 
 const activeStepIndex = computed(() => {
@@ -1564,16 +1569,16 @@ async function saveCleaner() {
 
         <div class="mapping-actions">
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canStartSlam" @click="handleStartMapping">
-            {{ mappingBusy ? '正在下发...' : '启动并检查' }}
+            {{ mappingBusy ? '正在下发...' : (isError && ['slam_starting', 'slam_warmup', 'imu_initializing', 'waiting_first_keyframe'].includes(failureStepKey) ? '重试启动并检查' : '启动并检查') }}
           </button>
           <button v-if="isOutdoorMapping" class="btn btn-origin" :disabled="mappingBusy || !selectedRobot || !canLockOrigin" @click="handleLockOrigin">
-            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : '锁定 ENU 原点') }}
+            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : (isError && failureStepKey === 'origin_waiting' ? '重试锁定 ENU 原点' : '锁定 ENU 原点')) }}
           </button>
           <button class="btn btn-confirm" :disabled="mappingBusy || !selectedRobot || !canBeginMapping" @click="handleBeginMapping">
-            {{ isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图' }}
+            {{ isError && failureStepKey === 'ready_to_map' ? '重试确认并开始建图' : (isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图') }}
           </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
-            {{ slamDiverged ? '停止并生成救援地图' : '停止并保存地图' }}
+            {{ slamDiverged ? '停止并生成救援地图' : (isError && ['mapping', 'saving'].includes(failureStepKey) ? '重试停止并保存地图' : '停止并保存地图') }}
           </button>
           <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot || !canCancelMapping" @click="handleCancelMapping">
             取消建图
