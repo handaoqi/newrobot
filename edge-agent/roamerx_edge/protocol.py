@@ -11,7 +11,7 @@ PROTOCOL_VERSION = "1.0"
 TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel", "task.force_exit"}
 MAPPING_COMMAND_TYPES = {
     "mapping.start", "mapping.save", "mapping.cancel", "mapping.status",
-    "mapping.origin_start", "mapping.origin_cancel", "mapping.slam_start", "mapping.begin",
+    "mapping.origin_start", "mapping.origin_cancel", "mapping.origin_extract_global", "mapping.slam_start", "mapping.begin",
 }
 NAV_COMMAND_TYPES = {
     "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",

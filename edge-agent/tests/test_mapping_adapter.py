@@ -174,6 +174,25 @@ def test_origin_lock_retries_after_quality_failure(tmp_path, monkeypatch):
     assert calls == ["stop_nav", "sensors"]
 
 
+def test_extract_global_enu_persists_locked_origin(tmp_path):
+    adapter = make_adapter(tmp_path)
+    result = adapter.extract_global_enu({
+        "source_map_id": "map-7",
+        "source_map_name": "outside",
+        "global_enu": {
+            "alignment_locked": 1,
+            "origin_latitude": 39.9,
+            "origin_longitude": 116.4,
+            "origin_altitude": 42.0,
+            "heading_deg": 12.5,
+        },
+    })
+
+    assert result["global_enu"]["source_map_id"] == "map-7"
+    assert adapter._global_enu_file.exists()
+    assert adapter.status()["global_enu"]["origin_latitude"] == 39.9
+
+
 def test_indoor_warmup_rejects_outdoor_scene_scope(tmp_path):
     adapter = make_adapter(tmp_path)
 
@@ -299,6 +318,11 @@ def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):
     (session / "gnss_origin.yaml").write_text(
         "origin_latitude: 39.0\norigin_longitude: 116.0\nalignment_locked: 1\n"
     )
+    (session / "map.pcd").write_bytes(b"pcd")
+    (session / "keyframes").mkdir()
+    (session / "keyframes" / "keyframes.csv").write_text("index,x,y,yaw\n0,0,0,0\n")
+    (session / "scan_context").mkdir()
+    (session / "scan_context" / "index.json").write_text("{}")
     adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
     monkeypatch.setattr(adapter, "_generate_map_preview", lambda _base: None)
 
@@ -306,6 +330,9 @@ def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):
 
     with zipfile.ZipFile(package) as archive:
         assert "gnss_origin.yaml" in archive.namelist()
+        assert "map.pcd" in archive.namelist()
+        assert "keyframes/keyframes.csv" in archive.namelist()
+        assert "scan_context/index.json" in archive.namelist()
     assert "gnss_origin.yaml" in metadata["files"]
 
 

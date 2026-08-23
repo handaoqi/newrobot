@@ -87,6 +87,7 @@ class MappingAdapter:
         self._scene_scope = "indoor"
         self._mapping_type = "indoor"
         self._origin_file = Path(config.origin_file).expanduser() if config.origin_file else self.map_dir / "gnss_origin.yaml"
+        self._global_enu_file = self._origin_file.parent / "global_enu.yaml"
         self._origin_state_file = (
             Path(config.origin_state_file).expanduser()
             if config.origin_state_file
@@ -217,6 +218,32 @@ class MappingAdapter:
         self._cleanup()
         result.update(self.status())
         return result
+
+    def extract_global_enu(self, command: dict) -> dict:
+        """Persist the selected locked map origin as the robot-wide ENU config."""
+        supplied = command.get("global_enu") or {}
+        origin = supplied if isinstance(supplied, dict) else {}
+        if not origin:
+            origin = self._origin_monitor.status().get("origin") or {}
+        if not origin.get("alignment_locked"):
+            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "当前地图没有有效的锁定 ENU 原点")
+        payload = {
+            "schema": "roamerx.global-enu.v1",
+            "source_map_id": command.get("source_map_id", ""),
+            "source_map_name": command.get("source_map_name", ""),
+            "extracted_at": now_iso(),
+            **{key: origin.get(key) for key in (
+                "origin_latitude", "origin_longitude", "origin_altitude",
+                "enu_axis", "enu_to_map_yaw", "map_offset_x", "map_offset_y",
+                "heading_deg", "heading_std_deg", "position_spread_m",
+                "origin_lock_session_id", "locked_at_unix", "alignment_locked",
+            ) if origin.get(key) is not None},
+        }
+        self._global_enu_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._global_enu_file.with_suffix(self._global_enu_file.suffix + ".tmp")
+        temporary.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.replace(temporary, self._global_enu_file)
+        return {"global_enu": payload, "global_enu_file": str(self._global_enu_file)}
 
     def start_slam_warmup(self, command: dict) -> dict:
         """Start FAST-LIO-SAM estimator while keeping formal keyframe capture closed."""
@@ -489,6 +516,7 @@ class MappingAdapter:
         readiness = self._mapping_readiness(progress, process_alive)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
         rosbag = self._rosbag_status()
+        global_enu = self._read_global_enu()
         if not self.session:
             progress_stage = str(progress.get("stage") or "")
             save_stages = {
@@ -516,6 +544,7 @@ class MappingAdapter:
                 "files": files,
                 "rosbag": rosbag,
                 "origin": origin,
+                "global_enu": global_enu,
                 "origin_status": origin.get("origin_status", "idle"),
                 "mapping_type": self._mapping_type,
                 "slam_process_alive": process_alive,
@@ -568,10 +597,20 @@ class MappingAdapter:
             "files": files,
             "rosbag": rosbag,
             "origin": origin,
+            "global_enu": global_enu,
             "origin_status": origin.get("origin_status", "idle"),
             "ready_for_mapping": bool(readiness.get("ready_for_mapping"))
             and (self.session.mapping_type == "indoor" or origin.get("heading_stable") is True),
         }
+
+    def _read_global_enu(self) -> dict:
+        if not self._global_enu_file.is_file():
+            return {}
+        try:
+            value = yaml.safe_load(self._global_enu_file.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _mapping_readiness(progress: dict, process_alive: bool) -> dict:
@@ -1221,6 +1260,7 @@ class MappingAdapter:
         upload_files = [
             "map.yaml",
             "map.pgm",
+            "map.pcd",
             "map.txt",
             "gnss_origin.yaml",
             "mapping_trace.json",
@@ -1230,24 +1270,29 @@ class MappingAdapter:
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
             "loop_closures.csv",
-        ]
-        if preview_path:
-            upload_files.append(preview_path.name)
-        if self.config.upload_point_cloud:
-            upload_files.append("map.pcd")
-        files = []
-        extra_files = [
+            "keyframes/keyframes.csv",
             "scan_context/index.json",
             "scan_context/loop_candidates.csv",
         ]
+        if preview_path:
+            upload_files.append(preview_path.name)
+        files = []
+        extra_files = []
         with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
             for name in upload_files:
                 path = filtered_base / name
+                if not path.exists() and filtered_base != base:
+                    # Visibility-filtered outputs contain only navigation
+                    # assets. Keep the complete session metadata from the raw
+                    # session in the cloud package.
+                    path = base / name
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
             for name in extra_files:
                 path = filtered_base / name
+                if not path.exists() and filtered_base != base:
+                    path = base / name
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
@@ -1256,6 +1301,8 @@ class MappingAdapter:
         if not is_rescue:
             self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
         map_manifest = self._read_json(filtered_base / "map_manifest.json")
+        if not map_manifest and filtered_base != base:
+            map_manifest = self._read_json(base / "map_manifest.json")
         metadata = {
             "robot_code": self.media_client.robot_id,
             "mapping_session_id": self.session.session_id if self.session else str(uuid.uuid4()),

@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
 import {
   fetchMaps,
   fetchMapSets,
+  fetchMapMappingTrace,
   fetchRobots,
   deleteMap,
   downloadMap,
@@ -12,6 +13,7 @@ import {
   fetchRobotMappingStatus,
   startRobotMappingOrigin,
   cancelRobotMappingOrigin,
+  extractRobotMappingGlobalEnu,
   startRobotMappingSlam,
   beginRobotMapping,
   saveRobotMapping,
@@ -42,7 +44,12 @@ const cleanerZoom = ref(1)
 const cleanerStrokes = ref([])
 const cleanerRedoStrokes = ref([])
 const cleanerSaving = ref(false)
+const cleanerShowTrace = ref(true)
 const cleanerImageSize = ref({ width: 0, height: 0 })
+const mappingTrace = ref(null)
+const mappingTraceLoading = ref(false)
+const showMappingTrace = ref(true)
+const globalEnuBusy = ref(false)
 let cleanerImage = null
 let activeCleanerStroke = null
 let cleanerPanStart = null
@@ -196,6 +203,7 @@ function ensureMapGroupExpanded(mapId) {
 }
 
 watch(selectedMapId, (mapId) => ensureMapGroupExpanded(mapId))
+watch(selectedMapId, (mapId) => loadMappingTrace(mapId), { immediate: true })
 const robotCurrentMap = computed(() => mappingStatus.value?.current_map || {})
 const robotCurrentMapId = computed(() => String(robotCurrentMap.value.map_id || mappingStatus.value?.current_map_id || ''))
 const robotCurrentMapVersion = computed(() => String(robotCurrentMap.value.map_version || mappingStatus.value?.current_map_version || ''))
@@ -213,6 +221,62 @@ const activeMapSync = computed(() => {
   }
   return { state: 'mismatch', label: '平台与机器狗端不一致', className: 'status-offline' }
 })
+
+const selectedMapDescription = computed(() => parseDescription(selectedMap.value?.description))
+const selectedMapPackageFiles = computed(() => {
+  const files = selectedMapDescription.value.package_files || selectedMapDescription.value.files || []
+  return Array.isArray(files) ? files : []
+})
+const globalEnu = computed(() => mappingStatus.value?.result?.global_enu || {})
+const mapArtifactFiles = computed(() => [
+  { key: 'map.pcd', label: '点云地图', match: (name) => name === 'map.pcd' },
+  { key: 'keyframes/keyframes.csv', label: '关键帧位置', match: (name) => name === 'keyframes/keyframes.csv' || name === 'trajectory_optimized.csv' || name === 'trajectory_raw.csv' },
+  { key: 'scan_context/index.json', label: '指纹库', match: (name) => name === 'scan_context/index.json' || name === 'scan_context/loop_candidates.csv' },
+])
+
+const mappingTracePoints = computed(() => {
+  const map = selectedMap.value
+  const samples = mappingTrace.value?.samples || []
+  if (!map || !samples.length || !Number(map.resolution) || !Number(map.width) || !Number(map.height)) return []
+  const origin = Array.isArray(map.origin) ? map.origin : [0, 0, 0]
+  return samples.map((sample) => {
+    const pose = sample.slam || sample.pose || {}
+    return [
+      (Number(pose.x || 0) - Number(origin[0] || 0)) / Number(map.resolution),
+      Number(map.height) - (Number(pose.y || 0) - Number(origin[1] || 0)) / Number(map.resolution),
+    ]
+  }).filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
+})
+const mappingTraceSvgPoints = computed(() => mappingTracePoints.value.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' '))
+
+async function loadMappingTrace(mapId) {
+  mappingTrace.value = null
+  if (!mapId) return
+  mappingTraceLoading.value = true
+  try {
+    mappingTrace.value = await fetchMapMappingTrace(mapId)
+  } catch (error) {
+    console.warn('加载建图轨迹失败:', error)
+  } finally {
+    mappingTraceLoading.value = false
+  }
+}
+
+async function handleExtractGlobalEnu() {
+  if (!selectedMap.value?.robot || globalEnuBusy.value) return
+  if (!confirm(`确认将地图“${selectedMap.value.name}”的锁定原点提取为机器狗全局 ENU 配置吗？`)) return
+  globalEnuBusy.value = true
+  try {
+    await extractRobotMappingGlobalEnu(selectedMap.value.robot, { map_id: selectedMap.value.id })
+    await new Promise(resolve => setTimeout(resolve, 800))
+    await refreshMappingStatus()
+    if (!Object.keys(globalEnu.value).length) throw new Error('Edge Agent 尚未返回全局 ENU 配置，请刷新状态')
+  } catch (error) {
+    alert(`提取全局 ENU 失败: ${error.message}`)
+  } finally {
+    globalEnuBusy.value = false
+  }
+}
 
 // 连接状态
 const connectionStatus = computed(() => mappingStatus.value?.connection_status || 'unknown')
@@ -996,6 +1060,7 @@ async function openCleaner() {
   }
   showCleaner.value = true
   cleanerTool.value = 'erase'
+  cleanerShowTrace.value = showMappingTrace.value
   cleanerBrushM.value = 0.5
   cleanerStrokes.value = []
   cleanerRedoStrokes.value = []
@@ -1035,6 +1100,20 @@ function redrawCleaner() {
   const context = canvas.getContext('2d')
   context.clearRect(0, 0, canvas.width, canvas.height)
   context.drawImage(cleanerImage, 0, 0)
+  if (cleanerShowTrace.value && mappingTracePoints.value.length > 1) {
+    context.save()
+    context.strokeStyle = 'rgba(22, 120, 255, 0.9)'
+    context.lineWidth = Math.max(2, 2 / cleanerZoom.value)
+    context.lineCap = 'round'
+    context.lineJoin = 'round'
+    context.beginPath()
+    mappingTracePoints.value.forEach(([x, y], index) => {
+      if (index === 0) context.moveTo(x, y)
+      else context.lineTo(x, y)
+    })
+    context.stroke()
+    context.restore()
+  }
   context.save()
   context.strokeStyle = 'rgba(220, 38, 38, 0.72)'
   context.fillStyle = 'rgba(220, 38, 38, 0.72)'
@@ -1133,6 +1212,11 @@ function changeCleanerZoom(delta) {
   cleanerZoom.value = Math.min(3, Math.max(0.2, Number((cleanerZoom.value + delta).toFixed(2))))
 }
 
+function toggleCleanerTrace() {
+  cleanerShowTrace.value = !cleanerShowTrace.value
+  redrawCleaner()
+}
+
 async function saveCleaner() {
   if (!cleanerStrokes.value.length || !selectedMap.value) return
   if (!confirm('保存清理版后将立即设为活动地图并下发到机器狗，确定继续吗？')) return
@@ -1188,12 +1272,22 @@ async function saveCleaner() {
             <div v-else-if="mapImageError[selectedMap.id]" class="no-preview">
               预览加载失败
             </div>
-            <img
-              v-else
-              :src="fullPreviewUrl(selectedMap.thumbnail_url)"
-              :alt="selectedMap.name"
-              @error="handleImageError($event, selectedMap)"
-            />
+            <div v-else class="map-image-stage">
+              <img
+                :src="fullPreviewUrl(selectedMap.thumbnail_url)"
+                :alt="selectedMap.name"
+                @error="handleImageError($event, selectedMap)"
+              />
+              <svg
+                v-if="showMappingTrace && mappingTracePoints.length > 1"
+                class="map-trace-overlay"
+                :viewBox="`0 0 ${selectedMap.width || 1} ${selectedMap.height || 1}`"
+                preserveAspectRatio="none"
+                aria-label="建图轨迹"
+              >
+                <polyline :points="mappingTraceSvgPoints" />
+              </svg>
+            </div>
           </div>
           <div class="map-preview-info">
             <h3>{{ selectedMap.name }}</h3>
@@ -1212,6 +1306,38 @@ async function saveCleaner() {
               <div v-if="parseDescription(selectedMap.description).rescue" class="rescue-map-label">
                 <strong>质量:</strong> 发散救援地图，启用前必须现场核对
               </div>
+            </div>
+            <div class="map-artifact-panel">
+              <div class="map-artifact-head">
+                <strong>地图数据文件</strong>
+                <span>{{ selectedMapPackageFiles.length }} 项已上传</span>
+              </div>
+              <div v-for="artifact in mapArtifactFiles" :key="artifact.key" class="map-artifact-row">
+                <span>{{ artifact.label }}</span>
+                <strong :class="{ missing: !selectedMapPackageFiles.some(artifact.match) }">
+                  {{ selectedMapPackageFiles.some(artifact.match) ? '已上传' : '缺失' }}
+                </strong>
+              </div>
+              <small v-if="selectedMap.package_url">三类文件随完整地图包上传，可通过“下载”获取。</small>
+            </div>
+            <div class="global-enu-panel">
+              <div class="map-artifact-head">
+                <strong>当前全局 ENU</strong>
+                <button
+                  class="btn btn-sm"
+                  type="button"
+                  :disabled="globalEnuBusy || !selectedMap.robot"
+                  @click="handleExtractGlobalEnu"
+                >{{ globalEnuBusy ? '提取中...' : '提取全局 ENU' }}</button>
+              </div>
+              <div v-if="Object.keys(globalEnu).length" class="global-enu-values">
+                <span>LAT {{ Number(globalEnu.origin_latitude || 0).toFixed(10) }}</span>
+                <span>LON {{ Number(globalEnu.origin_longitude || 0).toFixed(10) }}</span>
+                <span>ALT {{ Number(globalEnu.origin_altitude || 0).toFixed(3) }} m</span>
+                <span>航向 {{ Number(globalEnu.heading_deg || 0).toFixed(2) }}°</span>
+                <span>来源地图 {{ globalEnu.source_map_name || selectedMap.name }}</span>
+              </div>
+              <small v-else>尚未从当前地图提取全局 ENU。</small>
             </div>
             <div class="map-sync-panel">
               <div class="sync-row">
@@ -1242,6 +1368,12 @@ async function saveCleaner() {
             </div>
             <div class="map-preview-actions">
               <span v-if="selectedMap.active" class="badge badge-success">活动地图</span>
+              <button
+                v-if="mappingTracePoints.length > 1"
+                class="btn btn-sm"
+                type="button"
+                @click="showMappingTrace = !showMappingTrace"
+              >{{ showMappingTrace ? '隐藏轨迹' : '显示轨迹' }}</button>
               <button class="btn btn-sm btn-primary" @click="openCleaner">擦除障碍</button>
               <button class="btn btn-sm" @click="handleDownload(selectedMap)">下载</button>
               <button
@@ -1410,6 +1542,15 @@ async function saveCleaner() {
             <span>LAT {{ Number(originStatus.origin?.origin_latitude || originStatus.latitude).toFixed(10) }}</span>
             <span>LON {{ Number(originStatus.origin?.origin_longitude || originStatus.longitude).toFixed(10) }}</span>
             <span>航向 {{ Number(originStatus.heading_deg || 0).toFixed(2) }}°</span>
+          </div>
+          <div class="origin-live-metrics">
+            <span>实时 LAT {{ originStatus.latitude == null ? '—' : Number(originStatus.latitude).toFixed(10) }}</span>
+            <span>实时 LON {{ originStatus.longitude == null ? '—' : Number(originStatus.longitude).toFixed(10) }}</span>
+            <span>精度 {{ originStatus.horizontal_std_m == null ? '—' : `${Number(originStatus.horizontal_std_m).toFixed(3)} m` }}</span>
+            <span>基线 {{ originStatus.baseline_m == null ? '—' : `${Number(originStatus.baseline_m).toFixed(3)} m` }}</span>
+            <span>航向 {{ originStatus.heading_deg == null ? '—' : `${Number(originStatus.heading_deg).toFixed(2)}°` }}</span>
+            <span>样本 {{ originStatus.sample_count || 0 }}</span>
+            <span>RTK {{ originStatus.ntrip_quality || originStatus.message || '等待数据' }}</span>
           </div>
         </section>
 
@@ -1704,6 +1845,9 @@ async function saveCleaner() {
             <span>{{ Math.round(cleanerZoom * 100) }}%</span>
             <button type="button" title="放大" @click="changeCleanerZoom(0.2)">+</button>
             <button type="button" title="重置擦除" :disabled="!cleanerStrokes.length" @click="resetCleaner">重置</button>
+            <button type="button" :class="{ active: cleanerShowTrace }" @click="toggleCleanerTrace">
+              {{ cleanerShowTrace ? '隐藏轨迹' : '显示轨迹' }}
+            </button>
           </div>
         </div>
         <div ref="cleanerViewport" class="cleaner-viewport" :class="`tool-${cleanerTool}`">
@@ -1817,6 +1961,7 @@ async function saveCleaner() {
 .origin-quality-grid small { overflow: hidden; color: #667085; font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
 .origin-quality-card p { margin: 0; color: #5f4b20; font-size: 0.8rem; }
 .origin-coordinate { padding-top: 0.65rem; border-top: 1px dashed #9ed6b5; color: #176b3a; font: 600 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.origin-live-metrics { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; padding-top: 0.65rem; border-top: 1px dashed #d8c991; color: #5f4b20; font: 600 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 .mapping-actions .btn-origin { border-color: #d99a19; color: #7a5100; background: #fff8e6; }
 .mapping-actions .btn-confirm { border-color: #198754; color: #fff; background: #198754; }
@@ -1905,6 +2050,11 @@ async function saveCleaner() {
   object-fit: contain;
 }
 
+.map-image-stage { position: relative; display: inline-flex; max-width: 100%; max-height: 100%; }
+.map-image-stage img { display: block; }
+.map-trace-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.map-trace-overlay polyline { fill: none; stroke: #1678ff; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+
 .no-preview {
   color: #999;
   text-align: center;
@@ -1938,6 +2088,17 @@ async function saveCleaner() {
   font-size: 0.875rem;
   color: #555;
 }
+
+.map-artifact-panel { display: grid; gap: 0.35rem; padding: 0.7rem 0.75rem; border: 1px solid #e5e7eb; border-radius: 6px; background: #fff; font-size: 0.78rem; }
+.map-artifact-head, .map-artifact-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.map-artifact-head { padding-bottom: 0.25rem; border-bottom: 1px solid #eef0f3; }
+.map-artifact-head span { color: #667085; font-size: 0.7rem; }
+.map-artifact-row strong { color: #137333; }
+.map-artifact-row strong.missing { color: #b42318; }
+.map-artifact-panel small { color: #667085; }
+.global-enu-panel { display: grid; gap: 0.45rem; padding: 0.7rem 0.75rem; border: 1px solid #9ed6b5; border-radius: 6px; background: #f3fff7; font-size: 0.78rem; }
+.global-enu-values { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; color: #176b3a; font: 600 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.global-enu-panel small { color: #667085; }
 
 .map-sync-panel {
   display: grid;

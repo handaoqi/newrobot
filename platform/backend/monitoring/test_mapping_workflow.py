@@ -1,8 +1,10 @@
+import json
+
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import RemoteCommand, Robot
+from .models import MapData, RemoteCommand, Robot
 
 
 class MappingWorkflowApiTests(TestCase):
@@ -55,6 +57,23 @@ class MappingWorkflowApiTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_extract_global_origin_builds_edge_command_from_map_metadata(self):
+        map_data = MapData.objects.create(
+            name="室外原点地图",
+            robot=self.robot,
+            description=json.dumps({
+                "gnss_origin_yaml": (
+                    "alignment_locked: 1\n"
+                    "origin_latitude: 39.9\n"
+                    "origin_longitude: 116.4\n"
+                    "origin_altitude: 42.0\n"
+                ),
+            }),
+        )
+        command = self.command_for("origin/extract-global", {"map_id": map_data.id})
+        self.assertEqual(command.command_type, "mapping.origin_extract_global")
+        self.assertEqual(command.payload["global_enu"]["origin_latitude"], 39.9)
 
     def test_origin_status_alias_returns_unified_mapping_snapshot(self):
         response = self.client.get(f"/api/robots/{self.robot.id}/mapping/origin/status/")

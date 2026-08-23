@@ -608,6 +608,7 @@ class MapData(BaseTimestampModel):
     thumbnail = models.ImageField(upload_to='maps/thumbnails/', null=True, blank=True, verbose_name="缩略图")
     trajectory_file = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图轨迹")
     mapping_trace = models.FileField(upload_to='maps/traces/', null=True, blank=True, verbose_name="建图定位轨迹")
+    package_file = models.FileField(upload_to='maps/packages/', null=True, blank=True, verbose_name="完整地图包")
     resolution = models.FloatField(default=0.05, verbose_name="分辨率(m/像素)")
     width = models.IntegerField(default=0, verbose_name="宽度(像素)")
     height = models.IntegerField(default=0, verbose_name="高度(像素)")
@@ -897,6 +898,7 @@ class RemoteCommand(BaseTimestampModel):
         ("mapping.status", "查询建图状态"),
         ("mapping.origin_start", "锁定 ENU 原点"),
         ("mapping.origin_cancel", "取消原点锁定"),
+        ("mapping.origin_extract_global", "提取全局 ENU"),
         ("mapping.slam_start", "启动 SLAM 预热"),
         ("mapping.begin", "确认并开始正式建图"),
         ("nav.status", "查询导航状态"),

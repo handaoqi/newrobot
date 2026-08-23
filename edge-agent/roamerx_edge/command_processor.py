@@ -507,6 +507,8 @@ class CommandProcessor:
             result_payload = self.mapping_adapter.start_origin_lock(command)
         elif envelope.message_type == "mapping.origin_cancel":
             result_payload = self.mapping_adapter.cancel_origin_lock(command)
+        elif envelope.message_type == "mapping.origin_extract_global":
+            result_payload = self.mapping_adapter.extract_global_enu(command)
         elif envelope.message_type == "mapping.slam_start":
             result_payload = self.mapping_adapter.start_slam_warmup(command)
         elif envelope.message_type == "mapping.begin":

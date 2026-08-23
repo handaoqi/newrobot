@@ -5,6 +5,7 @@ import logging
 import math
 import uuid
 import zipfile
+import yaml
 from datetime import time as datetime_time, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -12,7 +13,7 @@ from urllib.request import Request, urlopen
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
-from django.http import HttpResponse, HttpResponseForbidden, StreamingHttpResponse
+from django.http import FileResponse, HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db import IntegrityError, transaction
 from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
 from django.db.models.deletion import ProtectedError
@@ -368,6 +369,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "local_image_path": local_image_path,
         "pgm_url": request.build_absolute_uri(map_data.pgm_file.url) if map_data.pgm_file else "",
         "yaml_url": request.build_absolute_uri(map_data.yaml_file.url) if map_data.yaml_file else "",
+        "package_url": request.build_absolute_uri(map_data.package_file.url) if map_data.package_file else "",
         "resolution": map_data.resolution,
         "origin": map_data.origin,
         "width": map_data.width,
@@ -375,6 +377,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "manual_edit": edit_metadata.get("mode") == "manual_cleanup",
         "pgm_sha256": _file_sha256(map_data.pgm_file.path) if map_data.pgm_file else "",
         "yaml_sha256": _file_sha256(map_data.yaml_file.path) if map_data.yaml_file else "",
+        "package_sha256": _file_sha256(map_data.package_file.path) if map_data.package_file else "",
         "gnss_origin_yaml": description.get("gnss_origin_yaml", "") if isinstance(description, dict) else "",
         "map_manifest": description.get("map_manifest", {}) if isinstance(description, dict) else {},
         "coordinate_mode": map_data.coordinate_mode,
@@ -528,7 +531,14 @@ def _force_delete_map(map_data: MapData) -> dict:
             Q(map_data=map_data) | Q(task_execution_id__in=execution_ids)
         ).count(),
     }
-    files = [map_data.pgm_file, map_data.yaml_file, map_data.thumbnail]
+    files = [
+        map_data.pgm_file,
+        map_data.yaml_file,
+        map_data.thumbnail,
+        map_data.trajectory_file,
+        map_data.mapping_trace,
+        map_data.package_file,
+    ]
     robot = map_data.robot
     was_active = map_data.active
     with transaction.atomic():
@@ -2146,7 +2156,14 @@ class MapDataDetailView(APIView):
                     f"{name} {count} 个" for name, count in blocking.items()
                 )
                 return Response({"detail": detail, "references": blocking}, status=status.HTTP_409_CONFLICT)
-            files = [map_data.pgm_file, map_data.yaml_file, map_data.thumbnail, map_data.trajectory_file, map_data.mapping_trace]
+            files = [
+                map_data.pgm_file,
+                map_data.yaml_file,
+                map_data.thumbnail,
+                map_data.trajectory_file,
+                map_data.mapping_trace,
+                map_data.package_file,
+            ]
             map_data.delete()
             for file_field in files:
                 if file_field:
@@ -2168,6 +2185,10 @@ class MapDataDownloadView(APIView):
     def get(self, request, pk):
         try:
             map_data = MapData.objects.get(pk=pk)
+            if map_data.package_file:
+                response = FileResponse(map_data.package_file.open("rb"), content_type="application/zip")
+                response["Content-Disposition"] = f'attachment; filename="{map_data.name}.zip"'
+                return response
             import io
             import zipfile
             from django.http import HttpResponse
@@ -2315,7 +2336,14 @@ class MapDataManualCleanView(APIView):
                 )
         except Exception:
             if cleaned:
-                for field in (cleaned.pgm_file, cleaned.yaml_file, cleaned.thumbnail, cleaned.trajectory_file, cleaned.mapping_trace):
+                for field in (
+                    cleaned.pgm_file,
+                    cleaned.yaml_file,
+                    cleaned.thumbnail,
+                    cleaned.trajectory_file,
+                    cleaned.mapping_trace,
+                    cleaned.package_file,
+                ):
                     if field:
                         field.delete(save=False)
             raise
@@ -2735,6 +2763,30 @@ class RobotMappingOriginCancelView(RobotMappingCommandView):
         return {"mapping_session_id": request.data.get("mapping_session_id", "")}
 
 
+class RobotMappingOriginExtractGlobalView(RobotMappingCommandView):
+    command_type = "mapping.origin_extract_global"
+    expiry_seconds = 120
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        map_data = get_object_or_404(MapData, pk=request.data.get("map_id"), robot=robot)
+        try:
+            description = json.loads(map_data.description or "{}")
+        except (TypeError, ValueError):
+            description = {}
+        origin_text = description.get("gnss_origin_yaml") or ""
+        try:
+            global_enu = yaml.safe_load(origin_text) if origin_text else {}
+        except yaml.YAMLError as exc:
+            raise ValidationError({"map_id": f"地图原点配置损坏: {exc}"}) from exc
+        if not isinstance(global_enu, dict) or not global_enu.get("alignment_locked"):
+            raise ValidationError({"map_id": "当前地图没有有效的锁定 ENU 原点"})
+        return {
+            "source_map_id": str(map_data.id),
+            "source_map_name": map_data.name,
+            "global_enu": global_enu,
+        }
+
+
 class RobotMappingSlamStartView(RobotMappingCommandView):
     command_type = "mapping.slam_start"
     expiry_seconds = 180
@@ -3014,8 +3066,11 @@ class DeviceMapUploadView(APIView):
         extracted: dict[str, bytes] = {}
         submap_files: dict[str, dict[str, bytes]] = {}
         map_set_manifest: dict = {}
+        package_bytes = package.read()
+        package_names: list[str] = []
         try:
-            with zipfile.ZipFile(io.BytesIO(package.read())) as archive:
+            with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
+                package_names = archive.namelist()
                 for name in archive.namelist():
                     if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json", "map_manifest.json", "trajectory_raw.csv", "trajectory_optimized.csv", "recording_manifest.yaml"}:
                         extracted[name] = archive.read(name)
@@ -3041,6 +3096,11 @@ class DeviceMapUploadView(APIView):
                     map_manifest = parsed_manifest
             except (UnicodeDecodeError, json.JSONDecodeError):
                 pass
+        if map_manifest.get("completeness") == "complete" and "map.pcd" not in package_names:
+            return Response(
+                {"detail": "完整地图包必须包含 map.pcd，当前上传包无法用于三维 NDT 导航"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         description = {
             "source": "edge_mapping",
             "map_version": metadata.get("map_version", ""),
@@ -3058,6 +3118,8 @@ class DeviceMapUploadView(APIView):
             "scene_scope": map_manifest.get("scene_scope") or metadata.get("scene_scope", ""),
             "localization_mode": map_manifest.get("localization_mode") or metadata.get("localization_mode", ""),
             "origin_status": map_manifest.get("origin_status") or metadata.get("origin_status", ""),
+            "package_files": package_names,
+            "package_sha256": hashlib.sha256(package_bytes).hexdigest(),
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
@@ -3084,6 +3146,7 @@ class DeviceMapUploadView(APIView):
             preview = extracted.get("map_preview.png") or extracted.get("preview.png")
             if preview:
                 map_data.thumbnail.save(f"{map_data.id}_preview.png", ContentFile(preview), save=False)
+            map_data.package_file.save(f"{map_data.id}_map_package.zip", ContentFile(package_bytes), save=False)
             map_data.save()
             map_set = None
             if map_set_manifest and submap_files:

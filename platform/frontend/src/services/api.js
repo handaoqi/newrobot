@@ -371,6 +371,13 @@ export async function cancelRobotMappingOrigin(robotId, payload = {}) {
   })
 }
 
+export async function extractRobotMappingGlobalEnu(robotId, payload = {}) {
+  return request(`/robots/${robotId}/mapping/origin/extract-global/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function startRobotMappingSlam(robotId, payload) {
   return request(`/robots/${robotId}/mapping/slam/start/`, {
     method: 'POST',

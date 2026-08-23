@@ -23,6 +23,7 @@ COMMAND_TYPES = {
     "mapping.status",
     "mapping.origin_start",
     "mapping.origin_cancel",
+    "mapping.origin_extract_global",
     "mapping.slam_start",
     "mapping.begin",
     "nav.status",
