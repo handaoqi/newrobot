@@ -228,6 +228,11 @@ const selectedMapPackageFiles = computed(() => {
   return Array.isArray(files) ? files : []
 })
 const globalEnu = computed(() => mappingStatus.value?.result?.global_enu || {})
+const currentMapGlobalEnu = computed(() => (
+  selectedMap.value && String(globalEnu.value.source_map_id || '') === String(selectedMap.value.id)
+    ? globalEnu.value
+    : {}
+))
 const mapArtifactFiles = computed(() => [
   { key: 'map.pcd', label: '点云地图', match: (name) => name === 'map.pcd' },
   { key: 'keyframes/keyframes.csv', label: '关键帧位置', match: (name) => name === 'keyframes/keyframes.csv' || name === 'trajectory_optimized.csv' || name === 'trajectory_raw.csv' },
@@ -268,9 +273,16 @@ async function handleExtractGlobalEnu() {
   globalEnuBusy.value = true
   try {
     await extractRobotMappingGlobalEnu(selectedMap.value.robot, { map_id: selectedMap.value.id })
-    await new Promise(resolve => setTimeout(resolve, 800))
-    await refreshMappingStatus()
-    if (!Object.keys(globalEnu.value).length) throw new Error('Edge Agent 尚未返回全局 ENU 配置，请刷新状态')
+    const deadline = Date.now() + 30 * 1000
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 800))
+      await refreshMappingStatus()
+      if (Object.keys(currentMapGlobalEnu.value).length) break
+      if (['failed', 'command_failed', 'command_rejected', 'command_timed_out'].includes(mappingStatus.value?.mapping_state)) {
+        throw new Error(mappingStatus.value?.error_message || 'Edge Agent 提取全局 ENU 失败')
+      }
+    }
+    if (!Object.keys(currentMapGlobalEnu.value).length) throw new Error('Edge Agent 尚未返回当前地图的全局 ENU 配置，请刷新状态')
   } catch (error) {
     alert(`提取全局 ENU 失败: ${error.message}`)
   } finally {
@@ -1330,12 +1342,12 @@ async function saveCleaner() {
                   @click="handleExtractGlobalEnu"
                 >{{ globalEnuBusy ? '提取中...' : '提取全局 ENU' }}</button>
               </div>
-              <div v-if="Object.keys(globalEnu).length" class="global-enu-values">
-                <span>LAT {{ Number(globalEnu.origin_latitude || 0).toFixed(10) }}</span>
-                <span>LON {{ Number(globalEnu.origin_longitude || 0).toFixed(10) }}</span>
-                <span>ALT {{ Number(globalEnu.origin_altitude || 0).toFixed(3) }} m</span>
-                <span>航向 {{ Number(globalEnu.heading_deg || 0).toFixed(2) }}°</span>
-                <span>来源地图 {{ globalEnu.source_map_name || selectedMap.name }}</span>
+              <div v-if="Object.keys(currentMapGlobalEnu).length" class="global-enu-values">
+                <span>LAT {{ Number(currentMapGlobalEnu.origin_latitude || 0).toFixed(10) }}</span>
+                <span>LON {{ Number(currentMapGlobalEnu.origin_longitude || 0).toFixed(10) }}</span>
+                <span>ALT {{ Number(currentMapGlobalEnu.origin_altitude || 0).toFixed(3) }} m</span>
+                <span>航向 {{ Number(currentMapGlobalEnu.heading_deg || 0).toFixed(2) }}°</span>
+                <span>来源地图 {{ currentMapGlobalEnu.source_map_name || selectedMap.name }}</span>
               </div>
               <small v-else>尚未从当前地图提取全局 ENU。</small>
             </div>
