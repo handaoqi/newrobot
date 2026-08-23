@@ -6,7 +6,7 @@ import math
 import uuid
 import zipfile
 import yaml
-from datetime import time as datetime_time, timedelta
+from datetime import datetime, time as datetime_time, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -207,7 +207,7 @@ def serialize_trend(title, subtitle, unit, accent, points):
 def _daily_counts(queryset, date_field, dates):
     """按本地日期统计 queryset 行数，对齐到 `dates`，返回 [{"label","value"}]。"""
     buckets = {date: 0 for date in dates}
-    for value in queryset.values_list(date_field, flat=True):
+    for value in queryset.values_list(date_field, flat=True).iterator(chunk_size=2000):
         if value is None:
             continue
         local_date = timezone.localtime(value).date()
@@ -220,7 +220,7 @@ def _daily_active_minutes(telemetry_qs, dates):
     """按本地日期统计遥测活跃时长（当日 max-min(reported_at) 分钟），无数据则 0。"""
     date_set = set(dates)
     spans = {date: [None, None] for date in dates}
-    for reported_at in telemetry_qs.values_list("reported_at", flat=True):
+    for reported_at in telemetry_qs.values_list("reported_at", flat=True).iterator(chunk_size=2000):
         if reported_at is None:
             continue
         local_dt = timezone.localtime(reported_at)
@@ -250,27 +250,66 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 def _daily_mileage_km(telemetry_qs, dates):
     """按本地日期统计相邻遥测点经纬度的 Haversine 累距（公里），无数据则 0。"""
     date_set = set(dates)
-    per_day = {date: [] for date in dates}
+    distances = {date: 0.0 for date in dates}
+    previous_points = {}
     rows = (
         telemetry_qs.filter(latitude__isnull=False, longitude__isnull=False)
         .values_list("reported_at", "latitude", "longitude")
         .order_by("reported_at")
     )
-    for reported_at, lat, lon in rows:
+    for reported_at, lat, lon in rows.iterator(chunk_size=2000):
         if reported_at is None:
             continue
         day = timezone.localtime(reported_at).date()
         if day not in date_set:
             continue
-        per_day[day].append((float(lat), float(lon)))
+        point = (float(lat), float(lon))
+        previous = previous_points.get(day)
+        if previous:
+            distances[day] += _haversine_km(*previous, *point)
+        previous_points[day] = point
     result = []
     for date in dates:
-        points = per_day[date]
-        distance = 0.0
-        for (lat1, lon1), (lat2, lon2) in zip(points, points[1:]):
-            distance += _haversine_km(lat1, lon1, lat2, lon2)
-        result.append({"label": date.strftime("%m-%d"), "value": round(distance, 2)})
+        result.append({"label": date.strftime("%m-%d"), "value": round(distances[date], 2)})
     return result
+
+
+def _daily_telemetry_series(telemetry_qs, dates):
+    """一次读取遥测点，同时计算每日活跃时长和经纬度累计里程。"""
+    date_set = set(dates)
+    spans = {date: [None, None] for date in dates}
+    distances = {date: 0.0 for date in dates}
+    previous_points = {}
+    rows = (
+        telemetry_qs.values_list("reported_at", "latitude", "longitude")
+        .order_by("reported_at")
+    )
+    for reported_at, lat, lon in rows.iterator(chunk_size=2000):
+        if reported_at is None:
+            continue
+        local_dt = timezone.localtime(reported_at)
+        day = local_dt.date()
+        if day not in date_set:
+            continue
+        low, high = spans[day]
+        spans[day][0] = local_dt if low is None else min(low, local_dt)
+        spans[day][1] = local_dt if high is None else max(high, local_dt)
+        if lat is None or lon is None:
+            continue
+        point = (float(lat), float(lon))
+        previous = previous_points.get(day)
+        if previous:
+            distances[day] += _haversine_km(*previous, *point)
+        previous_points[day] = point
+
+    active_minutes = []
+    mileage = []
+    for date in dates:
+        low, high = spans[date]
+        minutes = round((high - low).total_seconds() / 60, 1) if low and high else 0
+        active_minutes.append({"label": date.strftime("%m-%d"), "value": minutes})
+        mileage.append({"label": date.strftime("%m-%d"), "value": round(distances[date], 2)})
+    return active_minutes, mileage
 
 
 def request_force_delete(request) -> bool:
@@ -568,7 +607,12 @@ def build_analytics_payload():
     ensure_demo_seed()
     dates = build_period_labels(7)
     start_date = dates[0]
-    events = InspectionEvent.objects.all()
+    # Use local-midnight bounds instead of __date__ filters, avoiding a
+    # non-sargable date conversion and limiting the rows returned to 7 days.
+    start_at = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+    end_at = timezone.make_aware(datetime.combine(dates[-1] + timedelta(days=1), datetime.min.time()))
+
+    events = InspectionEvent.objects.filter(detected_at__gte=start_at, detected_at__lt=end_at)
 
     risk_weight_map = {"high": 3, "medium": 2, "low": 1}
     risk_totals = {date: 0 for date in dates}
@@ -577,23 +621,26 @@ def build_analytics_payload():
         if event_date in risk_totals:
             risk_totals[event_date] += risk_weight_map.get(event.risk_level, 1)
 
-    # 逐日真实聚合（今天往前滚动 7 天，窗口外的历史数据如实显示为 0）。
-    # 下面按 __date__gte 做超集预筛，helper 再按本地日期精确归桶。
-    window_events = events.filter(detected_at__date__gte=start_date)
+    # 逐日真实聚合（今天往前滚动 7 天，窗口外的历史数据不参与本次统计）。
+    window_events = events
     window_snapshots = MediaAsset.objects.filter(
-        media_type="snapshot", event_time__date__gte=start_date
+        media_type="snapshot", event_time__gte=start_at, event_time__lt=end_at
     )
-    window_telemetry = RobotTelemetry.objects.filter(reported_at__date__gte=start_date)
+    window_telemetry = RobotTelemetry.objects.filter(reported_at__gte=start_at, reported_at__lt=end_at)
 
     alert_series = _daily_counts(window_events, "detected_at", dates)
     detection_series = _daily_counts(window_snapshots, "event_time", dates)
-    duration_series = _daily_active_minutes(window_telemetry, dates)
-    mileage_series = _daily_mileage_km(window_telemetry, dates)
+    duration_series, mileage_series = _daily_telemetry_series(window_telemetry, dates)
 
     # 平均完成度：真实完成任务的航点完成比均值；无 completed 执行则无数据
     completion_ratios = [
-        execution.completed_waypoints / execution.total_waypoints
-        for execution in TaskExecution.objects.filter(state="completed", total_waypoints__gt=0)
+        completed / total
+        for completed, total in TaskExecution.objects.filter(
+            state="completed",
+            total_waypoints__gt=0,
+            created_at__gte=start_at,
+            created_at__lt=end_at,
+        ).values_list("completed_waypoints", "total_waypoints").iterator(chunk_size=2000)
     ]
     if completion_ratios:
         completion_value = f"{round(sum(completion_ratios) / len(completion_ratios) * 100)}%"
@@ -603,7 +650,7 @@ def build_analytics_payload():
     # 值守响应：已处理事件的平均响应时长；无已处理事件则无数据
     response_deltas = [
         (event.handled_at - event.detected_at).total_seconds()
-        for event in events.filter(handled_at__isnull=False).only("handled_at", "detected_at")
+        for event in events.filter(handled_at__isnull=False).only("handled_at", "detected_at").iterator(chunk_size=2000)
         if event.handled_at and event.detected_at and event.handled_at >= event.detected_at
     ]
     if response_deltas:
@@ -629,12 +676,12 @@ def build_analytics_payload():
             {
                 "title": "平均完成度",
                 "value": completion_value,
-                "note": "基于已完成任务执行的航点完成度均值",
+                "note": "近 7 个统计周期内已完成任务执行的航点完成度均值",
             },
             {
                 "title": "值守响应",
                 "value": response_value,
-                "note": f"当前在线设备 {online_robot_count} 台，均值取自已处理事件响应时长",
+                "note": f"当前在线设备 {online_robot_count} 台，均值取自近 7 个统计周期内已处理事件响应时长",
             },
         ],
         "trends": [
