@@ -770,6 +770,7 @@ class MapDataSerializer(serializers.ModelSerializer):
     yaml_url = serializers.SerializerMethodField()
     thumbnail_url = serializers.SerializerMethodField()
     mapping_trace_url = serializers.SerializerMethodField()
+    package_url = serializers.SerializerMethodField()
     file_size = serializers.SerializerMethodField()
 
     class Meta:
@@ -787,6 +788,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "yaml_url",
             "thumbnail_url",
             "mapping_trace_url",
+            "package_url",
             "resolution",
             "width",
             "height",
@@ -831,12 +833,17 @@ class MapDataSerializer(serializers.ModelSerializer):
     def get_mapping_trace_url(self, obj):
         return f"/api/maps/{obj.id}/mapping-trace/"
 
+    def get_package_url(self, obj):
+        return obj.package_file.url if obj.package_file else None
+
     def get_file_size(self, obj):
         size = 0
         if obj.pgm_file and hasattr(obj.pgm_file, 'size'):
             size += obj.pgm_file.size
         if obj.yaml_file and hasattr(obj.yaml_file, 'size'):
             size += obj.yaml_file.size
+        if obj.package_file and hasattr(obj.package_file, 'size'):
+            size += obj.package_file.size
         return size
 
 
