@@ -2532,7 +2532,8 @@ a { color: inherit; }
   overflow-wrap: anywhere;
 }
 .robot-card-side {
-  min-width: 74px;
+  min-width: 0;
+  width: max-content;
   align-self: stretch;
   justify-self: end;
   align-content: center;
