@@ -1887,7 +1887,7 @@ async function handleDeleteRoute(route) {
       </div>
 
       <div class="route-planner-layout">
-        <!-- 左侧面板 -->
+        <!-- 路线配置步骤 -->
         <div class="side-panel">
           <div class="panel-section route-step-panel route-step-1">
             <div class="route-step-heading">
@@ -2189,7 +2189,7 @@ async function handleDeleteRoute(route) {
           </div>
         </div>
 
-        <!-- 右侧地图预览区 -->
+        <!-- 地图主区域 -->
         <div class="map-preview-area">
           <div class="map-stage-layout">
             <div v-if="!selectedMap" class="map-placeholder">
@@ -2427,10 +2427,11 @@ async function handleDeleteRoute(route) {
 
 .route-planner-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  grid-template-rows: repeat(4, auto) minmax(0, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 1rem;
   height: calc(100vh - 200px);
+  min-height: 720px;
 }
 
 .side-panel {
@@ -2438,17 +2439,18 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-panel {
-  grid-column: 1 / -1;
+  grid-row: 1;
   min-width: 0;
+  min-height: 0;
 }
 
-.route-step-1 { grid-row: 1; }
-.route-step-2 { grid-row: 2; }
-.route-step-3 { grid-row: 3; }
-.route-step-4 { grid-row: 4; }
+.route-step-1 { grid-column: 1; }
+.route-step-2 { grid-column: 2; }
+.route-step-3 { grid-column: 3; }
+.route-step-4 { grid-column: 4; }
 .route-step-5 {
-  grid-column: 2;
-  grid-row: 5;
+  grid-column: 4;
+  grid-row: 2;
   align-self: end;
   max-height: 100%;
   overflow: auto;
@@ -2491,7 +2493,8 @@ async function handleDeleteRoute(route) {
 .panel-section {
   width: 100%;
   min-width: 0;
-  background: #f9f9f9;
+  color: var(--text);
+  background: var(--panel-soft);
   padding: 1rem;
   border-radius: 4px;
 }
@@ -2499,7 +2502,7 @@ async function handleDeleteRoute(route) {
 .panel-section h3 {
   margin: 0 0 0.75rem 0;
   font-size: 0.875rem;
-  color: #666;
+  color: var(--text);
 }
 
 .form-group {
@@ -2994,10 +2997,12 @@ async function handleDeleteRoute(route) {
 }
 
 .map-preview-area {
-  grid-column: 1;
-  grid-row: 5;
+  grid-column: 1 / span 3;
+  grid-row: 2;
   min-width: 0;
-  background: #f5f5f5;
+  min-height: 0;
+  height: 100%;
+  background: var(--panel-soft);
   border-radius: 4px;
   padding: 1rem;
   display: flex;
@@ -3779,6 +3784,7 @@ async function handleDeleteRoute(route) {
     grid-template-columns: 1fr;
     grid-template-rows: none;
     height: auto;
+    min-height: 0;
   }
 
   .route-step-panel,
@@ -3800,6 +3806,96 @@ async function handleDeleteRoute(route) {
     max-height: 420px;
   }
 
+}
+
+/* RoutePlannerPage uses a legacy, compact card palette in several detail blocks.
+   Keep those blocks readable when the shared dashboard theme switches to dark. */
+[data-theme="dark"] .route-step-panel,
+[data-theme="dark"] .panel-section,
+[data-theme="dark"] .map-preview-area {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--panel-soft);
+}
+
+[data-theme="dark"] .route-step-toggle,
+[data-theme="dark"] .map-toolbar,
+[data-theme="dark"] .map-click-mode,
+[data-theme="dark"] .state-machine-panel,
+[data-theme="dark"] .localization-debug-panel,
+[data-theme="dark"] .waypoint-item,
+[data-theme="dark"] .route-item,
+[data-theme="dark"] .map-mode-hint,
+[data-theme="dark"] .initial-pose-panel {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--panel);
+}
+
+[data-theme="dark"] .route-step-toggle:hover,
+[data-theme="dark"] .map-toolbar button:hover,
+[data-theme="dark"] .map-toolbar button.active {
+  color: #06111f;
+  background: var(--cyan);
+}
+
+[data-theme="dark"] .form-group label,
+[data-theme="dark"] .empty-hint,
+[data-theme="dark"] .waypoint-main label,
+[data-theme="dark"] .waypoint-main > small,
+[data-theme="dark"] .status-grid span,
+[data-theme="dark"] .command-note,
+[data-theme="dark"] .route-item small,
+[data-theme="dark"] .debug-header span,
+[data-theme="dark"] .debug-row span,
+[data-theme="dark"] .state-card span,
+[data-theme="dark"] .state-card small,
+[data-theme="dark"] .sensor-state-row span,
+[data-theme="dark"] .sensor-state-row small {
+  color: var(--muted);
+}
+
+[data-theme="dark"] .form-group input,
+[data-theme="dark"] .form-group textarea,
+[data-theme="dark"] .form-group select,
+[data-theme="dark"] .waypoint-main input,
+[data-theme="dark"] .waypoint-main select,
+[data-theme="dark"] .initial-pose-panel input {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--input-bg);
+}
+
+[data-theme="dark"] .status-grid strong,
+[data-theme="dark"] .state-card strong,
+[data-theme="dark"] .sensor-state-row strong,
+[data-theme="dark"] .debug-row strong,
+[data-theme="dark"] .debug-header strong,
+[data-theme="dark"] .route-item strong {
+  color: var(--text);
+}
+
+[data-theme="dark"] .state-card,
+[data-theme="dark"] .sensor-state-head,
+[data-theme="dark"] .debug-header,
+[data-theme="dark"] .waypoint-pose-grid,
+[data-theme="dark"] .route-item:hover {
+  border-color: var(--line);
+  background: var(--panel-soft);
+}
+
+[data-theme="dark"] .waypoint-pose-grid {
+  border-left-color: var(--cyan);
+}
+
+[data-theme="dark"] .route-item.active {
+  border-color: var(--cyan);
+  background: rgba(67, 213, 255, 0.12);
+}
+
+[data-theme="dark"] .map-mode-hint {
+  color: var(--text);
+  background: rgba(67, 213, 255, 0.1);
 }
 
 @media (max-width: 640px) {
