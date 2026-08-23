@@ -51,6 +51,11 @@ class DetectionPerfWindow:
         self.max_detect_seconds = 0.0
         self.max_telemetry_seconds = 0.0
         self.max_loop_seconds = 0.0
+        self.preprocess_seconds = 0.0
+        self.session_run_seconds = 0.0
+        self.parse_seconds = 0.0
+        self.max_session_run_seconds = 0.0
+        self.providers = ""
 
     def record(
         self,
@@ -65,6 +70,10 @@ class DetectionPerfWindow:
         target_count: int,
         dropped_frames: int,
         input_age_seconds: float,
+        preprocess_seconds: float = 0.0,
+        session_run_seconds: float = 0.0,
+        parse_seconds: float = 0.0,
+        providers: str = "",
     ) -> None:
         self.frames += 1
         self.events += event_count
@@ -79,10 +88,16 @@ class DetectionPerfWindow:
         self.snapshot_seconds += snapshot_seconds
         self.telemetry_seconds += telemetry_seconds
         self.loop_seconds += loop_seconds
+        self.preprocess_seconds += preprocess_seconds
+        self.session_run_seconds += session_run_seconds
+        self.parse_seconds += parse_seconds
         self.max_read_seconds = max(self.max_read_seconds, read_seconds)
         self.max_detect_seconds = max(self.max_detect_seconds, detect_seconds)
         self.max_telemetry_seconds = max(self.max_telemetry_seconds, telemetry_seconds)
         self.max_loop_seconds = max(self.max_loop_seconds, loop_seconds)
+        self.max_session_run_seconds = max(self.max_session_run_seconds, session_run_seconds)
+        if providers:
+            self.providers = providers
 
     def should_log(self, now: float) -> bool:
         return now - self.started_at >= PERF_LOG_INTERVAL_SECONDS
@@ -99,7 +114,9 @@ class DetectionPerfWindow:
             "source_fps=%.2f lag_risk=%s avg_wait_latest_ms=%.1f avg_input_age_ms=%.1f "
             "avg_detect_ms=%.1f avg_preview_ms=%.1f "
             "avg_snapshot_ms=%.1f avg_telemetry_ms=%.1f avg_loop_ms=%.1f max_read_ms=%.1f "
-            "max_detect_ms=%.1f max_telemetry_ms=%.1f max_loop_ms=%.1f",
+            "max_detect_ms=%.1f max_telemetry_ms=%.1f max_loop_ms=%.1f "
+            "avg_preprocess_ms=%.1f avg_session_run_ms=%.1f avg_parse_ms=%.1f "
+            "max_session_run_ms=%.1f providers=%s",
             self.frames,
             self.target_frames,
             self.max_target_count,
@@ -120,6 +137,11 @@ class DetectionPerfWindow:
             _milliseconds(self.max_detect_seconds),
             _milliseconds(self.max_telemetry_seconds),
             _milliseconds(self.max_loop_seconds),
+            _milliseconds(self.preprocess_seconds / frames),
+            _milliseconds(self.session_run_seconds / frames),
+            _milliseconds(self.parse_seconds / frames),
+            _milliseconds(self.max_session_run_seconds),
+            self.providers or "-",
         )
         self.reset(now)
 
@@ -429,6 +451,10 @@ def detection_worker(
                     target_count=target_count,
                     dropped_frames=sample.dropped_frames,
                     input_age_seconds=input_age_seconds,
+                    preprocess_seconds=detector.last_timing.preprocess_seconds,
+                    session_run_seconds=detector.last_timing.session_run_seconds,
+                    parse_seconds=detector.last_timing.parse_seconds,
+                    providers=detector.last_timing.providers,
                 )
                 if perf_window.should_log(time.perf_counter()):
                     perf_window.log_and_reset(time.perf_counter())
@@ -482,6 +508,10 @@ def detection_worker(
                 target_count=target_count,
                 dropped_frames=sample.dropped_frames,
                 input_age_seconds=input_age_seconds,
+                preprocess_seconds=detector.last_timing.preprocess_seconds,
+                session_run_seconds=detector.last_timing.session_run_seconds,
+                parse_seconds=detector.last_timing.parse_seconds,
+                providers=detector.last_timing.providers,
             )
             if perf_window.should_log(time.perf_counter()):
                 perf_window.log_and_reset(time.perf_counter())
@@ -570,8 +600,8 @@ def main() -> None:
         except Exception:
             LOGGER.exception("person model load failed, person following disabled")
     client = TelemetryClient(config, runtime_state, sdk_client)
-    audio_command_client = AudioCommandClient(config)
     pusher = StreamPusher(config)
+    audio_command_client = AudioCommandClient(config, pusher)
     command_server = CommandServer(config, sdk_client) if config.control.enable else None
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()

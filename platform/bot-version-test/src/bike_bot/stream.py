@@ -29,22 +29,13 @@ class StreamPusher:
         self._audio_capture_enabled = self._load_audio_capture_state()
 
     def _load_audio_capture_state(self) -> bool:
-        """Restore an operator's capture choice across a pusher restart."""
+        """Start video-only; field audio must be explicitly enabled each run."""
         default = bool(self.config.stream.audio_start_enabled)
         if self.config.stream.audio_mode not in AUDIO_CAPTURE_CONTROL_MODES:
             return default
-        try:
-            saved = self._audio_state_path.read_text(encoding="utf-8").strip().lower()
-        except FileNotFoundError:
-            return default
-        except OSError as exc:
-            LOGGER.warning("cannot read persisted stream audio state path=%s error=%s", self._audio_state_path, exc)
-            return default
-        if saved == "enabled":
-            return True
-        if saved == "disabled":
-            return False
-        LOGGER.warning("ignoring invalid persisted stream audio state path=%s value=%r", self._audio_state_path, saved)
+        # Do not restore the state file here.  A restart must never silently
+        # reopen the microphone; the operator must click the live-audio
+        # control again for the current process lifetime.
         return default
 
     def supports_audio_capture_control(self) -> bool:

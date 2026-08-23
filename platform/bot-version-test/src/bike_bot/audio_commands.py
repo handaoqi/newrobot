@@ -34,8 +34,9 @@ class PlaybackSuperseded(RuntimeError):
 
 
 class AudioCommandClient:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, stream_pusher=None) -> None:
         self.config = config
+        self.stream_pusher = stream_pusher
         self.api_base = self._derive_api_base(config.telemetry.endpoint)
         self.cache_dir = Path("data/audio-cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -102,8 +103,13 @@ class AudioCommandClient:
         cancel_event = cancel_event or threading.Event()
         command_id = command["id"]
         action = command.get("action")
+        if action == "set_stream_audio":
+            self.handle_stream_audio_command(command)
+            return
         if action != "play_audio":
-            LOGGER.warning("unsupported cloud command action=%s id=%s", action, command_id)
+            message = f"unsupported cloud command action={action}"
+            LOGGER.warning("%s id=%s", message, command_id)
+            self.report(command_id, "failed", {}, message)
             return
 
         payload = command.get("payload") or {}
@@ -159,6 +165,24 @@ class AudioCommandClient:
         finally:
             if local_path is not None:
                 local_path.unlink(missing_ok=True)
+
+    def handle_stream_audio_command(self, command: dict) -> None:
+        """Apply remote live-stream audio capture and report its result."""
+        command_id = command["id"]
+        enabled = (command.get("payload") or {}).get("enabled")
+        if not isinstance(enabled, bool):
+            self.report(command_id, "failed", {}, "enabled must be a boolean")
+            return
+        if self.stream_pusher is None:
+            self.report(command_id, "failed", {}, "stream audio control is unavailable")
+            return
+        self.report(command_id, "running", {"enabled": enabled}, "")
+        try:
+            result = self.stream_pusher.set_audio_capture_enabled(enabled)
+            self.report(command_id, "finished", result, "")
+        except Exception as exc:
+            LOGGER.exception("stream audio command failed id=%s enabled=%s", command_id, enabled)
+            self.report(command_id, "failed", {"enabled": enabled}, str(exc))
 
     def report(self, command_id: int, status: str, response_payload: dict, error_message: str) -> None:
         response = requests.post(
