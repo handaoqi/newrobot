@@ -2019,7 +2019,7 @@ async function handleDeleteRoute(route) {
               </div>
             </div>
             <div class="waypoint-actions">
-              <button class="btn btn-sm" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
+              <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
             </div>
             </div>
           </div>
@@ -2445,7 +2445,7 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: 400px auto;
+  grid-template-rows: 400px auto auto;
   gap: 1rem;
   height: auto;
   min-height: calc(100vh - 200px);
@@ -2477,7 +2477,7 @@ async function handleDeleteRoute(route) {
 .route-step-4 { grid-column: 4; }
 .route-step-5 {
   grid-column: 4;
-  grid-row: 2;
+  grid-row: 3;
   align-self: end;
   max-height: 100%;
   overflow: auto;
@@ -2713,9 +2713,13 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-actions {
-  display: flex;
-  gap: 0.5rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin-top: 0.5rem;
+}
+
+.waypoint-actions .btn {
+  width: 100%;
 }
 
 .status-grid {
@@ -3003,7 +3007,8 @@ async function handleDeleteRoute(route) {
 }
 
 .route-list {
-  max-height: 200px;
+  height: 320px;
+  max-height: 320px;
   overflow-y: auto;
 }
 
@@ -3055,7 +3060,7 @@ async function handleDeleteRoute(route) {
 }
 
 .map-preview-area {
-  grid-column: 1 / span 3;
+  grid-column: 1 / -1;
   grid-row: 2;
   min-width: 0;
   min-height: calc(100vh - 320px);
