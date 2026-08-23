@@ -2480,7 +2480,7 @@ a { color: inherit; }
   justify-self: end;
   width: max-content;
   max-width: 100%;
-  gap: 0;
+  gap: 5px;
   text-align: right;
 }
 .robot-card-dock-config span {
