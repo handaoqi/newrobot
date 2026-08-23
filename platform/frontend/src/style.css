@@ -3247,3 +3247,16 @@ a { color: inherit; }
 .robot-management-list-panel .robot-table-card {
   column-gap: 0;
 }
+.robot-management-list-panel .robot-card-side {
+  min-width: 52px;
+  width: 52px;
+}
+.robot-management-list-panel .robot-card-side .robot-status {
+  padding: 4px 7px;
+  font-size: 10px;
+}
+.robot-management-list-panel .robot-card-side .robot-card-refresh {
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+}
