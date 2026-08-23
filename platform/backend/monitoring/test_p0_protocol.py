@@ -45,6 +45,14 @@ class ProtocolContractTests(SimpleTestCase):
             payload["payload"]["command"] = {"mapping_type": "outdoor"}
             self.assertEqual(parse_message(payload).message_type, command_type)
 
+    def test_accepts_remote_trick_commands(self):
+        for command_type in ("teleop.shake_hand", "teleop.two_leg_stand"):
+            payload = json.loads(self.fixture_path.read_text())
+            payload["message_type"] = command_type
+            payload["payload"].pop("task_execution_id", None)
+            payload["payload"]["command"] = {}
+            self.assertEqual(parse_message(payload).message_type, command_type)
+
     def test_robot_command_omits_expected_state_without_task_execution(self):
         class Robot:
             code = "ZSL-1A-07"

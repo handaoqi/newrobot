@@ -649,8 +649,14 @@ watch(livePlayUrls, () => {
             </div>
             <small class="speed-estimate">预计速度：{{ expectedSpeedText }}</small>
           </div>
-          <div class="remote-actions">
+          <div class="remote-actions remote-special-actions">
             <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="emergencyStop">阻尼</button>
+            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('two_leg_stand', '双腿站立')">
+              双腿站立
+            </button>
+            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('shake_hand', '打招呼')">
+              打招呼
+            </button>
           </div>
           <div class="remote-actions">
             <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="setMotionControl('motion_start', '启动运控')">启动运控</button>
@@ -663,12 +669,6 @@ watch(livePlayUrls, () => {
             </button>
             <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('lie_down', '匍匐')">
               匍匐
-            </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('two_leg_stand', '双腿站立')">
-              双腿站立
-            </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('shake_hand', '打招呼')">
-              打招呼
             </button>
           </div>
           <small v-if="commandFeedback" class="remote-feedback">{{ commandFeedback }}</small>
