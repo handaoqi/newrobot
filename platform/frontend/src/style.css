@@ -2474,10 +2474,14 @@ a { color: inherit; }
 }
 .robot-card-dock-config {
   justify-items: end;
+  justify-self: end;
+  width: max-content;
+  max-width: 100%;
   text-align: right;
 }
 .robot-card-dock-config span {
-  width: 100%;
+  width: max-content;
+  max-width: 100%;
   color: var(--muted);
   font-size: 12px;
   text-align: right;
