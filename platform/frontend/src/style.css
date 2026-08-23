@@ -3237,3 +3237,9 @@ a { color: inherit; }
     word-break: break-all;
   }
 }
+
+/* Keep the robot operation column flush with the status column after the
+   generic responsive table-card spacing rules have been applied. */
+.robot-management-list-panel .robot-table-card {
+  column-gap: 0;
+}
