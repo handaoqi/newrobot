@@ -2879,7 +2879,7 @@ a { color: inherit; }
   .list-panel .robot-table-card {
     grid-template-columns: minmax(0, 1fr) auto;
     min-height: 84px;
-    width: 100%;
+    width: calc(100% * 2 / 3);
   }
 
   .robot-card-side {
