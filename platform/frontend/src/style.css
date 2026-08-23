@@ -2473,12 +2473,14 @@ a { color: inherit; }
   gap: 5px;
 }
 .robot-card-dock-config {
-  justify-items: start;
+  justify-items: end;
+  text-align: right;
 }
 .robot-card-dock-config span {
   width: 100%;
   color: var(--muted);
   font-size: 12px;
+  text-align: right;
 }
 .robot-card-title-row {
   min-width: 0;
