@@ -8,6 +8,9 @@
 | --- | --- |
 | [导航传感器说明](NAVIGATION_SENSOR_DESCRIPTION.md) | LiDAR、IMU、RTK、里程计、TF 与 Nav2 数据链 |
 | [三端数据架构](architecture/THREE_ENDPOINT_DATA_ARCHITECTURE.md) | 云平台、NX Edge、3588 的存储边界、表职责和初始记录 |
+| [系统总体架构](ROAMERX_SYSTEM_ARCHITECTURE.md) | 云平台、前端、Edge 和运动控制的组件边界与业务链路 |
+| [前端监测与视频架构](FRONTEND_MONITORING_VIDEO_ARCHITECTURE.md) | 页面骨架、异步视频、播放器生命周期和主题响应式约束 |
+| [巡检任务与路径规划架构](INSPECTION_TASK_ROUTE_ARCHITECTURE.md) | 地图、路线、任务、执行和统一机器狗图示 |
 | [SLAM 采集与世界位姿计划](SLAM_DATA_CAPTURE_AND_WORLD_POSE_PLAN.md) | 建图话题、完整世界位姿、IMU 预积分、Scan-Context 与无 RTK 场景限制 |
 | [SLAM 采集与世界位姿执行进度](SLAM_DATA_CAPTURE_AND_WORLD_POSE_EXECUTION.md) | 上述计划的任务拆分、实现决策和验收记录 |
 
@@ -17,6 +20,14 @@
 | --- | --- |
 | [云平台操作手册](operation-manual/ROAMERX_CLOUD_PLATFORM_OPERATION_MANUAL.md) | 值守、监测、机器人、任务、地图、路线和远程控制 |
 | [数据库初始化手册](operation-manual/DATABASE_INITIALIZATION_MANUAL.md) | 三端建库、初始化、验收、备份和恢复 |
+
+## Word 架构导出
+
+| 文档 | Word 文件 |
+| --- | --- |
+| 系统总体架构 | [ROAMERX_SYSTEM_ARCHITECTURE.docx](ROAMERX_SYSTEM_ARCHITECTURE.docx) |
+| 前端监测与视频架构 | [FRONTEND_MONITORING_VIDEO_ARCHITECTURE.docx](FRONTEND_MONITORING_VIDEO_ARCHITECTURE.docx) |
+| 巡检任务与路径规划架构 | [INSPECTION_TASK_ROUTE_ARCHITECTURE.docx](INSPECTION_TASK_ROUTE_ARCHITECTURE.docx) |
 
 ## 文档规则
 
