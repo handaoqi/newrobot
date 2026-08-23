@@ -1520,7 +1520,12 @@ watch(playUrlKey, () => {
                 </div>
               </div>
             </div>
-            <div class="guard-map-legend"><span class="route">规划路线</span><span class="track">实际轨迹</span><span class="robot">机器狗</span><span class="loss">定位丢失点 {{ localizationLossMarkers.length }}</span></div>
+            <div class="guard-map-legend">
+              <span class="route">规划路线</span>
+              <span class="track">实际轨迹</span>
+              <span class="robot"><RobotDogIcon :size="16" />机器狗</span>
+              <span class="loss">定位丢失点 {{ localizationLossMarkers.length }}</span>
+            </div>
             <section class="guard-route-log">
               <div class="guard-route-summary">
                 <div><span>本次轮次</span><strong>第 {{ currentExecutionRound || 1 }} 轮</strong></div>
@@ -1683,9 +1688,11 @@ watch(playUrlKey, () => {
 .guard-localization-loss i { position: absolute; left: 50%; top: 50%; z-index: 2; width: 0; height: 0; border-right: 5px solid transparent; border-bottom: 15px solid #7f1d1d; border-left: 5px solid transparent; transform-origin: 50% 100%; }
 .guard-localization-loss small { position: absolute; top: 26px; left: 50%; min-width: 16px; padding: 1px 3px; color: #fff; background: #991b1b; font-size: 9px; text-align: center; transform: translateX(-50%); }
 .guard-map-legend { display: flex; flex-wrap: wrap; gap: 14px; padding-top: 10px; color: #657681; font-size: 11px; }
+.guard-map-legend .robot { display: inline-flex; align-items: center; gap: 4px; }
+.guard-map-legend .robot .robot-dog-icon { flex: 0 0 auto; }
 .guard-map-legend span::before { content: ''; display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; background: #2563eb; }
 .guard-map-legend .track::before { background: #10b981; }
-.guard-map-legend .robot::before { width: 8px; height: 8px; border-radius: 50%; background: #ec4a3f; }
+.guard-map-legend .robot::before { width: 0; height: 0; margin-right: 0; background: transparent; }
 .guard-map-legend .loss::before { width: 8px; height: 8px; border-radius: 50%; background: #dc2626; }
 .guard-route-log { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #dde5e9; }
 .guard-route-summary { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; }
