@@ -108,6 +108,8 @@ const drillTimeline = ref([])
 const drillTimelineOpen = ref(false)
 const drillElapsedSeconds = ref(0)
 const drillCurrentSpeed = ref(0)
+const expandedWaypoints = ref(new Set())
+const routeListOpen = ref(false)
 let navTimer = null
 let drillClockTimer = null
 let drillStartedAt = null
@@ -125,7 +127,10 @@ const routeForm = ref({
   description: '',
   scene_scope: 'indoor',
 })
-const expandedRouteSteps = ref({ 1: true, 2: true, 3: true, 4: true })
+const allWaypointsExpanded = computed(() => (
+  waypoints.value.length > 0
+  && waypoints.value.every((_, index) => expandedWaypoints.value.has(index))
+))
 
 onMounted(async () => {
   await loadData()
@@ -186,8 +191,34 @@ const selectedRobot = computed(() => {
   }
 })
 
-function toggleRouteStep(step) {
-  expandedRouteSteps.value[step] = !expandedRouteSteps.value[step]
+function resetWaypointExpansion() {
+  expandedWaypoints.value = new Set()
+}
+
+function isWaypointExpanded(index) {
+  return expandedWaypoints.value.has(index)
+}
+
+function toggleWaypointExpanded(index) {
+  const next = new Set(expandedWaypoints.value)
+  if (next.has(index)) next.delete(index)
+  else next.add(index)
+  expandedWaypoints.value = next
+}
+
+function toggleAllWaypoints() {
+  expandedWaypoints.value = allWaypointsExpanded.value
+    ? new Set()
+    : new Set(waypoints.value.map((_, index) => index))
+}
+
+function handleRouteSelect(routeId) {
+  const route = routes.value.find(item => String(item.id) === String(routeId))
+  if (route) handleLoadRoute(route)
+}
+
+function toggleRouteList() {
+  routeListOpen.value = !routeListOpen.value
 }
 
 const inspectionSpeechCategory = computed(() => speechCategories.value.find(item => item.name === '巡检智能播报') || null)
@@ -212,6 +243,7 @@ function seedRobotsFromMapsAndRoutes() {
 async function handleMapSelect(map) {
   selectedMap.value = map
   selectedRoute.value = null
+  resetWaypointExpansion()
   waypoints.value = []
   waypointNames.value = []
   resetWaypointYawEditors()
@@ -357,6 +389,7 @@ function removeWaypoint(index) {
   waypointYawDrafts.value.splice(index, 1)
   waypointYawErrors.value.splice(index, 1)
   waypointYawConfirmed.value.splice(index, 1)
+  resetWaypointExpansion()
 }
 
 function setWaypointSpeech(index, templateId) {
@@ -490,6 +523,7 @@ function clearWaypoints() {
   stopDrill(false)
   waypoints.value = []
   waypointNames.value = []
+  resetWaypointExpansion()
   resetWaypointYawEditors()
 }
 
@@ -778,6 +812,7 @@ async function handleSaveRoute() {
 
 async function handleLoadRoute(route) {
   selectedRoute.value = route
+  resetWaypointExpansion()
   const routeMap = maps.value.find(m => String(m.id) === String(route.map_data)) || selectedMap.value
   const mapChanged = String(routeMap?.id) !== String(selectedMap.value?.id)
   selectedMap.value = routeMap
@@ -1873,95 +1908,74 @@ async function handleDeleteRoute(route) {
 <template>
   <section class="page-section">
     <section class="panel detail-panel route-planner-panel">
-      <div class="panel-header">
-        <div class="route-header-actions">
+      <div class="route-planner-layout">
+        <section class="panel-section route-config-panel">
+          <div class="route-config-grid">
+            <label>
+              <span>选择地图</span>
+              <select v-model="selectedMap" @change="handleMapSelect(selectedMap)">
+                <option :value="null">请选择地图</option>
+                <option v-for="map in maps" :key="map.id" :value="map">
+                  {{ map.name }} {{ map.active ? '(活动)' : '' }}
+                </option>
+              </select>
+            </label>
+            <label>
+              <span>路线名称</span>
+              <input v-model="routeForm.name" type="text" placeholder="输入路线名称" />
+            </label>
+            <label>
+              <span>场景范围</span>
+              <select v-model="routeForm.scene_scope" :disabled="mapIsLocalOnly">
+                <option value="indoor">室内</option>
+                <option value="transition" :disabled="mapIsLocalOnly">室内外过渡</option>
+                <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
+              </select>
+            </label>
+            <label class="route-description-field">
+              <span>描述</span>
+              <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
+            </label>
+          </div>
+          <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
+        </section>
+
+        <section class="panel-section route-drill-panel">
           <button
             class="btn drill-btn"
             :class="{ running: drillRunning }"
             :disabled="!drillRunning && (!selectedMap || waypoints.length < 2)"
             @click="startDrill"
           >
-            {{ drillRunning ? '■ 停止演练' : '▶ 演练' }}
+            {{ drillRunning ? '■ 停止演练' : '▶ 演练开始' }}
           </button>
-          <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
-            保存路线
-          </button>
-        </div>
-      </div>
+          <p>选择地图并添加至少两个途经点后开始演练。</p>
+        </section>
 
-      <div class="route-planner-layout">
-        <!-- 路线配置步骤 -->
+        <!-- 途径点和路线信息 -->
         <div class="side-panel">
-          <div class="panel-section route-step-panel route-step-1">
-            <div class="route-step-heading">
-              <h3>1. 选择地图</h3>
-              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[1]" @click="toggleRouteStep(1)">
-                {{ expandedRouteSteps[1] ? '收起' : '展开' }}
-              </button>
-            </div>
-            <div v-if="expandedRouteSteps[1]" class="route-step-content">
-            <select v-model="selectedMap" @change="handleMapSelect(selectedMap)">
-              <option :value="null">请选择地图</option>
-              <option v-for="map in maps" :key="map.id" :value="map">
-                {{ map.name }} {{ map.active ? '(活动)' : '' }}
-              </option>
-            </select>
-            <p v-if="mapIsLocalOnly" class="empty-hint">当前地图无 RTK 原点，只能用于室内 NDT 定位，不能绑定室外或过渡区任务。</p>
-            </div>
-          </div>
-
-          <div class="panel-section route-step-panel route-step-2">
-            <div class="route-step-heading">
-              <h3>2. 路线信息</h3>
-              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[2]" @click="toggleRouteStep(2)">
-                {{ expandedRouteSteps[2] ? '收起' : '展开' }}
-              </button>
-            </div>
-            <div v-if="expandedRouteSteps[2]" class="route-step-content">
-            <div class="form-group" v-if="mapSets.length">
-              <label>跨图地图集</label>
-              <select v-model="routeForm.map_set">
-                <option :value="null">单地图路线</option>
-                <option v-for="mapSet in mapSets" :key="mapSet.id" :value="mapSet.id">
-                  {{ mapSet.name }} ({{ mapSet.members.length }} 子图)
-                </option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>路线名称</label>
-              <input v-model="routeForm.name" type="text" placeholder="输入路线名称" />
-            </div>
-            <div class="form-group">
-              <label>场景范围</label>
-              <select v-model="routeForm.scene_scope" :disabled="mapIsLocalOnly">
-                <option value="indoor">室内</option>
-                <option value="transition" :disabled="mapIsLocalOnly">室内外过渡</option>
-                <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>描述</label>
-              <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
-            </div>
-            </div>
-          </div>
-
           <div class="panel-section route-step-panel route-step-3">
             <div class="route-step-heading">
-              <h3>3. 途经点列表</h3>
-              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[3]" @click="toggleRouteStep(3)">
-                {{ expandedRouteSteps[3] ? '收起' : '展开' }}
+              <div>
+                <h3>途经点列表</h3>
+                <small>{{ waypoints.length }} 个点位</small>
+              </div>
+              <button type="button" class="route-step-toggle" :disabled="waypoints.length === 0" @click="toggleAllWaypoints">
+                {{ allWaypointsExpanded ? '全部收起' : '全部展开' }}
               </button>
             </div>
-            <div v-if="expandedRouteSteps[3]" class="route-step-content">
+            <div class="route-step-content waypoint-panel-content">
             <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
             <div v-else class="waypoint-list">
               <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
-                <div class="waypoint-main">
-                  <div class="waypoint-title-row">
-                    <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
-                    <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
-                  </div>
+                <div class="waypoint-title-row">
+                  <button type="button" class="waypoint-expand-toggle" @click="toggleWaypointExpanded(index)">
+                    {{ isWaypointExpanded(index) ? '收起' : '展开' }}
+                  </button>
+                  <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                  <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
+                </div>
+                <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
                   <div class="waypoint-pose-grid">
                     <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
                     <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
@@ -2019,6 +2033,9 @@ async function handleDeleteRoute(route) {
               </div>
             </div>
             <div class="waypoint-actions">
+              <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+                保存路线
+              </button>
               <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
             </div>
             </div>
@@ -2026,14 +2043,20 @@ async function handleDeleteRoute(route) {
 
           <div class="panel-section route-step-panel route-step-4">
             <div class="route-step-heading">
-              <h3>4. 已保存路线</h3>
-              <button type="button" class="route-step-toggle" :aria-expanded="expandedRouteSteps[4]" @click="toggleRouteStep(4)">
-                {{ expandedRouteSteps[4] ? '收起' : '展开' }}
-              </button>
+              <h3>路线选择</h3>
             </div>
-            <div v-if="expandedRouteSteps[4]" class="route-step-content">
-            <div v-if="routes.length === 0" class="empty-hint">暂无保存的路线</div>
-            <div v-else class="route-list">
+            <div class="route-step-content route-select-content">
+              <select class="route-selector" :value="selectedRoute?.id || ''" @change="handleRouteSelect($event.target.value)">
+                <option value="">请选择已保存路线</option>
+                <option v-for="route in routes" :key="route.id" :value="route.id">
+                  {{ route.name }}（{{ route.waypoints.length }} 个途经点）
+                </option>
+              </select>
+              <button type="button" class="route-list-toggle" @click="toggleRouteList">
+                {{ routeListOpen ? '收起路线列表' : '展开路线列表' }}
+              </button>
+            <div v-if="routeListOpen" class="route-list">
+              <div v-if="routes.length === 0" class="empty-hint">暂无保存的路线</div>
               <div v-for="route in routes" :key="route.id" class="route-item" :class="{ active: selectedRoute?.id === route.id }">
                 <div @click="handleLoadRoute(route)">
                   <strong>{{ route.name }}</strong>
@@ -2041,18 +2064,6 @@ async function handleDeleteRoute(route) {
                 </div>
                 <button class="btn btn-sm btn-danger" @click="handleDeleteRoute(route)">删除</button>
               </div>
-            </div>
-            <div v-if="selectedRoute" class="route-preview-actions">
-              <button
-                class="btn drill-btn route-preview-btn"
-                :disabled="routeExecuteBusy"
-                @click="handleExecuteRoute"
-              >
-                {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
-              </button>
-              <small class="route-preview-note">
-                {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”
-              </small>
             </div>
             </div>
           </div>
@@ -2339,43 +2350,6 @@ async function handleDeleteRoute(route) {
               </section>
             </div>
 
-            <aside v-if="drillTimelineOpen" class="drill-timeline-panel">
-              <div class="drill-timeline-header">
-                <div>
-                  <span>演练记录</span>
-                  <strong>时间轴</strong>
-                </div>
-                <div class="drill-timeline-actions">
-                  <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
-                  <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">关闭</button>
-                </div>
-              </div>
-              <div class="drill-timeline-summary">
-                <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
-                <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
-                <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
-              </div>
-              <div v-if="!drillTimeline.length" class="drill-timeline-empty">
-                点击“演练”后，这里会记录移动、到达点位和播报内容。
-              </div>
-              <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
-                <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
-                  <div class="timeline-node"></div>
-                  <div class="timeline-content">
-                    <div class="timeline-time">
-                      <span>{{ formatDrillClock(event.occurredAt) }}</span>
-                      <em>+{{ formatDrillElapsed(event.elapsedSeconds) }}</em>
-                    </div>
-                    <strong>{{ event.title }}</strong>
-                    <p v-if="event.detail">{{ event.detail }}</p>
-                    <div class="timeline-meta">
-                      <span v-if="event.pointName">📍 {{ event.pointName }}</span>
-                      <span v-if="event.speed !== undefined">速度 {{ Number(event.speed).toFixed(2) }} m/s</span>
-                    </div>
-                  </div>
-                </article>
-              </div>
-            </aside>
           </div>
 
           <button
@@ -2392,6 +2366,44 @@ async function handleDeleteRoute(route) {
             {{ drillMessage }}
           </div>
         </div>
+
+        <aside v-if="drillTimelineOpen" class="drill-timeline-panel route-timeline-column">
+          <div class="drill-timeline-header">
+            <div>
+              <span>演练记录</span>
+              <strong>时间轴</strong>
+            </div>
+            <div class="drill-timeline-actions">
+              <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
+              <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">折叠</button>
+            </div>
+          </div>
+          <div class="drill-timeline-summary">
+            <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
+            <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
+            <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
+          </div>
+          <div v-if="!drillTimeline.length" class="drill-timeline-empty">
+            点击“演练”后，这里会记录移动、到达点位和播报内容。
+          </div>
+          <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
+            <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
+              <div class="timeline-node"></div>
+              <div class="timeline-content">
+                <div class="timeline-time">
+                  <span>{{ formatDrillClock(event.occurredAt) }}</span>
+                  <em>+{{ formatDrillElapsed(event.elapsedSeconds) }}</em>
+                </div>
+                <strong>{{ event.title }}</strong>
+                <p v-if="event.detail">{{ event.detail }}</p>
+                <div class="timeline-meta">
+                  <span v-if="event.pointName">📍 {{ event.pointName }}</span>
+                  <span v-if="event.speed !== undefined">速度 {{ Number(event.speed).toFixed(2) }} m/s</span>
+                </div>
+              </div>
+            </article>
+          </div>
+        </aside>
       </div>
     </section>
   </section>
@@ -2444,8 +2456,8 @@ async function handleDeleteRoute(route) {
 
 .route-planner-layout {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: 400px auto auto;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
+  grid-template-rows: auto minmax(620px, auto) auto auto;
   gap: 1rem;
   height: auto;
   min-height: calc(100vh - 200px);
@@ -2461,8 +2473,77 @@ async function handleDeleteRoute(route) {
   display: contents;
 }
 
-.route-step-panel {
+.route-config-panel {
+  grid-column: 1 / span 2;
   grid-row: 1;
+  min-width: 0;
+}
+
+.route-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.route-config-grid label {
+  display: grid;
+  min-width: 0;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.route-config-grid input,
+.route-config-grid select,
+.route-config-grid textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--input-bg);
+  font: inherit;
+  font-weight: 400;
+}
+
+.route-description-field {
+  grid-column: 1 / -1;
+}
+
+.route-config-panel .empty-hint {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  text-align: left;
+}
+
+.route-drill-panel {
+  display: flex;
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  flex-direction: column;
+  text-align: center;
+}
+
+.route-drill-panel .drill-btn {
+  width: 100%;
+  min-height: 52px;
+}
+
+.route-drill-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.route-step-panel {
   display: flex;
   align-self: stretch;
   flex-direction: column;
@@ -2471,16 +2552,25 @@ async function handleDeleteRoute(route) {
   min-height: 0;
 }
 
-.route-step-1 { grid-column: 1; }
-.route-step-2 { grid-column: 2; }
-.route-step-3 { grid-column: 3; }
-.route-step-4 { grid-column: 4; }
-.route-step-5 {
+.route-step-3 {
   grid-column: 4;
-  grid-row: 3;
-  align-self: end;
-  max-height: 100%;
-  overflow: auto;
+  grid-row: 2;
+  align-self: start;
+  height: 230px;
+  max-height: 230px;
+}
+
+.route-step-4 {
+  grid-column: 4;
+  grid-row: 1;
+  align-self: stretch;
+}
+
+.route-step-5 {
+  grid-column: 1 / -1;
+  grid-row: 4;
+  align-self: start;
+  overflow: visible;
 }
 
 .route-step-heading {
@@ -2492,6 +2582,17 @@ async function handleDeleteRoute(route) {
 
 .route-step-heading h3 {
   margin-bottom: 0;
+}
+
+.route-step-heading > div {
+  min-width: 0;
+}
+
+.route-step-heading small {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.7rem;
 }
 
 .route-step-toggle {
@@ -2517,6 +2618,23 @@ async function handleDeleteRoute(route) {
   min-height: 0;
   overflow: auto;
   margin-top: 0.75rem;
+}
+
+.route-step-3 .route-step-content {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.route-step-3 .waypoint-list {
+  height: auto;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.route-select-content {
+  overflow: visible;
 }
 
 .route-step-content select,
@@ -2599,12 +2717,27 @@ async function handleDeleteRoute(route) {
 .waypoint-title-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 0.5rem;
+}
+
+.waypoint-expand-toggle {
+  flex: 0 0 auto;
+  min-width: 42px;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #99d5ce;
+  border-radius: 5px;
+  color: #0f766e;
+  background: #f0fdfa;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 800;
 }
 
 .waypoint-title-row > span {
   min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2714,7 +2847,8 @@ async function handleDeleteRoute(route) {
 
 .waypoint-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
   margin-top: 0.5rem;
 }
 
@@ -3007,9 +3141,29 @@ async function handleDeleteRoute(route) {
 }
 
 .route-list {
-  height: 320px;
-  max-height: 320px;
+  max-height: 260px;
   overflow-y: auto;
+}
+
+.route-selector,
+.route-list-toggle {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--input-bg);
+  font: inherit;
+}
+
+.route-list-toggle {
+  margin-top: 0.65rem;
+  color: var(--cyan);
+  background: var(--ghost-bg);
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 800;
 }
 
 .route-item {
@@ -3060,7 +3214,7 @@ async function handleDeleteRoute(route) {
 }
 
 .map-preview-area {
-  grid-column: 1 / -1;
+  grid-column: 1 / span 3;
   grid-row: 2;
   min-width: 0;
   min-height: calc(100vh - 320px);
@@ -3078,7 +3232,7 @@ async function handleDeleteRoute(route) {
 
 .map-stage-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 1fr);
   min-height: 0;
   flex: 0 0 auto;
   gap: 0.85rem;
@@ -3192,6 +3346,8 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
+  grid-column: 4;
+  grid-row: 3;
   min-width: 0;
   max-height: calc(100vh - 285px);
   padding: 0.85rem;
@@ -3871,8 +4027,11 @@ async function handleDeleteRoute(route) {
   }
 
   .route-step-panel,
+  .route-config-panel,
+  .route-drill-panel,
   .route-step-5,
-  .map-preview-area {
+  .map-preview-area,
+  .route-timeline-column {
     grid-column: 1;
     grid-row: auto;
   }
@@ -3902,6 +4061,9 @@ async function handleDeleteRoute(route) {
 }
 
 [data-theme="dark"] .route-step-toggle,
+[data-theme="dark"] .waypoint-expand-toggle,
+[data-theme="dark"] .route-list-toggle,
+[data-theme="dark"] .route-selector,
 [data-theme="dark"] .map-toolbar,
 [data-theme="dark"] .map-click-mode,
 [data-theme="dark"] .state-machine-panel,
@@ -3916,6 +4078,7 @@ async function handleDeleteRoute(route) {
 }
 
 [data-theme="dark"] .route-step-toggle:hover,
+[data-theme="dark"] .waypoint-expand-toggle:hover,
 [data-theme="dark"] .map-toolbar button:hover,
 [data-theme="dark"] .map-toolbar button.active {
   color: #06111f;
@@ -4020,6 +4183,8 @@ async function handleDeleteRoute(route) {
 @media (max-width: 640px) {
   .route-planner-layout { gap: 0.75rem; }
   .panel-section { padding: 0.75rem; }
+  .route-config-grid { grid-template-columns: 1fr; }
+  .route-description-field { grid-column: auto; }
   .route-header-actions { width: 100%; flex-wrap: wrap; }
   .route-header-actions .btn { flex: 1 1 140px; }
   .map-container {
