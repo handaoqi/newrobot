@@ -11,10 +11,19 @@
 | `/` | 重定向 | 跳转到 `/dashboard/overview` |
 | `/login` | 登录页 | 用户登录 |
 | `/dashboard/overview` | 实时监测中心 | 视频、概览、远程控制台、历史事件 |
+| `/dashboard/guard-duty` | 保安值守 | 直播值守、地图、任务和收音 |
+| `/dashboard/remote-control` | 远程控制 | 机器人远程接管与动作控制 |
+| `/dashboard/remote-development` | 远程 AI 开发 | 远程开发会话与任务 |
 | `/dashboard/analytics` | 统计分析中心 | 指标卡片和趋势图 |
 | `/dashboard/events` | 事件中心 | 事件筛选、搜索、排序、复核归档 |
 | `/dashboard/robots` | 机器人管理 | 机器人列表与详情 |
 | `/dashboard/tasks` | 巡检任务 | 巡检任务列表 |
+| `/dashboard/tasks/calendar` | 巡检日历 | 计划执行与日历查看 |
+| `/dashboard/task-executions/:executionId` | 任务执行详情 | 执行状态、轨迹和事件 |
+| `/dashboard/tasks/maps` | 地图管理 | 地图上传、建图、清理与活动地图 |
+| `/dashboard/tasks/routes` | 路径规划 | 地图选点、路线保存与导航测试 |
+| `/dashboard/tasks/zones` | 禁区管理 | 地图关联的禁区配置 |
+| `/dashboard/tasks/tracks` | 轨迹回放 | 历史轨迹列表与回放 |
 
 路由守卫规则：
 
@@ -315,7 +324,18 @@
 
 当前页面以列表展示为主，未提供新增、编辑、暂停、完成等控制接口。
 
-## 9. 前端状态与容错
+## 9. 地图、路线与执行页面
+
+地图管理、路径规划、禁区、日历、执行详情和轨迹回放分别对应：
+
+- `MapsPage.vue`：上传/同步地图，室内或室外现场建图，显示地图包文件、建图轨迹、关键帧和全局 ENU；最终建图指标只在完整地图包上传后展示。
+- `RoutePlannerPage.vue`：选择地图并编辑途经点、方向、定位方式、避障和播报；地图区支持轨迹/关键帧查看，导航测试区显示地图一致性、定位质量和导航栈状态。
+- `ZoneManagerPage.vue`：按地图筛选、添加、编辑、启用或删除禁区。
+- `PatrolCalendarPage.vue`、`TaskExecutionPage.vue` 和 `TrackPlaybackPage.vue`：分别查看计划、执行详情和历史轨迹。
+
+地图与导航页面都有轮询或窗口/动画监听，离开页面时必须清理；路线执行、导航启动/停止、传感器重启、地图清理/删除和活动地图切换均属于副作用操作，按钮禁用、确认提示和错误反馈不能省略。
+
+## 10. 前端状态与容错
 
 | 场景 | 当前处理 |
 | --- | --- |
@@ -327,7 +347,7 @@
 | 没有实时流 | 显示静态图片 |
 | 控制类按钮 | 远程控制按当前控制通道下发；喊话通过独立音频命令队列下发并接收板端执行结果 |
 
-## 10. 可扩展功能建议
+## 11. 可扩展功能建议
 
 后续若从演示升级到真实业务，可补充：
 
