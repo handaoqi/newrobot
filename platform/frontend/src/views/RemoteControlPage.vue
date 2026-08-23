@@ -611,7 +611,9 @@ watch(livePlayUrls, () => {
               <span class="control-glyph" aria-hidden="true"></span>
             </button>
           </div>
-          <div class="remote-turn">
+        </div>
+
+        <div class="remote-turn">
             <button
               v-for="item in turnActions"
               :key="item.action"
@@ -627,7 +629,6 @@ watch(livePlayUrls, () => {
               <span class="turn-glyph" aria-hidden="true"></span>
               <span class="turn-label">{{ item.label }}</span>
             </button>
-          </div>
         </div>
 
         <div class="remote-controls">
@@ -942,7 +943,7 @@ watch(livePlayUrls, () => {
 
 .remote-console {
   display: grid;
-  grid-template-columns: minmax(360px, 1fr) minmax(300px, 360px);
+  grid-template-columns: minmax(276px, auto) minmax(140px, 180px) minmax(300px, 360px);
   gap: 24px;
   align-items: center;
   -webkit-touch-callout: none;
@@ -953,7 +954,7 @@ watch(livePlayUrls, () => {
 
 .remote-pad-wrap {
   display: flex;
-  gap: 18px;
+  justify-content: center;
   align-items: center;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
@@ -1050,17 +1051,19 @@ watch(livePlayUrls, () => {
 
 .remote-turn {
   display: grid;
+  grid-template-columns: 1fr;
   gap: 12px;
-  min-width: 130px;
+  min-width: 0;
 }
 
 .remote-turn-btn {
-  min-height: 54px;
+  min-height: 72px;
   border-radius: 999px;
-  padding: 0 16px;
+  padding: 8px 10px;
   display: inline-flex;
   place-items: center;
   justify-content: center;
+  flex-direction: column;
   gap: 10px;
 }
 
@@ -1228,6 +1231,11 @@ watch(livePlayUrls, () => {
   .remote-console {
     grid-template-columns: 1fr;
   }
+
+  .remote-turn {
+    width: min(180px, 100%);
+    justify-self: center;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1239,6 +1247,7 @@ watch(livePlayUrls, () => {
 
   .remote-pad-wrap {
     display: grid;
+    grid-template-columns: 1fr;
   }
 
   .remote-pad {
