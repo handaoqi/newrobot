@@ -3255,11 +3255,11 @@ a { color: inherit; }
   padding-right: 6px;
 }
 .robot-management-list-panel .robot-card-side .robot-status {
-  padding: 3px 5px;
-  font-size: 9px;
+  padding: 3px 4px;
+  font-size: 10px;
 }
 .robot-management-list-panel .robot-card-side .robot-card-refresh {
-  width: 22px;
-  height: 22px;
-  font-size: 14px;
+  width: 24px;
+  height: 24px;
+  font-size: 15px;
 }
