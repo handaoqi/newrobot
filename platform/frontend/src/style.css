@@ -2463,7 +2463,7 @@ a { color: inherit; }
   display: grid;
   grid-template-columns: minmax(0, 1fr) 88px;
   align-items: start;
-  gap: 14px;
+  gap: 0;
   line-height: 1.28;
 }
 .robot-card-identity,
@@ -2480,6 +2480,7 @@ a { color: inherit; }
   justify-self: end;
   width: max-content;
   max-width: 100%;
+  gap: 0;
   text-align: right;
 }
 .robot-card-dock-config span {
