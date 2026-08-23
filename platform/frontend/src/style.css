@@ -2236,6 +2236,7 @@ a { color: inherit; }
 }
 .robot-management-list-panel .robot-table-card {
   width: 100%;
+  column-gap: 0;
   font-size: 13px;
 }
 .robot-management-list-panel .robot-table-card strong {
