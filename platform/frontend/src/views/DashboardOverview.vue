@@ -4,6 +4,7 @@ import mpegts from 'mpegts.js'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import AppToast from '../components/AppToast.vue'
+import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -1084,27 +1085,21 @@ function handleVisibilityChange() {
         </div>
 
         <div ref="videoStageRef" class="video-stage">
-          <div v-if="dataLoading || videoLoading" class="video-source no-signal video-loading" role="status" aria-live="polite">
-            <strong>正在加载视频流</strong>
-            <span>页面已就绪，正在连接现场画面</span>
-          </div>
-          <video
-            v-else-if="hasLiveStream"
-            ref="videoRef"
-            class="video-source"
-            muted
-            playsinline
-            autoplay
-            @pause="keepLivePlaying"
-            @progress="seekLatestFrame"
-            @timeupdate="seekLatestFrame"
-            @loadedmetadata="keepLivePlaying"
-            @waiting="keepLivePlaying"
-          ></video>
-          <div v-else class="video-source no-signal" role="img" aria-label="视频无信号">
-            <strong>无信号</strong>
-            <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
-          </div>
+          <LiveVideoPlayer
+            :play-urls="livePlayUrls"
+            :robot-id="latestRobot?.id"
+            :available="hasLiveStream"
+            :loading="dataLoading"
+            @notice="({ message, variant }) => showToast(message, variant ? { variant } : undefined)"
+            @stream-error="streamUnavailable = true"
+          >
+            <template #empty>
+              <div class="video-source no-signal" role="img" aria-label="视频无信号">
+                <strong>无信号</strong>
+                <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
+              </div>
+            </template>
+            <template #overlay>
 
           <div v-if="loadError" class="overview-data-notice" role="alert">{{ loadError }}</div>
 
@@ -1200,6 +1195,9 @@ function handleVisibilityChange() {
               </button>
             </div>
           </div>
+
+            </template>
+          </LiveVideoPlayer>
 
         </div>
 
