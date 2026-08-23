@@ -329,7 +329,10 @@ class RosAdapter(Node):
             return
         for name, details in sensors.items():
             if isinstance(details, dict):
-                self.telemetry.on_sensor_message(str(name), **details)
+                if str(name) == "odometry":
+                    self.telemetry.update_sensor_details(str(name), **details)
+                else:
+                    self.telemetry.on_sensor_message(str(name), **details)
 
     def obstacle_monitor_snapshot(self) -> dict:
         """Navigation demand and filtered front-scan state for task recovery."""

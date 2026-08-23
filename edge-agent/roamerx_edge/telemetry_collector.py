@@ -19,6 +19,23 @@ LOCALIZATION_STATUS = {
     4: "lost",
 }
 
+RTK_QUALITY_ALIASES = {
+    "fixed": "fixed",
+    "rtk_fixed": "fixed",
+    "float": "float",
+    "rtk_float": "float",
+    "standalone": "standalone",
+    "single": "standalone",
+    "invalid": "invalid",
+    "no_fix": "invalid",
+}
+
+
+def normalize_rtk_quality(value) -> str | None:
+    if value is None or value == "":
+        return None
+    return RTK_QUALITY_ALIASES.get(str(value).strip().lower(), "invalid")
+
 
 @dataclass
 class PoseSnapshot:
@@ -51,6 +68,7 @@ class TelemetryCollector:
         self._pose: PoseSnapshot | None = None
         self._localization_quality: LocalizationQualitySnapshot | None = None
         self._localization_decision: dict = {}
+        self._raw_rtk: dict = {}
         self._state_version = 0
         self.power_available = False
         self.battery_percent = None
@@ -72,8 +90,103 @@ class TelemetryCollector:
         with self._lock:
             samples = self._sensor_samples.setdefault(name, deque(maxlen=1200))
             samples.append(now)
-            if details:
-                self._sensor_details[name] = details
+            current = dict(self._sensor_details.get(name) or {})
+            current.update(details)
+            current["received_at_unix"] = now
+            self._sensor_details[name] = current
+            if name == "rtk":
+                self._raw_rtk = self._build_raw_rtk_locked(current, now)
+
+    def update_sensor_details(self, name: str, **details) -> None:
+        """Merge diagnostics without counting a second synthetic sensor sample."""
+        if not details:
+            return
+        with self._lock:
+            current = dict(self._sensor_details.get(name) or {})
+            current.update(details)
+            current["received_at_unix"] = time.time()
+            self._sensor_details[name] = current
+            if name == "rtk":
+                self._raw_rtk = self._build_raw_rtk_locked(current, current["received_at_unix"])
+
+    @staticmethod
+    def _build_raw_rtk_locked(details: dict, now: float) -> dict:
+        raw = dict(details)
+        raw["quality"] = normalize_rtk_quality(details.get("quality"))
+        raw["topic"] = details.get("topic") or "/fix"
+        raw["sample_age_seconds"] = details.get("sample_age_seconds")
+        raw["received_at"] = details.get("received_at_unix", now)
+        heading = dict(details.get("heading") or {})
+        heading_stamp = heading.get("measurement_stamp")
+        if heading_stamp is not None:
+            try:
+                heading["sample_age_seconds"] = max(0.0, now - float(heading_stamp))
+            except (TypeError, ValueError):
+                heading["sample_age_seconds"] = None
+        raw["heading"] = heading
+        return raw
+
+    def _time_diagnostics_locked(self, now: float) -> dict:
+        names = ("lidar", "imu", "rtk", "odometry")
+        values = {}
+        for name in names:
+            details = dict(self._sensor_details.get(name) or {})
+            received = details.get("received_at_unix")
+            stamp = details.get("measurement_stamp")
+            age = None
+            reported_age = details.get("sample_age_seconds")
+            if reported_age is not None:
+                try:
+                    age = max(0.0, float(reported_age))
+                except (TypeError, ValueError):
+                    age = None
+            if age is None and received is not None:
+                try:
+                    age = max(0.0, now - float(received))
+                except (TypeError, ValueError):
+                    age = None
+            values[name] = {
+                "topic": details.get("topic"),
+                "measurement_stamp": stamp,
+                "received_at": received,
+                "sample_age_seconds": round(age, 3) if age is not None else None,
+                "measurement_time_offset_ms": details.get("measurement_time_offset_ms"),
+                "measurement_time_valid": details.get("measurement_time_valid"),
+            }
+
+        lidar_stamp = values["lidar"].get("measurement_stamp")
+        delta_fields = {
+            "lidar_to_rtk_delta_ms": (lidar_stamp, values["rtk"].get("measurement_stamp")),
+            "lidar_to_imu_delta_ms": (lidar_stamp, values["imu"].get("measurement_stamp")),
+            "lidar_to_odom_delta_ms": (lidar_stamp, values["odometry"].get("measurement_stamp")),
+        }
+        for field, (left, right) in delta_fields.items():
+            if left is None or right is None:
+                values[field] = None
+            else:
+                try:
+                    values[field] = round((float(right) - float(left)) * 1000.0, 3)
+                except (TypeError, ValueError):
+                    values[field] = None
+
+        valid_samples = [
+            item["measurement_time_valid"]
+            for name, item in values.items()
+            if name in names and item["measurement_stamp"] is not None
+            and item["measurement_time_valid"] is not None
+        ]
+        warnings = []
+        if any(value is False for value in valid_samples):
+            warnings.append("measurement_time_invalid")
+        rtk_age = values["rtk"].get("sample_age_seconds")
+        if rtk_age is not None and rtk_age > 1.5:
+            warnings.append("rtk_stale")
+        return {
+            **values,
+            "all_time_valid": bool(valid_samples) and all(valid_samples),
+            "warnings": warnings,
+            "warning": ",".join(warnings),
+        }
 
     def _sensor_snapshot_locked(self) -> dict:
         now = time.time()
@@ -195,6 +308,8 @@ class TelemetryCollector:
                     "relative_translation_m": quality.relative_translation_m,
                 } if quality else None,
                 "decision": dict(self._localization_decision),
+                "raw_rtk": dict(self._raw_rtk) if self._raw_rtk else None,
+                "time_diagnostics": self._time_diagnostics_locked(time.time()),
             }
 
     def configure_system_probe_staleness(self, stale_seconds: float) -> None:
@@ -258,6 +373,8 @@ class TelemetryCollector:
                 self._audio_sampled_monotonic
                 and now_monotonic - self._audio_sampled_monotonic <= self._system_probe_stale_seconds
             )
+            now = time.time()
+            sensors = self._sensor_snapshot_locked()
             return {
                 # The status sample is fresh even when localization is stopped
                 # during mapping. Reusing the last pose timestamp makes the
@@ -285,6 +402,8 @@ class TelemetryCollector:
                         "prediction_errors": quality.prediction_errors,
                     } if quality else None,
                     "decision": dict(self._localization_decision),
+                    "raw_rtk": dict(self._raw_rtk) if self._raw_rtk else None,
+                    "time_diagnostics": self._time_diagnostics_locked(now),
                 },
                 "power": {
                     "available": power_fresh,
@@ -302,7 +421,7 @@ class TelemetryCollector:
                     "available": audio_fresh,
                     **(self._audio_details if audio_fresh else {}),
                 },
-                "sensors": self._sensor_snapshot_locked(),
+                "sensors": sensors,
                 "runtime": {
                     "ros_ready": True,
                     "nav_ready": self.safety_state.nav_ready,

@@ -62,6 +62,15 @@ class TelemetryServiceTests(TestCase):
                         "rtk_y": 4.5,
                         "rtk_yaw": 0.7,
                     },
+                    "raw_rtk": {
+                        "quality": "fixed",
+                        "fix_status": 2,
+                        "heading": {"usable": True},
+                    },
+                    "time_diagnostics": {
+                        "all_time_valid": True,
+                        "lidar_to_rtk_delta_ms": 20.0,
+                    },
                 },
             },
         )
@@ -73,3 +82,6 @@ class TelemetryServiceTests(TestCase):
         self.assertEqual(serialized_quality["matching_error"], 0.12)
         self.assertEqual(serialized_quality["decision"]["active_source"], "rtk_imu")
         self.assertEqual(serialized_quality["decision"]["rtk_yaw"], 0.7)
+        serialized = RobotStatusSerializer(latest).data
+        self.assertEqual(serialized["raw_rtk"]["quality"], "fixed")
+        self.assertTrue(serialized["time_diagnostics"]["all_time_valid"])

@@ -246,6 +246,7 @@ ament_target_dependencies(sensor_health_monitor
         sensor_msgs
         nav_msgs
         std_msgs
+        robots_dog_msgs
 )
 
 #==========================>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

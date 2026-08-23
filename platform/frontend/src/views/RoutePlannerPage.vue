@@ -33,6 +33,7 @@ import {
   normalizeHeadingDegrees,
   paginateKeyframes,
   resolveMapClickAction,
+  rtkQualityLabel,
 } from '../services/routePlannerState'
 import {
   buildLocalizationLossMarkers,
@@ -1480,16 +1481,6 @@ function localizationStatusCodeLabel(code) {
   return `${code}（${labels[Number(code)] || '未知状态'}）`
 }
 
-function rtkQualityLabel(quality) {
-  const labels = {
-    rtk_fixed: '固定解',
-    rtk_float: '浮点解',
-    standalone: '单点解',
-    invalid: '无效',
-  }
-  return labels[quality] || quality || '无数据'
-}
-
 function sensorOnlineLabel(sensor) {
   if (!sensor) return '未上报'
   return sensor.online ? '在线' : '离线'
@@ -1507,6 +1498,42 @@ function sensorTimeOffsetLabel(sensor) {
   return `${offset.toFixed(1)} ms（${validity}）`
 }
 
+function rtkBlockedReasonLabel(reason) {
+  const labels = {
+    none: '无阻塞',
+    gnss_fusion_disabled: 'GNSS融合未启用',
+    gnss_origin_not_loaded: 'GNSS原点未加载',
+    no_fix: '未收到有效定位解',
+    quality_insufficient: '解质量不满足融合门限',
+    position_stale: 'RTK位置数据过期',
+    horizontal_error_exceeded: '水平误差超限',
+    heading_unavailable: '双天线航向不可用',
+    heading_stale: '双天线航向过期',
+    time_invalid: 'RTK时间戳无效',
+    not_initialized: '定位尚未初始化',
+  }
+  return labels[reason] || reason || '未上报'
+}
+
+function sensorAgeLabel(sensor) {
+  const age = Number(sensor?.sample_age_seconds)
+  if (!Number.isFinite(age)) return '无数据年龄'
+  return age > 3 ? `数据过期 ${age.toFixed(1)} 秒` : `${age.toFixed(1)} 秒前`
+}
+
+function odomTimeSourceLabel(decision) {
+  if (decision?.odom_time_source === 'not_used' || decision?.odom_time_source === 'unavailable') {
+    return '控制器里程计预测未启用'
+  }
+  if (decision?.odom_time_valid === false || decision?.odom_time_source === 'invalid') {
+    return '时间戳异常/未同步'
+  }
+  if (decision?.odom_time_source === 'ros_reception_monotonic') {
+    return 'ROS接收时间单调有效'
+  }
+  return decision?.odom_time_source || '未上报'
+}
+
 function predictionErrorBySource(quality, source) {
   const errors = Array.isArray(quality?.prediction_errors) ? quality.prediction_errors : []
   const error = errors.find(item => String(item.label || '').toLowerCase().includes(source))
@@ -1515,14 +1542,17 @@ function predictionErrorBySource(quality, source) {
 
 function localizationDecisionBasis(quality = localizationQuality()) {
   const decision = quality?.decision || {}
+  const rawRtk = navStatus.value?.status?.raw_rtk || {}
   const source = decision.active_source || ''
   if (!source) return '定位决策数据未上报。'
   const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
   const rtkUsable = decision.rtk_usable === true
-  const rtkQuality = decision.rtk_quality || '无数据'
+  const rtkQuality = rtkQualityLabel(rawRtk.quality || decision.rtk_quality)
+  const decisionQuality = rtkQualityLabel(decision.rtk_quality)
+  const blockedReason = rtkBlockedReasonLabel(decision.rtk_blocked_reason)
   const score = Number(quality?.matching_error)
   const ndtDetail = Number.isFinite(score) ? `NDT健康（分数 ${score.toFixed(3)}）` : 'NDT质量未上报'
-  const rtkDetail = `RTK ${rtkQuality}${rtkUsable ? '，可用' : '，不可用'}`
+  const rtkDetail = `原始RTK ${rtkQuality}；融合${rtkUsable ? '可用' : '不可用'}（决策${decisionQuality}，${blockedReason}）`
 
   if (source === 'rtk_imu') {
     return preferred === 'rtk'
@@ -1583,9 +1613,18 @@ function localizationDebugRows() {
   const decision = quality?.decision || {}
   const sensors = status.sensors || {}
   const rtk = sensors.rtk
+  const rawRtk = status.raw_rtk || {}
+  const timeDiagnostics = status.time_diagnostics || {}
   const imu = sensors.imu
   const odometry = sensors.odometry
   const qualityFresh = quality && !localizationQualityStale(quality)
+  const hasRtkCoordinate = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
+  const rtkMapPosition = hasRtkCoordinate(decision.rtk_x) && hasRtkCoordinate(decision.rtk_y)
+    ? `${formatNumber(decision.rtk_x)} / ${formatNumber(decision.rtk_y)}`
+    : '未形成地图坐标'
+  const rtkMapHeading = hasRtkCoordinate(decision.rtk_yaw)
+    ? `${formatNumber(decision.rtk_yaw)} rad`
+    : '未形成航向'
   return [
     ['页面地图', selectedMap.value ? `${selectedMap.value.id} / ${selectedMap.value.name}` : '—'],
     ['机器人地图', `${status.map_id || navStatus.value?.current_map_id || '—'} / ${status.map_version || navStatus.value?.current_map_version || '—'}`],
@@ -1604,15 +1643,25 @@ function localizationDebugRows() {
     ['IMU · 时间偏差', sensorTimeOffsetLabel(imu)],
     ['IMU · 预测误差', qualityFresh ? predictionErrorBySource(quality, 'imu') : '—'],
     ['RTK · 状态', sensorOnlineLabel(rtk)],
-    ['RTK · 解状态', rtkQualityLabel(decision.rtk_quality || rtk?.quality)],
+    ['RTK · 原始解状态', rtkQualityLabel(rawRtk.quality || rtk?.quality)],
+    ['RTK · 原始 fix 状态', rawRtk.fix_status === null || rawRtk.fix_status === undefined ? '—' : String(rawRtk.fix_status)],
+    ['RTK · 原始解类型', rawRtk.solution_status === null || rawRtk.solution_status === undefined ? '—' : `${rawRtk.solution_status} / ${rawRtk.position_type ?? '—'}`],
+    ['RTK · 原始卫星数', rawRtk.solution_satellites === null || rawRtk.solution_satellites === undefined ? '—' : String(rawRtk.solution_satellites)],
+    ['RTK · 定位决策解状态', rtkQualityLabel(decision.rtk_quality)],
     ['RTK · 融合可用', decision.rtk_usable === true || rtk?.fusion_usable === true ? '是' : '否'],
-    ['RTK · 地图坐标', decision.rtk_usable || decision.rtk_x || decision.rtk_y ? `${formatNumber(decision.rtk_x)} / ${formatNumber(decision.rtk_y)}` : '—'],
-    ['RTK · 航向', decision.rtk_usable || decision.rtk_yaw ? `${formatNumber(decision.rtk_yaw)} rad` : '—'],
+    ['RTK · 阻塞原因', rtkBlockedReasonLabel(decision.rtk_blocked_reason)],
+    ['RTK · 地图坐标', rtkMapPosition],
+    ['RTK · 航向', rtkMapHeading],
+    ['RTK · 原始航向', rawRtk.heading?.heading_deg === null || rawRtk.heading?.heading_deg === undefined ? '—' : `${formatNumber(rawRtk.heading.heading_deg, 2)}° / std ${formatNumber(rawRtk.heading.heading_std_deg, 2)}°`],
+    ['RTK · 原始数据年龄', sensorAgeLabel(rawRtk)],
     ['RTK · 水平误差', rtk?.horizontal_std_m === null || rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(rtk.horizontal_std_m, 2)} m`],
     ['RTK · 时间偏差', sensorTimeOffsetLabel(rtk)],
     ['里程计 · 状态', sensorOnlineLabel(odometry)],
     ['里程计 · 频率', sensorFrequencyLabel(odometry)],
-    ['里程计 · 时间源', decision.odom_time_source || '—'],
+    ['里程计 · 时间源', odomTimeSourceLabel(decision)],
+    ['时间 · 激光→RTK', Number.isFinite(Number(timeDiagnostics.lidar_to_rtk_delta_ms)) ? `${formatNumber(timeDiagnostics.lidar_to_rtk_delta_ms, 1)} ms` : '—'],
+    ['时间 · 激光→里程计', Number.isFinite(Number(timeDiagnostics.lidar_to_odom_delta_ms)) ? `${formatNumber(timeDiagnostics.lidar_to_odom_delta_ms, 1)} ms` : '—'],
+    ['时间 · 总体状态', timeDiagnostics.all_time_valid === true ? '有效' : timeDiagnostics.warning || '未形成诊断'],
     ['里程计 · 预测误差', qualityFresh ? predictionErrorBySource(quality, 'odom') : '—'],
     ['桥接 · 状态', decision.active_source === 'imu_odom_bridge' ? '当前使用' : (imu?.online && odometry?.online ? '待命' : '不可用')],
     ['桥接 · 距离/时长', `${formatNumber(decision.bridge_distance_m, 2)} m / ${formatNumber(decision.bridge_elapsed_s, 1)} s`],
@@ -1658,8 +1707,16 @@ function stateMachineSteps() {
   const ndtHealthy = typeof decision.ndt_healthy === 'boolean' ? decision.ndt_healthy : goodNdt
   const rtkOnline = sensors.rtk?.online === true
   const rtkUsable = decision.rtk_usable === true || sensors.rtk?.fusion_usable === true
+  const rawRtk = status.raw_rtk || {}
   const bridgeReady = sensors.imu?.online === true && sensors.odometry?.online === true
   const bridgeRejected = Boolean(decision.bridge_rejection_reason)
+  const hasRtkCoordinate = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
+  const rtkPositionText = hasRtkCoordinate(decision.rtk_x) && hasRtkCoordinate(decision.rtk_y)
+    ? `地图 ${formatNumber(decision.rtk_x)} / ${formatNumber(decision.rtk_y)}`
+    : '地图坐标未形成'
+  const rtkHeadingText = hasRtkCoordinate(decision.rtk_yaw)
+    ? `航向 ${formatNumber(decision.rtk_yaw)} rad`
+    : '航向未形成'
 
   return [
     {
@@ -1710,7 +1767,7 @@ function stateMachineSteps() {
       key: 'rtk',
       title: 'RTK定位',
       value: activeSource === 'rtk_imu' ? '当前使用' : rtkUsable ? '可用待命' : rtkOnline ? '不可用于融合' : '离线',
-      detail: `${rtkQualityLabel(decision.rtk_quality || sensors.rtk?.quality)} · 水平误差 ${sensors.rtk?.horizontal_std_m === null || sensors.rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(sensors.rtk.horizontal_std_m, 2)} m`}`,
+      detail: `原始${rtkQualityLabel(rawRtk.quality || sensors.rtk?.quality)} · 决策${rtkQualityLabel(decision.rtk_quality)} · ${rtkPositionText} · ${rtkHeadingText} · ${rtkBlockedReasonLabel(decision.rtk_blocked_reason)} · 水平误差 ${sensors.rtk?.horizontal_std_m === null || sensors.rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(sensors.rtk.horizontal_std_m, 2)} m`} · ${sensorAgeLabel(sensors.rtk)}`,
       state: activeSource === 'rtk_imu' || rtkUsable ? 'ok' : rtkOnline ? 'warn' : 'bad',
     },
     {
@@ -1764,14 +1821,8 @@ function sensorStateRows() {
         hybrid: '融合定位',
         lidar_fallback: '激光兜底',
       }
-      const qualityLabels = {
-        rtk_fixed: '固定解',
-        rtk_float: '浮点解',
-        standalone: '单点解',
-        invalid: '无效',
-      }
       const std = Number(sensor.horizontal_std_m)
-      const detail = `${qualityLabels[sensor.quality] || '未知质量'} · 水平误差 ${Number.isFinite(std) ? `${std.toFixed(2)} m` : '—'} · ${hz.toFixed(1)} Hz`
+      const detail = `${rtkQualityLabel(sensor.quality)} · 水平误差 ${Number.isFinite(std) ? `${std.toFixed(2)} m` : '—'} · ${hz.toFixed(1)} Hz · ${sensorAgeLabel(sensor)}`
       return {
         key,
         name,
@@ -2062,6 +2113,18 @@ async function handleDeleteRoute(route) {
                 <button class="btn btn-sm btn-danger" @click="handleDeleteRoute(route)">删除</button>
               </div>
             </div>
+              <div v-if="selectedRoute" class="route-preview-actions">
+                <button
+                  class="btn drill-btn route-preview-btn"
+                  :disabled="routeExecuteBusy || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready"
+                  @click="handleExecuteRoute"
+                >
+                  {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
+                </button>
+                <small class="route-preview-note">
+                  {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
+                </small>
+              </div>
             </div>
           </div>
 
@@ -2110,9 +2173,6 @@ async function handleDeleteRoute(route) {
               </button>
               <button class="btn btn-sm" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="activeRelocalize">
                 {{ navCommandBusy === 'relocalize' ? '搜索中...' : '主动重定位' }}
-              </button>
-              <button class="btn btn-sm btn-primary" :disabled="routeExecuteBusy || !selectedRoute?.id || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready" @click="handleExecuteRoute">
-                {{ routeExecuteBusy ? '执行中...' : '执行当前路线' }}
               </button>
               <button class="btn btn-sm" :class="{ 'btn-primary': showPoseTrail }" @click="showPoseTrail = !showPoseTrail">
                 {{ showPoseTrail ? '隐藏尾迹' : '显示尾迹' }}
@@ -2650,8 +2710,10 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 .waypoint-list {
   height: auto;
-  flex: 1;
-  min-height: 360px;
+  flex: 0 0 60%;
+  height: 60%;
+  min-height: 0;
+  max-height: 60%;
   overflow-y: auto;
 }
 

@@ -299,9 +299,11 @@ public:
     }
     if (use_gnss_fusion_) {
       gnss_sub = create_subscription<sensor_msgs::msg::NavSatFix>(
-        gnss_topic, 20, std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
+        gnss_topic, rclcpp::SensorDataQoS(),
+        std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
       rtk_pvh_sub_ = create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
-        rtk_pvh_topic, 20, std::bind(&HdlLocalizationNode::rtk_pvh_callback, this, std::placeholders::_1));
+        rtk_pvh_topic, rclcpp::SensorDataQoS(),
+        std::bind(&HdlLocalizationNode::rtk_pvh_callback, this, std::placeholders::_1));
       RCLCPP_INFO(get_logger(),
         "GNSS fusion enabled, fix=%s pvh=%s gain=%.3f auto_recovery=%s heading=%s",
         gnss_topic.c_str(), rtk_pvh_topic.c_str(), gnss_fusion_gain_,
@@ -693,6 +695,41 @@ private:
       return;
     }
     const RtkObservation rtk = currentRtkObservation(stamp);
+    // Expose the current RTK map observation independently from whether the
+    // source arbiter selected RTK for pose fusion.  In particular, a healthy
+    // NDT source may remain active while a fixed RTK solution is still valid.
+    // Never serialize unavailable coordinates as zero: zero is a valid map
+    // coordinate and would make stale/uninitialized data look trustworthy.
+    const bool rtk_position_available = rtk.usable &&
+      std::isfinite(rtk.position.x()) && std::isfinite(rtk.position.y());
+    const double rtk_map_yaw = std::atan2(
+      rtk.orientation.toRotationMatrix()(1, 0),
+      rtk.orientation.toRotationMatrix()(0, 0));
+    const bool rtk_heading_available = rtk_position_available && rtk.heading_usable &&
+      std::isfinite(rtk_map_yaw);
+    std::string rtk_blocked_reason = "none";
+    if (!use_gnss_fusion_) {
+      rtk_blocked_reason = "gnss_fusion_disabled";
+    } else if (!gnss_map_origin_loaded_) {
+      rtk_blocked_reason = "gnss_origin_not_loaded";
+    } else if (!rtk.usable) {
+      if (rtk.quality == "invalid") {
+        rtk_blocked_reason = "no_fix";
+      } else if (rtk.quality == "standalone") {
+        rtk_blocked_reason = "quality_insufficient";
+      } else if (!std::isfinite(rtk.horizontal_std_m) ||
+                 rtk.horizontal_std_m > gnss_max_horizontal_std_) {
+        rtk_blocked_reason = "horizontal_error_exceeded";
+      } else if (rtk.age_s > gnss_max_age_) {
+        rtk_blocked_reason = "position_stale";
+      } else {
+        rtk_blocked_reason = "quality_insufficient";
+      }
+    } else if (!rtk.heading_usable) {
+      rtk_blocked_reason = "heading_unavailable";
+    }
+    const bool odom_time_valid = odom_time_source_ == "ros_reception_monotonic" ||
+      odom_time_source_ == "duplicate_pose_ignored";
     std_msgs::msg::String message;
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
@@ -706,16 +743,40 @@ private:
         << ",\"rtk_quality\":\"" << rtk.quality
         << "\",\"rtk_usable\":" << (rtk.usable ? "true" : "false")
         << ",\"rtk_heading_usable\":" << (rtk.heading_usable ? "true" : "false")
+        << ",\"rtk_blocked_reason\":\"" << rtk_blocked_reason << "\""
         << ",\"rtk_heading_fused\":" << (rtk_heading_fused_this_frame_ ? "true" : "false")
         << ",\"rtk_position_fused\":" << (rtk_position_fused_this_frame_ ? "true" : "false")
-        << ",\"rtk_x\":" << last_rtk_map_position_.x()
-        << ",\"rtk_y\":" << last_rtk_map_position_.y()
-        << ",\"rtk_yaw\":" << last_rtk_map_yaw_
+        << ",\"rtk_x\":";
+    if (rtk_position_available) {
+      out << rtk.position.x();
+    } else {
+      out << "null";
+    }
+    out << ",\"rtk_y\":";
+    if (rtk_position_available) {
+      out << rtk.position.y();
+    } else {
+      out << "null";
+    }
+    out << ",\"rtk_yaw\":";
+    if (rtk_heading_available) {
+      out << rtk_map_yaw;
+    } else {
+      out << "null";
+    }
+    out
         << ",\"bridge_distance_m\":" << bridge_distance_m_
         << ",\"bridge_elapsed_s\":"
         << (bridge_active_ ? std::max(0.0, (stamp - bridge_start_time_).seconds()) : 0.0)
         << ",\"bridge_rejection_reason\":\"" << bridge_rejection_reason_ << "\""
         << ",\"odom_time_source\":\"" << odom_time_source_ << "\""
+        << ",\"odom_time_valid\":";
+    if (!enable_robot_odometry_prediction) {
+      out << "null";
+    } else {
+      out << (odom_time_valid ? "true" : "false");
+    }
+    out
         << ",\"position_sigma_m\":"
         << (pose_estimator ? pose_estimator->horizontal_position_sigma() : -1.0f)
         << ",\"yaw_sigma_deg\":"
@@ -2626,7 +2687,7 @@ private:
   bool absolute_stable_ = false;
   std::string stable_source_;
   std::string bridge_rejection_reason_;
-  std::string odom_time_source_ = "unavailable";
+  std::string odom_time_source_ = "not_used";
   int64_t last_absolute_observation_stamp_ns_ = 0;
   
   // transformation matrices 

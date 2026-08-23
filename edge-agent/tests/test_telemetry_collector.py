@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from roamerx_edge.safety_policy import RuntimeSafetyState
-from roamerx_edge.telemetry_collector import TelemetryCollector
+from roamerx_edge.telemetry_collector import TelemetryCollector, normalize_rtk_quality
 
 
 def test_status_timestamp_advances_without_new_localization(monkeypatch):
@@ -92,3 +92,77 @@ def test_power_and_network_are_only_reported_while_fresh(monkeypatch):
         "type": "",
         "signal_percent": None,
     }
+
+
+def test_direct_odometry_samples_keep_source_and_frame_details(monkeypatch):
+    now = {"value": 100.0}
+    monkeypatch.setattr("roamerx_edge.telemetry_collector.time.time", lambda: now["value"])
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+
+    collector.on_sensor_message(
+        "odometry",
+        topic="/odom/localization_odom",
+        frame_id="map",
+        child_frame_id="body",
+        source="slam",
+        message_time_offset_seconds=0.02,
+    )
+    snapshot = collector.build_status_snapshot()["sensors"]["odometry"]
+
+    assert snapshot["online"] is True
+    assert snapshot["source"] == "slam"
+    assert snapshot["frame_id"] == "map"
+    assert snapshot["child_frame_id"] == "body"
+
+
+def test_rtk_raw_details_and_cross_sensor_time_diagnostics(monkeypatch):
+    now = {"value": 100.0}
+    monkeypatch.setattr("roamerx_edge.telemetry_collector.time.time", lambda: now["value"])
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+
+    for name, stamp in (
+        ("lidar", 99.900),
+        ("imu", 99.905),
+        ("rtk", 99.920),
+        ("odometry", 99.910),
+    ):
+        collector.on_sensor_message(
+            name,
+            topic=f"/{name}",
+            measurement_stamp=stamp,
+            measurement_time_valid=True,
+            measurement_time_offset_ms=0.0,
+        )
+    collector.update_sensor_details(
+        "rtk",
+        quality="rtk_fixed",
+        fix_status=2,
+        solution_status=1,
+        position_type=4,
+        solution_satellites=18,
+        heading={
+            "status": 0,
+            "type": 1,
+            "heading_deg": 90.0,
+            "heading_std_deg": 0.1,
+            "measurement_stamp": 99.920,
+        },
+    )
+
+    snapshot = collector.build_status_snapshot()
+    raw_rtk = snapshot["localization"]["raw_rtk"]
+    diagnostics = snapshot["localization"]["time_diagnostics"]
+
+    assert normalize_rtk_quality("rtk_fixed") == "fixed"
+    assert raw_rtk["quality"] == "fixed"
+    assert raw_rtk["fix_status"] == 2
+    assert raw_rtk["heading"]["heading_deg"] == 90.0
+    assert diagnostics["lidar_to_rtk_delta_ms"] == 20.0
+    assert diagnostics["lidar_to_odom_delta_ms"] == 10.0
+    assert diagnostics["all_time_valid"] is True

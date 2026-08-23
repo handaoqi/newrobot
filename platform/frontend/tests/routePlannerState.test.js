@@ -6,8 +6,10 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   normalizeHeadingDegrees,
+  normalizeRtkQuality,
   paginateKeyframes,
   resolveMapClickAction,
+  rtkQualityLabel,
 } from '../src/services/routePlannerState.js'
 
 test('heading input is normalized and converted only when valid', () => {
@@ -45,4 +47,15 @@ test('two map points produce the same yaw convention used by initial pose', () =
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 2, y: 1 }), 0)
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1, y: 2 }), Number((Math.PI / 2).toFixed(5)))
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1.01, y: 1.01 }), null)
+})
+
+test('RTK quality aliases normalize to one route-planner enum', () => {
+  assert.equal(normalizeRtkQuality('rtk_fixed'), 'fixed')
+  assert.equal(normalizeRtkQuality('fixed'), 'fixed')
+  assert.equal(normalizeRtkQuality('rtk_float'), 'float')
+  assert.equal(normalizeRtkQuality('standalone'), 'standalone')
+  assert.equal(normalizeRtkQuality('unknown-quality'), 'invalid')
+  assert.equal(rtkQualityLabel('rtk_fixed'), '固定解')
+  assert.equal(rtkQualityLabel('float'), '浮点解')
+  assert.equal(rtkQualityLabel(null), '无数据')
 })

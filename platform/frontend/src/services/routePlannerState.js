@@ -3,6 +3,36 @@ export const MAP_ZOOM_MAX = 3
 export const MAP_ZOOM_STEP = 0.25
 export const KEYFRAME_PAGE_SIZE = 50
 
+const RTK_QUALITY_ALIASES = {
+  fixed: 'fixed',
+  rtk_fixed: 'fixed',
+  float: 'float',
+  rtk_float: 'float',
+  standalone: 'standalone',
+  single: 'standalone',
+  invalid: 'invalid',
+  no_fix: 'invalid',
+}
+
+const RTK_QUALITY_LABELS = {
+  fixed: '固定解',
+  float: '浮点解',
+  standalone: '单点解',
+  invalid: '无效',
+}
+
+/** Normalize RTK solution quality at the route-planner UI boundary. */
+export function normalizeRtkQuality(value) {
+  if (value === null || value === undefined || value === '') return null
+  const normalized = String(value).trim().toLowerCase()
+  return RTK_QUALITY_ALIASES[normalized] || 'invalid'
+}
+
+export function rtkQualityLabel(value) {
+  const quality = normalizeRtkQuality(value)
+  return quality ? RTK_QUALITY_LABELS[quality] : '无数据'
+}
+
 export function normalizeHeadingDegrees(value) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return null

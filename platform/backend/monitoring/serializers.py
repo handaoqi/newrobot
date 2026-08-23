@@ -1020,6 +1020,8 @@ class RobotSessionSerializer(serializers.ModelSerializer):
 class RobotStatusSerializer(serializers.ModelSerializer):
     task_execution_id = serializers.UUIDField(source="task_execution.id", read_only=True, allow_null=True)
     localization_quality = serializers.SerializerMethodField()
+    raw_rtk = serializers.SerializerMethodField()
+    time_diagnostics = serializers.SerializerMethodField()
     current_map = serializers.SerializerMethodField()
     sensors = serializers.SerializerMethodField()
     power = serializers.SerializerMethodField()
@@ -1042,6 +1044,14 @@ class RobotStatusSerializer(serializers.ModelSerializer):
             "map_id": obj.map_id,
             "map_version": obj.map_version,
         }
+
+    def get_raw_rtk(self, obj):
+        raw_localization = (obj.raw_payload or {}).get("localization") or {}
+        return raw_localization.get("raw_rtk")
+
+    def get_time_diagnostics(self, obj):
+        raw_localization = (obj.raw_payload or {}).get("localization") or {}
+        return raw_localization.get("time_diagnostics") or {}
 
     def get_sensors(self, obj):
         return (obj.raw_payload or {}).get("sensors") or {}
@@ -1092,6 +1102,8 @@ class RobotStatusSerializer(serializers.ModelSerializer):
             "localization_status",
             "localization_source_status",
             "localization_quality",
+            "raw_rtk",
+            "time_diagnostics",
             "sensors",
             "power_available",
             "battery_percent",
