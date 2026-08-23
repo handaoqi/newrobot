@@ -2445,7 +2445,7 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: 480px auto;
+  grid-template-rows: 400px auto;
   gap: 1rem;
   height: auto;
   min-height: calc(100vh - 200px);
@@ -2574,7 +2574,7 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-list {
-  height: 360px;
+  height: 280px;
   min-height: 0;
   max-height: none;
   overflow-y: auto;
