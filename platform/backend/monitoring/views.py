@@ -3167,6 +3167,7 @@ class DeviceMapUploadView(APIView):
             "origin_status": map_manifest.get("origin_status") or metadata.get("origin_status", ""),
             "package_files": package_names,
             "package_sha256": hashlib.sha256(package_bytes).hexdigest(),
+            "mapping_metrics": metadata.get("mapping_metrics", {}),
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
@@ -3183,6 +3184,7 @@ class DeviceMapUploadView(APIView):
                 localization_mode=str(description.get("localization_mode") or ""),
                 origin_status=str(description.get("origin_status") or ""),
                 map_completeness=str(map_manifest.get("completeness") or ""),
+                mapping_metrics=description.get("mapping_metrics") if isinstance(description.get("mapping_metrics"), dict) else {},
             )
             map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
             if extracted.get("map.txt"):

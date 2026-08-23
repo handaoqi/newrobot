@@ -137,7 +137,9 @@ class MappingConfig:
     visibility_filter_max_source_bytes: int = 268435456
     visibility_filter_output_suffix: str = "keyframe_visibility_loose03x"
     auto_activate_uploaded_map: bool = True
-    upload_point_cloud: bool = False
+    # A cloud map must remain usable for 3D NDT localization on a robot that
+    # does not already have the source session directory.
+    upload_point_cloud: bool = True
     preview_max_size: int = 1200
     rosbag_script: str = "/home/dogrobot/robot/script/robot/mapping_rosbag.sh"
     rosbag_stop_timeout_seconds: int = 45

@@ -223,6 +223,11 @@ const activeMapSync = computed(() => {
 })
 
 const selectedMapDescription = computed(() => parseDescription(selectedMap.value?.description))
+const selectedMapMetrics = computed(() => (
+  selectedMap.value?.mapping_metrics && Object.keys(selectedMap.value.mapping_metrics).length
+    ? selectedMap.value.mapping_metrics
+    : selectedMapDescription.value.mapping_metrics || {}
+))
 const selectedMapPackageFiles = computed(() => {
   const files = selectedMapDescription.value.package_files || selectedMapDescription.value.files || []
   return Array.isArray(files) ? files : []
@@ -307,6 +312,10 @@ const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle'
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
 const mappingCommandInFlight = computed(() => ['created', 'published', 'accepted', 'executing'].includes(commandStatus.value))
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
+const mappingMetrics = computed(() => {
+  const resultMetrics = mappingStatus.value?.result?.mapping_metrics || saveProgress.value.mapping_metrics || {}
+  return Object.keys(resultMetrics).length ? resultMetrics : selectedMapMetrics.value
+})
 const rosbagStatus = computed(() => mappingStatus.value?.result?.rosbag || {})
 const originStatus = computed(() => mappingStatus.value?.result?.origin || {})
 const originState = computed(() => originStatus.value.origin_status || 'idle')
@@ -442,6 +451,15 @@ const formatBytes = (value) => {
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   return `${(bytes / (1024 ** index)).toFixed(index > 1 ? 1 : 0)} ${units[index]}`
+}
+const formatDuration = (value) => {
+  const seconds = Math.max(0, Math.round(Number(value || 0)))
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  if (minutes < 60) return `${minutes} 分 ${remainder} 秒`
+  const hours = Math.floor(minutes / 60)
+  return `${hours} 小时 ${minutes % 60} 分`
 }
 
 const stateSteps = computed(() => [
@@ -1319,6 +1337,20 @@ async function saveCleaner() {
                 <strong>质量:</strong> 发散救援地图，启用前必须现场核对
               </div>
             </div>
+            <div v-if="Object.keys(selectedMapMetrics).length" class="mapping-metrics-panel">
+              <div class="map-artifact-head">
+                <strong>建图统计</strong>
+                <span>{{ selectedMapMetrics.schema || 'mapping-metrics.v1' }}</span>
+              </div>
+              <div class="mapping-metrics-grid">
+                <span>ZIP 包大小<strong>{{ formatBytes(selectedMapMetrics.package_size_bytes) }}</strong></span>
+                <span>机器狗目录<strong>{{ formatBytes(selectedMapMetrics.robot_directory_size_bytes) }}</strong></span>
+                <span>关键帧数量<strong>{{ selectedMapMetrics.keyframe_count || 0 }}</strong></span>
+                <span>里程<strong>{{ Number(selectedMapMetrics.trajectory_m || 0).toFixed(1) }} m</strong></span>
+                <span>建图耗时<strong>{{ formatDuration(selectedMapMetrics.mapping_duration_seconds) }}</strong></span>
+                <span>诊断数据<strong>{{ formatBytes(selectedMapMetrics.diagnostic_data_size_bytes) }}</strong></span>
+              </div>
+            </div>
             <div class="map-artifact-panel">
               <div class="map-artifact-head">
                 <strong>地图数据文件</strong>
@@ -1662,6 +1694,17 @@ async function saveCleaner() {
               <span :class="{ 'text-danger': slamHealthIssue }">{{ slamHealthLabel }}</span>
             </div>
             <div v-if="saveProgress.error" class="mapping-progress-error">{{ saveProgress.error }}</div>
+          </div>
+          <div v-if="Object.keys(mappingMetrics).length" class="mapping-metrics-panel mapping-metrics-runtime">
+            <div class="map-artifact-head"><strong>本次建图结果</strong><span>已上传指标</span></div>
+            <div class="mapping-metrics-grid">
+              <span>ZIP 包大小<strong>{{ formatBytes(mappingMetrics.package_size_bytes) }}</strong></span>
+              <span>机器狗目录<strong>{{ formatBytes(mappingMetrics.robot_directory_size_bytes) }}</strong></span>
+              <span>关键帧数量<strong>{{ mappingMetrics.keyframe_count || 0 }}</strong></span>
+              <span>里程<strong>{{ Number(mappingMetrics.trajectory_m || 0).toFixed(1) }} m</strong></span>
+              <span>建图耗时<strong>{{ formatDuration(mappingMetrics.mapping_duration_seconds) }}</strong></span>
+              <span>诊断数据<strong>{{ formatBytes(mappingMetrics.diagnostic_data_size_bytes) }}</strong></span>
+            </div>
           </div>
           <div class="state-steps">
             <div
@@ -2108,6 +2151,11 @@ async function saveCleaner() {
 .map-artifact-row strong { color: #137333; }
 .map-artifact-row strong.missing { color: #b42318; }
 .map-artifact-panel small { color: #667085; }
+.mapping-metrics-panel { display: grid; gap: 0.55rem; padding: 0.7rem 0.75rem; border: 1px solid #b8c7e8; border-radius: 6px; background: #f7f9ff; font-size: 0.78rem; }
+.mapping-metrics-runtime { margin-top: 0.7rem; }
+.mapping-metrics-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.45rem 0.8rem; }
+.mapping-metrics-grid span { display: flex; justify-content: space-between; gap: 0.6rem; color: #667085; }
+.mapping-metrics-grid strong { color: #1f2937; white-space: nowrap; }
 .global-enu-panel { display: grid; gap: 0.45rem; padding: 0.7rem 0.75rem; border: 1px solid #9ed6b5; border-radius: 6px; background: #f3fff7; font-size: 0.78rem; }
 .global-enu-values { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; color: #176b3a; font: 600 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .global-enu-panel small { color: #667085; }

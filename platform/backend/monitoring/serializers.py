@@ -802,6 +802,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "localization_mode",
             "origin_status",
             "map_completeness",
+            "mapping_metrics",
             "file_size",
             "created_at",
             "updated_at",

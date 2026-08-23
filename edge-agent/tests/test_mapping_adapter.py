@@ -334,6 +334,11 @@ def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):
         assert "keyframes/keyframes.csv" in archive.namelist()
         assert "scan_context/index.json" in archive.namelist()
     assert "gnss_origin.yaml" in metadata["files"]
+    metrics = metadata["mapping_metrics"]
+    assert metrics["package_size_bytes"] == package.stat().st_size
+    assert metrics["robot_directory_size_bytes"] > 0
+    assert metrics["keyframe_count"] == 1
+    assert metrics["diagnostic_data_size_bytes"] >= 0
 
 
 def test_map_package_contains_lightweight_slam_and_rtk_trace(tmp_path, monkeypatch):

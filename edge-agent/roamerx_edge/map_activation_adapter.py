@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import os
 from pathlib import Path
 import json
 import re
+import shutil
+import zipfile
 
+import requests
 import yaml
 
 from .config import EdgeConfig
@@ -225,22 +230,81 @@ class MapActivationAdapter:
         explicit = str(command.get("local_map_dir") or "").strip()
         if explicit:
             source_dir = Path(explicit).expanduser()
-            if source_dir.exists():
+            if source_dir.exists() and all((source_dir / name).is_file() for name in self.REQUIRED_FILES):
                 return source_dir
 
         image_path = str(command.get("local_image_path") or "").strip()
         if image_path:
             source_dir = Path(image_path).expanduser().parent
-            if source_dir.exists():
+            if source_dir.exists() and all((source_dir / name).is_file() for name in self.REQUIRED_FILES):
                 return source_dir
 
         map_version = str(command.get("source_map_version") or command.get("map_name") or "").strip()
         if map_version:
             candidate = self.map_dir / map_version
-            if candidate.exists():
+            if candidate.exists() and all((candidate / name).is_file() for name in self.REQUIRED_FILES):
                 return candidate
 
+        package_url = str(command.get("package_url") or "").strip()
+        if package_url:
+            return self._download_package_source(package_url, command)
+
         raise ProtocolError("MAP_SOURCE_NOT_FOUND", "selected map has no local source directory on this robot")
+
+    def _download_package_source(self, package_url: str, command: dict) -> Path:
+        if not package_url.startswith(("http://", "https://")):
+            raise ProtocolError("MAP_PACKAGE_URL_INVALID", "map package URL must use HTTP or HTTPS")
+        cache_key = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "_",
+            f"{command.get('map_id', '')}_{command.get('map_version', '')}",
+        )[:128].strip("_.") or "map"
+        cache_root = self.map_dir / ".cloud_packages" / cache_key
+        required = [cache_root / name for name in self.REQUIRED_FILES]
+        if all(path.is_file() for path in required):
+            return cache_root
+
+        temporary_root = cache_root.with_name(cache_root.name + ".partial")
+        if temporary_root.exists():
+            shutil.rmtree(temporary_root)
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        archive_path = temporary_root / "map_package.zip"
+        try:
+            response = requests.get(package_url, stream=True, timeout=300)
+            response.raise_for_status()
+            digest = hashlib.sha256()
+            with archive_path.open("wb") as stream:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        digest.update(chunk)
+                        stream.write(chunk)
+            expected_sha256 = str(command.get("package_sha256") or "").strip().lower()
+            if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
+                raise ProtocolError("MAP_PACKAGE_CHECKSUM_MISMATCH", "downloaded map package checksum is invalid")
+
+            extract_root = temporary_root / "content"
+            extract_root.mkdir()
+            with zipfile.ZipFile(archive_path) as archive:
+                root = extract_root.resolve()
+                for member in archive.infolist():
+                    destination = (extract_root / member.filename).resolve()
+                    if root != destination and root not in destination.parents:
+                        raise ProtocolError("MAP_PACKAGE_INVALID", "map package contains an unsafe path")
+                archive.extractall(extract_root)
+            missing = [name for name in self.REQUIRED_FILES if not (extract_root / name).is_file()]
+            if missing:
+                raise ProtocolError("MAP_FILES_MISSING", f"downloaded map package is missing: {', '.join(missing)}")
+            if cache_root.exists():
+                shutil.rmtree(cache_root)
+            os.replace(extract_root, cache_root)
+            return cache_root
+        except ProtocolError:
+            raise
+        except (OSError, requests.RequestException, zipfile.BadZipFile) as exc:
+            raise ProtocolError("MAP_PACKAGE_DOWNLOAD_FAILED", str(exc)) from exc
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
 
     def _persist_config(self, map_id: str, map_version: str) -> None:
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}

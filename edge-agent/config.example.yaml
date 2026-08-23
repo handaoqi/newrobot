@@ -120,7 +120,7 @@ mapping:
   visibility_filter_max_source_bytes: 268435456
   visibility_filter_output_suffix: keyframe_visibility_loose03x
   auto_activate_uploaded_map: true
-  upload_point_cloud: false
+  upload_point_cloud: true
   preview_max_size: 1200
   rosbag_script: "/home/dogrobot/robot/script/robot/mapping_rosbag.sh"
   rosbag_stop_timeout_seconds: 45

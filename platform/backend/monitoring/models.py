@@ -629,6 +629,7 @@ class MapData(BaseTimestampModel):
     localization_mode = models.CharField(max_length=32, blank=True, verbose_name="定位模式")
     origin_status = models.CharField(max_length=32, blank=True, verbose_name="原点状态")
     map_completeness = models.CharField(max_length=32, blank=True, verbose_name="地图完整度")
+    mapping_metrics = models.JSONField(default=dict, blank=True, verbose_name="建图指标")
 
     class Meta:
         verbose_name = "地图数据"

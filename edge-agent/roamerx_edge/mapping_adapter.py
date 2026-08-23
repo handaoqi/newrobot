@@ -12,6 +12,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -377,6 +378,7 @@ class MappingAdapter:
             upload_result = self.media_client.upload_map_package(str(package_path), metadata)
             result = self.status()
             result["package_path"] = str(package_path)
+            result["mapping_metrics"] = metadata.get("mapping_metrics", {})
             result["upload_result"] = upload_result
             return result
 
@@ -430,6 +432,7 @@ class MappingAdapter:
             self._set_state("packaging")
             package_path, metadata = self._package_map(command, work_dir)
             result["package_path"] = str(package_path)
+            result["mapping_metrics"] = metadata.get("mapping_metrics", {})
             if should_upload:
                 self._set_state("uploading")
                 result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
@@ -480,6 +483,7 @@ class MappingAdapter:
             rescue_source_dir=str(source_dir),
             rescue_output_dir=str(output_dir),
             package_path=str(package_path),
+            mapping_metrics=metadata.get("mapping_metrics", {}),
             upload_result=upload_result,
         )
         self._cleanup()
@@ -1233,6 +1237,125 @@ class MappingAdapter:
             }
         return files
 
+    @staticmethod
+    def _directory_size(base: Path | None) -> int:
+        """Return the regular-file bytes in a map session directory."""
+        if not base or not base.is_dir():
+            return 0
+        total = 0
+        try:
+            for path in base.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    total += path.stat().st_size
+        except OSError:
+            LOGGER.warning("failed to calculate map directory size for %s", base, exc_info=True)
+        return total
+
+    @staticmethod
+    def _count_keyframes(base: Path, manifest: dict, progress: dict) -> int:
+        count = int(manifest.get("keyframe_count") or progress.get("keyframe_count") or progress.get("written_keyframes") or 0)
+        if count > 0:
+            return count
+        csv_path = base / "keyframes" / "keyframes.csv"
+        if not csv_path.is_file():
+            return 0
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                return sum(1 for row in csv.DictReader(handle) if row)
+        except (OSError, csv.Error):
+            LOGGER.warning("failed to count keyframes in %s", csv_path, exc_info=True)
+            return 0
+
+    @staticmethod
+    def _trajectory_meters(base: Path, progress: dict) -> float:
+        reported = float(progress.get("trajectory_m") or 0)
+        if reported > 0:
+            return round(reported, 3)
+        csv_path = base / "keyframes" / "keyframes.csv"
+        if not csv_path.is_file():
+            return 0.0
+        distance = 0.0
+        previous = None
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        x = float(row.get("world_x") or row.get("x") or 0)
+                        y = float(row.get("world_y") or row.get("y") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if previous is not None:
+                        distance += math.hypot(x - previous[0], y - previous[1])
+                    previous = (x, y)
+        except (OSError, csv.Error):
+            LOGGER.warning("failed to calculate trajectory length from %s", csv_path, exc_info=True)
+        return round(distance, 3)
+
+    @staticmethod
+    def _mapping_duration_seconds(started_at: str | None, progress: dict) -> float:
+        recorded = float(progress.get("mapping_duration_seconds") or 0)
+        if recorded > 0:
+            return round(recorded, 1)
+        if not started_at:
+            return 0.0
+        try:
+            value = str(started_at).replace("Z", "+00:00")
+            started = datetime.fromisoformat(value)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            return round(max(0.0, time.time() - started.timestamp()), 1)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+    def _build_mapping_metrics(
+        self,
+        base: Path,
+        progress: dict,
+        manifest: dict,
+        package_path: Path | None = None,
+        started_at: str | None = None,
+        diagnostic_paths: list[str] | None = None,
+    ) -> dict:
+        diagnostic_paths = diagnostic_paths or [
+            "recording_manifest.yaml",
+            "mapping_trace.json",
+            "trajectory_raw.csv",
+            "trajectory_optimized.csv",
+            "trajectory_covariance.json",
+            "loop_closures.csv",
+            "scan_context/index.json",
+            "scan_context/loop_candidates.csv",
+            "save_progress.json",
+        ]
+        diagnostic_size = 0
+        diagnostic_count = 0
+        if package_path and package_path.is_file():
+            try:
+                with zipfile.ZipFile(package_path) as archive:
+                    diagnostic_names = set(diagnostic_paths)
+                    for info in archive.infolist():
+                        if info.filename in diagnostic_names:
+                            diagnostic_size += info.file_size
+                            diagnostic_count += 1
+            except (OSError, zipfile.BadZipFile):
+                LOGGER.warning("failed to calculate diagnostic package size for %s", package_path, exc_info=True)
+        else:
+            for relative in diagnostic_paths:
+                path = base / relative
+                if path.is_file():
+                    diagnostic_size += path.stat().st_size
+                    diagnostic_count += 1
+        return {
+            "schema": "roamerx.mapping-metrics.v1",
+            "package_size_bytes": package_path.stat().st_size if package_path and package_path.is_file() else 0,
+            "robot_directory_size_bytes": self._directory_size(base),
+            "keyframe_count": self._count_keyframes(base, manifest, progress),
+            "trajectory_m": self._trajectory_meters(base, progress),
+            "mapping_duration_seconds": self._mapping_duration_seconds(started_at, progress),
+            "diagnostic_data_size_bytes": diagnostic_size,
+            "diagnostic_file_count": diagnostic_count,
+        }
+
     def _package_map(self, command: dict, work_dir: Path | None = None) -> tuple[Path, dict]:
         base = work_dir or self.map_dir
         if not self._is_session_dir(base):
@@ -1303,6 +1426,13 @@ class MappingAdapter:
         map_manifest = self._read_json(filtered_base / "map_manifest.json")
         if not map_manifest and filtered_base != base:
             map_manifest = self._read_json(base / "map_manifest.json")
+        mapping_metrics = self._build_mapping_metrics(
+            base,
+            progress,
+            map_manifest,
+            package_path=package_path,
+            started_at=self.session.started_at if self.session else None,
+        )
         metadata = {
             "robot_code": self.media_client.robot_id,
             "mapping_session_id": self.session.session_id if self.session else str(uuid.uuid4()),
@@ -1326,6 +1456,7 @@ class MappingAdapter:
             "scene_scope": map_manifest.get("scene_scope", ""),
             "localization_mode": map_manifest.get("localization_mode", ""),
             "origin_status": map_manifest.get("origin_status", ""),
+            "mapping_metrics": mapping_metrics,
         }
         return package_path, metadata
 

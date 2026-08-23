@@ -178,6 +178,49 @@ class MapUploadMetadataTests(TestCase):
         description = json.loads(created.description)
         self.assertIn("origin_latitude: 39.0", description["gnss_origin_yaml"])
 
+    def test_complete_package_is_stored_and_downloaded_without_dropping_pcd(self):
+        package = io.BytesIO()
+        with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("map.yaml", "image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n")
+            archive.writestr("map.pgm", b"P5\n1 1\n255\n\xff")
+            archive.writestr("map.pcd", b"pcd-data")
+            archive.writestr(
+                "map_manifest.json",
+                json.dumps({
+                    "schema_version": 2,
+                    "completeness": "complete",
+                    "coordinate_mode": "local_only",
+                    "scene_scope": "indoor",
+                    "localization_mode": "ndt",
+                    "origin_status": "local_only",
+                }),
+            )
+            archive.writestr("recording_manifest.yaml", "schema_version: 1\n")
+            archive.writestr("scan_context/index.json", "{}")
+        package_bytes = package.getvalue()
+
+        response = self.client.post(
+            "/api/device/maps/upload/",
+            {
+                "robot_code": self.robot.code,
+                "map_name": "complete-uploaded",
+                "metadata": json.dumps({"map_version": "v2"}),
+                "map_package": SimpleUploadedFile("complete.zip", package_bytes, content_type="application/zip"),
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        created = MapData.objects.get(name="complete-uploaded")
+        self.assertTrue(created.package_file)
+        description = json.loads(created.description)
+        self.assertIn("map.pcd", description["package_files"])
+        downloaded = self.client.get(f"/api/maps/{created.id}/download/")
+        self.assertEqual(downloaded.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+            self.assertEqual(archive.read("map.pcd"), b"pcd-data")
+            self.assertIn("map_manifest.json", archive.namelist())
+
 
 class MapActivationPayloadTests(TestCase):
     def test_uses_uploaded_source_map_dir_before_original_image_path(self):

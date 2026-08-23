@@ -1,3 +1,6 @@
+import hashlib
+import io
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -137,3 +140,40 @@ def test_manual_activation_reuses_complete_cached_revision(tmp_path):
 
     assert result["manual_cleanup"] == {"reused_cached_revision": True}
     assert (tmp_path / "map.pcd").resolve() == cached / "map.pcd"
+
+
+def test_activation_downloads_complete_cloud_package_when_no_local_source(tmp_path, monkeypatch):
+    package_buffer = io.BytesIO()
+    with zipfile.ZipFile(package_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("map.yaml", "image: map.pgm\nresolution: 0.05\n")
+        archive.writestr("map.pgm", b"pgm")
+        archive.writestr("map.pcd", b"pcd")
+    package = package_buffer.getvalue()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield package
+
+    monkeypatch.setattr("roamerx_edge.map_activation_adapter.requests.get", lambda *args, **kwargs: Response())
+    config_path = tmp_path / "edge.yaml"
+    config_path.write_text("robot: {}\n")
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(map_dir=str(tmp_path)),
+        robot=SimpleNamespace(current_map_id="", current_map_version=""),
+    )
+    adapter = MapActivationAdapter(config, RuntimeSafetyState(), str(config_path))
+
+    result = adapter.activate({
+        "map_id": "cloud-1",
+        "map_version": "v1",
+        "package_url": "https://cloud.example/maps/1.zip",
+        "package_sha256": hashlib.sha256(package).hexdigest(),
+    })
+
+    source = tmp_path / ".cloud_packages" / "cloud-1_v1"
+    assert source.is_dir()
+    assert (source / "map.pcd").read_bytes() == b"pcd"
+    assert result["current_map"]["local_state"] == "applied"
