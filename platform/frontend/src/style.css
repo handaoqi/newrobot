@@ -2534,8 +2534,10 @@ a { color: inherit; }
 .robot-card-side {
   min-width: 74px;
   align-self: stretch;
+  justify-self: end;
   align-content: center;
   justify-items: end;
+  text-align: right;
 }
 .detail-empty {
   align-content: start;
