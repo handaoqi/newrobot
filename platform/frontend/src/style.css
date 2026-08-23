@@ -2611,7 +2611,7 @@ a { color: inherit; }
 .analytics-page-head h2 { margin: 6px 0 4px; }
 .analytics-page-head p { margin: 0; color: var(--muted); }
 .analytics-load-state { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--muted); font-size: 12px; }
-.analytics-load-state.is-ready { color: var(--accent-strong); border-color: rgba(25, 185, 127, 0.35); }
+.analytics-load-state.is-ready { color: var(--green); border-color: rgba(25, 185, 127, 0.35); }
 .analytics-loading-banner,
 .analytics-error-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid rgba(45, 140, 255, 0.24); border-radius: 16px; padding: 12px 16px; background: var(--panel-soft); color: var(--muted); }
 .analytics-error-banner { border-color: rgba(251, 123, 77, 0.34); }
@@ -3093,6 +3093,7 @@ a { color: inherit; }
 @media (max-width: 680px) {
   .login-shell { padding: 24px; }
   .metrics-grid, .analytics-summary, .trend-footer { grid-template-columns: 1fr; }
+  .analytics-page-head { flex-direction: column; }
   .main-header { flex-direction: column; align-items: flex-start; }
   .header-actions { width: 100%; justify-content: flex-start; }
   .header-user { text-align: left; }
