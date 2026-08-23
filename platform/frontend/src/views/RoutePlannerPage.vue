@@ -1872,7 +1872,7 @@ async function handleDeleteRoute(route) {
 
 <template>
   <section class="page-section">
-    <section class="panel detail-panel">
+    <section class="panel detail-panel route-planner-panel">
       <div class="panel-header">
         <div class="route-header-actions">
           <button
@@ -2445,10 +2445,16 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: 480px auto;
   gap: 1rem;
-  height: calc(100vh - 200px);
-  min-height: 720px;
+  height: auto;
+  min-height: calc(100vh - 200px);
+}
+
+.route-planner-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
 }
 
 .side-panel {
@@ -2457,7 +2463,10 @@ async function handleDeleteRoute(route) {
 
 .route-step-panel {
   grid-row: 1;
+  display: flex;
   align-self: stretch;
+  flex-direction: column;
+  overflow: hidden;
   min-width: 0;
   min-height: 0;
 }
@@ -2505,7 +2514,20 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-content {
+  min-height: 0;
+  overflow: auto;
   margin-top: 0.75rem;
+}
+
+.route-step-content select,
+.route-step-content input,
+.route-step-content textarea {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.route-step-1 .route-step-content > select {
+  width: 100%;
 }
 
 .panel-section {
@@ -2553,6 +2575,8 @@ async function handleDeleteRoute(route) {
 
 .waypoint-list {
   height: 360px;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
 }
 
@@ -3051,7 +3075,7 @@ async function handleDeleteRoute(route) {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 280px;
   min-height: 0;
-  flex: 1;
+  flex: 0 0 auto;
   gap: 0.85rem;
 }
 
@@ -3830,6 +3854,15 @@ async function handleDeleteRoute(route) {
     grid-template-rows: none;
     height: auto;
     min-height: 0;
+  }
+
+  .route-step-panel {
+    height: auto;
+    overflow: visible;
+  }
+
+  .route-step-content {
+    overflow: visible;
   }
 
   .route-step-panel,
