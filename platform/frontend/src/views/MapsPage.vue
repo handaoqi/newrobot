@@ -2,6 +2,10 @@
 import { nextTick, onMounted, ref, computed, watch } from 'vue'
 import { useAsyncPoller } from '../composables/useAsyncPoller'
 import {
+  hasActiveMappingWorkflow,
+  isActiveMappingState,
+} from '../utils/mappingWorkflowState'
+import {
   fetchMapSummaries,
   fetchMapSetSummaries,
   fetchMapDetail,
@@ -674,11 +678,7 @@ const isError = computed(() => (
   || (mappingProcessAlive.value && readinessState.value === 'telemetry_stale')
   || ['command_timed_out', 'command_failed', 'command_rejected'].includes(mappingState.value)
 ))
-const isActiveMapping = computed(() => [
-  'command_created', 'command_published', 'command_accepted', 'starting',
-  'origin_starting', 'origin_waiting', 'origin_locked', 'slam_starting', 'slam_warmup',
-  'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping',
-].includes(mappingState.value))
+const isActiveMapping = computed(() => isActiveMappingState(mappingState.value))
 const displayMappingState = computed(() => {
   if (['slam_warmup', 'ready_to_map'].includes(mappingState.value)) {
     if (['imu_initializing', 'waiting_first_keyframe'].includes(readinessState.value)) return readinessState.value
@@ -701,6 +701,15 @@ const canSaveMapping = computed(() => (
     || (mappingState.value === 'mapping' && readyForSave.value)
     || (isError.value && ['mapping', 'saving'].includes(failureStepKey.value))
   )
+))
+const canCancelMapping = computed(() => (
+  Boolean(selectedRobot.value)
+  && hasActiveMappingWorkflow({
+    mappingState: mappingState.value,
+    commandStatus: commandStatus.value,
+    processAlive: mappingProcessAlive.value,
+    originState: originState.value,
+  })
 ))
 const showMappingReadiness = computed(() => (
   Boolean(mappingStatus.value?.result?.process_alive)
@@ -2091,7 +2100,7 @@ async function saveCleaner() {
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
             {{ slamDiverged ? '停止并生成救援地图' : (isError && ['mapping', 'saving'].includes(failureStepKey) ? '重试停止并保存地图' : '停止并保存地图') }}
           </button>
-          <button class="btn btn-sm" @click="handleCancelMapping">
+          <button class="btn btn-sm" :disabled="!canCancelMapping" @click="handleCancelMapping">
             取消建图
           </button>
           <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot" @click="refreshMappingStatus">
