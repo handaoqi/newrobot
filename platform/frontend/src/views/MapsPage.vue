@@ -30,6 +30,7 @@ const loading = ref(false)
 const uploading = ref(false)
 const showUploadDialog = ref(false)
 const mappingBusy = ref(false)
+const mappingCancelInFlight = ref(false)
 const mappingStepFeedback = ref(null)
 const mappingStatus = ref(null)
 const mappingResult = ref({})
@@ -387,8 +388,20 @@ const connectionClass = computed(() => {
 })
 
 // 建图状态机
-const mappingState = computed(() => mappingStatus.value?.mapping_state || 'idle')
 const commandStatus = computed(() => mappingStatus.value?.command_status || 'idle')
+const completedUploadMapId = computed(() => (
+  mappingStatus.value?.result?.upload_result?.id
+  || (mappingStatus.value?.command_type === 'mapping.save' && commandStatus.value === 'succeeded'
+    ? mappingStatus.value?.latest_map?.id
+    : '')
+))
+const mappingState = computed(() => (
+  mappingStatus.value?.command_type === 'mapping.save'
+  && commandStatus.value === 'succeeded'
+  && completedUploadMapId.value
+    ? 'exited'
+    : (mappingStatus.value?.mapping_state || 'idle')
+))
 const mappingCommandInFlight = computed(() => ['created', 'published', 'accepted', 'executing'].includes(commandStatus.value))
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
 // Runtime result is intentionally independent from the selected map. It is
@@ -689,12 +702,6 @@ const canSaveMapping = computed(() => (
     || (isError.value && ['mapping', 'saving'].includes(failureStepKey.value))
   )
 ))
-const canCancelMapping = computed(() => (
-  isError.value
-  || isActiveMapping.value
-  || Boolean(mappingStatus.value?.result?.process_alive)
-  || ['waiting_fix', 'quality_holding', 'failed'].includes(originState.value)
-))
 const showMappingReadiness = computed(() => (
   Boolean(mappingStatus.value?.result?.process_alive)
   || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
@@ -924,6 +931,18 @@ async function refreshMappingStatus({ signal } = {}) {
       && shouldAdoptReportedType) {
       mappingForm.value.mapping_type = reportedType
     }
+    const completedMapId = mappingStatus.value?.result?.upload_result?.id
+      || (mappingStatus.value?.command_type === 'mapping.save'
+        && mappingStatus.value?.command_status === 'succeeded'
+        ? mappingStatus.value?.latest_map?.id
+        : '')
+    const completedMetrics = mappingStatus.value?.result?.mapping_metrics
+      || mappingStatus.value?.latest_map?.mapping_metrics
+      || {}
+    if (completedMapId && Object.keys(completedMetrics).length
+      && String(mappingResultMapId.value || '') !== String(completedMapId)) {
+      publishPendingMappingResult(completedMapId, completedMetrics)
+    }
   } catch (error) {
     if (error?.name === 'AbortError') return
     console.error('获取建图状态失败:', error)
@@ -1117,8 +1136,16 @@ async function handleSaveMapping() {
 }
 
 async function handleCancelMapping() {
-  if (!mappingForm.value.robot) return
+  if (!mappingForm.value.robot) {
+    alert('请先选择机器狗')
+    return
+  }
+  if (mappingCancelInFlight.value) {
+    setMappingStepFeedback('取消建图', true, '取消命令正在处理中，请等待 Edge Agent 响应…')
+    return
+  }
   if (!confirm('确定要取消本次建图吗？')) return
+  mappingCancelInFlight.value = true
   mappingBusy.value = true
   setMappingStepFeedback('取消建图', true, '正在下发取消建图命令，清理当前状态…')
   try {
@@ -1137,6 +1164,7 @@ async function handleCancelMapping() {
     setMappingStepFeedback('取消建图', false, error.message)
     alert(`取消建图失败: ${error.message}`)
   } finally {
+    mappingCancelInFlight.value = false
     mappingBusy.value = false
   }
 }
@@ -2063,7 +2091,7 @@ async function saveCleaner() {
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
             {{ slamDiverged ? '停止并生成救援地图' : (isError && ['mapping', 'saving'].includes(failureStepKey) ? '重试停止并保存地图' : '停止并保存地图') }}
           </button>
-          <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot || !canCancelMapping" @click="handleCancelMapping">
+          <button class="btn btn-sm" @click="handleCancelMapping">
             取消建图
           </button>
           <button class="btn btn-sm" :disabled="mappingBusy || !selectedRobot" @click="refreshMappingStatus">
