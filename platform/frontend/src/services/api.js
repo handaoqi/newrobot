@@ -1,18 +1,64 @@
+import { createTTLCache } from './cache'
+
 export const API_BASE = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/, '')
 
+export const listCache = createTTLCache({ ttlMs: 30_000 })
+const ROBOT_LIST_TIMEOUT_MS = 8_000
+
+function summaryPath(path) {
+  return `${path}${path.includes('?') ? '&' : '?'}view=summary`
+}
+
 async function request(path, options = {}) {
+  const { timeoutMs, signal: callerSignal, ...fetchOptions } = options
   const token = localStorage.getItem('inspection_token')
-  const headers = { ...(options.headers || {}) }
-  if (!(options.body instanceof FormData)) headers['Content-Type'] = 'application/json'
+  const headers = { ...(fetchOptions.headers || {}) }
+  if (!(fetchOptions.body instanceof FormData)) headers['Content-Type'] = 'application/json'
 
   if (token) {
     headers.Authorization = `Token ${token}`
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  })
+  let timeoutHandle = null
+  let timeoutTriggered = false
+  let requestController = null
+  let removeCallerAbortListener = null
+  let requestSignal = callerSignal
+  if (timeoutMs > 0) {
+    requestController = new AbortController()
+    requestSignal = requestController.signal
+    const abortFromCaller = () => requestController.abort()
+    if (callerSignal) {
+      if (callerSignal.aborted) requestController.abort()
+      else {
+        callerSignal.addEventListener('abort', abortFromCaller, { once: true })
+        removeCallerAbortListener = () => callerSignal.removeEventListener('abort', abortFromCaller)
+      }
+    }
+    timeoutHandle = setTimeout(() => {
+      timeoutTriggered = true
+      requestController.abort()
+    }, timeoutMs)
+  }
+
+  let response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...fetchOptions,
+      headers,
+      ...(requestSignal ? { signal: requestSignal } : {}),
+    })
+  } catch (error) {
+    if (timeoutTriggered && !callerSignal?.aborted) {
+      const timeoutError = new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`)
+      timeoutError.code = 'REQUEST_TIMEOUT'
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle)
+    removeCallerAbortListener?.()
+  }
 
   if (!response.ok) {
     const errorPayload = await response.json().catch(() => ({ detail: '请求失败' }))
@@ -71,16 +117,17 @@ export async function fetchEvents({
   return request(`/events/${query}`)
 }
 
-export async function fetchRobots() {
-  return request('/robots/')
+export async function fetchRobots({ force = false } = {}) {
+  const load = () => request('/robots/', { timeoutMs: ROBOT_LIST_TIMEOUT_MS })
+  return force ? load() : listCache.get('robots', load)
 }
 
-export async function fetchRobotDetail(robotId) {
-  return request(`/robots/${robotId}/`)
+export async function fetchRobotDetail(robotId, { signal } = {}) {
+  return request(`/robots/${robotId}/`, { signal })
 }
 
-export async function fetchRobotPersonDetections(robotId) {
-  return request(`/robots/${robotId}/person-detections/`)
+export async function fetchRobotPersonDetections(robotId, { signal } = {}) {
+  return request(`/robots/${robotId}/person-detections/`, { signal })
 }
 
 export async function setRobotPersonDetection(robotId, enabled) {
@@ -160,20 +207,27 @@ export async function synthesizeSpeech(text) {
   })
 }
 
-export async function fetchSpeechTemplates() {
-  return request('/speech-templates/')
+export async function fetchSpeechTemplates({ signal } = {}) {
+  if (signal) return request('/speech-templates/', { signal })
+  return listCache.get('speech-templates', () => request('/speech-templates/', { signal }))
 }
 
 export async function createSpeechTemplate(payload) {
-  return request('/speech-templates/', { method: 'POST', body: JSON.stringify(payload) })
+  const result = await request('/speech-templates/', { method: 'POST', body: JSON.stringify(payload) })
+  listCache.invalidate('speech-templates')
+  return result
 }
 
 export async function updateSpeechTemplate(templateId, payload) {
-  return request(`/speech-templates/${templateId}/`, { method: 'PATCH', body: JSON.stringify(payload) })
+  const result = await request(`/speech-templates/${templateId}/`, { method: 'PATCH', body: JSON.stringify(payload) })
+  listCache.invalidate('speech-templates')
+  return result
 }
 
 export async function deleteSpeechTemplate(templateId) {
-  return request(`/speech-templates/${templateId}/`, { method: 'DELETE' })
+  const result = await request(`/speech-templates/${templateId}/`, { method: 'DELETE' })
+  listCache.invalidate('speech-templates')
+  return result
 }
 
 export async function fetchAlertSkills() {
@@ -191,20 +245,27 @@ export async function previewAlertSkill(skillKey, robotId) {
   })
 }
 
-export async function fetchSpeechCategories() {
-  return request('/speech-categories/')
+export async function fetchSpeechCategories({ signal } = {}) {
+  if (signal) return request('/speech-categories/', { signal })
+  return listCache.get('speech-categories', () => request('/speech-categories/', { signal }))
 }
 
 export async function createSpeechCategory(name) {
-  return request('/speech-categories/', { method: 'POST', body: JSON.stringify({ name }) })
+  const result = await request('/speech-categories/', { method: 'POST', body: JSON.stringify({ name }) })
+  listCache.invalidate('speech-categories')
+  return result
 }
 
 export async function updateSpeechCategory(categoryId, name) {
-  return request(`/speech-categories/${categoryId}/`, { method: 'PATCH', body: JSON.stringify({ name }) })
+  const result = await request(`/speech-categories/${categoryId}/`, { method: 'PATCH', body: JSON.stringify({ name }) })
+  listCache.invalidate('speech-categories')
+  return result
 }
 
 export async function deleteSpeechCategory(categoryId) {
-  return request(`/speech-categories/${categoryId}/`, { method: 'DELETE' })
+  const result = await request(`/speech-categories/${categoryId}/`, { method: 'DELETE' })
+  listCache.invalidate('speech-categories')
+  return result
 }
 
 export async function fetchTasks() {
@@ -318,20 +379,20 @@ export async function fetchTaskTrajectory(executionId) {
   return request(`/task-executions/${executionId}/trajectory/`)
 }
 
-export async function fetchRobotStatus(robotId) {
-  return request(`/robots/${robotId}/status/`)
+export async function fetchRobotStatus(robotId, { signal } = {}) {
+  return request(`/robots/${robotId}/status/`, { signal })
 }
 
 export async function fetchRobotSessions(robotId) {
   return request(`/robots/${robotId}/sessions/`)
 }
 
-export async function fetchRobotMappingStatus(robotId) {
-  return request(`/robots/${robotId}/mapping/status/`)
+export async function fetchRobotMappingStatus(robotId, { signal } = {}) {
+  return request(`/robots/${robotId}/mapping/status/`, { signal })
 }
 
-export async function fetchRobotNavigationStatus(robotId) {
-  return request(`/robots/${robotId}/navigation/status/`)
+export async function fetchRobotNavigationStatus(robotId, { signal } = {}) {
+  return request(`/robots/${robotId}/navigation/status/`, { signal })
 }
 
 export async function sendRobotNavigationCommand(robotId, action, payload = {}) {
@@ -424,16 +485,26 @@ export async function handleEvent(eventId, payload) {
   })
 }
 
-export async function fetchMaps() {
-  return request('/maps/')
+export async function fetchMaps({ signal } = {}) {
+  return request('/maps/', { signal })
 }
 
-export async function fetchMapSets() {
-  return request('/map-sets/')
+export async function fetchMapSummaries({ signal } = {}) {
+  if (signal) return request(summaryPath('/maps/'), { signal })
+  return listCache.get('maps-summary', () => request(summaryPath('/maps/'), { signal }))
 }
 
-export async function fetchMapDetail(mapId) {
-  return request(`/maps/${mapId}/`)
+export async function fetchMapSets({ signal } = {}) {
+  return request('/map-sets/', { signal })
+}
+
+export async function fetchMapSetSummaries({ signal } = {}) {
+  if (signal) return request(summaryPath('/map-sets/'), { signal })
+  return listCache.get('map-sets-summary', () => request(summaryPath('/map-sets/'), { signal }))
+}
+
+export async function fetchMapDetail(mapId, { signal } = {}) {
+  return request(`/maps/${mapId}/`, { signal })
 }
 
 export async function fetchMapMappingTrace(mapId) {
@@ -447,24 +518,32 @@ export async function createMap(payload) {
       formData.append(key, payload[key])
     }
   })
-  return request('/maps/', {
+  const result = await request('/maps/', {
     method: 'POST',
     body: formData,
     headers: {},
   })
+  listCache.invalidate('maps-summary')
+  listCache.invalidate('map-sets-summary')
+  return result
 }
 
 export async function updateMap(mapId, payload) {
-  return request(`/maps/${mapId}/`, {
+  const result = await request(`/maps/${mapId}/`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })
+  listCache.invalidate('maps-summary')
+  return result
 }
 
 export async function deleteMap(mapId, { force = false } = {}) {
-  return request(`/maps/${mapId}/${force ? '?force=true' : ''}`, {
+  const result = await request(`/maps/${mapId}/${force ? '?force=true' : ''}`, {
     method: 'DELETE',
   })
+  listCache.invalidate('maps-summary')
+  listCache.invalidate('map-sets-summary')
+  return result
 }
 
 export async function downloadMap(mapId) {
@@ -483,44 +562,59 @@ export async function downloadMap(mapId) {
 }
 
 export async function setActiveMap(mapId) {
-  return request(`/maps/${mapId}/set_active/`, {
+  const result = await request(`/maps/${mapId}/set_active/`, {
     method: 'POST',
   })
+  listCache.invalidate('maps-summary')
+  return result
 }
 
 export async function manuallyCleanMap(mapId, payload) {
-  return request(`/maps/${mapId}/manual-clean/`, {
+  const result = await request(`/maps/${mapId}/manual-clean/`, {
     method: 'POST',
     body: JSON.stringify(payload),
   })
+  listCache.invalidate('maps-summary')
+  return result
 }
 
-export async function fetchRoutes() {
-  return request('/routes/')
+export async function fetchRoutes({ signal } = {}) {
+  return request('/routes/', { signal })
 }
 
-export async function fetchRouteDetail(routeId) {
-  return request(`/routes/${routeId}/`)
+export async function fetchRouteSummaries({ signal } = {}) {
+  if (signal) return request(summaryPath('/routes/'), { signal })
+  return listCache.get('routes-summary', () => request(summaryPath('/routes/'), { signal }))
+}
+
+export async function fetchRouteDetail(routeId, { signal } = {}) {
+  return request(`/routes/${routeId}/`, { signal })
 }
 
 export async function createRoute(payload) {
-  return request('/routes/', {
+  const result = await request('/routes/', {
     method: 'POST',
     body: JSON.stringify(payload),
   })
+  listCache.invalidate('routes-summary')
+  return result
 }
 
 export async function updateRoute(routeId, payload) {
-  return request(`/routes/${routeId}/`, {
+  const result = await request(`/routes/${routeId}/`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })
+  listCache.invalidate('routes-summary')
+  return result
 }
 
 export async function deleteRoute(routeId) {
-  return request(`/routes/${routeId}/`, {
+  const result = await request(`/routes/${routeId}/`, {
     method: 'DELETE',
   })
+  listCache.invalidate('routes-summary')
+  return result
 }
 
 export async function executeRoute(routeId, {
@@ -568,18 +662,25 @@ export async function deleteZone(zoneId) {
   })
 }
 
-export async function fetchTracks() {
-  return request('/tracks/')
+export async function fetchTracks({ signal } = {}) {
+  return request('/tracks/', { signal })
 }
 
-export async function fetchTrackDetail(trackId) {
-  return request(`/tracks/${trackId}/`)
+export async function fetchTrackSummaries({ signal } = {}) {
+  if (signal) return request(summaryPath('/tracks/'), { signal })
+  return listCache.get('tracks-summary', () => request(summaryPath('/tracks/'), { signal }))
+}
+
+export async function fetchTrackDetail(trackId, { signal } = {}) {
+  return request(`/tracks/${trackId}/`, { signal })
 }
 
 export async function deleteTrack(trackId) {
-  return request(`/tracks/${trackId}/`, {
+  const result = await request(`/tracks/${trackId}/`, {
     method: 'DELETE',
   })
+  listCache.invalidate('tracks-summary')
+  return result
 }
 
 // 机器狗连接

@@ -1,15 +1,18 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useAsyncPoller } from '../composables/useAsyncPoller'
 import {
-  fetchMaps,
+  fetchMapSummaries,
+  fetchMapDetail,
   fetchMapMappingTrace,
-  fetchMapSets,
+  fetchMapSetSummaries,
+  fetchRouteDetail,
   fetchRobotNavigationStatus,
   fetchRobotStatus,
   fetchTaskExecution,
   fetchTaskTrajectory,
   fetchRobots,
-  fetchRoutes,
+  fetchRouteSummaries,
   fetchSpeechCategories,
   fetchSpeechTemplates,
   createRoute,
@@ -31,9 +34,13 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   normalizeHeadingDegrees,
+  normalizeRoutePlannerTelemetry,
   paginateKeyframes,
   resolveMapClickAction,
+  rtkFixStatusLabel,
+  rtkPositionTypeLabel,
   rtkQualityLabel,
+  rtkSolutionStatusLabel,
 } from '../services/routePlannerState'
 import {
   buildLocalizationLossMarkers,
@@ -111,7 +118,10 @@ const drillElapsedSeconds = ref(0)
 const drillCurrentSpeed = ref(0)
 const expandedWaypoints = ref(new Set())
 const routeListOpen = ref(false)
-let navTimer = null
+const navigationPoller = useAsyncPoller((signal) => refreshNavigationStatus({ signal }), {
+  intervalMs: 2_000,
+  immediate: false,
+})
 let drillClockTimer = null
 let drillStartedAt = null
 let drillEventSequence = 0
@@ -119,6 +129,7 @@ let drillAnimationFrame = null
 let drillCancelled = false
 let drillAudio = null
 let drillAudioResolve = null
+let navigationStatusRefreshing = false
 
 const routeForm = ref({
   name: '',
@@ -135,13 +146,11 @@ const allWaypointsExpanded = computed(() => (
 
 onMounted(async () => {
   await loadData()
-  await refreshNavigationStatus()
-  navTimer = setInterval(refreshNavigationStatus, 2000)
+  await navigationPoller.run()
   window.addEventListener('resize', refreshImageGeometry)
 })
 
 onBeforeUnmount(() => {
-  if (navTimer) clearInterval(navTimer)
   window.removeEventListener('resize', refreshImageGeometry)
   stopDrill(false)
 })
@@ -150,9 +159,9 @@ async function loadData() {
   loading.value = true
   try {
     const [mapsResult, mapSetsResult, routesResult, robotsResult, categoriesResult, templatesResult] = await Promise.allSettled([
-      fetchMaps(),
-      fetchMapSets(),
-      fetchRoutes(),
+      fetchMapSummaries(),
+      fetchMapSetSummaries(),
+      fetchRouteSummaries(),
       fetchRobots(),
       fetchSpeechCategories(),
       fetchSpeechTemplates(),
@@ -171,7 +180,7 @@ async function loadData() {
     else console.error('加载播报文案失败:', templatesResult.reason)
     seedRobotsFromMapsAndRoutes()
     if (!selectedMap.value && maps.value.length) {
-      handleMapSelect(maps.value.find(map => map.active) || maps.value[0])
+      void handleMapSelect(maps.value.find(map => map.active) || maps.value[0])
     }
   } catch (error) {
     console.error('加载数据失败:', error)
@@ -213,9 +222,9 @@ function toggleAllWaypoints() {
     : new Set(waypoints.value.map((_, index) => index))
 }
 
-function handleRouteSelect(routeId) {
+async function handleRouteSelect(routeId) {
   const route = routes.value.find(item => String(item.id) === String(routeId))
-  if (route) handleLoadRoute(route)
+  if (route) await handleLoadRoute(route)
 }
 
 function toggleRouteList() {
@@ -266,7 +275,22 @@ async function handleMapSelect(map) {
   }
   refreshImageGeometry()
   refreshNavigationStatus()
-  await loadMappingTrace(map)
+  await Promise.all([
+    loadMappingTrace(map),
+    hydrateSelectedMap(map),
+  ])
+}
+
+async function hydrateSelectedMap(map) {
+  if (!map?.id || Object.prototype.hasOwnProperty.call(map, 'description')) return map
+  try {
+    const detail = await fetchMapDetail(map.id)
+    if (String(selectedMap.value?.id) === String(map.id)) selectedMap.value = detail
+    return detail
+  } catch (error) {
+    console.warn('加载地图详情失败:', error)
+    return map
+  }
 }
 
 async function loadMappingTrace(map = selectedMap.value) {
@@ -812,9 +836,12 @@ async function handleSaveRoute() {
 }
 
 async function handleLoadRoute(route) {
+  if (!route.waypoints) {
+    route = await fetchRouteDetail(route.id)
+  }
   selectedRoute.value = route
   resetWaypointExpansion()
-  const routeMap = maps.value.find(m => String(m.id) === String(route.map_data)) || selectedMap.value
+  let routeMap = maps.value.find(m => String(m.id) === String(route.map_data)) || selectedMap.value
   const mapChanged = String(routeMap?.id) !== String(selectedMap.value?.id)
   selectedMap.value = routeMap
   waypoints.value = (route.waypoints || []).map(point => ({ ...point }))
@@ -829,7 +856,11 @@ async function handleLoadRoute(route) {
   routeForm.value.map_set = route.map_set || null
   routeForm.value.scene_scope = route.scene_scope || selectedMap.value?.scene_scope || 'indoor'
   await nextTick()
-  if (mapChanged) await loadMappingTrace(routeMap)
+  const [, detailedMap] = await Promise.all([
+    mapChanged ? loadMappingTrace(routeMap) : Promise.resolve(),
+    hydrateSelectedMap(routeMap),
+  ])
+  routeMap = detailedMap
   refreshImageGeometry()
   refreshNavigationStatus()
 }
@@ -1070,13 +1101,14 @@ function recordPoseSample() {
   ].slice(-120)
 }
 
-async function refreshNavigationStatus() {
+async function refreshNavigationStatus({ signal } = {}) {
   const robotId = selectedRobot.value?.id || selectedMap.value?.robot || 1
-  if (!robotId) return
+  if (!robotId || navigationStatusRefreshing) return
+  navigationStatusRefreshing = true
   try {
     const [status, navigation] = await Promise.all([
-      fetchRobotStatus(robotId),
-      fetchRobotNavigationStatus(robotId),
+      fetchRobotStatus(robotId, { signal }),
+      fetchRobotNavigationStatus(robotId, { signal }),
     ])
     navStatus.value = {
       ...navigation,
@@ -1089,7 +1121,10 @@ async function refreshNavigationStatus() {
     navError.value = ''
     refreshImageGeometry()
   } catch (error) {
+    if (error?.name === 'AbortError') return
     navError.value = error.message || '导航状态获取失败'
+  } finally {
+    navigationStatusRefreshing = false
   }
 }
 
@@ -1179,7 +1214,7 @@ async function initializeLocalization() {
     await sleep(2500)
     await refreshNavigationStatus()
     localizationInitState.value = 'sending_pose'
-    const rtk = navStatus.value?.status?.sensors?.rtk
+    const rtk = normalizeRoutePlannerTelemetry(navStatus.value?.status).rtk
     const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
     localizationInitMessage.value = useFixedRtk
       ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
@@ -1483,6 +1518,7 @@ function localizationStatusCodeLabel(code) {
 
 function sensorOnlineLabel(sensor) {
   if (!sensor) return '未上报'
+  if (typeof sensor.online !== 'boolean') return '未上报'
   return sensor.online ? '在线' : '离线'
 }
 
@@ -1516,9 +1552,35 @@ function rtkBlockedReasonLabel(reason) {
 }
 
 function sensorAgeLabel(sensor) {
-  const age = Number(sensor?.sample_age_seconds)
+  const directAgeValue = Number(sensor?.sample_age_seconds ?? sensor?.age_seconds)
+  const directAge = Number.isFinite(directAgeValue) && directAgeValue >= 0 ? directAgeValue : NaN
+  const receivedUnix = Number(sensor?.received_at_unix)
+  const receivedAt = Number.isFinite(receivedUnix) && receivedUnix > 946684800
+    ? receivedUnix * 1000
+    : Date.parse(sensor?.received_at || sensor?.sampled_at || '')
+  const measurementStamp = Number(sensor?.measurement_stamp)
+  const measurementTime = Number.isFinite(measurementStamp) && measurementStamp > 946684800
+    ? measurementStamp * 1000
+    : NaN
+  const age = Number.isFinite(directAge)
+    ? directAge
+    : Number.isFinite(receivedAt)
+      ? Math.max(0, (Date.now() - receivedAt) / 1000)
+      : Number.isFinite(measurementTime)
+        ? Math.max(0, (Date.now() - measurementTime) / 1000)
+        : NaN
   if (!Number.isFinite(age)) return '无数据年龄'
   return age > 3 ? `数据过期 ${age.toFixed(1)} 秒` : `${age.toFixed(1)} 秒前`
+}
+
+function sensorMeasurementTimeLabel(sensor) {
+  const rawStamp = sensor?.measurement_stamp ?? sensor?.heading?.measurement_stamp
+  const stamp = Number(rawStamp)
+  if (Number.isFinite(stamp) && stamp > 946684800) {
+    return formatDateTimeWithAge(new Date(stamp * 1000).toISOString())
+  }
+  if (typeof rawStamp === 'string' && rawStamp) return formatDateTimeWithAge(rawStamp)
+  return '未上报'
 }
 
 function odomTimeSourceLabel(decision) {
@@ -1542,7 +1604,7 @@ function predictionErrorBySource(quality, source) {
 
 function localizationDecisionBasis(quality = localizationQuality()) {
   const decision = quality?.decision || {}
-  const rawRtk = navStatus.value?.status?.raw_rtk || {}
+  const { rawRtk } = normalizeRoutePlannerTelemetry(navStatus.value?.status)
   const source = decision.active_source || ''
   if (!source) return '定位决策数据未上报。'
   const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
@@ -1611,10 +1673,11 @@ function localizationDebugRows() {
   const command = navStatus.value?.command
   const quality = localizationQuality()
   const decision = quality?.decision || {}
-  const sensors = status.sensors || {}
-  const rtk = sensors.rtk
-  const rawRtk = status.raw_rtk || {}
-  const timeDiagnostics = status.time_diagnostics || {}
+  const telemetry = normalizeRoutePlannerTelemetry(status)
+  const sensors = telemetry.sensors
+  const rtk = telemetry.rtk
+  const rawRtk = telemetry.rawRtk
+  const timeDiagnostics = telemetry.timeDiagnostics
   const imu = sensors.imu
   const odometry = sensors.odometry
   const qualityFresh = quality && !localizationQualityStale(quality)
@@ -1644,8 +1707,9 @@ function localizationDebugRows() {
     ['IMU · 预测误差', qualityFresh ? predictionErrorBySource(quality, 'imu') : '—'],
     ['RTK · 状态', sensorOnlineLabel(rtk)],
     ['RTK · 原始解状态', rtkQualityLabel(rawRtk.quality || rtk?.quality)],
-    ['RTK · 原始 fix 状态', rawRtk.fix_status === null || rawRtk.fix_status === undefined ? '—' : String(rawRtk.fix_status)],
-    ['RTK · 原始解类型', rawRtk.solution_status === null || rawRtk.solution_status === undefined ? '—' : `${rawRtk.solution_status} / ${rawRtk.position_type ?? '—'}`],
+    ['RTK · 原始 fix 状态', rtkFixStatusLabel(rawRtk.fix_status)],
+    ['RTK · 原始位置类型', rtkPositionTypeLabel(rawRtk.position_type)],
+    ['RTK · 原始解算状态', rtkSolutionStatusLabel(rawRtk.solution_status)],
     ['RTK · 原始卫星数', rawRtk.solution_satellites === null || rawRtk.solution_satellites === undefined ? '—' : String(rawRtk.solution_satellites)],
     ['RTK · 定位决策解状态', rtkQualityLabel(decision.rtk_quality)],
     ['RTK · 融合可用', decision.rtk_usable === true || rtk?.fusion_usable === true ? '是' : '否'],
@@ -1653,6 +1717,7 @@ function localizationDebugRows() {
     ['RTK · 地图坐标', rtkMapPosition],
     ['RTK · 航向', rtkMapHeading],
     ['RTK · 原始航向', rawRtk.heading?.heading_deg === null || rawRtk.heading?.heading_deg === undefined ? '—' : `${formatNumber(rawRtk.heading.heading_deg, 2)}° / std ${formatNumber(rawRtk.heading.heading_std_deg, 2)}°`],
+    ['RTK · 原始测量时间', sensorMeasurementTimeLabel(rawRtk)],
     ['RTK · 原始数据年龄', sensorAgeLabel(rawRtk)],
     ['RTK · 水平误差', rtk?.horizontal_std_m === null || rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(rtk.horizontal_std_m, 2)} m`],
     ['RTK · 时间偏差', sensorTimeOffsetLabel(rtk)],
@@ -1693,7 +1758,8 @@ function stateMachineSteps() {
   const status = navStatus.value?.status || {}
   const quality = localizationQuality()
   const decision = quality?.decision || {}
-  const sensors = status.sensors || {}
+  const telemetry = normalizeRoutePlannerTelemetry(status)
+  const sensors = telemetry.sensors
   const activeSource = decision.active_source || ''
   const mapMatches = robotMapMatches()
   const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
@@ -1707,7 +1773,7 @@ function stateMachineSteps() {
   const ndtHealthy = typeof decision.ndt_healthy === 'boolean' ? decision.ndt_healthy : goodNdt
   const rtkOnline = sensors.rtk?.online === true
   const rtkUsable = decision.rtk_usable === true || sensors.rtk?.fusion_usable === true
-  const rawRtk = status.raw_rtk || {}
+  const rawRtk = telemetry.rawRtk
   const bridgeReady = sensors.imu?.online === true && sensors.odometry?.online === true
   const bridgeRejected = Boolean(decision.bridge_rejection_reason)
   const hasRtkCoordinate = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
@@ -1767,7 +1833,7 @@ function stateMachineSteps() {
       key: 'rtk',
       title: 'RTK定位',
       value: activeSource === 'rtk_imu' ? '当前使用' : rtkUsable ? '可用待命' : rtkOnline ? '不可用于融合' : '离线',
-      detail: `原始${rtkQualityLabel(rawRtk.quality || sensors.rtk?.quality)} · 决策${rtkQualityLabel(decision.rtk_quality)} · ${rtkPositionText} · ${rtkHeadingText} · ${rtkBlockedReasonLabel(decision.rtk_blocked_reason)} · 水平误差 ${sensors.rtk?.horizontal_std_m === null || sensors.rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(sensors.rtk.horizontal_std_m, 2)} m`} · ${sensorAgeLabel(sensors.rtk)}`,
+      detail: `原始${rtkQualityLabel(rawRtk.quality || sensors.rtk?.quality)} · ${rtkPositionTypeLabel(rawRtk.position_type)} · ${rtkSolutionStatusLabel(rawRtk.solution_status)} · 决策${rtkQualityLabel(decision.rtk_quality)} · ${rtkPositionText} · ${rtkHeadingText} · ${rtkBlockedReasonLabel(decision.rtk_blocked_reason)} · 水平误差 ${sensors.rtk?.horizontal_std_m === null || sensors.rtk?.horizontal_std_m === undefined ? '—' : `${formatNumber(sensors.rtk.horizontal_std_m, 2)} m`} · ${sensorAgeLabel(sensors.rtk)}`,
       state: activeSource === 'rtk_imu' || rtkUsable ? 'ok' : rtkOnline ? 'warn' : 'bad',
     },
     {
@@ -1805,15 +1871,23 @@ function stateMachineSteps() {
 
 function sensorStateRows() {
   const status = navStatus.value?.status || {}
-  const sensors = status.sensors || {}
+  const telemetry = normalizeRoutePlannerTelemetry(status)
+  const sensors = telemetry.sensors
   const hasPose = status.x !== null && status.x !== undefined && status.y !== null && status.y !== undefined
   const navReady = Boolean(status.nav_ready)
   const sensorRow = (key, name, fallbackDetail, restartSensor = '') => {
     const sensor = sensors[key]
     if (!sensor) {
-      return { key, name, value: '未上报', detail: fallbackDetail, state: 'unknown', restartSensor }
+      return {
+        key,
+        name,
+        value: '未上报',
+        detail: `状态 未上报 · 数据年龄 未上报 · ${fallbackDetail}`,
+        state: 'unknown',
+        restartSensor,
+      }
     }
-    const hz = Number(sensor.frequency_hz || 0)
+    const hz = Number(sensor.frequency_hz)
     const age = Number(sensor.sample_age_seconds)
     if (key === 'rtk') {
       const modeLabels = {
@@ -1822,11 +1896,11 @@ function sensorStateRows() {
         lidar_fallback: '激光兜底',
       }
       const std = Number(sensor.horizontal_std_m)
-      const detail = `${rtkQualityLabel(sensor.quality)} · 水平误差 ${Number.isFinite(std) ? `${std.toFixed(2)} m` : '—'} · ${hz.toFixed(1)} Hz · ${sensorAgeLabel(sensor)}`
+      const detail = `${sensorOnlineLabel(sensor)} · ${rtkQualityLabel(sensor.quality)} · ${rtkPositionTypeLabel(sensor.position_type)} · ${rtkSolutionStatusLabel(sensor.solution_status)} · 水平误差 ${Number.isFinite(std) ? `${std.toFixed(2)} m` : '—'} · ${Number.isFinite(hz) ? `${hz.toFixed(1)} Hz` : '—'} · 数据年龄 ${sensorAgeLabel(sensor)}`
       return {
         key,
         name,
-        value: sensor.online ? (modeLabels[sensor.fusion_mode] || '质量未知') : '无实时数据',
+        value: sensor.online ? `在线 · ${modeLabels[sensor.fusion_mode] || '质量未知'}` : '离线',
         detail,
         state: sensor.online && sensor.fusion_usable ? 'ok' : (sensor.online ? 'warn' : 'bad'),
         restartSensor: sensor.online ? '' : restartSensor,
@@ -1835,10 +1909,10 @@ function sensorStateRows() {
     return {
       key,
       name,
-      value: sensor.online ? '在线' : '无实时数据',
-      detail: sensor.sampled_at
-        ? `${hz.toFixed(1)} Hz · ${Number.isFinite(age) ? age.toFixed(1) : '—'}s 前`
-        : fallbackDetail,
+      value: sensorOnlineLabel(sensor),
+      detail: sensor.sampled_at || sensor.received_at || Number.isFinite(age)
+        ? `${sensorOnlineLabel(sensor)} · ${Number.isFinite(hz) ? `${hz.toFixed(1)} Hz` : '—'} · 数据年龄 ${sensorAgeLabel(sensor)}`
+        : `状态 ${sensorOnlineLabel(sensor)} · 数据年龄 ${sensorAgeLabel(sensor)} · ${fallbackDetail}`,
       state: sensor.online ? 'ok' : 'bad',
       restartSensor,
     }
@@ -1988,108 +2062,171 @@ async function handleDeleteRoute(route) {
         </section>
 
         <section class="panel-section route-drill-panel">
-          <button
-            class="btn drill-btn"
-            :class="{ running: drillRunning }"
-            :disabled="!drillRunning && (!selectedMap || waypoints.length < 2)"
-            @click="startDrill"
-          >
-            {{ drillRunning ? '■ 停止演练' : '▶ 演练开始' }}
-          </button>
+          <div class="route-drill-actions">
+            <button
+              class="btn drill-btn"
+              :class="{ running: drillRunning }"
+              :disabled="!drillRunning && (!selectedMap || waypoints.length < 2)"
+              @click="startDrill"
+            >
+              {{ drillRunning ? '■ 停止演练' : '▶ 演练开始' }}
+            </button>
+            <div v-if="selectedRoute" class="route-preview-actions">
+              <button
+                class="btn drill-btn route-preview-btn"
+                :disabled="routeExecuteBusy || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready"
+                @click="handleExecuteRoute"
+              >
+                {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
+              </button>
+              <small class="route-preview-note">
+                {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
+              </small>
+            </div>
+          </div>
           <p>选择地图并添加至少两个途经点后开始演练。</p>
         </section>
 
         <!-- 途径点和路线信息 -->
         <div class="side-panel">
-          <div class="panel-section route-step-panel route-step-3">
-            <div class="route-step-heading">
-              <div>
-                <h3>途经点列表</h3>
-                <small>{{ waypoints.length }} 个点位</small>
-              </div>
-              <button type="button" class="route-step-toggle" :disabled="waypoints.length === 0" @click="toggleAllWaypoints">
-                {{ allWaypointsExpanded ? '全部收起' : '全部展开' }}
-              </button>
-            </div>
-            <div class="route-step-content waypoint-panel-content">
-            <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
-            <div v-else class="waypoint-list">
-              <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
-                <div class="waypoint-title-row">
-                  <button type="button" class="waypoint-expand-toggle" @click="toggleWaypointExpanded(index)">
-                    {{ isWaypointExpanded(index) ? '收起' : '展开' }}
-                  </button>
-                  <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
-                  <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
+          <div class="route-waypoint-column">
+            <div class="panel-section route-step-panel route-step-3">
+              <div class="route-step-heading">
+                <div>
+                  <h3>途经点列表</h3>
+                  <small>{{ waypoints.length }} 个点位</small>
                 </div>
-                <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
-                  <div class="waypoint-pose-grid">
-                    <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
-                    <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
-                  </div>
-                  <label class="waypoint-heading-row">
-                    <span>方向</span>
-                    <div class="waypoint-heading-input">
-                      <input
-                        type="number"
-                        step="1"
-                        inputmode="decimal"
-                        :value="waypointYawDrafts[index]"
-                        @input="setWaypointYawDraft(index, $event.target.value)"
-                        @keydown.enter.prevent="confirmWaypointYaw(index)"
-                      />
-                      <span class="heading-unit">°</span>
-                      <button
-                        type="button"
-                        class="btn btn-sm heading-confirm-btn"
-                        :class="{ confirmed: waypointYawConfirmed[index] }"
-                        @click="confirmWaypointYaw(index)"
-                      >{{ waypointYawConfirmed[index] ? '已确认' : '确认' }}</button>
+                <button type="button" class="route-step-toggle" :disabled="waypoints.length === 0" @click="toggleAllWaypoints">
+                  {{ allWaypointsExpanded ? '全部收起' : '全部展开' }}
+                </button>
+              </div>
+              <div class="route-step-content waypoint-panel-content">
+                <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
+                <div v-else class="waypoint-list">
+                  <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
+                    <div class="waypoint-title-row">
+                      <button type="button" class="waypoint-expand-toggle" @click="toggleWaypointExpanded(index)">
+                        {{ isWaypointExpanded(index) ? '收起' : '展开' }}
+                      </button>
+                      <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                      <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
                     </div>
-                  </label>
-                  <small v-if="waypointYawErrors[index]" class="waypoint-field-error">{{ waypointYawErrors[index] }}</small>
-                  <label class="waypoint-check">
-                    <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
-                    <span>到点转向</span>
-                  </label>
-                  <label v-if="index < waypoints.length - 1" class="waypoint-check">
-                    <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
-                    <span>到下个点避障</span>
-                  </label>
-                  <label>
-                    <span>定位方式</span>
-                    <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
-                      <option value="ndt">NDT（室内/特征区）</option>
-                      <option value="rtk" :disabled="mapIsLocalOnly">RTK（室外开阔区）</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span>巡检智能播报</span>
-                    <select :value="point.speech_template_id || ''" @change="setWaypointSpeech(index, $event.target.value)">
-                      <option value="">到点不播报</option>
-                      <option v-for="template in inspectionSpeechTemplates" :key="template.id" :value="template.id">
-                        {{ template.name }}
-                      </option>
-                    </select>
-                  </label>
-                  <small v-if="point.speech_text">{{ point.speech_text }}</small>
-                  <small v-else-if="!inspectionSpeechTemplates.length" class="waypoint-speech-empty">
-                    “巡检智能播报”分类下暂无文案
-                  </small>
+                    <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
+                      <div class="waypoint-pose-grid">
+                        <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
+                        <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
+                      </div>
+                      <label class="waypoint-heading-row">
+                        <span>方向</span>
+                        <div class="waypoint-heading-input">
+                          <input
+                            type="number"
+                            step="1"
+                            inputmode="decimal"
+                            :value="waypointYawDrafts[index]"
+                            @input="setWaypointYawDraft(index, $event.target.value)"
+                            @keydown.enter.prevent="confirmWaypointYaw(index)"
+                          />
+                          <span class="heading-unit">°</span>
+                          <button
+                            type="button"
+                            class="btn btn-sm heading-confirm-btn"
+                            :class="{ confirmed: waypointYawConfirmed[index] }"
+                            @click="confirmWaypointYaw(index)"
+                          >{{ waypointYawConfirmed[index] ? '已确认' : '确认' }}</button>
+                        </div>
+                      </label>
+                      <small v-if="waypointYawErrors[index]" class="waypoint-field-error">{{ waypointYawErrors[index] }}</small>
+                      <label class="waypoint-check">
+                        <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
+                        <span>到点转向</span>
+                      </label>
+                      <label v-if="index < waypoints.length - 1" class="waypoint-check">
+                        <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
+                        <span>到下个点避障</span>
+                      </label>
+                      <label>
+                        <span>定位方式</span>
+                        <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
+                          <option value="ndt">NDT（室内/特征区）</option>
+                          <option value="rtk" :disabled="mapIsLocalOnly">RTK（室外开阔区）</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>巡检智能播报</span>
+                        <select :value="point.speech_template_id || ''" @change="setWaypointSpeech(index, $event.target.value)">
+                          <option value="">到点不播报</option>
+                          <option v-for="template in inspectionSpeechTemplates" :key="template.id" :value="template.id">
+                            {{ template.name }}
+                          </option>
+                        </select>
+                      </label>
+                      <small v-if="point.speech_text">{{ point.speech_text }}</small>
+                      <small v-else-if="!inspectionSpeechTemplates.length" class="waypoint-speech-empty">
+                        “巡检智能播报”分类下暂无文案
+                      </small>
+                    </div>
+                  </div>
                 </div>
+                <div class="waypoint-actions">
+                  <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+                    保存路线
+                  </button>
+                  <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
+                </div>
+                <label class="route-description-under-waypoints">
+                  <span>描述</span>
+                  <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
+                </label>
               </div>
             </div>
-            <div class="waypoint-actions">
-              <button class="btn btn-primary" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
-                保存路线
-              </button>
-              <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
-            </div>
-            <label class="route-description-under-waypoints">
-              <span>描述</span>
-              <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
-            </label>
-            </div>
+
+            <aside v-if="drillTimelineOpen" class="drill-timeline-panel route-timeline-column">
+              <div class="drill-timeline-header">
+                <div>
+                  <span>演练记录</span>
+                  <strong>时间轴</strong>
+                </div>
+                <div class="drill-timeline-actions">
+                  <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
+                  <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">折叠</button>
+                </div>
+              </div>
+              <div class="drill-timeline-summary">
+                <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
+                <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
+                <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
+              </div>
+              <div v-if="!drillTimeline.length" class="drill-timeline-empty">
+                点击“演练”后，这里会记录移动、到达点位和播报内容。
+              </div>
+              <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
+                <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
+                  <div class="timeline-node"></div>
+                  <div class="timeline-content">
+                    <div class="timeline-time">
+                      <span>{{ formatDrillClock(event.occurredAt) }}</span>
+                      <em>+{{ formatDrillElapsed(event.elapsedSeconds) }}</em>
+                    </div>
+                    <strong>{{ event.title }}</strong>
+                    <p v-if="event.detail">{{ event.detail }}</p>
+                    <div class="timeline-meta">
+                      <span v-if="event.pointName">📍 {{ event.pointName }}</span>
+                      <span v-if="event.speed !== undefined">速度 {{ Number(event.speed).toFixed(2) }} m/s</span>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </aside>
+
+            <button
+              v-if="!drillTimelineOpen && (drillRunning || drillTimeline.length)"
+              type="button"
+              class="btn btn-sm drill-timeline-reopen"
+              @click="drillTimelineOpen = true"
+            >
+              显示演练记录
+            </button>
           </div>
 
           <div class="panel-section route-step-panel route-step-4">
@@ -2097,7 +2234,7 @@ async function handleDeleteRoute(route) {
               <select class="route-selector" :value="selectedRoute?.id || ''" @change="handleRouteSelect($event.target.value)">
                 <option value="">请选择已保存路线</option>
                 <option v-for="route in routes" :key="route.id" :value="route.id">
-                  {{ route.name }}（{{ route.waypoints.length }} 个途经点）
+                  {{ route.name }}（{{ route.waypoint_count }} 个途经点）
                 </option>
               </select>
               <button type="button" class="route-list-toggle" @click="toggleRouteList">
@@ -2108,23 +2245,11 @@ async function handleDeleteRoute(route) {
               <div v-for="route in routes" :key="route.id" class="route-item" :class="{ active: selectedRoute?.id === route.id }">
                 <div @click="handleLoadRoute(route)">
                   <strong>{{ route.name }}</strong>
-                  <small>{{ route.waypoints.length }} 个途经点</small>
+                  <small>{{ route.waypoint_count }} 个途经点</small>
                 </div>
                 <button class="btn btn-sm btn-danger" @click="handleDeleteRoute(route)">删除</button>
               </div>
             </div>
-              <div v-if="selectedRoute" class="route-preview-actions">
-                <button
-                  class="btn drill-btn route-preview-btn"
-                  :disabled="routeExecuteBusy || navStatus?.connection_status !== 'online' || !navStatus?.status?.nav_ready"
-                  @click="handleExecuteRoute"
-                >
-                  {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
-                </button>
-                <small class="route-preview-note">
-                  {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
-                </small>
-              </div>
             </div>
           </div>
 
@@ -2409,58 +2534,11 @@ async function handleDeleteRoute(route) {
 
           </div>
 
-          <button
-            v-if="!drillTimelineOpen && (drillRunning || drillTimeline.length)"
-            type="button"
-            class="btn btn-sm drill-timeline-reopen"
-            @click="drillTimelineOpen = true"
-          >
-            显示演练记录
-          </button>
-
           <div v-if="drillMessage" class="drill-status" :class="{ active: drillRunning }">
             <span class="drill-status-dot"></span>
             {{ drillMessage }}
           </div>
         </div>
-
-        <aside v-if="drillTimelineOpen" class="drill-timeline-panel route-timeline-column">
-          <div class="drill-timeline-header">
-            <div>
-              <span>演练记录</span>
-              <strong>时间轴</strong>
-            </div>
-            <div class="drill-timeline-actions">
-              <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
-              <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">折叠</button>
-            </div>
-          </div>
-          <div class="drill-timeline-summary">
-            <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
-            <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
-            <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
-          </div>
-          <div v-if="!drillTimeline.length" class="drill-timeline-empty">
-            点击“演练”后，这里会记录移动、到达点位和播报内容。
-          </div>
-          <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
-            <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
-              <div class="timeline-node"></div>
-              <div class="timeline-content">
-                <div class="timeline-time">
-                  <span>{{ formatDrillClock(event.occurredAt) }}</span>
-                  <em>+{{ formatDrillElapsed(event.elapsedSeconds) }}</em>
-                </div>
-                <strong>{{ event.title }}</strong>
-                <p v-if="event.detail">{{ event.detail }}</p>
-                <div class="timeline-meta">
-                  <span v-if="event.pointName">📍 {{ event.pointName }}</span>
-                  <span v-if="event.speed !== undefined">速度 {{ Number(event.speed).toFixed(2) }} m/s</span>
-                </div>
-              </div>
-            </article>
-          </div>
-        </aside>
       </div>
     </section>
   </section>
@@ -2514,7 +2592,7 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
-  grid-template-rows: auto minmax(620px, auto) auto auto;
+  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto;
   column-gap: 1rem;
   row-gap: 0.45rem;
   height: auto;
@@ -2531,9 +2609,22 @@ async function handleDeleteRoute(route) {
   display: contents;
 }
 
+.route-waypoint-column {
+  display: flex;
+  grid-column: 4;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  gap: 0.45rem;
+  overflow: hidden;
+}
+
 .route-config-panel {
   grid-column: 2 / span 2;
   grid-row: 1;
+  align-self: stretch;
   min-width: 0;
 }
 
@@ -2606,11 +2697,31 @@ async function handleDeleteRoute(route) {
   grid-column: 4;
   grid-row: 1;
   min-width: 0;
-  align-items: center;
-  justify-content: center;
+  align-self: stretch;
+  align-items: stretch;
+  justify-content: stretch;
   gap: 0.65rem;
   flex-direction: column;
   text-align: center;
+}
+
+.route-drill-actions {
+  display: flex;
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.route-drill-actions > .drill-btn {
+  min-height: 52px;
+  flex: 1 1 0;
+}
+
+.route-drill-actions .route-preview-actions {
+  min-height: 78px;
+  flex: 1 1 0;
 }
 
 .route-drill-panel .drill-btn {
@@ -2635,11 +2746,12 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-3 {
-  grid-column: 4;
-  grid-row: 2;
   align-self: stretch;
+  min-height: 0;
   height: auto;
+  flex: 0 0 50%;
   max-height: none;
+  overflow: hidden;
 }
 
 .route-step-4 {
@@ -2650,7 +2762,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-5 {
   grid-column: 1 / -1;
-  grid-row: 4;
+  grid-row: 3;
   align-self: start;
   overflow: visible;
 }
@@ -2706,15 +2818,21 @@ async function handleDeleteRoute(route) {
   display: flex;
   flex: 1;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .route-step-3 .waypoint-list {
   height: auto;
-  flex: 0 0 60%;
-  height: 60%;
+  flex: 1 1 auto;
   min-height: 0;
-  max-height: 60%;
+  max-height: none;
   overflow-y: auto;
+}
+
+.route-step-3 .route-description-under-waypoints {
+  margin-top: auto;
+  margin-bottom: 0;
 }
 
 .route-select-content {
@@ -3287,9 +3405,16 @@ async function handleDeleteRoute(route) {
 
 .route-preview-actions {
   display: flex;
-  align-items: center;
+  min-height: 0;
+  align-items: stretch;
   gap: 0.65rem;
-  margin-top: 0.35rem;
+  flex-direction: column;
+  margin-top: 0;
+}
+
+.route-preview-actions .route-preview-btn {
+  min-height: 52px;
+  flex: 1 1 auto;
 }
 
 .route-preview-note {
@@ -3430,10 +3555,10 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
-  grid-column: 4;
-  grid-row: 3;
   min-width: 0;
-  max-height: calc(100vh - 285px);
+  min-height: 0;
+  max-height: none;
+  flex: 1 1 50%;
   padding: 0.85rem;
   border: 1px solid #fed7aa;
   border-radius: 12px;
@@ -3508,7 +3633,8 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-empty {
   display: grid;
-  min-height: 180px;
+  min-height: 0;
+  flex: 1 1 auto;
   padding: 1rem;
   place-items: center;
   color: #9a6b53;
@@ -3519,6 +3645,7 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-list {
   min-height: 0;
+  flex: 1 1 auto;
   margin-top: 0.75rem;
   padding: 0 0.2rem 0 0.1rem;
   overflow-y: auto;
@@ -4106,21 +4233,42 @@ async function handleDeleteRoute(route) {
     overflow: visible;
   }
 
+  .route-waypoint-column {
+    grid-column: 1;
+    grid-row: auto;
+    height: auto;
+    overflow: visible;
+  }
+
+  .route-waypoint-column .route-step-3 {
+    flex: 0 0 auto;
+  }
+
   .route-step-content {
     overflow: visible;
   }
 
   .route-step-panel,
   .route-config-panel,
-  .route-drill-panel,
-  .route-step-5,
-  .map-preview-area,
-  .route-timeline-column {
+    .route-drill-panel,
+    .route-step-5,
+    .map-preview-area,
+    .route-timeline-column {
     grid-column: 1;
     grid-row: auto;
   }
 
   .route-step-3 {
+    max-height: none;
+  }
+
+  .route-step-3 .route-step-content {
+    overflow: visible;
+  }
+
+  .route-step-3 .waypoint-list {
+    flex: 0 0 auto;
+    height: auto;
     max-height: none;
   }
 
@@ -4133,6 +4281,7 @@ async function handleDeleteRoute(route) {
   }
 
   .drill-timeline-panel {
+    flex: 0 0 auto;
     max-height: 420px;
   }
 

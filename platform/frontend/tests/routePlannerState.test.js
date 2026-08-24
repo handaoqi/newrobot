@@ -6,10 +6,14 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   normalizeHeadingDegrees,
+  normalizeRoutePlannerTelemetry,
   normalizeRtkQuality,
   paginateKeyframes,
   resolveMapClickAction,
+  rtkFixStatusLabel,
+  rtkPositionTypeLabel,
   rtkQualityLabel,
+  rtkSolutionStatusLabel,
 } from '../src/services/routePlannerState.js'
 
 test('heading input is normalized and converted only when valid', () => {
@@ -58,4 +62,29 @@ test('RTK quality aliases normalize to one route-planner enum', () => {
   assert.equal(rtkQualityLabel('rtk_fixed'), '固定解')
   assert.equal(rtkQualityLabel('float'), '浮点解')
   assert.equal(rtkQualityLabel(null), '无数据')
+})
+
+test('RTK position and solution codes retain numeric values and expose confirmed meanings', () => {
+  assert.equal(rtkPositionTypeLabel(0), '无定位（码 0）')
+  assert.equal(rtkPositionTypeLabel(48), 'RTK固定类型（码 48）')
+  assert.equal(rtkPositionTypeLabel(17), 'RTK浮点类型（码 17）')
+  assert.equal(rtkPositionTypeLabel(99), '未知类型（码 99）')
+  assert.equal(rtkSolutionStatusLabel(0), '解算成功（码 0）')
+  assert.equal(rtkSolutionStatusLabel(2), '解算未通过（码 2）')
+  assert.equal(rtkFixStatusLabel(-1), '无定位（码 -1）')
+  assert.equal(rtkFixStatusLabel(2), 'GBAS差分定位（RTK固定映射）（码 2）')
+})
+
+test('route planner telemetry normalizes nested and raw RTK payloads', () => {
+  const telemetry = normalizeRoutePlannerTelemetry({
+    localization: {
+      sensors: { imu: { online: true } },
+      raw_rtk: { position_type: 48, solution_status: 0 },
+    },
+    sensors: { rtk: { online: true, sample_age_seconds: 0.2 } },
+  })
+  assert.equal(telemetry.sensors.imu.online, true)
+  assert.equal(telemetry.rtk.online, true)
+  assert.equal(telemetry.rawRtk.position_type, 48)
+  assert.equal(telemetry.rawRtk.solution_status, 0)
 })

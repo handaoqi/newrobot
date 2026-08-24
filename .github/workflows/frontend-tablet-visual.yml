@@ -1,0 +1,56 @@
+name: Frontend tablet visual checks
+
+on:
+  pull_request:
+    paths:
+      - 'platform/frontend/**'
+      - '.github/workflows/frontend-tablet-visual.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'platform/frontend/**'
+      - '.github/workflows/frontend-tablet-visual.yml'
+
+jobs:
+  tablet-portrait:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform/frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: platform/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install tablet browser engines
+        run: npx playwright install --with-deps chromium webkit
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run tablet portrait checks
+        run: npm run test:tablet
+
+      - name: Upload tablet reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-tablet-visual-report
+          path: |
+            platform/frontend/test-results/tablet
+            platform/frontend/playwright-report/tablet
+          if-no-files-found: ignore
+          retention-days: 14

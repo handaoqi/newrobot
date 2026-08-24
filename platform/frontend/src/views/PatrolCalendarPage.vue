@@ -12,7 +12,7 @@ import {
   fetchPatrolSchedules,
   fetchPatrolTasks,
   fetchRobots,
-  fetchRoutes,
+  fetchRouteSummaries,
   fetchScheduleRuns,
   runPatrolScheduleNow,
   setPatrolScheduleEnabled,
@@ -179,7 +179,7 @@ async function loadAll() {
     ;[robots.value, tasks.value, routes.value, schedules.value, calendarDays.value, calendar.value, scheduleRuns.value] = await Promise.all([
       fetchRobots(),
       fetchPatrolTasks(),
-      fetchRoutes(),
+      fetchRouteSummaries(),
       fetchPatrolSchedules({ robot: selectedRobot.value }),
       fetchCalendarDays(),
       fetchPatrolCalendar(params),

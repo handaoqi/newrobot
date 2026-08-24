@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { createAsyncPoller, useAsyncPoller } from '../composables/useAsyncPoller'
 
 import AppToast from '../components/AppToast.vue'
-import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
+import { useSharedVideoStream } from '../composables/useSharedVideoStream'
 import { useToast } from '../composables/useToast'
 import {
   fetchRobotDetail,
@@ -17,7 +18,8 @@ import {
 const robots = ref([])
 const selectedRobot = ref(null)
 const liveStatus = ref(null)
-const loading = ref(true)
+const robotListLoading = ref(true)
+const robotListError = ref('')
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const streamUnavailable = ref(false)
@@ -30,9 +32,9 @@ const followActive = ref(false)
 const followStatus = ref('等待选择人员')
 const personDetectionChanging = ref(false)
 
-let statusTimer = null
-let personDetectionTimer = null
-let followTimer = null
+const statusPoller = useAsyncPoller((signal) => refreshStatus({ signal }), { intervalMs: 1_000 })
+const personDetectionPoller = useAsyncPoller((signal) => refreshPersonDetections({ signal }), { intervalMs: 350 })
+const followPoller = createAsyncPoller(() => followControlTick(), { intervalMs: 400 })
 let followCommandInFlight = false
 let targetLostSince = 0
 let holdTimer = null
@@ -42,6 +44,8 @@ let holdTarget = null
 let holdInFlight = false
 let holdPromise = null
 let statusRefreshing = false
+let robotLoadController = null
+let robotListLoadVersion = 0
 
 const HOLD_REPEAT_MS = 150
 const SPEED_MODES = [
@@ -63,10 +67,23 @@ const KEY_ACTIONS = {
   e: 'turn_right',
 }
 const { toastMessage, toastVariant, visible, showToast } = useToast()
+const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 
 const selectedRobotId = computed(() => selectedRobot.value?.id || '')
 const livePlayUrls = computed(() => selectedRobot.value?.play_urls || {})
-const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const liveSourceKey = computed(() => `${selectedRobot.value?.id || ''}\n${livePlayUrls.value.flv || ''}\n${livePlayUrls.value.hls || ''}`)
+const hasLiveStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+
+function syncSharedVideoSource() {
+  const urls = livePlayUrls.value
+  if (!selectedRobot.value?.id && !urls.flv && !urls.hls) return
+  setSharedVideoSource({
+    playUrls: urls,
+    robotId: selectedRobot.value?.id,
+    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
+    loading: !Boolean(urls.flv || urls.hls),
+  })
+}
 const status = computed(() => liveStatus.value?.status || {})
 const localizationQuality = computed(() => status.value?.localization_quality || {})
 const localizationDecision = computed(() => localizationQuality.value?.decision || {})
@@ -82,10 +99,6 @@ const personDetections = computed(() => (personDetectionState.value?.detections 
 ))
 const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
 const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
-
-function showVideoNotice({ message, variant }) {
-  showToast(message, variant ? { variant } : undefined)
-}
 
 const motionActions = computed(() => [
   { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.60) } },
@@ -217,10 +230,10 @@ async function sendStop(source = 'remote_control_stop') {
   }
 }
 
-async function refreshPersonDetections() {
+async function refreshPersonDetections({ signal } = {}) {
   if (!selectedRobot.value?.id) return
   try {
-    personDetectionState.value = await fetchRobotPersonDetections(selectedRobot.value.id)
+    personDetectionState.value = await fetchRobotPersonDetections(selectedRobot.value.id, { signal })
   } catch {
     personDetectionState.value = { detections: [] }
   }
@@ -317,7 +330,7 @@ async function startFollowing() {
     targetLostSince = 0
     followStatus.value = '跟随已启动'
     await followControlTick()
-    followTimer = window.setInterval(followControlTick, 400)
+    followPoller.start()
     showToast('人员跟随已启动，请保持现场通道畅通')
   } catch (error) {
     followStatus.value = error.message || '启动跟随失败'
@@ -330,8 +343,7 @@ async function startFollowing() {
 async function stopFollowing(message = '跟随已停止') {
   const wasActive = followActive.value
   followActive.value = false
-  window.clearInterval(followTimer)
-  followTimer = null
+  followPoller.stop()
   targetLostSince = 0
   followStatus.value = message
   if (wasActive) await sendStop('person_follow_stop')
@@ -436,35 +448,66 @@ async function stopHoldAction(event = null) {
 async function chooseRobot(robotId) {
   if (!robotId || switchingRobot.value || selectedRobot.value?.id === robotId) return
   switchingRobot.value = true
+  robotLoadController?.abort()
+  robotLoadController = new AbortController()
+  const { signal } = robotLoadController
   try {
     await stopHoldAction()
     await stopFollowing('已切换设备')
     if (personDetectionEnabled.value && selectedRobot.value?.id) {
       await setRobotPersonDetection(selectedRobot.value.id, false).catch(() => {})
     }
-    selectedRobot.value = await fetchRobotDetail(robotId)
+    const listRobot = robots.value.find((robot) => String(robot.id) === String(robotId))
+    selectedRobot.value = listRobot || { id: robotId }
+    liveStatus.value = null
+    personDetectionState.value = { detections: [] }
     streamUnavailable.value = false
-    await refreshStatus()
-    await refreshPersonDetections()
+    const [detailResult, statusResult, detectionResult] = await Promise.allSettled([
+      fetchRobotDetail(robotId, { signal }),
+      fetchRobotStatus(robotId, { signal }),
+      fetchRobotPersonDetections(robotId, { signal }),
+    ])
+    if (detailResult.status === 'fulfilled') selectedRobot.value = detailResult.value
+    if (statusResult.status === 'fulfilled') liveStatus.value = statusResult.value
+    if (detectionResult.status === 'fulfilled') personDetectionState.value = detectionResult.value
+    const firstError = [detailResult, statusResult, detectionResult]
+      .find((result) => result.status === 'rejected' && result.reason?.name !== 'AbortError')
+    if (firstError) throw firstError.reason
   } catch (error) {
-    showToast(error.message || '切换设备失败')
+    if (error?.name !== 'AbortError') showToast(error.message || '切换设备失败')
   } finally {
-    switchingRobot.value = false
+    if (robotLoadController?.signal === signal) {
+      switchingRobot.value = false
+      robotLoadController = null
+    }
   }
 }
 
-async function refreshStatus() {
+async function refreshStatus({ signal } = {}) {
   if (!selectedRobot.value?.id || statusRefreshing) return
   statusRefreshing = true
   try {
-    liveStatus.value = await fetchRobotStatus(selectedRobot.value.id)
+    liveStatus.value = await fetchRobotStatus(selectedRobot.value.id, { signal })
   } catch {} finally {
     statusRefreshing = false
   }
 }
 
-function fallbackToSnapshot() {
-  streamUnavailable.value = true
+async function loadRobotList({ force = false } = {}) {
+  const version = ++robotListLoadVersion
+  robotListLoading.value = true
+  robotListError.value = ''
+  try {
+    const result = await fetchRobots({ force })
+    if (version !== robotListLoadVersion) return
+    robots.value = Array.isArray(result) ? result : []
+    if (robots.value[0]?.id) void chooseRobot(robots.value[0].id)
+  } catch (error) {
+    if (version !== robotListLoadVersion) return
+    robotListError.value = error?.message || '设备列表加载失败'
+  } finally {
+    if (version === robotListLoadVersion) robotListLoading.value = false
+  }
 }
 
 function handleKeyDown(event) {
@@ -492,7 +535,7 @@ function preventRemoteGesture(event) {
   }
 }
 
-onMounted(async () => {
+onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
   window.addEventListener('keyup', handleKeyUp)
   window.addEventListener('blur', stopHoldAction)
@@ -500,14 +543,10 @@ onMounted(async () => {
   document.addEventListener('contextmenu', preventRemoteGesture, { capture: true })
   document.addEventListener('selectstart', preventRemoteGesture, { capture: true })
   document.addEventListener('dragstart', preventRemoteGesture, { capture: true })
-  try {
-    robots.value = await fetchRobots()
-    if (robots.value[0]?.id) await chooseRobot(robots.value[0].id)
-    statusTimer = window.setInterval(refreshStatus, 1000)
-    personDetectionTimer = window.setInterval(refreshPersonDetections, 350)
-  } finally {
-    loading.value = false
-  }
+  // Render the control shell immediately. Device discovery is independent of
+  // the page layout, and must not leave the whole remote-control page blank
+  // while the cloud request is waiting on a slow network.
+  void loadRobotList()
 })
 
 onBeforeUnmount(async () => {
@@ -518,19 +557,24 @@ onBeforeUnmount(async () => {
   document.removeEventListener('contextmenu', preventRemoteGesture, { capture: true })
   document.removeEventListener('selectstart', preventRemoteGesture, { capture: true })
   document.removeEventListener('dragstart', preventRemoteGesture, { capture: true })
-  window.clearInterval(statusTimer)
-  window.clearInterval(personDetectionTimer)
+  statusPoller.stop()
+  personDetectionPoller.stop()
+  followPoller.stop()
+  robotListLoadVersion += 1
+  robotLoadController?.abort()
+  robotLoadController = null
   await stopFollowing('页面关闭，跟随已停止')
   await stopHoldAction()
 })
 
-watch(livePlayUrls, () => {
+watch(liveSourceKey, () => {
   streamUnavailable.value = false
+  syncSharedVideoSource()
 })
 </script>
 
 <template>
-  <section v-if="!loading" class="remote-control-page">
+  <section class="remote-control-page">
     <div class="remote-main">
       <section class="panel remote-video-panel">
         <div class="panel-head">
@@ -544,38 +588,27 @@ watch(livePlayUrls, () => {
         </div>
 
         <div class="remote-video-stage">
-          <LiveVideoPlayer
-            :play-urls="livePlayUrls"
-            :robot-id="selectedRobot?.id"
-            :available="hasLiveStream"
-            @notice="showVideoNotice"
-            @stream-error="fallbackToSnapshot"
+          <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
+          <div v-if="!hasLiveStream" class="remote-video-source remote-no-signal">
+            <strong>无视频流</strong>
+            <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
+          </div>
+          <button
+            v-for="person in personDetections"
+            :key="person.track_id"
+            type="button"
+            class="person-detection-box"
+            :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
+            :style="detectionStyle(person)"
+            :disabled="followActive"
+            @click="selectPerson(person)"
           >
-            <template #empty>
-              <div class="remote-video-source remote-no-signal">
-                <strong>无视频流</strong>
-                <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
-              </div>
-            </template>
-            <template #overlay>
-              <button
-                v-for="person in personDetections"
-                :key="person.track_id"
-                type="button"
-                class="person-detection-box"
-                :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
-                :style="detectionStyle(person)"
-                :disabled="followActive"
-                @click="selectPerson(person)"
-              >
-                <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
-              </button>
-              <div class="remote-video-overlay">
-                <span>{{ selectedRobot?.code || '--' }}</span>
-                <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
-              </div>
-            </template>
-          </LiveVideoPlayer>
+            <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
+          </button>
+          <div class="remote-video-overlay">
+            <span>{{ selectedRobot?.code || '--' }}</span>
+            <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
+          </div>
         </div>
         <div class="person-follow-toolbar">
           <div>
@@ -684,7 +717,13 @@ watch(livePlayUrls, () => {
             <p>{{ switchingRobot ? '正在切换设备...' : '切换后可直接发送遥控器指令' }}</p>
           </div>
         </div>
-        <div class="robot-list compact">
+        <div v-if="robotListLoading" class="remote-list-state">正在加载设备列表…</div>
+        <div v-else-if="robotListError" class="remote-list-state remote-list-error">
+          <span>{{ robotListError }}</span>
+          <button type="button" class="ghost-btn" @click="loadRobotList({ force: true })">重试</button>
+        </div>
+        <div v-else-if="!robots.length" class="remote-list-state">暂无可用机器人</div>
+        <div v-else class="robot-list compact">
           <button
             v-for="robot in robots"
             :key="robot.id"
@@ -1225,6 +1264,23 @@ watch(livePlayUrls, () => {
   white-space: nowrap;
 }
 
+.remote-list-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 72px;
+  padding: 14px;
+  border-radius: 12px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 13px;
+}
+
+.remote-list-error {
+  color: var(--danger, #d14b4b);
+}
+
 .robot-list.compact {
   display: grid;
   gap: 12px;
@@ -1242,6 +1298,27 @@ watch(livePlayUrls, () => {
     width: min(180px, 100%);
     justify-self: center;
   }
+}
+
+@media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
+  .remote-control-page,
+  .remote-main,
+  .remote-side,
+  .remote-console {
+    min-width: 0;
+  }
+
+  .remote-main,
+  .remote-side { gap: 18px; }
+
+  .person-follow-toolbar { grid-template-columns: minmax(0, 1fr); }
+
+  .person-follow-toolbar button,
+  .speed-mode-button,
+  .remote-actions button,
+  .remote-stop { min-height: 44px; }
+
+  .remote-status-grid div { min-width: 0; }
 }
 
 @media (max-width: 720px) {

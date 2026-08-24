@@ -1,5 +1,5 @@
-<script setup>import { onMounted, ref, computed } from 'vue';
-import { fetchMaps, fetchTracks, fetchRoutes, deleteTrack } from '../services/api';
+<script setup>import { onBeforeUnmount, onMounted, ref, computed } from 'vue';
+import { fetchMapSummaries, fetchTrackDetail, fetchTrackSummaries, fetchRouteSummaries, deleteTrack } from '../services/api';
 const maps = ref([]);
 const tracks = ref([]);
 const routes = ref([]);
@@ -8,6 +8,8 @@ const playing = ref(false);
 const playbackProgress = ref(0);
 const currentPositionIndex = ref(0);
 let playbackInterval = null;
+let pageController = null;
+let trackController = null;
 const routeMap = computed(() => {
  const map = {};
  routes.value.forEach(r => {
@@ -16,16 +18,19 @@ const routeMap = computed(() => {
  return map;
 });
 onMounted(async () => {
- await loadData();
+ pageController = new AbortController();
+ await loadData(pageController.signal);
 });
-async function loadData() {
+async function loadData(signal) {
  try {
- maps.value = await fetchMaps();
- tracks.value = await fetchTracks();
- routes.value = await fetchRoutes();
+ [maps.value, tracks.value, routes.value] = await Promise.all([
+ fetchMapSummaries({ signal }),
+ fetchTrackSummaries({ signal }),
+ fetchRouteSummaries({ signal }),
+ ]);
  }
  catch (error) {
- console.error('加载数据失败:', error);
+ if (error?.name !== 'AbortError') console.error('加载数据失败:', error);
  }
 }
 function getMapName(mapId) {
@@ -42,14 +47,31 @@ function formatDuration(seconds) {
 function formatDistance(meters) {
  return meters.toFixed(2) + ' 米';
 }
-function selectTrack(track) {
- selectedTrack.value = track;
+async function selectTrack(track) {
+ stopPlayback();
+ trackController?.abort();
+ trackController = new AbortController();
+ selectedTrack.value = { ...track, path: null };
+ try {
+ const detail = await fetchTrackDetail(track.id, { signal: trackController.signal });
+ if (selectedTrack.value?.id === track.id) selectedTrack.value = detail;
+ } catch (error) {
+ if (error?.name !== 'AbortError') {
+ console.error('加载轨迹详情失败:', error);
+ if (selectedTrack.value?.id === track.id) selectedTrack.value = track;
+ }
+ }
  playbackProgress.value = 0;
  currentPositionIndex.value = 0;
- stopPlayback();
 }
+
+onBeforeUnmount(() => {
+ stopPlayback();
+ pageController?.abort();
+ trackController?.abort();
+});
 function startPlayback() {
- if (!selectedTrack.value || !selectedTrack.value.path.length)
+ if (!selectedTrack.value || !Array.isArray(selectedTrack.value.path) || !selectedTrack.value.path.length)
  return;
  playing.value = true;
  const totalPoints = selectedTrack.value.path.length;

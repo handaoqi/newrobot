@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { fetchMaps, fetchZones, createZone, updateZone, deleteZone } from '../services/api'
+import { fetchMapSummaries, fetchZones, createZone, updateZone, deleteZone } from '../services/api'
 
 const maps = ref([])
 const zones = ref([])
@@ -29,7 +29,7 @@ onMounted(async () => {
 
 async function loadData() {
   try {
-    maps.value = await fetchMaps()
+    maps.value = await fetchMapSummaries()
     zones.value = await fetchZones()
   } catch (error) {
     console.error('加载数据失败:', error)

@@ -1,21 +1,22 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import DashboardLayout from '../views/DashboardLayout.vue'
-import AnalyticsPage from '../views/AnalyticsPage.vue'
-import DashboardOverview from '../views/DashboardOverview.vue'
-import EventsPage from '../views/EventsPage.vue'
-import GuardDutyPage from '../views/GuardDutyPage.vue'
-import LoginPage from '../views/LoginPage.vue'
-import RemoteControlPage from '../views/RemoteControlPage.vue'
-import RobotsPage from '../views/RobotsPage.vue'
-import TasksPage from '../views/TasksPage.vue'
-import TaskExecutionPage from '../views/TaskExecutionPage.vue'
-import PatrolCalendarPage from '../views/PatrolCalendarPage.vue'
-import MapsPage from '../views/MapsPage.vue'
-import RoutePlannerPage from '../views/RoutePlannerPage.vue'
-import ZoneManagerPage from '../views/ZoneManagerPage.vue'
-import TrackPlaybackPage from '../views/TrackPlaybackPage.vue'
-import RemoteDevelopmentPage from '../views/RemoteDevelopmentPage.vue'
+
+const AnalyticsPage = () => import('../views/AnalyticsPage.vue')
+const DashboardOverview = () => import('../views/DashboardOverview.vue')
+const EventsPage = () => import('../views/EventsPage.vue')
+const GuardDutyPage = () => import('../views/GuardDutyPage.vue')
+const LoginPage = () => import('../views/LoginPage.vue')
+const RemoteControlPage = () => import('../views/RemoteControlPage.vue')
+const RobotsPage = () => import('../views/RobotsPage.vue')
+const TasksPage = () => import('../views/TasksPage.vue')
+const TaskExecutionPage = () => import('../views/TaskExecutionPage.vue')
+const PatrolCalendarPage = () => import('../views/PatrolCalendarPage.vue')
+const MapsPage = () => import('../views/MapsPage.vue')
+const RoutePlannerPage = () => import('../views/RoutePlannerPage.vue')
+const ZoneManagerPage = () => import('../views/ZoneManagerPage.vue')
+const TrackPlaybackPage = () => import('../views/TrackPlaybackPage.vue')
+const RemoteDevelopmentPage = () => import('../views/RemoteDevelopmentPage.vue')
 
 const routes = [
   { path: '/', redirect: '/dashboard/overview' },

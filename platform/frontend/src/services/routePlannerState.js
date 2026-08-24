@@ -33,6 +33,66 @@ export function rtkQualityLabel(value) {
   return quality ? RTK_QUALITY_LABELS[quality] : '无数据'
 }
 
+/**
+ * Decode the RTK solution status exposed by UniBestNav.p_sol_status.
+ * The controller only treats 0 as a successful solution; other protocol
+ * values are intentionally kept as unknown failure codes.
+ */
+export function rtkSolutionStatusLabel(value) {
+  const code = Number(value)
+  if (!Number.isFinite(code)) return '未上报'
+  return code === 0 ? `解算成功（码 ${code}）` : `解算未通过（码 ${code}）`
+}
+
+/** Decode sensor_msgs/NavSatFix.status.status used by /fix. */
+export function rtkFixStatusLabel(value) {
+  const code = Number(value)
+  const labels = {
+    '-1': '无定位',
+    0: '有效单点定位',
+    1: 'SBAS增强定位（RTK浮点映射）',
+    2: 'GBAS差分定位（RTK固定映射）',
+  }
+  if (!Number.isFinite(code)) return '未上报'
+  return `${labels[code] || '未知状态'}（码 ${code}）`
+}
+
+/**
+ * Decode the NovAtel-compatible position-type groups configured by the RTK
+ * bridge. Keep the numeric code visible because the protocol does not expose
+ * a complete enum description in the ROS message.
+ */
+export function rtkPositionTypeLabel(value) {
+  const code = Number(value)
+  if (!Number.isFinite(code)) return '未上报'
+  if (code === 0) return `无定位（码 ${code}）`
+  if ([48, 49, 50].includes(code)) return `RTK固定类型（码 ${code}）`
+  if ([17, 18, 32, 33, 34].includes(code)) return `RTK浮点类型（码 ${code}）`
+  return `未知类型（码 ${code}）`
+}
+
+export function normalizeRoutePlannerTelemetry(status = {}) {
+  const root = status?.status && typeof status.status === 'object' ? status.status : status
+  const localization = root?.localization && typeof root.localization === 'object'
+    ? root.localization
+    : {}
+  const rootSensors = root?.sensors && typeof root.sensors === 'object' ? root.sensors : {}
+  const localizationSensors = localization?.sensors && typeof localization.sensors === 'object'
+    ? localization.sensors
+    : {}
+  const sensorRtk = rootSensors.rtk || localizationSensors.rtk || {}
+  const rawSource = root?.raw_rtk || localization?.raw_rtk || sensorRtk?.raw_rtk || {}
+  const rawRtk = { ...sensorRtk, ...(rawSource || {}) }
+  const sensors = { ...localizationSensors, ...rootSensors }
+  if (Object.keys(rawRtk).length > 0 && !sensors.rtk) sensors.rtk = rawRtk
+  return {
+    sensors,
+    rtk: sensors.rtk || rawRtk,
+    rawRtk,
+    timeDiagnostics: root?.time_diagnostics || localization?.time_diagnostics || {},
+  }
+}
+
 export function normalizeHeadingDegrees(value) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return null

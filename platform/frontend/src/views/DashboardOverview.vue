@@ -1,10 +1,9 @@
 <script setup>
-import Hls from 'hls.js'
-import mpegts from 'mpegts.js'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useAsyncPoller } from '../composables/useAsyncPoller'
 
 import AppToast from '../components/AppToast.vue'
-import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
+import { useSharedVideoStream } from '../composables/useSharedVideoStream'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -53,7 +52,6 @@ const selectedRobot = ref(null)
 const loading = ref(false)
 const dataLoading = ref(true)
 const loadError = ref('')
-const videoLoading = ref(true)
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
@@ -81,13 +79,9 @@ const recordingTitle = ref('现场录音')
 const recordingCategoryId = ref(null)
 const savedRecordings = ref([])
 const recordingSaving = ref(false)
-const videoRef = ref(null)
 const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
 const liveDetectionState = ref({ detections: [] })
-let flvPlayer = null
-let hlsPlayer = null
-let liveGuardTimer = null
 let alertEventSource = null
 let holdTimer = null
 let holdAction = null
@@ -101,15 +95,14 @@ let recordingTimer = null
 let recordingStream = null
 let recordedChunks = []
 let previewPlayer = null
-let audioStatusTimer = null
-let liveDetectionTimer = null
 const realtimeEventIds = new Set()
 const HOLD_REPEAT_MS = 300
 const AUDIO_COMMAND_COOLDOWN_MS = 3000
+
 const { toastMessage, toastVariant, visible, showToast } = useToast()
+const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
-const streamConnectTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
 const speaker3588Status = computed(() => robotAudioStatus.value?.speaker_3588 || null)
 const speakerNxStatus = computed(() => robotAudioStatus.value?.speaker_nx || null)
@@ -127,7 +120,19 @@ const filteredSpeechItems = computed(() => {
 const selectedSourceType = computed(() => selectedRecordingId.value ? 'recording' : 'tts')
 const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
-const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const liveSourceKey = computed(() => `${latestRobot.value?.id || ''}\n${livePlayUrls.value.flv || ''}\n${livePlayUrls.value.hls || ''}`)
+const hasLiveStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+
+function syncSharedVideoSource() {
+  const urls = livePlayUrls.value
+  if (!latestRobot.value?.id && !urls.flv && !urls.hls) return
+  setSharedVideoSource({
+    playUrls: urls,
+    robotId: latestRobot.value?.id,
+    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
+    loading: !Boolean(urls.flv || urls.hls),
+  })
+}
 const bicycleDetections = computed(() => (liveDetectionState.value?.detections || []).filter((item) =>
   ['bicycle', 'bike', '自行车'].includes(String(item.label || '').toLowerCase()),
 ))
@@ -170,14 +175,14 @@ function formatEventTime(value) {
   })
 }
 
-async function refreshLiveDetections() {
+async function refreshLiveDetections({ signal } = {}) {
   const robotId = latestRobot.value?.id
   if (!robotId) {
     liveDetectionState.value = { detections: [] }
     return
   }
   try {
-    const state = await fetchRobotPersonDetections(robotId)
+    const state = await fetchRobotPersonDetections(robotId, { signal })
     if (latestRobot.value?.id === robotId) liveDetectionState.value = state
   } catch {
     liveDetectionState.value = { detections: [] }
@@ -685,44 +690,6 @@ async function stopHoldAction(event) {
   }
 }
 
-function seekLatestFrame() {
-  const element = videoRef.value
-  if (!element) return
-  const ranges = element.buffered
-  if (ranges?.length) {
-    const liveEnd = ranges.end(ranges.length - 1)
-    if (Number.isFinite(liveEnd) && liveEnd - element.currentTime > 0.8) {
-      element.currentTime = Math.max(0, liveEnd - 0.12)
-    }
-  } else if (Number.isFinite(element.duration) && element.duration > 0 && element.duration - element.currentTime > 0.8) {
-    element.currentTime = Math.max(0, element.duration - 0.12)
-  }
-}
-
-function keepLivePlaying() {
-  const element = videoRef.value
-  if (!element) return
-  element.muted = true
-  element.controls = false
-  seekLatestFrame()
-  if (element.paused) {
-    element.play().catch(() => {})
-  }
-}
-
-function startLiveGuard() {
-  stopLiveGuard()
-  keepLivePlaying()
-  liveGuardTimer = window.setInterval(keepLivePlaying, 800)
-}
-
-function stopLiveGuard() {
-  if (liveGuardTimer) {
-    window.clearInterval(liveGuardTimer)
-    liveGuardTimer = null
-  }
-}
-
 function setupAlertStream() {
   closeAlertStream()
   const token = localStorage.getItem('inspection_token')
@@ -800,7 +767,6 @@ async function enterTakeover() {
     })
     takeoverActive.value = true
     await nextTick()
-    startLiveGuard()
     try {
       await videoStageRef.value?.requestFullscreen?.()
     } catch {}
@@ -833,31 +799,9 @@ async function exitTakeover(options = {}) {
     showToast(error.message || '退出接管失败')
   } finally {
     takeoverActive.value = false
-    stopLiveGuard()
     takeoverExitInFlight = false
   }
   if (!options.skipFullscreen && document.fullscreenElement) {
-    document.exitFullscreen?.().catch(() => {})
-  }
-}
-
-function destroyVideoPlayers() {
-  if (flvPlayer) {
-    flvPlayer.destroy()
-    flvPlayer = null
-  }
-  if (hlsPlayer) {
-    hlsPlayer.destroy()
-    hlsPlayer = null
-  }
-  if (videoRef.value) {
-    videoRef.value.removeAttribute('src')
-    videoRef.value.load()
-  }
-  takeoverActive.value = false
-  void stopHoldAction()
-  stopLiveGuard()
-  if (document.fullscreenElement === videoStageRef.value) {
     document.exitFullscreen?.().catch(() => {})
   }
 }
@@ -880,11 +824,11 @@ async function chooseRobot(robotId, announce = true) {
   }
 }
 
-async function refreshAudioStatus() {
+async function refreshAudioStatus({ signal } = {}) {
   const robotId = latestRobot.value?.id
   if (!robotId) return
   try {
-    const liveStatus = await fetchRobotStatus(robotId)
+    const liveStatus = await fetchRobotStatus(robotId, { signal })
     if (latestRobot.value?.id === robotId) {
       robotAudioStatus.value = liveStatus?.status?.audio || null
     }
@@ -893,99 +837,8 @@ async function refreshAudioStatus() {
   }
 }
 
-function fallbackToSnapshot() {
-  streamUnavailable.value = true
-  videoLoading.value = false
-  destroyVideoPlayers()
-}
-
-async function canReachStream(url) {
-  if (!url) return false
-  const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), streamConnectTimeoutMs)
-  try {
-    await fetch(url, {
-      method: 'GET',
-      mode: 'no-cors',
-      cache: 'no-store',
-      signal: controller.signal,
-    })
-    return true
-  } catch {
-    return false
-  } finally {
-    window.clearTimeout(timeout)
-  }
-}
-
-async function setupLivePlayer() {
-  videoLoading.value = true
-  await nextTick()
-  destroyVideoPlayers()
-  const element = videoRef.value
-  if (!element || !hasLiveStream.value) {
-    videoLoading.value = false
-    return
-  }
-
-  const { flv, hls } = livePlayUrls.value
-  const playableFlv = flv && mpegts.getFeatureList().mseLivePlayback && (await canReachStream(flv))
-  const playableHls = hls && (await canReachStream(hls))
-
-  if (!playableFlv && !playableHls) {
-    fallbackToSnapshot()
-    return
-  }
-
-  try {
-    element.addEventListener('error', fallbackToSnapshot, { once: true })
-  } catch {}
-
-  if (playableFlv) {
-    flvPlayer = mpegts.createPlayer({
-      type: 'flv',
-      isLive: true,
-      url: flv,
-    }, {
-      enableStashBuffer: false,
-      liveBufferLatencyChasing: true,
-    })
-    flvPlayer.on(mpegts.Events.ERROR, fallbackToSnapshot)
-    flvPlayer.attachMediaElement(element)
-    flvPlayer.load()
-    flvPlayer.play().catch(fallbackToSnapshot)
-    startLiveGuard()
-    videoLoading.value = false
-    return
-  }
-
-  if (playableHls && Hls.isSupported()) {
-    hlsPlayer = new Hls({
-      lowLatencyMode: true,
-      liveSyncDurationCount: 1,
-      liveMaxLatencyDurationCount: 2,
-      maxLiveSyncPlaybackRate: 1.5,
-    })
-    hlsPlayer.loadSource(hls)
-    hlsPlayer.attachMedia(element)
-    hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
-      if (data?.fatal) fallbackToSnapshot()
-    })
-    hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
-      element.play().catch(fallbackToSnapshot)
-      startLiveGuard()
-      videoLoading.value = false
-    })
-    return
-  }
-
-  if (playableHls) {
-    element.src = hls
-    element.play().catch(fallbackToSnapshot)
-    startLiveGuard()
-    videoLoading.value = false
-  }
-}
+const audioStatusPoller = useAsyncPoller((signal) => refreshAudioStatus({ signal }), { intervalMs: 5_000 })
+const liveDetectionPoller = useAsyncPoller((signal) => refreshLiveDetections({ signal }), { intervalMs: 400 })
 
 onMounted(async () => {
   document.addEventListener('fullscreenchange', handleFullscreenChange)
@@ -1019,10 +872,7 @@ onMounted(async () => {
     dataLoading.value = false
   }
 
-  setupLivePlayer()
-  audioStatusTimer = window.setInterval(refreshAudioStatus, 5000)
   await refreshLiveDetections()
-  liveDetectionTimer = window.setInterval(refreshLiveDetections, 400)
 })
 
 onBeforeUnmount(() => {
@@ -1036,18 +886,15 @@ onBeforeUnmount(() => {
     previewPlayer.pause()
     previewPlayer = null
   }
-  destroyVideoPlayers()
   closeAlertStream()
-  if (audioStatusTimer) window.clearInterval(audioStatusTimer)
-  if (liveDetectionTimer) window.clearInterval(liveDetectionTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   window.removeEventListener('blur', stopHoldAction)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 
-watch(livePlayUrls, () => {
+watch(liveSourceKey, () => {
   streamUnavailable.value = false
-  setupLivePlayer()
+  syncSharedVideoSource()
 })
 
 function handleFullscreenChange() {
@@ -1085,21 +932,11 @@ function handleVisibilityChange() {
         </div>
 
         <div ref="videoStageRef" class="video-stage">
-          <LiveVideoPlayer
-            :play-urls="livePlayUrls"
-            :robot-id="latestRobot?.id"
-            :available="hasLiveStream"
-            :loading="dataLoading"
-            @notice="({ message, variant }) => showToast(message, variant ? { variant } : undefined)"
-            @stream-error="streamUnavailable = true"
-          >
-            <template #empty>
-              <div class="video-source no-signal" role="img" aria-label="视频无信号">
-                <strong>无信号</strong>
-                <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
-              </div>
-            </template>
-            <template #overlay>
+          <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
+          <div v-if="!hasLiveStream" class="video-source no-signal" role="img" aria-label="视频无信号">
+            <strong>无信号</strong>
+            <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
+          </div>
 
           <div v-if="loadError" class="overview-data-notice" role="alert">{{ loadError }}</div>
 
@@ -1195,9 +1032,6 @@ function handleVisibilityChange() {
               </button>
             </div>
           </div>
-
-            </template>
-          </LiveVideoPlayer>
 
         </div>
 

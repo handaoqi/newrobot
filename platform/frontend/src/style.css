@@ -1298,6 +1298,25 @@ a { color: inherit; }
   position: relative; min-height: 560px; border-radius: 24px; overflow: hidden; border: 1px solid rgba(120, 194, 255, 0.22);
   background: var(--stage-bg);
 }
+.shared-video-slot {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.shared-video-empty {
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  color: #d7e0e6;
+  text-align: center;
+  background: #152633;
+}
+.shared-video-empty span {
+  color: #9fb0ba;
+  font-size: 13px;
+}
 .video-panel.takeover-active {
   position: relative;
   z-index: 100;
@@ -3262,4 +3281,115 @@ a { color: inherit; }
   width: 26px;
   height: 26px;
   font-size: 16px;
+}
+
+/* Tablet portrait workspace: keep controls touchable and let content reflow
+   instead of shrinking the desktop canvas. */
+@media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
+  .dashboard-shell,
+  .page-grid,
+  .data-grid,
+  .analytics-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .main-layout {
+    min-width: 0;
+    padding: 18px;
+  }
+
+  .overview-page {
+    zoom: 1;
+  }
+
+  .login-shell {
+    grid-template-columns: minmax(0, 1fr);
+    align-content: center;
+    justify-items: stretch;
+    gap: 24px;
+    min-height: 100dvh;
+    padding: 32px clamp(32px, 8vw, 72px);
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .login-hero {
+    min-height: auto;
+  }
+
+  .login-copy {
+    max-width: 680px;
+  }
+
+  .login-copy h1 {
+    margin-bottom: 16px;
+    font-size: clamp(40px, 7vw, 58px);
+    word-break: normal;
+  }
+
+  .login-copy h1 span {
+    display: block;
+  }
+
+  .login-copy p {
+    font-size: clamp(16px, 2.4vw, 20px);
+    word-break: normal;
+  }
+
+  .login-panel {
+    justify-content: center;
+  }
+
+  .login-card {
+    width: min(520px, 100%);
+  }
+
+  .top-summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .top-summary .status-pill {
+    display: flex;
+    align-items: center;
+    min-height: 46px;
+    white-space: normal;
+  }
+
+  .top-summary .status-pill:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .panel,
+  .side-panel,
+  .detail-panel,
+  .list-panel,
+  .compact-panel {
+    min-width: 0;
+    padding: 18px;
+    border-radius: 22px;
+  }
+
+  .video-stage {
+    min-height: 0;
+    aspect-ratio: 16 / 9;
+  }
+
+  .video-footer {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .video-footer > *,
+  .video-footer button {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .header-actions button,
+  .main-layout input,
+  .main-layout select,
+  .main-layout textarea {
+    min-height: 44px;
+  }
 }

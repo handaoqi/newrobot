@@ -1,8 +1,10 @@
 <script setup>
-import { nextTick, onBeforeUnmount, onMounted, ref, computed, watch } from 'vue'
+import { nextTick, onMounted, ref, computed, watch } from 'vue'
+import { useAsyncPoller } from '../composables/useAsyncPoller'
 import {
-  fetchMaps,
-  fetchMapSets,
+  fetchMapSummaries,
+  fetchMapSetSummaries,
+  fetchMapDetail,
   fetchMapMappingTrace,
   fetchRobots,
   deleteMap,
@@ -56,6 +58,7 @@ const globalEnuBusy = ref(false)
 let cleanerImage = null
 let activeCleanerStroke = null
 let cleanerPanStart = null
+let mappingStatusRefreshing = false
 
 const mappingForm = ref({
   robot: '',
@@ -88,7 +91,6 @@ function setMappingStepFeedback(step, success, message) {
       : step
   mappingStepFeedback.value = { step: normalizedStep, success, message, at: Date.now() }
 }
-let statusTimer = null
 let lastSlamAlert = ''
 
 watch(() => mappingForm.value.mapping_type, (mappingType) => {
@@ -105,18 +107,15 @@ const uploadForm = ref({
   description: '',
 })
 
+const mappingStatusPoller = useAsyncPoller(async (signal) => {
+  if (mappingForm.value.robot) await refreshMappingStatus({ signal })
+}, { intervalMs: 1_000 })
+
 onMounted(async () => {
   await loadMaps()
   await loadRobots()
   restorePendingMappingResult(mappingForm.value.robot)
   if (mappingForm.value.robot) await refreshMappingStatus()
-  statusTimer = setInterval(() => {
-    if (mappingForm.value.robot) refreshMappingStatus()
-  }, 1000)
-})
-
-onBeforeUnmount(() => {
-  if (statusTimer) clearInterval(statusTimer)
 })
 
 // 预览 URL（用绝对 URL 避免相对路径问题）
@@ -202,7 +201,14 @@ watch(() => mappingForm.value.robot, (robot, previousRobot) => {
   if (String(robot || '') !== String(previousRobot || '')) restorePendingMappingResult(robot)
 })
 
-const selectedMap = computed(() => maps.value.find(m => m.id === selectedMapId.value))
+const selectedMapDetail = ref(null)
+const selectedMap = computed(() => {
+  const summary = maps.value.find(m => m.id === selectedMapId.value)
+  if (!summary) return null
+  return selectedMapDetail.value?.id === summary.id
+    ? { ...summary, ...selectedMapDetail.value }
+    : summary
+})
 const mapGroups = computed(() => {
   const groups = new Map()
   for (const map of maps.value) {
@@ -272,7 +278,10 @@ function ensureMapGroupExpanded(mapId) {
   }
 }
 
-watch(selectedMapId, (mapId) => ensureMapGroupExpanded(mapId))
+watch(selectedMapId, (mapId) => {
+  ensureMapGroupExpanded(mapId)
+  void loadSelectedMapDetail(mapId)
+})
 watch(selectedMapId, (mapId) => loadMappingTrace(mapId), { immediate: true })
 const robotCurrentMap = computed(() => mappingStatus.value?.current_map || {})
 const robotCurrentMapId = computed(() => String(robotCurrentMap.value.map_id || mappingStatus.value?.current_map_id || ''))
@@ -387,20 +396,108 @@ const saveProgress = computed(() => mappingStatus.value?.result?.save_progress |
 // next successful startup/check command.
 const mappingMetrics = computed(() => mappingResult.value)
 const rosbagStatus = computed(() => mappingStatus.value?.result?.rosbag || {})
+const mappingOdometry = computed(() => mappingStatus.value?.result?.odometry || {})
+const mappingOdometrySourceLabel = computed(() => {
+  if (mappingOdometry.value.source === 'slam') return 'FAST-LIO-SAM'
+  if (mappingOdometry.value.source === 'localization') return 'Localization'
+  return '未知来源'
+})
 const originStatus = computed(() => mappingStatus.value?.result?.origin || {})
 const originState = computed(() => originStatus.value.origin_status || 'idle')
 const isOutdoorMapping = computed(() => mappingForm.value.mapping_type === 'outdoor')
 const originLocked = computed(() => originState.value === 'locked')
-const originLockPercent = computed(() => {
-  const required = Number(originStatus.value.required_seconds || 60)
-  return required > 0 ? Math.min(100, Number(originStatus.value.continuous_seconds || 0) / required * 100) : 0
+const rtkAlignment = computed(() => (
+  mappingStatus.value?.result?.rtk_alignment
+  || saveProgress.value.rtk_alignment
+  || {}
+))
+const rtkAlignmentLabel = computed(() => {
+  if (!isOutdoorMapping.value) return ''
+  if (rtkAlignment.value.locked) {
+    if (rtkAlignment.value.source === 'heading') return 'ENU-地图航向 双天线已锁'
+    if (rtkAlignment.value.source === 'trajectory') return 'ENU-地图航向 轨迹已锁'
+    return 'ENU-地图航向 已锁定'
+  }
+  if (mappingStatus.value?.result?.mapping_capture_enabled) return 'ENU-地图航向 待锁定'
+  if (originLocked.value) return 'ENU-地图航向 确认后锁定'
+  return ''
+})
+const headingReviewStatus = computed(() => originStatus.value.heading_review_status || 'idle')
+const originQualityRequired = computed(() => Number(originStatus.value.origin_quality_required_seconds || 10))
+const originQualityElapsed = computed(() => Number(originStatus.value.continuous_seconds || 0))
+const originQualityPercent = computed(() => {
+  const required = originQualityRequired.value
+  return required > 0 ? Math.min(100, originQualityElapsed.value / required * 100) : 0
+})
+const headingBaselineReady = computed(() => (
+  Number(originStatus.value.baseline_m || 0) >= Number(originStatus.value.heading_min_baseline_m || 0.2)
+))
+const headingAccuracyReady = computed(() => (
+  Number(originStatus.value.heading_std_deg ?? Infinity) <= Number(originStatus.value.heading_max_std_deg || 5)
+  && Number(originStatus.value.data_age_seconds ?? originStatus.value.age_seconds ?? Infinity) <= Number(originStatus.value.heading_max_age_seconds || 1.5)
+))
+const originQualityLabel = computed(() => {
+  const labels = {
+    rtk_fixed: 'RTK FIX',
+    fixed: 'RTK FIX',
+    rtk_float: 'RTK FLOAT',
+    float: 'RTK FLOAT',
+    standalone: '单点解',
+    invalid: '无效解',
+  }
+  const quality = String(originStatus.value.ntrip_quality || '').toLowerCase()
+  return labels[quality] || (quality ? quality.toUpperCase() : '等待数据')
+})
+const originDataStale = computed(() => Number(originStatus.value.data_age_seconds ?? originStatus.value.age_seconds ?? 0) > 1.5)
+const rtkTelemetryOnline = computed(() => (
+  Number.isFinite(Number(originStatus.value.data_age_seconds ?? originStatus.value.age_seconds))
+  && !originDataStale.value
+))
+
+function formatOriginNumber(value, digits = 3, suffix = '') {
+  if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) return '—'
+  return `${Number(value).toFixed(digits)}${suffix}`
+}
+
+function formatOriginStamp(value) {
+  const stamp = Number(value)
+  if (!Number.isFinite(stamp) || stamp <= 0) return '—'
+  return new Date(stamp * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+
+const originDiagnosticRows = computed(() => [
+  { label: '解类型', value: originQualityLabel.value, tone: originStatus.value.position_fixed ? 'ok' : 'warn' },
+  { label: 'NTRIP 状态', value: originStatus.value.ntrip_state || '未上报' },
+  { label: '解状态 / 类型', value: `${originStatus.value.solution_status ?? '—'} / ${originStatus.value.position_type ?? '—'}` },
+  { label: '跟踪 / 解算卫星', value: `${originStatus.value.tracking_satellites ?? '—'} / ${originStatus.value.solution_satellites ?? '—'}` },
+  { label: '水平 / 垂直误差', value: `${formatOriginNumber(originStatus.value.horizontal_std_m, 3, ' m')} / ${formatOriginNumber(originStatus.value.vertical_std_m, 3, ' m')}` },
+  { label: '经度', value: formatOriginNumber(originStatus.value.longitude, 10) },
+  { label: '纬度', value: formatOriginNumber(originStatus.value.latitude, 10) },
+  { label: '高程', value: formatOriginNumber(originStatus.value.altitude, 3, ' m') },
+  { label: '航向状态 / 类型', value: `${originStatus.value.heading_status ?? '—'} / ${originStatus.value.heading_type ?? '—'}`, tone: originStatus.value.heading_fixed ? 'ok' : 'warn' },
+  { label: '航向 / 标准差', value: `${formatOriginNumber(originStatus.value.heading_deg, 2, '°')} / ${formatOriginNumber(originStatus.value.heading_std_deg, 2, '°')}` },
+  { label: '俯仰 / 标准差', value: `${formatOriginNumber(originStatus.value.pitch_deg, 2, '°')} / ${formatOriginNumber(originStatus.value.pitch_std_deg, 2, '°')}` },
+  { label: '双天线基线', value: formatOriginNumber(originStatus.value.baseline_m, 3, ' m') },
+  { label: '航向跟踪 / 解算卫星', value: `${originStatus.value.heading_satellites ?? '—'} / ${originStatus.value.heading_solution_satellites ?? '—'}` },
+  { label: '差分龄期', value: formatOriginNumber(originStatus.value.differential_age_seconds, 2, ' s') },
+  { label: '消息时间偏差', value: formatOriginNumber(originStatus.value.message_time_offset_seconds, 3, ' s'), tone: originDataStale.value ? 'bad' : 'ok' },
+  { label: '数据延迟', value: formatOriginNumber(originStatus.value.data_age_seconds ?? originStatus.value.age_seconds, 3, ' s'), tone: originDataStale.value ? 'bad' : 'ok' },
+  { label: '测量时间源', value: originStatus.value.measurement_time_source || '未上报' },
+  { label: 'RTK 测量时间', value: formatOriginStamp(originStatus.value.measurement_stamp) },
+])
+const originDiagnosticTableRows = computed(() => {
+  const rows = []
+  for (let index = 0; index < originDiagnosticRows.value.length; index += 2) {
+    rows.push(originDiagnosticRows.value.slice(index, index + 2))
+  }
+  return rows
 })
 const originStatusMessage = computed(() => {
   if (originStatus.value.message) return originStatus.value.message
   if (!originStatus.value.position_fixed) return '等待 RTK 位置 FIX，暂不能锁定 ENU 原点'
-  if (!originStatus.value.heading_fixed) return '位置已 FIX，等待双天线航向 FIX'
-  if (!originStatus.value.heading_stable) return '位置和航向已接入，等待连续稳定质量窗'
-  return '质量条件满足后即可锁定 ENU 原点'
+  if (!originLocked.value) return '点击锁定后，将连续检查位置 FIX、双天线航向 FIX 和坐标波动＜2 cm 达到 10 秒'
+  if (headingReviewStatus.value === 'manual_confirmation') return '请原地小范围转动，确认航向稳定后点击“确认航向稳定，开始建图”'
+  return 'ENU 原点已锁定，等待启动 SLAM 和航向复核'
 })
 const slamHealth = computed(() => saveProgress.value.slam_health || {})
 const slamHealthState = computed(() => slamHealth.value.state || 'unknown')
@@ -539,7 +636,7 @@ const stateSteps = computed(() => [
   { key: 'command_accepted', label: 'Edge确认' },
   ...(isOutdoorMapping.value ? [
     { key: 'origin_starting', label: '启动RTK' },
-    { key: 'origin_waiting', label: '锁定原点' },
+    { key: 'origin_waiting', label: '3秒锁定原点' },
     { key: 'origin_locked', label: '原点已锁' },
   ] : []),
   { key: 'slam_starting', label: '启动SLAM' },
@@ -596,7 +693,7 @@ const canCancelMapping = computed(() => (
   isError.value
   || isActiveMapping.value
   || Boolean(mappingStatus.value?.result?.process_alive)
-  || ['waiting_quality', 'quality_holding', 'failed'].includes(originState.value)
+  || ['waiting_fix', 'quality_holding', 'failed'].includes(originState.value)
 ))
 const showMappingReadiness = computed(() => (
   Boolean(mappingStatus.value?.result?.process_alive)
@@ -616,7 +713,7 @@ const canLockOrigin = computed(() => (
   && !mappingProcessAlive.value
   && !originLocked.value
   && !mappingCommandInFlight.value
-  && !['waiting_quality', 'quality_holding'].includes(originState.value)
+  && !['waiting_fix', 'quality_holding'].includes(originState.value)
 ))
 const canStartSlam = computed(() => (
   connectionStatus.value === 'online'
@@ -625,11 +722,20 @@ const canStartSlam = computed(() => (
   && !mappingCommandInFlight.value
   && (!isOutdoorMapping.value || originLocked.value || ['idle', 'cancelled', 'failed'].includes(originState.value))
 ))
+const startSlamButtonLabel = computed(() => {
+  if (mappingBusy.value) return '正在下发...'
+  if (isError.value && ['slam_starting', 'slam_warmup', 'imu_initializing', 'waiting_first_keyframe'].includes(failureStepKey.value)) {
+    return '重试启动并检查'
+  }
+  if (isOutdoorMapping.value && originLocked.value) return '启动 SLAM 并检查航向'
+  if (isOutdoorMapping.value) return '启动传感器并检查'
+  return '启动并检查'
+})
 const canBeginMapping = computed(() => (
   mappingProcessAlive.value
   && !mappingCommandInFlight.value
   && Boolean(mappingStatus.value?.result?.ready_for_mapping ?? mappingReadiness.value.ready_for_mapping)
-  && (!isOutdoorMapping.value || (originLocked.value && originStatus.value.heading_stable))
+  && (!isOutdoorMapping.value || originLocked.value)
   && !mappingStatus.value?.result?.mapping_capture_enabled
   && (!isError.value || failureStepKey.value === 'ready_to_map')
 ))
@@ -753,7 +859,7 @@ async function loadRobots() {
 async function loadMaps() {
   loading.value = true
   try {
-    const [loadedMaps, loadedMapSets] = await Promise.all([fetchMaps(), fetchMapSets()])
+    const [loadedMaps, loadedMapSets] = await Promise.all([fetchMapSummaries(), fetchMapSetSummaries()])
     maps.value = loadedMaps
     mapSets.value = loadedMapSets
     if (maps.value.length && !selectedMapId.value) {
@@ -765,6 +871,15 @@ async function loadMaps() {
     console.error('加载地图失败:', error)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadSelectedMapDetail(mapId) {
+  if (!mapId) return
+  try {
+    selectedMapDetail.value = await fetchMapDetail(mapId)
+  } catch (error) {
+    console.warn('加载地图详情失败:', error)
   }
 }
 
@@ -786,10 +901,11 @@ function seedRobotsFromMaps() {
   }
 }
 
-async function refreshMappingStatus() {
-  if (!mappingForm.value.robot) return
+async function refreshMappingStatus({ signal } = {}) {
+  if (!mappingForm.value.robot || mappingStatusRefreshing) return
+  mappingStatusRefreshing = true
   try {
-    mappingStatus.value = await fetchRobotMappingStatus(mappingForm.value.robot)
+    mappingStatus.value = await fetchRobotMappingStatus(mappingForm.value.robot, { signal })
     const reportedType = mappingStatus.value?.result?.mapping_type
     const reportedState = mappingStatus.value?.mapping_state || mappingStatus.value?.result?.state || 'idle'
     const activeReportedWorkflow = [
@@ -809,7 +925,10 @@ async function refreshMappingStatus() {
       mappingForm.value.mapping_type = reportedType
     }
   } catch (error) {
+    if (error?.name === 'AbortError') return
     console.error('获取建图状态失败:', error)
+  } finally {
+    mappingStatusRefreshing = false
   }
 }
 
@@ -893,7 +1012,7 @@ async function handleLockOrigin() {
     return
   }
   mappingBusy.value = true
-  setMappingStepFeedback('锁定 ENU 原点', true, '正在下发锁定原点命令，请等待 RTK 质量窗口…')
+  setMappingStepFeedback('锁定 ENU 原点', true, '正在等待 RTK 位置固定解，最多 3 秒…')
   try {
     await startRobotMappingOrigin(mappingForm.value.robot, {
       map_name: mappingForm.value.map_name,
@@ -903,7 +1022,7 @@ async function handleLockOrigin() {
       mapping_session_id: workflowSessionId.value,
     })
     await refreshMappingStatus()
-    setMappingStepFeedback('锁定 ENU 原点', true, '原点质量窗口已启动，等待 60 秒连续质量检查')
+    setMappingStepFeedback('锁定 ENU 原点', true, '3 秒固定解检查已启动；成功后原点立即锁定')
   } catch (error) {
     setMappingStepFeedback('锁定 ENU 原点', false, error.message)
     alert(`锁定原点启动失败: ${error.message}`)
@@ -1003,7 +1122,7 @@ async function handleCancelMapping() {
   mappingBusy.value = true
   setMappingStepFeedback('取消建图', true, '正在下发取消建图命令，清理当前状态…')
   try {
-    if (!mappingProcessAlive.value && ['ready', 'waiting_quality', 'quality_holding', 'locked'].includes(originState.value)) {
+    if (!mappingProcessAlive.value && ['ready', 'waiting_fix', 'locked'].includes(originState.value)) {
       await cancelRobotMappingOrigin(mappingForm.value.robot, { mapping_session_id: workflowSessionId.value })
     } else {
       await cancelRobotMapping(mappingForm.value.robot, { reason: 'operator_cancel', mapping_session_id: workflowSessionId.value })
@@ -1390,6 +1509,8 @@ async function saveCleaner() {
               <img
                 :src="fullPreviewUrl(selectedMap.thumbnail_url)"
                 :alt="selectedMap.name"
+                loading="lazy"
+                decoding="async"
                 @error="handleImageError($event, selectedMap)"
               />
               <svg
@@ -1528,10 +1649,10 @@ async function saveCleaner() {
         <article v-for="mapSet in mapSets" :key="mapSet.id" class="map-set-card">
           <div>
             <h4>{{ mapSet.name }}</h4>
-            <span>{{ mapSet.members.length }} 个子图 · {{ mapSet.manifest?.total_distance_m || '—' }} m · 重叠 {{ mapSet.manifest?.overlap_m || '—' }} m</span>
+            <span>{{ mapSet.member_count }} 个子图 · {{ mapSet.manifest?.total_distance_m || '—' }} m · 重叠 {{ mapSet.manifest?.overlap_m || '—' }} m</span>
           </div>
           <div class="map-set-members">
-            <span v-for="member in mapSet.members" :key="member.submap_id" class="badge badge-sm">{{ member.submap_id }}</span>
+            <span v-for="submapId in mapSet.submap_ids" :key="submapId" class="badge badge-sm">{{ submapId }}</span>
           </div>
         </article>
       </div>
@@ -1570,6 +1691,8 @@ async function saveCleaner() {
                     <img
                       :src="fullPreviewUrl(map.thumbnail_url)"
                       :alt="map.name"
+                      loading="lazy"
+                      decoding="async"
                       @error.stop="handleImageError($event, map)"
                     />
                   </template>
@@ -1640,45 +1763,115 @@ async function saveCleaner() {
           <div class="origin-quality-head">
             <div>
               <span class="origin-kicker">室外 ENU 锚点</span>
-              <strong>{{ originLocked ? '原点已锁定' : '60 秒连续质量窗' }}</strong>
+              <strong>RTK 传感器实时信息</strong>
             </div>
-            <span class="origin-countdown">
-              {{ Math.floor(Number(originStatus.continuous_seconds || 0)) }} / {{ Number(originStatus.required_seconds || 60) }}s
+            <span class="origin-state-chip" :class="{ locked: originLocked, failed: originState === 'failed' }">
+              {{ originLocked
+                ? 'ENU 原点已锁定'
+                : (originState === 'quality_holding'
+                  ? `质量稳定 ${originQualityElapsed.toFixed(1)} / ${originQualityRequired.toFixed(0)}s`
+                  : (originState === 'waiting_fix'
+                    ? `等待位置 FIX ${Number(originStatus.lock_wait_seconds || 0).toFixed(1)} / ${Number(originStatus.lock_timeout_seconds || 3).toFixed(0)}s`
+                    : originState)) }}
             </span>
           </div>
-          <progress :value="originLockPercent" max="100"></progress>
-          <div class="origin-quality-grid">
-            <div :class="{ ok: originStatus.position_fixed }">
-              <span>{{ originStatus.position_fixed ? '✓' : '…' }}</span>
-              <div><strong>位置 FIX</strong><small>{{ originStatus.ntrip_quality || '等待 RTK FIX' }}</small></div>
+          <p>{{ originStatusMessage }}</p>
+          <progress v-if="['waiting_fix', 'quality_holding'].includes(originState)" :value="originQualityPercent" max="100"></progress>
+          <div class="origin-lock-check-grid">
+            <div :class="{ ok: originStatus.origin_position_ready }">
+              <span>{{ originStatus.origin_position_ready ? '✓' : '…' }}</span>
+              <div>
+                <strong>位置 FIX</strong>
+                <small>{{ originQualityLabel }} · 状态 / 类型 {{ originStatus.solution_status ?? '—' }} / {{ originStatus.position_type ?? '—' }}</small>
+              </div>
             </div>
-            <div :class="{ ok: originStatus.heading_fixed }">
-              <span>{{ originStatus.heading_fixed ? '✓' : '…' }}</span>
-              <div><strong>双天线航向 FIX</strong><small>基线 {{ Number(originStatus.baseline_m || 0).toFixed(2) }} m</small></div>
+            <div :class="{ ok: originStatus.origin_heading_ready }">
+              <span>{{ originStatus.origin_heading_ready ? '✓' : '…' }}</span>
+              <div>
+                <strong>双天线航向基线 FIX</strong>
+                <small>{{ originStatus.heading_fixed ? '航向 FIX' : '等待航向 FIX' }} · 基线 {{ formatOriginNumber(originStatus.baseline_m, 3, ' m') }}</small>
+              </div>
             </div>
-            <div :class="{ ok: Number(originStatus.position_spread_m ?? 1) <= 0.02 }">
-              <span>{{ Number(originStatus.position_spread_m ?? 1) <= 0.02 ? '✓' : '…' }}</span>
-              <div><strong>位置波动 &lt; 2 cm</strong><small>{{ originStatus.position_spread_m == null ? '等待稳定窗口' : `${(Number(originStatus.position_spread_m) * 100).toFixed(1)} cm` }}</small></div>
-            </div>
-            <div :class="{ ok: originStatus.heading_stable }">
-              <span>{{ originStatus.heading_stable ? '✓' : '…' }}</span>
-              <div><strong>航向质量</strong><small>σ {{ Number(originStatus.heading_std_deg || 0).toFixed(2) }}° · 延迟 {{ Number(originStatus.age_seconds || 0).toFixed(1) }}s</small></div>
+            <div :class="{ ok: originStatus.origin_spread_ready }">
+              <span>{{ originStatus.origin_spread_ready ? '✓' : '…' }}</span>
+              <div>
+                <strong>lat / lon 数值波动＜2 cm</strong>
+                <small>当前波动 {{ formatOriginNumber(Number(originStatus.position_spread_m) * 100, 2, ' cm') }} · 连续 {{ originQualityElapsed.toFixed(1) }}s</small>
+              </div>
             </div>
           </div>
-          <p>{{ originStatusMessage }}</p>
           <div v-if="originLocked" class="origin-coordinate">
             <span>LAT {{ Number(originStatus.origin?.origin_latitude || originStatus.latitude).toFixed(10) }}</span>
             <span>LON {{ Number(originStatus.origin?.origin_longitude || originStatus.longitude).toFixed(10) }}</span>
-            <span>航向 {{ Number(originStatus.heading_deg || 0).toFixed(2) }}°</span>
+            <span>ALT {{ Number(originStatus.origin?.origin_altitude || originStatus.altitude).toFixed(3) }} m</span>
           </div>
-          <div class="origin-live-metrics">
-            <span>实时 LAT {{ originStatus.latitude == null ? '—' : Number(originStatus.latitude).toFixed(10) }}</span>
-            <span>实时 LON {{ originStatus.longitude == null ? '—' : Number(originStatus.longitude).toFixed(10) }}</span>
-            <span>精度 {{ originStatus.horizontal_std_m == null ? '—' : `${Number(originStatus.horizontal_std_m).toFixed(3)} m` }}</span>
-            <span>基线 {{ originStatus.baseline_m == null ? '—' : `${Number(originStatus.baseline_m).toFixed(3)} m` }}</span>
-            <span>航向 {{ originStatus.heading_deg == null ? '—' : `${Number(originStatus.heading_deg).toFixed(2)}°` }}</span>
-            <span>样本 {{ originStatus.sample_count || 0 }}</span>
-            <span>RTK {{ originStatus.ntrip_quality || originStatus.message || '等待数据' }}</span>
+          <div class="origin-diagnostic-table-wrap" :class="{ stale: originDataStale }">
+            <table class="origin-diagnostic-table">
+              <tbody>
+                <tr v-for="(rowPair, rowIndex) in originDiagnosticTableRows" :key="rowIndex">
+                  <template v-for="row in rowPair" :key="row.label">
+                    <th>{{ row.label }}</th>
+                    <td :class="row.tone || ''">{{ row.value }}</td>
+                  </template>
+                  <template v-if="rowPair.length < 2"><th></th><td></td></template>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="originLocked && mappingState === 'ready_to_map'" class="heading-review-panel" :class="`review-${headingReviewStatus}`">
+            <div class="heading-review-head">
+              <div>
+                <strong>双天线航向复核</strong>
+                <small>请原地小范围转动，观察下列实时数据；确认航向稳定后点击“确认航向稳定，开始建图”</small>
+              </div>
+              <span>人工确认</span>
+            </div>
+            <div class="heading-quality-grid">
+              <div :class="{ ok: originStatus.heading_fixed }">
+                <span>{{ originStatus.heading_fixed ? '✓' : '…' }}</span>
+                <div>
+                  <strong>双天线航向 FIX</strong>
+                  <small>状态 / 类型 {{ originStatus.heading_status ?? '—' }} / {{ originStatus.heading_type ?? '—' }}</small>
+                </div>
+              </div>
+              <div :class="{ ok: headingBaselineReady }">
+                <span>{{ headingBaselineReady ? '✓' : '…' }}</span>
+                <div>
+                  <strong>双天线基线达标</strong>
+                  <small>{{ formatOriginNumber(originStatus.baseline_m, 3, ' m') }} / ≥ {{ formatOriginNumber(originStatus.heading_min_baseline_m || 0.2, 2, ' m') }}</small>
+                </div>
+              </div>
+              <div :class="{ ok: headingAccuracyReady }">
+                <span>{{ headingAccuracyReady ? '✓' : '…' }}</span>
+                <div>
+                  <strong>航向精度与时效达标</strong>
+                  <small>σ {{ formatOriginNumber(originStatus.heading_std_deg, 2, '°') }} · 延迟 {{ formatOriginNumber(originStatus.data_age_seconds ?? originStatus.age_seconds, 2, ' s') }}</small>
+                </div>
+              </div>
+            </div>
+            <div class="heading-review-summary">
+              <span>航向数据实时刷新，仅供人工复核，不再等待倒计时</span>
+              <span>确认按钮已激活后可随时继续</span>
+            </div>
+            <p>{{ originStatus.message }}</p>
+          </div>
+          <div class="mapping-odom-strip" :class="{ online: mappingOdometry.online, offline: !mappingOdometry.online }">
+            <strong>/odom/localization_odom</strong>
+            <span>{{ mappingOdometry.online ? '实时' : '无数据' }}</span>
+            <span>来源 {{ mappingOdometrySourceLabel }}</span>
+            <span>{{ formatOriginNumber(mappingOdometry.frequency_hz, 1, ' Hz') }}</span>
+            <span>接收延迟 {{ formatOriginNumber(mappingOdometry.sample_age_seconds, 3, ' s') }}</span>
+            <span>时间偏差 {{ formatOriginNumber(mappingOdometry.message_time_offset_seconds, 3, ' s') }}</span>
+            <span>{{ mappingOdometry.frame_id || '—' }} → {{ mappingOdometry.child_frame_id || '—' }}</span>
+          </div>
+          <div class="mapping-odom-strip mapping-rtk-strip" :class="{ online: rtkTelemetryOnline, offline: !rtkTelemetryOnline }">
+            <strong>/rtk_pvh</strong>
+            <span>{{ rtkTelemetryOnline ? '实时' : '无数据或已过期' }}</span>
+            <span>X {{ formatOriginNumber(originStatus.rtk_enu_x_m, 3, ' m') }}</span>
+            <span>Y {{ formatOriginNumber(originStatus.rtk_enu_y_m, 3, ' m') }}</span>
+            <span>Yaw {{ formatOriginNumber(originStatus.rtk_yaw_deg, 2, '°') }}</span>
+            <span>解 {{ originQualityLabel }} · {{ originStatus.solution_status ?? '—' }} / {{ originStatus.position_type ?? '—' }}</span>
+            <span>数据年龄 {{ formatOriginNumber(originStatus.data_age_seconds ?? originStatus.age_seconds, 3, ' s') }}</span>
           </div>
         </section>
 
@@ -1700,6 +1893,9 @@ async function saveCleaner() {
             </span>
             <span :class="{ ok: mappingStatus?.result?.mapping_capture_enabled }">
               正式采集 {{ mappingStatus?.result?.mapping_capture_enabled ? '已开启' : '门控关闭' }}
+            </span>
+            <span v-if="isOutdoorMapping && rtkAlignmentLabel" :class="{ ok: rtkAlignment.locked }">
+              {{ rtkAlignmentLabel }}
             </span>
             <span v-if="mappingStatus?.result?.mapping_capture_enabled" :class="{ ok: Number(mappingReadiness.keyframe_count || 0) > 0 }">
               关键帧 {{ mappingReadiness.keyframe_count || 0 }}
@@ -1852,10 +2048,14 @@ async function saveCleaner() {
 
         <div class="mapping-actions">
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canStartSlam" @click="handleStartMapping">
-            {{ mappingBusy ? '正在下发...' : (isError && ['slam_starting', 'slam_warmup', 'imu_initializing', 'waiting_first_keyframe'].includes(failureStepKey) ? '重试启动并检查' : '启动并检查') }}
+            {{ startSlamButtonLabel }}
           </button>
           <button v-if="isOutdoorMapping" class="btn btn-origin" :disabled="mappingBusy || !selectedRobot || !canLockOrigin" @click="handleLockOrigin">
-            {{ ['waiting_quality', 'quality_holding'].includes(originState) ? '原点锁定中…' : (originLocked ? 'ENU 原点已锁定' : (isError && failureStepKey === 'origin_waiting' ? '重试锁定 ENU 原点' : '锁定 ENU 原点')) }}
+            {{ originState === 'waiting_fix'
+              ? '等待位置 FIX（最多3秒）…'
+              : (originState === 'quality_holding'
+                ? `检查三项质量（${originQualityElapsed.toFixed(1)} / ${originQualityRequired.toFixed(0)}s）…`
+                : (originLocked ? 'ENU 原点已锁定' : (isError && failureStepKey === 'origin_waiting' ? '重试锁定 ENU 原点' : '锁定 ENU 原点'))) }}
           </button>
           <button class="btn btn-confirm" :disabled="mappingBusy || !selectedRobot || !canBeginMapping" @click="handleBeginMapping">
             {{ isError && failureStepKey === 'ready_to_map' ? '重试确认并开始建图' : (isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图') }}
@@ -1900,11 +2100,11 @@ async function saveCleaner() {
         <div class="mapping-guide">
           <strong>操作步骤：</strong>
           <template v-if="isOutdoorMapping">
-            <span>1. 将机器人开到预选开阔锚点，点击“启动并检查”，完成传感器检查后停在锁定原点步骤</span>
-            <span>2. 点击“锁定 ENU 原点”，等待位置 FIX、双天线航向 FIX、位置波动小于 2 cm 连续满足 60 秒</span>
-            <span>3. 原点锁定后再次点击“启动并检查”，启动 SLAM 并完成 IMU、位姿预热</span>
-            <span>4. 状态机停在“航向复核”，原地小范围转动，确认航向稳定后点击“确认航向稳定，开始建图”</span>
-            <span>5. 此时才正式采集数据和关键帧；走场结束后停止并保存地图</span>
+            <span>1. 将机器人开到预选开阔锚点，点击“启动传感器并检查”，完成传感器检查后停在锁定原点步骤</span>
+            <span>2. 点击“锁定 ENU 原点”，3 秒内须获得位置 FIX；位置 FIX、双天线航向基线 FIX、坐标波动＜2 cm 连续稳定 10 秒后锁定经纬高</span>
+            <span>3. 原点锁定后点击“启动 SLAM 并检查航向”，完成 IMU/位姿预热。预热和原地转动期间 GNSS 不会拉雷达</span>
+            <span>4. 状态机停在“航向复核”，请原地小范围转动；观察航向稳定后点击已激活的“确认航向稳定，开始建图”</span>
+            <span>5. 确认后用当前雷达航向和双天线航向锁定 ENU→地图航向，再开始采关键帧和 GNSS 融合；若航向锁失败，先直线走约 15 米用轨迹拟合</span>
           </template>
           <template v-else>
             <span>1. 点击“启动并检查”，自动启动雷达内置 IMU 和 SLAM 预热</span>
@@ -2076,45 +2276,66 @@ async function saveCleaner() {
 
 .origin-quality-head > div { display: grid; gap: 0.15rem; }
 .origin-kicker { color: #8a5a00; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
-.origin-countdown { font-variant-numeric: tabular-nums; font-size: 1.15rem; font-weight: 800; color: #8a5a00; }
+.origin-state-chip { padding: 0.35rem 0.65rem; border-radius: 999px; background: #fff1c7; color: #8a5a00; font-size: 0.72rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.origin-state-chip.locked { background: #dff7e8; color: #176b3a; }
+.origin-state-chip.failed { background: #fee4e2; color: #b42318; }
 .origin-quality-card progress { width: 100%; height: 0.55rem; accent-color: #e4a11b; }
 .origin-locked progress { accent-color: #198754; }
-
-.origin-quality-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.6rem;
-}
-
-.origin-quality-grid > div {
-  display: flex;
-  gap: 0.55rem;
-  min-width: 0;
-  padding: 0.65rem;
-  border: 1px solid #e6e9ef;
-  border-radius: 8px;
-  background: rgba(255,255,255,0.82);
-}
-
-.origin-quality-grid > div > span { color: #98a2b3; font-weight: 800; }
-.origin-quality-grid > div.ok > span { color: #198754; }
-.origin-quality-grid div div { display: grid; min-width: 0; gap: 0.15rem; }
-.origin-quality-grid strong { font-size: 0.78rem; }
-.origin-quality-grid small { overflow: hidden; color: #667085; font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
 .origin-quality-card p { margin: 0; color: #5f4b20; font-size: 0.8rem; }
 .origin-coordinate { padding-top: 0.65rem; border-top: 1px dashed #9ed6b5; color: #176b3a; font: 600 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace; }
-.origin-live-metrics { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; padding-top: 0.65rem; border-top: 1px dashed #d8c991; color: #5f4b20; font: 600 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.origin-diagnostic-table-wrap { overflow-x: auto; border: 1px solid #eadfba; border-radius: 8px; background: rgba(255,255,255,0.82); }
+.origin-diagnostic-table { width: 100%; min-width: 760px; border-collapse: collapse; table-layout: fixed; }
+.origin-diagnostic-table th,
+.origin-diagnostic-table td { padding: 0.55rem 0.65rem; border-right: 1px solid #eee5ca; border-bottom: 1px solid #eee5ca; text-align: left; }
+.origin-diagnostic-table th { width: 17%; color: #8a6b24; background: rgba(255,248,230,0.65); font-size: 0.68rem; font-weight: 600; }
+.origin-diagnostic-table td { width: 33%; color: #344054; font: 700 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.origin-diagnostic-table tr:last-child th,
+.origin-diagnostic-table tr:last-child td { border-bottom: 0; }
+.origin-diagnostic-table td.ok { color: #16794a; }
+.origin-diagnostic-table td.warn { color: #a15c00; }
+.origin-diagnostic-table td.bad { color: #c43232; }
+.origin-diagnostic-table-wrap.stale { border-color: #e58b8b; }
+.heading-review-panel { display: grid; gap: 0.65rem; padding: 0.8rem; border: 1px solid #d6dee9; border-radius: 9px; background: #f8fbff; }
+.heading-review-panel.review-ready { border-color: #6fcf97; background: #f1fff6; }
+.heading-review-head { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; }
+.heading-review-head > div { display: grid; gap: 0.15rem; }
+.heading-review-head small { color: #667085; font-size: 0.7rem; }
+.heading-review-head > span { color: #176b3a; font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.origin-lock-check-grid,
+.heading-quality-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.6rem; }
+.origin-lock-check-grid > div,
+.heading-quality-grid > div { display: flex; gap: 0.55rem; min-width: 0; padding: 0.65rem; border: 1px solid #e6e9ef; border-radius: 8px; background: #fff; }
+.origin-lock-check-grid > div > span,
+.heading-quality-grid > div > span { color: #98a2b3; font-size: 1rem; font-weight: 800; }
+.origin-lock-check-grid > div.ok,
+.heading-quality-grid > div.ok { border-color: #9ed6b5; background: #f1fff6; }
+.origin-lock-check-grid > div.ok > span,
+.heading-quality-grid > div.ok > span { color: #198754; }
+.origin-lock-check-grid > div > div,
+.heading-quality-grid > div > div { display: grid; min-width: 0; gap: 0.15rem; }
+.origin-lock-check-grid strong,
+.heading-quality-grid strong { color: #344054; font-size: 0.78rem; }
+.origin-lock-check-grid small,
+.heading-quality-grid small { overflow: hidden; color: #667085; font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
+.heading-review-summary { display: flex; justify-content: space-between; gap: 0.8rem; color: #667085; font-size: 0.7rem; }
+.mapping-odom-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem 0.85rem; padding: 0.65rem 0.75rem; border: 1px solid #e6e9ef; border-radius: 8px; color: #667085; background: rgba(255,255,255,0.85); font-size: 0.72rem; }
+.mapping-odom-strip strong { color: #344054; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mapping-odom-strip.online { border-color: #9ed6b5; color: #176b3a; }
+.mapping-odom-strip.offline { border-color: #f1b4b4; color: #b42318; }
 
 .mapping-actions .btn-origin { border-color: #d99a19; color: #7a5100; background: #fff8e6; }
 .mapping-actions .btn-confirm { border-color: #198754; color: #fff; background: #198754; }
 .mapping-actions .btn-confirm:disabled { border-color: #b9c4cf; background: #b9c4cf; }
 
 @media (max-width: 900px) {
-  .origin-quality-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .origin-diagnostic-table { min-width: 680px; }
+  .origin-lock-check-grid,
+  .heading-quality-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {
-  .mapping-mode-switch, .origin-quality-grid { grid-template-columns: 1fr; }
+  .mapping-mode-switch { grid-template-columns: 1fr; }
+  .heading-review-head { align-items: flex-start; }
 }
 
 .map-full-preview {

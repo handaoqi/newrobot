@@ -8,7 +8,7 @@ import {
   executePatrolTask,
   fetchPatrolTasks,
   fetchRobots,
-  fetchRoutes,
+  fetchRouteSummaries,
 } from '../services/api'
 
 const router = useRouter()
@@ -36,7 +36,7 @@ async function load() {
   const [tasksResult, robotsResult, routesResult] = await Promise.allSettled([
     fetchPatrolTasks(),
     fetchRobots(),
-    fetchRoutes(),
+    fetchRouteSummaries(),
   ])
   if (tasksResult.status === 'fulfilled') tasks.value = tasksResult.value
   else {

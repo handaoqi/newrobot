@@ -1,6 +1,4 @@
 <script setup>
-import Hls from 'hls.js'
-import mpegts from 'mpegts.js'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { fetchRobotStreamAudioCommand, setRobotStreamAudioCapture } from '../services/api'
@@ -36,6 +34,21 @@ let historyManifestUrl = ''
 let playerResetInProgress = false
 let applyingBrowserAudio = false
 let setupVersion = 0
+let mediaModulesPromise = null
+let playerSetupTimer = null
+
+function loadMediaModules() {
+  if (!mediaModulesPromise) {
+    mediaModulesPromise = Promise.all([
+      import('hls.js'),
+      import('mpegts.js'),
+    ]).then(([hlsModule, mpegtsModule]) => ({
+      Hls: hlsModule.default,
+      mpegts: mpegtsModule.default,
+    }))
+  }
+  return mediaModulesPromise
+}
 
 const HISTORY_BUFFER_SECONDS = 30 * 60
 const streamConnectTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
@@ -121,6 +134,14 @@ function clearStreamStartupTimer() {
   streamStartupTimer = null
 }
 
+function schedulePlayerSetup() {
+  if (playerSetupTimer) return
+  playerSetupTimer = window.setTimeout(() => {
+    playerSetupTimer = null
+    void setupPlayer()
+  }, 0)
+}
+
 function armStreamStartupTimer(version, { fallbackToHls = false } = {}) {
   clearStreamStartupTimer()
   streamStartupTimer = window.setTimeout(() => {
@@ -161,6 +182,10 @@ function startLiveGuard() {
 }
 
 function destroyPlayers() {
+  if (playerSetupTimer) {
+    window.clearTimeout(playerSetupTimer)
+    playerSetupTimer = null
+  }
   clearStreamStartupTimer()
   if (historySeekTimer) {
     window.clearTimeout(historySeekTimer)
@@ -316,6 +341,8 @@ async function setupPlayer({ preferHls = false } = {}) {
     streamLoading.value = false
     return
   }
+  const { Hls, mpegts } = await loadMediaModules()
+  if (version !== setupVersion) return
   applyBrowserAudio(element, { muted: true, volume: browserAudioVolume.value })
   const { flv, hls } = playUrls.value
   try {
@@ -403,7 +430,7 @@ watch(sourceKey, (nextSource, previousSource) => {
   streamUnavailable.value = false
   playbackMode.value = 'live'
   historyPlaybackPaused.value = false
-  void setupPlayer()
+  schedulePlayerSetup()
 })
 
 watch(() => props.loading, (isLoading, wasLoading) => {
@@ -415,7 +442,7 @@ watch(() => props.loading, (isLoading, wasLoading) => {
   }
   if (wasLoading && !isLoading) {
     streamUnavailable.value = false
-    void setupPlayer()
+    schedulePlayerSetup()
   }
 })
 
@@ -426,7 +453,7 @@ watch(() => props.available, (available) => {
   }
   else {
     streamUnavailable.value = false
-    void setupPlayer()
+    schedulePlayerSetup()
   }
 })
 

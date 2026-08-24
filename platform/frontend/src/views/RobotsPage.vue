@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
-import { fetchMaps, fetchRobotCommand, fetchRobotDetail, fetchRobots, fetchRobotSessions, fetchRobotStatus, fetchRoutes, fetchTaskExecution, sendRobotCommand, startRobotChargingDock } from '../services/api'
+import { fetchMapSummaries, fetchRobotCommand, fetchRobotDetail, fetchRobots, fetchRobotSessions, fetchRobotStatus, fetchRoutes, fetchTaskExecution, sendRobotCommand, startRobotChargingDock } from '../services/api'
 
 const robots = ref([])
 const selectedRobot = ref(null)
@@ -435,7 +435,7 @@ async function openDockDialog(robot) {
   dockRunning.value = false
   dockDialogOpen.value = true
   try {
-    const [maps, routes] = await Promise.all([fetchMaps(), fetchRoutes()])
+    const [maps, routes] = await Promise.all([fetchMapSummaries(), fetchRoutes()])
     dockRoutes.value = routes.filter((route) => Number(route.robot) === Number(robot.id))
     const routeMapIds = new Set(dockRoutes.value.map((route) => Number(route.map_data)))
     dockMaps.value = maps.filter((map) => routeMapIds.has(Number(map.id)))

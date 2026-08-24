@@ -3,8 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AppToast from '../components/AppToast.vue'
-import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import RobotDogIcon from '../components/RobotDogIcon.vue'
+import { useSharedVideoStream } from '../composables/useSharedVideoStream'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -70,6 +70,7 @@ const liveRecording = ref(false)
 const liveRecordingSeconds = ref(0)
 const streamUnavailable = ref(false)
 const { toastMessage, toastVariant, visible, showToast } = useToast()
+const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 const router = useRouter()
 
 let alertEventSource = null
@@ -88,8 +89,20 @@ const activeCommandStatuses = new Set(['created', 'published', 'accepted', 'exec
 
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
 const playUrls = computed(() => latestRobot.value?.play_urls || {})
-const playUrlKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
-const hasStream = computed(() => !streamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
+const playUrlKey = computed(() => `${latestRobot.value?.id || ''}\n${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
+const hasStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
+
+function syncSharedVideoSource() {
+  const urls = playUrls.value
+  if (!latestRobot.value?.id && !urls.flv && !urls.hls) return
+  setSharedVideoSource({
+    playUrls: urls,
+    robotId: latestRobot.value?.id,
+    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
+    loading: !Boolean(urls.flv || urls.hls),
+    objectFit: 'contain',
+  })
+}
 const robotTasks = computed(() => {
   if (!latestRobot.value?.id) return tasks.value
   return tasks.value.filter((task) => String(task.robot) === String(latestRobot.value.id))
@@ -946,10 +959,6 @@ function toggleLiveSpeechPanel() {
   liveSpeechOpen.value = !liveSpeechOpen.value
 }
 
-function showVideoNotice({ message, variant }) {
-  showToast(message, variant ? { variant } : undefined)
-}
-
 onMounted(async () => {
   let loaded = false
   try {
@@ -984,6 +993,7 @@ onBeforeUnmount(() => {
 
 watch(playUrlKey, () => {
   streamUnavailable.value = false
+  syncSharedVideoSource()
 })
 </script>
 
@@ -1005,28 +1015,11 @@ watch(playUrlKey, () => {
       <main class="guard-grid">
         <section class="guard-video-panel">
           <div class="guard-video-stage">
-            <LiveVideoPlayer
-              :play-urls="playUrls"
-              :robot-id="latestRobot?.id"
-              :available="hasStream"
-              :loading="dataLoading"
-              object-fit="contain"
-              @notice="showVideoNotice"
-              @stream-error="streamUnavailable = true"
-            >
-              <template #empty>
-                <div class="guard-video-empty">
-                  <strong>视频暂不可用</strong>
-                  <span>{{ latestRobot?.stream_id || '机器人未上报视频流' }}</span>
-                </div>
-              </template>
-              <template #overlay>
-                <div class="guard-video-label">
-                  <strong>{{ latestRobot?.name || latestRobot?.code || '机器狗' }}</strong>
-                  <span>{{ latestRobot?.location || '位置未知' }}</span>
-                </div>
-              </template>
-            </LiveVideoPlayer>
+            <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
+            <div class="guard-video-label">
+              <strong>{{ latestRobot?.name || latestRobot?.code || '机器狗' }}</strong>
+              <span>{{ latestRobot?.location || '位置未知' }}</span>
+            </div>
           </div>
 
           <div class="guard-task-bar">
@@ -1395,6 +1388,97 @@ watch(playUrlKey, () => {
 .guard-waypoint-log span, .guard-waypoint-log small, .guard-waypoint-log p { color: #71818c; font-size: 10px; line-height: 1.4; }
 .guard-waypoint-log p { margin: 8px 0 0; }
 .guard-loading { display: grid; place-items: center; min-height: 50vh; color: #657681; }
+
+/* Guard duty uses a legacy light palette, so explicitly map its surfaces to the
+   application theme when the global dark theme is active. */
+:global([data-theme="dark"] .guard-page) { background: transparent; color: var(--text); }
+:global([data-theme="dark"] .guard-page .guard-status),
+:global([data-theme="dark"] .guard-page .guard-video-panel),
+:global([data-theme="dark"] .guard-page .guard-alert-panel),
+:global([data-theme="dark"] .guard-page .guard-loop-panel),
+:global([data-theme="dark"] .guard-page .guard-map-panel) {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--text);
+}
+:global([data-theme="dark"] .guard-page .guard-localization-bar),
+:global([data-theme="dark"] .guard-page .guard-live-speech),
+:global([data-theme="dark"] .guard-page .guard-map-stage),
+:global([data-theme="dark"] .guard-page .guard-countdown-clock strong),
+:global([data-theme="dark"] .guard-page .guard-map-layer) {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--text);
+}
+:global([data-theme="dark"] .guard-page .guard-live-speech textarea),
+:global([data-theme="dark"] .guard-page .guard-loop-settings input) {
+  border-color: var(--line);
+  background: var(--input-bg);
+  color: var(--text);
+}
+:global([data-theme="dark"] .guard-page .guard-loop-settings input:disabled) {
+  background: rgba(255, 255, 255, .02);
+  color: var(--muted);
+}
+:global([data-theme="dark"] .guard-page .guard-secondary) {
+  color: var(--text);
+  background: var(--ghost-bg);
+}
+:global([data-theme="dark"] .guard-page .guard-alert-actions > button) {
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(31, 191, 120, .1);
+}
+:global([data-theme="dark"] .guard-page .guard-alert-actions > button.active) {
+  color: #071d16;
+  background: var(--green);
+}
+:global([data-theme="dark"] .guard-page .guard-panel-title),
+:global([data-theme="dark"] .guard-page .guard-alert-list),
+:global([data-theme="dark"] .guard-page .guard-live-microphone),
+:global([data-theme="dark"] .guard-page .guard-route-log),
+:global([data-theme="dark"] .guard-page .guard-waypoint-log),
+:global([data-theme="dark"] .guard-page .guard-runtime-grid),
+:global([data-theme="dark"] .guard-page .guard-runtime-grid > div),
+:global([data-theme="dark"] .guard-page .guard-loop-inline .guard-runtime-grid > div),
+:global([data-theme="dark"] .guard-page .guard-waypoint-log article) {
+  border-color: var(--line);
+}
+:global([data-theme="dark"] .guard-page .guard-runtime-grid) { background: rgba(255, 255, 255, .02); }
+:global([data-theme="dark"] .guard-page .guard-current-target) {
+  border-left-color: var(--warning);
+  background: rgba(255, 196, 92, .12);
+}
+:global([data-theme="dark"] .guard-page .guard-current-target strong) { color: #ffd58a; }
+:global([data-theme="dark"] .guard-page .guard-countdown-clock strong) { color: var(--text); }
+:global([data-theme="dark"] .guard-page .guard-eyebrow),
+:global([data-theme="dark"] .guard-page .guard-task-bar span),
+:global([data-theme="dark"] .guard-page .guard-localization-copy > span),
+:global([data-theme="dark"] .guard-page .guard-localization-copy > small),
+:global([data-theme="dark"] .guard-page .guard-live-speech label),
+:global([data-theme="dark"] .guard-page .guard-live-microphone span),
+:global([data-theme="dark"] .guard-page .guard-live-speech > small),
+:global([data-theme="dark"] .guard-page .guard-alert-main span),
+:global([data-theme="dark"] .guard-page .guard-alert-main small),
+:global([data-theme="dark"] .guard-page .guard-alert-list small),
+:global([data-theme="dark"] .guard-page .guard-empty),
+:global([data-theme="dark"] .guard-page .guard-countdown-clock span),
+:global([data-theme="dark"] .guard-page .guard-loop-settings label),
+:global([data-theme="dark"] .guard-page .guard-runtime-grid span),
+:global([data-theme="dark"] .guard-page .guard-loop-message),
+:global([data-theme="dark"] .guard-page .guard-map-head small),
+:global([data-theme="dark"] .guard-page .guard-map-empty),
+:global([data-theme="dark"] .guard-page .guard-map-legend),
+:global([data-theme="dark"] .guard-page .guard-route-summary span),
+:global([data-theme="dark"] .guard-page .guard-route-order small),
+:global([data-theme="dark"] .guard-page .guard-current-target > span),
+:global([data-theme="dark"] .guard-page .guard-current-target small),
+:global([data-theme="dark"] .guard-page .guard-waypoint-log span),
+:global([data-theme="dark"] .guard-page .guard-waypoint-log small),
+:global([data-theme="dark"] .guard-page .guard-waypoint-log p),
+:global([data-theme="dark"] .guard-page .guard-loading) {
+  color: var(--muted);
+}
 @media (max-width: 980px) {
   .guard-grid { grid-template-columns: 1fr; }
   .guard-side { grid-template-columns: 1fr 220px; align-items: start; }
@@ -1405,6 +1489,28 @@ watch(playUrlKey, () => {
   .guard-initialize { width: 100%; }
   .guard-loop-inline { grid-template-columns: 1fr; }
   .guard-loop-inline .guard-runtime-grid, .guard-loop-inline .guard-loop-message { grid-column: 1; }
+}
+@media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
+  .guard-page { min-width: 0; padding: 18px; }
+  .guard-grid, .guard-side { grid-template-columns: minmax(0, 1fr); }
+  .guard-video-stage, .guard-video, .guard-video-empty {
+    min-height: 0;
+    aspect-ratio: 16 / 9;
+  }
+  .guard-task-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guard-primary, .guard-secondary, .guard-danger, .guard-initialize { width: 100%; min-width: 0; }
+  .guard-loop-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guard-loop-inline .guard-loop-toggle { grid-column: 1 / -1; height: auto; min-height: 44px; }
+  .guard-loop-inline .guard-loop-settings { max-width: none; }
+  .guard-loop-inline .guard-runtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guard-loop-inline .guard-runtime-grid > div { border-bottom: 1px solid #e5eaed; }
+  .guard-loop-inline .guard-runtime-grid > div:nth-child(even) { border-right: 0; }
+  .guard-loop-inline .guard-runtime-status { grid-column: 1 / -1; border-bottom: 0; }
+  .guard-alert-actions > button,
+  .guard-live-text-send,
+  .guard-live-microphone button,
+  .guard-playback-controls button { min-height: 44px; }
+  .guard-map-stage, .guard-map-empty { min-height: 300px; }
 }
 @media (max-width: 640px) {
   .guard-page { padding: 14px; }
