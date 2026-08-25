@@ -1309,13 +1309,13 @@ watch(playUrlKey, () => {
 
 <style scoped>
 .guard-page { min-height: calc(100vh - 120px); padding: 24px; background: #eef2f5; color: #142330; }
-.guard-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 0 auto 18px; max-width: 1440px; }
+.guard-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 0 auto 18px; width: 100%; max-width: none; }
 .guard-header h1 { margin: 4px 0 0; font-size: clamp(24px, 3vw, 40px); letter-spacing: 0; }
 .guard-eyebrow { color: #667785; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .guard-status { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border: 1px solid #d6dee3; background: #fff; font-weight: 800; }
 .guard-status-dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa8b2; }
 .guard-status.is-online .guard-status-dot { background: #1b9b65; }
-.guard-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 320px); gap: 18px; max-width: 1440px; margin: 0 auto; }
+.guard-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 272px); gap: 18px; width: 100%; max-width: none; margin: 0 auto; }
 .guard-video-panel, .guard-alert-panel { border: 1px solid #d6dee3; background: #fff; }
 .guard-video-stage { position: relative; min-height: 520px; background: #152633; overflow: hidden; }
 .guard-video, .guard-video-empty { display: block; width: 100%; height: 100%; min-height: 520px; object-fit: contain; }
