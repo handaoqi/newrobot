@@ -2706,7 +2706,8 @@ async function handleDeleteRoute(route) {
   height: 100%;
   flex-direction: column;
   gap: 0.45rem;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .route-config-panel {
@@ -2837,9 +2838,9 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 {
   align-self: stretch;
-  min-height: 0;
+  min-height: 560px;
   height: auto;
-  flex: 0 0 50%;
+  flex: 1 0 100%;
   max-height: none;
   overflow: hidden;
 }
@@ -2915,7 +2916,7 @@ async function handleDeleteRoute(route) {
 .route-step-3 .waypoint-list {
   height: auto;
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 220px;
   max-height: none;
   overflow-y: auto;
 }
@@ -4414,6 +4415,7 @@ async function handleDeleteRoute(route) {
   }
 
   .route-step-3 {
+    min-height: 0;
     max-height: none;
   }
 
@@ -4424,6 +4426,7 @@ async function handleDeleteRoute(route) {
   .route-step-3 .waypoint-list {
     flex: 0 0 auto;
     height: auto;
+    min-height: 0;
     max-height: none;
   }
 
