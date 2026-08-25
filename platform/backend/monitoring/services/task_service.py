@@ -80,7 +80,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "yaw": float(yaw),
                 "dwell_seconds": dwell_seconds,
                 "actions": actions,
-                "localization_mode": localization_mode if localization_mode in {"ndt", "rtk"} else "ndt",
+                "localization_mode": localization_mode if localization_mode in {"ndt", "rtk", "ukf"} else "ndt",
                 "avoidance_to_next": avoidance_to_next,
                 "require_yaw": require_yaw,
             }

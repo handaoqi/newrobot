@@ -455,8 +455,14 @@ function setWaypointSpeech(index, templateId) {
   }
 }
 
+function normalizeWaypointLocalizationMode(mode) {
+  const normalized = String(mode || 'ndt').trim().toLowerCase()
+  return ['ndt', 'rtk', 'ukf'].includes(normalized) ? normalized : 'ndt'
+}
+
 function setWaypointLocalization(index, mode) {
-  const allowed = mapIsLocalOnly.value ? 'ndt' : (mode === 'rtk' ? 'rtk' : 'ndt')
+  const normalized = normalizeWaypointLocalizationMode(mode)
+  const allowed = mapIsLocalOnly.value && normalized === 'rtk' ? 'ndt' : normalized
   waypoints.value[index] = {
     ...waypoints.value[index],
     localization_mode: allowed,
@@ -838,7 +844,9 @@ async function handleSaveRoute() {
     waypoints: withWaypointYaw(waypoints.value).map((point, index) => ({
       ...point,
       map_point_number: index + 1,
-      localization_mode: mapIsLocalOnly.value ? 'ndt' : (point.localization_mode === 'rtk' ? 'rtk' : 'ndt'),
+      localization_mode: mapIsLocalOnly.value && normalizeWaypointLocalizationMode(point.localization_mode) === 'rtk'
+        ? 'ndt'
+        : normalizeWaypointLocalizationMode(point.localization_mode),
     })),
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
@@ -917,7 +925,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     speech_template_id: point.speech_template_id || null,
     speech_template_name: point.speech_template_name || '',
     speech_text: point.speech_text || '',
-    localization_mode: point.localization_mode === 'rtk' ? 'rtk' : 'ndt',
+    localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
     avoidance_to_next: point.avoidance_to_next !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
@@ -970,7 +978,7 @@ function withWaypointYaw(points) {
       v: Number(current.v.toFixed(8)),
       speech_template_id: current.speech_template_id || null,
       speech_template_name: current.speech_template_name || '',
-      localization_mode: current.localization_mode === 'rtk' ? 'rtk' : 'ndt',
+      localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
       avoidance_to_next: current.avoidance_to_next !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
@@ -2190,6 +2198,7 @@ async function handleDeleteRoute(route) {
                         <span>定位方式</span>
                         <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
                           <option value="ndt">NDT（室内/特征区）</option>
+                          <option value="ukf">UKF（复杂过道融合）</option>
                           <option value="rtk" :disabled="mapIsLocalOnly">RTK（室外开阔区）</option>
                         </select>
                       </label>
@@ -2838,9 +2847,9 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 {
   align-self: stretch;
-  min-height: 560px;
+  min-height: 520px;
   height: auto;
-  flex: 1 0 100%;
+  flex: 0 0 calc(100% - 88px);
   max-height: none;
   overflow: hidden;
 }
@@ -3080,9 +3089,9 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-main label.waypoint-heading-row {
-  grid-template-columns: 1fr;
-  align-items: stretch;
-  gap: 0.25rem;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 0.4rem;
 }
 
 .heading-unit {

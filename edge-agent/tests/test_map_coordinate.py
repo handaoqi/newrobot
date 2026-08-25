@@ -45,3 +45,12 @@ def test_local_only_route_rejects_outdoor_and_rtk():
     with pytest.raises(MapConstraintError) as rtk:
         validate_route_against_map(constraints, scene_scope="indoor", waypoints=[{"localization_mode": "rtk"}])
     assert rtk.value.code == MAP_LOCAL_ONLY_NDT_ONLY
+
+
+def test_local_only_route_allows_ukf_fusion_waypoints():
+    constraints = new_map_constraints(gnss_origin={}, requested_scene_scope="indoor")
+    validate_route_against_map(
+        constraints,
+        scene_scope="indoor",
+        waypoints=[{"localization_mode": "ukf"}],
+    )

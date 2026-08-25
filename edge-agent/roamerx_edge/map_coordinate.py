@@ -1,6 +1,6 @@
 """Map coordinate mode, scene scope, and localization capability checks.
 
-Waypoint localization keeps the existing values ``ndt`` and ``rtk``.
+Waypoint localization uses ``ndt``, ``ukf``, and ``rtk``.
 Map-level capability uses ``ndt`` or ``rtk_ndt``. JSON quaternions use ROS
 ``qx, qy, qz, qw`` and field names ending in ``_xyzw``.
 """
@@ -13,7 +13,7 @@ SCHEMA_VERSION = 2
 COORDINATE_MODES = ("rtk_fixed", "local_only")
 SCENE_SCOPES = ("indoor", "transition", "outdoor")
 MAP_LOCALIZATION_MODES = ("ndt", "rtk_ndt")
-WAYPOINT_LOCALIZATION_MODES = ("ndt", "rtk")
+WAYPOINT_LOCALIZATION_MODES = ("ndt", "rtk", "ukf")
 ORIGIN_STATUSES = ("fixed", "local_only", "legacy_incomplete")
 
 MAP_RTK_ORIGIN_REQUIRED = "MAP_RTK_ORIGIN_REQUIRED"
@@ -39,6 +39,8 @@ def waypoint_localization_mode(value: Any) -> str:
     mode = normalize_text(value, "ndt")
     if mode in {"rtk", "rtk_ndt"}:
         return "rtk"
+    if mode == "ukf":
+        return "ukf"
     return "ndt"
 
 

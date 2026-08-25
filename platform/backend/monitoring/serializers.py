@@ -950,10 +950,10 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             point.get("localization_mode")
             for point in value
             if isinstance(point, dict)
-            and str(point.get("localization_mode") or "ndt").lower() not in {"ndt", "rtk"}
+            and str(point.get("localization_mode") or "ndt").lower() not in {"ndt", "rtk", "ukf"}
         ]
         if invalid_modes:
-            raise serializers.ValidationError("途经点定位方式只能是 NDT 或 RTK")
+            raise serializers.ValidationError("途经点定位方式只能是 NDT、UKF 或 RTK")
         try:
             template_ids = {
                 int(point["speech_template_id"])

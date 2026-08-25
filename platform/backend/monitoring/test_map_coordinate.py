@@ -51,6 +51,18 @@ class MapCoordinateTests(TestCase):
         )
         self.assertFalse(serializer.is_valid())
 
+    def test_serializer_accepts_ukf_waypoints_for_local_only_map(self):
+        serializer = PatrolRouteSerializer(
+            data={
+                "name": "corridor-ukf",
+                "map_data": self.local_map.id,
+                "robot": self.robot.id,
+                "scene_scope": "indoor",
+                "waypoints": [{"x": 1.0, "y": 2.0, "yaw": 0.0, "localization_mode": "ukf"}],
+            }
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
     def test_task_start_rejects_local_only_outdoor_route(self):
         from .models import PatrolTask
         from django.utils import timezone
