@@ -61,6 +61,7 @@ def merge_keyframes(
     output_path: Path,
     *,
     voxel_size: float,
+    normalize_z: bool,
 ) -> tuple[int, int]:
     reference_z = rows[0]["z"]
     clouds = []
@@ -74,7 +75,8 @@ def merge_keyframes(
         if header["data"] != "binary":
             raise RuntimeError(f"unsupported PCD encoding: {scan_path}")
         points = np.fromfile(scan_path, dtype=dtype, offset=offset).copy()
-        points["z"] -= row["z"] - reference_z
+        if normalize_z:
+            points["z"] -= row["z"] - reference_z
         clouds.append(points)
         source_path = source_path or scan_path
         source_header = source_header or header
@@ -95,7 +97,26 @@ def merge_keyframes(
     return source_count, int(merged.size)
 
 
-def write_metadata(source: Path, output: Path, rows: list[dict], cutoff: int, reason: str, counts: tuple[int, int]) -> None:
+def copy_preintegrations(source: Path, output: Path, rows: list[dict]) -> int:
+    """Preserve every healthy interval measurement needed to audit the rescue cutoff."""
+    source_dir = source / "imu_preintegration"
+    if not source_dir.is_dir():
+        return 0
+    output_dir = output / "imu_preintegration"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for row in rows:
+        path = source_dir / f"preint_{row['index']:05d}.json"
+        if path.is_file():
+            shutil.copy2(path, output_dir / path.name)
+            copied += 1
+    return copied
+
+
+def write_metadata(
+    source: Path, output: Path, rows: list[dict], cutoff: int, reason: str,
+    counts: tuple[int, int], *, normalize_z: bool, preintegration_count: int,
+) -> None:
     adjusted_rows = []
     reference_z = rows[0]["z"]
     fieldnames = list(rows[0].keys())
@@ -106,7 +127,8 @@ def write_metadata(source: Path, output: Path, rows: list[dict], cutoff: int, re
         writer.writeheader()
         for row in rows:
             item = dict(row)
-            item["z"] = reference_z
+            if normalize_z:
+                item["z"] = reference_z
             writer.writerow(item)
             adjusted_rows.append(item)
 
@@ -138,9 +160,10 @@ def write_metadata(source: Path, output: Path, rows: list[dict], cutoff: int, re
         "cutoff_keyframe": cutoff,
         "keyframe_count": len(rows),
         "cutoff_reason": reason,
-        "z_normalized": True,
+        "z_normalized": normalize_z,
         "source_points": source_points,
         "kept_points": kept_points,
+        "preintegration_count": preintegration_count,
         "created_at_unix": int(time.time()),
         "warning": "Recovered from pre-divergence keyframes; verify alignment before navigation.",
     }
@@ -170,6 +193,9 @@ def write_metadata(source: Path, output: Path, rows: list[dict], cutoff: int, re
         json.dumps(progress, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    divergence_event = source / "divergence_event.json"
+    if divergence_event.is_file():
+        shutil.copy2(divergence_event, output / "divergence_event.json")
 
 
 def main() -> int:
@@ -185,14 +211,28 @@ def main() -> int:
     source = args.source.resolve()
     rows = load_rows(source / "keyframes" / "keyframes.csv")
     detected_cutoff, reason = detect_cutoff(rows, args.speed_limit, args.z_jump_limit)
+    divergence_event_path = source / "divergence_event.json"
+    if args.cutoff_index is None and divergence_event_path.is_file():
+        event = json.loads(divergence_event_path.read_text(encoding="utf-8"))
+        recorded_cutoff = int(event.get("last_healthy_keyframe", -1))
+        if recorded_cutoff >= 0:
+            detected_cutoff = recorded_cutoff
+            reason = f"SLAM recorded last healthy keyframe {recorded_cutoff}"
     cutoff = args.cutoff_index if args.cutoff_index is not None else detected_cutoff
     rows = [row for row in rows if row["index"] <= cutoff]
     if len(rows) < 10:
         raise RuntimeError("too few healthy keyframes remain for rescue")
     output = args.output or source.with_name(f"{source.name}_rescue_{int(time.time())}")
+    source_progress = json.loads((source / "save_progress.json").read_text(encoding="utf-8"))
+    alignment = source_progress.get("rtk_alignment") or {}
+    normalize_z = not bool(alignment.get("fusion_enabled") or alignment.get("locked"))
     output.mkdir(parents=True, exist_ok=False)
     try:
-        counts = merge_keyframes(source / "keyframes", rows, output / "map.pcd", voxel_size=args.voxel_size)
+        counts = merge_keyframes(
+            source / "keyframes", rows, output / "map.pcd",
+            voxel_size=args.voxel_size, normalize_z=normalize_z,
+        )
+        preintegration_count = copy_preintegrations(source, output, rows)
         converter = WORKSPACE / "install" / "robot_slam" / "lib" / "robot_slam" / "pcd2grid_streaming"
         subprocess.run(
             [str(converter), str(output / "map.pcd"), str(output / "map"), "0.05", "0.05", "0.75", "200000000"],
@@ -200,7 +240,10 @@ def main() -> int:
         )
         generate_map_preview(output / "map.pgm", output / "map_preview.png")
         shutil.copy2(output / "map_preview.png", output / "preview.png")
-        write_metadata(source, output, rows, cutoff, reason, counts)
+        write_metadata(
+            source, output, rows, cutoff, reason, counts,
+            normalize_z=normalize_z, preintegration_count=preintegration_count,
+        )
     except Exception:
         shutil.rmtree(output, ignore_errors=True)
         raise

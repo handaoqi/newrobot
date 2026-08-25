@@ -1,4 +1,4 @@
-laser_mapping:
+/**:
   ros__parameters:
     feature_extract_enable: false
     point_filter_num: 2
@@ -10,6 +10,7 @@ laser_mapping:
         lid_topic:  "/front_lidar"
         imu_topic:  "/front_lidar/imu"
         gnss_topic: "/fix"
+        enu_odom_topic: "/gnss/enu_odom"
         time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
         time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
     preprocess:
@@ -36,19 +37,15 @@ laser_mapping:
         max_acc_variance: 0.5
         max_gyro_variance: 0.05
     gnss_fusion:
-        # Only quality-gated RTK float/fixed fixes may alter LIO. Invalid GNSS
-        # automatically falls back to LiDAR + IMU without resetting the pose.
+        # Legacy master gate. RTK never rewrites the FAST-LIO front-end pose;
+        # quality-gated ENU measurements enter only the GTSAM backend.
         enable: true
         # Edge Agent writes this after the outdoor ENU origin lock (RTK position
         # FIX, about 3 s). Indoor mapping ignores a missing file.
         origin_file: /home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml
-        gain: 0.20
-        max_correction_step: 0.30
-        max_residual: 5.0
         max_age: 1.5
         max_horizontal_std: 1.5
         min_status: 1
-        use_elevation: false
         lever_arm_base: [ -0.05, 0.0, 0.15 ]
         alignment_min_samples: 20
         alignment_min_baseline: 15.0
@@ -123,6 +120,9 @@ laser_mapping:
         imu_velocity_prior_sigma: 0.30
         imu_bias_prior_sigma: 0.10
         gravity_magnitude: 9.81
+        # Outdoor launch keeps this enabled; the indoor state command forces
+        # GPS off while retaining the standard IMU pose/velocity/bias factors.
+        use_gps: true
         use_imu_factor: true
         max_pose_jump_m: 25.0
         max_abs_z_change_m: 1.5

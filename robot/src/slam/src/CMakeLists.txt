@@ -74,11 +74,13 @@ set(dependencies
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(GTSAM REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 file(GLOB_RECURSE SLAM_SDK
      CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
+list(FILTER SLAM_SDK EXCLUDE REGEX ".*/enu_converter\\.cpp$")
 
 include_directories(inlcude
         ${PCL_INCLUDE_DIRS}
@@ -89,12 +91,16 @@ include_directories(inlcude
 
 add_executable(mapping ${SLAM_SDK} test/mapping_demo.cpp)
 
+add_executable(slam_enu_converter src/enu_converter.cpp)
+
 add_executable(pcd2grid_streaming src/pcd2grid.cpp test/pcd2grid_streaming_cli.cpp)
 
-target_link_libraries(mapping ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
+target_link_libraries(mapping ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam OpenSSL::Crypto)
+target_link_libraries(slam_enu_converter OpenSSL::Crypto)
 target_link_libraries(pcd2grid_streaming ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 ament_target_dependencies(mapping ${dependencies})
+ament_target_dependencies(slam_enu_converter rclcpp nav_msgs sensor_msgs)
 ament_target_dependencies(pcd2grid_streaming ${dependencies})
 
 if(BUILD_TESTING)
@@ -110,15 +116,21 @@ if(BUILD_TESTING)
     )
     target_link_libraries(global_factor_graph_test gtsam)
   endif()
+  ament_add_gtest(enu_conversion_test test/enu_conversion_test.cpp)
+  if(TARGET enu_conversion_test)
+    target_include_directories(enu_conversion_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+  endif()
 endif()
 
-install(TARGETS mapping pcd2grid_streaming
+install(TARGETS mapping slam_enu_converter pcd2grid_streaming
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
   DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE
 )
 
 ament_package()

@@ -26,6 +26,9 @@ def make_adapter(tmp_path, **overrides):
     overrides.setdefault("rosbag_script", str(tmp_path / "missing-rosbag-script"))
     overrides.setdefault("mapping_unit", "")
     overrides.setdefault("navigation_script", str(tmp_path / "missing-nav-script"))
+    overrides.setdefault("deployment_manifest", str(tmp_path / "missing-deployment.json"))
+    overrides.setdefault("mapping_session_params_file", str(tmp_path / "mapping-origin-session.yaml"))
+    overrides.setdefault("mapping_environment_file", str(tmp_path / "mapping-session.env"))
     config = MappingConfig(map_dir=str(tmp_path), **overrides)
     media = SimpleNamespace(robot_id="test-dog")
     return MappingAdapter(config, media)
@@ -93,6 +96,80 @@ def test_mapping_deployment_hash_mismatch_blocks_start(tmp_path):
     with pytest.raises(ProtocolError, match="SHA256") as error:
         adapter._verify_mapping_deployment()
     assert error.value.code == "MAPPING_DEPLOYMENT_MISMATCH"
+
+
+def test_outdoor_runtime_uses_locked_origin_and_records_hash(tmp_path):
+    adapter = make_adapter(tmp_path)
+    adapter._mapping_type = "outdoor"
+    adapter.session = MappingSession(
+        "mapping-session", "outside", "", "slam_warmup", "now", "now",
+        mapping_type="outdoor",
+    )
+    adapter._origin_file.write_text(yaml.safe_dump({
+        "alignment_locked": True,
+        "origin_lock_session_id": "origin-session",
+        "origin_latitude": 39.9042,
+        "origin_longitude": 116.4074,
+        "origin_altitude": 43.5,
+    }))
+
+    runtime = adapter._prepare_mapping_runtime()
+
+    params = yaml.safe_load(Path(adapter.config.mapping_session_params_file).read_text())
+    converter = params["slam_enu_converter"]["ros__parameters"]
+    assert converter["lat0"] == 39.9042
+    assert converter["lon0"] == 116.4074
+    assert converter["alt0"] == 43.5
+    assert converter["origin_session_id"] == "origin-session"
+    assert converter["origin_sha256"] == runtime["origin_sha256"]
+    assert adapter.session.origin_sha256 == runtime["origin_sha256"]
+    assert "ROAMERX_MAPPING_TYPE=outdoor" in Path(
+        adapter.config.mapping_environment_file
+    ).read_text()
+
+
+def test_outdoor_runtime_rejects_all_zero_origin(tmp_path):
+    adapter = make_adapter(tmp_path)
+    adapter._mapping_type = "outdoor"
+    adapter.session = MappingSession(
+        "mapping-session", "outside", "", "slam_warmup", "now", "now",
+        mapping_type="outdoor",
+    )
+    adapter._origin_file.write_text(yaml.safe_dump({
+        "alignment_locked": True,
+        "origin_lock_session_id": "origin-session",
+        "origin_latitude": 0.0,
+        "origin_longitude": 0.0,
+        "origin_altitude": 0.0,
+    }))
+
+    with pytest.raises(ProtocolError) as error:
+        adapter._prepare_mapping_runtime()
+
+    assert error.value.code == "MAPPING_ORIGIN_LOCK_FAILED"
+
+
+def test_auto_rescue_keeps_post_trigger_rosbag_tail(tmp_path, monkeypatch):
+    source = tmp_path / "20260825_190000_001"
+    source.mkdir()
+    (source / "save_progress.json").write_text(json.dumps({"error_code": "SLAM_DIVERGED"}))
+    adapter = make_adapter(tmp_path, divergence_post_record_seconds=3.0)
+    adapter.session = MappingSession("session", "map", "", "mapping", "now", "now")
+    calls = []
+    monkeypatch.setattr(mapping_adapter_module.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+    monkeypatch.setattr(adapter, "_stop_rosbag", lambda: calls.append(("stop_rosbag",)))
+    monkeypatch.setattr(
+        adapter,
+        "_rescue_diverged_mapping",
+        lambda command, directory: calls.append(("rescue", command, directory)) or {"rescued": True},
+    )
+
+    result = adapter.auto_rescue_diverged_mapping({"map_dir": str(source)})
+
+    assert result == {"rescued": True}
+    assert calls[0] == ("sleep", 3.0)
+    assert calls[1] == ("stop_rosbag",)
+    assert calls[2][0] == "rescue"
 
 
 def test_start_mapping_records_before_slam_start(tmp_path, monkeypatch):
@@ -852,7 +929,8 @@ def test_origin_stop_preserves_localization_and_ensures_odom(tmp_path, monkeypat
     adapter._ensure_origin_odometry()
     adapter._stop_localization_for_slam()
 
-    assert [call[1] for call in calls] == ["stop", "ensure-localization-odom", "stop-localization"]
+    script_calls = [call for call in calls if call and call[0] == str(script)]
+    assert [call[1] for call in script_calls] == ["stop", "ensure-localization-odom", "stop-localization"]
 
 
 def test_ensure_slam_starts_systemd_unit(tmp_path, monkeypatch):
@@ -869,8 +947,9 @@ def test_ensure_slam_starts_systemd_unit(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "_systemctl", fake_systemctl)
     monkeypatch.setattr(adapter, "_is_mapping_unit_active", lambda: active["value"])
     monkeypatch.setattr(adapter, "_wait_for_slam_services", lambda: calls.append("wait"))
+    monkeypatch.setattr(adapter, "_verify_mapping_publishers", lambda: calls.append("publishers"))
     adapter._ensure_slam_process()
-    assert calls == ["start", "wait"]
+    assert calls == ["start", "wait", "publishers"]
 
 
 def test_wait_until_ready_for_motion(tmp_path):

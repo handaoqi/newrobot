@@ -126,3 +126,38 @@ def test_mapping_divergence_alert_emits_once(monkeypatch):
 
     application._observe_mapping_health({"state": "idle", "save_progress": {}})
     assert application._mapping_divergence_notified is False
+
+
+def test_mapping_divergence_event_requests_passive_then_rescues():
+    application = object.__new__(EdgeAgentApplication)
+    calls = []
+    application.navigation = SimpleNamespace(
+        confirmed_remote_teleop_action=lambda *args, **kwargs: calls.append(("passive", args, kwargs))
+    )
+    application.mapping_adapter = SimpleNamespace(
+        auto_rescue_diverged_mapping=lambda event: calls.append(("rescue", event))
+    )
+    application._mapping_rescue_lock = threading.Lock()
+    event = {"writer_flushed": True, "last_healthy_keyframe": 12}
+
+    application._handle_mapping_divergence_event(event)
+
+    assert calls[0][0] == "passive"
+    assert calls[0][1][0] == "passive"
+    assert calls[1] == ("rescue", event)
+
+
+def test_mapping_divergence_event_does_not_rescue_before_flush():
+    application = object.__new__(EdgeAgentApplication)
+    calls = []
+    application.navigation = SimpleNamespace(
+        confirmed_remote_teleop_action=lambda *args, **kwargs: calls.append("passive")
+    )
+    application.mapping_adapter = SimpleNamespace(
+        auto_rescue_diverged_mapping=lambda event: calls.append("rescue")
+    )
+    application._mapping_rescue_lock = threading.Lock()
+
+    application._handle_mapping_divergence_event({"writer_flushed": False})
+
+    assert calls == ["passive"]

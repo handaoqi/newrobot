@@ -108,6 +108,10 @@ class EdgeAgentApplication:
             set_trusted_pose_callback(self._persist_last_trusted_pose)
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
         self._mapping_divergence_notified = False
+        self._mapping_rescue_lock = threading.Lock()
+        set_mapping_divergence_callback = getattr(navigation, "set_mapping_divergence_callback", None)
+        if callable(set_mapping_divergence_callback):
+            set_mapping_divergence_callback(self._handle_mapping_divergence_event)
         origin_payload_snapshot = getattr(navigation, "origin_payload_snapshot", None)
         if callable(origin_payload_snapshot):
             self.mapping_adapter.set_origin_payload_provider(origin_payload_snapshot)
@@ -193,7 +197,7 @@ class EdgeAgentApplication:
     def _start_docking_charge(self, docking: dict) -> None:
         """Called only after the second docking waypoint has been reached."""
         self.task_executor.report_docking_charge("task.docking_contact_checking", message="已到充电桩，正在检查蓝牙与极片")
-        passive = getattr(self.navigation, "confirmed_remote_teleop_action", None)
+        passive = getattr(getattr(self, "navigation", None), "confirmed_remote_teleop_action", None)
         if callable(passive):
             passive("passive", {"passive"}, {"passive_failed"}, timeout_seconds=5.0)
         self._docking_undock_pending = True
@@ -433,6 +437,7 @@ class EdgeAgentApplication:
         self._mapping_divergence_notified = True
         reason = progress.get("error") or health.get("warning") or "SLAM pose diverged"
         LOGGER.error("Mapping diverged; stopping capture notification: %s", reason)
+        self._request_mapping_passive()
         try:
             self.alerts.emit_system_alert(
                 "slam_diverged",
@@ -453,6 +458,47 @@ class EdgeAgentApplication:
             daemon=True,
             name="mapping-diverged-speech",
         ).start()
+
+    def _request_mapping_passive(self) -> None:
+        navigation = getattr(self, "navigation", None)
+        stop_velocity = getattr(navigation, "teleop_velocity", None)
+        if callable(stop_velocity):
+            try:
+                stop_velocity(0.0, 0.0, 0.0)
+            except Exception:
+                LOGGER.exception("failed to clear teleop velocity after mapping SAFE_HOLD")
+        passive = getattr(
+            navigation,
+            "confirmed_remote_teleop_action",
+            None,
+        )
+        if not callable(passive):
+            return
+        for attempt in range(1, 4):
+            try:
+                passive("passive", {"passive"}, {"passive_failed"}, timeout_seconds=5.0)
+                return
+            except Exception:
+                if attempt == 3:
+                    LOGGER.exception("failed to put robot into passive after mapping SAFE_HOLD")
+                else:
+                    LOGGER.warning("mapping SAFE_HOLD passive confirmation failed; retry %d/3", attempt + 1)
+                    time.sleep(0.25)
+
+    def _handle_mapping_divergence_event(self, event: dict) -> None:
+        """Immediately immobilize the robot, then rescue only after SLAM flushed evidence."""
+        self._request_mapping_passive()
+        if not bool(event.get("writer_flushed")):
+            LOGGER.error("SAFE_HOLD writer did not flush; preserving session for manual recovery: %s", event)
+            return
+        if not self._mapping_rescue_lock.acquire(blocking=False):
+            return
+        try:
+            self.mapping_adapter.auto_rescue_diverged_mapping(event)
+        except Exception:
+            LOGGER.exception("automatic diverged-map rescue failed")
+        finally:
+            self._mapping_rescue_lock.release()
 
     def _speak_mapping_diverged(self) -> None:
         text = "建图定位已发散，请立即停止移动。回到地图页保存救援地图。"

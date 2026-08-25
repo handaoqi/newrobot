@@ -75,6 +75,7 @@ class RosAdapter(Node):
         self._localization_failure_cb: Callable | None = None
         self._localization_recovery_cb: Callable | None = None
         self._trusted_pose_cb: Callable | None = None
+        self._mapping_divergence_cb: Callable | None = None
         self._last_trusted_pose: dict | None = None
         self._last_trusted_pose_report_monotonic = 0.0
         self._localization_sample_condition = threading.Condition()
@@ -137,6 +138,14 @@ class RosAdapter(Node):
                 mapping_config.origin_ntrip_status_topic,
                 self._on_origin_ntrip,
                 qos_profile_sensor_data,
+            )
+            divergence_qos = QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+            )
+            self.create_subscription(
+                String, "/slam/divergence_event", self._on_mapping_divergence_event, divergence_qos
             )
         if ros_config.scan_matching_status_topic and ScanMatchingStatus is not None:
             self.create_subscription(
@@ -370,6 +379,23 @@ class RosAdapter(Node):
 
     def set_trusted_pose_callback(self, callback: Callable) -> None:
         self._trusted_pose_cb = callback
+
+    def set_mapping_divergence_callback(self, callback: Callable) -> None:
+        self._mapping_divergence_cb = callback
+
+    def _on_mapping_divergence_event(self, msg) -> None:
+        if not self._mapping_divergence_cb:
+            return
+        try:
+            event = json.loads(str(msg.data or "{}"))
+        except (TypeError, ValueError):
+            event = {"reason": str(msg.data or "invalid divergence event")}
+        threading.Thread(
+            target=self._mapping_divergence_cb,
+            args=(event,),
+            daemon=True,
+            name="mapping-safe-hold-handler",
+        ).start()
 
     def latest_trusted_pose(self) -> dict | None:
         return dict(self._last_trusted_pose) if self._last_trusted_pose else None

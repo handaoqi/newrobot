@@ -57,6 +57,14 @@
 #include <visualization_msgs/msg/marker.hpp>
 namespace robot::slam
 {
+    enum class HealthDecision
+    {
+        ACCEPT,
+        REJECT_FRAME,
+        SAFE_HOLD,
+        FATAL,
+    };
+
     struct DynamicFilterVoxelKey
     {
         int x;
@@ -141,6 +149,16 @@ namespace robot::slam
         double      rtk_heading_deg = 0.0;
         double      rtk_heading_std_deg = 0.0;
         double      rtk_heading_age_seconds = 0.0;
+        bool        enu_valid = false;
+        Vec3d       enu_position = Zero3d;
+        double      enu_yaw = 0.0;
+        double      enu_stamp = 0.0;
+        double      enu_age_seconds = 0.0;
+        double      enu_covariance_x = 0.0;
+        double      enu_covariance_y = 0.0;
+        double      enu_covariance_z = 0.0;
+        std::string enu_origin_session_id;
+        std::string enu_origin_sha256;
         ImuPreintegrationSnapshot preint;
     };
 
@@ -189,6 +207,8 @@ namespace robot::slam
 
         void gnssCallBack(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
 
+        void enuOdometryCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
+
         void rtkPvhCallBack(const robots_dog_msgs::msg::UniRtkPvh::SharedPtr msg);
 
         void odomGuardCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
@@ -213,7 +233,7 @@ namespace robot::slam
 
         void stopKeyframeWriter(bool drain);
 
-        bool flushKeyframeWriter();
+        bool flushKeyframeWriter(double timeout_seconds = 0.0);
 
         void keyframeWriterLoop();
 
@@ -271,25 +291,25 @@ namespace robot::slam
 
         void map_publish_callback();
 
-        void applyGnssCorrection(double lidar_time);
-
         void collectGnssAlignment(double lidar_time);
 
         bool estimateGnssAlignment();
 
-        bool lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss);
+        bool lockGnssAlignmentFromHeading(const nav_msgs::msg::Odometry& enu_odometry);
 
         void tryLockGnssAlignmentOnCaptureStart();
 
         bool gnssHeadingIsValid(double& heading_deg, double& heading_std_deg, double& age_s);
 
-        bool gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos);
+        bool enuToMap(const nav_msgs::msg::Odometry& msg, Vec3d& map_pos) const;
 
-        Vec3d llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const;
-
-        void updateSlamHealth(double lidar_time);
+        HealthDecision updateSlamHealth(double lidar_time);
 
         void markSlamDiverged(const std::string& reason);
+
+        void enterSafeHold(const std::string& reason, const std::string& trigger_type, HealthDecision decision);
+
+        void writeDivergenceEvent(const std::string& reason, const std::string& trigger_type);
 
         bool validateMappingSession(std::string& reason) const;
 
@@ -335,7 +355,7 @@ namespace robot::slam
         std::mutex              mtx_buffer;
         std::condition_variable sig_buffer;
         std::string             root_dir_ = ROOT_DIR;
-        std::string             lid_topic, imu_topic, gnss_topic, rtk_pvh_topic, odom_guard_topic;
+        std::string             lid_topic, imu_topic, gnss_topic, enu_odom_topic, rtk_pvh_topic, odom_guard_topic;
         std::string             data_path_;
 
         double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -365,6 +385,9 @@ namespace robot::slam
         std::mutex                         gnss_mutex_;
         sensor_msgs::msg::NavSatFix        latest_gnss_;
         bool                               has_gnss_ = false;
+        std::mutex                         enu_mutex_;
+        nav_msgs::msg::Odometry            latest_enu_odometry_;
+        bool                               has_enu_odometry_ = false;
         std::mutex                         gnss_heading_mutex_;
         bool                               has_gnss_heading_ = false;
         double                             latest_gnss_heading_deg_ = 0.0;
@@ -386,18 +409,17 @@ namespace robot::slam
         Vec3d                              gnss_lever_arm_base_ = Zero3d;
         bool                               use_gnss_fusion_ = false;
         bool                               gnss_fusion_config_enabled_ = false;
-        double                             gnss_fusion_gain_ = 0.03;
-        double                             gnss_max_correction_step_ = 0.10;
-        double                             gnss_max_residual_ = 5.0;
+        bool                               use_gps_config_enabled_ = true;
         double                             gnss_max_age_ = 1.5;
         double                             gnss_max_horizontal_std_ = 1.5;
         int                                gnss_min_status_ = 0;
-        bool                               gnss_use_elevation_ = false;
         int                                gnss_correction_count_ = 0;
         std::deque<GnssAlignmentSample>    gnss_alignment_samples_;
         bool                               gnss_alignment_locked_ = false;
         std::string                        gnss_alignment_source_;
         std::string                        gnss_origin_file_;
+        std::string                        gnss_origin_session_id_;
+        std::string                        gnss_origin_sha256_;
         bool                               gnss_origin_prelocked_ = false;
         double                             gnss_enu_to_map_yaw_ = 0.0;
         Eigen::Vector2d                    gnss_enu_to_map_translation_ = Eigen::Vector2d::Zero();
@@ -437,8 +459,15 @@ namespace robot::slam
         int                                pose_anomaly_streak_ = 0;
         bool                               has_last_health_pose_ = false;
         Vec3d                              last_health_position_ = Zero3d;
+        double                             last_health_yaw_ = 0.0;
         double                             last_health_stamp_ = 0.0;
+        Vec3d                              health_prediction_position_ = Zero3d;
+        double                             health_prediction_yaw_ = 0.0;
         double                             mapping_started_stamp_ = 0.0;
+        double                             health_start_z_m_ = 0.0;
+        bool                               has_health_start_z_ = false;
+        long long                          last_healthy_keyframe_ = -1;
+        std::string                        divergence_trigger_type_;
         double                             health_max_frame_translation_m_ = 1.5;
         double                             health_max_speed_mps_ = 3.0;
         double                             health_max_abs_z_m_ = 5.0;
@@ -563,8 +592,10 @@ namespace robot::slam
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubGlobalOptimizedOdom_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubGlobalOptimizedPath_;
         rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubGlobalOptimizationStatus_;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubDivergenceEvent_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         sub_imu_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr   sub_gnss_ptr_;
+        rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       sub_enu_odom_ptr_;
         rclcpp::Subscription<robots_dog_msgs::msg::UniRtkPvh>::SharedPtr sub_rtk_pvh_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_ptr_;
 

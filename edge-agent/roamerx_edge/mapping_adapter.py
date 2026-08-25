@@ -42,6 +42,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 from .config import MappingConfig
+from . import __version__ as edge_agent_version
 from .keyframe_visibility_filter import filter_with_keyframe_visibility
 from .map_coordinate import MapConstraintError, SCENE_SCOPES, normalize_text
 from .map_optimization_summary import build_optimization_summary, summary_without_corrections
@@ -65,6 +66,8 @@ class MappingSession:
     mapping_type: str = "indoor"
     heading_check_confirmed: bool = False
     mapping_capture_enabled: bool = False
+    origin_session_id: str = ""
+    origin_sha256: str = ""
 
 
 class MappingAdapter:
@@ -90,6 +93,9 @@ class MappingAdapter:
         "trajectory_raw.csv",
         "trajectory_optimized.csv",
         "optimization_summary.json",
+        "divergence_event.json",
+        "rescue_metadata.json",
+        "save_progress.json",
     )
     SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
     SLAM_PROCESS_PATTERNS = (
@@ -556,6 +562,49 @@ class MappingAdapter:
         result.update(self.status())
         return result
 
+    def auto_rescue_diverged_mapping(self, event: dict) -> dict:
+        """Rescue a flushed SAFE_HOLD session without waiting for a cloud save command."""
+        if not self.session:
+            raise ProtocolError("MAPPING_RESCUE_FAILED", "no active mapping session for automatic rescue")
+        if self.session.state in {"recovering", "packaging", "uploading", "exited"}:
+            return self.status()
+        source = Path(str(event.get("map_dir") or "")).expanduser()
+        if not source.is_dir() or source.parent.resolve() != self.map_dir.resolve():
+            raise ProtocolError("MAPPING_RESCUE_FAILED", "SAFE_HOLD map directory is outside mapping storage")
+        progress = self._read_save_progress(source)
+        if progress.get("error_code") != "SLAM_DIVERGED":
+            raise ProtocolError("MAPPING_RESCUE_FAILED", "SAFE_HOLD progress does not contain SLAM_DIVERGED")
+        # Keep a short post-trigger tail so the diagnostic bag contains both
+        # the rejected frames and the sensor behaviour immediately afterward.
+        post_record_seconds = max(0.0, float(self.config.divergence_post_record_seconds))
+        if post_record_seconds:
+            time.sleep(post_record_seconds)
+        self._stop_rosbag()
+        self._enrich_divergence_event(source, event, post_record_seconds)
+        return self._rescue_diverged_mapping({"upload": True, "stop_process": True}, source)
+
+    def _enrich_divergence_event(
+        self, source: Path, event: dict, post_record_seconds: float
+    ) -> None:
+        path = source / "divergence_event.json"
+        try:
+            payload = self._read_json(path)
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.update({
+                "map_dir": str(source.resolve()),
+                "diagnostic_rosbag_dir": str(Path(self._rosbag_dir).expanduser())
+                if self._rosbag_dir else "",
+                "post_trigger_record_seconds": post_record_seconds,
+                "writer_flushed": bool(event.get("writer_flushed")),
+            })
+            _atomic_write_text(
+                path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except (OSError, TypeError, ValueError):
+            LOGGER.exception("failed to enrich mapping divergence evidence at %s", path)
+
     def cancel_mapping(self, command: dict) -> dict:
         progress_dir = self._find_latest_progress_dir()
         if self.session:
@@ -942,20 +991,91 @@ class MappingAdapter:
         return self._rosbag_command("status")
 
     def _ensure_slam_process(self) -> None:
+        self._prepare_mapping_runtime()
         self._verify_mapping_deployment()
         if self._any_slam_process_alive:
             return
         if self.config.mapping_unit:
-            try:
-                self._systemctl("start")
-            except ProtocolError:
-                LOGGER.warning("systemd start of %s failed; falling back to a direct mapping process", self.config.mapping_unit)
+            self._systemctl("start")
             if self._is_mapping_unit_active():
                 self._wait_for_slam_services()
+                self._verify_mapping_publishers()
                 return
-            LOGGER.warning("mapping unit %s is not active; falling back to a direct mapping process", self.config.mapping_unit)
+            raise ProtocolError(
+                "MAPPING_SLAM_START_FAILED",
+                f"mapping unit {self.config.mapping_unit} did not become active",
+            )
         self._start_slam_subprocess()
         self._wait_for_slam_services()
+
+    def _prepare_mapping_runtime(self) -> dict:
+        """Write the mode-scoped launch environment and strict outdoor origin parameters."""
+        mapping_type = self.session.mapping_type if self.session else self._mapping_type
+        environment_path = Path(self.config.mapping_environment_file).expanduser()
+        params_path = Path(self.config.mapping_session_params_file).expanduser()
+        origin_sha256 = ""
+        origin_session_id = ""
+        if mapping_type == "outdoor":
+            if not self._origin_file.is_file():
+                raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "locked gnss_origin.yaml is missing")
+            try:
+                origin = yaml.safe_load(self._origin_file.read_text(encoding="utf-8")) or {}
+                lat0 = float(origin["origin_latitude"])
+                lon0 = float(origin["origin_longitude"])
+                alt0 = float(origin["origin_altitude"])
+            except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+                raise ProtocolError("MAPPING_ORIGIN_LOCK_FAILED", f"invalid locked ENU origin: {exc}") from exc
+            if (
+                not bool(origin.get("alignment_locked"))
+                or not all(math.isfinite(value) for value in (lat0, lon0, alt0))
+                or not -90.0 <= lat0 <= 90.0
+                or not -180.0 <= lon0 <= 180.0
+                or (abs(lat0) < 1e-12 and abs(lon0) < 1e-12 and abs(alt0) < 1e-9)
+            ):
+                raise ProtocolError("MAPPING_ORIGIN_LOCK_FAILED", "locked ENU origin is unlocked, non-finite or out of range")
+            origin_session_id = str(origin.get("origin_lock_session_id") or "")
+            monitor_session_id = str(
+                ((self._origin_monitor.status().get("origin") or {}).get("origin_lock_session_id")) or ""
+            )
+            if not origin_session_id or (monitor_session_id and monitor_session_id != origin_session_id):
+                raise ProtocolError("MAPPING_ORIGIN_LOCK_FAILED", "locked ENU origin session does not match this workflow")
+            origin_sha256 = self._sha256_file(self._origin_file)
+            params = {
+                "slam_enu_converter": {
+                    "ros__parameters": {
+                        "lat0": lat0,
+                        "lon0": lon0,
+                        "alt0": alt0,
+                        "origin_file": str(self._origin_file.resolve()),
+                        "origin_session_id": origin_session_id,
+                        "origin_sha256": origin_sha256,
+                        "input_topic": self.config.origin_fix_topic,
+                        "output_topic": "/gnss/enu_odom",
+                        "max_age_seconds": float(self.config.heading_max_age_seconds),
+                        "min_status": 1,
+                    }
+                }
+            }
+            _atomic_write_text(params_path, yaml.safe_dump(params, allow_unicode=True, sort_keys=False))
+        else:
+            params_path.unlink(missing_ok=True)
+        environment = (
+            f"ROAMERX_MAPPING_TYPE={mapping_type}\n"
+            f"ROAMERX_SLAM_PARAMS={Path(self.config.slam_params_file).expanduser()}\n"
+            f"ROAMERX_MAPPING_ORIGIN_PARAMS={params_path if mapping_type == 'outdoor' else '/dev/null'}\n"
+        )
+        _atomic_write_text(environment_path, environment)
+        if self.session:
+            self.session.origin_session_id = origin_session_id
+            self.session.origin_sha256 = origin_sha256
+            self._persist_workflow_state()
+        return {
+            "mapping_type": mapping_type,
+            "origin_session_id": origin_session_id,
+            "origin_sha256": origin_sha256,
+            "environment_file": str(environment_path),
+            "origin_params_file": str(params_path) if mapping_type == "outdoor" else "",
+        }
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -996,6 +1116,16 @@ class MappingAdapter:
             "slam_params_file": Path(self.config.slam_params_file).expanduser(),
             "mapping_adapter": Path(__file__).resolve(),
         }
+        if self.config.mapping_unit:
+            required.update({
+                "enu_binary": Path(self.config.enu_binary).expanduser(),
+                "unified_launch_file": Path(self.config.unified_launch_file).expanduser(),
+                "mapping_unit_file": Path(self.config.mapping_unit_file).expanduser(),
+            })
+            if str(manifest.get("edge_agent_version") or "") != edge_agent_version:
+                raise ProtocolError(
+                    "MAPPING_DEPLOYMENT_MISMATCH", "Edge Agent version differs from deployment manifest"
+                )
         for name, configured_path in required.items():
             record = artifacts.get(name) or {}
             recorded_path = Path(str(record.get("path") or "")).expanduser()
@@ -1057,6 +1187,50 @@ class MappingAdapter:
             last_error = "waiting for /slam/start_mapping or /slam_state_service"
             time.sleep(1)
         raise ProtocolError("MAPPING_SLAM_START_FAILED", last_error)
+
+    def _ros_node_names(self) -> set[str]:
+        result = subprocess.run(
+            ["bash", "-lc", self._shell_prefix() + "ROS2CLI_DISABLE_DAEMON=1 ros2 node list"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0:
+            raise ProtocolError("MAPPING_STACK_STOP_FAILED", (result.stderr or "cannot inspect ROS nodes").strip())
+        return set((result.stdout or "").split())
+
+    def _verify_navigation_stack_stopped(self) -> None:
+        forbidden = {
+            "/localization", "/planner_server", "/controller_server", "/bt_navigator",
+            "/behavior_server", "/waypoint_follower", "/navigo_container",
+        }
+        remaining = sorted(name for name in self._ros_node_names() if name in forbidden)
+        if remaining or self._find_slam_process_pids():
+            detail = ", ".join(remaining) if remaining else "old SLAM process"
+            raise ProtocolError("MAPPING_STACK_STOP_FAILED", f"mapping-conflicting process remains: {detail}")
+
+    def _verify_mapping_publishers(self) -> None:
+        nodes = self._ros_node_names()
+        if "/mapping" not in nodes:
+            raise ProtocolError("MAPPING_SLAM_START_FAILED", "mapping node is absent after service startup")
+        if self._mapping_type == "outdoor" and "/slam_enu_converter" not in nodes:
+            raise ProtocolError("MAPPING_SLAM_START_FAILED", "outdoor ENU converter node is absent")
+        result = subprocess.run(
+            ["bash", "-lc", self._shell_prefix() + "ROS2CLI_DISABLE_DAEMON=1 ros2 topic info -v /odom/localization_odom"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        output = result.stdout or ""
+        match = re.search(r"Publisher count:\s*(\d+)", output)
+        publisher_nodes = {
+            name.lstrip("/") for name in re.findall(r"Node name:\s*([^\s]+)", output)
+        }
+        if result.returncode != 0 or not match or int(match.group(1)) != 1 or "mapping" not in publisher_nodes:
+            raise ProtocolError(
+                "MAPPING_ODOMETRY_PUBLISHER_CONFLICT",
+                "expected /odom/localization_odom to have exactly one publisher from /mapping",
+            )
 
     def _ensure_mapping_sensors(self) -> None:
         script = Path(self.config.sensor_start_script).expanduser()
@@ -1132,6 +1306,8 @@ class MappingAdapter:
             "MAPPING_STACK_STOP_FAILED",
             "failed to stop navigation stack",
         )
+        if not preserve_localization:
+            self._verify_navigation_stack_stopped()
 
     def _ensure_origin_odometry(self) -> None:
         self._run_navigation_script(
@@ -1146,6 +1322,7 @@ class MappingAdapter:
             "MAPPING_LOCALIZATION_STOP_FAILED",
             "failed to release localization before starting SLAM",
         )
+        self._verify_navigation_stack_stopped()
 
     def _call_map_state(self, data: int) -> str:
         named = None
@@ -1589,6 +1766,7 @@ class MappingAdapter:
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
             "optimization_summary.json",
+            "divergence_event.json",
             "loop_closures.csv",
             "scan_context/index.json",
             "scan_context/loop_candidates.csv",
@@ -1664,6 +1842,9 @@ class MappingAdapter:
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
             "optimization_summary.json",
+            "divergence_event.json",
+            "rescue_metadata.json",
+            "save_progress.json",
             "loop_closures.csv",
             "keyframes/keyframes.csv",
             "scan_context/index.json",

@@ -110,10 +110,14 @@ class MappingConfig:
     ros_setup: str = "/opt/ros/humble/setup.bash"
     workspace_setup: str = "/home/dogrobot/robot/install/setup.bash"
     slam_binary: str = "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping"
+    enu_binary: str = "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/slam_enu_converter"
     slam_params_file: str = "/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
+    unified_launch_file: str = "/home/dogrobot/robot/install/robot_slam/share/robot_slam/launch/unified_mapping.launch.py"
+    mapping_unit_file: str = "/etc/systemd/system/roamerx-mapping.service"
+    mapping_session_params_file: str = "/home/dogrobot/runtime/nx-edge/conf/mapping-origin-session.yaml"
+    mapping_environment_file: str = "/home/dogrobot/runtime/nx-edge/conf/mapping-session.env"
     slam_command: str = (
-        "exec /home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping "
-        "--ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
+        "exec ros2 launch robot_slam unified_mapping.launch.py"
     )
     mapping_unit: str = "roamerx-mapping.service"
     deployment_manifest: str = "/home/dogrobot/runtime/nx-edge/conf/mapping-deployment.json"
@@ -146,6 +150,7 @@ class MappingConfig:
     preview_max_size: int = 1200
     rosbag_script: str = "/home/dogrobot/robot/script/robot/mapping_rosbag.sh"
     rosbag_stop_timeout_seconds: int = 45
+    divergence_post_record_seconds: float = 3.0
     sensor_start_script: str = "/home/dogrobot/robot/script/robot/ensure_mapping_sensors.sh"
     sensor_start_timeout_seconds: int = 40
     warmup_data: int = 6

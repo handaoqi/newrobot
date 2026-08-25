@@ -11,7 +11,11 @@ User=dogrobot
 Group=robot
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/dogrobot/robot/install/setup.bash && exec /home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping --ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml'
+Environment=ROAMERX_MAPPING_TYPE=indoor
+Environment=ROAMERX_SLAM_PARAMS=/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml
+Environment=ROAMERX_MAPPING_ORIGIN_PARAMS=/dev/null
+EnvironmentFile=-/home/dogrobot/runtime/nx-edge/conf/mapping-session.env
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/dogrobot/robot/install/setup.bash && exec ros2 launch robot_slam unified_mapping.launch.py'
 Restart=no
 KillMode=control-group
 TimeoutStopSec=20

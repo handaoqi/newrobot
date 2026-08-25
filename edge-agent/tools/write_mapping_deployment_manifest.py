@@ -42,17 +42,18 @@ def main() -> int:
     parser.add_argument("--repo", type=Path, default=Path("/home/dogrobot"))
     parser.add_argument("--slam-binary", type=Path, default=Path(
         "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping"))
+    parser.add_argument("--enu-binary", type=Path, default=Path(
+        "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/slam_enu_converter"))
     parser.add_argument("--slam-params", type=Path, default=Path(
         "/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"))
+    parser.add_argument("--unified-launch-file", type=Path, default=Path(
+        "/home/dogrobot/robot/install/robot_slam/share/robot_slam/launch/unified_mapping.launch.py"))
     parser.add_argument("--mapping-adapter", type=Path, default=Path(
         "/home/dogrobot/edge-agent/roamerx_edge/mapping_adapter.py"))
     parser.add_argument("--mapping-unit-file", type=Path, default=Path(
         "/etc/systemd/system/roamerx-mapping.service"))
     parser.add_argument("--mapping-unit", default="roamerx-mapping.service")
-    parser.add_argument("--slam-command", default=(
-        "exec /home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping "
-        "--ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
-    ))
+    parser.add_argument("--slam-command", default="exec ros2 launch robot_slam unified_mapping.launch.py")
     parser.add_argument("--output", type=Path, default=Path(
         "/home/dogrobot/runtime/nx-edge/conf/mapping-deployment.json"))
     args = parser.parse_args()
@@ -62,13 +63,16 @@ def main() -> int:
         "generated_at_unix": round(time.time(), 3),
         "git_commit": git_value(args.repo, "rev-parse", "HEAD"),
         "git_dirty": bool(git_value(args.repo, "status", "--porcelain")),
+        "edge_agent_version": "0.1.0",
         "configuration": {
             "mapping_unit": args.mapping_unit,
             "slam_command": args.slam_command,
         },
         "artifacts": {
             "slam_binary": artifact(args.slam_binary),
+            "enu_binary": artifact(args.enu_binary),
             "slam_params_file": artifact(args.slam_params),
+            "unified_launch_file": artifact(args.unified_launch_file),
             "mapping_adapter": artifact(args.mapping_adapter),
             "mapping_unit_file": artifact(args.mapping_unit_file),
         },

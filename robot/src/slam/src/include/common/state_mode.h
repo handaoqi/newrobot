@@ -18,6 +18,7 @@ namespace robot::slam
         READY,    // The SLAM system is ready to start processing.
         WARMUP,   // Estimator runs, but formal keyframe capture stays closed.
         ACTIVE,   // The SLAM system is actively running and processing data.
+        SAFE_HOLD,// Mapping is frozen after a confirmed health anomaly while evidence is flushed.
         ERROR,    // The SLAM system encountered an error.
         SAVE,     // The SLAM system encountered an save.
         SUCCESS,  // The SLAM system has successfully completed its operations.

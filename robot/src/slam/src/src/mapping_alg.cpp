@@ -16,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <openssl/evp.h>
 #include <regex>
 #include <stdexcept>
 #include <sys/statvfs.h>
@@ -26,6 +27,43 @@ namespace robot::slam
 {
     namespace
     {
+        std::string sha256File(const std::string& path)
+        {
+            std::ifstream input(path, std::ios::binary);
+            if (!input.is_open())
+                return {};
+            EVP_MD_CTX* context = EVP_MD_CTX_new();
+            if (!context || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1)
+            {
+                EVP_MD_CTX_free(context);
+                return {};
+            }
+            std::array<char, 65536> buffer {};
+            while (input.good())
+            {
+                input.read(buffer.data(), buffer.size());
+                if (input.gcount() > 0
+                    && EVP_DigestUpdate(context, buffer.data(), static_cast<std::size_t>(input.gcount())) != 1)
+                {
+                    EVP_MD_CTX_free(context);
+                    return {};
+                }
+            }
+            std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+            unsigned int digest_size = 0;
+            if (EVP_DigestFinal_ex(context, digest.data(), &digest_size) != 1)
+            {
+                EVP_MD_CTX_free(context);
+                return {};
+            }
+            EVP_MD_CTX_free(context);
+            std::ostringstream output;
+            output << std::hex << std::setfill('0');
+            for (unsigned int index = 0; index < digest_size; ++index)
+                output << std::setw(2) << static_cast<unsigned int>(digest[index]);
+            return output.str();
+        }
+
 #pragma pack(push, 1)
         struct BinaryPcdPoint
         {
@@ -225,13 +263,9 @@ namespace robot::slam
         this->declare_parameter<double>("imu_init.max_gyro_variance", 0.05);
         this->declare_parameter<bool>("gnss_fusion.enable", false);
         this->declare_parameter<string>("gnss_fusion.origin_file", "/home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml");
-        this->declare_parameter<double>("gnss_fusion.gain", 0.03);
-        this->declare_parameter<double>("gnss_fusion.max_correction_step", 0.10);
-        this->declare_parameter<double>("gnss_fusion.max_residual", 5.0);
         this->declare_parameter<double>("gnss_fusion.max_age", 1.5);
         this->declare_parameter<double>("gnss_fusion.max_horizontal_std", 1.5);
         this->declare_parameter<int>("gnss_fusion.min_status", 0);
-        this->declare_parameter<bool>("gnss_fusion.use_elevation", false);
         this->declare_parameter<vector<double>>("gnss_fusion.lever_arm_base", vector<double>({ -0.05, 0.0, 0.15 }));
         this->declare_parameter<int>("gnss_fusion.alignment_min_samples", 20);
         this->declare_parameter<double>("gnss_fusion.alignment_min_baseline", 15.0);
@@ -299,6 +333,7 @@ namespace robot::slam
         this->declare_parameter<double>("global_optimization.loop_rotation_sigma_rad", 0.08);
         this->declare_parameter<double>("global_optimization.robust_huber_k", 1.345);
         this->declare_parameter<bool>("global_optimization.use_imu_factor", true);
+        this->declare_parameter<bool>("global_optimization.use_gps", true);
         this->declare_parameter<double>("global_optimization.max_pose_jump_m", 25.0);
         this->declare_parameter<double>("global_optimization.max_abs_z_change_m", 1.5);
         this->declare_parameter<string>("storage.data_path", "");
@@ -352,6 +387,7 @@ namespace robot::slam
         this->get_parameter_or<double>("global_optimization.loop_rotation_sigma_rad", global_factor_graph_config_.loop_rotation_sigma_rad, 0.08);
         this->get_parameter_or<double>("global_optimization.robust_huber_k", global_factor_graph_config_.robust_huber_k, 1.345);
         this->get_parameter_or<bool>("global_optimization.use_imu_factor", global_factor_graph_config_.use_imu_factor, true);
+        this->get_parameter_or<bool>("global_optimization.use_gps", use_gps_config_enabled_, true);
         this->get_parameter_or<double>("global_optimization.max_pose_jump_m", global_factor_graph_config_.max_pose_jump_m, 25.0);
         this->get_parameter_or<double>("global_optimization.max_abs_z_change_m", global_factor_graph_config_.max_abs_z_change_m, 1.5);
         global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
@@ -366,6 +402,7 @@ namespace robot::slam
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
         this->get_parameter_or<string>("common.gnss_topic", gnss_topic, "/fix");
+        this->get_parameter_or<string>("common.enu_odom_topic", enu_odom_topic, "/gnss/enu_odom");
         this->get_parameter_or<string>("common.rtk_pvh_topic", rtk_pvh_topic, "/rtk_pvh");
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
@@ -395,15 +432,12 @@ namespace robot::slam
         this->get_parameter_or<double>("imu_init.max_acc_variance", imu_init_max_acc_variance, 0.5);
         this->get_parameter_or<double>("imu_init.max_gyro_variance", imu_init_max_gyro_variance, 0.05);
         this->get_parameter_or<bool>("gnss_fusion.enable", use_gnss_fusion_, false);
+        use_gnss_fusion_ = use_gnss_fusion_ && use_gps_config_enabled_;
         gnss_fusion_config_enabled_ = use_gnss_fusion_;
         this->get_parameter_or<string>("gnss_fusion.origin_file", gnss_origin_file_, "/home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml");
-        this->get_parameter_or<double>("gnss_fusion.gain", gnss_fusion_gain_, 0.03);
-        this->get_parameter_or<double>("gnss_fusion.max_correction_step", gnss_max_correction_step_, 0.10);
-        this->get_parameter_or<double>("gnss_fusion.max_residual", gnss_max_residual_, 5.0);
         this->get_parameter_or<double>("gnss_fusion.max_age", gnss_max_age_, 1.5);
         this->get_parameter_or<double>("gnss_fusion.max_horizontal_std", gnss_max_horizontal_std_, 1.5);
         this->get_parameter_or<int>("gnss_fusion.min_status", gnss_min_status_, 0);
-        this->get_parameter_or<bool>("gnss_fusion.use_elevation", gnss_use_elevation_, false);
         std::vector<double> gnss_lever_arm;
         this->get_parameter_or<vector<double>>("gnss_fusion.lever_arm_base", gnss_lever_arm, vector<double>({ -0.05, 0.0, 0.15 }));
         if (gnss_lever_arm.size() >= 3)
@@ -491,6 +525,8 @@ namespace robot::slam
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
         sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
             gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+        sub_enu_odom_ptr_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            enu_odom_topic, 20, std::bind(&MappingAlg::enuOdometryCallBack, this, std::placeholders::_1));
         sub_rtk_pvh_ptr_ = this->create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
             rtk_pvh_topic, 20, std::bind(&MappingAlg::rtkPvhCallBack, this, std::placeholders::_1));
         if (odom_guard_enable_)
@@ -499,8 +535,8 @@ namespace robot::slam
                 odom_guard_topic, rclcpp::QoS(100).best_effort(),
                 std::bind(&MappingAlg::odomGuardCallBack, this, std::placeholders::_1));
         }
-        RCLCPP_INFO(this->get_logger(), "GNSS collection enabled on %s; pose correction=%s heading_lock=%s", gnss_topic.c_str(),
-            use_gnss_fusion_ ? "enabled after alignment lock" : "disabled",
+        RCLCPP_INFO(this->get_logger(), "GNSS audit=%s ENU factors=%s frontend_pose_correction=disabled heading_lock=%s", gnss_topic.c_str(),
+            enu_odom_topic.c_str(),
             gnss_use_heading_ ? "enabled" : "disabled");
         RCLCPP_INFO(this->get_logger(), "Odometry replay guard=%s topic=%s", odom_guard_enable_ ? "enabled" : "disabled",
             odom_guard_topic.c_str());
@@ -514,6 +550,8 @@ namespace robot::slam
         pubGlobalOptimizedPath_ = this->create_publisher<nav_msgs::msg::Path>("/slam/global_optimized_path", 10);
         pubGlobalOptimizationStatus_ = this->create_publisher<std_msgs::msg::String>(
             "/slam/global_optimization_status", rclcpp::QoS(1).transient_local());
+        pubDivergenceEvent_ = this->create_publisher<std_msgs::msg::String>(
+            "/slam/divergence_event", rclcpp::QoS(1).transient_local());
         tf_broadcaster_         = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         state_service_ = this->create_service<robots_dog_msgs::srv::MapState>(
@@ -854,6 +892,10 @@ namespace robot::slam
             gnss_origin_initialized_ = false;
             gnss_correction_count_ = 0;
         }
+        {
+            std::lock_guard<std::mutex> enu_lock(enu_mutex_);
+            has_enu_odometry_ = false;
+        }
         gnss_alignment_samples_.clear();
         gnss_alignment_locked_ = false;
         gnss_alignment_source_.clear();
@@ -893,8 +935,16 @@ namespace robot::slam
         no_effective_points_streak_ = 0;
         pose_anomaly_streak_ = 0;
         has_last_health_pose_ = false;
+        last_health_position_ = Zero3d;
+        last_health_yaw_ = 0.0;
         last_health_stamp_ = 0.0;
+        health_prediction_position_ = Zero3d;
+        health_prediction_yaw_ = 0.0;
         mapping_started_stamp_ = 0.0;
+        health_start_z_m_ = 0.0;
+        has_health_start_z_ = false;
+        last_healthy_keyframe_ = -1;
+        divergence_trigger_type_.clear();
         mapping_capture_enabled_ = false;
         slam_pose_ready_ = false;
         mapping_keyframes_.clear();
@@ -929,6 +979,8 @@ namespace robot::slam
     bool MappingAlg::loadLockedGnssOrigin()
     {
         gnss_origin_prelocked_ = false;
+        gnss_origin_session_id_.clear();
+        gnss_origin_sha256_.clear();
         if (gnss_origin_file_.empty())
             return false;
         std::ifstream input(gnss_origin_file_);
@@ -938,6 +990,7 @@ namespace robot::slam
         bool has_lat = false;
         bool has_lon = false;
         bool has_alt = false;
+        bool has_session_id = false;
         std::string line;
         try
         {
@@ -963,8 +1016,18 @@ namespace robot::slam
                     gnss_origin_alt_ = std::stod(value);
                     has_alt = true;
                 }
+                else if (key == "origin_lock_session_id")
+                {
+                    const auto first = value.find_first_not_of(" \t\"'");
+                    const auto last = value.find_last_not_of(" \t\"'");
+                    if (first != std::string::npos)
+                        gnss_origin_session_id_ = value.substr(first, last - first + 1);
+                    has_session_id = !gnss_origin_session_id_.empty();
+                }
                 else if (key == "alignment_locked")
-                    locked = value.find("true") != std::string::npos || value.find("True") != std::string::npos;
+                    locked = value.find("true") != std::string::npos
+                        || value.find("True") != std::string::npos
+                        || value.find('1') != std::string::npos;
             }
         }
         catch (const std::exception& exc)
@@ -972,11 +1035,22 @@ namespace robot::slam
             RCLCPP_ERROR(get_logger(), "Invalid locked GNSS origin %s: %s", gnss_origin_file_.c_str(), exc.what());
             return false;
         }
-        gnss_origin_initialized_ = locked && has_lat && has_lon && has_alt;
+        const bool finite = std::isfinite(gnss_origin_lat_) && std::isfinite(gnss_origin_lon_)
+            && std::isfinite(gnss_origin_alt_);
+        const bool in_range = gnss_origin_lat_ >= -90.0 && gnss_origin_lat_ <= 90.0
+            && gnss_origin_lon_ >= -180.0 && gnss_origin_lon_ <= 180.0;
+        const bool all_zero = std::fabs(gnss_origin_lat_) < 1e-12 && std::fabs(gnss_origin_lon_) < 1e-12
+            && std::fabs(gnss_origin_alt_) < 1e-9;
+        gnss_origin_sha256_ = sha256File(gnss_origin_file_);
+        gnss_origin_initialized_ = locked && has_lat && has_lon && has_alt && has_session_id
+            && finite && in_range && !all_zero && gnss_origin_sha256_.size() == 64;
         gnss_origin_prelocked_ = gnss_origin_initialized_;
         if (gnss_origin_prelocked_)
-            RCLCPP_INFO(get_logger(), "Loaded locked ENU origin %.10f, %.10f, %.3f from %s",
-                gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_, gnss_origin_file_.c_str());
+            RCLCPP_INFO(get_logger(), "Loaded locked ENU origin %.10f, %.10f, %.3f session=%s sha256=%s",
+                gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_, gnss_origin_session_id_.c_str(),
+                gnss_origin_sha256_.c_str());
+        else
+            RCLCPP_ERROR(get_logger(), "Rejected invalid locked ENU origin file %s", gnss_origin_file_.c_str());
         return gnss_origin_prelocked_;
     }
 
@@ -1114,6 +1188,19 @@ namespace robot::slam
         has_gnss_    = true;
     }
 
+    void MappingAlg::enuOdometryCallBack(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        if (msg->header.frame_id != "enu")
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                "Reject ENU odometry with frame_id=%s", msg->header.frame_id.c_str());
+            return;
+        }
+        std::lock_guard<std::mutex> lock(enu_mutex_);
+        latest_enu_odometry_ = *msg;
+        has_enu_odometry_ = true;
+    }
+
     void MappingAlg::rtkPvhCallBack(const robots_dog_msgs::msg::UniRtkPvh::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(gnss_heading_mutex_);
@@ -1233,30 +1320,13 @@ namespace robot::slam
         return !rejected;
     }
 
-    Vec3d MappingAlg::llaToEnu(double latitude_deg, double longitude_deg, double altitude_m) const
+    bool MappingAlg::enuToMap(const nav_msgs::msg::Odometry& msg, Vec3d& map_pos) const
     {
-        constexpr double kEarthRadiusM = 6378137.0;
-        constexpr double kDegToRad     = M_PI / 180.0;
-        const double     d_lat         = (latitude_deg - gnss_origin_lat_) * kDegToRad;
-        const double     d_lon         = (longitude_deg - gnss_origin_lon_) * kDegToRad;
-        const double     lat0          = gnss_origin_lat_ * kDegToRad;
-        return Vec3d(d_lon * std::cos(lat0) * kEarthRadiusM, d_lat * kEarthRadiusM, altitude_m - gnss_origin_alt_);
-    }
-
-    bool MappingAlg::gnssToMap(const sensor_msgs::msg::NavSatFix& msg, Vec3d& map_pos)
-    {
-        if (msg.status.status < gnss_min_status_)
+        if (!gnss_origin_initialized_ || !gnss_alignment_locked_ || msg.header.frame_id != "enu")
             return false;
-        if (std::fabs(msg.latitude) < 1e-7 || std::fabs(msg.longitude) < 1e-7)
+        const Vec3d enu(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z);
+        if (!enu.allFinite())
             return false;
-        const double h_std = std::sqrt(std::max(msg.position_covariance[0], msg.position_covariance[4]));
-        if (h_std > gnss_max_horizontal_std_)
-            return false;
-
-        if (!gnss_origin_initialized_ || !gnss_alignment_locked_)
-            return false;
-
-        const Vec3d enu = llaToEnu(msg.latitude, msg.longitude, msg.altitude);
         const double cosine = std::cos(gnss_enu_to_map_yaw_);
         const double sine = std::sin(gnss_enu_to_map_yaw_);
         map_pos(0) = cosine * enu(0) - sine * enu(1) + gnss_enu_to_map_translation_(0);
@@ -1270,40 +1340,30 @@ namespace robot::slam
         if (!use_gnss_fusion_ || !flg_EKF_inited || slam_diverged_ || !mapping_capture_enabled_)
             return;
 
-        sensor_msgs::msg::NavSatFix gnss;
+        nav_msgs::msg::Odometry enu_odometry;
         {
-            std::lock_guard<std::mutex> lock(gnss_mutex_);
-            if (!has_gnss_)
+            std::lock_guard<std::mutex> lock(enu_mutex_);
+            if (!has_enu_odometry_)
                 return;
-            gnss = latest_gnss_;
+            enu_odometry = latest_enu_odometry_;
         }
-        const double gnss_time = get_time_sec(gnss.header.stamp);
+        const double gnss_time = get_time_sec(enu_odometry.header.stamp);
         if (gnss_time <= gnss_last_alignment_stamp_ + 1e-6 || std::fabs(lidar_time - gnss_time) > gnss_max_age_)
             return;
-        if (gnss.status.status < gnss_min_status_ || std::fabs(gnss.latitude) < 1e-7 || std::fabs(gnss.longitude) < 1e-7)
-            return;
-        const double h_std = std::sqrt(std::max(0.0,
-            std::max(gnss.position_covariance[0], gnss.position_covariance[4])));
+        const double h_std = std::sqrt(std::max(0.0, std::max(
+            enu_odometry.pose.covariance[0], enu_odometry.pose.covariance[7])));
         if (!std::isfinite(h_std) || h_std > gnss_max_horizontal_std_)
             return;
-
-        if (!gnss_origin_initialized_)
-        {
-            gnss_origin_lat_ = gnss.latitude;
-            gnss_origin_lon_ = gnss.longitude;
-            gnss_origin_alt_ = gnss.altitude;
-            gnss_origin_initialized_ = true;
-            RCLCPP_INFO(get_logger(), "GNSS origin collected lat=%.9f lon=%.9f alt=%.3f; waiting for heading or trajectory ENU-map alignment",
-                gnss_origin_lat_, gnss_origin_lon_, gnss_origin_alt_);
-        }
-
-        const Vec3d enu = llaToEnu(gnss.latitude, gnss.longitude, gnss.altitude);
+        const Vec3d enu(enu_odometry.pose.pose.position.x, enu_odometry.pose.pose.position.y,
+            enu_odometry.pose.pose.position.z);
+        if (!enu.allFinite())
+            return;
         const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
         gnss_alignment_samples_.push_back({ enu.head<2>(), estimated_gps.head<2>(), gnss_time });
         gnss_last_alignment_stamp_ = gnss_time;
         while (gnss_alignment_samples_.size() > gnss_alignment_max_samples_)
             gnss_alignment_samples_.pop_front();
-        if (!lockGnssAlignmentFromHeading(gnss))
+        if (!lockGnssAlignmentFromHeading(enu_odometry))
             estimateGnssAlignment();
     }
 
@@ -1323,7 +1383,7 @@ namespace robot::slam
             && age_s <= gnss_heading_max_age_s_;
     }
 
-    bool MappingAlg::lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss)
+    bool MappingAlg::lockGnssAlignmentFromHeading(const nav_msgs::msg::Odometry& enu_odometry)
     {
         if (gnss_alignment_locked_ || !gnss_use_heading_ || !gnss_origin_initialized_
             || !mapping_capture_enabled_ || !p_imu->initialization_ready() || !slam_pose_ready_)
@@ -1341,7 +1401,10 @@ namespace robot::slam
         const double alignment_yaw = std::atan2(
             std::sin(slam_yaw - yaw_enu - gnss_heading_offset_rad_),
             std::cos(slam_yaw - yaw_enu - gnss_heading_offset_rad_));
-        const Vec3d enu = llaToEnu(gnss.latitude, gnss.longitude, gnss.altitude);
+        const Vec3d enu(enu_odometry.pose.pose.position.x, enu_odometry.pose.pose.position.y,
+            enu_odometry.pose.pose.position.z);
+        if (!enu.allFinite())
+            return false;
         const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
         const double cosine = std::cos(alignment_yaw);
         const double sine = std::sin(alignment_yaw);
@@ -1366,18 +1429,18 @@ namespace robot::slam
         if (gnss_alignment_locked_ || !gnss_use_heading_ || !mapping_capture_enabled_)
             return;
 
-        sensor_msgs::msg::NavSatFix gnss;
+        nav_msgs::msg::Odometry enu_odometry;
         {
-            std::lock_guard<std::mutex> lock(gnss_mutex_);
-            if (!has_gnss_)
+            std::lock_guard<std::mutex> lock(enu_mutex_);
+            if (!has_enu_odometry_)
             {
                 RCLCPP_WARN(get_logger(),
-                    "Formal capture started; GNSS heading lock deferred because no RTK fix is available yet");
+                    "Formal capture started; GNSS heading lock deferred because no ENU odometry is available yet");
                 return;
             }
-            gnss = latest_gnss_;
+            enu_odometry = latest_enu_odometry_;
         }
-        if (lockGnssAlignmentFromHeading(gnss))
+        if (lockGnssAlignmentFromHeading(enu_odometry))
             return;
         RCLCPP_WARN(get_logger(),
             "Formal capture started; dual-antenna heading lock is not ready. "
@@ -1474,94 +1537,146 @@ namespace robot::slam
         return gnss_alignment_locked_;
     }
 
-    void MappingAlg::applyGnssCorrection(double lidar_time)
+    void MappingAlg::markSlamDiverged(const std::string& reason)
     {
-        if (!use_gnss_fusion_ || !flg_EKF_inited || !mapping_capture_enabled_)
-            return;
-
-        sensor_msgs::msg::NavSatFix gnss;
-        {
-            std::lock_guard<std::mutex> lock(gnss_mutex_);
-            if (!has_gnss_)
-                return;
-            gnss = latest_gnss_;
-        }
-
-        const double gnss_time = get_time_sec(gnss.header.stamp);
-        if (std::fabs(lidar_time - gnss_time) > gnss_max_age_)
-            return;
-
-        Vec3d gnss_gps_map;
-        if (!gnssToMap(gnss, gnss_gps_map))
-            return;
-
-        const Vec3d estimated_gps = state_point.pos + state_point.rot * gnss_lever_arm_base_;
-        Vec3d       residual      = gnss_gps_map - estimated_gps;
-        if (!gnss_use_elevation_)
-            residual(2) = 0.0;
-
-        const double residual_norm = residual.norm();
-        if (residual_norm > gnss_max_residual_)
-        {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-                "Reject GNSS correction: residual %.2fm exceeds %.2fm", residual_norm, gnss_max_residual_);
-            return;
-        }
-
-        // Fixed RTK acts as the primary absolute-position constraint. Float
-        // solutions remain useful, but are deliberately applied more softly.
-        const double quality_gain = gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX
-            ? gnss_fusion_gain_ : gnss_fusion_gain_ * 0.25;
-        Vec3d correction = residual * quality_gain;
-        const double correction_norm = correction.norm();
-        if (correction_norm > gnss_max_correction_step_)
-        {
-            correction *= gnss_max_correction_step_ / correction_norm;
-        }
-
-        if (correction.norm() < 1e-4)
-            return;
-
-        state_ikfom corrected = state_point;
-        corrected.pos += correction;
-        kf.change_x(corrected);
-        state_point = corrected;
-        gnss_correction_count_++;
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "GNSS correction #%d mode=%s residual=%.2fm step=%.3fm", gnss_correction_count_,
-            gnss.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX ? "rtk_primary" : "hybrid",
-            residual_norm, correction.norm());
+        enterSafeHold(reason, "fatal", HealthDecision::FATAL);
     }
 
-    void MappingAlg::markSlamDiverged(const std::string& reason)
+    void MappingAlg::writeDivergenceEvent(const std::string& reason, const std::string& trigger_type)
+    {
+        if (active_map_subdir_.empty())
+            return;
+        std::size_t queued_keyframes = 0;
+        std::size_t written_keyframes = 0;
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            queued_keyframes = keyframe_write_queue_.size() + (keyframe_writer_active_ ? 1 : 0);
+            written_keyframes = written_keyframes_;
+        }
+        double gnss_stamp = -1.0;
+        double enu_stamp = -1.0;
+        double odom_stamp = -1.0;
+        {
+            std::lock_guard<std::mutex> lock(gnss_mutex_);
+            if (has_gnss_)
+                gnss_stamp = rclcpp::Time(latest_gnss_.header.stamp).seconds();
+        }
+        {
+            std::lock_guard<std::mutex> lock(enu_mutex_);
+            if (has_enu_odometry_)
+                enu_stamp = rclcpp::Time(latest_enu_odometry_.header.stamp).seconds();
+        }
+        {
+            std::lock_guard<std::mutex> lock(odom_guard_mutex_);
+            if (has_odom_guard_)
+                odom_stamp = rclcpp::Time(latest_odom_guard_.header.stamp).seconds();
+        }
+        const auto rejected_rotation = state_point.rot.toRotationMatrix();
+        const double rejected_yaw = std::atan2(rejected_rotation(1, 0), rejected_rotation(0, 0));
+        std::ostringstream json;
+        json << "{\n"
+             << "  \"format\": \"roamerx.slam-divergence.v1\",\n"
+             << "  \"state\": \"SAFE_HOLD\",\n"
+             << "  \"trigger_type\": \"" << jsonEscape(trigger_type) << "\",\n"
+             << "  \"reason\": \"" << jsonEscape(reason) << "\",\n"
+             << "  \"map_dir\": \"" << jsonEscape(active_map_subdir_) << "\",\n"
+             << "  \"last_healthy_keyframe\": " << last_healthy_keyframe_ << ",\n"
+             << "  \"last_healthy_stamp\": " << std::fixed << std::setprecision(6) << last_health_stamp_ << ",\n"
+             << "  \"last_healthy_position\": [" << last_health_position_(0) << ", "
+             << last_health_position_(1) << ", " << last_health_position_(2) << "],\n"
+             << "  \"last_healthy_yaw\": " << last_health_yaw_ << ",\n"
+             << "  \"prediction_position\": [" << health_prediction_position_(0) << ", "
+             << health_prediction_position_(1) << ", " << health_prediction_position_(2) << "],\n"
+             << "  \"prediction_yaw\": " << health_prediction_yaw_ << ",\n"
+             << "  \"rejected_position\": [" << state_point.pos(0) << ", " << state_point.pos(1)
+             << ", " << state_point.pos(2) << "],\n"
+             << "  \"rejected_yaw\": " << rejected_yaw << ",\n"
+             << "  \"frame_delta_m\": " << health_frame_delta_m_ << ",\n"
+             << "  \"speed_mps\": " << health_speed_mps_ << ",\n"
+             << "  \"pose_z_m\": " << health_pose_z_m_ << ",\n"
+             << "  \"pose_anomaly_streak\": " << pose_anomaly_streak_ << ",\n"
+             << "  \"thresholds\": {\"frame_translation_m\": " << health_max_frame_translation_m_
+             << ", \"speed_mps\": " << health_max_speed_mps_ << ", \"frame_z_m\": "
+             << health_max_frame_z_m_ << "},\n"
+             << "  \"queued_keyframes\": " << queued_keyframes << ",\n"
+             << "  \"written_keyframes\": " << written_keyframes << ",\n"
+             << "  \"sensor_timestamps\": {\"lidar\": " << lidar_end_time
+             << ", \"imu\": " << last_timestamp_imu << ", \"rtk_fix\": " << gnss_stamp
+             << ", \"enu_odom\": " << enu_stamp << ", \"odometry\": " << odom_stamp << "},\n"
+             << "  \"sensor_age_seconds\": {\"imu\": " << std::fabs(lidar_end_time - last_timestamp_imu)
+             << ", \"rtk_fix\": " << (gnss_stamp >= 0.0 ? std::fabs(lidar_end_time - gnss_stamp) : -1.0)
+             << ", \"enu_odom\": " << (enu_stamp >= 0.0 ? std::fabs(lidar_end_time - enu_stamp) : -1.0)
+             << ", \"odometry\": " << (odom_stamp >= 0.0 ? std::fabs(lidar_end_time - odom_stamp) : -1.0)
+             << "},\n"
+             << "  \"updated_at_unix\": " << std::time(nullptr) << "\n"
+             << "}\n";
+        const std::string destination = active_map_subdir_ + "/divergence_event.json";
+        const std::string temporary = destination + ".tmp";
+        std::ofstream output(temporary, std::ios::out | std::ios::trunc);
+        if (output.is_open())
+        {
+            output << json.str();
+            output.close();
+            std::error_code error;
+            std::filesystem::rename(temporary, destination, error);
+            if (error)
+                std::filesystem::remove(temporary);
+        }
+    }
+
+    void MappingAlg::enterSafeHold(
+        const std::string& reason, const std::string& trigger_type, HealthDecision decision)
     {
         if (slam_diverged_)
             return;
+        mapping_capture_enabled_ = false;
         slam_diverged_ = true;
         slam_health_state_ = "diverged";
         slam_health_error_code_ = "SLAM_DIVERGED";
         slam_health_error_ = reason;
-        state_.store(SlamState::ERROR);
-        writeSaveProgress("failed", 0.0, reason);
-        RCLCPP_ERROR(get_logger(), "SLAM_DIVERGED: %s; keyframe recording and map export disabled", reason.c_str());
+        divergence_trigger_type_ = trigger_type;
+        state_.store(SlamState::SAFE_HOLD);
+        const bool flushed = flushKeyframeWriter(10.0);
+        if (!flushed && !keyframe_writer_error_.empty())
+            slam_health_error_ += "; " + keyframe_writer_error_;
+        writeDivergenceEvent(slam_health_error_, trigger_type);
+        writeSaveProgress("failed", 0.0, slam_health_error_);
+        if (pubDivergenceEvent_)
+        {
+            std_msgs::msg::String event;
+            event.data = "{\"state\":\"SAFE_HOLD\",\"error_code\":\"SLAM_DIVERGED\","
+                "\"trigger_type\":\"" + jsonEscape(trigger_type) + "\",\"reason\":\""
+                + jsonEscape(slam_health_error_) + "\",\"map_dir\":\""
+                + jsonEscape(active_map_subdir_) + "\",\"last_healthy_keyframe\":"
+                + std::to_string(last_healthy_keyframe_) + ",\"writer_flushed\":"
+                + (flushed ? "true" : "false") + "}";
+            pubDivergenceEvent_->publish(event);
+        }
+        RCLCPP_ERROR(get_logger(), "SLAM SAFE_HOLD (%s/%d): %s", trigger_type.c_str(),
+            static_cast<int>(decision), slam_health_error_.c_str());
     }
 
-    void MappingAlg::updateSlamHealth(double lidar_time)
+    HealthDecision MappingAlg::updateSlamHealth(double lidar_time)
     {
         if (slam_diverged_)
-            return;
+            return HealthDecision::SAFE_HOLD;
         if (!p_imu->initialization_ready())
         {
             slam_health_state_ = "initializing";
-            return;
+            return HealthDecision::ACCEPT;
         }
         if (!state_point.pos.allFinite())
         {
-            markSlamDiverged("pose contains non-finite values");
-            return;
+            enterSafeHold("pose contains non-finite values", "non_finite_pose", HealthDecision::FATAL);
+            return HealthDecision::FATAL;
         }
         if (mapping_started_stamp_ <= 0.0)
             mapping_started_stamp_ = lidar_time;
+        if (!has_health_start_z_)
+        {
+            health_start_z_m_ = state_point.pos(2);
+            has_health_start_z_ = true;
+        }
 
         no_effective_points_streak_ = effct_feat_num < 1 ? no_effective_points_streak_ + 1 : 0;
         if (no_effective_points_streak_ >= health_no_effective_limit_)
@@ -1570,18 +1685,19 @@ namespace robot::slam
             slam_health_warning_ = "scan matching produced no effective points for "
                 + std::to_string(no_effective_points_streak_) + " consecutive scans";
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
-            return;
+            return HealthDecision::ACCEPT;
         }
 
         health_pose_z_m_ = state_point.pos(2);
-        if (health_max_abs_z_m_ > 0.0 && std::fabs(health_pose_z_m_) > health_max_abs_z_m_)
+        if (!use_gnss_fusion_ && health_max_abs_z_m_ > 0.0
+            && std::fabs(health_pose_z_m_ - health_start_z_m_) > health_max_abs_z_m_)
         {
             std::ostringstream reason;
-            reason << "pose height diverged: z=" << health_pose_z_m_ << "m";
-            markSlamDiverged(reason.str());
-            return;
+            reason << "indoor relative pose height diverged: z_delta="
+                   << health_pose_z_m_ - health_start_z_m_ << "m";
+            enterSafeHold(reason.str(), "relative_height", HealthDecision::FATAL);
+            return HealthDecision::FATAL;
         }
-        bool hard_anomaly = false;
         if (has_last_health_pose_)
         {
             const double dt = lidar_time - last_health_stamp_;
@@ -1589,7 +1705,7 @@ namespace robot::slam
             const double speed = dt > 1e-3 ? delta.norm() / dt : 0.0;
             health_frame_delta_m_ = delta.norm();
             health_speed_mps_ = speed;
-            hard_anomaly = delta.norm() > health_max_frame_translation_m_
+            const bool hard_anomaly = delta.norm() > health_max_frame_translation_m_
                 || std::fabs(delta(2)) > health_max_frame_z_m_
                 || speed > health_max_speed_mps_;
             pose_anomaly_streak_ = hard_anomaly ? pose_anomaly_streak_ + 1 : 0;
@@ -1600,20 +1716,29 @@ namespace robot::slam
                        << "m/s z=" << state_point.pos(2) << "m";
                 slam_health_state_ = "degraded";
                 slam_health_warning_ = reason.str();
-                last_health_position_ = state_point.pos;
-                last_health_stamp_ = lidar_time;
-                has_last_health_pose_ = true;
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
                 if (pose_anomaly_streak_ >= std::max(1, health_pose_guard_frames_))
-                    markSlamDiverged(reason.str());
-                return;
+                {
+                    enterSafeHold(reason.str(), "pose_anomaly", HealthDecision::SAFE_HOLD);
+                    return HealthDecision::SAFE_HOLD;
+                }
+                return HealthDecision::REJECT_FRAME;
             }
         }
         has_last_health_pose_ = true;
         last_health_position_ = state_point.pos;
+        {
+            const auto rotation = state_point.rot.toRotationMatrix();
+            last_health_yaw_ = std::atan2(rotation(1, 0), rotation(0, 0));
+        }
         last_health_stamp_ = lidar_time;
+        {
+            std::lock_guard<std::mutex> lock(keyframe_writer_mutex_);
+            last_healthy_keyframe_ = mapping_keyframes_.empty()
+                ? -1 : static_cast<long long>(mapping_keyframes_.back().index);
+        }
         slam_health_warning_.clear();
-        if (hard_anomaly || health_speed_mps_ > health_warn_speed_mps_)
+        if (health_speed_mps_ > health_warn_speed_mps_)
         {
             slam_health_state_ = "degraded";
             std::ostringstream warning;
@@ -1636,6 +1761,7 @@ namespace robot::slam
         {
             slam_health_state_ = "healthy";
         }
+        return HealthDecision::ACCEPT;
     }
 
     bool MappingAlg::validateMappingSession(std::string& reason) const
@@ -1887,6 +2013,26 @@ namespace robot::slam
             }
         }
         {
+            std::lock_guard<std::mutex> enu_lock(enu_mutex_);
+            if (has_enu_odometry_)
+            {
+                metadata.enu_position << latest_enu_odometry_.pose.pose.position.x,
+                    latest_enu_odometry_.pose.pose.position.y, latest_enu_odometry_.pose.pose.position.z;
+                metadata.enu_stamp = get_time_sec(latest_enu_odometry_.header.stamp);
+                metadata.enu_age_seconds = std::fabs(lidar_end_time - metadata.enu_stamp);
+                metadata.enu_covariance_x = latest_enu_odometry_.pose.covariance[0];
+                metadata.enu_covariance_y = latest_enu_odometry_.pose.covariance[7];
+                metadata.enu_covariance_z = latest_enu_odometry_.pose.covariance[14];
+                const double horizontal_std = std::sqrt(std::max(0.0,
+                    std::max(metadata.enu_covariance_x, metadata.enu_covariance_y)));
+                metadata.enu_valid = use_gnss_fusion_ && metadata.enu_position.allFinite()
+                    && metadata.enu_age_seconds <= gnss_max_age_
+                    && std::isfinite(horizontal_std) && horizontal_std <= gnss_max_horizontal_std_;
+                metadata.enu_origin_session_id = gnss_origin_session_id_;
+                metadata.enu_origin_sha256 = gnss_origin_sha256_;
+            }
+        }
+        {
             double heading_deg = 0.0;
             double heading_std_deg = 0.0;
             double heading_age = 0.0;
@@ -1894,6 +2040,9 @@ namespace robot::slam
             metadata.rtk_heading_deg = heading_deg;
             metadata.rtk_heading_std_deg = heading_std_deg;
             metadata.rtk_heading_age_seconds = heading_age;
+            metadata.enu_yaw = std::atan2(
+                std::sin(M_PI / 2.0 - heading_deg * M_PI / 180.0 + gnss_heading_offset_rad_),
+                std::cos(M_PI / 2.0 - heading_deg * M_PI / 180.0 + gnss_heading_offset_rad_));
         }
 
         {
@@ -1936,7 +2085,8 @@ namespace robot::slam
                      "gyro_bias_x,gyro_bias_y,gyro_bias_z,gravity_x,gravity_y,gravity_z,"
                      "scan_context_index,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,"
                      "rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,"
-                     "rtk_heading_age_seconds\n";
+                     "rtk_heading_age_seconds,enu_valid,enu_x,enu_y,enu_z,enu_yaw,enu_stamp,enu_age_seconds,"
+                     "enu_covariance_x,enu_covariance_y,enu_covariance_z,enu_origin_session_id,enu_origin_sha256\n";
             poses.close();
             resetImuPreintegration(0.0);
             startKeyframeWriter();
@@ -2083,6 +2233,17 @@ namespace robot::slam
                 keyframe.rtk_heading_deg = std::stod(field("rtk_heading_deg"));
                 keyframe.rtk_heading_std_deg = std::stod(field("rtk_heading_std_deg"));
                 keyframe.rtk_heading_age_seconds = std::stod(field("rtk_heading_age_seconds"));
+                keyframe.enu_valid = std::stoi(field("enu_valid")) != 0;
+                keyframe.enu_position << std::stod(field("enu_x")), std::stod(field("enu_y")),
+                    std::stod(field("enu_z"));
+                keyframe.enu_yaw = std::stod(field("enu_yaw"));
+                keyframe.enu_stamp = std::stod(field("enu_stamp"));
+                keyframe.enu_age_seconds = std::stod(field("enu_age_seconds"));
+                keyframe.enu_covariance_x = std::stod(field("enu_covariance_x"));
+                keyframe.enu_covariance_y = std::stod(field("enu_covariance_y"));
+                keyframe.enu_covariance_z = std::stod(field("enu_covariance_z"));
+                keyframe.enu_origin_session_id = field("enu_origin_session_id", "");
+                keyframe.enu_origin_sha256 = field("enu_origin_sha256", "");
                 std::ostringstream file_name;
                 file_name << (latest_dir / "keyframes" / "scan_").string()
                           << std::setw(5) << std::setfill('0') << keyframe.index << ".pcd";
@@ -2155,12 +2316,24 @@ namespace robot::slam
         keyframe_writer_thread_.join();
     }
 
-    bool MappingAlg::flushKeyframeWriter()
+    bool MappingAlg::flushKeyframeWriter(double timeout_seconds)
     {
         std::unique_lock<std::mutex> lock(keyframe_writer_mutex_);
-        keyframe_writer_cv_.wait(lock, [this]() {
+        const auto complete = [this]() {
             return keyframe_writer_failed_ || (keyframe_write_queue_.empty() && !keyframe_writer_active_);
-        });
+        };
+        if (timeout_seconds > 0.0)
+        {
+            if (!keyframe_writer_cv_.wait_for(lock, std::chrono::duration<double>(timeout_seconds), complete))
+            {
+                keyframe_writer_error_ = "timed out flushing keyframes during SAFE_HOLD";
+                return false;
+            }
+        }
+        else
+        {
+            keyframe_writer_cv_.wait(lock, complete);
+        }
         return !keyframe_writer_failed_;
     }
 
@@ -2222,7 +2395,13 @@ namespace robot::slam
                       << std::setprecision(4) << keyframe.rtk_altitude << ',' << keyframe.rtk_horizontal_std << ','
                       << keyframe.rtk_age_seconds << ',' << (keyframe.rtk_heading_valid ? 1 : 0) << ','
                       << keyframe.rtk_heading_deg << ',' << keyframe.rtk_heading_std_deg << ','
-                      << keyframe.rtk_heading_age_seconds << '\n';
+                      << keyframe.rtk_heading_age_seconds << ',' << (keyframe.enu_valid ? 1 : 0) << ','
+                      << std::setprecision(6) << keyframe.enu_position(0) << ',' << keyframe.enu_position(1) << ','
+                      << keyframe.enu_position(2) << ',' << keyframe.enu_yaw << ','
+                      << keyframe.enu_stamp << ',' << keyframe.enu_age_seconds << ','
+                      << keyframe.enu_covariance_x << ',' << keyframe.enu_covariance_y << ','
+                      << keyframe.enu_covariance_z << ',' << keyframe.enu_origin_session_id << ','
+                      << keyframe.enu_origin_sha256 << '\n';
                 poses.close();
                 if (!writeImuPreintegrationFile(keyframe))
                     throw std::runtime_error("cannot write " + keyframe.preintegration_file);
@@ -2539,18 +2718,29 @@ namespace robot::slam
                 int  rematch_num       = 0;
                 bool nearest_search_en = true;  //
 
-                const state_ikfom guarded_prediction = kf.get_x();
+                state_ikfom guarded_prediction = kf.get_x();
+                health_prediction_position_ = guarded_prediction.pos;
+                {
+                    const auto rotation = guarded_prediction.rot.toRotationMatrix();
+                    health_prediction_yaw_ = std::atan2(rotation(1, 0), rotation(0, 0));
+                }
                 double solve_H_time = 0;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
                 const bool lidar_update_accepted = !odom_guard_active
                     || acceptOdomGuardCorrection(Measures.lidar_end_time, guarded_prediction);
                 collectGnssAlignment(Measures.lidar_end_time);
-                applyGnssCorrection(Measures.lidar_end_time);
                 state_point = kf.get_x();
-                updateSlamHealth(Measures.lidar_end_time);
-                if (slam_diverged_)
+                const HealthDecision health_decision = updateSlamHealth(Measures.lidar_end_time);
+                if (health_decision != HealthDecision::ACCEPT)
+                {
+                    kf.change_x(guarded_prediction);
+                    state_point = guarded_prediction;
+                    publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+                    if (path_en)
+                        publish_path(pubPath_);
                     return;
+                }
                 euler_cur   = SO3ToEuler(state_point.rot);
                 pos_lid     = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 geoQuat.x   = state_point.rot.coeffs()[0];
@@ -3146,21 +3336,23 @@ namespace robot::slam
             frame.initial_bias = gtsam::imuBias::ConstantBias(
                 gtsam::Vector3(keyframe.accel_bias(0), keyframe.accel_bias(1), keyframe.accel_bias(2)),
                 gtsam::Vector3(keyframe.gyro_bias(0), keyframe.gyro_bias(1), keyframe.gyro_bias(2)));
-            if (use_gnss_fusion_ && keyframe.rtk_valid && gnss_origin_initialized_ && gnss_alignment_locked_)
+            if (use_gnss_fusion_ && keyframe.enu_valid && gnss_origin_initialized_ && gnss_alignment_locked_)
             {
-                sensor_msgs::msg::NavSatFix fix;
-                fix.status.status = keyframe.rtk_status;
-                fix.latitude = keyframe.rtk_latitude;
-                fix.longitude = keyframe.rtk_longitude;
-                fix.altitude = keyframe.rtk_altitude;
-                fix.position_covariance[0] = keyframe.rtk_horizontal_std * keyframe.rtk_horizontal_std;
-                fix.position_covariance[4] = fix.position_covariance[0];
+                nav_msgs::msg::Odometry enu_odometry;
+                enu_odometry.header.frame_id = "enu";
+                enu_odometry.pose.pose.position.x = keyframe.enu_position(0);
+                enu_odometry.pose.pose.position.y = keyframe.enu_position(1);
+                enu_odometry.pose.pose.position.z = keyframe.enu_position(2);
+                enu_odometry.pose.covariance[0] = keyframe.enu_covariance_x;
+                enu_odometry.pose.covariance[7] = keyframe.enu_covariance_y;
+                enu_odometry.pose.covariance[14] = keyframe.enu_covariance_z;
                 Vec3d map_position;
-                if (gnssToMap(fix, map_position))
+                if (enuToMap(enu_odometry, map_position))
                 {
                     frame.has_rtk_position = true;
                     frame.rtk_position = gtsam::Point3(map_position(0), map_position(1), map_position(2));
-                    frame.rtk_position_sigma = std::max(0.05, keyframe.rtk_horizontal_std);
+                    frame.rtk_position_sigma = std::max(0.05, std::sqrt(std::max(0.0,
+                        std::max(keyframe.enu_covariance_x, keyframe.enu_covariance_y))));
                     frame.rtk_lever_arm = gtsam::Point3(gnss_lever_arm_base_(0), gnss_lever_arm_base_(1), gnss_lever_arm_base_(2));
                 }
             }
@@ -3168,8 +3360,7 @@ namespace robot::slam
                 && keyframe.rtk_heading_valid && gnss_use_heading_)
             {
                 frame.has_rtk_heading = true;
-                frame.rtk_heading_rad = M_PI / 2.0 - keyframe.rtk_heading_deg * M_PI / 180.0
-                    + gnss_enu_to_map_yaw_ + gnss_heading_offset_rad_;
+                frame.rtk_heading_rad = keyframe.enu_yaw + gnss_enu_to_map_yaw_;
                 frame.rtk_heading_sigma_rad = std::max(0.005, keyframe.rtk_heading_std_deg * M_PI / 180.0);
             }
             const auto& preint = keyframe.preint;
@@ -3314,6 +3505,8 @@ namespace robot::slam
             meta << "origin_longitude: " << gnss_origin_lon_ << "\n";
             meta << std::setprecision(4);
             meta << "origin_altitude: " << gnss_origin_alt_ << "\n";
+            meta << "origin_lock_session_id: " << gnss_origin_session_id_ << "\n";
+            meta << "origin_sha256: " << gnss_origin_sha256_ << "\n";
             meta << "alignment_locked: " << (gnss_alignment_locked_ ? 1 : 0) << "\n";
             meta << "alignment_source: " << (gnss_alignment_source_.empty() ? "none" : gnss_alignment_source_) << "\n";
             meta << "enu_to_map_yaw: " << gnss_enu_to_map_yaw_ << "\n";
@@ -3537,6 +3730,23 @@ namespace robot::slam
                 std::to_string(global_factor_graph_result_.loop_closure_factor_count));
             replace_number(existing, "global_factor_count",
                 std::to_string(global_factor_graph_result_.factor_count));
+            replace_number(existing, "ndt_factor_count",
+                std::to_string(global_factor_graph_result_.ndt_factor_count));
+            replace_number(existing, "imu_factor_count",
+                std::to_string(global_factor_graph_result_.imu_factor_count));
+            replace_number(existing, "imu_bias_factor_count",
+                std::to_string(global_factor_graph_result_.imu_bias_factor_count));
+            replace_number(existing, "imu_velocity_prior_factor_count",
+                std::to_string(global_factor_graph_result_.imu_velocity_prior_factor_count));
+            replace_number(existing, "rtk_position_factor_count",
+                std::to_string(global_factor_graph_result_.rtk_position_factor_count));
+            replace_number(existing, "rtk_heading_factor_count",
+                std::to_string(global_factor_graph_result_.rtk_heading_factor_count));
+            replace_number(existing, "use_gps", use_gnss_fusion_ ? "true" : "false");
+            replace_number(existing, "use_imu_factor",
+                global_factor_graph_config_.use_imu_factor ? "true" : "false");
+            replace_number(existing, "error_before", std::to_string(global_factor_graph_result_.error_before));
+            replace_number(existing, "error_after", std::to_string(global_factor_graph_result_.error_after));
             std::ofstream output(path, std::ios::out | std::ios::trunc);
             if (!output.is_open())
             {
@@ -3557,7 +3767,8 @@ namespace robot::slam
         output << "{\n"
                << "  \"schema_version\": 2,\n"
                << "  \"coordinate_mode\": \"" << (rtk_fixed ? "rtk_fixed" : "local_only") << "\",\n"
-               << "  \"scene_scope\": \"" << (rtk_fixed ? "" : "indoor") << "\",\n"
+               << "  \"scene_scope\": \"" << (rtk_fixed ? "outdoor" : "indoor") << "\",\n"
+               << "  \"mapping_type\": \"" << (rtk_fixed ? "outdoor" : "indoor") << "\",\n"
                << "  \"localization_mode\": \"" << (rtk_fixed ? "rtk_ndt" : "ndt") << "\",\n"
                << "  \"origin_status\": \"" << (rtk_fixed ? "fixed" : "local_only") << "\",\n"
                << "  \"rtk_origin_required\": " << (rtk_fixed ? "true" : "false") << ",\n"
@@ -3570,9 +3781,20 @@ namespace robot::slam
                << "  \"scan_context_count\": " << scan_context_count_ << ",\n"
                << "  \"loop_closure_count\": " << global_factor_graph_result_.loop_closure_factor_count << ",\n"
                << "  \"global_factor_count\": " << global_factor_graph_result_.factor_count << ",\n"
+               << "  \"ndt_factor_count\": " << global_factor_graph_result_.ndt_factor_count << ",\n"
+               << "  \"use_gps\": " << (use_gnss_fusion_ ? "true" : "false") << ",\n"
                << "  \"use_imu_factor\": " << (global_factor_graph_config_.use_imu_factor ? "true" : "false") << ",\n"
                << "  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count << ",\n"
                << "  \"imu_bias_factor_count\": " << global_factor_graph_result_.imu_bias_factor_count << ",\n"
+               << "  \"imu_velocity_prior_factor_count\": "
+               << global_factor_graph_result_.imu_velocity_prior_factor_count << ",\n"
+               << "  \"rtk_position_factor_count\": " << global_factor_graph_result_.rtk_position_factor_count << ",\n"
+               << "  \"rtk_heading_factor_count\": " << global_factor_graph_result_.rtk_heading_factor_count << ",\n"
+               << "  \"gravity_magnitude\": " << global_factor_graph_config_.gravity_magnitude << ",\n"
+               << "  \"error_before\": " << global_factor_graph_result_.error_before << ",\n"
+               << "  \"error_after\": " << global_factor_graph_result_.error_after << ",\n"
+               << "  \"origin_lock_session_id\": \"" << jsonEscape(gnss_origin_session_id_) << "\",\n"
+               << "  \"origin_sha256\": \"" << jsonEscape(gnss_origin_sha256_) << "\",\n"
                << "  \"trajectory_source\": \"" << trajectory_source << "\",\n"
                << "  \"loop_status\": \"" << loop_status_ << "\"\n"
                << "}\n";
@@ -3754,6 +3976,8 @@ namespace robot::slam
                << ", \"samples\": " << gnss_alignment_samples_.size()
                << ", \"rms\": " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0)
                << ", \"yaw_deg\": " << gnss_enu_to_map_yaw_ * 180.0 / M_PI
+               << ", \"origin_session_id\": \"" << jsonEscape(gnss_origin_session_id_) << "\""
+               << ", \"origin_sha256\": \"" << jsonEscape(gnss_origin_sha256_) << "\""
                << ", \"fusion_enabled\": " << (use_gnss_fusion_ ? "true" : "false") << "},\n"
                << "  \"slam_health\": {\"state\": \"" << jsonEscape(slam_health_state_)
                << "\", \"imu_initialized\": " << (p_imu->initialization_ready() ? "true" : "false")
@@ -3767,6 +3991,9 @@ namespace robot::slam
                << ", \"frame_delta_m\": " << health_frame_delta_m_
                << ", \"speed_mps\": " << health_speed_mps_
                << ", \"pose_z_m\": " << health_pose_z_m_
+               << ", \"last_healthy_keyframe\": " << last_healthy_keyframe_
+               << ", \"last_healthy_stamp\": " << last_health_stamp_
+               << ", \"divergence_trigger_type\": \"" << jsonEscape(divergence_trigger_type_) << "\""
                << ", \"warning\": \"" << jsonEscape(slam_health_warning_) << "\"},\n"
                << "  \"updated_at_unix\": " << std::time(nullptr) << ",\n"
                << "  \"recoverable\": "
