@@ -2124,9 +2124,6 @@ async function handleDeleteRoute(route) {
               >
                 {{ routeExecuteBusy ? '■ 下发中...' : '▶ 预演' }}
               </button>
-              <small class="route-preview-note">
-                {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
-              </small>
             </div>
           </div>
           <p>选择地图并添加至少两个途经点后开始演练。</p>
@@ -2223,6 +2220,9 @@ async function handleDeleteRoute(route) {
                   </button>
                   <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
                 </div>
+                <small v-if="selectedRoute" class="route-preview-note route-save-preview-note">
+                  {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
+                </small>
                 <div v-if="drillMessage" class="drill-status route-save-status" :class="{ active: drillRunning }">
                   <span class="drill-status-dot"></span>
                   {{ drillMessage }}
@@ -3982,7 +3982,8 @@ async function handleDeleteRoute(route) {
   left: 24px;
   z-index: 30;
   display: grid;
-  max-width: calc(100% - 48px);
+  width: 50%;
+  max-width: 50%;
   max-height: min(42%, 300px);
   gap: 6px;
   overflow: auto;
@@ -3991,11 +3992,11 @@ async function handleDeleteRoute(route) {
 
 .map-inspection-row {
   display: grid;
-  grid-template-columns: auto minmax(170px, auto) auto minmax(170px, auto) minmax(200px, auto) minmax(220px, auto) auto;
+  grid-template-columns: auto minmax(0, 1.1fr) minmax(0, 0.8fr) minmax(0, 1.1fr) minmax(0, 1.2fr) minmax(0, 1.35fr) auto;
   align-items: center;
-  width: max-content;
-  min-width: 100%;
-  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  gap: 0.5ch;
   padding: 7px 8px;
   border: 1px solid #fecaca;
   border-radius: 6px;
