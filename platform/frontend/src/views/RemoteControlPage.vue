@@ -1292,23 +1292,14 @@ watch(liveSourceKey, () => {
 .robot-list.compact {
   display: grid;
   gap: 12px;
-  max-height: 440px;
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 @media (min-width: 1181px) {
   .remote-video-stage {
     height: min(52dvh, 620px);
     aspect-ratio: auto;
-  }
-
-  .remote-main,
-  .remote-side {
-    max-height: 80dvh;
-    overflow-x: hidden;
-    overflow-y: auto;
-    padding-right: 4px;
-    scrollbar-gutter: stable;
   }
 }
 

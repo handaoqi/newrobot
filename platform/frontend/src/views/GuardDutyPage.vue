@@ -1315,7 +1315,7 @@ watch(playUrlKey, () => {
 .guard-status { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border: 1px solid #d6dee3; background: #fff; font-weight: 800; }
 .guard-status-dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa8b2; }
 .guard-status.is-online .guard-status-dot { background: #1b9b65; }
-.guard-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; max-width: 1440px; margin: 0 auto; }
+.guard-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 320px); gap: 18px; max-width: 1440px; margin: 0 auto; }
 .guard-video-panel, .guard-alert-panel { border: 1px solid #d6dee3; background: #fff; }
 .guard-video-stage { position: relative; min-height: 520px; background: #152633; overflow: hidden; }
 .guard-video, .guard-video-empty { display: block; width: 100%; height: 100%; min-height: 520px; object-fit: contain; }
@@ -1353,12 +1353,13 @@ watch(playUrlKey, () => {
 .guard-danger { color: #fff; background: #b8322c; }
 .guard-initialize { min-width: 150px; color: #fff; background: #146fb3; }
 .guard-primary:disabled, .guard-secondary:disabled, .guard-danger:disabled, .guard-initialize:disabled { cursor: not-allowed; opacity: .45; }
-.guard-side { display: grid; align-content: start; gap: 18px; }
+.guard-side { display: grid; min-width: 0; align-content: start; gap: 18px; }
+.guard-side > * { min-width: 0; max-width: 100%; }
 .guard-alert-panel, .guard-loop-panel, .guard-map-panel { border: 1px solid #d6dee3; background: #fff; }
 .guard-alert-panel { min-height: 360px; padding: 18px; }
-.guard-panel-title { display: flex; justify-content: space-between; align-items: start; padding-bottom: 14px; border-bottom: 1px solid #e4eaed; }
+.guard-panel-title { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: start; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid #e4eaed; }
 .guard-panel-title h2 { margin: 5px 0 0; font-size: 24px; letter-spacing: 0; }
-.guard-alert-actions { display: flex; align-items: center; gap: 8px; }
+.guard-alert-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .guard-alert-actions > button { min-height: 38px; padding: 0 12px; border: 1px solid #19724d; color: #176343; background: #edf8f3; font: inherit; font-size: 12px; font-weight: 900; cursor: pointer; }
 .guard-alert-actions > button.active { color: #fff; background: #19724d; }
 .guard-alert-actions > .guard-pending-events { display: grid; place-items: center; min-width: 44px; height: 38px; box-sizing: border-box; padding: 0 7px; border: 0; color: #fff; background: #ba302b; }
