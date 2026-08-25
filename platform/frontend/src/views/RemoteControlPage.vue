@@ -835,7 +835,7 @@ watch(liveSourceKey, () => {
 <style scoped>
 .remote-control-page {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  grid-template-columns: minmax(0, 1fr) minmax(224px, 272px);
   gap: 16px;
   align-items: start;
   -webkit-touch-callout: none;
@@ -1300,6 +1300,69 @@ watch(liveSourceKey, () => {
   .remote-video-stage {
     height: min(52dvh, 620px);
     aspect-ratio: auto;
+  }
+
+  .remote-side {
+    gap: 13px;
+    font-size: 12px;
+  }
+
+  .remote-side .panel {
+    padding: 18px;
+  }
+
+  .remote-side .panel-head {
+    gap: 8px;
+  }
+
+  .remote-side .panel-head h3 {
+    font-size: 17px;
+  }
+
+  .remote-side .panel-head p {
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  .remote-side .robot-list.compact {
+    gap: 10px;
+  }
+
+  .remote-side .robot-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 12px;
+    font-size: 11px;
+  }
+
+  .remote-side .robot-main,
+  .remote-side .robot-side {
+    min-width: 0;
+  }
+
+  .remote-side .remote-status-grid {
+    gap: 9px;
+  }
+
+  .remote-side .remote-status-grid div {
+    gap: 4px;
+    padding: 10px;
+  }
+
+  .remote-side .remote-status-grid span {
+    font-size: 10px;
+  }
+
+  .remote-side .remote-status-grid strong {
+    font-size: 11px;
+  }
+
+  .remote-side .remote-list-state {
+    min-height: 58px;
+    gap: 8px;
+    padding: 11px;
+    font-size: 11px;
   }
 }
 
