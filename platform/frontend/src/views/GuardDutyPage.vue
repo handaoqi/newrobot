@@ -1564,6 +1564,149 @@ watch(playUrlKey, () => {
 :global([data-theme="dark"] .guard-page .guard-loading) {
   color: var(--muted);
 }
+@media (min-width: 981px) {
+  .guard-side {
+    gap: 14px;
+    font-size: 11px;
+  }
+  .guard-alert-panel {
+    min-height: 320px;
+    padding: 14px;
+  }
+  .guard-map-panel {
+    padding: 12px;
+  }
+  .guard-panel-title {
+    flex-wrap: nowrap;
+    gap: 8px;
+  }
+  .guard-panel-title > div:first-child,
+  .guard-map-head > div {
+    min-width: 0;
+  }
+  .guard-side .guard-eyebrow {
+    font-size: 10px;
+    letter-spacing: .05em;
+    white-space: nowrap;
+  }
+  .guard-panel-title h2 {
+    margin-top: 3px;
+    font-size: 18px;
+    white-space: nowrap;
+  }
+  .guard-alert-actions {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: 6px;
+  }
+  .guard-alert-actions > button {
+    min-height: 32px;
+    padding: 0 8px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .guard-alert-actions > .guard-pending-events {
+    min-width: 38px;
+    height: 32px;
+    padding-inline: 5px;
+  }
+  .guard-live-speech {
+    gap: 8px;
+    margin-top: 10px;
+    padding: 10px;
+  }
+  .guard-live-speech label,
+  .guard-live-speech textarea,
+  .guard-live-speech > small {
+    font-size: 10px;
+  }
+  .guard-live-microphone {
+    grid-template-columns: minmax(0, 1fr) 88px;
+    gap: 7px;
+  }
+  .guard-live-microphone span,
+  .guard-live-microphone strong,
+  .guard-live-microphone button,
+  .guard-live-text-send {
+    font-size: 10px;
+  }
+  .guard-live-microphone strong,
+  .guard-live-microphone button {
+    white-space: nowrap;
+  }
+  .guard-alert-main {
+    grid-template-columns: 64px minmax(0, 1fr);
+    gap: 9px;
+    padding: 12px 0;
+  }
+  .guard-alert-image {
+    width: 64px;
+    height: 52px;
+  }
+  .guard-alert-main div:last-child,
+  .guard-alert-list div {
+    min-width: 0;
+  }
+  .guard-alert-main strong,
+  .guard-alert-main span,
+  .guard-alert-main small,
+  .guard-alert-list div {
+    overflow: hidden;
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .guard-alert-list {
+    gap: 7px;
+    padding-top: 9px;
+  }
+  .guard-map-head {
+    gap: 7px;
+    margin-bottom: 9px;
+  }
+  .guard-map-head h2 {
+    overflow: hidden;
+    margin-top: 2px;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .guard-map-head small {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 9px;
+    text-overflow: ellipsis;
+  }
+  .guard-map-empty {
+    font-size: 10px;
+  }
+  .guard-map-legend {
+    gap: 5px 8px;
+    padding-top: 8px;
+    font-size: 9px;
+  }
+  .guard-route-log {
+    gap: 8px;
+    margin-top: 9px;
+    padding-top: 9px;
+  }
+  .guard-route-summary {
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 6px;
+  }
+  .guard-route-summary span,
+  .guard-route-summary strong,
+  .guard-current-target > span,
+  .guard-current-target strong,
+  .guard-current-target small,
+  .guard-route-order small,
+  .guard-waypoint-log strong,
+  .guard-waypoint-log span,
+  .guard-waypoint-log small,
+  .guard-waypoint-log p {
+    font-size: 9px;
+  }
+}
 @media (max-width: 980px) {
   .guard-grid { grid-template-columns: 1fr; }
   .guard-side { grid-template-columns: 1fr 220px; align-items: start; }
