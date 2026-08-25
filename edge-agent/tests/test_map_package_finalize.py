@@ -35,6 +35,7 @@ def test_finalize_local_only_map_writes_manifest_and_keeps_raw(tmp_path):
     assert manifest["coordinate_mode"] == "local_only"
     assert manifest["scene_scope"] == "indoor"
     assert manifest["mapping_type"] == "indoor"
+    assert manifest["use_gps"] is False
     assert manifest["localization_mode"] == "ndt"
     assert manifest["quaternion_order"] == "xyzw"
     assert (session / "map_raw.pcd").read_bytes() == b"raw-pcd"
@@ -58,6 +59,9 @@ def test_outdoor_manifest_carries_origin_lock_audit_fields(tmp_path):
         "origin_lock_session_id: origin-123\n"
         "locked_at_unix: 1234.5\n"
         "position_spread_m: 0.012\n"
+        "confirmed_heading_deg: 93.2\n"
+        "heading_offset_deg: 180.0\n"
+        "heading_confirmed_at_unix: 1240.0\n"
     )
 
     manifest = finalize_map_package(session, requested_scene_scope="outdoor")
@@ -66,6 +70,9 @@ def test_outdoor_manifest_carries_origin_lock_audit_fields(tmp_path):
     assert manifest["coordinate_mode"] == "rtk_fixed"
     assert manifest["origin_lock_session_id"] == "origin-123"
     assert manifest["origin_position_spread_m"] == pytest.approx(0.012)
+    assert manifest["origin_confirmed_heading_deg"] == pytest.approx(93.2)
+    assert manifest["origin_heading_offset_deg"] == pytest.approx(180.0)
+    assert manifest["origin_heading_confirmed_at_unix"] == pytest.approx(1240.0)
 
 
 def test_recording_manifest_lists_required_topics(tmp_path):
@@ -79,7 +86,7 @@ rosbag2_bagfile_information:
     nanoseconds_since_epoch: 1000000000
   duration:
     nanoseconds: 2000000000
-  message_count: 5
+  message_count: 9
   topics_with_message_count:
     - topic_metadata:
         name: /front_lidar
@@ -102,6 +109,30 @@ rosbag2_bagfile_information:
     - topic_metadata:
         name: /rtk_pvh
         type: robots_dog_msgs/msg/UniRtkPvh
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /rtk/ntrip_status
+        type: std_msgs/msg/String
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /odom/localization_odom
+        type: nav_msgs/msg/Odometry
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /slam_odom
+        type: nav_msgs/msg/Odometry
+        serialization_format: cdr
+        offered_qos_profiles: []
+      message_count: 1
+    - topic_metadata:
+        name: /tf
+        type: tf2_msgs/msg/TFMessage
         serialization_format: cdr
         offered_qos_profiles: []
       message_count: 1

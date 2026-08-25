@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -61,7 +63,13 @@ class EdgeAgentApplication:
             if not ROS_AVAILABLE:
                 raise RuntimeError("ROS2 is required unless a navigation adapter is injected")
             rclpy.init(args=None)
-            navigation = RosAdapter(config.ros, config.safety, self.telemetry, self.safety_state)
+            navigation = RosAdapter(
+                config.ros,
+                config.safety,
+                self.telemetry,
+                self.safety_state,
+                config.mapping,
+            )
             self.ros_runtime = RosRuntime(navigation)
         self.navigation = navigation
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
@@ -99,6 +107,10 @@ class EdgeAgentApplication:
         if callable(set_trusted_pose_callback):
             set_trusted_pose_callback(self._persist_last_trusted_pose)
         self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
+        self._mapping_divergence_notified = False
+        origin_payload_snapshot = getattr(navigation, "origin_payload_snapshot", None)
+        if callable(origin_payload_snapshot):
+            self.mapping_adapter.set_origin_payload_provider(origin_payload_snapshot)
         self.teleop_control_adapter = TeleopControlAdapter(config.teleop_control)
         self.person_follow_controller = PersonFollowController(navigation, config.person_follow)
         self.sensor_control_adapter = SensorControlAdapter(config.sensor_control)
@@ -347,6 +359,7 @@ class EdgeAgentApplication:
         while not self.stop_event.wait(self.config.telemetry.status_interval_seconds):
             try:
                 mapping_status = self.mapping_adapter.status()
+                self._observe_mapping_health(mapping_status)
                 if mapping_status.get("process_alive"):
                     self.navigation.safety_state.nav_ready = False
                 else:
@@ -355,6 +368,7 @@ class EdgeAgentApplication:
                 snapshot = self.telemetry.build_status_snapshot(
                     context.task_execution_id if context and self.task_executor.has_active_task() else None
                 )
+                mapping_status["odometry"] = dict((snapshot.get("sensors") or {}).get("odometry") or {})
                 snapshot["current_map"] = self._current_map_payload()
                 snapshot["map_set"] = self.map_set_coordinator.status()
                 snapshot["mapping"] = mapping_status
@@ -401,6 +415,68 @@ class EdgeAgentApplication:
             power = self.telemetry.latest_power()
             self.charge_control_adapter.observe_power(power)
             self.power_mode_controller.refresh_service_status(power)
+
+    def _observe_mapping_health(self, mapping_status: dict) -> None:
+        progress = mapping_status.get("save_progress") or {}
+        health = progress.get("slam_health") or {}
+        diverged = (
+            progress.get("error_code") == "SLAM_DIVERGED"
+            or health.get("state") == "diverged"
+        )
+        state = str(mapping_status.get("state") or "")
+        if not diverged:
+            if state in {"", "idle", "cancelled", "exited", "completed"}:
+                self._mapping_divergence_notified = False
+            return
+        if self._mapping_divergence_notified:
+            return
+        self._mapping_divergence_notified = True
+        reason = progress.get("error") or health.get("warning") or "SLAM pose diverged"
+        LOGGER.error("Mapping diverged; stopping capture notification: %s", reason)
+        try:
+            self.alerts.emit_system_alert(
+                "slam_diverged",
+                "high",
+                "SLAM_DIVERGED",
+                attributes={
+                    "message": reason,
+                    "map_name": mapping_status.get("map_name", ""),
+                    "mapping_session_id": mapping_status.get("mapping_session_id", ""),
+                },
+                detection={"label": "建图定位已发散", "class": "slam_diverged", "confidence": 1},
+                component="mapping",
+            )
+        except Exception:
+            LOGGER.exception("failed to publish mapping divergence alert")
+        threading.Thread(
+            target=self._speak_mapping_diverged,
+            daemon=True,
+            name="mapping-diverged-speech",
+        ).start()
+
+    def _speak_mapping_diverged(self) -> None:
+        text = "建图定位已发散，请立即停止移动。回到地图页保存救援地图。"
+        commands = []
+        if shutil.which("espeak-ng"):
+            commands.append(["espeak-ng", "-v", "zh", text])
+        if shutil.which("espeak"):
+            commands.append(["espeak", "-v", "zh", text])
+        if shutil.which("spd-say"):
+            commands.append(["spd-say", "-l", "zh", text])
+        if shutil.which("speaker-test"):
+            commands.append(["timeout", "2", "speaker-test", "-t", "sine", "-f", "880", "-l", "1"])
+        for command in commands:
+            try:
+                subprocess.run(
+                    command,
+                    check=False,
+                    timeout=8,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception:
+                LOGGER.exception("mapping divergence local speech failed command=%s", command)
 
     def _handle_low_battery_charge(self) -> None:
         """Stop autonomous motion before waiting for an operator to dock the robot."""

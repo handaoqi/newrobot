@@ -84,6 +84,13 @@ namespace robot::slam
         }
     };
 
+    struct ImuPreintegrationMeasurement
+    {
+        double delta_t = 0.0;
+        Vec3d  acceleration = Zero3d;
+        Vec3d  angular_velocity = Zero3d;
+    };
+
     struct ImuPreintegrationSnapshot
     {
         double      start_timestamp = 0.0;
@@ -97,6 +104,7 @@ namespace robot::slam
         std::array<double, 225> covariance {};
         int         imu_sample_count = 0;
         std::string error_status;
+        std::vector<ImuPreintegrationMeasurement> measurements;
     };
 
     struct MappingKeyframe
@@ -114,6 +122,10 @@ namespace robot::slam
         double      lidar_qz = 0.0;
         double      lidar_qw = 1.0;
         double      yaw = 0.0;
+        Vec3d       velocity = Zero3d;
+        Vec3d       accel_bias = Zero3d;
+        Vec3d       gyro_bias = Zero3d;
+        Vec3d       gravity = Vec3d(0.0, 0.0, -G_m_s2);
         std::string file_path;
         std::string preintegration_file;
         std::size_t point_count = 0;
@@ -219,6 +231,8 @@ namespace robot::slam
 
         bool writeImuPreintegrationFile(const MappingKeyframe& keyframe) const;
 
+        bool readImuPreintegrationFile(MappingKeyframe& keyframe) const;
+
         bool writeMapManifest(const std::string& map_subdir);
 
         void accumulateImuPreintegration(double timestamp, const Vec3d& acc, const Vec3d& gyro);
@@ -264,6 +278,8 @@ namespace robot::slam
         bool estimateGnssAlignment();
 
         bool lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss);
+
+        void tryLockGnssAlignmentOnCaptureStart();
 
         bool gnssHeadingIsValid(double& heading_deg, double& heading_std_deg, double& age_s);
 
@@ -488,6 +504,7 @@ namespace robot::slam
         Vec3d                              imu_preint_ba_ = Zero3d;
         Vec3d                              imu_preint_bg_ = Zero3d;
         Eigen::Matrix<double, 15, 15>      imu_preint_cov_ = Eigen::Matrix<double, 15, 15>::Zero();
+        std::vector<ImuPreintegrationMeasurement> imu_preint_measurements_;
         int                                imu_preint_samples_ = 0;
         std::string                        imu_preint_error_;
 
@@ -541,6 +558,7 @@ namespace robot::slam
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr    pubLaserCloudFull_body_;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr    pubLaserCloudMap_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubOdomAftMapped_;
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubLocalizationOdom_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubPath_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubGlobalOptimizedOdom_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubGlobalOptimizedPath_;

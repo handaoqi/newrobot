@@ -22,30 +22,31 @@
 | `/fix` | GNSS/RTK 经纬高、状态和精度 |
 | `/rtk_pvh` | 双天线 RTK 航向、基线、解状态和航向精度 |
 
-当前采用轻量建图采集模式，标准 rosbag 只录制：
+勾选“同步录制诊断数据”时，标准诊断 rosbag 录制：
 
 ```text
 /front_lidar
 /front_lidar/imu
 /fix
 /rtk_pvh
+/rtk/ntrip_status
+/odom/localization_odom
+/slam_odom
+/tf
 /tf_static
 ```
 
-建图状态估计优先使用 LiDAR 内置 IMU；`/odom/mc_odom` 不作为建图采集依赖，也不进入标准建图 rosbag。动态 `/tf`、SLAM 输出和日志仅在故障诊断时通过额外话题开启。
+建图状态估计优先使用 LiDAR 内置 IMU；`/odom/mc_odom` 不作为建图采集依赖，也不进入标准诊断 rosbag。`/odom/localization_odom` 用于核对建图全程兼容里程计，`/slam_odom` 用于保留 FAST-LIO-SAM 原始输出，`/tf` 与 `/tf_static` 用于恢复完整坐标链。
 
 ### 诊断模式可选采集
 
 | 话题 | 作用 |
 |---|---|
-| `/slam_odom` | 记录 SLAM 输出位姿，便于离线复盘 |
-| `/odom/localization_odom` | 记录定位输出和 Nav2 使用的里程计 |
 | `/odom/mc_odom` | 控制器里程计，仅作为诊断和运动约束，不作为地图真值 |
-| `/tf` | 动态坐标变换，便于诊断坐标链和外部节点关系 |
 | `/world_points` | 记录 SLAM 生成的世界坐标点云，便于调试 |
 | `/rosout` | 记录建图、RTK、回环和异常日志 |
 
-其中 `/world_points` 是由原始 LiDAR 和 SLAM 位姿派生的点云，默认不录制；`/rosout`、`/tf`、`/slam_odom` 和 `/odom/mc_odom` 只在诊断模式启用。
+其中 `/world_points` 是由原始 LiDAR 和 SLAM 位姿派生的点云，默认不录制；`/rosout`、`/world_points` 和 `/odom/mc_odom` 只通过 `ROSBAG_EXTRA_TOPICS` 临时启用。
 
 `/laser_scan`、`/map` 等派生话题不作为原始建图数据的替代品；地图应以三维 LiDAR、IMU、`/tf_static` 和结构化关键帧数据为准。
 

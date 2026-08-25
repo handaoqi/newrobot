@@ -87,6 +87,42 @@ def _queue_waypoint_speech(execution: TaskExecution, robot: Robot, waypoint_inde
     )
 
 
+MAPPING_DIVERGED_SPEECH = "建图定位已发散，请立即停止移动。请到地图页停止并生成救援地图。"
+
+
+def _queue_mapping_divergence_speech(robot: Robot, payload: dict):
+    session_id = str((payload.get("attributes") or {}).get("mapping_session_id") or "")
+    duplicate_filter = {
+        "robot": robot,
+        "action": "play_audio",
+        "payload__source": "mapping_divergence_speech",
+    }
+    if session_id:
+        duplicate_filter["payload__mapping_session_id"] = session_id
+    if RobotCommand.objects.filter(**duplicate_filter).exists():
+        return None
+    try:
+        saved_path, cache_hit = tts_service.synthesize_speech(MAPPING_DIVERGED_SPEECH)
+    except Exception:
+        LOGGER.exception("mapping divergence speech synthesis failed robot=%s", robot.code)
+        return None
+    return RobotCommand.objects.create(
+        robot=robot,
+        action="play_audio",
+        payload={
+            "audio_url": _public_media_url(saved_path),
+            "audio_name": "建图定位已发散",
+            "text": MAPPING_DIVERGED_SPEECH,
+            "source": "mapping_divergence_speech",
+            "dual_output": True,
+            "content_type": "audio/mpeg",
+            "tts_cache_hit": cache_hit,
+            "mapping_session_id": session_id,
+            "alert_event_id": payload.get("event_id", ""),
+        },
+    )
+
+
 def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict):
     """Queue the fixed recovery announcement selected by the robot-side stage."""
     stage_skills = {
@@ -234,6 +270,9 @@ def _dispatch(
                     "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
                 }
             )
+            source_code = str((payload.get("source") or {}).get("code") or "")
+            if payload.get("event_type") == "slam_diverged" or source_code == "SLAM_DIVERGED":
+                _queue_mapping_divergence_speech(robot, payload)
         return {"created": created, "event_id": str(event.event_id)}
     if message_type == "sync.request":
         return _handle_sync(envelope, robot, publish_response)

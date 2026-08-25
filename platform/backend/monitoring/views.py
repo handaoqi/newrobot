@@ -15,7 +15,7 @@ from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
 from django.http import FileResponse, HttpResponse, HttpResponseForbidden, StreamingHttpResponse
 from django.db import IntegrityError, transaction
-from django.db.models import Case, Count, IntegerField, Max, Min, Q, When
+from django.db.models import Case, Count, IntegerField, Max, Min, Prefetch, Q, When
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date, parse_datetime
@@ -84,10 +84,14 @@ from .serializers import (
     TelemetryIngestSerializer,
     PersonDetectionIngestSerializer,
     MapDataSerializer,
+    MapDataSummarySerializer,
     MapSetSerializer,
+    MapSetSummarySerializer,
     PatrolRouteSerializer,
+    PatrolRouteSummarySerializer,
     ZoneSerializer,
     TrackSerializer,
+    TrackSummarySerializer,
     AlertTimelineSerializer,
     RobotSessionSerializer,
     RobotStatusSerializer,
@@ -901,7 +905,12 @@ class RobotListView(APIView):
 
     def get(self, request):
         ensure_demo_seed()
-        return Response(RobotSerializer(Robot.objects.all(), many=True).data)
+        robots = Robot.objects.select_related("charging_map", "charging_route").annotate(
+            today_alert_count=Count(
+                "events", filter=Q(events__detected_at__date=timezone.localdate())
+            )
+        )
+        return Response(RobotSerializer(robots, many=True).data)
 
 
 class RobotDetailView(APIView):
@@ -909,7 +918,7 @@ class RobotDetailView(APIView):
 
     def get(self, request, robot_id):
         ensure_demo_seed()
-        robot = Robot.objects.get(id=robot_id)
+        robot = Robot.objects.select_related("charging_map", "charging_route").get(id=robot_id)
         return Response(RobotDetailSerializer(robot, context={"request": request}).data)
 
 
@@ -2140,8 +2149,9 @@ class MapDataListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        maps = MapData.objects.all()
-        serializer = MapDataSerializer(maps, many=True, context={"request": request})
+        maps = MapData.objects.select_related("robot", "parent_map").all()
+        serializer_class = MapDataSummarySerializer if request.query_params.get("view") == "summary" else MapDataSerializer
+        serializer = serializer_class(maps, many=True, context={"request": request})
         return Response(serializer.data)
 
     def post(self, request):
@@ -2155,6 +2165,12 @@ class MapSetListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        if request.query_params.get("view") == "summary":
+            members = MapSetMember.objects.only("map_set_id", "submap_id", "sequence").order_by("sequence")
+            map_sets = MapSet.objects.select_related("robot").annotate(member_count=Count("members")).prefetch_related(
+                Prefetch("members", queryset=members)
+            )
+            return Response(MapSetSummarySerializer(map_sets, many=True, context={"request": request}).data)
         map_sets = MapSet.objects.select_related("robot").prefetch_related("members__map_data")
         return Response(MapSetSerializer(map_sets, many=True, context={"request": request}).data)
 
@@ -2646,12 +2662,38 @@ class RobotMappingStatusView(APIView):
             or live_mapping.get("state") not in {None, "idle"}
             or (live_progress and progress_is_current)
         )
+        latest_map = MapData.objects.filter(robot=robot).order_by("-created_at").first()
+        command_result = dict(command.result_payload or {}) if command else {}
+        uploaded_map_id = str((command_result.get("upload_result") or {}).get("id") or "")
+        successful_save_completed = bool(
+            command
+            and command.command_type == "mapping.save"
+            and command.status == "succeeded"
+            and uploaded_map_id
+        )
 
         # 从 result_payload 提取 edge_agent 返回的真实 mapping state
         mapping_state = "idle"
         mapping_result = {}
         using_live_mapping = False
-        if (
+        if successful_save_completed:
+            # A successful upload response is the authoritative completion
+            # boundary.  Do not let a delayed telemetry sample (for example a
+            # stale writing_pcd/65% file) reopen the finished save workflow.
+            mapping_result = command_result
+            mapping_result["state"] = "exited"
+            completed_progress = dict(mapping_result.get("save_progress") or {})
+            if completed_progress:
+                completed_progress.update(
+                    stage="completed",
+                    progress_percent=100.0,
+                    recoverable=False,
+                    error_code="",
+                    error="",
+                )
+                mapping_result["save_progress"] = completed_progress
+            mapping_state = "exited"
+        elif (
             live_mapping
             and live_sample_is_current
             and (not command_is_active or live_mapping_is_active)
@@ -2674,7 +2716,6 @@ class RobotMappingStatusView(APIView):
             }
             mapping_state = status_map.get(command.status, command.status)
 
-        latest_map = MapData.objects.filter(robot=robot).order_by("-created_at").first()
         robot_current_map = {}
         if latest_status and latest_status.raw_payload:
             robot_current_map = latest_status.raw_payload.get("current_map") or {}
@@ -2894,7 +2935,7 @@ class RobotMappingCancelView(RobotMappingCommandView):
 class RobotMappingSyncView(RobotMappingCommandView):
     """触发 Edge Agent 打包最近的地图文件并上传（不需要活跃建图会话）。"""
     command_type = "mapping.save"
-    expiry_seconds = 300
+    expiry_seconds = 1800
 
     def build_payload(self, request, robot: Robot) -> dict:
         # 不传 map_name，让 Edge Agent 使用 session 目录名（如 20260626_215355）
@@ -3170,6 +3211,7 @@ class DeviceMapUploadView(APIView):
             "package_files": package_names,
             "package_sha256": hashlib.sha256(package_bytes).hexdigest(),
             "mapping_metrics": metadata.get("mapping_metrics", {}),
+            "optimization": metadata.get("optimization", {}),
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
@@ -3272,8 +3314,9 @@ class PatrolRouteListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        routes = PatrolRoute.objects.all()
-        serializer = PatrolRouteSerializer(routes, many=True)
+        routes = PatrolRoute.objects.select_related("robot", "map_data", "map_set").all()
+        serializer_class = PatrolRouteSummarySerializer if request.query_params.get("view") == "summary" else PatrolRouteSerializer
+        serializer = serializer_class(routes, many=True)
         return Response(serializer.data)
 
     def post(self, request):
@@ -3478,8 +3521,9 @@ class ZoneDetailView(APIView):
 class TrackListView(APIView):
     """轨迹记录列表视图"""
     def get(self, request):
-        tracks = Track.objects.all()
-        serializer = TrackSerializer(tracks, many=True)
+        tracks = Track.objects.select_related("robot", "map_data", "route", "task").all()
+        serializer_class = TrackSummarySerializer if request.query_params.get("view") == "summary" else TrackSerializer
+        serializer = serializer_class(tracks, many=True)
         return Response(serializer.data)
 
     def post(self, request):

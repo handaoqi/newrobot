@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -8,6 +9,8 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -19,14 +22,35 @@ import yaml
 
 LOGGER = logging.getLogger(__name__)
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write then replace using a unique tmp name so concurrent persist cannot steal the file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+
 from .config import MappingConfig
 from .keyframe_visibility_filter import filter_with_keyframe_visibility
 from .map_coordinate import MapConstraintError, SCENE_SCOPES, normalize_text
+from .map_optimization_summary import build_optimization_summary, summary_without_corrections
 from .map_package_finalize import finalize_map_package
 from .map_preview import generate_map_preview
 from .media_client import MediaClient
 from .origin_lock import OriginLockMonitor, OriginSample
 from .protocol import ProtocolError, now_iso
+from .rtk_origin import build_origin_sample
 
 
 @dataclass
@@ -65,6 +89,7 @@ class MappingAdapter:
         "recording_manifest.yaml",
         "trajectory_raw.csv",
         "trajectory_optimized.csv",
+        "optimization_summary.json",
     )
     SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
     SLAM_PROCESS_PATTERNS = (
@@ -85,8 +110,10 @@ class MappingAdapter:
         self._slam_log_path: Path | None = None
         self._record_rosbag = False
         self._rosbag_dir: str | None = None
+        self._origin_payload_provider = None
         self._scene_scope = "indoor"
         self._mapping_type = "indoor"
+        self._state_lock = threading.RLock()
         self._origin_file = Path(config.origin_file).expanduser() if config.origin_file else self.map_dir / "gnss_origin.yaml"
         self._global_enu_file = self._origin_file.parent / "global_enu.yaml"
         self._origin_state_file = (
@@ -104,6 +131,7 @@ class MappingAdapter:
             max_heading_std_deg=config.heading_max_std_deg,
             max_age_seconds=config.heading_max_age_seconds,
             no_signal_timeout_seconds=config.origin_lock_no_signal_timeout_seconds,
+            heading_offset_deg=config.heading_offset_deg,
         )
         self._restore_workflow_state()
 
@@ -117,7 +145,7 @@ class MappingAdapter:
 
     def start_mapping(self, command: dict) -> dict:
         # 如果有残留 session 但 SLAM 进程已死（崩溃/中断），自动清理
-        if self.session and self.session.state in {"starting", "mapping", "saving", "packaging", "uploading"}:
+        if self.session and self.session.state in {"starting", "mapping", "saving", "optimizing", "packaging", "uploading"}:
             if self._slam_process_alive:
                 raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping session is already active")
             LOGGER.warning("Stale session '%s' (state=%s) detected with dead SLAM process — cleaning up", self.session.session_id, self.session.state)
@@ -154,10 +182,8 @@ class MappingAdapter:
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self._stop_conflicting_navigation_stack()
         self._ensure_mapping_sensors()
-        self._record_rosbag = bool(command.get("record_rosbag", False))
-        if self._record_rosbag:
-            self._start_rosbag(map_name)
         try:
+            self._configure_mapping_recording(command, map_name)
             self._ensure_slam_process()
             if mapping_type == "outdoor":
                 self._call_map_state(self.config.warmup_data)
@@ -178,7 +204,7 @@ class MappingAdapter:
             raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping workflow is already active")
         if existing_origin_session and not prepare_only:
             origin_state = self._origin_monitor.status().get("origin_status")
-            if origin_state in {"waiting_quality", "quality_holding"}:
+            if origin_state in {"waiting_fix", "quality_holding"}:
                 raise ProtocolError("MAPPING_ALREADY_ACTIVE", "ENU origin lock is already running")
             if origin_state == "locked":
                 return self.status()
@@ -199,13 +225,26 @@ class MappingAdapter:
                 mapping_type="outdoor",
             )
         self.map_dir.mkdir(parents=True, exist_ok=True)
-        if not existing_origin_session:
-            self._stop_conflicting_navigation_stack()
-            self._ensure_mapping_sensors()
-        if prepare_only:
-            self._origin_monitor.prepare()
-        else:
-            self._origin_monitor.start()
+        try:
+            if not existing_origin_session:
+                self._stop_conflicting_navigation_stack(preserve_localization=True)
+                self._ensure_mapping_sensors()
+                self._configure_mapping_recording(command, self.session.map_name)
+                self._ensure_origin_odometry()
+            else:
+                # The second request starts the actual quality window after a
+                # prepare_only request. Preserve the checkbox state and ensure
+                # the bag is already running before sampling the origin.
+                self._configure_mapping_recording(command, self.session.map_name)
+            if prepare_only:
+                self._origin_monitor.prepare()
+            else:
+                self._origin_monitor.start()
+        except Exception:
+            self._stop_rosbag()
+            if not existing_origin_session:
+                self._cleanup()
+            raise
         self._set_state("origin_waiting")
         return self.status()
 
@@ -237,6 +276,10 @@ class MappingAdapter:
                 "origin_latitude", "origin_longitude", "origin_altitude",
                 "enu_axis", "enu_to_map_yaw", "map_offset_x", "map_offset_y",
                 "heading_deg", "heading_std_deg", "position_spread_m",
+                "heading_confirmed", "heading_confirmation_source",
+                "heading_confirmed_at_unix", "confirmed_heading_deg",
+                "confirmed_receiver_heading_deg", "confirmed_enu_yaw_deg",
+                "confirmed_heading_std_deg", "confirmed_baseline_m", "heading_offset_deg",
                 "origin_lock_session_id", "locked_at_unix", "alignment_locked",
             ) if origin.get(key) is not None},
         }
@@ -288,9 +331,11 @@ class MappingAdapter:
         self._scene_scope = scene_scope
         self.session.mapping_type = mapping_type
         self.session.scene_scope = scene_scope
-        self._record_rosbag = bool(command.get("record_rosbag", False))
         self._set_state("slam_starting")
         try:
+            self._configure_mapping_recording(command, self.session.map_name)
+            if mapping_type == "outdoor":
+                self._stop_localization_for_slam()
             self._ensure_slam_process()
             self._call_map_state(
                 self.config.warmup_data if mapping_type == "outdoor" else self.config.indoor_warmup_data
@@ -315,22 +360,34 @@ class MappingAdapter:
             origin = status.get("origin") or {}
             if origin.get("origin_status") != "locked":
                 raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor ENU origin is no longer locked")
-            if not origin.get("heading_stable"):
-                raise ProtocolError("MAPPING_HEADING_NOT_CONFIRMED", "dual-antenna heading is not stable")
             if not bool(command.get("heading_check_confirmed")):
                 raise ProtocolError("MAPPING_HEADING_NOT_CONFIRMED", "operator must confirm the heading check")
-            self.session.heading_check_confirmed = True
-        # Diagnostic recording begins with formal keyframe capture, not during
-        # RTK/origin checks or SLAM warmup.
+        # Keep this as a defensive fallback for clients that call begin
+        # directly. Normal outdoor/indoor workflows already started the bag
+        # during origin preparation or SLAM warmup.
         try:
-            if self._record_rosbag and not self._rosbag_status().get("running"):
-                self._start_rosbag(self.session.map_name)
+            self._configure_mapping_recording(command, self.session.map_name)
             self._call_map_state(self.config.start_data)
+            if self.session.mapping_type == "outdoor":
+                self._origin_monitor.confirm_heading_review()
+                self.session.heading_check_confirmed = True
+                alignment = self._wait_for_heading_alignment()
+                if alignment.get("locked"):
+                    LOGGER.info(
+                        "ENU-map yaw locked from %s after heading confirmation",
+                        alignment.get("source") or "unknown",
+                    )
+                else:
+                    LOGGER.warning(
+                        "ENU-map yaw is not locked yet; GNSS fusion waits for dual-antenna heading "
+                        "or a 15 m trajectory fit"
+                    )
         except Exception:
             self._stop_rosbag()
             raise
         self.session.mapping_capture_enabled = True
-        self._origin_monitor.stop()
+        # Keep the persistent /rtk_pvh-backed monitor alive during formal
+        # mapping so ENU X/Y/Yaw and quality telemetry continue to refresh.
         self._set_state("mapping")
         return self.status()
 
@@ -435,7 +492,11 @@ class MappingAdapter:
             result["mapping_metrics"] = metadata.get("mapping_metrics", {})
             if should_upload:
                 self._set_state("uploading")
-                result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
+                try:
+                    result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
+                except ProtocolError:
+                    self._set_state("failed")
+                    raise
         if should_stop:
             self._set_state("stopping")
             self._stop_rosbag()
@@ -448,6 +509,11 @@ class MappingAdapter:
         if should_stop:
             self._cleanup()
             result.update(self.status())
+            # The command result is the durable terminal snapshot consumed by
+            # the platform.  status() intentionally returns idle after cleanup,
+            # but a successful save must retain the explicit workflow terminal
+            # state so stale progress cannot put the UI back into "saving".
+            result["state"] = "exited"
         return result
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:
@@ -519,10 +585,20 @@ class MappingAdapter:
         progress = self._read_save_progress(latest_session_dir)
         readiness = self._mapping_readiness(progress, process_alive)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
+        optimization = self._read_optimization_status(latest_session_dir)
         rosbag = self._rosbag_status()
         global_enu = self._read_global_enu()
         if not self.session:
             progress_stage = str(progress.get("stage") or "")
+            manifest = self._read_json(latest_session_dir / "map_manifest.json") if latest_session_dir else {}
+            output_complete = bool(
+                progress_stage == "completed"
+                or (
+                    manifest.get("completeness") == "complete"
+                    and progress_stage != "failed"
+                    and not progress.get("error_code")
+                )
+            )
             save_stages = {
                 "recovering",
                 "flushing_keyframes",
@@ -532,7 +608,15 @@ class MappingAdapter:
                 "building_grid",
                 "writing_metadata",
             }
-            recovered_state = "saving" if progress_stage in save_stages else ("mapping" if process_alive else "idle")
+            recovered_state = (
+                "idle"
+                if output_complete and not process_alive
+                else "saving"
+                if progress_stage in save_stages
+                else "mapping"
+                if process_alive
+                else "idle"
+            )
             return {
                 "state": recovered_state,
                 "map_dir": str(self.map_dir),
@@ -542,10 +626,12 @@ class MappingAdapter:
                 "slam_pids": self._find_slam_process_pids(),
                 "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
                 "save_progress": progress,
+                "rtk_alignment": progress.get("rtk_alignment") or {},
                 "readiness": readiness,
                 "ready_for_motion": readiness["ready_for_motion"],
                 "ready_for_save": readiness["ready_for_save"],
                 "files": files,
+                "optimization": optimization,
                 "rosbag": rosbag,
                 "origin": origin,
                 "global_enu": global_enu,
@@ -558,6 +644,7 @@ class MappingAdapter:
                 "slam_pose_ready": bool(readiness.get("slam_pose_ready")),
                 "ready_for_mapping": bool(readiness.get("ready_for_mapping")),
             }
+        origin = self._origin_monitor.status()
         state = self.session.state
         if state == "origin_waiting" and origin.get("origin_status") == "locked":
             self._set_state("origin_locked")
@@ -568,6 +655,8 @@ class MappingAdapter:
         if state == "slam_warmup" and readiness.get("ready_for_mapping"):
             self._set_state("ready_to_map")
             state = "ready_to_map"
+            if self.session.mapping_type == "outdoor":
+                origin = self._origin_monitor.begin_heading_review()
         if (
             progress.get("error_code") == "SLAM_DIVERGED"
             or progress.get("slam_health", {}).get("state") == "diverged"
@@ -595,17 +684,26 @@ class MappingAdapter:
             "slam_pids": self._find_slam_process_pids(),
             "slam_log_path": str(self._slam_log_path) if self._slam_log_path else None,
             "save_progress": progress,
+            "rtk_alignment": progress.get("rtk_alignment") or {},
             "readiness": readiness,
             "ready_for_motion": readiness["ready_for_motion"],
             "ready_for_save": readiness["ready_for_save"],
             "files": files,
+            "optimization": optimization,
             "rosbag": rosbag,
             "origin": origin,
             "global_enu": global_enu,
             "origin_status": origin.get("origin_status", "idle"),
-            "ready_for_mapping": bool(readiness.get("ready_for_mapping"))
-            and (self.session.mapping_type == "indoor" or origin.get("heading_stable") is True),
+            "ready_for_mapping": bool(readiness.get("ready_for_mapping")),
         }
+
+    def _read_optimization_status(self, session_dir: Path | None) -> dict:
+        if not session_dir:
+            return {}
+        summary = self._read_json(session_dir / "optimization_summary.json")
+        if summary:
+            return summary_without_corrections(summary)
+        return self._read_json(session_dir / "optimization_status.json")
 
     def _read_global_enu(self) -> dict:
         if not self._global_enu_file.is_file():
@@ -665,7 +763,19 @@ class MappingAdapter:
             message = "正式采集已开启，正在建立首个关键帧"
         else:
             state = "ready"
-            message = "传感器和首个关键帧正常，可以开始移动建图"
+            alignment = progress.get("rtk_alignment") or {}
+            if alignment.get("locked"):
+                source = str(alignment.get("source") or "")
+                if source == "heading":
+                    message = "正式采集中，ENU-地图航向已用双天线锁定"
+                elif source == "trajectory":
+                    message = "正式采集中，ENU-地图航向已用轨迹拟合锁定"
+                else:
+                    message = "正式采集中，ENU-地图航向已锁定"
+            elif alignment.get("fusion_enabled"):
+                message = "正式采集中；GNSS 尚未锁定航向，直线行走约 15 米后将用轨迹拟合"
+            else:
+                message = "传感器和首个关键帧正常，可以开始移动建图"
 
         return {
             "state": state,
@@ -743,16 +853,19 @@ class MappingAdapter:
     def _persist_workflow_state(self) -> None:
         if not self.session:
             return
-        self._origin_state_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema": "roamerx.mapping-workflow.v2",
             "session": asdict(self.session),
             "origin_status": self._origin_monitor.status().get("origin_status"),
             "updated_at": now_iso(),
         }
-        temporary = self._origin_state_file.with_suffix(self._origin_state_file.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, self._origin_state_file)
+        try:
+            _atomic_write_text(
+                self._origin_state_file,
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except OSError:
+            LOGGER.exception("failed to persist mapping workflow state to %s", self._origin_state_file)
 
     def _rosbag_command(self, action: str, label: str = "") -> dict:
         script = Path(self.config.rosbag_script).expanduser()
@@ -789,6 +902,29 @@ class MappingAdapter:
         status = self._rosbag_command("start", label)
         self._rosbag_dir = status.get("bag_dir") or self._rosbag_dir
 
+    def _configure_mapping_recording(self, command: dict, label: str) -> None:
+        """Apply the recording checkbox and start the fixed diagnostic bag.
+
+        The bag must cover the complete workflow, including outdoor RTK
+        preparation/origin locking and SLAM warmup. Repeated workflow commands
+        are expected, so the recorder script remains the single idempotent
+        owner of duplicate-start handling.
+        """
+        if "record_rosbag" in command:
+            requested = bool(command.get("record_rosbag"))
+            if not requested and self._record_rosbag:
+                # An explicit uncheck must not leave a recorder from an
+                # earlier prepare request running in the background.
+                self._record_rosbag = False
+                self._stop_rosbag()
+            else:
+                self._record_rosbag = requested
+        if not self._record_rosbag:
+            return
+        status = self._rosbag_status()
+        if not status.get("running"):
+            self._start_rosbag(label)
+
     def _stop_rosbag(self) -> None:
         status = self._rosbag_status()
         if status.get("bag_dir"):
@@ -806,6 +942,7 @@ class MappingAdapter:
         return self._rosbag_command("status")
 
     def _ensure_slam_process(self) -> None:
+        self._verify_mapping_deployment()
         if self._any_slam_process_alive:
             return
         if self.config.mapping_unit:
@@ -819,6 +956,60 @@ class MappingAdapter:
             LOGGER.warning("mapping unit %s is not active; falling back to a direct mapping process", self.config.mapping_unit)
         self._start_slam_subprocess()
         self._wait_for_slam_services()
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _verify_mapping_deployment(self) -> dict:
+        manifest_path = Path(self.config.deployment_manifest).expanduser()
+        if not manifest_path.is_file():
+            if self.config.deployment_manifest_required:
+                raise ProtocolError(
+                    "MAPPING_DEPLOYMENT_MISMATCH",
+                    f"mapping deployment manifest is missing: {manifest_path}",
+                )
+            return {}
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProtocolError(
+                "MAPPING_DEPLOYMENT_MISMATCH", f"invalid mapping deployment manifest: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise ProtocolError("MAPPING_DEPLOYMENT_MISMATCH", "mapping deployment manifest must be an object")
+        configuration = manifest.get("configuration") or {}
+        expected_unit = str(configuration.get("mapping_unit") or "")
+        expected_command = str(configuration.get("slam_command") or "")
+        if expected_unit != self.config.mapping_unit or expected_command != self.config.slam_command:
+            raise ProtocolError(
+                "MAPPING_DEPLOYMENT_MISMATCH",
+                "mapping unit or SLAM command differs from the deployment manifest",
+            )
+        artifacts = manifest.get("artifacts") or {}
+        required = {
+            "slam_binary": Path(self.config.slam_binary).expanduser(),
+            "slam_params_file": Path(self.config.slam_params_file).expanduser(),
+            "mapping_adapter": Path(__file__).resolve(),
+        }
+        for name, configured_path in required.items():
+            record = artifacts.get(name) or {}
+            recorded_path = Path(str(record.get("path") or "")).expanduser()
+            expected_hash = str(record.get("sha256") or "").lower()
+            if not configured_path.is_file() or recorded_path.resolve() != configured_path.resolve():
+                raise ProtocolError(
+                    "MAPPING_DEPLOYMENT_MISMATCH", f"{name} path does not match deployed artifact"
+                )
+            actual_hash = self._sha256_file(configured_path)
+            if not expected_hash or actual_hash != expected_hash:
+                raise ProtocolError(
+                    "MAPPING_DEPLOYMENT_MISMATCH", f"{name} SHA256 does not match deployment manifest"
+                )
+        return manifest
 
     def _start_slam_subprocess(self) -> None:
         command = self._shell_prefix() + self.config.slam_command
@@ -904,61 +1095,57 @@ class MappingAdapter:
         return payload
 
     def _sample_origin_topics(self) -> OriginSample:
-        timeout = self.config.origin_topic_timeout_seconds
-        fix = self._echo_topic_once(self.config.origin_fix_topic, timeout)
-        pvh = self._echo_topic_once(self.config.origin_rtk_topic, timeout)
-        ntrip_message = self._echo_topic_once(self.config.origin_ntrip_status_topic, timeout)
-        ntrip_data = ntrip_message.get("data") or ""
-        ntrip = yaml.safe_load(ntrip_data) if isinstance(ntrip_data, str) else ntrip_data
-        if not isinstance(ntrip, dict):
-            ntrip = {}
-        bestnav = pvh.get("bestnav") or {}
-        heading = pvh.get("heading") or {}
-        fix_status = int(((fix.get("status") or {}).get("status")) or -1)
-        position_type = int(bestnav.get("pos_type") or 0)
-        ntrip_quality = str(ntrip.get("quality") or "")
-        position_fixed = (
-            fix_status >= 2
-            and int(bestnav.get("p_sol_status", -1)) == 0
-            and position_type in {48, 49, 50}
-            and ntrip_quality == "rtk_fixed"
-        )
-        heading_fixed = int(heading.get("sol_status", -1)) == 0 and int(heading.get("heading_type") or 0) > 0
-        lat_std = float(bestnav.get("lat_std") or ntrip.get("horizontal_std_m") or math.inf)
-        lon_std = float(bestnav.get("lon_std") or ntrip.get("horizontal_std_m") or math.inf)
-        header_stamp = pvh.get("header", {}).get("stamp", {})
-        stamp_seconds = float(header_stamp.get("sec") or 0) + float(header_stamp.get("nanosec") or 0) / 1e9
-        header_age = max(0.0, time.time() - stamp_seconds) if stamp_seconds > 1_000_000_000 else 0.0
-        return OriginSample(
-            latitude=float(bestnav.get("latitude_deg") or fix.get("latitude") or math.nan),
-            longitude=float(bestnav.get("longitude_deg") or fix.get("longitude") or math.nan),
-            altitude=float(bestnav.get("altitude_m") or fix.get("altitude") or 0.0),
-            position_fixed=position_fixed,
-            heading_fixed=heading_fixed,
-            baseline_m=float(heading.get("base_line") or 0.0),
-            heading_deg=float(heading.get("heading_deg") or 0.0),
-            heading_std_deg=float(heading.get("heading_std") or math.inf),
-            horizontal_std_m=max(lat_std, lon_std),
-            age_seconds=max(float(ntrip.get("age_sec") or 0.0), header_age),
-            ntrip_quality=ntrip_quality,
-        )
+        sampled_at = None
+        if self._origin_payload_provider is not None:
+            fix, pvh, ntrip_message, sampled_at = self._origin_payload_provider()
+        else:
+            timeout = self.config.origin_topic_timeout_seconds
+            fix = self._echo_topic_once(self.config.origin_fix_topic, timeout)
+            pvh = self._echo_topic_once(self.config.origin_rtk_topic, timeout)
+            ntrip_message = self._echo_topic_once(self.config.origin_ntrip_status_topic, timeout)
+        return build_origin_sample(fix, pvh, ntrip_message, sampled_at=sampled_at)
 
-    def _stop_conflicting_navigation_stack(self) -> None:
-        """Stop localization/Nav2 so mapping owns the lidar, IMU, and map TF."""
+    def set_origin_payload_provider(self, provider) -> None:
+        """Use the Edge ROS node's persistent RTK subscriptions for sampling."""
+        self._origin_payload_provider = provider
+
+    def _run_navigation_script(self, action: str, error_code: str, error_message: str) -> None:
         script = Path(self.config.navigation_script).expanduser()
         if not script.is_file():
             raise ProtocolError("MAPPING_STACK_STOP_FAILED", f"navigation script not found: {script}")
         result = subprocess.run(
-            [str(script), "full-stop"],
+            [str(script), action],
             capture_output=True,
             text=True,
             timeout=max(15, self.config.command_timeout_seconds),
         )
         if result.returncode != 0:
             raise ProtocolError(
-                "MAPPING_STACK_STOP_FAILED",
-                (result.stderr or result.stdout or "failed to stop navigation/localization").strip(),
+                error_code,
+                (result.stderr or result.stdout or error_message).strip(),
             )
+
+    def _stop_conflicting_navigation_stack(self, *, preserve_localization: bool = False) -> None:
+        """Stop Nav2 and optionally preserve localization during RTK origin checks."""
+        self._run_navigation_script(
+            "stop" if preserve_localization else "full-stop",
+            "MAPPING_STACK_STOP_FAILED",
+            "failed to stop navigation stack",
+        )
+
+    def _ensure_origin_odometry(self) -> None:
+        self._run_navigation_script(
+            "ensure-localization-odom",
+            "MAPPING_ODOMETRY_NOT_READY",
+            "localization odometry did not become ready for origin checks",
+        )
+
+    def _stop_localization_for_slam(self) -> None:
+        self._run_navigation_script(
+            "stop-localization",
+            "MAPPING_LOCALIZATION_STOP_FAILED",
+            "failed to release localization before starting SLAM",
+        )
 
     def _call_map_state(self, data: int) -> str:
         named = None
@@ -1048,6 +1235,18 @@ class MappingAdapter:
                 candidates.append(entry)
         return max(candidates, key=self._latest_file_mtime) if candidates else None
 
+    def _wait_for_heading_alignment(self, timeout_seconds: float = 2.5) -> dict:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        alignment: dict = {}
+        while True:
+            progress = self._read_save_progress(
+                self._find_latest_session_dir() or self._find_latest_progress_dir()
+            )
+            alignment = (progress or {}).get("rtk_alignment") or {}
+            if alignment.get("locked") or time.monotonic() >= deadline:
+                return alignment
+            time.sleep(0.15)
+
     @staticmethod
     def _read_save_progress(base: Path | None) -> dict:
         if not base:
@@ -1080,6 +1279,7 @@ class MappingAdapter:
             stage="cancelled",
             recoverable=False,
             updated_at_unix=int(time.time()),
+            error_code="",
             error="",
         )
         path = base / "save_progress.json"
@@ -1090,6 +1290,24 @@ class MappingAdapter:
         except OSError:
             LOGGER.exception("failed to mark mapping progress cancelled: %s", path)
             temporary.unlink(missing_ok=True)
+
+    def _mark_progress_completed(self, base: Path | None) -> None:
+        """Close a validated export after optional post-save optimization."""
+        progress = self._read_save_progress(base)
+        if not base or not progress:
+            return
+        progress.update(
+            stage="completed",
+            progress_percent=100.0,
+            recoverable=False,
+            updated_at_unix=int(time.time()),
+            error="",
+        )
+        path = base / "save_progress.json"
+        try:
+            _atomic_write_text(path, json.dumps(progress, ensure_ascii=False, indent=2) + "\n")
+        except OSError:
+            LOGGER.exception("failed to mark mapping progress completed: %s", path)
 
     def _wait_for_complete_map_dir(self, min_mtime: float | None = None) -> Path:
         deadline = time.monotonic() + max(
@@ -1136,6 +1354,12 @@ class MappingAdapter:
             "indoor",
         )
         self._merge_locked_origin_metadata(work_dir)
+        self._write_optimization_status(work_dir, {
+            "stage": "detecting",
+            "success": None,
+            "trigger_source": "automatic_save",
+            "started_at_unix": round(time.time(), 3),
+        })
         try:
             manifest = finalize_map_package(
                 work_dir,
@@ -1145,22 +1369,61 @@ class MappingAdapter:
             )
         except MapConstraintError as exc:
             raise ProtocolError(exc.code, exc.message) from exc
-        # Scan-Context is generated after the SLAM save service returns. Feed
-        # accepted candidates back into the still-running C++ node so the
-        # authoritative GTSAM graph, rather than the Python SE2 fallback, owns
-        # the final trajectory and map.pcd.
-        if manifest.get("loop_status") == "accepted" and int(manifest.get("loop_closure_count") or 0) > 0:
+        # Scan-Context writes loop_closures.csv after the SLAM save returns.
+        # Always invoke the C++ graph: NDT/IMU/RTK optimization remains useful
+        # when Scan-Context accepts no loop. On failure keep the raw LIO map.
+        optimization_started = time.monotonic()
+        fallback_error = ""
+        if int(manifest.get("keyframe_count") or 0) > 1:
+            self._write_optimization_status(work_dir, {
+                "stage": "optimizing",
+                "success": None,
+                "trigger_source": "automatic_save",
+                "candidate_count": int(manifest.get("loop_candidate_count") or 0),
+                "accepted_loop_count": int(manifest.get("loop_closure_count") or 0),
+            })
+            if self.session:
+                self._set_state("optimizing")
             try:
                 self._call_ros_service("/slam/global_optimize", "std_srvs/srv/Trigger", "{}")
                 refreshed = self._read_json(work_dir / "map_manifest.json")
                 if refreshed:
                     manifest = refreshed
             except ProtocolError as exc:
-                # finalize_loop_closure has already rebuilt map.pcd from its
-                # conservative SE2 result, so retain a usable offline fallback
-                # while making the missing GTSAM handoff visible in logs.
-                LOGGER.warning("C++ GTSAM global optimization handoff failed: %s", exc)
+                fallback_error = str(exc)
+                LOGGER.warning("C++ GTSAM global optimization handoff failed; keeping raw LIO map: %s", exc)
+        optimization_duration = round(time.monotonic() - optimization_started, 3)
+        timing = {
+            "loop_detection_seconds": float(manifest.get("loop_detection_duration_seconds") or 0.0),
+            "optimization_and_rebuild_seconds": optimization_duration,
+        }
+        summary = build_optimization_summary(
+            work_dir,
+            mapping_type="indoor" if scene_scope == "indoor" else "outdoor",
+            timing=timing,
+            fallback_error=fallback_error,
+        )
+        compact_summary = summary_without_corrections(summary)
+        manifest["optimization"] = compact_summary
+        manifest["trajectory_source"] = summary.get("trajectory_source") or manifest.get("trajectory_source") or "raw"
+        manifest["use_gps"] = bool(summary.get("use_gps"))
+        _atomic_write_text(
+            work_dir / "map_manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        self._write_optimization_status(work_dir, compact_summary)
+        if manifest.get("completeness") == "complete":
+            self._mark_progress_completed(work_dir)
         return manifest
+
+    @staticmethod
+    def _write_optimization_status(work_dir: Path, payload: dict) -> None:
+        value = dict(payload)
+        value["updated_at_unix"] = round(time.time(), 3)
+        _atomic_write_text(
+            work_dir / "optimization_status.json",
+            json.dumps(value, ensure_ascii=False, indent=2),
+        )
 
     def _merge_locked_origin_metadata(self, work_dir: Path) -> None:
         if not self.session or self.session.mapping_type != "outdoor":
@@ -1176,6 +1439,9 @@ class MappingAdapter:
         evidence_fields = {
             "schema", "origin_lock_session_id", "lock_duration_seconds", "position_spread_m",
             "sample_count", "heading_deg", "heading_std_deg", "baseline_m", "locked_at_unix", "enu_axis",
+            "heading_confirmed", "heading_confirmation_source", "heading_confirmed_at_unix",
+            "confirmed_heading_deg", "confirmed_receiver_heading_deg", "confirmed_enu_yaw_deg",
+            "confirmed_heading_std_deg", "confirmed_baseline_m", "heading_offset_deg",
         }
         for key in evidence_fields:
             if key in locked:
@@ -1322,6 +1588,7 @@ class MappingAdapter:
             "trajectory_raw.csv",
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
+            "optimization_summary.json",
             "loop_closures.csv",
             "scan_context/index.json",
             "scan_context/loop_candidates.csv",
@@ -1334,7 +1601,11 @@ class MappingAdapter:
                 with zipfile.ZipFile(package_path) as archive:
                     diagnostic_names = set(diagnostic_paths)
                     for info in archive.infolist():
-                        if info.filename in diagnostic_names:
+                        if (
+                            info.filename in diagnostic_names
+                            or info.filename.startswith("diagnostics/rosbag/")
+                            or info.filename.startswith("imu_preintegration/")
+                        ):
                             diagnostic_size += info.file_size
                             diagnostic_count += 1
             except (OSError, zipfile.BadZipFile):
@@ -1392,6 +1663,7 @@ class MappingAdapter:
             "trajectory_raw.csv",
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
+            "optimization_summary.json",
             "loop_closures.csv",
             "keyframes/keyframes.csv",
             "scan_context/index.json",
@@ -1400,7 +1672,7 @@ class MappingAdapter:
         if preview_path:
             upload_files.append(preview_path.name)
         files = []
-        extra_files = []
+        bag_dir = Path(self._rosbag_dir).expanduser() if self._rosbag_dir else None
         with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
             for name in upload_files:
                 path = filtered_base / name
@@ -1412,13 +1684,19 @@ class MappingAdapter:
                 if path.exists():
                     archive.write(path, arcname=name)
                     files.append(name)
-            for name in extra_files:
-                path = filtered_base / name
-                if not path.exists() and filtered_base != base:
-                    path = base / name
-                if path.exists():
+            # Raw interval IMU samples and their bias linearization points are
+            # required to audit or replay standard preintegration in the cloud.
+            preintegration_root = base / "imu_preintegration"
+            if preintegration_root.is_dir():
+                for path in sorted(preintegration_root.glob("preint_*.json")):
+                    name = path.relative_to(base).as_posix()
                     archive.write(path, arcname=name)
                     files.append(name)
+        if bag_dir and bag_dir.is_dir():
+            LOGGER.info(
+                "Keeping mapping rosbag on robot at %s; not embedding it in the upload package",
+                bag_dir,
+            )
         # A rescue map must be inspected before it can replace the active
         # navigation map. Normal saves retain the existing auto-activation flow.
         if not is_rescue:
@@ -1426,6 +1704,10 @@ class MappingAdapter:
         map_manifest = self._read_json(filtered_base / "map_manifest.json")
         if not map_manifest and filtered_base != base:
             map_manifest = self._read_json(base / "map_manifest.json")
+        optimization_summary = self._read_json(filtered_base / "optimization_summary.json")
+        if not optimization_summary and filtered_base != base:
+            optimization_summary = self._read_json(base / "optimization_summary.json")
+        optimization = summary_without_corrections(optimization_summary) if optimization_summary else {}
         mapping_metrics = self._build_mapping_metrics(
             base,
             progress,
@@ -1441,7 +1723,11 @@ class MappingAdapter:
             "map_version": version,
             "source_map_dir": str(filtered_base),
             "raw_map_dir": str(base),
-            "auto_activate": bool(self.config.auto_activate_uploaded_map and not is_rescue),
+            "auto_activate": bool(
+                self.config.auto_activate_uploaded_map
+                and not is_rescue
+                and optimization.get("auto_activation_allowed", True)
+            ),
             "route_hint": self.session.route_hint if self.session else "",
             "frame_id": "map",
             "resolution": command.get("resolution") or 0.05,
@@ -1457,6 +1743,8 @@ class MappingAdapter:
             "localization_mode": map_manifest.get("localization_mode", ""),
             "origin_status": map_manifest.get("origin_status", ""),
             "mapping_metrics": mapping_metrics,
+            "optimization": optimization,
+            "local_rosbag_dir": str(bag_dir) if bag_dir and bag_dir.is_dir() else "",
         }
         return package_path, metadata
 
@@ -1468,10 +1756,17 @@ class MappingAdapter:
         gnss_path = source / "gnss_origin.yaml"
         if gnss_path.exists():
             gnss_metadata = yaml.safe_load(gnss_path.read_text(encoding="utf-8")) or {}
+        optimization_payload = self._read_json(source / "optimization_summary.json")
+        correction_by_index = {
+            int(item.get("index")): item
+            for item in optimization_payload.get("corrections", [])
+            if isinstance(item, dict) and item.get("index") is not None
+        }
         alignment_locked = bool(int(gnss_metadata.get("alignment_locked") or 0))
         origin_lat = float(gnss_metadata.get("origin_latitude") or 0.0)
         origin_lon = float(gnss_metadata.get("origin_longitude") or 0.0)
         alignment_yaw = float(gnss_metadata.get("enu_to_map_yaw") or 0.0)
+        heading_offset = math.radians(float(gnss_metadata.get("heading_offset_deg") or 0.0))
         offset_x = float(gnss_metadata.get("map_offset_x") or 0.0)
         offset_y = float(gnss_metadata.get("map_offset_y") or 0.0)
         earth_radius_m = 6378137.0
@@ -1512,13 +1807,32 @@ class MappingAdapter:
                         rtk["y"] = round(math.sin(alignment_yaw) * east + math.cos(alignment_yaw) * north + offset_y, 4)
                         if rtk["heading_valid"]:
                             yaw_enu = math.pi / 2.0 - math.radians(rtk["heading_deg"])
-                            rtk["yaw"] = round(math.atan2(math.sin(yaw_enu + alignment_yaw), math.cos(yaw_enu + alignment_yaw)), 5)
-                    samples.append({
+                            rtk["base_heading_deg"] = round(
+                                (rtk["heading_deg"] - math.degrees(heading_offset)) % 360.0,
+                                3,
+                            )
+                            map_yaw = yaw_enu + alignment_yaw + heading_offset
+                            rtk["yaw"] = round(math.atan2(math.sin(map_yaw), math.cos(map_yaw)), 5)
+                    correction = correction_by_index.get(int(row["index"]))
+                    if correction:
+                        raw_pose = correction.get("raw") or {}
+                        optimized_pose = correction.get("optimized") or {}
+                        if optimization_payload.get("applied") and optimized_pose:
+                            slam = dict(optimized_pose)
+                    sample = {
                         "index": int(row["index"]),
                         "stamp": round(float(row["stamp"]), 6),
                         "slam": slam,
                         "rtk": rtk,
-                    })
+                    }
+                    if correction:
+                        sample.update({
+                            "raw": raw_pose,
+                            "optimized": optimized_pose,
+                            "correction": correction.get("delta") or {},
+                            "correction_significant": bool(correction.get("significant")),
+                        })
+                    samples.append(sample)
                 except (KeyError, TypeError, ValueError):
                     LOGGER.warning("Skipping malformed mapping trace row: %s", row)
         if not samples:
@@ -1526,9 +1840,11 @@ class MappingAdapter:
         output.mkdir(parents=True, exist_ok=True)
         trace_path = output / "mapping_trace.json"
         trace_path.write_text(json.dumps({
-            "format": "roamerx.mapping-trace.v1",
+            "format": "roamerx.mapping-trace.v2",
             "frame_id": "map",
             "alignment_locked": alignment_locked,
+            "heading_offset_deg": round(math.degrees(heading_offset), 3),
+            "optimization": summary_without_corrections(optimization_payload) if optimization_payload else {},
             "samples": samples,
         }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         return trace_path
@@ -1606,7 +1922,9 @@ class MappingAdapter:
         LOGGER.info("Current map links refreshed to %s with files=%s", base, files)
 
     def _set_state(self, state: str) -> None:
-        if self.session:
+        if not self.session:
+            return
+        with self._state_lock:
             self.session.state = state
             self.session.updated_at = now_iso()
             self._persist_workflow_state()

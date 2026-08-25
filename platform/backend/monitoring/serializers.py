@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -179,6 +180,8 @@ class RobotSerializer(serializers.ModelSerializer):
         return obj.effective_connection_status()
 
     def get_today_alerts(self, obj):
+        if hasattr(obj, "today_alert_count"):
+            return obj.today_alert_count
         return InspectionEvent.objects.filter(
             robot=obj, detected_at__date=timezone.localdate()
         ).count()
@@ -772,6 +775,7 @@ class MapDataSerializer(serializers.ModelSerializer):
     mapping_trace_url = serializers.SerializerMethodField()
     package_url = serializers.SerializerMethodField()
     file_size = serializers.SerializerMethodField()
+    optimization_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = MapData
@@ -803,6 +807,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "origin_status",
             "map_completeness",
             "mapping_metrics",
+            "optimization_summary",
             "file_size",
             "created_at",
             "updated_at",
@@ -847,6 +852,33 @@ class MapDataSerializer(serializers.ModelSerializer):
             size += obj.package_file.size
         return size
 
+    def get_optimization_summary(self, obj):
+        try:
+            description = json.loads(obj.description or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(description, dict):
+            return {}
+        optimization = description.get("optimization")
+        if isinstance(optimization, dict) and optimization:
+            return optimization
+        manifest = description.get("map_manifest")
+        if isinstance(manifest, dict) and isinstance(manifest.get("optimization"), dict):
+            return manifest["optimization"]
+        return {}
+
+
+class MapDataSummarySerializer(MapDataSerializer):
+    """Compact map representation for selectors and cards."""
+
+    class Meta(MapDataSerializer.Meta):
+        fields = [
+            "id", "name", "robot", "robot_name", "robot_code", "thumbnail", "thumbnail_url",
+            "resolution", "width", "height", "origin", "active", "parent_map", "coordinate_mode",
+            "scene_scope", "localization_mode", "origin_status", "map_completeness", "file_size",
+            "created_at", "updated_at",
+        ]
+
 
 class MapSetMemberSerializer(serializers.ModelSerializer):
     map_data = MapDataSerializer(read_only=True)
@@ -863,6 +895,22 @@ class MapSetSerializer(serializers.ModelSerializer):
     class Meta:
         model = MapSet
         fields = ["id", "name", "robot", "robot_name", "version", "manifest", "active", "members", "created_at", "updated_at"]
+
+
+class MapSetSummarySerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True, allow_null=True)
+    member_count = serializers.IntegerField(read_only=True)
+    submap_ids = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MapSet
+        fields = [
+            "id", "name", "robot", "robot_name", "version", "manifest", "active",
+            "member_count", "submap_ids", "created_at", "updated_at",
+        ]
+
+    def get_submap_ids(self, obj):
+        return [member.submap_id for member in obj.members.all()]
 
 
 class PatrolRouteSerializer(serializers.ModelSerializer):
@@ -946,6 +994,20 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class PatrolRouteSummarySerializer(PatrolRouteSerializer):
+    waypoint_count = serializers.SerializerMethodField()
+
+    class Meta(PatrolRouteSerializer.Meta):
+        fields = [
+            "id", "name", "map_data", "map_name", "map_set", "map_set_name", "robot",
+            "robot_name", "robot_code", "waypoint_count", "description", "scene_scope",
+            "created_at", "updated_at",
+        ]
+
+    def get_waypoint_count(self, obj):
+        return len(obj.waypoints or [])
+
+
 class ZoneSerializer(serializers.ModelSerializer):
     map_name = serializers.CharField(source="map_data.name", read_only=True)
     zone_type_label = serializers.CharField(source="get_zone_type_display", read_only=True)
@@ -996,6 +1058,20 @@ class TrackSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+
+class TrackSummarySerializer(TrackSerializer):
+    point_count = serializers.SerializerMethodField()
+
+    class Meta(TrackSerializer.Meta):
+        fields = [
+            "id", "robot", "robot_name", "robot_code", "map_data", "map_name", "route",
+            "route_name", "task", "task_name", "start_time", "end_time", "distance",
+            "duration", "point_count", "description", "created_at", "updated_at",
+        ]
+
+    def get_point_count(self, obj):
+        return len(obj.path or [])
 
 
 class RobotSessionSerializer(serializers.ModelSerializer):

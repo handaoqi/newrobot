@@ -39,8 +39,8 @@ laser_mapping:
         # Only quality-gated RTK float/fixed fixes may alter LIO. Invalid GNSS
         # automatically falls back to LiDAR + IMU without resetting the pose.
         enable: true
-        # Edge Agent writes this atomically after the outdoor 60 s anchor lock.
-        # Indoor mapping safely ignores a missing file and uses its local frame.
+        # Edge Agent writes this after the outdoor ENU origin lock (RTK position
+        # FIX, about 3 s). Indoor mapping ignores a missing file.
         origin_file: /home/dogrobot/runtime/nx-edge/data/jszr/map/gnss_origin.yaml
         gain: 0.20
         max_correction_step: 0.30
@@ -55,11 +55,13 @@ laser_mapping:
         alignment_max_rms: 1.5
         alignment_max_yaw_change_deg: 3.0
         alignment_required_fits: 3
-        # Dual-antenna heading locks ENU-map yaw immediately so RTK fusion
-        # does not wait for a 15 m trajectory baseline. Trajectory fitting
-        # remains the fallback when heading is unavailable.
+        # Dual-antenna heading locks ENU-map yaw only after formal capture
+        # starts (operator confirmed the 60 s heading review). Locking during
+        # warmup uses slam_yaw≈0 and then fights LIO after the review spin.
+        # Trajectory fitting remains the fallback when heading is unavailable.
         use_heading: true
-        heading_offset_deg: 0.0
+        # Receiver primary-to-secondary baseline points opposite base_link +X.
+        heading_offset_deg: 180.0
         heading_min_baseline_m: 0.20
         heading_max_std_deg: 5.0
         heading_max_age: 1.5
@@ -103,17 +105,27 @@ laser_mapping:
         # Bound the background disk writer so storage stalls cannot consume RAM.
         max_queue_size: 8
     global_optimization:
-        # Batch optimize all saved keyframes before publishing the final map.
-        # NDT/LIO between factors, IMU preintegration, RTK XY/heading and
-        # optional loop_closures.csv constraints share one GTSAM graph.
+        # Batch optimize NDT, standard IMU preintegration, RTK and Scan-Context loops.
+        # First save always exports the raw LIO cloud as map.pcd/map_raw.pcd.
+        # IMU acceleration is calibrated to m/s^2 and gravity is modeled in the
+        # GTSAM pose/velocity/bias state instead of as a Pose3-between delta.
         enable: true
         max_iterations: 80
         prior_translation_sigma: 0.01
         prior_rotation_sigma_rad: 0.01
         ndt_translation_sigma: 0.15
         ndt_rotation_sigma_rad: 0.08
-        imu_translation_sigma: 0.20
-        imu_rotation_sigma_rad: 0.12
+        imu_accelerometer_noise_sigma: 0.10
+        imu_gyroscope_noise_sigma: 0.10
+        imu_integration_noise_sigma: 0.0001
+        imu_accel_bias_random_walk_sigma: 0.0001
+        imu_gyro_bias_random_walk_sigma: 0.0001
+        imu_velocity_prior_sigma: 0.30
+        imu_bias_prior_sigma: 0.10
+        gravity_magnitude: 9.81
+        use_imu_factor: true
+        max_pose_jump_m: 25.0
+        max_abs_z_change_m: 1.5
         rtk_position_sigma_floor: 0.20
         rtk_heading_sigma_floor_rad: 0.035
         loop_translation_sigma: 0.10

@@ -200,6 +200,108 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     store.close()
 
 
+def test_round_trip_starts_from_first_copy_when_start_and_end_overlap(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.12, y=2.04)
+    envelope = command("task.start")
+    waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    waypoints.extend(
+        [
+            {**waypoints[1], "waypoint_id": "wp-4", "sequence": 3, "name": "B-return"},
+            {
+                "waypoint_id": "wp-5",
+                "sequence": 4,
+                "name": "A-return",
+                "x": 1.15,
+                "y": 2.05,
+                "yaw": 3.14,
+                "dwell_seconds": 0,
+                "actions": [],
+            },
+        ]
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert executor.context.current_waypoint_index == 0
+    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-1"]
+    store.close()
+
+
+def test_round_trip_resume_does_not_skip_outbound_legs_to_return_copy(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.12, y=2.04)
+    envelope = command("task.start")
+    waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    waypoints.extend(
+        [
+            {**waypoints[1], "waypoint_id": "wp-4", "sequence": 3, "name": "B-return"},
+            {
+                "waypoint_id": "wp-5",
+                "sequence": 4,
+                "name": "A-return",
+                "x": 1.15,
+                "y": 2.05,
+                "yaw": 3.14,
+                "dwell_seconds": 0,
+                "actions": [],
+            },
+        ]
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert [waypoint["waypoint_id"] for waypoint in nav.sent[-1]] == ["wp-2"]
+
+    nav.pose = SimpleNamespace(x=1.16, y=2.06)
+    executor.on_localization_lost()
+    executor.on_localization_recovered()
+
+    assert executor.context.current_waypoint_index == 1
+    assert [waypoint["waypoint_id"] for waypoint in nav.sent[-1]] == ["wp-2"]
+    store.close()
+
+
+def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["loop_execution"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert executor.context.route_snapshot["execution_order"] == "reverse_from_route_end"
+    assert [waypoint["waypoint_id"] for waypoint in executor.context.route_snapshot["waypoints"]] == [
+        "wp-3",
+        "wp-2",
+        "wp-1",
+    ]
+    assert executor.context.current_waypoint_index == 0
+    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-3"]
+    store.close()
+
+
 def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

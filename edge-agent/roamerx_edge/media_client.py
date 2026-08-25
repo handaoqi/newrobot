@@ -7,6 +7,7 @@ import json
 import requests
 
 from .config import MediaConfig
+from .protocol import ProtocolError
 
 
 class MediaClient:
@@ -30,15 +31,29 @@ class MediaClient:
             "map_name": metadata.get("map_name", ""),
             "metadata": json.dumps(metadata, ensure_ascii=False),
         }
-        with file_path.open("rb") as stream:
-            response = requests.post(
-                self.config.map_upload_url,
-                data=data,
-                files={"map_package": (file_path.name, stream, "application/zip")},
-                headers=headers,
-                timeout=300,
-            )
-        response.raise_for_status()
+        timeout_seconds = max(60, int(self.config.map_upload_timeout_seconds or 1800))
+        try:
+            with file_path.open("rb") as stream:
+                response = requests.post(
+                    self.config.map_upload_url,
+                    data=data,
+                    files={"map_package": (file_path.name, stream, "application/zip")},
+                    headers=headers,
+                    timeout=(30, timeout_seconds),
+                )
+            response.raise_for_status()
+        except (requests.Timeout, TimeoutError) as exc:
+            raise ProtocolError(
+                "MAP_UPLOAD_TIMEOUT",
+                f"地图包上传超时（{timeout_seconds}s）: {file_path.name}",
+            ) from exc
+        except requests.RequestException as exc:
+            if "timed out" in str(exc).lower():
+                raise ProtocolError(
+                    "MAP_UPLOAD_TIMEOUT",
+                    f"地图包上传超时（{timeout_seconds}s）: {file_path.name}",
+                ) from exc
+            raise ProtocolError("MAP_UPLOAD_FAILED", f"地图包上传失败: {exc}") from exc
         return response.json()
 
     def _upload(self, path: str, media_type: str, event_id: str, task_execution_id: str | None) -> dict:

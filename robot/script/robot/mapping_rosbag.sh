@@ -95,6 +95,10 @@ start_recording() {
     /front_lidar/imu
     /fix
     /rtk_pvh
+    /rtk/ntrip_status
+    /odom/localization_odom
+    /slam_odom
+    /tf
     /tf_static
   )
   if [ -n "${ROSBAG_EXTRA_TOPICS}" ]; then

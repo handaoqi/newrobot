@@ -123,6 +123,18 @@ class FakeNavigationStack:
         return {"action": "reload_map", "returncode": 0}
 
 
+class FakeDeferredNavigationStack(FakeNavigationStack):
+    def reload_map_if_running(self, pcd_path, yaml_path):
+        return {
+            "action": "reload_map",
+            "returncode": 0,
+            "deferred": True,
+            "reason": "map_consumers_inactive",
+            "pcd_path": pcd_path,
+            "yaml_path": yaml_path,
+        }
+
+
 def test_task_start_rejects_transient_localization(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     envelope = decode_message(raw)
@@ -686,5 +698,36 @@ def test_map_activation_reloads_both_map_consumers_and_requires_reseed(tmp_path)
 
     assert stack.reload_calls == [("/maps/selected/map.pcd", "/maps/selected/map.yaml")]
     assert result["payload"]["result"]["localization_reset_required"] is True
+    assert state.localization_status == "initializing"
+    store.close()
+
+
+def test_map_activation_succeeds_when_reload_is_deferred_after_mapping(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "map.activate"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"map_id": "131", "map_version": "mapped-site"}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=False)
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store,
+            FakeNavigation(),
+            event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=FakeDeferredNavigationStack(),
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert result["payload"]["result"]["map_reload"]["deferred"] is True
     assert state.localization_status == "initializing"
     store.close()

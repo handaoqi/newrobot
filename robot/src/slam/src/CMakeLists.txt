@@ -97,6 +97,21 @@ target_link_libraries(pcd2grid_streaming ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 ament_target_dependencies(mapping ${dependencies})
 ament_target_dependencies(pcd2grid_streaming ${dependencies})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(global_factor_graph_test
+    test/global_factor_graph_test.cpp
+    src/global_factor_graph.cpp
+  )
+  if(TARGET global_factor_graph_test)
+    target_include_directories(global_factor_graph_test PRIVATE
+      ${EIGEN3_INCLUDE_DIR}
+      ${CMAKE_CURRENT_LIST_DIR}/include
+    )
+    target_link_libraries(global_factor_graph_test gtsam)
+  endif()
+endif()
+
 install(TARGETS mapping pcd2grid_streaming
   DESTINATION lib/${PROJECT_NAME}
 )

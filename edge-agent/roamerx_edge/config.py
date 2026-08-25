@@ -100,6 +100,7 @@ class MediaConfig:
     map_upload_url: str = ""
     device_id: str = ""
     device_key: str = ""
+    map_upload_timeout_seconds: int = 1800
 
 
 @dataclass
@@ -115,6 +116,8 @@ class MappingConfig:
         "--ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
     )
     mapping_unit: str = "roamerx-mapping.service"
+    deployment_manifest: str = "/home/dogrobot/runtime/nx-edge/conf/mapping-deployment.json"
+    deployment_manifest_required: bool = False
     navigation_script: str = "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
     service_name: str = "/slam_state_service"
     service_type: str = "robots_dog_msgs/srv/MapState"
@@ -149,7 +152,7 @@ class MappingConfig:
     indoor_warmup_data: int = 7
     origin_file: str = ""
     origin_state_file: str = ""
-    origin_lock_duration_seconds: float = 60.0
+    origin_lock_duration_seconds: float = 10.0
     origin_lock_max_spread_m: float = 0.02
     origin_lock_sample_interval_seconds: float = 1.0
     origin_lock_no_signal_timeout_seconds: float = 3.0
@@ -161,6 +164,9 @@ class MappingConfig:
     heading_min_baseline_m: float = 0.20
     heading_max_std_deg: float = 5.0
     heading_max_age_seconds: float = 1.5
+    # The receiver reports the primary-to-secondary antenna baseline, which
+    # points opposite base_link +X on the current robot installation.
+    heading_offset_deg: float = 180.0
 
 
 @dataclass

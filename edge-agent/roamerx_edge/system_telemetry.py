@@ -128,7 +128,12 @@ class SystemTelemetryProbe:
         if legacy_active:
             self._remember_legacy_status(legacy_status)
         elif (
-            not charging
+            # The legacy probe must never preempt a healthy ARC controller.
+            # Both implementations use /dev/ttyUSB0; legacy-status stops
+            # arc_platform while it samples the vendor helper. Running that
+            # probe from the normal telemetry loop interrupts motion/teleop.
+            not arc_platform_active
+            and not charging
             and values["power"] > self.charge_config.low_battery_start_percent
             and arc_dock_state in {None, 0, 5}
             and time.monotonic() - self._last_legacy_status_at

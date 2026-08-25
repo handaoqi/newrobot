@@ -86,3 +86,43 @@ def test_localization_loss_does_not_start_task_recovery_without_active_task(monk
 
     assert application.task_executor.loss_notifications == 1
     assert application._localization_recovery_lock.acquire(blocking=False)
+
+
+def test_mapping_divergence_alert_emits_once(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application._mapping_divergence_notified = False
+    alerts = []
+    application.alerts = SimpleNamespace(
+        emit_system_alert=lambda *args, **kwargs: alerts.append((args, kwargs)) or "event-1"
+    )
+    started = []
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            started.append(name)
+            self.target = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(app_module.threading, "Thread", FakeThread)
+
+    payload = {
+        "state": "mapping",
+        "map_name": "园区",
+        "mapping_session_id": "sess-1",
+        "save_progress": {
+            "error_code": "SLAM_DIVERGED",
+            "error": "pose anomaly detected",
+            "slam_health": {"state": "diverged", "warning": "speed=12"},
+        },
+    }
+    application._observe_mapping_health(payload)
+    application._observe_mapping_health(payload)
+
+    assert len(alerts) == 1
+    assert alerts[0][0][0] == "slam_diverged"
+    assert started == ["mapping-diverged-speech"]
+
+    application._observe_mapping_health({"state": "idle", "save_progress": {}})
+    assert application._mapping_divergence_notified is False

@@ -87,6 +87,36 @@ class NavigationStackAdapter:
             raise ProtocolError("MAP_RELOAD_FAILED", payload["stderr"] or payload["stdout"])
         return payload
 
+    def reload_map_if_running(self, pcd_path: str, yaml_path: str) -> dict:
+        """Reload live consumers, or defer until the next navigation start.
+
+        Mapping deliberately full-stops localization and Nav2.  An automatic
+        activation command can arrive immediately after upload, before those
+        services exist again; calling ROS load-map services in that window is
+        an expected unavailable state rather than an activation failure.
+        """
+        status_payload = self.status()
+        stdout = str(status_payload.get("stdout") or "")
+        localization_running = any(token in stdout for token in (
+            "localization localization.launch.py",
+            "localization_node",
+        ))
+        navigation_running = any(token in stdout for token in (
+            "robot_navigo navigation_bringup.launch.py",
+            "navigo_container",
+        ))
+        if not (localization_running and navigation_running):
+            return {
+                "action": "reload_map",
+                "returncode": 0,
+                "deferred": True,
+                "reason": "map_consumers_inactive",
+                "pcd_path": pcd_path,
+                "yaml_path": yaml_path,
+                "precheck": status_payload,
+            }
+        return self.reload_map(pcd_path, yaml_path)
+
     def _looks_ready(self, stdout: str) -> bool:
         required = (
             "/planner_server",

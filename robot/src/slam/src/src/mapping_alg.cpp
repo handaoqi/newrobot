@@ -10,10 +10,13 @@
 #include "mapping_alg.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <regex>
 #include <stdexcept>
 #include <sys/statvfs.h>
 #include <unordered_set>
@@ -236,7 +239,7 @@ namespace robot::slam
         this->declare_parameter<double>("gnss_fusion.alignment_max_yaw_change_deg", 3.0);
         this->declare_parameter<int>("gnss_fusion.alignment_required_fits", 3);
         this->declare_parameter<bool>("gnss_fusion.use_heading", true);
-        this->declare_parameter<double>("gnss_fusion.heading_offset_deg", 0.0);
+        this->declare_parameter<double>("gnss_fusion.heading_offset_deg", 180.0);
         this->declare_parameter<double>("gnss_fusion.heading_min_baseline_m", 0.20);
         this->declare_parameter<double>("gnss_fusion.heading_max_std_deg", 5.0);
         this->declare_parameter<double>("gnss_fusion.heading_max_age", 1.5);
@@ -282,13 +285,22 @@ namespace robot::slam
         this->declare_parameter<double>("global_optimization.prior_rotation_sigma_rad", 0.01);
         this->declare_parameter<double>("global_optimization.ndt_translation_sigma", 0.15);
         this->declare_parameter<double>("global_optimization.ndt_rotation_sigma_rad", 0.08);
-        this->declare_parameter<double>("global_optimization.imu_translation_sigma", 0.20);
-        this->declare_parameter<double>("global_optimization.imu_rotation_sigma_rad", 0.12);
+        this->declare_parameter<double>("global_optimization.imu_accelerometer_noise_sigma", 0.10);
+        this->declare_parameter<double>("global_optimization.imu_gyroscope_noise_sigma", 0.10);
+        this->declare_parameter<double>("global_optimization.imu_integration_noise_sigma", 0.0001);
+        this->declare_parameter<double>("global_optimization.imu_accel_bias_random_walk_sigma", 0.0001);
+        this->declare_parameter<double>("global_optimization.imu_gyro_bias_random_walk_sigma", 0.0001);
+        this->declare_parameter<double>("global_optimization.imu_velocity_prior_sigma", 0.30);
+        this->declare_parameter<double>("global_optimization.imu_bias_prior_sigma", 0.10);
+        this->declare_parameter<double>("global_optimization.gravity_magnitude", G_m_s2);
         this->declare_parameter<double>("global_optimization.rtk_position_sigma_floor", 0.20);
         this->declare_parameter<double>("global_optimization.rtk_heading_sigma_floor_rad", 0.035);
         this->declare_parameter<double>("global_optimization.loop_translation_sigma", 0.10);
         this->declare_parameter<double>("global_optimization.loop_rotation_sigma_rad", 0.08);
         this->declare_parameter<double>("global_optimization.robust_huber_k", 1.345);
+        this->declare_parameter<bool>("global_optimization.use_imu_factor", true);
+        this->declare_parameter<double>("global_optimization.max_pose_jump_m", 25.0);
+        this->declare_parameter<double>("global_optimization.max_abs_z_change_m", 1.5);
         this->declare_parameter<string>("storage.data_path", "");
 
         this->get_parameter_or<string>("pcd2pgm.file_name", pcd2pgm_options_.file_name, "map");
@@ -326,13 +338,22 @@ namespace robot::slam
         this->get_parameter_or<double>("global_optimization.prior_rotation_sigma_rad", global_factor_graph_config_.prior_rotation_sigma_rad, 0.01);
         this->get_parameter_or<double>("global_optimization.ndt_translation_sigma", global_factor_graph_config_.ndt_translation_sigma, 0.15);
         this->get_parameter_or<double>("global_optimization.ndt_rotation_sigma_rad", global_factor_graph_config_.ndt_rotation_sigma_rad, 0.08);
-        this->get_parameter_or<double>("global_optimization.imu_translation_sigma", global_factor_graph_config_.imu_translation_sigma, 0.20);
-        this->get_parameter_or<double>("global_optimization.imu_rotation_sigma_rad", global_factor_graph_config_.imu_rotation_sigma_rad, 0.12);
+        this->get_parameter_or<double>("global_optimization.imu_accelerometer_noise_sigma", global_factor_graph_config_.imu_accelerometer_noise_sigma, 0.10);
+        this->get_parameter_or<double>("global_optimization.imu_gyroscope_noise_sigma", global_factor_graph_config_.imu_gyroscope_noise_sigma, 0.10);
+        this->get_parameter_or<double>("global_optimization.imu_integration_noise_sigma", global_factor_graph_config_.imu_integration_noise_sigma, 0.0001);
+        this->get_parameter_or<double>("global_optimization.imu_accel_bias_random_walk_sigma", global_factor_graph_config_.imu_accel_bias_random_walk_sigma, 0.0001);
+        this->get_parameter_or<double>("global_optimization.imu_gyro_bias_random_walk_sigma", global_factor_graph_config_.imu_gyro_bias_random_walk_sigma, 0.0001);
+        this->get_parameter_or<double>("global_optimization.imu_velocity_prior_sigma", global_factor_graph_config_.imu_velocity_prior_sigma, 0.30);
+        this->get_parameter_or<double>("global_optimization.imu_bias_prior_sigma", global_factor_graph_config_.imu_bias_prior_sigma, 0.10);
+        this->get_parameter_or<double>("global_optimization.gravity_magnitude", global_factor_graph_config_.gravity_magnitude, G_m_s2);
         this->get_parameter_or<double>("global_optimization.rtk_position_sigma_floor", global_factor_graph_config_.rtk_position_sigma_floor, 0.20);
         this->get_parameter_or<double>("global_optimization.rtk_heading_sigma_floor_rad", global_factor_graph_config_.rtk_heading_sigma_floor_rad, 0.035);
         this->get_parameter_or<double>("global_optimization.loop_translation_sigma", global_factor_graph_config_.loop_translation_sigma, 0.10);
         this->get_parameter_or<double>("global_optimization.loop_rotation_sigma_rad", global_factor_graph_config_.loop_rotation_sigma_rad, 0.08);
         this->get_parameter_or<double>("global_optimization.robust_huber_k", global_factor_graph_config_.robust_huber_k, 1.345);
+        this->get_parameter_or<bool>("global_optimization.use_imu_factor", global_factor_graph_config_.use_imu_factor, true);
+        this->get_parameter_or<double>("global_optimization.max_pose_jump_m", global_factor_graph_config_.max_pose_jump_m, 25.0);
+        this->get_parameter_or<double>("global_optimization.max_abs_z_change_m", global_factor_graph_config_.max_abs_z_change_m, 1.5);
         global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
         std::string configured_data_path;
         this->get_parameter_or<string>("storage.data_path", configured_data_path, "");
@@ -397,8 +418,8 @@ namespace robot::slam
         gnss_alignment_max_yaw_change_rad_ = gnss_alignment_yaw_change_deg * M_PI / 180.0;
         this->get_parameter_or<int>("gnss_fusion.alignment_required_fits", gnss_alignment_required_fits_, 3);
         this->get_parameter_or<bool>("gnss_fusion.use_heading", gnss_use_heading_, true);
-        double gnss_heading_offset_deg = 0.0;
-        this->get_parameter_or<double>("gnss_fusion.heading_offset_deg", gnss_heading_offset_deg, 0.0);
+        double gnss_heading_offset_deg = 180.0;
+        this->get_parameter_or<double>("gnss_fusion.heading_offset_deg", gnss_heading_offset_deg, 180.0);
         gnss_heading_offset_rad_ = gnss_heading_offset_deg * M_PI / 180.0;
         this->get_parameter_or<double>("gnss_fusion.heading_min_baseline_m", gnss_heading_min_baseline_m_, 0.20);
         this->get_parameter_or<double>("gnss_fusion.heading_max_std_deg", gnss_heading_max_std_deg_, 5.0);
@@ -487,6 +508,7 @@ namespace robot::slam
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/body_points", 20);
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
         pubOdomAftMapped_       = this->create_publisher<nav_msgs::msg::Odometry>("/slam_odom", 20);
+        pubLocalizationOdom_    = this->create_publisher<nav_msgs::msg::Odometry>("/odom/localization_odom", 20);
         pubPath_                = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubGlobalOptimizedOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/slam/global_optimized_odom", 20);
         pubGlobalOptimizedPath_ = this->create_publisher<nav_msgs::msg::Path>("/slam/global_optimized_path", 10);
@@ -549,6 +571,11 @@ namespace robot::slam
                     mapping_capture_enabled_ = true;
                     has_last_keyframe_ = false;
                     resetImuPreintegration(lidar_end_time);
+                    // Heading review rotation must not lock ENU-map yaw. Lock
+                    // once, from the current SLAM yaw, after formal capture starts.
+                    gnss_alignment_samples_.clear();
+                    gnss_alignment_stable_fits_ = 0;
+                    tryLockGnssAlignmentOnCaptureStart();
                     writeSaveProgress("waiting_first_keyframe", 0.0);
                 }
                 else
@@ -709,21 +736,64 @@ namespace robot::slam
         std::shared_ptr<std_srvs::srv::Trigger::Response> response)
     {
         (void)request;
+        const auto publish_stage = [this](const std::string& stage, bool success, const std::string& error = "") {
+            if (!pubGlobalOptimizationStatus_)
+                return;
+            std_msgs::msg::String status;
+            std::ostringstream json;
+            const double updated_at_unix = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const int progress_percent = stage == "completed" || stage == "no_valid_loop" || stage == "fallback"
+                ? 100 : stage == "rebuilding_map" ? 82 : stage == "optimizing" ? 65 : 0;
+            const std::string mapping_session_id = active_map_subdir_.empty()
+                ? "" : std::filesystem::path(active_map_subdir_).filename().string();
+            json << "{\"stage\":\"" << stage << "\",\"success\":" << (success ? "true" : "false")
+                 << ",\"progress_percent\":" << progress_percent
+                 << ",\"trigger_source\":\"automatic_save\""
+                 << ",\"mapping_session_id\":\"" << jsonEscape(mapping_session_id) << '"'
+                 << ",\"map_dir\":\"" << jsonEscape(active_map_subdir_) << '"'
+                 << ",\"updated_at_unix\":" << std::fixed << std::setprecision(3) << updated_at_unix
+                 << ",\"use_gps\":" << (use_gnss_fusion_ ? "true" : "false")
+                 << ",\"use_imu_factor\":" << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                 << ",\"gravity_magnitude\":" << global_factor_graph_config_.gravity_magnitude
+                 << ",\"keyframe_count\":" << mapping_keyframes_.size()
+                 << ",\"factor_count\":" << global_factor_graph_result_.factor_count
+                 << ",\"ndt_factor_count\":" << global_factor_graph_result_.ndt_factor_count
+                 << ",\"imu_factor_count\":" << global_factor_graph_result_.imu_factor_count
+                 << ",\"imu_bias_factor_count\":" << global_factor_graph_result_.imu_bias_factor_count
+                 << ",\"imu_velocity_prior_factor_count\":" << global_factor_graph_result_.imu_velocity_prior_factor_count
+                 << ",\"rtk_position_factor_count\":" << global_factor_graph_result_.rtk_position_factor_count
+                 << ",\"rtk_heading_factor_count\":" << global_factor_graph_result_.rtk_heading_factor_count
+                 << ",\"loop_closure_count\":" << global_factor_graph_result_.loop_closure_factor_count;
+            if (!error.empty())
+                json << ",\"error\":\"" << jsonEscape(error) << '"';
+            json << '}';
+            status.data = json.str();
+            pubGlobalOptimizationStatus_->publish(status);
+            if (!active_map_subdir_.empty())
+            {
+                std::ofstream durable_status(active_map_subdir_ + "/optimization_status.json",
+                    std::ios::out | std::ios::trunc);
+                if (durable_status.is_open())
+                    durable_status << status.data << '\n';
+            }
+        };
         if (active_map_subdir_.empty() || mapping_keyframes_.empty())
         {
             response->success = false;
             response->message = "No active mapping session or keyframes.";
+            publish_stage("failed", false, response->message);
             return;
         }
+        publish_stage("optimizing", true);
         bool success = optimizeHistoricalTrajectory(active_map_subdir_);
         if (success && map_export_completed_ && global_optimization_applied_)
         {
+            publish_stage("rebuilding_map", true);
             const auto map_pcd = std::filesystem::path(active_map_subdir_) / "map.pcd";
             const auto map_raw = std::filesystem::path(active_map_subdir_) / "map_raw.pcd";
             std::error_code filesystem_error;
-            if (!std::filesystem::exists(map_raw) && std::filesystem::exists(map_pcd))
-                std::filesystem::copy_file(map_pcd, map_raw,
-                    std::filesystem::copy_options::overwrite_existing, filesystem_error);
+            // Never overwrite map_raw.pcd here; finish() snapshots the LIO export.
             std::size_t written_points = 0;
             success = streamMapFromKeyframes(active_map_subdir_, written_points);
             if (success)
@@ -752,6 +822,17 @@ namespace robot::slam
         response->message = success
             ? "Historical GTSAM optimization and map rebuild completed."
             : keyframe_writer_error_;
+        // streamMapFromKeyframes() reports its own writing_pcd progress.  The
+        // initial export was already complete before this optional global
+        // optimization callback, so never leave the durable progress file at
+        // 65% after either rebuilding the optimized map or falling back to
+        // map_raw.pcd.
+        if (map_export_completed_)
+            writeSaveProgress("completed", 100.0);
+        publish_stage(
+            success ? (global_optimization_applied_ ? "completed" : "no_valid_loop") : "fallback",
+            success,
+            success ? "" : keyframe_writer_error_);
     }
 
     void MappingAlg::reset()
@@ -1186,7 +1267,7 @@ namespace robot::slam
 
     void MappingAlg::collectGnssAlignment(double lidar_time)
     {
-        if (!flg_EKF_inited || slam_diverged_)
+        if (!use_gnss_fusion_ || !flg_EKF_inited || slam_diverged_ || !mapping_capture_enabled_)
             return;
 
         sensor_msgs::msg::NavSatFix gnss;
@@ -1244,7 +1325,8 @@ namespace robot::slam
 
     bool MappingAlg::lockGnssAlignmentFromHeading(const sensor_msgs::msg::NavSatFix& gnss)
     {
-        if (gnss_alignment_locked_ || !gnss_use_heading_ || !gnss_origin_initialized_)
+        if (gnss_alignment_locked_ || !gnss_use_heading_ || !gnss_origin_initialized_
+            || !mapping_capture_enabled_ || !p_imu->initialization_ready() || !slam_pose_ready_)
             return gnss_alignment_locked_;
 
         double heading_deg = 0.0;
@@ -1279,8 +1361,33 @@ namespace robot::slam
         return true;
     }
 
+    void MappingAlg::tryLockGnssAlignmentOnCaptureStart()
+    {
+        if (gnss_alignment_locked_ || !gnss_use_heading_ || !mapping_capture_enabled_)
+            return;
+
+        sensor_msgs::msg::NavSatFix gnss;
+        {
+            std::lock_guard<std::mutex> lock(gnss_mutex_);
+            if (!has_gnss_)
+            {
+                RCLCPP_WARN(get_logger(),
+                    "Formal capture started; GNSS heading lock deferred because no RTK fix is available yet");
+                return;
+            }
+            gnss = latest_gnss_;
+        }
+        if (lockGnssAlignmentFromHeading(gnss))
+            return;
+        RCLCPP_WARN(get_logger(),
+            "Formal capture started; dual-antenna heading lock is not ready. "
+            "GNSS fusion waits for a valid heading or a 15 m trajectory fit");
+    }
+
     bool MappingAlg::estimateGnssAlignment()
     {
+        if (!mapping_capture_enabled_)
+            return false;
         if (gnss_alignment_samples_.size() < static_cast<std::size_t>(gnss_alignment_min_samples_))
             return false;
 
@@ -1369,7 +1476,7 @@ namespace robot::slam
 
     void MappingAlg::applyGnssCorrection(double lidar_time)
     {
-        if (!use_gnss_fusion_ || !flg_EKF_inited)
+        if (!use_gnss_fusion_ || !flg_EKF_inited || !mapping_capture_enabled_)
             return;
 
         sensor_msgs::msg::NavSatFix gnss;
@@ -1467,6 +1574,13 @@ namespace robot::slam
         }
 
         health_pose_z_m_ = state_point.pos(2);
+        if (health_max_abs_z_m_ > 0.0 && std::fabs(health_pose_z_m_) > health_max_abs_z_m_)
+        {
+            std::ostringstream reason;
+            reason << "pose height diverged: z=" << health_pose_z_m_ << "m";
+            markSlamDiverged(reason.str());
+            return;
+        }
         bool hard_anomaly = false;
         if (has_last_health_pose_)
         {
@@ -1490,6 +1604,8 @@ namespace robot::slam
                 last_health_stamp_ = lidar_time;
                 has_last_health_pose_ = true;
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", slam_health_warning_.c_str());
+                if (pose_anomaly_streak_ >= std::max(1, health_pose_guard_frames_))
+                    markSlamDiverged(reason.str());
                 return;
             }
         }
@@ -1738,6 +1854,10 @@ namespace robot::slam
         metadata.lidar_qz = lidar_quat.z();
         metadata.lidar_qw = lidar_quat.w();
         metadata.yaw = yaw;
+        metadata.velocity = state_point.vel;
+        metadata.accel_bias = state_point.ba;
+        metadata.gyro_bias = state_point.bg;
+        metadata.gravity << state_point.grav[0], state_point.grav[1], state_point.grav[2];
         metadata.point_count = keyframe_cloud->size();
         metadata.scan_context_index = metadata.index;
         metadata.preint = captureImuPreintegration(lidar_end_time);
@@ -1812,6 +1932,8 @@ namespace robot::slam
                 throw std::runtime_error("cannot create keyframes.csv");
             poses << "index,stamp,x,y,z,yaw,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw,"
                      "lidar_x,lidar_y,lidar_z,lidar_qx,lidar_qy,lidar_qz,lidar_qw,point_count,preintegration_file,"
+                     "velocity_x,velocity_y,velocity_z,accel_bias_x,accel_bias_y,accel_bias_z,"
+                     "gyro_bias_x,gyro_bias_y,gyro_bias_z,gravity_x,gravity_y,gravity_z,"
                      "scan_context_index,rtk_valid,rtk_status,rtk_latitude,rtk_longitude,rtk_altitude,"
                      "rtk_horizontal_std,rtk_age_seconds,rtk_heading_valid,rtk_heading_deg,rtk_heading_std_deg,"
                      "rtk_heading_age_seconds\n";
@@ -1935,6 +2057,21 @@ namespace robot::slam
                 keyframe.point_count = static_cast<std::size_t>(std::stoull(field("point_count")));
                 keyframe.scan_context_index = static_cast<std::size_t>(std::stoull(field("scan_context_index", field("index"))));
                 keyframe.preintegration_file = field("preintegration_file", "");
+                if (!keyframe.preintegration_file.empty()
+                    && !std::filesystem::is_regular_file(keyframe.preintegration_file))
+                {
+                    keyframe.preintegration_file = (
+                        latest_dir / "imu_preintegration"
+                        / std::filesystem::path(keyframe.preintegration_file).filename()).string();
+                }
+                keyframe.velocity << std::stod(field("velocity_x")), std::stod(field("velocity_y")),
+                    std::stod(field("velocity_z"));
+                keyframe.accel_bias << std::stod(field("accel_bias_x")), std::stod(field("accel_bias_y")),
+                    std::stod(field("accel_bias_z"));
+                keyframe.gyro_bias << std::stod(field("gyro_bias_x")), std::stod(field("gyro_bias_y")),
+                    std::stod(field("gyro_bias_z"));
+                keyframe.gravity << std::stod(field("gravity_x")), std::stod(field("gravity_y")),
+                    std::stod(field("gravity_z", std::to_string(-G_m_s2)));
                 keyframe.rtk_valid = std::stoi(field("rtk_valid")) != 0;
                 keyframe.rtk_status = std::stoi(field("rtk_status", "-1"));
                 keyframe.rtk_latitude = std::stod(field("rtk_latitude"));
@@ -1956,6 +2093,8 @@ namespace robot::slam
                     keyframe.point_count = binaryPcdPointCount(keyframe.file_path);
                 if (keyframe.point_count == 0)
                     continue;
+                if (!keyframe.preintegration_file.empty())
+                    readImuPreintegrationFile(keyframe);
                 if (!recovered.empty())
                     recovered_trajectory += (keyframe.lidar_origin - recovered.back().lidar_origin).norm();
                 recovered.push_back(std::move(keyframe));
@@ -2072,6 +2211,11 @@ namespace robot::slam
                       << std::setprecision(7) << keyframe.lidar_qx << ',' << keyframe.lidar_qy << ','
                       << keyframe.lidar_qz << ',' << keyframe.lidar_qw << ','
                       << keyframe.point_count << ',' << keyframe.preintegration_file << ','
+                      << std::setprecision(8) << keyframe.velocity(0) << ',' << keyframe.velocity(1) << ','
+                      << keyframe.velocity(2) << ',' << keyframe.accel_bias(0) << ',' << keyframe.accel_bias(1) << ','
+                      << keyframe.accel_bias(2) << ',' << keyframe.gyro_bias(0) << ',' << keyframe.gyro_bias(1) << ','
+                      << keyframe.gyro_bias(2) << ',' << keyframe.gravity(0) << ',' << keyframe.gravity(1) << ','
+                      << keyframe.gravity(2) << ','
                       << keyframe.scan_context_index << ','
                       << (keyframe.rtk_valid ? 1 : 0) << ',' << keyframe.rtk_status << ','
                       << std::setprecision(10) << keyframe.rtk_latitude << ',' << keyframe.rtk_longitude << ','
@@ -2153,7 +2297,6 @@ namespace robot::slam
         odomAftMapped.child_frame_id  = "body";
         odomAftMapped.header.stamp    = get_ros_time(lidar_end_time);
         set_posestamp(odomAftMapped.pose);
-        pubOdomAftMapped->publish(odomAftMapped);
         auto P = kf.get_P();
         for (int i = 0; i < 6; i++)
         {
@@ -2165,6 +2308,8 @@ namespace robot::slam
             odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
             odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
         }
+        pubOdomAftMapped->publish(odomAftMapped);
+        pubLocalizationOdom_->publish(odomAftMapped);
 
         geometry_msgs::msg::TransformStamped trans;
         trans.header.frame_id         = "map";
@@ -2863,7 +3008,10 @@ namespace robot::slam
             return false;
         }
         trajectory << "index,timestamp,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw\n";
-        covariance << "{\n  \"schema_version\": 1,\n  \"ordering\": \"rotation_xyz,translation_xyz\",\n  \"poses\": [\n";
+        covariance << "{\n  \"schema_version\": 2,\n  \"ordering\": \"rotation_xyz,translation_xyz\",\n  \"use_imu_factor\": "
+                   << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                   << ",\n  \"gravity_magnitude\": " << global_factor_graph_config_.gravity_magnitude
+                   << ",\n  \"poses\": [\n";
         nav_msgs::msg::Path optimized_path;
         optimized_path.header.frame_id = "map";
         optimized_path.header.stamp = get_clock()->now();
@@ -2897,11 +3045,22 @@ namespace robot::slam
         covariance << "  ],\n  \"factor_count\": " << global_factor_graph_result_.factor_count
                    << ",\n  \"ndt_factor_count\": " << global_factor_graph_result_.ndt_factor_count
                    << ",\n  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count
+                   << ",\n  \"imu_bias_factor_count\": " << global_factor_graph_result_.imu_bias_factor_count
+                   << ",\n  \"imu_velocity_prior_factor_count\": " << global_factor_graph_result_.imu_velocity_prior_factor_count
                    << ",\n  \"rtk_position_factor_count\": " << global_factor_graph_result_.rtk_position_factor_count
                    << ",\n  \"rtk_heading_factor_count\": " << global_factor_graph_result_.rtk_heading_factor_count
                    << ",\n  \"loop_closure_factor_count\": " << global_factor_graph_result_.loop_closure_factor_count
                    << ",\n  \"error_before\": " << global_factor_graph_result_.error_before
-                   << ",\n  \"error_after\": " << global_factor_graph_result_.error_after << "\n}\n";
+                   << ",\n  \"error_after\": " << global_factor_graph_result_.error_after
+                   << ",\n  \"final_velocity\": [" << global_factor_graph_result_.final_velocity(0) << ", "
+                   << global_factor_graph_result_.final_velocity(1) << ", "
+                   << global_factor_graph_result_.final_velocity(2) << "]"
+                   << ",\n  \"final_accel_bias\": [" << global_factor_graph_result_.final_bias.accelerometer()(0) << ", "
+                   << global_factor_graph_result_.final_bias.accelerometer()(1) << ", "
+                   << global_factor_graph_result_.final_bias.accelerometer()(2) << "]"
+                   << ",\n  \"final_gyro_bias\": [" << global_factor_graph_result_.final_bias.gyroscope()(0) << ", "
+                   << global_factor_graph_result_.final_bias.gyroscope()(1) << ", "
+                   << global_factor_graph_result_.final_bias.gyroscope()(2) << "]\n}\n";
 
         if (pubGlobalOptimizedPath_)
             pubGlobalOptimizedPath_->publish(optimized_path);
@@ -2934,8 +3093,18 @@ namespace robot::slam
         {
             std_msgs::msg::String status;
             std::ostringstream json;
-            json << "{\"success\":true,\"keyframe_count\":" << mapping_keyframes_.size()
+            json << "{\"stage\":\"trajectory_optimized\",\"success\":true,\"use_gps\":"
+                 << (use_gnss_fusion_ ? "true" : "false")
+                 << ",\"use_imu_factor\":" << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                 << ",\"gravity_magnitude\":" << global_factor_graph_config_.gravity_magnitude
+                 << ",\"keyframe_count\":" << mapping_keyframes_.size()
                  << ",\"factor_count\":" << global_factor_graph_result_.factor_count
+                 << ",\"ndt_factor_count\":" << global_factor_graph_result_.ndt_factor_count
+                 << ",\"imu_factor_count\":" << global_factor_graph_result_.imu_factor_count
+                 << ",\"imu_bias_factor_count\":" << global_factor_graph_result_.imu_bias_factor_count
+                 << ",\"imu_velocity_prior_factor_count\":" << global_factor_graph_result_.imu_velocity_prior_factor_count
+                 << ",\"rtk_position_factor_count\":" << global_factor_graph_result_.rtk_position_factor_count
+                 << ",\"rtk_heading_factor_count\":" << global_factor_graph_result_.rtk_heading_factor_count
                  << ",\"loop_closure_count\":" << global_factor_graph_result_.loop_closure_factor_count
                  << ",\"error_before\":" << global_factor_graph_result_.error_before
                  << ",\"error_after\":" << global_factor_graph_result_.error_after << '}';
@@ -2959,6 +3128,9 @@ namespace robot::slam
             keyframe_writer_error_ = "cannot read loop_closures.csv";
             return false;
         }
+        if (loop_closures.empty())
+            RCLCPP_INFO(get_logger(),
+                "No loop closures; continuing NDT/IMU/RTK global optimization");
         std::vector<GlobalGraphKeyframe> graph_keyframes;
         graph_keyframes.reserve(mapping_keyframes_.size());
         for (const auto& keyframe : mapping_keyframes_)
@@ -2969,7 +3141,12 @@ namespace robot::slam
             frame.initial_pose = gtsam::Pose3(
                 gtsam::Rot3::Quaternion(keyframe.world_qw, keyframe.world_qx, keyframe.world_qy, keyframe.world_qz),
                 gtsam::Point3(keyframe.world_origin(0), keyframe.world_origin(1), keyframe.world_origin(2)));
-            if (keyframe.rtk_valid && gnss_origin_initialized_ && gnss_alignment_locked_)
+            frame.initial_velocity = gtsam::Vector3(
+                keyframe.velocity(0), keyframe.velocity(1), keyframe.velocity(2));
+            frame.initial_bias = gtsam::imuBias::ConstantBias(
+                gtsam::Vector3(keyframe.accel_bias(0), keyframe.accel_bias(1), keyframe.accel_bias(2)),
+                gtsam::Vector3(keyframe.gyro_bias(0), keyframe.gyro_bias(1), keyframe.gyro_bias(2)));
+            if (use_gnss_fusion_ && keyframe.rtk_valid && gnss_origin_initialized_ && gnss_alignment_locked_)
             {
                 sensor_msgs::msg::NavSatFix fix;
                 fix.status.status = keyframe.rtk_status;
@@ -2987,7 +3164,8 @@ namespace robot::slam
                     frame.rtk_lever_arm = gtsam::Point3(gnss_lever_arm_base_(0), gnss_lever_arm_base_(1), gnss_lever_arm_base_(2));
                 }
             }
-            if (keyframe.rtk_heading_valid && gnss_use_heading_)
+            if (use_gnss_fusion_ && gnss_origin_initialized_ && gnss_alignment_locked_
+                && keyframe.rtk_heading_valid && gnss_use_heading_)
             {
                 frame.has_rtk_heading = true;
                 frame.rtk_heading_rad = M_PI / 2.0 - keyframe.rtk_heading_deg * M_PI / 180.0
@@ -2995,21 +3173,28 @@ namespace robot::slam
                 frame.rtk_heading_sigma_rad = std::max(0.005, keyframe.rtk_heading_std_deg * M_PI / 180.0);
             }
             const auto& preint = keyframe.preint;
-            if (preint.imu_sample_count > 0 && preint.error_status.empty())
+            if (global_factor_graph_config_.use_imu_factor
+                && preint.imu_sample_count > 0 && preint.error_status.empty()
+                && !preint.measurements.empty())
             {
-                frame.has_imu_delta = true;
-                frame.imu_delta = gtsam::Pose3(
-                    gtsam::Rot3::Quaternion(preint.delta_rotation_xyzw[3], preint.delta_rotation_xyzw[0],
-                        preint.delta_rotation_xyzw[1], preint.delta_rotation_xyzw[2]),
-                    gtsam::Point3(preint.delta_position(0), preint.delta_position(1), preint.delta_position(2)));
-                frame.imu_covariance.setZero();
-                for (int row = 0; row < 3; ++row)
-                    for (int col = 0; col < 3; ++col)
-                    {
-                        frame.imu_covariance(row, col) = preint.covariance[static_cast<std::size_t>(row * 15 + col)];
-                        frame.imu_covariance(row + 3, col + 3) = preint.covariance[
-                            static_cast<std::size_t>((row + 6) * 15 + col + 6)];
-                    }
+                frame.has_imu_preintegration = true;
+                frame.imu_bias_hat = gtsam::imuBias::ConstantBias(
+                    gtsam::Vector3(preint.linearized_accel_bias(0), preint.linearized_accel_bias(1),
+                        preint.linearized_accel_bias(2)),
+                    gtsam::Vector3(preint.linearized_gyro_bias(0), preint.linearized_gyro_bias(1),
+                        preint.linearized_gyro_bias(2)));
+                frame.imu_measurements.reserve(preint.measurements.size());
+                for (const auto& measurement : preint.measurements)
+                {
+                    GlobalGraphKeyframe::ImuMeasurement value;
+                    value.delta_t = measurement.delta_t;
+                    value.acceleration = gtsam::Vector3(
+                        measurement.acceleration(0), measurement.acceleration(1), measurement.acceleration(2));
+                    value.angular_velocity = gtsam::Vector3(
+                        measurement.angular_velocity(0), measurement.angular_velocity(1),
+                        measurement.angular_velocity(2));
+                    frame.imu_measurements.push_back(value);
+                }
             }
             graph_keyframes.push_back(frame);
         }
@@ -3031,9 +3216,10 @@ namespace robot::slam
         global_pose_covariances_ = global_factor_graph_result_.covariances;
         global_optimization_applied_ = true;
         RCLCPP_INFO(get_logger(),
-            "Historical GTSAM optimization completed: keyframes=%zu factors=%zu ndt=%zu imu=%zu rtk_xy=%zu rtk_heading=%zu loops=%zu error %.3f -> %.3f",
+            "Historical GTSAM optimization completed: keyframes=%zu factors=%zu ndt=%zu imu=%zu imu_bias=%zu rtk_xy=%zu rtk_heading=%zu loops=%zu error %.3f -> %.3f",
             mapping_keyframes_.size(), global_factor_graph_result_.factor_count,
             global_factor_graph_result_.ndt_factor_count, global_factor_graph_result_.imu_factor_count,
+            global_factor_graph_result_.imu_bias_factor_count,
             global_factor_graph_result_.rtk_position_factor_count, global_factor_graph_result_.rtk_heading_factor_count,
             global_factor_graph_result_.loop_closure_factor_count,
             global_factor_graph_result_.error_before, global_factor_graph_result_.error_after);
@@ -3107,8 +3293,7 @@ namespace robot::slam
             return false;
         }
         const auto map_pcd = std::filesystem::path(map_subdir) / "map.pcd";
-        if (std::filesystem::exists(map_pcd)
-            && !std::filesystem::exists(std::filesystem::path(map_subdir) / "map_raw.pcd"))
+        if (!global_optimization_applied_ && std::filesystem::exists(map_pcd))
         {
             std::filesystem::copy_file(map_pcd, std::filesystem::path(map_subdir) / "map_raw.pcd",
                 std::filesystem::copy_options::overwrite_existing, copy_error);
@@ -3132,6 +3317,7 @@ namespace robot::slam
             meta << "alignment_locked: " << (gnss_alignment_locked_ ? 1 : 0) << "\n";
             meta << "alignment_source: " << (gnss_alignment_source_.empty() ? "none" : gnss_alignment_source_) << "\n";
             meta << "enu_to_map_yaw: " << gnss_enu_to_map_yaw_ << "\n";
+            meta << "heading_offset_deg: " << gnss_heading_offset_rad_ * 180.0 / M_PI << "\n";
             meta << "alignment_rms: " << (std::isfinite(gnss_alignment_rms_) ? gnss_alignment_rms_ : -1.0) << "\n";
             meta << "alignment_samples: " << gnss_alignment_samples_.size() << "\n";
             meta << "map_offset_x: " << gnss_map_offset_(0) << "\n";
@@ -3161,7 +3347,7 @@ namespace robot::slam
         const auto& preint = keyframe.preint;
         output << std::fixed;
         output << "{\n"
-               << "  \"schema_version\": 1,\n"
+               << "  \"schema_version\": 2,\n"
                << "  \"keyframe_index\": " << keyframe.index << ",\n"
                << "  \"start_timestamp\": " << std::setprecision(6) << preint.start_timestamp << ",\n"
                << "  \"end_timestamp\": " << preint.end_timestamp << ",\n"
@@ -3188,9 +3374,93 @@ namespace robot::slam
         output << "],\n"
                << "  \"imu_sample_count\": " << preint.imu_sample_count << ",\n"
                << "  \"error_status\": \"" << jsonEscape(preint.error_status) << "\",\n"
-               << "  \"state_order\": \"dtheta,dv,dp,dba,dbg\"\n"
+               << "  \"state_order\": \"dtheta,dv,dp,dba,dbg\",\n"
+               << "  \"measurement_frame\": \"imu\",\n"
+               << "  \"acceleration_unit\": \"m/s^2\",\n"
+               << "  \"measurements\": [\n";
+        for (std::size_t index = 0; index < preint.measurements.size(); ++index)
+        {
+            const auto& measurement = preint.measurements[index];
+            output << "    {\"dt\":" << std::setprecision(8) << measurement.delta_t
+                   << ",\"acc\":[" << measurement.acceleration(0) << ','
+                   << measurement.acceleration(1) << ',' << measurement.acceleration(2)
+                   << "],\"gyro\":[" << measurement.angular_velocity(0) << ','
+                   << measurement.angular_velocity(1) << ',' << measurement.angular_velocity(2) << "]}"
+                   << (index + 1 == preint.measurements.size() ? "\n" : ",\n");
+        }
+        output << "  ]\n"
                << "}\n";
         return true;
+    }
+
+    bool MappingAlg::readImuPreintegrationFile(MappingKeyframe& keyframe) const
+    {
+        std::ifstream input(keyframe.preintegration_file);
+        if (!input.is_open())
+            return false;
+        const std::string content(
+            (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (content.find("\"schema_version\": 2") == std::string::npos)
+            return false;
+        auto extract_scalar = [&content](const std::string& name, double& output) {
+            std::smatch match;
+            const std::regex expression("\\\"" + name
+                + "\\\"\\s*:\\s*([-+0-9.eE]+)");
+            if (!std::regex_search(content, match, expression))
+                return false;
+            output = std::stod(match[1].str());
+            return std::isfinite(output);
+        };
+        auto extract_vec3 = [&content](const std::string& name, Vec3d& output) {
+            std::smatch match;
+            const std::string number = "([-+0-9.eE]+)";
+            const std::regex expression("\\\"" + name + "\\\"\\s*:\\s*\\[\\s*"
+                + number + "\\s*,\\s*" + number + "\\s*,\\s*" + number + "\\s*\\]");
+            if (!std::regex_search(content, match, expression))
+                return false;
+            output << std::stod(match[1].str()), std::stod(match[2].str()), std::stod(match[3].str());
+            return output.allFinite();
+        };
+        auto& preint = keyframe.preint;
+        extract_scalar("start_timestamp", preint.start_timestamp);
+        extract_scalar("end_timestamp", preint.end_timestamp);
+        extract_scalar("delta_t", preint.delta_t);
+        extract_vec3("linearized_accel_bias", preint.linearized_accel_bias);
+        extract_vec3("linearized_gyro_bias", preint.linearized_gyro_bias);
+        std::smatch error_match;
+        if (std::regex_search(content, error_match,
+            std::regex("\\\"error_status\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"")))
+            preint.error_status = error_match[1].str();
+        double sample_count = 0.0;
+        if (extract_scalar("imu_sample_count", sample_count))
+            preint.imu_sample_count = static_cast<int>(std::max(0.0, sample_count));
+
+        const std::string number = "([-+0-9.eE]+)";
+        const std::regex measurement_expression(
+            "\\{\\\"dt\\\":" + number
+            + ",\\\"acc\\\":\\[" + number + "," + number + "," + number
+            + "\\],\\\"gyro\\\":\\[" + number + "," + number + "," + number + "\\]\\}");
+        preint.measurements.clear();
+        for (std::sregex_iterator iterator(content.begin(), content.end(), measurement_expression), end;
+            iterator != end; ++iterator)
+        {
+            ImuPreintegrationMeasurement measurement;
+            measurement.delta_t = std::stod((*iterator)[1].str());
+            measurement.acceleration << std::stod((*iterator)[2].str()),
+                std::stod((*iterator)[3].str()), std::stod((*iterator)[4].str());
+            measurement.angular_velocity << std::stod((*iterator)[5].str()),
+                std::stod((*iterator)[6].str()), std::stod((*iterator)[7].str());
+            if (measurement.delta_t > 0.0 && measurement.delta_t <= 0.25
+                && measurement.acceleration.allFinite() && measurement.angular_velocity.allFinite())
+                preint.measurements.push_back(measurement);
+        }
+        if (preint.imu_sample_count != static_cast<int>(preint.measurements.size()))
+        {
+            RCLCPP_WARN(get_logger(),
+                "Recovered IMU preintegration sample mismatch for keyframe %zu: declared=%d parsed=%zu",
+                keyframe.index, preint.imu_sample_count, preint.measurements.size());
+        }
+        return !preint.measurements.empty() || preint.error_status == "no_previous_keyframe";
     }
 
     bool MappingAlg::writeMapManifest(const std::string& map_subdir)
@@ -3207,7 +3477,78 @@ namespace robot::slam
                     ++preintegration_count;
             }
         }
-        std::ofstream output(map_subdir + "/map_manifest.json", std::ios::out | std::ios::trunc);
+        const auto path = map_subdir + "/map_manifest.json";
+        std::string existing;
+        {
+            std::ifstream input(path);
+            if (input)
+                existing.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        }
+        const std::string trajectory_source = global_optimization_applied_ ? "gtsam_global_optimized" : "raw";
+        auto replace_string = [](std::string& json, const std::string& key, const std::string& value) {
+            const std::string needle = "\"" + key + "\"";
+            const auto pos = json.find(needle);
+            if (pos == std::string::npos)
+                return false;
+            const auto colon = json.find(':', pos + needle.size());
+            if (colon == std::string::npos)
+                return false;
+            const auto first = json.find_first_not_of(" \t\r\n", colon + 1);
+            if (first == std::string::npos || json[first] != '"')
+                return false;
+            const auto last = json.find('"', first + 1);
+            if (last == std::string::npos)
+                return false;
+            json.replace(first, last - first + 1, "\"" + value + "\"");
+            return true;
+        };
+        auto replace_number = [](std::string& json, const std::string& key, const std::string& value) {
+            const std::string needle = "\"" + key + "\"";
+            const auto pos = json.find(needle);
+            if (pos == std::string::npos)
+                return false;
+            const auto colon = json.find(':', pos + needle.size());
+            if (colon == std::string::npos)
+                return false;
+            const auto first = json.find_first_not_of(" \t\r\n", colon + 1);
+            if (first == std::string::npos)
+                return false;
+            auto last = first;
+            while (last < json.size() && (std::isdigit(static_cast<unsigned char>(json[last]))
+                || json[last] == '.' || json[last] == '-' || json[last] == '+' || json[last] == 'e'
+                || json[last] == 'E'))
+                ++last;
+            if (json.compare(first, 4, "true") == 0)
+                last = first + 4;
+            else if (json.compare(first, 5, "false") == 0)
+                last = first + 5;
+            json.replace(first, last - first, value);
+            return true;
+        };
+        if (!existing.empty())
+        {
+            replace_string(existing, "trajectory_source", trajectory_source);
+            replace_string(existing, "loop_status", loop_status_);
+            replace_number(existing, "keyframe_count", std::to_string(mapping_keyframes_.size()));
+            replace_number(existing, "point_cloud_count", std::to_string(mapping_keyframes_.size()));
+            replace_number(existing, "preintegration_count", std::to_string(preintegration_count));
+            replace_number(existing, "scan_context_count", std::to_string(scan_context_count_));
+            replace_number(existing, "loop_closure_count",
+                std::to_string(global_factor_graph_result_.loop_closure_factor_count));
+            replace_number(existing, "global_factor_count",
+                std::to_string(global_factor_graph_result_.factor_count));
+            std::ofstream output(path, std::ios::out | std::ios::trunc);
+            if (!output.is_open())
+            {
+                keyframe_writer_error_ = "cannot create map_manifest.json";
+                return false;
+            }
+            output << existing;
+            if (!existing.empty() && existing.back() != '\n')
+                output << '\n';
+            return true;
+        }
+        std::ofstream output(path, std::ios::out | std::ios::trunc);
         if (!output.is_open())
         {
             keyframe_writer_error_ = "cannot create map_manifest.json";
@@ -3229,7 +3570,10 @@ namespace robot::slam
                << "  \"scan_context_count\": " << scan_context_count_ << ",\n"
                << "  \"loop_closure_count\": " << global_factor_graph_result_.loop_closure_factor_count << ",\n"
                << "  \"global_factor_count\": " << global_factor_graph_result_.factor_count << ",\n"
-               << "  \"trajectory_source\": \"" << (global_optimization_applied_ ? "gtsam_global_optimized" : "raw") << "\",\n"
+               << "  \"use_imu_factor\": " << (global_factor_graph_config_.use_imu_factor ? "true" : "false") << ",\n"
+               << "  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count << ",\n"
+               << "  \"imu_bias_factor_count\": " << global_factor_graph_result_.imu_bias_factor_count << ",\n"
+               << "  \"trajectory_source\": \"" << trajectory_source << "\",\n"
                << "  \"loop_status\": \"" << loop_status_ << "\"\n"
                << "}\n";
         return true;
@@ -3238,6 +3582,7 @@ namespace robot::slam
     void MappingAlg::accumulateImuPreintegration(double timestamp, const Vec3d& acc, const Vec3d& gyro)
     {
         std::lock_guard<std::mutex> lock(imu_preint_mutex_);
+        const Vec3d calibrated_acc = acc * p_imu->acceleration_scale();
         if (timestamp < imu_preint_last_t_ && imu_preint_has_sample_)
         {
             imu_preint_error_ = "time_rollback";
@@ -3248,8 +3593,9 @@ namespace robot::slam
             imu_preint_dp_ = Zero3d;
             imu_preint_cov_.setZero();
             imu_preint_last_t_ = timestamp;
-            imu_preint_last_acc_ = acc;
+            imu_preint_last_acc_ = calibrated_acc;
             imu_preint_last_gyro_ = gyro;
+            imu_preint_measurements_.clear();
             imu_preint_has_sample_ = true;
             return;
         }
@@ -3257,7 +3603,7 @@ namespace robot::slam
         {
             imu_preint_start_ = imu_preint_start_ > 0.0 ? imu_preint_start_ : timestamp;
             imu_preint_last_t_ = timestamp;
-            imu_preint_last_acc_ = acc;
+            imu_preint_last_acc_ = calibrated_acc;
             imu_preint_last_gyro_ = gyro;
             imu_preint_has_sample_ = true;
             imu_preint_ba_ = Vec3d(state_point.ba(0), state_point.ba(1), state_point.ba(2));
@@ -3283,9 +3629,10 @@ namespace robot::slam
         imu_preint_cov_.block<3, 3>(6, 6) += Mat3d::Identity() * acc_var * dt * dt;
         imu_preint_cov_.block<3, 3>(9, 9) += Mat3d::Identity() * ba_var;
         imu_preint_cov_.block<3, 3>(12, 12) += Mat3d::Identity() * bg_var;
+        imu_preint_measurements_.push_back({ dt, imu_preint_last_acc_, imu_preint_last_gyro_ });
         ++imu_preint_samples_;
         imu_preint_last_t_ = timestamp;
-        imu_preint_last_acc_ = acc;
+        imu_preint_last_acc_ = calibrated_acc;
         imu_preint_last_gyro_ = gyro;
     }
 
@@ -3306,6 +3653,7 @@ namespace robot::slam
         snapshot.linearized_accel_bias = imu_preint_ba_;
         snapshot.linearized_gyro_bias = imu_preint_bg_;
         snapshot.imu_sample_count = imu_preint_samples_;
+        snapshot.measurements = imu_preint_measurements_;
         for (int row = 0; row < 15; ++row)
         {
             for (int col = 0; col < 15; ++col)
@@ -3323,6 +3671,7 @@ namespace robot::slam
         imu_preint_dv_ = Zero3d;
         imu_preint_dp_ = Zero3d;
         imu_preint_cov_.setZero();
+        imu_preint_measurements_.clear();
         imu_preint_samples_ = 0;
         imu_preint_error_.clear();
         imu_preint_ba_ = Vec3d(state_point.ba(0), state_point.ba(1), state_point.ba(2));
@@ -3345,6 +3694,7 @@ namespace robot::slam
         imu_preint_ba_ = Zero3d;
         imu_preint_bg_ = Zero3d;
         imu_preint_cov_.setZero();
+        imu_preint_measurements_.clear();
         imu_preint_samples_ = 0;
         imu_preint_error_.clear();
     }
@@ -3453,17 +3803,11 @@ namespace robot::slam
             return false;
         }
         stopKeyframeWriter(true);
-        writeSaveProgress("global_optimization", 8.0);
-        if (!optimizeHistoricalTrajectory(active_map_subdir_))
-        {
-            // Keep the map export recoverable when an external loop file or graph
-            // is invalid. Raw keyframes remain available for a later batch retry.
-            RCLCPP_WARN(get_logger(), "Global optimization unavailable; exporting raw trajectory: %s",
-                keyframe_writer_error_.c_str());
-            optimized_global_poses_.clear();
-            global_pose_covariances_.clear();
-            global_optimization_applied_ = false;
-        }
+        // Export the raw LIO cloud first. IMU-only GTSAM previously stacked Z
+        // before Scan-Context loops existed. /slam/global_optimize runs later.
+        optimized_global_poses_.clear();
+        global_pose_covariances_.clear();
+        global_optimization_applied_ = false;
         writeSaveProgress("filtering", 12.0);
 
         std::size_t written_points = 0;

@@ -11,8 +11,22 @@ class AlertBridge:
         self.task_executor = task_executor
         self.publish_alert = publish_alert
 
-    def emit_system_alert(self, event_type: str, severity: str, source_code: str, attributes=None) -> str:
-        return self._emit(event_type, severity, {"component": "edge_agent", "code": source_code}, attributes=attributes)
+    def emit_system_alert(
+        self,
+        event_type: str,
+        severity: str,
+        source_code: str,
+        attributes=None,
+        detection=None,
+        component: str = "edge_agent",
+    ) -> str:
+        return self._emit(
+            event_type,
+            severity,
+            {"component": component, "code": source_code},
+            attributes=attributes,
+            detection=detection,
+        )
 
     def emit_detection_alert(self, detection: dict, media: dict | None = None) -> str:
         return self._emit(

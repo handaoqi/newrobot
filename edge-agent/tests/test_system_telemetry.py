@@ -108,6 +108,31 @@ def test_persistent_charge_controller_is_ready_without_requesting_charge():
     assert power["charging"] is False
 
 
+def test_running_arc_does_not_trigger_intrusive_legacy_probe():
+    outputs = [
+        "power: 61\nvolt: 46358\ncurrent: -1700\ntemp: 45000\nerror: 0\n"
+        "__ARC_PLATFORM__\nrunning\n__ARC_DOCK_STATE__\nstate: 0\nerror_msg: ''\n"
+        "__LEGACY_SERVICE__\ninactive\n__LEGACY_MODE__\nunknown\n"
+        "__LEGACY_MODULE__\nunknown\n__LEGACY_STATUS__\n"
+        "__ARC_SERIAL_OWNER__\narc_platform\n",
+    ]
+    calls = []
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+
+    def runner(command, _timeout):
+        calls.append(command)
+        return CommandResult(0, outputs.pop(0))
+
+    probe = SystemTelemetryProbe(TelemetryConfig(), collector, runner=runner)
+    probe._poll_power()
+
+    assert len(calls) == 1
+    assert all("legacy-status" not in " ".join(command) for command in calls)
+
+
 def test_probe_decodes_unsigned_bms_current_as_signed_discharge():
     collector, probe = make_probe(
         [

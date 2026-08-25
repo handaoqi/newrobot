@@ -548,10 +548,17 @@ class CommandProcessor:
             if not self.navigation_stack_adapter:
                 raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")
             active_files = result_payload["current_map"]["active_files"]
-            result_payload["map_reload"] = self.navigation_stack_adapter.reload_map(
-                active_files["map.pcd"],
-                active_files["map.yaml"],
-            )
+            reload_if_running = getattr(self.navigation_stack_adapter, "reload_map_if_running", None)
+            if callable(reload_if_running):
+                result_payload["map_reload"] = reload_if_running(
+                    active_files["map.pcd"],
+                    active_files["map.yaml"],
+                )
+            else:
+                result_payload["map_reload"] = self.navigation_stack_adapter.reload_map(
+                    active_files["map.pcd"],
+                    active_files["map.yaml"],
+                )
             # A map-local pose cannot be carried across maps.  The map is
             # loaded now, but a fresh map-specific initial pose is required
             # before task admission can consider localization usable.

@@ -1,10 +1,11 @@
 import json
+from datetime import timedelta
 
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import MapData, RemoteCommand, Robot
+from .models import MapData, RemoteCommand, Robot, RobotStatusLatest
 
 
 class MappingWorkflowApiTests(TestCase):
@@ -68,15 +69,65 @@ class MappingWorkflowApiTests(TestCase):
                     "origin_latitude: 39.9\n"
                     "origin_longitude: 116.4\n"
                     "origin_altitude: 42.0\n"
+                    "heading_confirmed: true\n"
+                    "confirmed_heading_deg: 93.2\n"
                 ),
             }),
         )
         command = self.command_for("origin/extract-global", {"map_id": map_data.id})
         self.assertEqual(command.command_type, "mapping.origin_extract_global")
         self.assertEqual(command.payload["global_enu"]["origin_latitude"], 39.9)
+        self.assertEqual(command.payload["global_enu"]["confirmed_heading_deg"], 93.2)
 
     def test_origin_status_alias_returns_unified_mapping_snapshot(self):
         response = self.client.get(f"/api/robots/{self.robot.id}/mapping/origin/status/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["robot_id"], self.robot.id)
         self.assertIn("mapping_state", response.data)
+
+    def test_successful_upload_overrides_stale_live_saving_progress(self):
+        uploaded = MapData.objects.create(name="室内完整地图", robot=self.robot, active=True)
+        now = timezone.now()
+        command = RemoteCommand.objects.create(
+            robot=self.robot,
+            command_type="mapping.save",
+            status="succeeded",
+            issued_at=now - timedelta(minutes=6),
+            expires_at=now + timedelta(hours=1),
+            finished_at=now,
+            result_payload={
+                "state": "saving",
+                "upload_result": {"id": uploaded.id},
+                "mapping_metrics": {"keyframe_count": 178},
+                "save_progress": {
+                    "stage": "writing_pcd",
+                    "progress_percent": 65,
+                    "recoverable": True,
+                },
+            },
+        )
+        RobotStatusLatest.objects.create(
+            robot=self.robot,
+            sampled_at=now,
+            raw_payload={
+                "mapping": {
+                    "state": "saving",
+                    "process_alive": False,
+                    "save_progress": {
+                        "stage": "writing_pcd",
+                        "progress_percent": 65,
+                        "updated_at_unix": now.timestamp(),
+                    },
+                }
+            },
+        )
+
+        response = self.client.get(f"/api/robots/{self.robot.id}/mapping/status/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["command_id"], str(command.id))
+        self.assertEqual(response.data["command_status"], "succeeded")
+        self.assertEqual(response.data["mapping_state"], "exited")
+        self.assertEqual(response.data["result"]["state"], "exited")
+        self.assertEqual(response.data["result"]["save_progress"]["stage"], "completed")
+        self.assertEqual(response.data["result"]["save_progress"]["progress_percent"], 100.0)

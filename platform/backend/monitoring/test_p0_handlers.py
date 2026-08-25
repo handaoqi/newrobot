@@ -358,3 +358,29 @@ class MessageHandlerTests(TestCase):
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
         self.assertEqual(InspectionEvent.objects.filter(event_id=event_id).count(), 1)
+
+    @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/slam-diverged.mp3", True))
+    def test_slam_diverged_alert_queues_operator_speech(self, synthesize_speech):
+        event_id = str(uuid.uuid4())
+        payload = {
+            "event_id": event_id,
+            "event_type": "slam_diverged",
+            "severity": "high",
+            "occurred_at": timezone.now().isoformat(),
+            "task_execution_id": None,
+            "map_id": "1",
+            "map_version": "v1",
+            "pose": {"frame_id": "map", "x": 1.0, "y": 2.0, "yaw": 0.0},
+            "source": {"component": "mapping", "code": "SLAM_DIVERGED"},
+            "detection": {"label": "建图定位已发散", "class": "slam_diverged", "confidence": 1},
+            "attributes": {"mapping_session_id": "session-1", "message": "pose anomaly"},
+        }
+        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
+        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
+        event = InspectionEvent.objects.get(event_id=event_id)
+        self.assertEqual(event.title, "建图定位已发散")
+        commands = RobotCommand.objects.filter(payload__source="mapping_divergence_speech")
+        self.assertEqual(commands.count(), 1)
+        self.assertEqual(commands.get().payload["mapping_session_id"], "session-1")
+        self.assertTrue(commands.get().payload["dual_output"])
+        synthesize_speech.assert_called_once()

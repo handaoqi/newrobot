@@ -193,6 +193,11 @@ class MapUploadMetadataTests(TestCase):
                     "scene_scope": "indoor",
                     "localization_mode": "ndt",
                     "origin_status": "local_only",
+                    "optimization": {
+                        "stage": "completed",
+                        "accepted_loop_count": 2,
+                        "use_gps": False,
+                    },
                 }),
             )
             archive.writestr("recording_manifest.yaml", "schema_version: 1\n")
@@ -213,11 +218,14 @@ class MapUploadMetadataTests(TestCase):
         self.assertEqual(response.status_code, 201)
         created = MapData.objects.get(name="complete-uploaded")
         self.assertTrue(created.package_file)
+        self.assertEqual(response.data["optimization_summary"]["accepted_loop_count"], 2)
+        self.assertFalse(response.data["optimization_summary"]["use_gps"])
         description = json.loads(created.description)
         self.assertIn("map.pcd", description["package_files"])
         downloaded = self.client.get(f"/api/maps/{created.id}/download/")
         self.assertEqual(downloaded.status_code, 200)
-        with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        downloaded_bytes = b"".join(downloaded.streaming_content) if downloaded.streaming else downloaded.content
+        with zipfile.ZipFile(io.BytesIO(downloaded_bytes)) as archive:
             self.assertEqual(archive.read("map.pcd"), b"pcd-data")
             self.assertIn("map_manifest.json", archive.namelist())
 

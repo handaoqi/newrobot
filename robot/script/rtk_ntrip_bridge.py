@@ -13,6 +13,7 @@ import rclpy
 import serial
 import yaml
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 from std_msgs.msg import String
 
@@ -89,8 +90,9 @@ class NtripBridge(Node):
             UniRtkPvh,
             self.config["rtk_topic"],
             self.on_rtk,
-            10,
+            qos_profile_sensor_data,
         )
+        self.timer = self.create_timer(2.0, self.publish_snapshot)
         self.worker = threading.Thread(target=self.run_bridge, daemon=True)
         self.worker.start()
 
@@ -128,7 +130,6 @@ class NtripBridge(Node):
             stamp.sec += 1
             stamp.nanosec -= 1_000_000_000
         return stamp, source
-        self.timer = self.create_timer(2.0, self.publish_snapshot)
 
     def load_config(self, path: str) -> dict:
         with open(path, "r", encoding="utf-8") as handle:
@@ -293,7 +294,34 @@ class NtripBridge(Node):
         self.last_measurement_time_source = measurement_time_source
 
     def publish_status(self, state: str, **extra):
-        payload = {"state": state, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        with self.position_lock:
+            pos = self.position
+            position_fields = {
+                "lat": round(pos.latitude, 8),
+                "lon": round(pos.longitude, 8),
+                "satellites": pos.satellites,
+                "solution_satellites": pos.solution_satellites,
+                "quality": pos.quality,
+                "fusion_usable": pos.quality in {"rtk_fixed", "rtk_float"},
+                "horizontal_std_m": (
+                    round(pos.horizontal_std_m, 3) if math.isfinite(pos.horizontal_std_m) else None
+                ),
+                "vertical_std_m": (
+                    round(pos.vertical_std_m, 3) if math.isfinite(pos.vertical_std_m) else None
+                ),
+                "solution_status": pos.solution_status,
+                "position_type": pos.position_type,
+                "differential_age_s": (
+                    round(pos.differential_age_s, 2) if math.isfinite(pos.differential_age_s) else None
+                ),
+                "age_sec": round(time.time() - pos.stamp, 1) if pos.stamp else None,
+                "measurement_time_source": self.last_measurement_time_source,
+            }
+        payload = {
+            "state": state,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            **position_fields,
+        }
         payload.update(extra)
         msg = String()
         msg.data = yaml.safe_dump(payload, allow_unicode=False, sort_keys=True).strip()

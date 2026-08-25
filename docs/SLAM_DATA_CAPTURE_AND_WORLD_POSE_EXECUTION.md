@@ -16,7 +16,7 @@
 ## 已拍板的实现决策
 
 - 新建地图才生成完整产物；旧地图标 `legacy_incomplete`，不伪造预积分或回环数据，也不套用新的室外禁止规则，除非 manifest 已明确 `local_only`。
-- 标准 rosbag 仍只录 `/front_lidar`、`/front_lidar/imu`、`/fix`、`/rtk_pvh`、`/tf_static`。
+- “同步录制诊断数据”固定录制 `/front_lidar`、`/front_lidar/imu`、`/fix`、`/rtk_pvh`、`/rtk/ntrip_status`、`/odom/localization_odom`、`/slam_odom`、`/tf`、`/tf_static`。
 - NX 会话目录保存完整 `keyframes/`、`imu_preintegration/`、`scan_context/`。上传 zip 只带轻量元数据（manifest、轨迹 CSV、Scan-Context 索引/候选、地图预览），不把全量关键帧 PCD 传到云端。
 - `rtk_fixed` 复用现有 `alignment_locked`、样本数和 RMS 阈值。
 - 回环优化失败或残差过大时，保留 `map_raw.pcd` 和 `trajectory_raw.csv`，不覆盖可用导航地图。

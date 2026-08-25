@@ -1,7 +1,9 @@
-"""Scan-Context retrieval and a conservative SE2 pose-graph update.
+"""Scan-Context retrieval for loop candidates.
 
-Loop acceptance requires both descriptor similarity and a geometric check.
-Optimization failure leaves map_raw.pcd and trajectory_raw.csv untouched.
+Keyframe clouds are stored in the world frame. Descriptors and geometric
+checks run in the lidar frame so already-aligned map points cannot generate
+hundreds of identity-yaw false loops. Python does not rebuild map.pcd; the
+C++ GTSAM service owns the final trajectory when accepted loops exist.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ import csv
 import json
 import math
 import struct
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,15 +22,20 @@ MAX_RADIUS_M = 80.0
 CANDIDATE_TOP_K = 5
 MIN_KEYFRAME_GAP = 30
 YAW_SEARCH_STEPS = 60
-ACCEPT_DISTANCE = 0.35
+ACCEPT_DISTANCE = 0.30
 GEOM_XY_LIMIT_M = 2.5
 GEOM_YAW_LIMIT_RAD = 0.6
+GEOM_OVERLAP_MIN = 0.35
+LOOP_MIN_SLAM_XY_M = 2.0
+LOOP_MAX_SLAM_XY_M = 20.0
+MAX_ACCEPTED_LOOPS = 30
 MAX_OPTIMIZED_JUMP_M = 5.0
 
 IDENTITY_XYZW = (0.0, 0.0, 0.0, 1.0)
 
 
 def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
+    started_at = time.time()
     root = Path(map_dir)
     keyframes = _load_keyframes(root)
     raw_path = root / "trajectory_raw.csv"
@@ -41,15 +49,23 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
     if not keyframes:
         if not optimized_path.exists() and raw_path.exists():
             optimized_path.write_bytes(raw_path.read_bytes())
+        _write_loop_closures_csv(root, [])
         return {
             "scan_context_count": 0,
             "loop_closure_count": 0,
             "trajectory_source": "raw",
             "loop_status": "no_keyframes",
+            "candidate_count": 0,
+            "rejected_loop_count": 0,
+            "detection_duration_seconds": round(time.time() - started_at, 3),
         }
 
-    clouds = [_load_pcd_xyzi(root / keyframe["point_cloud_file"]) for keyframe in keyframes]
-    descriptors = [_scan_context(points) for points in clouds]
+    world_clouds = [_load_pcd_xyzi(root / keyframe["point_cloud_file"]) for keyframe in keyframes]
+    lidar_clouds = [
+        _world_to_lidar_frame(points, keyframe)
+        for points, keyframe in zip(world_clouds, keyframes)
+    ]
+    descriptors = [_scan_context(points) for points in lidar_clouds]
     scan_dir = root / "scan_context"
     scan_dir.mkdir(parents=True, exist_ok=True)
     _write_binary_matrix(scan_dir / "descriptors.bin", descriptors)
@@ -63,15 +79,37 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
 
     candidates = []
     accepted = []
+    seen_pairs: set[tuple[int, int]] = set()
     for query_index, descriptor in enumerate(descriptors):
         ranked = _retrieve_candidates(query_index, descriptor, descriptors, ring_keys)
         for rank, (match_index, distance, yaw) in enumerate(ranked, start=1):
             geom_ok, geom_dx, geom_dy, geom_dyaw = _geometric_verify(
-                clouds[query_index],
-                clouds[match_index],
+                lidar_clouds[query_index],
+                lidar_clouds[match_index],
                 yaw,
             )
-            accepted_loop = geom_ok and distance <= ACCEPT_DISTANCE
+            slam_xy, slam_dyaw = _slam_relative_xy_yaw(keyframes[query_index], keyframes[match_index])
+            accepted_loop = _should_accept_loop(
+                rank=rank,
+                distance=distance,
+                geom_ok=geom_ok,
+                geom_dx=geom_dx,
+                geom_dy=geom_dy,
+                geom_dyaw=geom_dyaw,
+                slam_xy=slam_xy,
+                slam_dyaw=slam_dyaw,
+            )
+            pair = (min(query_index, match_index), max(query_index, match_index))
+            if accepted_loop and pair in seen_pairs:
+                accepted_loop = False
+                rejection_reason = "duplicate_pair"
+            else:
+                rejection_reason = "" if accepted_loop else _loop_rejection_reason(
+                    rank=rank,
+                    distance=distance,
+                    geom_ok=geom_ok,
+                    slam_xy=slam_xy,
+                )
             row = {
                 "query_index": query_index,
                 "match_index": match_index,
@@ -80,23 +118,37 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
                 "estimated_yaw_rad": round(yaw, 6),
                 "geometric_verified": geom_ok,
                 "accepted": accepted_loop,
+                "rejection_reason": rejection_reason,
                 "dx": round(geom_dx, 4),
                 "dy": round(geom_dy, 4),
                 "dyaw": round(geom_dyaw, 6),
             }
             candidates.append(row)
             if accepted_loop:
+                seen_pairs.add(pair)
                 accepted.append(row)
 
+    accepted.sort(key=lambda item: item["distance"])
+    if len(accepted) > MAX_ACCEPTED_LOOPS:
+        kept = {(item["query_index"], item["match_index"]) for item in accepted[:MAX_ACCEPTED_LOOPS]}
+        for row in candidates:
+            if row["accepted"] and (row["query_index"], row["match_index"]) not in kept:
+                row["accepted"] = False
+                row["rejection_reason"] = "accepted_loop_limit"
+        accepted = accepted[:MAX_ACCEPTED_LOOPS]
+
     index_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "rings": RINGS,
         "sectors": SECTORS,
         "max_radius_m": MAX_RADIUS_M,
         "descriptor": "max-height",
+        "frame": "lidar",
         "candidate_top_k": CANDIDATE_TOP_K,
         "min_keyframe_gap": MIN_KEYFRAME_GAP,
         "yaw_search_steps": YAW_SEARCH_STEPS,
+        "loop_min_slam_xy_m": LOOP_MIN_SLAM_XY_M,
+        "loop_max_slam_xy_m": LOOP_MAX_SLAM_XY_M,
         "keyframe_count": len(keyframes),
         "quaternion_order": "xyzw",
     }
@@ -112,6 +164,7 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
                 "estimated_yaw_rad",
                 "geometric_verified",
                 "accepted",
+                "rejection_reason",
                 "dx",
                 "dy",
                 "dyaw",
@@ -119,34 +172,153 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
         )
         writer.writeheader()
         writer.writerows(candidates)
+    _write_loop_closures_csv(root, accepted)
 
-    trajectory_source = "raw"
-    loop_status = "no_valid_loop"
-    optimized = [dict(item) for item in keyframes]
-    if accepted:
-        try:
-            optimized = _optimize_se2(keyframes, accepted)
-            if _trajectory_jump_m(keyframes, optimized) > MAX_OPTIMIZED_JUMP_M:
-                raise ValueError("optimized trajectory jumped too far from raw")
-            if not _rebuild_map_from_optimized_keyframes(root, keyframes, optimized):
-                raise ValueError("optimized keyframe map rebuild failed")
-            trajectory_source = "optimized"
-            loop_status = "accepted"
-        except (OSError, ValueError, ArithmeticError):
-            optimized = [dict(item) for item in keyframes]
-            trajectory_source = "raw"
-            loop_status = "optimization_rejected"
+    if not optimized_path.exists() and raw_path.exists():
+        optimized_path.write_bytes(raw_path.read_bytes())
+    elif not optimized_path.exists():
+        _write_trajectory_csv(optimized_path, keyframes)
 
-    _write_trajectory_csv(optimized_path, optimized if trajectory_source == "optimized" else keyframes)
-    if trajectory_source != "optimized" and map_raw.exists() and map_pcd.exists():
-        # Keep the navigation map identical to the raw export.
+    # Keep the LIO export. False-loop SE2 rebuilds previously warped map.pcd.
+    if map_raw.exists() and map_pcd.exists():
         map_pcd.write_bytes(map_raw.read_bytes())
+
     return {
         "scan_context_count": len(keyframes),
-        "loop_closure_count": len(accepted) if trajectory_source == "optimized" else 0,
-        "trajectory_source": trajectory_source,
-        "loop_status": loop_status,
+        "loop_closure_count": len(accepted),
+        "trajectory_source": "raw",
+        "loop_status": "accepted" if accepted else "no_valid_loop",
+        "candidate_count": len(candidates),
+        "rejected_loop_count": sum(not row["accepted"] for row in candidates),
+        "detection_duration_seconds": round(time.time() - started_at, 3),
     }
+
+
+def _loop_rejection_reason(*, rank: int, distance: float, geom_ok: bool, slam_xy: float) -> str:
+    if rank != 1:
+        return "not_top_rank"
+    if distance >= ACCEPT_DISTANCE:
+        return "descriptor_distance"
+    if not geom_ok:
+        return "geometric_verification"
+    if slam_xy < LOOP_MIN_SLAM_XY_M:
+        return "slam_distance_too_near"
+    if slam_xy > LOOP_MAX_SLAM_XY_M:
+        return "slam_distance_too_far"
+    return "rejected_other"
+
+
+def _should_accept_loop(
+    *,
+    rank: int,
+    distance: float,
+    geom_ok: bool,
+    geom_dx: float,
+    geom_dy: float,
+    geom_dyaw: float,
+    slam_xy: float,
+    slam_dyaw: float,
+) -> bool:
+    if rank != 1 or not geom_ok or distance > ACCEPT_DISTANCE:
+        return False
+    if slam_xy < LOOP_MIN_SLAM_XY_M or slam_xy > LOOP_MAX_SLAM_XY_M:
+        return False
+    if abs(_wrap_angle(geom_dyaw - slam_dyaw)) > GEOM_YAW_LIMIT_RAD:
+        return False
+    if math.hypot(geom_dx, geom_dy) > GEOM_XY_LIMIT_M:
+        return False
+    return True
+
+
+def _wrap_angle(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def _quat_normalize(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float, float]:
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm <= 1e-12:
+        return 0.0, 0.0, 0.0, 1.0
+    return qx / norm, qy / norm, qz / norm, qw / norm
+
+
+def _quat_to_rotation(qx: float, qy: float, qz: float, qw: float) -> list[list[float]]:
+    qx, qy, qz, qw = _quat_normalize(qx, qy, qz, qw)
+    return [
+        [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw), 2.0 * (qx * qz + qy * qw)],
+        [2.0 * (qx * qy + qz * qw), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+        [2.0 * (qx * qz - qy * qw), 2.0 * (qy * qz + qx * qw), 1.0 - 2.0 * (qx * qx + qy * qy)],
+    ]
+
+
+def _world_to_lidar_frame(
+    points: list[tuple[float, float, float]],
+    keyframe: dict[str, Any],
+) -> list[tuple[float, float, float]]:
+    rotation = _quat_to_rotation(
+        float(keyframe.get("lidar_qx") or 0.0),
+        float(keyframe.get("lidar_qy") or 0.0),
+        float(keyframe.get("lidar_qz") or 0.0),
+        float(keyframe.get("lidar_qw") or 1.0),
+    )
+    origin_x = float(keyframe.get("lidar_x") or 0.0)
+    origin_y = float(keyframe.get("lidar_y") or 0.0)
+    origin_z = float(keyframe.get("lidar_z") or 0.0)
+    local = []
+    for x, y, z in points:
+        dx = x - origin_x
+        dy = y - origin_y
+        dz = z - origin_z
+        local.append(
+            (
+                rotation[0][0] * dx + rotation[1][0] * dy + rotation[2][0] * dz,
+                rotation[0][1] * dx + rotation[1][1] * dy + rotation[2][1] * dz,
+                rotation[0][2] * dx + rotation[1][2] * dy + rotation[2][2] * dz,
+            )
+        )
+    return local
+
+
+def _slam_relative_xy_yaw(query: dict[str, Any], match: dict[str, Any]) -> tuple[float, float]:
+    dx = float(match["lidar_x"]) - float(query["lidar_x"])
+    dy = float(match["lidar_y"]) - float(query["lidar_y"])
+    yaw = float(query.get("yaw") or 0.0)
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    local_x = cosine * dx + sine * dy
+    local_y = -sine * dx + cosine * dy
+    dyaw = _wrap_angle(float(match.get("yaw") or 0.0) - yaw)
+    return math.hypot(local_x, local_y), dyaw
+
+
+def _write_loop_closures_csv(root: Path, accepted: list[dict[str, Any]]) -> None:
+    path = root / "loop_closures.csv"
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            ["from", "to", "tx", "ty", "tz", "qx", "qy", "qz", "qw", "sigma_translation", "sigma_rotation", "score"]
+        )
+        for row in accepted:
+            yaw = float(row["dyaw"])
+            score = max(0.0, 1.0 - float(row["distance"]))
+            writer.writerow(
+                [
+                    int(row["query_index"]),
+                    int(row["match_index"]),
+                    f"{float(row['dx']):.4f}",
+                    f"{float(row['dy']):.4f}",
+                    "0",
+                    "0",
+                    "0",
+                    f"{math.sin(yaw / 2.0):.7f}",
+                    f"{math.cos(yaw / 2.0):.7f}",
+                    "0.50",
+                    "0.15",
+                    f"{score:.6f}",
+                ]
+            )
 
 
 def _rebuild_map_from_optimized_keyframes(
@@ -156,9 +328,8 @@ def _rebuild_map_from_optimized_keyframes(
 ) -> bool:
     """Reproject each world-frame keyframe into the optimized SE2 trajectory.
 
-    The C++ GTSAM service is the authoritative optimizer in a live mapping
-    session. This local rebuild keeps standalone/offline package finalization
-    consistent and is also the safe fallback if the service is unavailable.
+    Kept for offline diagnostics. Live mapping no longer rebuilds map.pcd here
+    because false loops previously warped the navigation cloud.
     """
     if len(raw_keyframes) != len(optimized_keyframes):
         return False
@@ -444,11 +615,11 @@ def _geometric_verify(
     mcx = sum(x for x, _y in rotated) / len(rotated)
     mcy = sum(y for _x, y in rotated) / len(rotated)
     dx, dy = qcx - mcx, qcy - mcy
-    ok = overlap >= 0.25 and math.hypot(dx, dy) <= GEOM_XY_LIMIT_M and abs(yaw) <= math.pi
+    ok = overlap >= GEOM_OVERLAP_MIN and math.hypot(dx, dy) <= GEOM_XY_LIMIT_M
     return ok, dx, dy, yaw
 
 
-def _occupancy(points: list[tuple[float, float]], resolution: float = 1.0) -> set[tuple[int, int]]:
+def _occupancy(points: list[tuple[float, float]], resolution: float = 0.5) -> set[tuple[int, int]]:
     cells = set()
     for x, y in points:
         cells.add((int(math.floor(x / resolution)), int(math.floor(y / resolution))))

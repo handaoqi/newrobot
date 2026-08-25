@@ -8,6 +8,7 @@
 #include <gtsam/nonlinear/PriorFactor.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/base/numericalDerivative.h>
 
@@ -189,7 +190,14 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
         gtsam::NonlinearFactorGraph graph;
         gtsam::Values initial;
         for (std::size_t i = 0; i < keyframes.size(); ++i)
+        {
             initial.insert(gtsam::Symbol('x', i), keyframes[i].initial_pose);
+            if (config_.use_imu_factor)
+            {
+                initial.insert(gtsam::Symbol('v', i), keyframes[i].initial_velocity);
+                initial.insert(gtsam::Symbol('b', i), keyframes[i].initial_bias);
+            }
+        }
 
         const auto prior_sigmas = (gtsam::Vector(6) <<
             config_.prior_rotation_sigma_rad, config_.prior_rotation_sigma_rad, config_.prior_rotation_sigma_rad,
@@ -197,6 +205,34 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
         graph.add(gtsam::PriorFactor<gtsam::Pose3>(
             gtsam::Symbol('x', 0), keyframes.front().initial_pose,
             robustDiagonal(prior_sigmas, config_.robust_huber_k)));
+
+        boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params;
+        if (config_.use_imu_factor)
+        {
+            imu_params = gtsam::PreintegrationCombinedParams::MakeSharedU(
+                std::max(1e-6, config_.gravity_magnitude));
+            imu_params->setAccelerometerCovariance(gtsam::Matrix3::Identity()
+                * std::pow(std::max(1e-8, config_.imu_accelerometer_noise_sigma), 2));
+            imu_params->setGyroscopeCovariance(gtsam::Matrix3::Identity()
+                * std::pow(std::max(1e-8, config_.imu_gyroscope_noise_sigma), 2));
+            imu_params->setIntegrationCovariance(gtsam::Matrix3::Identity()
+                * std::pow(std::max(1e-10, config_.imu_integration_noise_sigma), 2));
+            imu_params->setBiasAccCovariance(gtsam::Matrix3::Identity()
+                * std::pow(std::max(1e-10, config_.imu_accel_bias_random_walk_sigma), 2));
+            imu_params->setBiasOmegaCovariance(gtsam::Matrix3::Identity()
+                * std::pow(std::max(1e-10, config_.imu_gyro_bias_random_walk_sigma), 2));
+            imu_params->setBiasAccOmegaInit(gtsam::Matrix6::Identity()
+                * std::pow(std::max(1e-8, config_.imu_bias_prior_sigma), 2));
+            graph.add(gtsam::PriorFactor<gtsam::Vector3>(
+                gtsam::Symbol('v', 0), keyframes.front().initial_velocity,
+                gtsam::noiseModel::Isotropic::Sigma(
+                    3, std::max(1e-6, config_.imu_velocity_prior_sigma))));
+            graph.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+                gtsam::Symbol('b', 0), keyframes.front().initial_bias,
+                gtsam::noiseModel::Isotropic::Sigma(
+                    6, std::max(1e-6, config_.imu_bias_prior_sigma))));
+            result.imu_velocity_prior_factor_count = 1;
+        }
 
         for (std::size_t i = 1; i < keyframes.size(); ++i)
         {
@@ -211,22 +247,53 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
             ++result.ndt_factor_count;
 
             const auto& frame = keyframes[i];
-            if (frame.has_imu_delta)
+            if (config_.use_imu_factor && frame.has_imu_preintegration)
             {
-                gtsam::SharedNoiseModel imu_model;
-                bool valid_covariance = frame.imu_covariance.allFinite()
-                    && (frame.imu_covariance.diagonal().array() > 0.0).all();
-                if (valid_covariance)
-                    imu_model = robustCovariance(frame.imu_covariance, config_.robust_huber_k);
+                gtsam::PreintegratedCombinedMeasurements preintegrated(imu_params, frame.imu_bias_hat);
+                double integrated_time = 0.0;
+                for (const auto& measurement : frame.imu_measurements)
+                {
+                    if (!std::isfinite(measurement.delta_t) || measurement.delta_t <= 0.0
+                        || measurement.delta_t > 0.25 || !measurement.acceleration.allFinite()
+                        || !measurement.angular_velocity.allFinite())
+                        continue;
+                    preintegrated.integrateMeasurement(
+                        measurement.acceleration, measurement.angular_velocity, measurement.delta_t);
+                    integrated_time += measurement.delta_t;
+                }
+                if (integrated_time > 1e-6)
+                {
+                    graph.add(gtsam::CombinedImuFactor(
+                        previous, gtsam::Symbol('v', i - 1), current, gtsam::Symbol('v', i),
+                        gtsam::Symbol('b', i - 1), gtsam::Symbol('b', i), preintegrated));
+                    ++result.imu_factor_count;
+                    // CombinedImuFactor embeds the bias random-walk transition.
+                    ++result.imu_bias_factor_count;
+                }
                 else
                 {
-                    const auto imu_sigmas = (gtsam::Vector(6) <<
-                        config_.imu_rotation_sigma_rad, config_.imu_rotation_sigma_rad, config_.imu_rotation_sigma_rad,
-                        config_.imu_translation_sigma, config_.imu_translation_sigma, config_.imu_translation_sigma).finished();
-                    imu_model = robustDiagonal(imu_sigmas, config_.robust_huber_k);
+                    graph.add(gtsam::PriorFactor<gtsam::Vector3>(
+                        gtsam::Symbol('v', i), frame.initial_velocity,
+                        gtsam::noiseModel::Isotropic::Sigma(
+                            3, std::max(1e-6, config_.imu_velocity_prior_sigma))));
+                    graph.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+                        gtsam::Symbol('b', i), frame.initial_bias,
+                        gtsam::noiseModel::Isotropic::Sigma(
+                            6, std::max(1e-6, config_.imu_bias_prior_sigma))));
+                    ++result.imu_velocity_prior_factor_count;
                 }
-                graph.add(gtsam::BetweenFactor<gtsam::Pose3>(previous, current, frame.imu_delta, imu_model));
-                ++result.imu_factor_count;
+            }
+            else if (config_.use_imu_factor)
+            {
+                graph.add(gtsam::PriorFactor<gtsam::Vector3>(
+                    gtsam::Symbol('v', i), frame.initial_velocity,
+                    gtsam::noiseModel::Isotropic::Sigma(
+                        3, std::max(1e-6, config_.imu_velocity_prior_sigma))));
+                graph.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+                    gtsam::Symbol('b', i), frame.initial_bias,
+                    gtsam::noiseModel::Isotropic::Sigma(
+                        6, std::max(1e-6, config_.imu_bias_prior_sigma))));
+                ++result.imu_velocity_prior_factor_count;
             }
         }
 
@@ -271,18 +338,52 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
         gtsam::LevenbergMarquardtOptimizer optimizer(graph, initial, params);
         const gtsam::Values optimized = optimizer.optimize();
         result.error_after = graph.error(optimized);
+        if (config_.use_imu_factor)
+        {
+            result.final_velocity = optimized.at<gtsam::Vector3>(
+                gtsam::Symbol('v', keyframes.size() - 1));
+            result.final_bias = optimized.at<gtsam::imuBias::ConstantBias>(
+                gtsam::Symbol('b', keyframes.size() - 1));
+        }
         result.optimized_poses.reserve(keyframes.size());
         result.covariances.reserve(keyframes.size());
         gtsam::Marginals marginals(graph, optimized, gtsam::Marginals::QR);
+        double max_jump = 0.0;
+        double max_abs_z = 0.0;
+        double initial_z_min = keyframes.front().initial_pose.z();
+        double initial_z_max = initial_z_min;
+        double optimized_z_min = std::numeric_limits<double>::infinity();
+        double optimized_z_max = -std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < keyframes.size(); ++i)
         {
             const Key key = gtsam::Symbol('x', i);
-            result.optimized_poses.push_back(optimized.at<Pose3>(key));
+            const Pose3 pose = optimized.at<Pose3>(key);
+            const auto& initial = keyframes[i].initial_pose;
+            result.optimized_poses.push_back(pose);
             const gtsam::Matrix covariance = marginals.marginalCovariance(key);
             gtsam::Matrix6 covariance6 = gtsam::Matrix6::Identity();
             if (covariance.rows() == 6 && covariance.cols() == 6 && covariance.allFinite())
                 covariance6 = covariance;
             result.covariances.push_back(covariance6);
+            max_jump = std::max(max_jump, (pose.translation() - initial.translation()).norm());
+            max_abs_z = std::max(max_abs_z, std::fabs(pose.z() - initial.z()));
+            initial_z_min = std::min(initial_z_min, initial.z());
+            initial_z_max = std::max(initial_z_max, initial.z());
+            optimized_z_min = std::min(optimized_z_min, pose.z());
+            optimized_z_max = std::max(optimized_z_max, pose.z());
+        }
+        const double z_span_growth = (optimized_z_max - optimized_z_min) - (initial_z_max - initial_z_min);
+        if (max_jump > config_.max_pose_jump_m || max_abs_z > config_.max_abs_z_change_m
+            || z_span_growth > config_.max_abs_z_change_m)
+        {
+            result.success = false;
+            result.optimized_poses.clear();
+            result.covariances.clear();
+            std::ostringstream message;
+            message << "optimization rejected: max_jump=" << max_jump
+                    << "m max_abs_z=" << max_abs_z << "m z_span_growth=" << z_span_growth << "m";
+            result.error = message.str();
+            return result;
         }
         result.success = true;
     }

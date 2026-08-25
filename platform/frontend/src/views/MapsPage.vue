@@ -316,32 +316,85 @@ const selectedMapPackageFiles = computed(() => {
   const files = selectedMapDescription.value.package_files || selectedMapDescription.value.files || []
   return Array.isArray(files) ? files : []
 })
+const selectedMapOptimization = computed(() => {
+  const explicit = selectedMap.value?.optimization_summary
+  if (explicit && Object.keys(explicit).length) return explicit
+  const traceValue = mappingTrace.value?.optimization
+  if (traceValue && Object.keys(traceValue).length) return traceValue
+  const descriptionValue = selectedMapDescription.value.optimization
+  if (descriptionValue && typeof descriptionValue === 'object') return descriptionValue
+  return selectedMapDescription.value.map_manifest?.optimization || {}
+})
+const runtimeOptimization = computed(() => mappingStatus.value?.result?.optimization || {})
 const globalEnu = computed(() => mappingStatus.value?.result?.global_enu || {})
 const currentMapGlobalEnu = computed(() => (
   selectedMap.value && String(globalEnu.value.source_map_id || '') === String(selectedMap.value.id)
     ? globalEnu.value
     : {}
 ))
+const currentMapConfirmedHeading = computed(() => {
+  const confirmedRaw = currentMapGlobalEnu.value.confirmed_heading_deg
+  const confirmed = Number(confirmedRaw)
+  if (confirmedRaw !== null && confirmedRaw !== undefined && confirmedRaw !== '' && Number.isFinite(confirmed)) {
+    return { value: confirmed, confirmed: true }
+  }
+  const lockSnapshotRaw = currentMapGlobalEnu.value.heading_deg
+  const lockSnapshot = Number(lockSnapshotRaw)
+  if (lockSnapshotRaw !== null && lockSnapshotRaw !== undefined && lockSnapshotRaw !== '' && Number.isFinite(lockSnapshot)) {
+    return { value: lockSnapshot, confirmed: false }
+  }
+  return null
+})
+const currentMapEnuToMapYawDeg = computed(() => {
+  const yawRaw = currentMapGlobalEnu.value.enu_to_map_yaw
+  const yaw = Number(yawRaw)
+  return yawRaw !== null && yawRaw !== undefined && yawRaw !== '' && Number.isFinite(yaw)
+    ? yaw * 180 / Math.PI
+    : null
+})
 const mapArtifactFiles = computed(() => [
   { key: 'map.pcd', label: '点云地图', match: (name) => name === 'map.pcd' },
   { key: 'keyframes/keyframes.csv', label: '关键帧位置', match: (name) => name === 'keyframes/keyframes.csv' || name === 'trajectory_optimized.csv' || name === 'trajectory_raw.csv' },
   { key: 'scan_context/index.json', label: '指纹库', match: (name) => name === 'scan_context/index.json' || name === 'scan_context/loop_candidates.csv' },
+  { key: 'optimization_summary.json', label: '回环优化摘要', match: (name) => name === 'optimization_summary.json' },
 ])
 
-const mappingTracePoints = computed(() => {
+function tracePoints(poseNames) {
   const map = selectedMap.value
   const samples = mappingTrace.value?.samples || []
   if (!map || !samples.length || !Number(map.resolution) || !Number(map.width) || !Number(map.height)) return []
   const origin = Array.isArray(map.origin) ? map.origin : [0, 0, 0]
   return samples.map((sample) => {
-    const pose = sample.slam || sample.pose || {}
+    const pose = poseNames.map(name => sample[name]).find(value => value && typeof value === 'object') || {}
     return [
       (Number(pose.x || 0) - Number(origin[0] || 0)) / Number(map.resolution),
       Number(map.height) - (Number(pose.y || 0) - Number(origin[1] || 0)) / Number(map.resolution),
     ]
   }).filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
-})
+}
+const mappingTraceRawPoints = computed(() => tracePoints(['raw', 'slam', 'pose']))
+const mappingTraceOptimizedPoints = computed(() => tracePoints(['optimized', 'slam', 'pose']))
+const mappingTracePoints = computed(() => mappingTraceOptimizedPoints.value)
+const mappingTraceRawSvgPoints = computed(() => mappingTraceRawPoints.value.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' '))
 const mappingTraceSvgPoints = computed(() => mappingTracePoints.value.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' '))
+const mappingCorrectionArrows = computed(() => {
+  const map = selectedMap.value
+  if (!map || !Number(map.resolution) || !Number(map.height)) return []
+  const origin = Array.isArray(map.origin) ? map.origin : [0, 0, 0]
+  const toPoint = (pose) => ({
+    x: (Number(pose?.x || 0) - Number(origin[0] || 0)) / Number(map.resolution),
+    y: Number(map.height) - (Number(pose?.y || 0) - Number(origin[1] || 0)) / Number(map.resolution),
+  })
+  return (mappingTrace.value?.samples || [])
+    .filter(sample => Number(sample.correction?.position_m || 0) >= 0.30 || Math.abs(Number(sample.correction?.yaw_deg || 0)) >= 3)
+    .map(sample => ({
+      index: sample.index,
+      from: toPoint(sample.raw),
+      to: toPoint(sample.optimized),
+      yawSignificant: Math.abs(Number(sample.correction?.yaw_deg || 0)) >= 3,
+    }))
+    .filter(item => [item.from.x, item.from.y, item.to.x, item.to.y].every(Number.isFinite))
+})
 
 async function loadMappingTrace(mapId) {
   mappingTrace.value = null
@@ -492,7 +545,10 @@ const originDiagnosticRows = computed(() => [
   { label: '纬度', value: formatOriginNumber(originStatus.value.latitude, 10) },
   { label: '高程', value: formatOriginNumber(originStatus.value.altitude, 3, ' m') },
   { label: '航向状态 / 类型', value: `${originStatus.value.heading_status ?? '—'} / ${originStatus.value.heading_type ?? '—'}`, tone: originStatus.value.heading_fixed ? 'ok' : 'warn' },
-  { label: '航向 / 标准差', value: `${formatOriginNumber(originStatus.value.heading_deg, 2, '°')} / ${formatOriginNumber(originStatus.value.heading_std_deg, 2, '°')}` },
+  { label: '接收机航向 / 标准差', value: `${formatOriginNumber(originStatus.value.heading_deg, 2, '°')} / ${formatOriginNumber(originStatus.value.heading_std_deg, 2, '°')}` },
+  { label: '航向安装补偿', value: formatOriginNumber(originStatus.value.heading_offset_deg, 1, '°') },
+  { label: '人工确认原点航向', value: formatOriginNumber(originStatus.value.confirmed_heading_deg, 2, '°'), tone: originStatus.value.heading_confirmed ? 'ok' : '' },
+  { label: '航向确认时间', value: formatOriginStamp(originStatus.value.heading_confirmed_at_unix) },
   { label: '俯仰 / 标准差', value: `${formatOriginNumber(originStatus.value.pitch_deg, 2, '°')} / ${formatOriginNumber(originStatus.value.pitch_std_deg, 2, '°')}` },
   { label: '双天线基线', value: formatOriginNumber(originStatus.value.baseline_m, 3, ' m') },
   { label: '航向跟踪 / 解算卫星', value: `${originStatus.value.heading_satellites ?? '—'} / ${originStatus.value.heading_solution_satellites ?? '—'}` },
@@ -645,6 +701,45 @@ const formatDuration = (value) => {
   const hours = Math.floor(minutes / 60)
   return `${hours} 小时 ${minutes % 60} 分`
 }
+const optimizationStageLabels = {
+  waiting: '等待触发',
+  detecting: '回环检测中',
+  optimizing: '全局优化中',
+  trajectory_optimized: '轨迹优化完成',
+  rebuilding_map: '重建地图中',
+  completed: '回环优化完成',
+  no_valid_loop: '无有效回环，保持原始轨迹',
+  fallback: '优化异常，已回退原始地图',
+  failed: '优化失败',
+}
+const formatAgo = (unix) => {
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - Number(unix || 0)))
+  if (!unix) return ''
+  if (seconds < 60) return `${seconds}秒前`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟前`
+  return `${Math.floor(seconds / 3600)}小时前`
+}
+function optimizationLine(value) {
+  if (!value || !Object.keys(value).length) return ''
+  const stage = optimizationStageLabels[value.stage] || value.stage || '等待触发'
+  const accepted = Number(value.accepted_loop_count || 0)
+  const candidates = Number(value.candidate_count || 0)
+  const position = value.correction?.position_m || {}
+  const yaw = value.correction?.yaw_deg || {}
+  const reduction = value.graph_error?.reduction_percent
+  const parts = [stage]
+  if (candidates || accepted) parts.push(`接受 ${accepted}/${candidates} 个回环`)
+  if (value.stage === 'completed') {
+    parts.push(`平均位置 ${Number(position.mean || 0).toFixed(2)}m`)
+    parts.push(`最大 ${Number(position.max || 0).toFixed(2)}m`)
+    parts.push(`平均航向 ${Number(yaw.mean || 0).toFixed(1)}°`)
+    parts.push(`最大 ${Number(yaw.max || 0).toFixed(1)}°`)
+    if (reduction !== null && reduction !== undefined) parts.push(`图误差下降 ${Number(reduction).toFixed(1)}%`)
+  }
+  const age = formatAgo(value.updated_at_unix || value.completed_at_unix)
+  if (age) parts.push(age)
+  return parts.join(' · ')
+}
 
 const stateSteps = computed(() => [
   { key: 'idle', label: '配置' },
@@ -663,6 +758,7 @@ const stateSteps = computed(() => [
   { key: 'ready_to_map', label: isOutdoorMapping.value ? '航向复核' : '等待确认' },
   { key: 'mapping', label: '正式采集' },
   { key: 'saving', label: '保存中' },
+  { key: 'optimizing', label: '回环优化' },
   { key: 'packaging', label: '打包中' },
   { key: 'uploading', label: '上传中' },
   { key: 'stopping', label: '退出建图' },
@@ -713,14 +809,14 @@ const canCancelMapping = computed(() => (
 ))
 const showMappingReadiness = computed(() => (
   Boolean(mappingStatus.value?.result?.process_alive)
-  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
+  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'optimizing', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
 ))
 const workflowSessionId = computed(() => mappingStatus.value?.result?.mapping_session_id || '')
 const mappingModeSwitchDisabled = computed(() => (
   mappingBusy.value
   || mappingCommandInFlight.value
   || mappingProcessAlive.value
-  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
+  || ['slam_starting', 'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'optimizing', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)
 ))
 const canLockOrigin = computed(() => (
   isOutdoorMapping.value
@@ -927,7 +1023,7 @@ async function refreshMappingStatus({ signal } = {}) {
     const activeReportedWorkflow = [
       'command_created', 'command_published', 'command_accepted', 'starting',
     'origin_starting', 'origin_waiting', 'origin_locked', 'slam_starting',
-      'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'packaging',
+      'slam_warmup', 'ready_to_map', 'mapping', 'saving', 'optimizing', 'packaging',
       'uploading', 'stopping',
     ].includes(reportedState)
     // An idle Edge Agent reports its default indoor mapping type even when
@@ -1074,7 +1170,19 @@ async function handleBeginMapping() {
       heading_check_confirmed: isOutdoorMapping.value,
     })
     await refreshMappingStatus()
-    setMappingStepFeedback(beginStep, true, '人工确认已完成，正式关键帧采集已开始')
+    const confirmedHeadingRaw = originStatus.value.confirmed_heading_deg
+    const confirmedHeading = Number(confirmedHeadingRaw)
+    setMappingStepFeedback(
+      beginStep,
+      true,
+      isOutdoorMapping.value
+        && confirmedHeadingRaw !== null
+        && confirmedHeadingRaw !== undefined
+        && confirmedHeadingRaw !== ''
+        && Number.isFinite(confirmedHeading)
+        ? `已记录人工确认原点航向 ${confirmedHeading.toFixed(2)}°，正式关键帧采集已开始`
+        : '人工确认已完成，正式关键帧采集已开始',
+    )
   } catch (error) {
     setMappingStepFeedback(beginStep, false, error.message)
     alert(`开始正式建图失败: ${error.message}`)
@@ -1094,7 +1202,7 @@ async function handleSaveMapping() {
     // The save endpoint only queues the command. Keep polling through
     // packaging/upload so the newly uploaded map is actually visible before
     // returning the workflow to the configuration step.
-    const deadline = Date.now() + 15 * 60 * 1000
+    const deadline = Date.now() + 30 * 60 * 1000
     while (Date.now() < deadline) {
       await refreshMappingStatus()
       if (['failed', 'command_failed', 'command_rejected', 'command_timed_out'].includes(mappingState.value)) {
@@ -1103,7 +1211,7 @@ async function handleSaveMapping() {
       if (!mappingCommandInFlight.value && ['exited', 'completed', 'cancelled', 'idle'].includes(mappingState.value)) break
       await new Promise(resolve => setTimeout(resolve, 1000))
     }
-    if (mappingCommandInFlight.value || ['saving', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)) {
+    if (mappingCommandInFlight.value || ['saving', 'optimizing', 'packaging', 'uploading', 'stopping'].includes(mappingState.value)) {
       throw new Error('地图仍在上传，请稍后点击“刷新状态”查看结果')
     }
     const uploadedMapId = mappingStatus.value?.result?.upload_result?.id || mappingStatus.value?.latest_map?.id
@@ -1557,7 +1665,26 @@ async function saveCleaner() {
                 preserveAspectRatio="none"
                 aria-label="建图轨迹"
               >
-                <polyline :points="mappingTraceSvgPoints" />
+                <defs>
+                  <marker id="correction-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                    <path d="M0,0 L6,3 L0,6 Z" />
+                  </marker>
+                </defs>
+                <polyline v-if="mappingTraceRawPoints.length > 1" class="trace-raw" :points="mappingTraceRawSvgPoints" />
+                <polyline class="trace-optimized" :points="mappingTraceSvgPoints" />
+                <g class="trace-corrections">
+                  <line
+                    v-for="item in mappingCorrectionArrows"
+                    :key="item.index"
+                    :x1="item.from.x" :y1="item.from.y" :x2="item.to.x" :y2="item.to.y"
+                    marker-end="url(#correction-arrow)"
+                  />
+                  <circle
+                    v-for="item in mappingCorrectionArrows.filter(value => value.yawSignificant)"
+                    :key="`yaw-${item.index}`"
+                    :cx="item.to.x" :cy="item.to.y" r="3"
+                  />
+                </g>
               </svg>
             </div>
           </div>
@@ -1593,6 +1720,28 @@ async function saveCleaner() {
                 <span>诊断数据<strong>{{ formatBytes(selectedMapMetrics.diagnostic_data_size_bytes) }}</strong></span>
               </div>
             </div>
+            <div v-if="Object.keys(selectedMapOptimization).length" class="optimization-panel" :class="`optimization-${selectedMapOptimization.stage || 'waiting'}`">
+              <div class="optimization-line" :title="optimizationLine(selectedMapOptimization)">
+                {{ optimizationLine(selectedMapOptimization) }}
+              </div>
+              <details>
+                <summary>优化详情</summary>
+                <div class="optimization-grid">
+                  <span>触发来源<strong>{{ selectedMapOptimization.trigger_source || 'automatic_save' }}</strong></span>
+                  <span>候选/接受/拒绝<strong>{{ selectedMapOptimization.candidate_count || 0 }}/{{ selectedMapOptimization.accepted_loop_count || 0 }}/{{ selectedMapOptimization.rejected_loop_count || 0 }}</strong></span>
+                  <span>位置 RMS / P95<strong>{{ Number(selectedMapOptimization.correction?.position_m?.rms || 0).toFixed(3) }} / {{ Number(selectedMapOptimization.correction?.position_m?.p95 || 0).toFixed(3) }} m</strong></span>
+                  <span>航向 RMS / P95<strong>{{ Number(selectedMapOptimization.correction?.yaw_deg?.rms || 0).toFixed(2) }} / {{ Number(selectedMapOptimization.correction?.yaw_deg?.p95 || 0).toFixed(2) }}°</strong></span>
+                  <span>激光 / IMU / GPS / 航向 / 回环因子<strong>{{ selectedMapOptimization.factors?.ndt || 0 }}/{{ selectedMapOptimization.factors?.imu || 0 }}/{{ selectedMapOptimization.factors?.rtk_position || 0 }}/{{ selectedMapOptimization.factors?.rtk_heading || 0 }}/{{ selectedMapOptimization.factors?.loop_closure || 0 }}</strong></span>
+                  <span>检测 / 优化重建耗时<strong>{{ formatDuration(selectedMapOptimization.timing?.loop_detection_seconds) }} / {{ formatDuration(selectedMapOptimization.timing?.optimization_and_rebuild_seconds) }}</strong></span>
+                </div>
+                <div v-if="selectedMapOptimization.mapping_type === 'outdoor'" class="enu-guard" :class="{ danger: !selectedMapOptimization.enu_guard?.passed }">
+                  ENU 原点保护：{{ selectedMapOptimization.enu_guard?.passed ? '通过' : '未通过，已禁止自动激活' }}
+                  · 起点 {{ Number(selectedMapOptimization.enu_guard?.start_translation_m || 0).toFixed(3) }} m
+                  · 航向 {{ Number(selectedMapOptimization.enu_guard?.global_yaw_deg || 0).toFixed(2) }}°
+                </div>
+                <div v-if="selectedMapOptimization.fallback_error" class="mapping-progress-error">{{ selectedMapOptimization.fallback_error }}</div>
+              </details>
+            </div>
             <div class="map-artifact-panel">
               <div class="map-artifact-head">
                 <strong>地图数据文件</strong>
@@ -1620,7 +1769,11 @@ async function saveCleaner() {
                 <span>LAT {{ Number(currentMapGlobalEnu.origin_latitude || 0).toFixed(10) }}</span>
                 <span>LON {{ Number(currentMapGlobalEnu.origin_longitude || 0).toFixed(10) }}</span>
                 <span>ALT {{ Number(currentMapGlobalEnu.origin_altitude || 0).toFixed(3) }} m</span>
-                <span>航向 {{ Number(currentMapGlobalEnu.heading_deg || 0).toFixed(2) }}°</span>
+                <span v-if="currentMapConfirmedHeading">
+                  {{ currentMapConfirmedHeading.confirmed ? '人工确认原点航向' : '锁定时航向' }}
+                  {{ currentMapConfirmedHeading.value.toFixed(2) }}°
+                </span>
+                <span v-if="currentMapEnuToMapYawDeg !== null">ENU→地图旋转 {{ currentMapEnuToMapYawDeg.toFixed(2) }}°</span>
                 <span>来源地图 {{ currentMapGlobalEnu.source_map_name || selectedMap.name }}</span>
               </div>
               <small v-else>尚未从当前地图提取全局 ENU。</small>
@@ -1906,7 +2059,7 @@ async function saveCleaner() {
             <span>{{ rtkTelemetryOnline ? '实时' : '无数据或已过期' }}</span>
             <span>X {{ formatOriginNumber(originStatus.rtk_enu_x_m, 3, ' m') }}</span>
             <span>Y {{ formatOriginNumber(originStatus.rtk_enu_y_m, 3, ' m') }}</span>
-            <span>Yaw {{ formatOriginNumber(originStatus.rtk_yaw_deg, 2, '°') }}</span>
+            <span>Yaw(ENU/机身) {{ formatOriginNumber(originStatus.rtk_yaw_deg, 2, '°') }}</span>
             <span>解 {{ originQualityLabel }} · {{ originStatus.solution_status ?? '—' }} / {{ originStatus.position_type ?? '—' }}</span>
             <span>数据年龄 {{ formatOriginNumber(originStatus.data_age_seconds ?? originStatus.age_seconds, 3, ' s') }}</span>
           </div>
@@ -2012,6 +2165,11 @@ async function saveCleaner() {
             </div>
             <div v-if="saveProgress.error" class="mapping-progress-error">{{ saveProgress.error }}</div>
           </div>
+          <div v-if="Object.keys(runtimeOptimization).length" class="optimization-panel optimization-runtime" :class="`optimization-${runtimeOptimization.stage || 'waiting'}`">
+            <div class="optimization-line" :title="optimizationLine(runtimeOptimization)">
+              {{ optimizationLine(runtimeOptimization) }}
+            </div>
+          </div>
           <div v-if="Object.keys(mappingMetrics).length" class="mapping-metrics-panel mapping-metrics-runtime">
             <div class="map-artifact-head">
               <strong>本次建图结果</strong>
@@ -2078,7 +2236,7 @@ async function saveCleaner() {
             <input v-model="mappingForm.record_rosbag" type="checkbox" :disabled="isActiveMapping" />
             <span>
               <strong>同步录制诊断数据</strong>
-              <small>记录雷达、IMU、里程计、TF和RTK，便于离线复现漂移</small>
+              <small>记录雷达、IMU、里程计、TF和RTK，便于离线复现漂移；诊断包留在机器上，不随地图上传</small>
             </span>
           </label>
         </div>
@@ -2453,7 +2611,12 @@ async function saveCleaner() {
 .map-image-stage { position: relative; display: inline-flex; max-width: 100%; max-height: 100%; }
 .map-image-stage img { display: block; }
 .map-trace-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.map-trace-overlay polyline { fill: none; stroke: #1678ff; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.map-trace-overlay polyline { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.map-trace-overlay .trace-raw { stroke: #f59e0b; stroke-dasharray: 7 5; opacity: 0.85; }
+.map-trace-overlay .trace-optimized { stroke: #1678ff; }
+.map-trace-overlay .trace-corrections line { stroke: #dc2626; stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.map-trace-overlay .trace-corrections path { fill: #dc2626; }
+.map-trace-overlay .trace-corrections circle { fill: none; stroke: #7c3aed; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 
 .no-preview {
   color: #999;
@@ -2501,6 +2664,18 @@ async function saveCleaner() {
 .mapping-metrics-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.45rem 0.8rem; }
 .mapping-metrics-grid span { display: flex; justify-content: space-between; gap: 0.6rem; color: #667085; }
 .mapping-metrics-grid strong { color: #1f2937; white-space: nowrap; }
+.optimization-panel { display: grid; gap: 0.45rem; padding: 0.65rem 0.75rem; border: 1px solid #93c5fd; border-radius: 6px; background: #eff6ff; font-size: 0.78rem; }
+.optimization-runtime { margin-top: 0.7rem; }
+.optimization-line { overflow: hidden; color: #174ea6; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.optimization-no_valid_loop { border-color: #cbd5e1; background: #f8fafc; }
+.optimization-fallback, .optimization-failed { border-color: #f0a69a; background: #fff4f2; }
+.optimization-fallback .optimization-line, .optimization-failed .optimization-line { color: #b42318; }
+.optimization-panel details summary { cursor: pointer; color: #475467; }
+.optimization-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.4rem 0.8rem; padding-top: 0.5rem; }
+.optimization-grid span { display: flex; justify-content: space-between; gap: 0.6rem; color: #667085; }
+.optimization-grid strong { color: #1f2937; text-align: right; }
+.enu-guard { margin-top: 0.5rem; padding: 0.4rem 0.5rem; border-radius: 4px; background: #ecfdf3; color: #067647; }
+.enu-guard.danger { background: #fef3f2; color: #b42318; font-weight: 650; }
 .global-enu-panel { display: grid; gap: 0.45rem; padding: 0.7rem 0.75rem; border: 1px solid #9ed6b5; border-radius: 6px; background: #f3fff7; font-size: 0.78rem; }
 .global-enu-values { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; color: #176b3a; font: 600 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .global-enu-panel small { color: #667085; }

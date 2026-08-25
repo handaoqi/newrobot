@@ -16,6 +16,31 @@ from .protocol import MessageEnvelope, ProtocolError, now_iso
 
 LOGGER = logging.getLogger(__name__)
 
+# Duplicate map clicks for a round-trip (1-2-3-2-1) rarely land on the exact
+# same XY.  If the robot is standing on that cluster, start from the earliest
+# copy so the outbound legs are not skipped.  After the first copy is marked
+# complete, a later resume must also refuse to jump to the return copy.
+WAYPOINT_COLOCATION_M = 1.0
+
+
+def _waypoint_xy(waypoint: dict) -> tuple[float, float] | None:
+    try:
+        x = float(waypoint["x"])
+        y = float(waypoint["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isfinite(x) or not isfinite(y):
+        return None
+    return x, y
+
+
+def _waypoints_are_colocated(left, right) -> bool:
+    left_xy = _waypoint_xy(left) if isinstance(left, dict) else left
+    right_xy = _waypoint_xy(right) if isinstance(right, dict) else right
+    if left_xy is None or right_xy is None:
+        return False
+    return hypot(left_xy[0] - right_xy[0], left_xy[1] - right_xy[1]) <= WAYPOINT_COLOCATION_M
+
 
 class NavigationAdapter(Protocol):
     def prepare_for_navigation(self, timeout_seconds: float = 12.0) -> bool: ...
@@ -351,19 +376,10 @@ class TaskExecutor:
     def _nearest_remaining_waypoint_index(self, start_index: int) -> int:
         if not self.context:
             return start_index
-        waypoints = self.context.route_snapshot.get("waypoints") or []
-        if start_index >= len(waypoints):
-            return start_index
-        pose = self.navigation.latest_pose()
-        if pose is None:
-            return start_index
-        candidates = range(max(0, start_index), len(waypoints))
-        return min(
-            candidates,
-            key=lambda index: hypot(
-                float(pose.x) - float(waypoints[index]["x"]),
-                float(pose.y) - float(waypoints[index]["y"]),
-            ),
+        return self._earliest_colocated_nearest_index(
+            self.context.route_snapshot.get("waypoints") or [],
+            self.navigation.latest_pose(),
+            start_index=max(0, start_index),
         )
 
     def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
@@ -462,28 +478,58 @@ class TaskExecutor:
             raise ProtocolError(exc.code, exc.message) from exc
 
     def _nearest_waypoint_index(self, route: dict) -> int:
-        waypoints = route.get("waypoints") or []
+        return self._earliest_colocated_nearest_index(route.get("waypoints") or [], self.navigation.latest_pose())
+
+    def _earliest_colocated_nearest_index(
+        self,
+        waypoints: list,
+        pose,
+        *,
+        start_index: int = 0,
+    ) -> int:
         if not waypoints:
             return 0
-        pose = self.navigation.latest_pose()
+        if start_index >= len(waypoints):
+            return start_index
         if pose is None:
-            return 0
+            return start_index
         try:
             pose_x = float(pose.x)
             pose_y = float(pose.y)
         except (AttributeError, TypeError, ValueError):
-            return 0
+            return start_index
         if not isfinite(pose_x) or not isfinite(pose_y):
-            return 0
+            return start_index
         distances = []
-        for waypoint in waypoints:
-            try:
-                distance = hypot(pose_x - float(waypoint["x"]), pose_y - float(waypoint["y"]))
-            except (KeyError, TypeError, ValueError):
-                distance = float("inf")
-            distances.append(distance)
-        nearest = min(range(len(distances)), key=distances.__getitem__)
-        return nearest if isfinite(distances[nearest]) else 0
+        for waypoint in waypoints[start_index:]:
+            xy = _waypoint_xy(waypoint)
+            distances.append(hypot(pose_x - xy[0], pose_y - xy[1]) if xy else float("inf"))
+        nearest_offset = min(range(len(distances)), key=distances.__getitem__)
+        if not isfinite(distances[nearest_offset]):
+            return start_index
+        nearest_index = start_index + nearest_offset
+        nearest_xy = _waypoint_xy(waypoints[nearest_index])
+        if nearest_xy is None:
+            return start_index
+        chosen_index = nearest_index
+        for index in range(start_index, len(waypoints)):
+            if _waypoints_are_colocated(waypoints[index], nearest_xy):
+                chosen_index = index
+                break
+        # A later copy of an already-visited location is not "ahead" on the
+        # route.  After 1 is complete on a 1-2-3-2-1 round trip, the robot is
+        # still on that start/end cluster; jumping to 5 would skip 2-3-4.
+        if chosen_index > start_index and any(
+            _waypoints_are_colocated(waypoint, waypoints[chosen_index])
+            for waypoint in waypoints[:start_index]
+        ):
+            LOGGER.info(
+                "keeping pending waypoint %d instead of later colocated copy %d",
+                start_index,
+                chosen_index,
+            )
+            return start_index
+        return chosen_index
 
     def launch_prepared_task(self) -> None:
         """Start navigation after the accepted command acknowledgement is queued."""

@@ -16,6 +16,7 @@ ImuProcess::ImuProcess()
     cov_bias_gyr    = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     cov_bias_acc    = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     mean_acc        = robot::slam::Vec3d(0, 0, -1.0);
+    acceleration_scale_.store(robot::slam::G_m_s2);
     mean_gyr        = robot::slam::Vec3d(0, 0, 0);
     angvel_last     = robot::slam::Zero3d;
     Lidar_T_wrt_IMU = robot::slam::Zero3d;
@@ -29,6 +30,7 @@ void ImuProcess::Reset()
 {
     // ROS_WARN("Reset ImuProcess");
     mean_acc         = robot::slam::Vec3d(0, 0, -1.0);
+    acceleration_scale_.store(robot::slam::G_m_s2);
     mean_gyr         = robot::slam::Vec3d(0, 0, 0);
     cov_acc          = robot::slam::Zero3d;
     cov_gyr          = robot::slam::Zero3d;
@@ -63,6 +65,7 @@ void ImuProcess::set_extrinsic(const robot::slam::Vec3d& transl, const robot::sl
 void ImuProcess::reset()
 {
     mean_acc         = robot::slam::Vec3d(0, 0, -1.0);
+    acceleration_scale_.store(robot::slam::G_m_s2);
     mean_gyr         = robot::slam::Vec3d(0, 0, 0);
     angvel_last      = robot::slam::Zero3d;
     b_first_frame_   = true;
@@ -136,6 +139,8 @@ void ImuProcess::IMU_init(const robot::slam::MeasureGroup& meas, esekfom::esekf<
 
         N++;
     }
+    if (mean_acc.norm() > 1e-3)
+        acceleration_scale_.store(robot::slam::G_m_s2 / mean_acc.norm());
     state_ikfom init_state = kf_state.get_x();
 
     Eigen::Vector3d gracity_norm(0.0, 0.0, mean_acc.norm());

@@ -8,8 +8,9 @@ import time
 from collections import deque
 from typing import Callable
 
-from .config import RosConfig, SafetyConfig
+from .config import MappingConfig, RosConfig, SafetyConfig
 from .protocol import ProtocolError
+from .rtk_origin import RtkOriginPayloadCache
 from .safety_policy import RuntimeSafetyState
 from .telemetry_collector import TelemetryCollector
 
@@ -21,15 +22,15 @@ try:
     from geometry_msgs.msg import PoseWithCovarianceStamped
     from geometry_msgs.msg import Twist
     from nav2_msgs.action import FollowWaypoints
+    from nav_msgs.msg import Odometry
     from action_msgs.srv import CancelGoal
     from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-    from sensor_msgs.msg import LaserScan
-    from robots_dog_msgs.msg import Localization
-    from localization.msg import ScanMatchingStatus
+    from sensor_msgs.msg import LaserScan, NavSatFix
+    from robots_dog_msgs.msg import Localization, UniRtkPvh
     from std_msgs.msg import Bool, String
     from std_srvs.srv import Trigger
     from rcl_interfaces.msg import Parameter as ParameterMessage, ParameterType, ParameterValue
@@ -40,6 +41,17 @@ except ImportError:
     ROS_AVAILABLE = False
     Node = object
 
+try:
+    if ROS_AVAILABLE:
+        from localization.msg import ScanMatchingStatus
+    else:
+        ScanMatchingStatus = None
+except ImportError:
+    # Localization quality telemetry is useful but must not take the complete
+    # Edge Agent (including mapping/RTK control) offline while a ROS install is
+    # being upgraded or repaired.
+    ScanMatchingStatus = None
+
 
 class RosAdapter(Node):
     def __init__(
@@ -48,6 +60,7 @@ class RosAdapter(Node):
         safety_config: SafetyConfig,
         telemetry: TelemetryCollector,
         safety_state: RuntimeSafetyState,
+        mapping_config: MappingConfig | None = None,
     ) -> None:
         if not ROS_AVAILABLE:
             raise RuntimeError("ROS2 Python packages are not available")
@@ -86,23 +99,55 @@ class RosAdapter(Node):
         self._robot_motion_condition = threading.Condition()
         self._robot_standing_event = threading.Event()
         self._remote_control_event = threading.Event()
+        self._rtk_origin_cache = RtkOriginPayloadCache(
+            stale_after_seconds=(mapping_config.heading_max_age_seconds if mapping_config else 1.5)
+        )
         self.create_subscription(
             Localization,
             ros_config.localization_topic,
             self._on_localization,
             10,
         )
+        self.create_subscription(
+            Odometry,
+            ros_config.odometry_topic,
+            self._on_odometry,
+            20,
+        )
         self.create_subscription(Twist, ros_config.cmd_vel_raw_topic, self._on_cmd_vel_raw, 10)
         self.create_subscription(Twist, ros_config.cmd_vel_topic, self._on_cmd_vel, 10)
         self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
-        if ros_config.scan_matching_status_topic:
+        if mapping_config is not None:
+            self.create_subscription(
+                NavSatFix,
+                mapping_config.origin_fix_topic,
+                self._on_origin_fix,
+                qos_profile_sensor_data,
+            )
+            self.create_subscription(
+                UniRtkPvh,
+                mapping_config.origin_rtk_topic,
+                self._on_origin_pvh,
+                qos_profile_sensor_data,
+            )
+            self.create_subscription(
+                String,
+                mapping_config.origin_ntrip_status_topic,
+                self._on_origin_ntrip,
+                qos_profile_sensor_data,
+            )
+        if ros_config.scan_matching_status_topic and ScanMatchingStatus is not None:
             self.create_subscription(
                 ScanMatchingStatus,
                 ros_config.scan_matching_status_topic,
                 self._on_scan_matching_status,
                 qos_profile_sensor_data,
+            )
+        elif ros_config.scan_matching_status_topic:
+            LOGGER.warning(
+                "localization ScanMatchingStatus message is unavailable; quality telemetry subscription is disabled"
             )
         self._action_client = ActionClient(self, FollowWaypoints, ros_config.follow_waypoints_action)
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
@@ -139,6 +184,89 @@ class RosAdapter(Node):
             return
         if isinstance(payload, dict):
             self.telemetry.on_localization_decision(payload)
+
+    @staticmethod
+    def _header_payload(header) -> dict:
+        stamp = getattr(header, "stamp", None)
+        return {
+            "stamp": {
+                "sec": int(getattr(stamp, "sec", 0)),
+                "nanosec": int(getattr(stamp, "nanosec", 0)),
+            },
+            "frame_id": str(getattr(header, "frame_id", "") or ""),
+        }
+
+    def _on_origin_fix(self, msg) -> None:
+        self._rtk_origin_cache.update(
+            "fix",
+            {
+                "header": self._header_payload(getattr(msg, "header", None)),
+                "status": {"status": int(getattr(getattr(msg, "status", None), "status", -1))},
+                "latitude": float(getattr(msg, "latitude", math.nan)),
+                "longitude": float(getattr(msg, "longitude", math.nan)),
+                "altitude": float(getattr(msg, "altitude", math.nan)),
+            },
+        )
+
+    def _on_origin_pvh(self, msg) -> None:
+        bestnav = getattr(msg, "bestnav", None)
+        heading = getattr(msg, "heading", None)
+        self._rtk_origin_cache.update(
+            "pvh",
+            {
+                "header": self._header_payload(getattr(msg, "header", None)),
+                "bestnav": {
+                    "p_sol_status": int(getattr(bestnav, "p_sol_status", -1)),
+                    "pos_type": int(getattr(bestnav, "pos_type", 0)),
+                    "latitude_deg": float(getattr(bestnav, "latitude_deg", math.nan)),
+                    "longitude_deg": float(getattr(bestnav, "longitude_deg", math.nan)),
+                    "altitude_m": float(getattr(bestnav, "altitude_m", math.nan)),
+                    "lat_std": float(getattr(bestnav, "lat_std", math.inf)),
+                    "lon_std": float(getattr(bestnav, "lon_std", math.inf)),
+                    "hgt_std": float(getattr(bestnav, "hgt_std", math.inf)),
+                    "diff_age_s": float(getattr(bestnav, "diff_age_s", math.inf)),
+                    "svs_num": int(getattr(bestnav, "svs_num", 0)),
+                    "soln_svs_num": int(getattr(bestnav, "soln_svs_num", 0)),
+                },
+                "heading": {
+                    "sol_status": int(getattr(heading, "sol_status", -1)),
+                    "heading_type": int(getattr(heading, "heading_type", 0)),
+                    "base_line": float(getattr(heading, "base_line", 0.0)),
+                    "heading_deg": float(getattr(heading, "heading_deg", 0.0)),
+                    "heading_std": float(getattr(heading, "heading_std", math.inf)),
+                    "pitch_deg": float(getattr(heading, "pitch_deg", 0.0)),
+                    "pitch_std": float(getattr(heading, "pitch_std", math.inf)),
+                    "svs_num": int(getattr(heading, "svs_num", 0)),
+                    "soln_svs_num": int(getattr(heading, "soln_svs_num", 0)),
+                },
+            },
+        )
+
+    def _on_origin_ntrip(self, msg) -> None:
+        self._rtk_origin_cache.update("ntrip", {"data": str(getattr(msg, "data", "") or "")})
+
+    def origin_payload_snapshot(self) -> tuple[dict, dict, dict, float]:
+        return self._rtk_origin_cache.snapshot()
+
+    def _on_odometry(self, msg) -> None:
+        stamp = getattr(getattr(msg, "header", None), "stamp", None)
+        stamp_seconds = 0.0
+        if stamp is not None:
+            stamp_seconds = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
+        now_seconds = self.get_clock().now().nanoseconds / 1e9
+        offset = now_seconds - stamp_seconds if stamp_seconds > 0 else None
+        child_frame = str(getattr(msg, "child_frame_id", "") or "")
+        source = "slam" if child_frame == "body" else "localization"
+        self.telemetry.on_sensor_message(
+            "odometry",
+            topic=self.ros_config.odometry_topic,
+            frame_id=str(getattr(getattr(msg, "header", None), "frame_id", "") or ""),
+            child_frame_id=child_frame,
+            source=source,
+            measurement_stamp=stamp_seconds or None,
+            message_time_offset_seconds=round(offset, 6) if offset is not None else None,
+            message_time_valid=bool(stamp_seconds > 0 and offset is not None and abs(offset) <= 5.0),
+        )
 
     def set_localization_policy(self, source: str, phase: str) -> dict:
         source = "rtk" if str(source).lower() == "rtk" else "ndt"

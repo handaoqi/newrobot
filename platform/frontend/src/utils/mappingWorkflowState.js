@@ -14,6 +14,7 @@ const ACTIVE_MAPPING_STATES = new Set([
   'mapping',
   'recovering',
   'saving',
+  'optimizing',
   'packaging',
   'uploading',
   'stopping',

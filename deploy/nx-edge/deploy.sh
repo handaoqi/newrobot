@@ -6,6 +6,7 @@ ROBOT_HOST="${ROAMERX_ROBOT_HOST:-}"
 ROBOT_PROJECT_DIR="${ROAMERX_ROBOT_PROJECT_DIR:-/home/dogrobot/robot}"
 EDGE_SOURCE_DIR="${ROAMERX_EDGE_SOURCE_DIR:-/home/dogrobot/edge-agent}"
 EDGE_RUNTIME_DIR="${ROAMERX_EDGE_RUNTIME_DIR:-/home/dogrobot/runtime/nx-edge}"
+TARGET_REPO_ROOT="$(dirname "$ROBOT_PROJECT_DIR")"
 BUILD=false
 INSTALL_SERVICE=false
 DRY_RUN=false
@@ -81,5 +82,7 @@ if "$INSTALL_SERVICE"; then
   rsync -a "$REPO_ROOT/edge-agent/tools/roamerx-5g-share" "$(target_path /tmp/roamerx-5g-share)"
   remote_exec "sudo install -m 0755 /tmp/roamerx-5g-share /usr/local/sbin/roamerx-5g-share && sudo systemctl daemon-reload && sudo systemctl enable roamerx-edge-agent roamerx-teleop-bridge roamerx-dev-agent roamerx-local-asr roamerx-bike-bot roamerx-robot-mcp roamerx-zenoh roamerx-5g-share"
 fi
+
+remote_exec "python3 '$EDGE_SOURCE_DIR/tools/write_mapping_deployment_manifest.py' --repo '$TARGET_REPO_ROOT' --output '$EDGE_RUNTIME_DIR/conf/mapping-deployment.json'"
 
 echo "NX code deployed to ${ROBOT_HOST:+$ROBOT_HOST:}$ROBOT_PROJECT_DIR"

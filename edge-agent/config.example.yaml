@@ -73,6 +73,7 @@ media:
   map_upload_url: "https://center.example.com/api/device/maps/upload/"
   device_id: "rx-001"
   device_key: ""
+  map_upload_timeout_seconds: 1800
 
 mapping:
   log_dir: /tmp/roamerx_mapping_logs
@@ -83,6 +84,8 @@ mapping:
   slam_params_file: "/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
   slam_command: "exec /home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping --ros-args --params-file /home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
   mapping_unit: "roamerx-mapping.service"
+  deployment_manifest: "/home/dogrobot/runtime/nx-edge/conf/mapping-deployment.json"
+  deployment_manifest_required: true
   navigation_script: "/home/dogrobot/robot/script/robot/start_navigation_real.sh"
   service_name: "/slam_state_service"
   service_type: "robots_dog_msgs/srv/MapState"
@@ -97,7 +100,7 @@ mapping:
   # Empty paths derive from map_dir, yielding gnss_origin.yaml and mapping_workflow.json.
   origin_file: ""
   origin_state_file: ""
-  origin_lock_duration_seconds: 60.0
+  origin_lock_duration_seconds: 10.0
   origin_lock_max_spread_m: 0.02
   origin_lock_sample_interval_seconds: 1.0
   origin_lock_ttl_seconds: 1800
@@ -107,6 +110,8 @@ mapping:
   heading_min_baseline_m: 0.20
   heading_max_std_deg: 5.0
   heading_max_age_seconds: 1.5
+  # Primary-to-secondary antenna heading is opposite the robot forward axis.
+  heading_offset_deg: 180.0
   command_timeout_seconds: 15
   save_wait_seconds: 7200
   dynamic_filter_enabled: false

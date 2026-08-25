@@ -1,0 +1,54 @@
+/front_lidar:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/front_lidar/imu:
+  history: keep_last
+  depth: 200
+  reliability: best_effort
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/fix:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/rtk_pvh:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/rtk/ntrip_status:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/odom/localization_odom:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/slam_odom:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/tf:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+  avoid_ros_namespace_conventions: false
+/tf_static:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: transient_local
+  avoid_ros_namespace_conventions: false
