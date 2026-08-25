@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAsyncPoller } from '../composables/useAsyncPoller'
 
 import AppToast from '../components/AppToast.vue'
-import { useSharedVideoStream } from '../composables/useSharedVideoStream'
+import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -100,7 +100,6 @@ const HOLD_REPEAT_MS = 300
 const AUDIO_COMMAND_COOLDOWN_MS = 3000
 
 const { toastMessage, toastVariant, visible, showToast } = useToast()
-const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
@@ -121,18 +120,7 @@ const selectedSourceType = computed(() => selectedRecordingId.value ? 'recording
 const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const liveSourceKey = computed(() => `${latestRobot.value?.id || ''}\n${livePlayUrls.value.flv || ''}\n${livePlayUrls.value.hls || ''}`)
-const hasLiveStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
-
-function syncSharedVideoSource() {
-  const urls = livePlayUrls.value
-  if (!latestRobot.value?.id && !urls.flv && !urls.hls) return
-  setSharedVideoSource({
-    playUrls: urls,
-    robotId: latestRobot.value?.id,
-    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
-    loading: !Boolean(urls.flv || urls.hls),
-  })
-}
+const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 const bicycleDetections = computed(() => (liveDetectionState.value?.detections || []).filter((item) =>
   ['bicycle', 'bike', '自行车'].includes(String(item.label || '').toLowerCase()),
 ))
@@ -894,7 +882,6 @@ onBeforeUnmount(() => {
 
 watch(liveSourceKey, () => {
   streamUnavailable.value = false
-  syncSharedVideoSource()
 })
 
 function handleFullscreenChange() {
@@ -932,35 +919,45 @@ function handleVisibilityChange() {
         </div>
 
         <div ref="videoStageRef" class="video-stage">
-          <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
-          <div v-if="!hasLiveStream" class="video-source no-signal" role="img" aria-label="视频无信号">
-            <strong>无信号</strong>
-            <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
-          </div>
-
-          <div v-if="loadError" class="overview-data-notice" role="alert">{{ loadError }}</div>
-
-          <div
-            v-for="detection in bicycleDetections"
-            :key="detection.track_id"
-            class="bicycle-detection-box"
-            :style="bicycleDetectionStyle(detection)"
+          <LiveVideoPlayer
+            :play-urls="livePlayUrls"
+            :robot-id="latestRobot?.id"
+            :available="hasLiveStream"
+            :loading="dataLoading"
+            @notice="({ message, variant }) => showToast(message, variant ? { variant } : undefined)"
+            @stream-error="streamUnavailable = true"
           >
-            <span>自行车 · {{ Math.round(Number(detection.confidence || 0) * 100) }}%</span>
-          </div>
+            <template #empty>
+              <div class="video-source no-signal" role="img" aria-label="视频无信号">
+                <strong>无信号</strong>
+                <span>{{ latestRobot?.stream_id || '当前设备暂无可用视频源' }}</span>
+              </div>
+            </template>
+            <template #overlay>
 
-          <div class="video-overlay">
-            <div class="overlay-card">
-              <strong>巡检位置</strong>
-              <span>{{ latestRobot?.location }}</span>
-            </div>
-            <div class="overlay-card" v-if="latestRobot?.stream_id">
-              <strong>视频流</strong>
-              <span>{{ latestRobot.stream_id }}</span>
-            </div>
-          </div>
+              <div v-if="loadError" class="overview-data-notice" role="alert">{{ loadError }}</div>
 
-          <div v-if="takeoverActive" class="takeover-layer">
+              <div
+                v-for="detection in bicycleDetections"
+                :key="detection.track_id"
+                class="bicycle-detection-box"
+                :style="bicycleDetectionStyle(detection)"
+              >
+                <span>自行车 · {{ Math.round(Number(detection.confidence || 0) * 100) }}%</span>
+              </div>
+
+              <div class="video-overlay">
+                <div class="overlay-card">
+                  <strong>巡检位置</strong>
+                  <span>{{ latestRobot?.location }}</span>
+                </div>
+                <div class="overlay-card" v-if="latestRobot?.stream_id">
+                  <strong>视频流</strong>
+                  <span>{{ latestRobot.stream_id }}</span>
+                </div>
+              </div>
+
+              <div v-if="takeoverActive" class="takeover-layer">
             <div class="takeover-status">
               <strong>人工接管</strong>
               <span>{{ latestRobot?.code }} · {{ latestRobot?.location }}</span>
@@ -1031,8 +1028,9 @@ function handleVisibilityChange() {
                 {{ item.arrow || item.label }}
               </button>
             </div>
-          </div>
-
+              </div>
+            </template>
+          </LiveVideoPlayer>
         </div>
 
         <div class="video-footer">

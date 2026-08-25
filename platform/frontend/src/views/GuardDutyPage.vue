@@ -3,8 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AppToast from '../components/AppToast.vue'
+import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import RobotDogIcon from '../components/RobotDogIcon.vue'
-import { useSharedVideoStream } from '../composables/useSharedVideoStream'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
@@ -75,7 +75,6 @@ const liveRecording = ref(false)
 const liveRecordingSeconds = ref(0)
 const streamUnavailable = ref(false)
 const { toastMessage, toastVariant, visible, showToast } = useToast()
-const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 const router = useRouter()
 
 let alertEventSource = null
@@ -95,23 +94,7 @@ const activeCommandStatuses = new Set(['created', 'published', 'accepted', 'exec
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
 const playUrls = computed(() => latestRobot.value?.play_urls || {})
 const playUrlKey = computed(() => `${latestRobot.value?.id || ''}\n${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
-const hasStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
-
-function syncSharedVideoSource() {
-  const urls = playUrls.value
-  if (!latestRobot.value?.id && !urls.flv && !urls.hls) return
-  setSharedVideoSource({
-    playUrls: urls,
-    robotId: latestRobot.value?.id,
-    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
-    loading: !Boolean(urls.flv || urls.hls),
-    objectFit: 'contain',
-  })
-}
-const robotTasks = computed(() => {
-  if (!latestRobot.value?.id) return tasks.value
-  return tasks.value.filter((task) => String(task.robot) === String(latestRobot.value.id))
-})
+const hasStream = computed(() => !streamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
 const taskOptions = computed(() => guardDutyTaskOptions(tasks.value, latestRobot.value?.id))
 const presetTask = computed(() => {
   return taskOptions.value.find((task) => String(task.id) === String(selectedTaskId.value))
@@ -1019,6 +1002,10 @@ function toggleLiveSpeechPanel() {
   liveSpeechOpen.value = !liveSpeechOpen.value
 }
 
+function showVideoNotice({ message, variant }) {
+  showToast(message, variant ? { variant } : undefined)
+}
+
 onMounted(async () => {
   let loaded = false
   try {
@@ -1053,7 +1040,6 @@ onBeforeUnmount(() => {
 
 watch(playUrlKey, () => {
   streamUnavailable.value = false
-  syncSharedVideoSource()
 })
 </script>
 
@@ -1075,11 +1061,29 @@ watch(playUrlKey, () => {
       <main class="guard-grid">
         <section class="guard-video-panel">
           <div class="guard-video-stage">
-            <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
-            <div class="guard-video-label">
-              <strong>{{ latestRobot?.name || latestRobot?.code || '机器狗' }}</strong>
-              <span>{{ latestRobot?.location || '位置未知' }}</span>
-            </div>
+            <LiveVideoPlayer
+              :play-urls="playUrls"
+              :robot-id="latestRobot?.id"
+              :available="hasStream"
+              :loading="dataLoading"
+              object-fit="contain"
+              @notice="showVideoNotice"
+              @stream-error="streamUnavailable = true"
+            >
+              <template #empty>
+                <div class="guard-video-empty">
+                  <RobotDogIcon :size="64" label="机器狗示意图标" />
+                  <strong>视频暂不可用</strong>
+                  <span>{{ latestRobot?.stream_id || '机器人未上报视频流' }}</span>
+                </div>
+              </template>
+              <template #overlay>
+                <div class="guard-video-label">
+                  <strong>{{ latestRobot?.name || latestRobot?.code || '机器狗' }}</strong>
+                  <span>{{ latestRobot?.location || '位置未知' }}</span>
+                </div>
+              </template>
+            </LiveVideoPlayer>
           </div>
 
           <div class="guard-task-bar">
@@ -1316,6 +1320,7 @@ watch(playUrlKey, () => {
 .guard-video-stage { position: relative; min-height: 520px; background: #152633; overflow: hidden; }
 .guard-video, .guard-video-empty { display: block; width: 100%; height: 100%; min-height: 520px; object-fit: contain; }
 .guard-video-empty { display: grid; place-content: center; gap: 8px; color: #d7e0e6; text-align: center; }
+.guard-video-empty > .robot-dog-icon { justify-self: center; margin-bottom: 6px; }
 .guard-video-empty span { color: #9fb0ba; font-size: 13px; }
 .guard-video-label { position: absolute; left: 18px; top: 18px; display: grid; gap: 4px; padding: 10px 12px; color: #fff; background: rgba(12, 25, 34, .78); }
 .guard-video-label span { color: #c5d1d8; font-size: 13px; }
@@ -1422,7 +1427,7 @@ watch(playUrlKey, () => {
 .guard-map-waypoint.current { background: #f59e0b; }
 .guard-map-robot { position: absolute; z-index: 5; width: 28px; height: 28px; transform: translate(-50%, -50%); }
 .guard-map-robot::before { content: ''; position: absolute; inset: 3px; border: 3px solid #fff; border-radius: 50%; background: #ec4a3f; box-shadow: 0 2px 8px rgba(236, 74, 63, .5); }
-.guard-map-robot > .robot-dog-icon { position: absolute; inset: 1px; z-index: 6; }
+.guard-map-robot > .robot-dog-icon { position: absolute; inset: 1px; z-index: 6; display: block; }
 .guard-map-robot i { position: absolute; left: 50%; top: 50%; z-index: 6; width: 0; height: 0; border-right: 5px solid transparent; border-bottom: 14px solid #8f2019; border-left: 5px solid transparent; transform-origin: 50% 70%; }
 .guard-map-robot > small { position: absolute; top: 28px; left: 50%; min-width: max-content; padding: 2px 5px; color: #fff; background: #8f2019; font-size: 9px; transform: translateX(-50%); }
 .guard-map-robot.untrusted::before { border-style: dashed; background: #f59e0b; box-shadow: 0 0 0 4px rgba(220, 38, 38, .28); }
@@ -1434,7 +1439,13 @@ watch(playUrlKey, () => {
 .guard-localization-loss small { position: absolute; top: 26px; left: 50%; min-width: 16px; padding: 1px 3px; color: #fff; background: #991b1b; font-size: 9px; text-align: center; transform: translateX(-50%); }
 .guard-map-legend { display: flex; flex-wrap: wrap; gap: 14px; padding-top: 10px; color: #657681; font-size: 11px; }
 .guard-map-legend .robot { display: inline-flex; align-items: center; gap: 4px; }
-.guard-map-legend .robot .robot-dog-icon { flex: 0 0 auto; }
+.guard-map-legend .robot .robot-dog-icon {
+  box-sizing: content-box;
+  flex: 0 0 auto;
+  padding: 2px;
+  border-radius: 50%;
+  background: #b42318;
+}
 .guard-map-legend span::before { content: ''; display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; background: #2563eb; }
 .guard-map-legend .track::before { background: #10b981; }
 .guard-map-legend .robot::before { width: 0; height: 0; margin-right: 0; background: transparent; }
@@ -1584,6 +1595,19 @@ watch(playUrlKey, () => {
   .guard-live-microphone button,
   .guard-playback-controls button { min-height: 44px; }
   .guard-map-stage, .guard-map-empty { min-height: 300px; }
+}
+@media (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
+  .guard-loop-inline .guard-loop-toggle,
+  .guard-alert-actions > button,
+  .guard-live-text-send,
+  .guard-live-microphone button,
+  .guard-playback-controls button,
+  .guard-primary,
+  .guard-secondary,
+  .guard-danger,
+  .guard-initialize {
+    min-height: 44px;
+  }
 }
 @media (max-width: 640px) {
   .guard-page { padding: 14px; }

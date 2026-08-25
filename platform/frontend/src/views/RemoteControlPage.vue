@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createAsyncPoller, useAsyncPoller } from '../composables/useAsyncPoller'
 
 import AppToast from '../components/AppToast.vue'
-import { useSharedVideoStream } from '../composables/useSharedVideoStream'
+import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
 import {
   fetchRobotDetail,
@@ -67,23 +67,11 @@ const KEY_ACTIONS = {
   e: 'turn_right',
 }
 const { toastMessage, toastVariant, visible, showToast } = useToast()
-const { setSharedVideoSource, streamUnavailable: sharedStreamUnavailable } = useSharedVideoStream()
 
 const selectedRobotId = computed(() => selectedRobot.value?.id || '')
 const livePlayUrls = computed(() => selectedRobot.value?.play_urls || {})
 const liveSourceKey = computed(() => `${selectedRobot.value?.id || ''}\n${livePlayUrls.value.flv || ''}\n${livePlayUrls.value.hls || ''}`)
-const hasLiveStream = computed(() => !streamUnavailable.value && !sharedStreamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
-
-function syncSharedVideoSource() {
-  const urls = livePlayUrls.value
-  if (!selectedRobot.value?.id && !urls.flv && !urls.hls) return
-  setSharedVideoSource({
-    playUrls: urls,
-    robotId: selectedRobot.value?.id,
-    available: Boolean(urls.flv || urls.hls) && !streamUnavailable.value,
-    loading: !Boolean(urls.flv || urls.hls),
-  })
-}
+const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
 const status = computed(() => liveStatus.value?.status || {})
 const localizationQuality = computed(() => status.value?.localization_quality || {})
 const localizationDecision = computed(() => localizationQuality.value?.decision || {})
@@ -99,6 +87,14 @@ const personDetections = computed(() => (personDetectionState.value?.detections 
 ))
 const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
 const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
+
+function showVideoNotice({ message, variant }) {
+  showToast(message, variant ? { variant } : undefined)
+}
+
+function fallbackToSnapshot() {
+  streamUnavailable.value = true
+}
 
 const motionActions = computed(() => [
   { action: 'move_forward', label: '前进', arrow: '↑', className: 'up', payload: { vx: roundSpeed(0.60) } },
@@ -569,7 +565,6 @@ onBeforeUnmount(async () => {
 
 watch(liveSourceKey, () => {
   streamUnavailable.value = false
-  syncSharedVideoSource()
 })
 </script>
 
@@ -588,27 +583,38 @@ watch(liveSourceKey, () => {
         </div>
 
         <div class="remote-video-stage">
-          <div id="shared-video-slot" class="shared-video-slot" aria-label="机器狗实时视频"></div>
-          <div v-if="!hasLiveStream" class="remote-video-source remote-no-signal">
-            <strong>无视频流</strong>
-            <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
-          </div>
-          <button
-            v-for="person in personDetections"
-            :key="person.track_id"
-            type="button"
-            class="person-detection-box"
-            :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
-            :style="detectionStyle(person)"
-            :disabled="followActive"
-            @click="selectPerson(person)"
+          <LiveVideoPlayer
+            :play-urls="livePlayUrls"
+            :robot-id="selectedRobot?.id"
+            :available="hasLiveStream"
+            @notice="showVideoNotice"
+            @stream-error="fallbackToSnapshot"
           >
-            <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
-          </button>
-          <div class="remote-video-overlay">
-            <span>{{ selectedRobot?.code || '--' }}</span>
-            <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
-          </div>
+            <template #empty>
+              <div class="remote-video-source remote-no-signal">
+                <strong>无视频流</strong>
+                <span>{{ selectedRobot?.stream_id || '当前设备未上报 FLV/HLS 播放地址' }}</span>
+              </div>
+            </template>
+            <template #overlay>
+              <button
+                v-for="person in personDetections"
+                :key="person.track_id"
+                type="button"
+                class="person-detection-box"
+                :class="{ selected: selectedPersonTrackId === person.track_id, following: followActive && selectedPersonTrackId === person.track_id }"
+                :style="detectionStyle(person)"
+                :disabled="followActive"
+                @click="selectPerson(person)"
+              >
+                <span>{{ person.track_id }} · {{ Math.round(person.confidence * 100) }}%</span>
+              </button>
+              <div class="remote-video-overlay">
+                <span>{{ selectedRobot?.code || '--' }}</span>
+                <strong>{{ selectedRobot?.location || '未知位置' }}</strong>
+              </div>
+            </template>
+          </LiveVideoPlayer>
         </div>
         <div class="person-follow-toolbar">
           <div>
@@ -829,8 +835,8 @@ watch(liveSourceKey, () => {
 <style scoped>
 .remote-control-page {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
-  gap: 22px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  gap: 16px;
   align-items: start;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
@@ -841,7 +847,9 @@ watch(liveSourceKey, () => {
 .remote-main,
 .remote-side {
   display: grid;
-  gap: 22px;
+  min-width: 0;
+  align-content: start;
+  gap: 16px;
 }
 
 .remote-video-stage {
@@ -988,8 +996,8 @@ watch(liveSourceKey, () => {
 
 .remote-console {
   display: grid;
-  grid-template-columns: minmax(276px, auto) minmax(140px, 180px) minmax(300px, 360px);
-  gap: 24px;
+  grid-template-columns: minmax(244px, 0.9fr) minmax(120px, 140px) minmax(250px, 1fr);
+  gap: 16px;
   align-items: center;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
@@ -1009,10 +1017,10 @@ watch(liveSourceKey, () => {
 
 .remote-pad {
   display: grid;
-  grid-template-columns: repeat(3, 72px);
-  grid-template-rows: repeat(3, 72px);
-  gap: 12px;
-  padding: 18px;
+  grid-template-columns: repeat(3, 64px);
+  grid-template-rows: repeat(3, 64px);
+  gap: 10px;
+  padding: 14px;
   border: 1px solid var(--line);
   border-radius: 18px;
   background: var(--panel-soft);
@@ -1039,8 +1047,8 @@ watch(liveSourceKey, () => {
 .remote-pad-btn {
   display: grid;
   place-items: center;
-  width: 72px;
-  height: 72px;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
 }
 
@@ -1102,7 +1110,7 @@ watch(liveSourceKey, () => {
 }
 
 .remote-turn-btn {
-  min-height: 72px;
+  min-height: 64px;
   border-radius: 999px;
   padding: 8px 10px;
   display: inline-flex;
@@ -1288,6 +1296,22 @@ watch(liveSourceKey, () => {
   overflow: auto;
 }
 
+@media (min-width: 1181px) {
+  .remote-video-stage {
+    height: min(52dvh, 620px);
+    aspect-ratio: auto;
+  }
+
+  .remote-main,
+  .remote-side {
+    max-height: 80dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-right: 4px;
+    scrollbar-gutter: stable;
+  }
+}
+
 @media (max-width: 1180px) {
   .remote-control-page,
   .remote-console {
@@ -1319,6 +1343,12 @@ watch(liveSourceKey, () => {
   .remote-stop { min-height: 44px; }
 
   .remote-status-grid div { min-width: 0; }
+}
+
+@media (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
+  .speed-mode-button {
+    min-height: 44px;
+  }
 }
 
 @media (max-width: 720px) {

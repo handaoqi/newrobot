@@ -67,5 +67,14 @@ export default defineConfig({
         screen: { width: 834, height: 1194 },
       },
     },
+    {
+      name: 'tablet-2000-landscape-chromium',
+      use: {
+        ...commonUse,
+        browserName: 'chromium',
+        viewport: { width: 2000, height: 1200 },
+        screen: { width: 2000, height: 1200 },
+      },
+    },
   ],
 })

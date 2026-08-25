@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import SharedLiveVideoHost from '../components/SharedLiveVideoHost.vue'
 import { useTheme } from '../composables/useTheme'
 import { API_BASE, fetchRobotMappingStatus, fetchRobots } from '../services/api'
 
@@ -20,7 +19,6 @@ let mappingPollTimer = null
 let mappingAlertEventSource = null
 let lastMappingAlertKey = ''
 let mappingStatusRefreshing = false
-const sharedVideoRoutes = new Set(['overview', 'guard-duty', 'remote-control'])
 
 const menuItems = [
   { label: '保安值守', path: '/dashboard/guard-duty' },
@@ -48,13 +46,25 @@ const user = computed(() => {
   }
 })
 
-const sharedVideoActive = computed(() => sharedVideoRoutes.has(route.name))
-
 function toggleMenu(index) {
   expandedMenus.value[index] = !expandedMenus.value[index]
 }
 
+function menuContainsPath(item) {
+  return route.path === item.path || Boolean(item.children?.some(menuContainsPath))
+}
+
+function expandActiveMenu() {
+  menuItems.forEach((item, index) => {
+    if (item.children?.some(menuContainsPath)) expandedMenus.value[index] = true
+    item.children?.forEach((child, childIndex) => {
+      if (child.children?.some(menuContainsPath)) expandedMenus.value[`${index}-${childIndex}`] = true
+    })
+  })
+}
+
 async function openTabletMenu() {
+  expandActiveMenu()
   tabletMenuOpen.value = true
   document.body.classList.add('tablet-menu-locked')
   await nextTick()
@@ -80,10 +90,7 @@ function handleTabletMenuKeydown(event) {
 }
 
 function isMenuActive(item) {
-  if (item.children) {
-    return item.children.some(child => route.path === child.path)
-  }
-  return route.path === item.path
+  return menuContainsPath(item)
 }
 
 function logout() {
@@ -193,6 +200,7 @@ function setupMappingAlertStream() {
 }
 
 onMounted(() => {
+  expandActiveMenu()
   document.addEventListener('keydown', handleTabletMenuKeydown)
   refreshMappingAlerts()
   mappingPollTimer = window.setInterval(refreshMappingAlerts, 2000)
@@ -208,6 +216,7 @@ onBeforeUnmount(() => {
 })
 
 watch(() => route.path, () => {
+  expandActiveMenu()
   closeTabletMenu()
   if (mappingAlert.value?.diverged) return
   refreshMappingAlerts()
@@ -221,7 +230,7 @@ watch(() => route.path, () => {
         ref="tabletMenuButton"
         class="tablet-menu-button"
         type="button"
-        aria-label="打开导航菜单"
+        :aria-label="tabletMenuOpen ? '关闭导航菜单' : '打开导航菜单'"
         aria-controls="dashboard-navigation"
         :aria-expanded="tabletMenuOpen"
         @click="toggleTabletMenu"
@@ -269,15 +278,39 @@ watch(() => route.path, () => {
               <span class="menu-arrow">{{ expandedMenus[index] ? '▼' : '▶' }}</span>
             </button>
             <div v-if="expandedMenus[index]" class="menu-submenu">
-              <router-link
-                v-for="child in item.children"
-                :key="child.path"
-                :to="child.path"
-                class="menu-item menu-subitem"
-                :class="{ active: route.path === child.path }"
-              >
-                {{ child.label }}
-              </router-link>
+              <template v-for="(child, childIndex) in item.children" :key="child.path">
+                <div v-if="child.children" class="menu-subgroup">
+                  <button
+                    class="menu-item menu-subitem menu-group-header"
+                    :class="{ active: isMenuActive(child) }"
+                    type="button"
+                    :aria-expanded="Boolean(expandedMenus[`${index}-${childIndex}`])"
+                    @click="toggleMenu(`${index}-${childIndex}`)"
+                  >
+                    <span>{{ child.label }}</span>
+                    <span class="menu-arrow">{{ expandedMenus[`${index}-${childIndex}`] ? '▼' : '▶' }}</span>
+                  </button>
+                  <div v-if="expandedMenus[`${index}-${childIndex}`]" class="menu-submenu menu-third-level">
+                    <router-link
+                      v-for="grandchild in child.children"
+                      :key="grandchild.path"
+                      :to="grandchild.path"
+                      class="menu-item menu-subitem menu-third-item"
+                      :class="{ active: route.path === grandchild.path }"
+                    >
+                      {{ grandchild.label }}
+                    </router-link>
+                  </div>
+                </div>
+                <router-link
+                  v-else
+                  :to="child.path"
+                  class="menu-item menu-subitem"
+                  :class="{ active: route.path === child.path }"
+                >
+                  {{ child.label }}
+                </router-link>
+              </template>
             </div>
           </div>
           <router-link
@@ -328,7 +361,6 @@ watch(() => route.path, () => {
       </div>
 
       <router-view />
-      <SharedLiveVideoHost v-if="sharedVideoActive" />
     </section>
   </div>
 </template>
@@ -381,7 +413,8 @@ watch(() => route.path, () => {
   background: #7a4e00;
 }
 
-@media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
+@media (max-width: 1024px) and (orientation: portrait),
+  (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
   :global(body.tablet-menu-locked) {
     overflow: hidden;
   }
@@ -391,10 +424,10 @@ watch(() => route.path, () => {
     z-index: 1100;
     top: 0;
     display: grid;
-    grid-template-columns: 48px minmax(0, 1fr) auto;
+    grid-template-columns: 56px minmax(0, 1fr) auto;
     align-items: center;
     gap: 12px;
-    min-height: 72px;
+    min-height: 76px;
     padding: 10px 18px;
     border-bottom: 1px solid var(--line);
     background: color-mix(in srgb, var(--panel) 94%, transparent);
@@ -406,13 +439,23 @@ watch(() => route.path, () => {
     display: grid;
     place-content: center;
     gap: 5px;
-    width: 48px;
-    height: 48px;
+    width: 56px;
+    height: 56px;
     padding: 0;
     border: 1px solid var(--chip-border);
-    border-radius: 14px;
+    border-radius: 50%;
     color: var(--text);
     background: var(--ghost-bg);
+    transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+  }
+
+  .tablet-menu-button:hover {
+    border-color: var(--cyan);
+    background: var(--menu-active-bg);
+  }
+
+  .tablet-menu-button[aria-expanded="true"] {
+    transform: rotate(90deg);
   }
 
   .tablet-menu-button span {
@@ -421,6 +464,7 @@ watch(() => route.path, () => {
     height: 2px;
     border-radius: 999px;
     background: currentColor;
+    transition: transform 0.2s ease, opacity 0.2s ease;
   }
 
   .tablet-app-title {
@@ -507,6 +551,11 @@ watch(() => route.path, () => {
     position: static;
   }
 
+  .sidebar .menu-subgroup {
+    width: 100%;
+    min-width: 0;
+  }
+
   .sidebar .menu-submenu {
     position: static;
     width: 100%;
@@ -514,6 +563,10 @@ watch(() => route.path, () => {
     border: 0;
     background: transparent;
     box-shadow: none;
+  }
+
+  .sidebar .menu-third-level {
+    padding-left: 20px;
   }
 
   .desktop-page-heading {
@@ -531,6 +584,55 @@ watch(() => route.path, () => {
 
   .mapping-live-alert {
     align-items: flex-start;
+  }
+}
+
+@media (max-width: 1024px) and (orientation: portrait) {
+  .tablet-app-bar {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    left: auto;
+    display: block;
+    width: 56px;
+    min-height: 56px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .tablet-app-title,
+  .tablet-user {
+    display: none;
+  }
+
+  .tablet-menu-button {
+    box-shadow: 0 10px 28px rgba(25, 55, 90, 0.22);
+    backdrop-filter: blur(18px);
+  }
+
+  .sidebar {
+    inset: 0 0 0 auto;
+    border-right: 0;
+    border-left: 1px solid var(--line);
+    transform: translateX(105%);
+  }
+
+  .main-layout {
+    padding-top: 78px;
+  }
+}
+
+@media (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
+  .main-layout {
+    min-width: 0;
+    padding: 24px clamp(24px, 3vw, 56px);
+  }
+
+  .main-header {
+    margin-bottom: 20px;
   }
 }
 </style>

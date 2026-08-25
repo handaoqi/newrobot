@@ -51,7 +51,8 @@ function loadMediaModules() {
 }
 
 const HISTORY_BUFFER_SECONDS = 30 * 60
-const streamConnectTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
+const streamProbeTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
+const streamStartupTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_STARTUP_TIMEOUT_MS || 10000)
 const playUrls = computed(() => props.playUrls || {})
 const sourceKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
 const hasHistoryStream = computed(() => Boolean(playUrls.value.hls))
@@ -149,7 +150,7 @@ function armStreamStartupTimer(version, { fallbackToHls = false } = {}) {
     if (version !== setupVersion || !streamLoading.value) return
     if (fallbackToHls && playUrls.value.hls) void setupPlayer({ preferHls: true })
     else markStreamUnavailable()
-  }, streamConnectTimeoutMs)
+  }, streamStartupTimeoutMs)
 }
 
 function seekLatestFrame() {
@@ -219,7 +220,7 @@ function markStreamUnavailable() {
 async function canReachStream(url) {
   if (!url) return false
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), streamConnectTimeoutMs)
+  const timeout = window.setTimeout(() => controller.abort(), streamProbeTimeoutMs)
   try {
     await fetch(url, {
       method: 'GET',

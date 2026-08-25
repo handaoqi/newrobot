@@ -2317,24 +2317,16 @@ async function handleDeleteRoute(route) {
             <h3>5. 导航测试</h3>
             <div class="status-grid">
               <div>
-                <span>机器人</span>
-                <strong>{{ selectedRobot?.name || '未选择' }}</strong>
+                <span>任务对象</span>
+                <strong :title="`机器狗：${selectedRobot?.name || '未选择'}；地图：${selectedMap?.name || '未选择'}`">
+                  机器狗 {{ selectedRobot?.name || '未选择' }} · 地图 {{ selectedMap?.name || '未选择' }}
+                </strong>
               </div>
               <div>
-                <span>活动地图</span>
-                <strong>{{ selectedMap?.name || '未选择' }}</strong>
-              </div>
-              <div>
-                <span>连接</span>
-                <strong>{{ navStatus?.connection_status || 'unknown' }}</strong>
-              </div>
-              <div>
-                <span>定位</span>
-                <strong>{{ localizationLabel() }}</strong>
-              </div>
-              <div>
-                <span>导航栈</span>
-                <strong>{{ navReadyLabel() }}</strong>
+                <span>运行链路</span>
+                <strong :title="`连接：${navStatus?.connection_status || 'unknown'}；定位：${localizationLabel()}；导航栈：${navReadyLabel()}`">
+                  连接 {{ navStatus?.connection_status || 'unknown' }} · 定位 {{ localizationLabel() }} · 导航 {{ navReadyLabel() }}
+                </strong>
               </div>
               <div>
                 <span>当前位置</span>
@@ -3160,15 +3152,20 @@ async function handleDeleteRoute(route) {
 
 .status-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.5rem;
 }
 
 .status-grid div {
   display: grid;
-  grid-template-columns: 74px 1fr;
+  grid-template-columns: 72px minmax(0, 1fr);
   gap: 0.5rem;
   align-items: center;
+  min-width: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  background: #f9fafb;
   font-size: 0.75rem;
 }
 
@@ -3180,7 +3177,9 @@ async function handleDeleteRoute(route) {
   color: #1f2937;
   font-size: 0.78rem;
   font-weight: 700;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav-actions {
@@ -3206,7 +3205,7 @@ async function handleDeleteRoute(route) {
 
 .state-machine-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.5rem;
   padding: 0.65rem;
 }
@@ -3277,6 +3276,8 @@ async function handleDeleteRoute(route) {
 }
 
 .sensor-state-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border-top: 1px solid #eaecf0;
 }
 
@@ -3302,6 +3303,7 @@ async function handleDeleteRoute(route) {
 }
 
 .sensor-state-head {
+  grid-column: 1 / -1;
   background: #f8fafc;
 }
 
@@ -3346,21 +3348,23 @@ async function handleDeleteRoute(route) {
 .debug-header strong {
   font-size: 0.8rem;
   color: #101828;
+  white-space: nowrap;
 }
 
 .debug-header span {
   font-size: 0.7rem;
   color: #667085;
+  white-space: nowrap;
 }
 
 .debug-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .debug-row {
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr);
+  grid-template-columns: minmax(160px, 190px) minmax(0, 1fr);
   gap: 0.5rem;
   padding: 0.42rem 0.65rem;
   border-bottom: 1px solid #f2f4f7;
@@ -3373,6 +3377,7 @@ async function handleDeleteRoute(route) {
 
 .debug-row span {
   color: #667085;
+  white-space: nowrap;
 }
 
 .debug-row strong {
@@ -4439,6 +4444,13 @@ async function handleDeleteRoute(route) {
     max-height: none;
   }
 
+  .status-grid,
+  .state-machine-grid,
+  .sensor-state-list,
+  .debug-grid {
+    grid-template-columns: 1fr;
+  }
+
   .map-container {
     min-height: 420px;
   }
@@ -4527,6 +4539,7 @@ async function handleDeleteRoute(route) {
   color: var(--text);
 }
 
+[data-theme="dark"] .status-grid div,
 [data-theme="dark"] .state-card,
 [data-theme="dark"] .sensor-state-head,
 [data-theme="dark"] .debug-header,

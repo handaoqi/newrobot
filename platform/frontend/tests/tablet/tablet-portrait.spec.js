@@ -10,6 +10,20 @@ const pages = [
   { name: 'remote-control', path: '/dashboard/remote-control', ready: '.remote-control-page', authenticated: true },
 ]
 
+const shellRoutes = [
+  { name: 'remote-development', path: '/dashboard/remote-development' },
+  { name: 'analytics', path: '/dashboard/analytics' },
+  { name: 'events', path: '/dashboard/events' },
+  { name: 'robots', path: '/dashboard/robots' },
+  { name: 'tasks', path: '/dashboard/tasks' },
+  { name: 'patrol-calendar', path: '/dashboard/tasks/calendar' },
+  { name: 'task-execution', path: '/dashboard/task-executions/1' },
+  { name: 'maps', path: '/dashboard/tasks/maps' },
+  { name: 'routes', path: '/dashboard/tasks/routes' },
+  { name: 'zones', path: '/dashboard/tasks/zones' },
+  { name: 'tracks', path: '/dashboard/tasks/tracks' },
+]
+
 async function collectLayoutReport(page) {
   return page.evaluate(() => {
     const viewportWidth = window.innerWidth
@@ -62,7 +76,7 @@ async function collectLayoutReport(page) {
 }
 
 for (const pageCase of pages) {
-  test(`${pageCase.name} adapts to tablet portrait`, async ({ page }, testInfo) => {
+  test(`${pageCase.name} adapts to tablet viewport`, async ({ page }, testInfo) => {
     await installTabletMocks(page, pageCase)
     await page.goto(pageCase.path)
     await expect(page.locator(pageCase.ready)).toBeVisible()
@@ -80,13 +94,20 @@ for (const pageCase of pages) {
     expect(report.smallTouchTargets, JSON.stringify(report, null, 2)).toEqual([])
 
     if (pageCase.authenticated) {
-      const menuButton = page.getByRole('button', { name: '打开导航菜单' })
+      const menuButton = page.locator('.tablet-menu-button')
       await expect(menuButton).toBeVisible()
+      await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
+      await expect(menuButton).toHaveCSS('border-radius', '50%')
+      await expect(menuButton).toHaveJSProperty('offsetWidth', 56)
+      await expect(menuButton).toHaveJSProperty('offsetHeight', 56)
       await menuButton.click()
       await expect(menuButton).toHaveAttribute('aria-expanded', 'true')
+      await expect(menuButton).toHaveAttribute('aria-label', '关闭导航菜单')
       await expect(page.locator('#dashboard-navigation')).toHaveClass(/tablet-open/)
       await page.keyboard.press('Escape')
       await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
+      await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
+      await expect(menuButton).toBeFocused()
     }
 
     const fullPagePath = testInfo.outputPath(`${pageCase.name}-full-page.png`)
@@ -102,3 +123,61 @@ for (const pageCase of pages) {
     await page.goto('about:blank')
   })
 }
+
+for (const routeCase of shellRoutes) {
+  test(`${routeCase.name} keeps the tablet shell within the 2000x1200 viewport`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The full route shell matrix runs at the target landscape tablet size')
+    await installTabletMocks(page, { authenticated: true })
+    await page.goto(routeCase.path)
+    await expect(page.locator('.tablet-app-bar')).toBeVisible()
+    await page.waitForTimeout(700)
+    await page.emulateMedia({ reducedMotion: 'reduce', colorScheme: 'light' })
+    await page.addStyleTag({ content: '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }' })
+
+    const report = await collectLayoutReport(page)
+    await testInfo.attach('layout-report', {
+      body: Buffer.from(JSON.stringify(report, null, 2)),
+      contentType: 'application/json',
+    })
+
+    expect(report.hasHorizontalScroll, JSON.stringify(report, null, 2)).toBe(false)
+    expect(report.horizontalOffenders, JSON.stringify(report, null, 2)).toEqual([])
+    expect(report.smallTouchTargets, JSON.stringify(report, null, 2)).toEqual([])
+
+    const menuButton = page.locator('.tablet-menu-button')
+    await expect(menuButton).toHaveCSS('border-radius', '50%')
+    await menuButton.click()
+    await expect(page.locator('#dashboard-navigation')).toHaveClass(/tablet-open/)
+    const taskMenu = page.getByRole('button', { name: '巡检任务' })
+    const taskLink = page.getByRole('link', { name: '任务列表', exact: true })
+    if (!(await taskLink.isVisible())) await taskMenu.click()
+    await expect(taskLink).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
+    await expect(menuButton).toBeFocused()
+    await page.goto('about:blank')
+  })
+}
+
+test('2000x1200 tablet menu does not depend on coarse pointer reporting', async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The pointer capability regression runs in the target Chromium project')
+  const context = await browser.newContext({
+    baseURL: 'http://127.0.0.1:4173',
+    colorScheme: 'light',
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
+    hasTouch: false,
+    isMobile: false,
+    viewport: { width: 2000, height: 1200 },
+    screen: { width: 2000, height: 1200 },
+  })
+  try {
+    const page = await context.newPage()
+    await installTabletMocks(page, { authenticated: true })
+    await page.goto('/dashboard/overview')
+    await expect(page.locator('.tablet-app-bar')).toBeVisible()
+    await expect(page.locator('.tablet-menu-button')).toHaveCSS('border-radius', '50%')
+  } finally {
+    await context.close()
+  }
+})
