@@ -3393,3 +3393,107 @@ a { color: inherit; }
     min-height: 44px;
   }
 }
+/* Event image fullscreen preview */
+.event-image-trigger {
+  position: relative;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background-color: transparent;
+  cursor: zoom-in;
+}
+
+.event-image-trigger:focus-visible {
+  outline: 3px solid rgba(67, 213, 255, 0.72);
+  outline-offset: 3px;
+}
+
+.event-image-frame.event-image-trigger {
+  display: block;
+  width: 100%;
+}
+
+.event-image-expand {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 7px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(5, 15, 28, 0.68);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  font-size: 12px;
+  font-weight: 700;
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.event-image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: grid;
+  place-items: center;
+  padding: 64px 32px;
+  background: rgba(2, 8, 18, 0.94);
+  backdrop-filter: blur(14px);
+}
+
+.event-image-lightbox > img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.62);
+}
+
+.event-lightbox-close {
+  position: fixed;
+  top: max(20px, env(safe-area-inset-top));
+  right: max(24px, env(safe-area-inset-right));
+  z-index: 1;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 32px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.event-lightbox-close:hover,
+.event-lightbox-close:focus-visible {
+  background: rgba(255, 255, 255, 0.2);
+  outline: none;
+}
+
+.event-lightbox-hint {
+  position: fixed;
+  bottom: max(20px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.event-lightbox-enter-active,
+.event-lightbox-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.event-lightbox-enter-from,
+.event-lightbox-leave-to {
+  opacity: 0;
+}
+
+@media (max-width: 640px) {
+  .event-image-lightbox {
+    padding: 68px 12px 52px;
+  }
+}

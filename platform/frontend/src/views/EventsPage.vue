@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import { fetchEvents, handleEvent } from '../services/api'
@@ -47,8 +47,10 @@ const detectedFrom = ref('')
 const detectedTo = ref('')
 const timeFilterError = ref('')
 const calendarMonth = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
+const fullscreenImage = ref(null)
 const pageSize = 8
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
+let previousBodyOverflow = ''
 
 const activeFilterIndex = computed(() => {
   const index = filters.findIndex((filter) => filter.value === activeFilter.value)
@@ -291,6 +293,27 @@ function selectEvent(event) {
   reviewResult.value = event.review_result || 'confirmed'
 }
 
+function openFullscreenImage(event) {
+  fullscreenImage.value = {
+    src: getEventImage(event),
+    alt: event?.title || '事件图片',
+  }
+  previousBodyOverflow = document.body.style.overflow
+  document.body.style.overflow = 'hidden'
+}
+
+function closeFullscreenImage() {
+  if (!fullscreenImage.value) return
+  fullscreenImage.value = null
+  document.body.style.overflow = previousBodyOverflow
+}
+
+function handleFullscreenKeydown(event) {
+  if (event.key === 'Escape' && fullscreenImage.value) {
+    closeFullscreenImage()
+  }
+}
+
 async function markResolved() {
   if (!selectedEvent.value || archiving.value) return
   archiving.value = true
@@ -317,7 +340,15 @@ watch(() => route.query.status, (value) => {
   loadEvents()
 })
 
-onMounted(loadEvents)
+onMounted(() => {
+  document.addEventListener('keydown', handleFullscreenKeydown)
+  loadEvents()
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handleFullscreenKeydown)
+  if (fullscreenImage.value) document.body.style.overflow = previousBodyOverflow
+})
 </script>
 
 <template>
@@ -434,7 +465,14 @@ onMounted(loadEvents)
             :class="{ selected: selectedEvent?.id === event.id }"
             @click="selectEvent(event)"
           >
-            <div class="event-thumb table-thumb" :style="eventThumbStyle(event)"></div>
+            <button
+              type="button"
+              class="event-thumb table-thumb event-image-trigger"
+              :style="eventThumbStyle(event)"
+              :aria-label="`全屏查看 ${event.title} 图片`"
+              title="点击全屏查看"
+              @click.stop="openFullscreenImage(event)"
+            ></button>
             <div class="table-main">
               <strong>{{ event.title }}</strong>
               <span>{{ event.location }}</span>
@@ -463,9 +501,16 @@ onMounted(loadEvents)
           <span class="panel-badge">{{ selectedEvent.risk_label }}风险</span>
         </div>
         <div class="detail-stack">
-          <div class="event-image-frame">
+          <button
+            type="button"
+            class="event-image-frame event-image-trigger"
+            :aria-label="`全屏查看 ${selectedEvent.title} 图片`"
+            title="点击全屏查看"
+            @click="openFullscreenImage(selectedEvent)"
+          >
             <img class="event-detail-image" :src="getEventImage(selectedEvent)" :alt="selectedEvent.title" />
-          </div>
+            <span class="event-image-expand" aria-hidden="true">全屏查看</span>
+          </button>
           <div class="detail-card">
             <strong>识别置信度</strong>
             <p>{{ selectedEvent.confidence }}%</p>
@@ -532,5 +577,30 @@ onMounted(loadEvents)
         </div>
       </section>
     </div>
+
+    <Teleport to="body">
+      <Transition name="event-lightbox">
+        <div
+          v-if="fullscreenImage"
+          class="event-image-lightbox"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="`${fullscreenImage.alt}全屏预览`"
+          @click.self="closeFullscreenImage"
+        >
+          <button
+            type="button"
+            class="event-lightbox-close"
+            aria-label="退出全屏查看"
+            title="退出全屏 (Esc)"
+            @click="closeFullscreenImage"
+          >
+            ×
+          </button>
+          <img :src="fullscreenImage.src" :alt="fullscreenImage.alt" />
+          <span class="event-lightbox-hint">ESC 退出全屏</span>
+        </div>
+      </Transition>
+    </Teleport>
   </section>
 </template>
