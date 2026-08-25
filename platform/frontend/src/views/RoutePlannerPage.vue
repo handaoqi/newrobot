@@ -2126,7 +2126,6 @@ async function handleDeleteRoute(route) {
               </button>
             </div>
           </div>
-          <p>选择地图并添加至少两个途经点后开始演练。</p>
         </section>
 
         <!-- 途径点和路线信息 -->
@@ -2220,12 +2219,15 @@ async function handleDeleteRoute(route) {
                   </button>
                   <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
                 </div>
-                <small v-if="selectedRoute" class="route-preview-note route-save-preview-note">
-                  {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
-                </small>
-                <div v-if="drillMessage" class="drill-status route-save-status" :class="{ active: drillRunning }">
-                  <span class="drill-status-dot"></span>
-                  {{ drillMessage }}
+                <div class="route-save-hints" aria-label="路线操作提示">
+                  <small class="route-preview-note">选择地图并添加至少两个途经点后开始演练。</small>
+                  <small v-if="selectedRoute" class="route-preview-note route-save-preview-note">
+                    {{ selectedRobot?.name || '机器狗' }}将实际执行“{{ selectedRoute.name }}”，请确认现场安全
+                  </small>
+                  <div v-if="drillMessage" class="drill-status route-save-status" :class="{ active: drillRunning }">
+                    <span class="drill-status-dot"></span>
+                    {{ drillMessage }}
+                  </div>
                 </div>
               </div>
             </div>
@@ -2475,6 +2477,9 @@ async function handleDeleteRoute(route) {
                     :key="item.id"
                     class="map-inspection-row confirmed"
                   >
+                    <div class="inspection-row-actions">
+                      <button type="button" class="btn btn-sm inspection-reset-btn" @click="removeConfirmedInspectedPoint(item.id)">重选位置</button>
+                    </div>
                     <strong>点{{ index + 1 }}</strong>
                     <span :title="waypointDisplayText(item.point)">XY {{ waypointDisplayText(item.point) }}</span>
                     <span>方向 {{ waypointYawDegrees(item.point).toFixed(1) }}°</span>
@@ -2482,16 +2487,8 @@ async function handleDeleteRoute(route) {
                     <span :title="rtkPoseText(item.sample?.rtk)">RTK {{ rtkPoseText(item.sample?.rtk) }}</span>
                     <small v-if="item.sample">关键帧 {{ item.sample.distance_m.toFixed(2) }}m · {{ mappingSampleTime(item.sample) }}</small>
                     <small v-else>附近无建图轨迹记录</small>
-                    <button type="button" class="btn btn-sm inspection-reset-btn" @click="removeConfirmedInspectedPoint(item.id)">重选位置</button>
                   </div>
                   <div v-if="inspectedMapPoint" class="map-inspection-row draft">
-                    <strong>点{{ confirmedInspectedPoints.length + 1 }}</strong>
-                    <span :title="waypointDisplayText(inspectedMapPoint.point)">XY {{ waypointDisplayText(inspectedMapPoint.point) }}</span>
-                    <span>{{ inspectPoseStep === 'complete' ? `方向 ${waypointYawDegrees(inspectedMapPoint.point).toFixed(1)}°` : '方向待选' }}</span>
-                    <span :title="poseText(inspectedMapPoint.sample?.slam)">NDT {{ poseText(inspectedMapPoint.sample?.slam) }}</span>
-                    <span :title="rtkPoseText(inspectedMapPoint.sample?.rtk)">RTK {{ rtkPoseText(inspectedMapPoint.sample?.rtk) }}</span>
-                    <small v-if="inspectedMapPoint.sample">关键帧 {{ inspectedMapPoint.sample.distance_m.toFixed(2) }}m · {{ mappingSampleTime(inspectedMapPoint.sample) }}</small>
-                    <small v-else>附近无建图轨迹记录</small>
                     <div class="inspection-row-actions">
                       <button
                         type="button"
@@ -2501,6 +2498,13 @@ async function handleDeleteRoute(route) {
                       >确认</button>
                       <button type="button" class="btn btn-sm inspection-reset-btn" @click="resetInspectedMapPoint">重选位置</button>
                     </div>
+                    <strong>点{{ confirmedInspectedPoints.length + 1 }}</strong>
+                    <span :title="waypointDisplayText(inspectedMapPoint.point)">XY {{ waypointDisplayText(inspectedMapPoint.point) }}</span>
+                    <span>{{ inspectPoseStep === 'complete' ? `方向 ${waypointYawDegrees(inspectedMapPoint.point).toFixed(1)}°` : '方向待选' }}</span>
+                    <span :title="poseText(inspectedMapPoint.sample?.slam)">NDT {{ poseText(inspectedMapPoint.sample?.slam) }}</span>
+                    <span :title="rtkPoseText(inspectedMapPoint.sample?.rtk)">RTK {{ rtkPoseText(inspectedMapPoint.sample?.rtk) }}</span>
+                    <small v-if="inspectedMapPoint.sample">关键帧 {{ inspectedMapPoint.sample.distance_m.toFixed(2) }}m · {{ mappingSampleTime(inspectedMapPoint.sample) }}</small>
+                    <small v-else>附近无建图轨迹记录</small>
                   </div>
                 </div>
                 <div v-if="selectedMap.thumbnail_url" class="map-image-layer" :style="mapImageLayerStyle">
@@ -3515,6 +3519,20 @@ async function handleDeleteRoute(route) {
   line-height: 1.4;
 }
 
+.route-save-hints {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.route-save-hints .drill-status {
+  margin-top: 0;
+}
+
 .map-preview-area {
   grid-column: 1 / span 3;
   grid-row: 2;
@@ -3987,15 +4005,16 @@ async function handleDeleteRoute(route) {
   max-height: min(42%, 300px);
   gap: 6px;
   overflow: auto;
+  scrollbar-gutter: stable;
   pointer-events: auto;
 }
 
 .map-inspection-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1.1fr) minmax(0, 0.8fr) minmax(0, 1.1fr) minmax(0, 1.2fr) minmax(0, 1.35fr) auto;
+  grid-template-columns: repeat(7, max-content);
   align-items: center;
-  width: 100%;
-  min-width: 0;
+  width: max-content;
+  min-width: 100%;
   gap: 0.5ch;
   padding: 7px 8px;
   border: 1px solid #fecaca;
@@ -4011,16 +4030,19 @@ async function handleDeleteRoute(route) {
 .map-inspection-row.draft strong { color: #c2410c; }
 .map-inspection-row span,
 .map-inspection-row small {
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .map-inspection-row small { color: #667085; }
 
 .inspection-row-actions {
+  position: sticky;
+  left: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 5px;
+  padding-right: 0.5ch;
+  background: inherit;
 }
 
 .inspection-reset-btn {
@@ -4442,6 +4464,7 @@ async function handleDeleteRoute(route) {
 [data-theme="dark"] .route-item,
 [data-theme="dark"] .map-mode-hint,
 [data-theme="dark"] .initial-pose-panel,
+[data-theme="dark"] .route-save-hints,
 [data-theme="dark"] .map-inspection-row {
   color: var(--text);
   border-color: var(--line);
