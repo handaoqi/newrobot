@@ -29,11 +29,16 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
+import {
+  guardDutyTaskOptions,
+  initialGuardDutyExecution,
+} from '../utils/guardDutyTaskSelection'
 
 const overview = ref(null)
 const robots = ref([])
 const tasks = ref([])
 const selectedRobot = ref(null)
+const selectedTaskId = ref('')
 const execution = ref(null)
 const loading = ref(false)
 const dataLoading = ref(true)
@@ -107,21 +112,17 @@ const robotTasks = computed(() => {
   if (!latestRobot.value?.id) return tasks.value
   return tasks.value.filter((task) => String(task.robot) === String(latestRobot.value.id))
 })
+const taskOptions = computed(() => guardDutyTaskOptions(tasks.value, latestRobot.value?.id))
 const presetTask = computed(() => {
-  const enabledTasks = robotTasks.value.filter((task) => task.enabled)
-  const status = navigationStatus.value?.status || {}
-  const activeMapId = status.map_id || navigationStatus.value?.current_map_id || latestRobot.value?.current_map_id
-  if (activeMapId) {
-    return enabledTasks.find((task) => String(task.map_id || '') === String(activeMapId)) || null
-  }
-  return enabledTasks[0] || null
+  return taskOptions.value.find((task) => String(task.id) === String(selectedTaskId.value))
+    || taskOptions.value[0]
+    || null
 })
 const latestAlert = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const alerts = computed(() => latestRobot.value?.recent_events || [])
 const pendingEventCount = computed(() => Number(overview.value?.summary?.pending_event_count || 0))
 const actions = computed(() => executionActions(execution.value?.state))
 const isRunning = computed(() => isExecutionActive(execution.value?.state))
-const executionTaskName = computed(() => execution.value?.task_name || presetTask.value?.name || '管理员尚未配置巡检任务')
 const routeWaypoints = computed(() => execution.value?.route_snapshot?.waypoints || routeData.value?.waypoints || [])
 const displayRouteWaypoints = computed(() => {
   const routeMapId = execution.value?.map_data || routeData.value?.map_data || presetTask.value?.map_id
@@ -251,6 +252,35 @@ function formatTime(value) {
   if (!value) return '--'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function executionStateLabel(state) {
+  return ({
+    created: '准备中',
+    dispatching: '下发中',
+    accepted: '已接收',
+    running: '执行中',
+    pausing: '暂停中',
+    paused: '已暂停',
+    resuming: '恢复中',
+    cancelling: '退出中',
+    interrupted: '已中断',
+    completed: '已完成',
+    failed: '已失败',
+    cancelled: '已结束',
+    timed_out: '已超时',
+    rejected: '已拒绝',
+  })[state] || '未执行'
+}
+
+function taskOptionLabel(task) {
+  const latest = task.latest_execution
+  if (!latest) return `${task.name} · 未执行`
+  const date = new Date(latest.created_at || '')
+  const timeLabel = Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  return `${task.name} · ${executionStateLabel(latest.state)}${timeLabel ? ` · ${timeLabel}` : ''}`
 }
 
 function formatPose(pose) {
@@ -426,6 +456,10 @@ async function load() {
   tasks.value = taskResult
   const robotId = overviewResult.latest_robot?.id || robotResult[0]?.id
   if (robotId && selectedRobot.value?.id !== robotId) await chooseRobot(robotId)
+  const availableTasks = guardDutyTaskOptions(taskResult, robotId)
+  if (!availableTasks.some((task) => String(task.id) === String(selectedTaskId.value))) {
+    selectedTaskId.value = String(availableTasks[0]?.id || '')
+  }
   restoreLoopState(robotId)
   await restoreExecution(taskResult, robotId)
   await refreshExecutionVisual()
@@ -437,23 +471,48 @@ function startExecutionPolling() {
 }
 
 async function restoreExecution(taskList, robotId) {
-  if (loopCurrentExecutionId.value) {
+  if (loopActive.value && loopCurrentExecutionId.value) {
     try {
       execution.value = await fetchTaskExecution(loopCurrentExecutionId.value)
+      selectedTaskId.value = String(execution.value.task || selectedTaskId.value)
       startExecutionPolling()
       return
     } catch {}
   }
-  const candidates = taskList
-    .filter((task) => !robotId || String(task.robot) === String(robotId))
-    .map((task) => task.latest_execution)
-    .filter(Boolean)
-  const summary = candidates.find((item) => isExecutionActive(item.state))
-    || presetTask.value?.latest_execution
-    || candidates.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))[0]
-  if (!summary?.id) return
+  const availableTasks = guardDutyTaskOptions(taskList, robotId)
+  const summary = initialGuardDutyExecution(availableTasks)
+  if (!summary?.id) {
+    execution.value = null
+    startExecutionPolling()
+    return
+  }
   execution.value = await fetchTaskExecution(summary.id)
+  selectedTaskId.value = String(execution.value.task || selectedTaskId.value)
   startExecutionPolling()
+}
+
+async function changeSelectedTask() {
+  if (busy.value || loopActive.value || isRunning.value) return
+  const task = presetTask.value
+  if (!task) return
+  busy.value = true
+  if (executionTimer) window.clearInterval(executionTimer)
+  executionTimer = null
+  execution.value = null
+  trajectory.value = []
+  trajectoryExecutionId.value = ''
+  routeData.value = null
+  mapData.value = null
+  try {
+    if (task.latest_execution?.id) {
+      execution.value = await fetchTaskExecution(task.latest_execution.id)
+    }
+    await refreshExecutionVisual()
+  } catch (error) {
+    showToast(error.message || '任务记录加载失败', { variant: 'alert' })
+  } finally {
+    busy.value = false
+  }
 }
 
 async function refreshRobot() {
@@ -635,6 +694,7 @@ function restoreLoopState(robotId) {
       loopMessage.value = saved.message || '循环巡检已恢复'
     } else {
       loopActive.value = false
+      loopCurrentExecutionId.value = ''
       loopState.value = saved.active ? 'completed' : (saved.state || 'idle')
       loopStoppedAt.value = loopStoppedAt.value || (loopEndsAt.value ? Math.min(Date.now(), loopEndsAt.value) : 0)
       loopMessage.value = saved.active ? '循环时长已结束' : (saved.message || '未启动循环巡检')
@@ -1023,10 +1083,19 @@ watch(playUrlKey, () => {
           </div>
 
           <div class="guard-task-bar">
-            <div>
+            <label class="guard-task-selector">
               <span>当前任务</span>
-              <strong>{{ executionTaskName }}</strong>
-            </div>
+              <select
+                v-model="selectedTaskId"
+                :disabled="busy || loopActive || isRunning || !taskOptions.length"
+                @change="changeSelectedTask"
+              >
+                <option v-if="!taskOptions.length" value="">管理员尚未配置巡检任务</option>
+                <option v-for="task in taskOptions" :key="task.id" :value="String(task.id)">
+                  {{ taskOptionLabel(task) }}
+                </option>
+              </select>
+            </label>
             <div>
               <span>执行状态</span>
               <strong>{{ taskStateText }}</strong>
@@ -1262,6 +1331,9 @@ watch(playUrlKey, () => {
 .guard-task-bar > div { display: grid; gap: 5px; min-width: 0; }
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guard-task-selector { display: grid; gap: 5px; min-width: 0; }
+.guard-task-selector select { width: 100%; min-width: 0; height: 38px; padding: 0 32px 0 10px; border: 1px solid #c8d3d9; color: #1c303c; background: #fff; font: inherit; font-weight: 800; text-overflow: ellipsis; }
+.guard-task-selector select:disabled { cursor: not-allowed; opacity: .65; }
 .guard-localization-bar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 14px 16px; border-top: 1px solid #e2e8ec; background: #f7f9fa; }
 .guard-localization-copy { display: grid; grid-template-columns: auto auto; align-items: center; gap: 4px 12px; min-width: 0; }
 .guard-localization-copy > span { color: #70808c; font-size: 12px; }
@@ -1411,7 +1483,8 @@ watch(playUrlKey, () => {
   color: var(--text);
 }
 :global([data-theme="dark"] .guard-page .guard-live-speech textarea),
-:global([data-theme="dark"] .guard-page .guard-loop-settings input) {
+:global([data-theme="dark"] .guard-page .guard-loop-settings input),
+:global([data-theme="dark"] .guard-page .guard-task-selector select) {
   border-color: var(--line);
   background: var(--input-bg);
   color: var(--text);
@@ -1484,7 +1557,7 @@ watch(playUrlKey, () => {
   .guard-side { grid-template-columns: 1fr 220px; align-items: start; }
   .guard-video-stage, .guard-video, .guard-video-empty { min-height: 56vw; }
   .guard-task-bar { grid-template-columns: 1fr 1fr; }
-  .guard-task-bar > div:first-child { grid-column: 1 / -1; }
+  .guard-task-selector { grid-column: 1 / -1; }
   .guard-localization-bar { align-items: stretch; flex-direction: column; }
   .guard-initialize { width: 100%; }
   .guard-loop-inline { grid-template-columns: 1fr; }
@@ -1517,7 +1590,7 @@ watch(playUrlKey, () => {
   .guard-header { align-items: start; flex-direction: column; }
   .guard-grid, .guard-side { grid-template-columns: 1fr; }
   .guard-task-bar { grid-template-columns: 1fr 1fr; }
-  .guard-task-bar > div:first-child { grid-column: 1 / -1; }
+  .guard-task-selector { grid-column: 1 / -1; }
   .guard-primary, .guard-secondary, .guard-danger { width: 100%; }
   .guard-loop-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .guard-loop-toggle { grid-column: 1 / -1; }
