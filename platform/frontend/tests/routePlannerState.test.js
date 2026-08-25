@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  appendConfirmedInspectionPoint,
   clampMapZoom,
   headingBetweenMapPoints,
   headingDegreesToRadians,
@@ -10,6 +11,7 @@ import {
   normalizeRtkQuality,
   paginateKeyframes,
   resolveMapClickAction,
+  removeConfirmedInspectionPoint,
   rtkFixStatusLabel,
   rtkPositionTypeLabel,
   rtkQualityLabel,
@@ -45,6 +47,31 @@ test('map click mode has one explicit action and initial pose takes precedence',
   assert.equal(resolveMapClickAction('waypoint'), 'waypoint')
   assert.equal(resolveMapClickAction('inspect'), 'inspect')
   assert.equal(resolveMapClickAction('waypoint', true), 'initial_pose')
+})
+
+test('confirmed inspection points append independently and can be removed with contiguous display order', () => {
+  const firstDraft = {
+    point: { x: 1, y: 2, yaw: headingBetweenMapPoints({ x: 1, y: 2 }, { x: 2, y: 2 }) },
+    sample: { index: 10, distance_m: 0.2 },
+  }
+  const secondDraft = {
+    point: { x: 3, y: 4, yaw: headingBetweenMapPoints({ x: 3, y: 4 }, { x: 3, y: 5 }) },
+    sample: null,
+  }
+  const confirmed = appendConfirmedInspectionPoint(
+    appendConfirmedInspectionPoint([], firstDraft, 1),
+    secondDraft,
+    2,
+  )
+
+  assert.deepEqual(confirmed.map((item, index) => ({ id: item.id, number: index + 1 })), [
+    { id: 1, number: 1 },
+    { id: 2, number: 2 },
+  ])
+  assert.notEqual(confirmed[0].point, firstDraft.point)
+  assert.deepEqual(removeConfirmedInspectionPoint(confirmed, 1).map((item, index) => ({ id: item.id, number: index + 1 })), [
+    { id: 2, number: 1 },
+  ])
 })
 
 test('two map points produce the same yaw convention used by initial pose', () => {

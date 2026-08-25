@@ -130,6 +130,23 @@ export function resolveMapClickAction(mode, initialPoseMode = false) {
   return mode === 'inspect' ? 'inspect' : 'waypoint'
 }
 
+export function appendConfirmedInspectionPoint(points, draft, id) {
+  const source = Array.isArray(points) ? points : []
+  if (!draft?.point || id === null || id === undefined || id === '') return source
+  return [
+    ...source,
+    {
+      id,
+      point: { ...draft.point },
+      sample: draft.sample ? { ...draft.sample } : null,
+    },
+  ]
+}
+
+export function removeConfirmedInspectionPoint(points, id) {
+  return (Array.isArray(points) ? points : []).filter((item) => item.id !== id)
+}
+
 export function headingBetweenMapPoints(from, to, minimumDistance = 0.05) {
   const fromX = Number(from?.x)
   const fromY = Number(from?.y)
