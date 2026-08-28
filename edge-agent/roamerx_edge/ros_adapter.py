@@ -151,6 +151,12 @@ class RosAdapter(Node):
         self._robot_motion_condition = threading.Condition()
         self._robot_standing_event = threading.Event()
         self._remote_control_event = threading.Event()
+        # The telemetry loop and MQTT command threads both probe Nav2.  rclpy
+        # action/service clients are not safe to drive through overlapping
+        # blocking discovery calls on the same node; concurrent probes can
+        # therefore report every lifecycle node as unavailable even while an
+        # external ROS probe sees the complete stack active.
+        self._nav_ready_probe_lock = threading.Lock()
         self._rtk_origin_cache = RtkOriginPayloadCache(
             stale_after_seconds=(mapping_config.heading_max_age_seconds if mapping_config else 1.5)
         )
@@ -655,6 +661,11 @@ class RosAdapter(Node):
         return min(RosAdapter._NAV_READY_SERVER_PROBE_SECONDS, max(0.0, remaining))
 
     def wait_until_ready(self, timeout_seconds: float = 10.0) -> bool:
+        """Serialize Nav2 discovery probes made by background threads."""
+        with self._nav_ready_probe_lock:
+            return self._wait_until_ready_probe(timeout_seconds)
+
+    def _wait_until_ready_probe(self, timeout_seconds: float) -> bool:
         """Wait for Nav2's action server *and* all required lifecycle nodes.
 
         ``wait_for_server`` alone is not sufficient after a map switch: ROS

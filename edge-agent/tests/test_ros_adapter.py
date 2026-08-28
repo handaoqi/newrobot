@@ -255,3 +255,34 @@ def test_zero_timeout_ready_probe_still_waits_for_action_discovery():
     assert RosAdapter._action_server_wait_timeout(0.0, 0.0) == 0.5
     assert RosAdapter._action_server_wait_timeout(10.0, 0.2) == 0.2
     assert RosAdapter._action_server_wait_timeout(10.0, 2.0) == 0.5
+
+
+def test_ready_probes_are_serialized_across_background_threads():
+    adapter = object.__new__(RosAdapter)
+    adapter._nav_ready_probe_lock = threading.Lock()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    calls = []
+
+    def _probe(timeout_seconds):
+        calls.append(timeout_seconds)
+        if len(calls) == 1:
+            first_entered.set()
+            release_first.wait(1)
+        else:
+            second_entered.set()
+        return True
+
+    adapter._wait_until_ready_probe = _probe
+    first = threading.Thread(target=adapter.wait_until_ready, args=(45.0,))
+    second = threading.Thread(target=adapter.wait_until_ready, args=(0.5,))
+    first.start()
+    assert first_entered.wait(1)
+    second.start()
+    assert not second_entered.wait(0.1)
+    release_first.set()
+    first.join(1)
+    second.join(1)
+
+    assert calls == [45.0, 0.5]
