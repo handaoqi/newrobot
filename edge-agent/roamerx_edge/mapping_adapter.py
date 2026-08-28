@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import json
@@ -201,7 +202,16 @@ class MappingAdapter:
             LOGGER.warning("Stale session '%s' (state=%s) detected with dead SLAM process — cleaning up", self.session.session_id, self.session.state)
             self._cleanup()
         if not self.session and self._any_slam_process_alive:
-            raise ProtocolError("MAPPING_ALREADY_ACTIVE", "mapping process is already running")
+            # No session but a live mapping node: either a mapping run whose
+            # session was lost across an edge-agent restart, or a leftover from a
+            # failed export.  We cannot tell the two apart here, so refuse rather
+            # than kill — but say how to clear it, since mapping.cancel is the
+            # only path that unconditionally stops the node.
+            raise ProtocolError(
+                "MAPPING_ALREADY_ACTIVE",
+                "mapping process is already running without a tracked session; "
+                "send mapping.cancel (or `mapping_cli.py stop`) to stop it before starting a new run",
+            )
         session_id = command.get("mapping_session_id") or str(uuid.uuid4())
         map_name = command.get("map_name") or f"现场地图 {time.strftime('%Y%m%d-%H%M%S')}"
         scene_scope = normalize_text(command.get("scene_scope"), "indoor")
@@ -566,6 +576,9 @@ class MappingAdapter:
         self._stop_rosbag()
         self._set_state("saving")
         save_started_at = time.time()
+        should_upload = bool(command.get("upload", True))
+        should_package = bool(command.get("package", should_upload))
+        should_stop = bool(command.get("stop_process", True))
         try:
             self._call_map_state(self.config.save_data)
         except ProtocolError:
@@ -581,28 +594,41 @@ class MappingAdapter:
             ):
                 return self._rescue_diverged_mapping(command, progress_dir)
             raise
-        # SLAM writes yaml/pgm asynchronously after the save service returns.
-        # Wait for an output touched after this save command instead of falling
-        # back to an older complete map directory.
-        work_dir = self._wait_for_complete_map_dir(save_started_at)
-        self._validate_map_files(work_dir)
-        self._finalize_session_package(work_dir, command)
-        should_upload = bool(command.get("upload", True))
-        should_package = bool(command.get("package", should_upload))
-        should_stop = bool(command.get("stop_process", True))
-        result = self.status()
-        if should_package:
-            self._set_state("packaging")
-            package_path, metadata = self._package_map(command, work_dir)
-            result["package_path"] = str(package_path)
-            result["mapping_metrics"] = metadata.get("mapping_metrics", {})
-            if should_upload:
-                self._set_state("uploading")
-                try:
+        # Past this point the save service has returned, so the map is already on
+        # disk and SLAM has nothing left to do.  Every step below can raise, and
+        # letting one of them escape used to leak the mapping node: it kept a core
+        # and ~230 MB busy, and the *next* start_mapping was then rejected with
+        # MAPPING_ALREADY_ACTIVE until somebody thought to send mapping.cancel.
+        # Export failures must not cost the operator the next mapping run.
+        try:
+            # SLAM writes yaml/pgm asynchronously after the save service returns.
+            # Wait for an output touched after this save command instead of falling
+            # back to an older complete map directory.
+            work_dir = self._wait_for_complete_map_dir(save_started_at)
+            self._validate_map_files(work_dir)
+            self._finalize_session_package(work_dir, command)
+            result = self.status()
+            if should_package:
+                self._set_state("packaging")
+                package_path, metadata = self._package_map(command, work_dir)
+                result["package_path"] = str(package_path)
+                result["mapping_metrics"] = metadata.get("mapping_metrics", {})
+                if should_upload:
+                    self._set_state("uploading")
                     result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
-                except ProtocolError:
-                    self._set_state("failed")
-                    raise
+        except Exception:
+            if should_stop:
+                self._set_state("stopping")
+                # Suppressed so a failing teardown cannot mask the export error
+                # that actually explains what went wrong.  Separate blocks: a
+                # recorder that refuses to stop must not cost us the SLAM stop,
+                # which is the whole point of this handler.
+                with contextlib.suppress(Exception):
+                    self._stop_rosbag()
+                with contextlib.suppress(Exception):
+                    self._stop_slam_process()
+            self._set_state("failed")
+            raise
         if should_stop:
             self._set_state("stopping")
             self._stop_rosbag()
@@ -1094,6 +1120,18 @@ class MappingAdapter:
         self._prepare_mapping_runtime()
         self._verify_mapping_deployment()
         if self._any_slam_process_alive:
+            # Adopting a live node instead of restarting it.  systemd only reads
+            # mapping-session.env at unit start, so the mapping type and ENU
+            # origin _prepare_mapping_runtime() just wrote do not take effect —
+            # the adopted process keeps the previous session's values.  Say so,
+            # because otherwise this is silent and the map comes out referenced
+            # to the wrong origin.
+            LOGGER.warning(
+                "Adopting a live SLAM mapping process (unit_active=%s, pids=%s); "
+                "runtime params just written apply only to a fresh start",
+                self._is_mapping_unit_active(),
+                self._find_slam_process_pids() or "none",
+            )
             return
         if self.config.mapping_unit:
             self._systemctl("start")
@@ -2418,8 +2456,18 @@ class MappingAdapter:
 
     def _find_slam_process_pids(self) -> list[int]:
         try:
+            # -ww is load-bearing, not cosmetic.  Without it ps truncates args to
+            # $COLUMNS, and navigation's LIO node is the *same executable* as the
+            # mapping node - only "-r __node:=lio_odometry" tells them apart, and
+            # that sits ~70 chars in.  At COLUMNS=80 the line truncates to
+            # ".../lib/robot_slam/mapping --ros-arg": the marker is gone, so
+            # _is_lio_odometry_process() says False, "lib/robot_slam/mapping"
+            # matches, and _stop_orphan_slam_processes() SIGKILLs the running
+            # navigation odometry.  Reproduced from a terminal-launched
+            # mapping_cli.py; the systemd service escapes only because it happens
+            # to leave COLUMNS unset.
             result = subprocess.run(
-                ["ps", "-eo", "pid=,args="],
+                ["ps", "-ww", "-eo", "pid=,args="],
                 capture_output=True,
                 text=True,
                 timeout=5,

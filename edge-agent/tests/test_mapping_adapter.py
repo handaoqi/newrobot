@@ -1088,6 +1088,159 @@ def test_local_save_skips_upload_and_keeps_process(tmp_path, monkeypatch):
     assert "upload_result" not in result
 
 
+def test_lio_odometry_is_never_matched_when_ps_output_is_narrow(tmp_path, monkeypatch):
+    # Navigation's LIO node is the same executable as the mapping node; only
+    # "-r __node:=lio_odometry" separates them, ~70 chars into the line. ps
+    # truncates args to $COLUMNS, so without -ww an 80-column caller loses the
+    # marker and _stop_orphan_slam_processes() SIGKILLs live navigation.
+    adapter = make_adapter(tmp_path)
+    lio_args = (
+        "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping "
+        "--ros-args -r __node:=lio_odometry --params-file "
+        "/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml"
+    )
+    seen_argv = {}
+
+    def fake_run(argv, **_kwargs):
+        seen_argv["argv"] = argv
+        # Emulate ps honouring -ww: full args only when it is present.
+        args = lio_args if "-ww" in argv else lio_args[:71]
+        return SimpleNamespace(returncode=0, stdout=f"  57606 {args}\n")
+
+    monkeypatch.setattr(mapping_adapter_module.subprocess, "run", fake_run)
+
+    assert adapter._find_slam_process_pids() == []
+    assert "-ww" in seen_argv["argv"]
+
+
+def _ready_to_save_adapter(tmp_path, monkeypatch):
+    """An adapter parked one step before the export, with a healthy save_progress."""
+    session = tmp_path / "20260828_120000_001"
+    session.mkdir()
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "save_progress.json").write_text(
+        json.dumps(
+            {
+                "stage": "mapping",
+                "keyframe_count": 2,
+                "written_keyframes": 2,
+                "updated_at_unix": time.time(),
+                "slam_health": {"state": "healthy", "imu_initialized": True},
+            }
+        )
+    )
+    adapter = make_adapter(tmp_path)
+    adapter._slam_process = RunningProcess()
+    adapter.session = MappingSession("session", "map", "", "mapping", "now", "now")
+    stopped = []
+    monkeypatch.setattr(adapter, "_call_map_state", lambda data: "ok")
+    monkeypatch.setattr(adapter, "_wait_for_complete_map_dir", lambda *_a, **_kw: session)
+    monkeypatch.setattr(adapter, "_stop_slam_process", lambda: stopped.append("slam"))
+    return adapter, session, stopped
+
+
+def test_save_stops_slam_when_packaging_fails(tmp_path, monkeypatch):
+    # The save service already returned, so the map is on disk and SLAM has
+    # nothing left to do. A packaging failure used to leak the mapping node and
+    # block the next start_mapping with MAPPING_ALREADY_ACTIVE.
+    adapter, _session, stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        adapter,
+        "_package_map",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ProtocolError("MAP_PACKAGE_FAILED", "boom")),
+    )
+
+    with pytest.raises(ProtocolError) as excinfo:
+        adapter._save_active_mapping({"upload": False, "package": True})
+
+    assert excinfo.value.code == "MAP_PACKAGE_FAILED"
+    assert stopped == ["slam"]
+    assert adapter.session.state == "failed"
+
+
+def test_save_stops_slam_when_upload_fails(tmp_path, monkeypatch):
+    adapter, _session, stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(adapter, "_package_map", lambda *_a, **_kw: (tmp_path / "map.zip", {}))
+    adapter.media_client = SimpleNamespace(
+        upload_map_package=lambda *_a, **_kw: (_ for _ in ()).throw(
+            ProtocolError("MAP_UPLOAD_FAILED", "network")
+        )
+    )
+
+    with pytest.raises(ProtocolError) as excinfo:
+        adapter._save_active_mapping({"upload": True})
+
+    assert excinfo.value.code == "MAP_UPLOAD_FAILED"
+    assert stopped == ["slam"]
+    assert adapter.session.state == "failed"
+
+
+def test_save_teardown_failure_does_not_mask_the_export_error(tmp_path, monkeypatch):
+    # The operator needs the reason the export failed, not whatever went wrong
+    # while tearing SLAM down afterwards.
+    adapter, _session, _stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        adapter,
+        "_package_map",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ProtocolError("MAP_PACKAGE_FAILED", "boom")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_stop_slam_process",
+        lambda: (_ for _ in ()).throw(RuntimeError("systemctl unavailable")),
+    )
+
+    with pytest.raises(ProtocolError) as excinfo:
+        adapter._save_active_mapping({"upload": False, "package": True})
+
+    assert excinfo.value.code == "MAP_PACKAGE_FAILED"
+
+
+def test_save_defaults_to_stopping_slam(tmp_path, monkeypatch):
+    # The platform never sends stop_process, so the default is what mapping.save
+    # actually runs. "Mapping finished" has to mean the node exits.
+    adapter, _session, stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+
+    result = adapter._save_active_mapping({"upload": False, "package": False})
+
+    # Not an equality check: the success path stops SLAM once itself and again
+    # via _cleanup(). The repeat is a harmless no-op, so only "it stopped" matters.
+    assert stopped
+    assert result["state"] == "exited"
+
+
+def test_save_keeps_slam_when_the_save_service_itself_fails(tmp_path, monkeypatch):
+    # Nothing was exported, so mapping can legitimately continue and be retried.
+    adapter, _session, stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        adapter,
+        "_call_map_state",
+        lambda data: (_ for _ in ()).throw(ProtocolError("MAP_SAVE_FAILED", "service down")),
+    )
+
+    with pytest.raises(ProtocolError) as excinfo:
+        adapter._save_active_mapping({"upload": False, "package": False})
+
+    assert excinfo.value.code == "MAP_SAVE_FAILED"
+    assert stopped == []
+    assert adapter.session.state == "mapping"
+
+
+def test_save_keeps_slam_when_not_ready(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    adapter._slam_process = RunningProcess()
+    adapter.session = MappingSession("session", "map", "", "mapping", "now", "now")
+    stopped = []
+    monkeypatch.setattr(adapter, "_stop_slam_process", lambda: stopped.append("slam"))
+
+    with pytest.raises(ProtocolError) as excinfo:
+        adapter._save_active_mapping({"upload": False, "package": False})
+
+    assert excinfo.value.code == "MAPPING_NOT_READY"
+    assert stopped == []
+
+
 def test_begin_mapping_outdoor_requires_explicit_operator_confirmation(tmp_path, monkeypatch):
     adapter = make_adapter(tmp_path)
     adapter.session = MappingSession(

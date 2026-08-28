@@ -32,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--map-name", default="")
     parser.add_argument("--record-rosbag", action="store_true")
     parser.add_argument("--upload", action="store_true", help="package and upload after save (cloud path)")
+    parser.add_argument(
+        "--keep-slam",
+        action="store_true",
+        help="leave the SLAM mapping node running after save, to keep mapping from the same session "
+             "(checkpoint save). Without this, save stops it, matching the cloud mapping.save default.",
+    )
     parser.add_argument("--wait-seconds", type=float, default=90.0)
     args = parser.parse_args(argv)
 
@@ -41,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         "record_rosbag": args.record_rosbag,
         "upload": args.upload,
         "package": args.upload,
-        "stop_process": False,
+        "stop_process": not args.keep_slam,
     }
     try:
         if args.action == "status":
@@ -55,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
             print_status(result)
             return 0
         if args.action == "save":
-            result = adapter.save_mapping({**command, "stop_process": False})
+            result = adapter.save_mapping(command)
             print_status(result)
             return 0
         if args.action == "stop":
