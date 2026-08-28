@@ -76,6 +76,7 @@ class CommandProcessor:
             prepared_task_start = envelope.message_type == "task.start"
             if prepared_task_start:
                 self._release_manual_control_for_task()
+                self.safety.wait_until_localization_stable()
                 self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
                 docking = ((envelope.payload.get("command") or {}).get("docking") or {})
                 if docking.get("enabled"):
@@ -256,7 +257,10 @@ class CommandProcessor:
                 seed = self._resolve_localization_seed(command)
                 result_payload = self.localization_adapter.active_relocalize(seed)
         else:
-            if not self._navigation_command_lock.acquire(blocking=False):
+            wait_seconds = 90.0 if envelope.message_type in {
+                "nav.start", "nav.restart", "nav.recover",
+            } else 5.0
+            if not self._navigation_command_lock.acquire(blocking=True, timeout=wait_seconds):
                 raise ProtocolError("NAV_COMMAND_BUSY", "another navigation command is still running")
             try:
                 if not self.navigation_stack_adapter:

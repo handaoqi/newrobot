@@ -21,6 +21,14 @@ LOGGER = logging.getLogger(__name__)
 # copy so the outbound legs are not skipped.  After the first copy is marked
 # complete, a later resume must also refuse to jump to the return copy.
 WAYPOINT_COLOCATION_M = 1.0
+# Hand-clicked return-to-start points are often 1-2 m off the original click.
+# If the nearest waypoint is the route end and the robot is also that close
+# to waypoint 1, start the outbound legs instead of treating 1..N-1 as done.
+ROUND_TRIP_START_MARGIN_M = 2.0
+# Patrol clicks on a "straight" corridor are rarely colinear. NavigateThroughPoses
+# then builds a left-right polyline, and MPPI hugs that heading. Flatten clicks
+# whose lateral error is below this threshold; keep real turns.
+WAYPOINT_STRAIGHTEN_M = 0.40
 
 
 def _waypoint_xy(waypoint: dict) -> tuple[float, float] | None:
@@ -40,6 +48,89 @@ def _waypoints_are_colocated(left, right) -> bool:
     if left_xy is None or right_xy is None:
         return False
     return hypot(left_xy[0] - right_xy[0], left_xy[1] - right_xy[1]) <= WAYPOINT_COLOCATION_M
+
+
+def _segment_projection(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float
+) -> tuple[float, float, float]:
+    dx = bx - ax
+    dy = by - ay
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-12:
+        return hypot(px - ax, py - ay), ax, ay
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    qx = ax + t * dx
+    qy = ay + t * dy
+    return hypot(px - qx, py - qy), qx, qy
+
+
+def _douglas_peucker_indices(points: list[tuple[float, float]], epsilon_m: float) -> list[int]:
+    if len(points) < 3:
+        return list(range(len(points)))
+    keep = [False] * len(points)
+    keep[0] = True
+    keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        ax, ay = points[start]
+        bx, by = points[end]
+        farthest_i = -1
+        farthest_d = -1.0
+        for index in range(start + 1, end):
+            dist, _, _ = _segment_projection(points[index][0], points[index][1], ax, ay, bx, by)
+            if dist > farthest_d:
+                farthest_d = dist
+                farthest_i = index
+        if farthest_i >= 0 and farthest_d > epsilon_m:
+            keep[farthest_i] = True
+            stack.append((start, farthest_i))
+            stack.append((farthest_i, end))
+    return [index for index, flagged in enumerate(keep) if flagged]
+
+
+def straighten_pass_through_waypoints(
+    waypoints: list[dict],
+    epsilon_m: float = WAYPOINT_STRAIGHTEN_M,
+) -> list[dict]:
+    """Project nearly-colinear via points onto the intended straight segments.
+
+    The cloud route still owns the original clicks for progress and speech.
+    Only the Nav2 goal geometry is flattened so a hand-drawn corridor does not
+    become a snaking polyline.
+    """
+    if len(waypoints) < 3:
+        return [dict(waypoint) for waypoint in waypoints]
+    points: list[tuple[float, float]] = []
+    for waypoint in waypoints:
+        xy = _waypoint_xy(waypoint)
+        if xy is None:
+            return [dict(item) for item in waypoints]
+        points.append(xy)
+    kept = _douglas_peucker_indices(points, epsilon_m)
+    kept_set = set(kept)
+    if len(kept) == len(points):
+        return [dict(waypoint) for waypoint in waypoints]
+    straightened = []
+    for index, waypoint in enumerate(waypoints):
+        item = dict(waypoint)
+        if index in kept_set:
+            straightened.append(item)
+            continue
+        prev_keep = max(k for k in kept if k <= index)
+        next_keep = min(k for k in kept if k >= index)
+        _, qx, qy = _segment_projection(
+            points[index][0],
+            points[index][1],
+            points[prev_keep][0],
+            points[prev_keep][1],
+            points[next_keep][0],
+            points[next_keep][1],
+        )
+        item["x"] = qx
+        item["y"] = qy
+        straightened.append(item)
+    return straightened
 
 
 class NavigationAdapter(Protocol):
@@ -117,6 +208,8 @@ class TaskExecutor:
         self._paused_for_localization = False
         self._navigation_prepared = False
         self._segment_avoidance_enabled = True
+        self._dispatched_count = 0
+        self._patrol_final_approach_applied = False
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
         if self.context:
@@ -359,9 +452,10 @@ class TaskExecutor:
                 or not self._paused_for_localization
             ):
                 return
-            resume_index = self._nearest_remaining_waypoint_index(
-                self.context.current_waypoint_index
-            )
+            # Keep the pending target. Re-picking the nearest remaining point
+            # on a round-trip treats the return copy (point 4 of 1-2-3-2-1) as
+            # closer and skips the outbound legs.
+            resume_index = max(0, self.context.current_waypoint_index)
             self._paused_for_localization = False
             self.context.state = "resuming"
             self.context.state_version += 1
@@ -372,15 +466,6 @@ class TaskExecutor:
                 message="localization is stable; resuming from the pending waypoint",
             )
             self._send_from(resume_index)
-
-    def _nearest_remaining_waypoint_index(self, start_index: int) -> int:
-        if not self.context:
-            return start_index
-        return self._earliest_colocated_nearest_index(
-            self.context.route_snapshot.get("waypoints") or [],
-            self.navigation.latest_pose(),
-            start_index=max(0, start_index),
-        )
 
     def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
         with self._lock:
@@ -478,7 +563,34 @@ class TaskExecutor:
             raise ProtocolError(exc.code, exc.message) from exc
 
     def _nearest_waypoint_index(self, route: dict) -> int:
-        return self._earliest_colocated_nearest_index(route.get("waypoints") or [], self.navigation.latest_pose())
+        waypoints = route.get("waypoints") or []
+        pose = self.navigation.latest_pose()
+        index = self._earliest_colocated_nearest_index(waypoints, pose)
+        return self._prefer_round_trip_start(waypoints, pose, index)
+
+    def _prefer_round_trip_start(self, waypoints: list, pose, nearest_index: int) -> int:
+        if nearest_index != len(waypoints) - 1 or len(waypoints) < 2 or pose is None:
+            return nearest_index
+        first_xy = _waypoint_xy(waypoints[0])
+        last_xy = _waypoint_xy(waypoints[-1])
+        if first_xy is None or last_xy is None:
+            return nearest_index
+        try:
+            pose_x = float(pose.x)
+            pose_y = float(pose.y)
+        except (AttributeError, TypeError, ValueError):
+            return nearest_index
+        first_dist = hypot(pose_x - first_xy[0], pose_y - first_xy[1])
+        last_dist = hypot(pose_x - last_xy[0], pose_y - last_xy[1])
+        if first_dist <= last_dist + ROUND_TRIP_START_MARGIN_M:
+            LOGGER.info(
+                "round-trip start: nearest is route end (index %d, %.2fm) but start is also nearby (%.2fm); using waypoint 0",
+                nearest_index,
+                last_dist,
+                first_dist,
+            )
+            return 0
+        return nearest_index
 
     def _earliest_colocated_nearest_index(
         self,
@@ -516,19 +628,22 @@ class TaskExecutor:
             if _waypoints_are_colocated(waypoints[index], nearest_xy):
                 chosen_index = index
                 break
-        # A later copy of an already-visited location is not "ahead" on the
-        # route.  After 1 is complete on a 1-2-3-2-1 round trip, the robot is
-        # still on that start/end cluster; jumping to 5 would skip 2-3-4.
-        if chosen_index > start_index and any(
-            _waypoints_are_colocated(waypoint, waypoints[chosen_index])
-            for waypoint in waypoints[:start_index]
-        ):
+        if chosen_index <= start_index:
+            return chosen_index
+        # A later copy of an earlier waypoint is not "ahead" on the route.
+        # After 1 is complete on a 1-2-3-2-1 round trip, the start/end cluster
+        # would otherwise jump to 5.  While going to 2, the return copy 4 is
+        # often closer and would skip 3.
+        for index in range(chosen_index):
+            if not _waypoints_are_colocated(waypoints[index], waypoints[chosen_index]):
+                continue
+            keep_index = max(start_index, index)
             LOGGER.info(
                 "keeping pending waypoint %d instead of later colocated copy %d",
-                start_index,
+                keep_index,
                 chosen_index,
             )
-            return start_index
+            return keep_index
         return chosen_index
 
     def launch_prepared_task(self) -> None:
@@ -563,53 +678,167 @@ class TaskExecutor:
     def _send_segment(self, segment_index: int, start_index: int | None = None) -> None:
         if not self.context:
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "task context is missing")
-        if not self._prepare_robot_for_navigation():
-            return
         segment = self._segments[segment_index]
         goal_start_index = max(segment.start_index, start_index if start_index is not None else segment.start_index)
         self.context.current_segment_index = segment_index
-        self.context.current_waypoint_index = goal_start_index
-        self._goal_offset = goal_start_index
-        waypoint = self.context.route_snapshot["waypoints"][goal_start_index]
-        self._apply_navigation_profile(goal_start_index)
-        self._set_localization_policy(waypoint, "moving")
-        waypoints = [waypoint]
-        accepted = self.navigation.send_waypoints(waypoints, self.on_feedback, self.on_navigation_result)
-        if not accepted:
-            self._fail("NAV_STACK_NOT_READY", "FollowWaypoints goal was rejected")
-            return
-        self.context.state = "running"
-        self.context.state_version += 1
-        self._persist()
-        self._emit(
-            "task.started",
-            extra={
-                "initial_waypoint_index": goal_start_index,
-                "skipped_waypoints": goal_start_index,
-                "execution_waypoint_order": [
-                    point.get("map_point_number", int(point.get("sequence", 0)) + 1)
-                    for point in self.context.route_snapshot["waypoints"][goal_start_index:]
-                ],
-            },
-        )
-        self.on_feedback(0, milestone="target_dispatched")
-        if self._segment_avoidance_enabled:
-            self._start_obstacle_monitor()
+        self._dispatch_navigation(goal_start_index)
 
     def _send_from(self, index: int) -> None:
+        self._dispatch_navigation(index)
+
+    def _batch_end_index(self, start_index: int) -> int:
+        """Last exclusive index of one Nav2 goal. Patrol vias share a goal; stops split it."""
+        waypoints = self.context.route_snapshot["waypoints"]
+        total = len(waypoints)
+        if self._is_docking_task():
+            return min(start_index + 1, total)
+        end = total
+        if self._segments:
+            end = min(self._segments[self.context.current_segment_index].end_index, total)
+        start_wp = waypoints[start_index]
+        if bool(start_wp.get("require_yaw", False)) or float(start_wp.get("dwell_seconds") or 0) > 0:
+            return start_index + 1
+        for index in range(start_index + 1, end):
+            if index == end - 1:
+                break
+            waypoint = waypoints[index]
+            if bool(waypoint.get("require_yaw", False)) or float(waypoint.get("dwell_seconds") or 0) > 0:
+                return index + 1
+        return self._through_poses_end_index(waypoints, start_index, end)
+
+    def _current_pose_xy(self) -> tuple[float, float] | None:
+        pose = self.navigation.latest_pose() if self.navigation else None
+        if pose is None:
+            return None
+        try:
+            x = float(pose.x)
+            y = float(pose.y)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not isfinite(x) or not isfinite(y):
+            return None
+        return x, y
+
+    def _through_poses_end_index(self, waypoints: list, start_index: int, end: int) -> int:
+        """Keep a through-poses goal from ending at the robot's current cluster.
+
+        NavigateThroughPoses is complete once the last pose is within the goal
+        checker. A round-trip that returns to start would therefore succeed
+        immediately if the robot is already standing on that cluster.
+        """
+        if end - start_index <= 1:
+            return end
+        last_xy = _waypoint_xy(waypoints[end - 1])
+        origin_xy = self._current_pose_xy() or _waypoint_xy(waypoints[start_index])
+        if last_xy is None or origin_xy is None:
+            return end
+        if hypot(origin_xy[0] - last_xy[0], origin_xy[1] - last_xy[1]) > ROUND_TRIP_START_MARGIN_M:
+            return end
+        farthest_index = start_index
+        farthest_dist = -1.0
+        for index in range(start_index, end):
+            xy = _waypoint_xy(waypoints[index])
+            if xy is None:
+                continue
+            dist = hypot(origin_xy[0] - xy[0], origin_xy[1] - xy[1])
+            if dist >= farthest_dist:
+                farthest_index = index
+                farthest_dist = dist
+        if farthest_index <= start_index or farthest_dist <= WAYPOINT_COLOCATION_M:
+            return end
+        LOGGER.info(
+            "splitting round-trip through-poses at farthest waypoint %d (%.2fm) so the goal is not already complete",
+            farthest_index,
+            farthest_dist,
+        )
+        return farthest_index + 1
+
+    def _apply_batch_travel_yaw(self, batch: list[dict], start_index: int) -> None:
+        """Point pass-through poses along the Nav2 goal, not the cloud click yaw."""
+        for item_index, waypoint in enumerate(batch):
+            stop = item_index + 1 == len(batch)
+            if stop and bool(waypoint.get("require_yaw", False)):
+                waypoint["yaw"] = float(waypoint.get("yaw") or 0.0)
+                continue
+            if not stop:
+                nxt = batch[item_index + 1]
+                dx = float(nxt["x"]) - float(waypoint["x"])
+                dy = float(nxt["y"]) - float(waypoint["y"])
+                if hypot(dx, dy) >= 1e-3:
+                    waypoint["yaw"] = atan2(dy, dx)
+                    continue
+            if item_index > 0:
+                previous = batch[item_index - 1]
+                dx = float(waypoint["x"]) - float(previous["x"])
+                dy = float(waypoint["y"]) - float(previous["y"])
+                if hypot(dx, dy) >= 1e-3:
+                    waypoint["yaw"] = atan2(dy, dx)
+                    continue
+            waypoint["yaw"] = self._dispatch_yaw(
+                start_index + item_index, waypoint, stop=stop
+            )
+
+    def _dispatch_yaw(self, index: int, waypoint: dict, *, stop: bool) -> float:
+        if stop and bool(waypoint.get("require_yaw", False)):
+            return float(waypoint.get("yaw") or 0.0)
+        waypoints = self.context.route_snapshot["waypoints"]
+        if not stop and index + 1 < len(waypoints):
+            nxt = waypoints[index + 1]
+            dx = float(nxt["x"]) - float(waypoint["x"])
+            dy = float(nxt["y"]) - float(waypoint["y"])
+            if hypot(dx, dy) >= 1e-3:
+                return atan2(dy, dx)
+        return self._pass_through_yaw(index, waypoint)
+
+    def _dispatch_navigation(self, index: int) -> None:
         if not self.context:
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "task context is missing")
         if not self._prepare_robot_for_navigation():
             return
-        self._apply_navigation_profile(index)
-        waypoint = self.context.route_snapshot["waypoints"][index]
-        self._set_localization_policy(waypoint, "moving")
-        waypoints = [waypoint]
+        waypoints = self.context.route_snapshot["waypoints"]
+        if index >= len(waypoints):
+            raise ProtocolError("TASK_CONTEXT_MISMATCH", "waypoint index is past the route")
+        batch_end = self._batch_end_index(index)
+        original_batch = [dict(waypoints[item_index]) for item_index in range(index, batch_end)]
+        batch = (
+            original_batch
+            if self._is_docking_task()
+            else straighten_pass_through_waypoints(original_batch)
+        )
+        self._apply_batch_travel_yaw(batch, index)
+        last_index = batch_end - 1
+        if batch is not original_batch:
+            max_shift = max(
+                (
+                    hypot(
+                        float(straight["x"]) - float(original["x"]),
+                        float(straight["y"]) - float(original["y"]),
+                    )
+                    for straight, original in zip(batch, original_batch)
+                ),
+                default=0.0,
+            )
+            if max_shift > 1e-3:
+                LOGGER.info(
+                    "straightened patrol Nav2 goal by up to %.2fm so colinear clicks do not weave",
+                    max_shift,
+                )
+        single = len(batch) == 1
+        patrol_final = (not self._is_docking_task()) and last_index == len(waypoints) - 1
+        self._patrol_final_approach_applied = False
+        self._apply_navigation_profile(
+            index,
+            force_final=single and patrol_final,
+            force_require_yaw=single and bool(waypoints[last_index].get("require_yaw", False)),
+        )
+        self._set_localization_policy(batch[0], "moving")
         self._goal_offset = index
-        accepted = self.navigation.send_waypoints(waypoints, self.on_feedback, self.on_navigation_result)
+        self._dispatched_count = len(batch)
+        accepted = self.navigation.send_waypoints(batch, self.on_feedback, self.on_navigation_result)
         if not accepted:
             self._fail("NAV_STACK_NOT_READY", "FollowWaypoints goal was rejected")
             return
+        self.context.current_waypoint_index = index
         self.context.state = "running"
         self.context.state_version += 1
         self._persist()
@@ -620,13 +849,38 @@ class TaskExecutor:
                 "skipped_waypoints": index,
                 "execution_waypoint_order": [
                     point.get("map_point_number", int(point.get("sequence", 0)) + 1)
-                    for point in self.context.route_snapshot["waypoints"][index:]
+                    for point in waypoints[index:]
                 ],
             },
         )
         self.on_feedback(0, milestone="target_dispatched")
         if self._segment_avoidance_enabled:
             self._start_obstacle_monitor()
+
+    def _pass_through_yaw(self, index: int, waypoint: dict) -> float:
+        """Use travel heading for pass-through patrol points (cloud yaw is often 0)."""
+        if bool(waypoint.get("require_yaw", False)):
+            return float(waypoint.get("yaw") or 0.0)
+        target_x = float(waypoint["x"])
+        target_y = float(waypoint["y"])
+        source_x = None
+        source_y = None
+        if index > 0:
+            previous = self.context.route_snapshot["waypoints"][index - 1]
+            source_x = float(previous["x"])
+            source_y = float(previous["y"])
+        else:
+            pose = self.navigation.latest_pose() if self.navigation else None
+            if pose is not None:
+                source_x = float(getattr(pose, "x", target_x))
+                source_y = float(getattr(pose, "y", target_y))
+        if source_x is None:
+            return float(waypoint.get("yaw") or 0.0)
+        dx = target_x - source_x
+        dy = target_y - source_y
+        if hypot(dx, dy) < 1e-3:
+            return float(waypoint.get("yaw") or 0.0)
+        return atan2(dy, dx)
 
     def _set_localization_policy(self, waypoint: dict, phase: str) -> None:
         setter = getattr(self.navigation, "set_localization_policy", None)
@@ -641,7 +895,7 @@ class TaskExecutor:
         while time.monotonic() <= deadline:
             decision = getter() or {}
             source = str(decision.get("active_source") or "")
-            if source in {"ndt_imu", "rtk_imu"} and bool(decision.get("absolute_stable")):
+            if source in {"ndt_imu", "rtk_imu", "lio_imu"} and bool(decision.get("absolute_stable")):
                 return True
             time.sleep(0.1)
         return False
@@ -780,14 +1034,24 @@ class TaskExecutor:
         milestone: str = "",
         completed_waypoints: int | None = None,
     ) -> None:
+        apply_final = False
+        progress = None
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
             current_waypoint_index += self._goal_offset
             self.context.current_waypoint_index = current_waypoint_index
+            total = len(self.context.route_snapshot["waypoints"])
+            if (
+                not self._is_docking_task()
+                and current_waypoint_index == total - 1
+                and not self._patrol_final_approach_applied
+                and milestone != "waypoint_reached"
+            ):
+                self._patrol_final_approach_applied = True
+                apply_final = True
             self.context.state_version += 1
             self._persist()
-            total = len(self.context.route_snapshot["waypoints"])
             waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index] if current_waypoint_index < total else None
             pose = self.navigation.latest_pose()
             robot_pose = None
@@ -798,36 +1062,48 @@ class TaskExecutor:
                     "yaw": float(getattr(pose, "yaw", 0.0)),
                     "sampled_at": getattr(pose, "sampled_at", None),
                 }
-            self.event_callback(
-                "task.progress",
-                {
-                    "task_execution_id": self.context.task_execution_id,
-                    "state": "running",
-                    "state_version": self.context.state_version,
-                    "current_waypoint_index": current_waypoint_index,
-                    "current_waypoint_id": waypoint["waypoint_id"] if waypoint else "",
-                    "completed_waypoints": current_waypoint_index if completed_waypoints is None else completed_waypoints,
-                    "total_waypoints": total,
-                    "distance_remaining_m": distance_remaining_m,
-                    "estimated_time_remaining_s": None,
-                    "reported_at": now_iso(),
-                    "milestone": milestone or None,
-                    "execution_waypoint_order": [
-                        point.get("map_point_number", int(point.get("sequence", 0)) + 1)
-                        for point in self.context.route_snapshot["waypoints"]
-                    ],
-                    "waypoint": {
-                        "waypoint_id": waypoint.get("waypoint_id"),
-                        "map_point_number": waypoint.get("map_point_number", int(waypoint.get("sequence", 0)) + 1),
-                        "name": waypoint.get("name") or "",
-                        "x": float(waypoint["x"]),
-                        "y": float(waypoint["y"]),
-                        "yaw": float(waypoint["yaw"]),
-                    } if waypoint else None,
-                    "robot_pose": robot_pose,
-                },
-                "",
-            )
+            progress = {
+                "task_execution_id": self.context.task_execution_id,
+                "state": "running",
+                "state_version": self.context.state_version,
+                "current_waypoint_index": current_waypoint_index,
+                "current_waypoint_id": waypoint["waypoint_id"] if waypoint else "",
+                "completed_waypoints": current_waypoint_index if completed_waypoints is None else completed_waypoints,
+                "total_waypoints": total,
+                "distance_remaining_m": distance_remaining_m,
+                "estimated_time_remaining_s": None,
+                "reported_at": now_iso(),
+                "milestone": milestone or None,
+                "execution_waypoint_order": [
+                    point.get("map_point_number", int(point.get("sequence", 0)) + 1)
+                    for point in self.context.route_snapshot["waypoints"]
+                ],
+                "waypoint": {
+                    "waypoint_id": waypoint.get("waypoint_id"),
+                    "map_point_number": waypoint.get("map_point_number", int(waypoint.get("sequence", 0)) + 1),
+                    "name": waypoint.get("name") or "",
+                    "x": float(waypoint["x"]),
+                    "y": float(waypoint["y"]),
+                    "yaw": float(waypoint["yaw"]),
+                } if waypoint else None,
+                "robot_pose": robot_pose,
+            }
+        if apply_final:
+            try:
+                self._apply_patrol_final_approach()
+            except ProtocolError:
+                LOGGER.exception(
+                    "final-approach navigation profile failed; continuing the current goal"
+                )
+        with self._lock:
+            if not self.context or self.context.state != "running" or progress is None:
+                if apply_final:
+                    try:
+                        self._restore_navigation_profile()
+                    except Exception:
+                        LOGGER.exception("failed to restore profile after late final approach")
+                return
+            self.event_callback("task.progress", progress, "")
 
     def on_navigation_result(self, status: str, error_message: str = "", details: dict | None = None) -> None:
         with self._lock:
@@ -843,8 +1119,11 @@ class TaskExecutor:
                         f"Nav2 reported missed waypoints: {absolute_missed}",
                     )
                     return
-                reached_index = self._goal_offset
+                reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
                 reached_waypoint = self.context.route_snapshot["waypoints"][reached_index]
+                total_waypoints = len(self.context.route_snapshot["waypoints"])
+                if reached_index + 1 >= total_waypoints:
+                    self._hold_final_pose()
                 self._set_localization_policy(reached_waypoint, "stationary")
                 if not self._absolute_localization_ready():
                     self.navigation.stop_motion()
@@ -889,8 +1168,8 @@ class TaskExecutor:
                             return
                     self._send_from(next_waypoint_index)
                     return
-                self._restore_navigation_profile()
                 pose_error = self._final_pose_error()
+                self._restore_navigation_profile()
                 if pose_error:
                     self._fail(*pose_error)
                     return
@@ -947,7 +1226,13 @@ class TaskExecutor:
             self._stop_obstacle_monitor()
             self._emit("task.docking_final_approach", message="进入充电桩末段：微速、实时避障关闭")
 
-    def _apply_navigation_profile(self, waypoint_index: int) -> None:
+    def _apply_navigation_profile(
+        self,
+        waypoint_index: int,
+        *,
+        force_final: bool | None = None,
+        force_require_yaw: bool | None = None,
+    ) -> None:
         if not self.context:
             return
         waypoints = self.context.route_snapshot.get("waypoints") or []
@@ -964,19 +1249,46 @@ class TaskExecutor:
             if waypoint_index >= final_index:
                 avoid_obstacles = False
             precision_goal = waypoint_index == final_index
+        patrol_final = (not self._is_docking_task()) and waypoint_index == len(waypoints) - 1
+        require_yaw = bool(target.get("require_yaw", False)) or precision_goal
+        final_approach = patrol_final or precision_goal
+        if force_require_yaw is not None:
+            require_yaw = bool(force_require_yaw) or precision_goal
+        if force_final is not None:
+            final_approach = bool(force_final) or precision_goal
         self._segment_avoidance_enabled = avoid_obstacles
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if callable(setter):
             setter(
                 avoid_obstacles=avoid_obstacles,
-                require_yaw=bool(target.get("require_yaw", False)) or precision_goal,
+                require_yaw=require_yaw,
+                final_approach=final_approach,
             )
-        precision_setter = getattr(self.navigation, "set_goal_precision", None)
-        if callable(precision_setter):
-            precision_setter(enabled=precision_goal)
-        self._apply_docking_profile(waypoint_index)
+        outdoor_setter = getattr(self.navigation, "apply_outdoor_gps_profile", None)
+        if callable(outdoor_setter):
+            outdoor_setter()
+        if self._is_docking_task():
+            precision_setter = getattr(self.navigation, "set_goal_precision", None)
+            if callable(precision_setter):
+                precision_setter(enabled=precision_goal)
+            self._apply_docking_profile(waypoint_index)
         if not avoid_obstacles:
             self._stop_obstacle_monitor()
+
+    def _apply_patrol_final_approach(self) -> None:
+        """Slow the live FollowPath goal; do not touch costmaps or docking precision."""
+        setter = getattr(self.navigation, "set_waypoint_profile", None)
+        if not callable(setter):
+            return
+        kwargs = {
+            "avoid_obstacles": self._segment_avoidance_enabled,
+            "require_yaw": False,
+            "final_approach": True,
+        }
+        try:
+            setter(**kwargs, live=True)
+        except TypeError:
+            setter(**kwargs)
 
     def _restore_docking_profile(self) -> None:
         setter = getattr(self.navigation, "set_docking_profile", None)
@@ -988,11 +1300,12 @@ class TaskExecutor:
         try:
             setter = getattr(self.navigation, "set_waypoint_profile", None)
             if callable(setter):
-                setter(avoid_obstacles=True, require_yaw=False)
-            precision_setter = getattr(self.navigation, "set_goal_precision", None)
-            if callable(precision_setter):
-                precision_setter(enabled=False)
-            self._restore_docking_profile()
+                setter(avoid_obstacles=True, require_yaw=False, final_approach=False)
+            if self._is_docking_task():
+                precision_setter = getattr(self.navigation, "set_goal_precision", None)
+                if callable(precision_setter):
+                    precision_setter(enabled=False)
+                self._restore_docking_profile()
         except Exception:
             LOGGER.exception("failed to restore default navigation profile")
 
@@ -1039,6 +1352,20 @@ class TaskExecutor:
             if not self.context or self.context.state != "running":
                 return
             self._send_from(self.context.current_waypoint_index)
+
+    def _hold_final_pose(self) -> None:
+        """Stop the dog before measuring the last waypoint.
+
+        Nav2's checker does not require zero velocity, and a quadruped still
+        coasts after /cmd_vel goes to zero. Measuring immediately lets that
+        coast fail a 0.35 m check the controller had already accepted.
+        """
+        stop_motion = getattr(self.navigation, "stop_motion", None)
+        if callable(stop_motion):
+            stop_motion()
+        is_stopped = getattr(self.navigation, "is_robot_stopped", None)
+        if callable(is_stopped):
+            is_stopped()
 
     def _final_pose_error(self) -> tuple[str, str] | None:
         if not self.context:

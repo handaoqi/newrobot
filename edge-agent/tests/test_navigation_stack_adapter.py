@@ -40,3 +40,34 @@ def test_reload_map_runs_when_both_consumers_are_active(tmp_path, monkeypatch):
 
     assert result["returncode"] == 0
     assert calls == [("/maps/map.pcd", "/maps/map.yaml")]
+
+
+
+def _ready_status_stdout(*, localization_status: str = "3") -> str:
+    return (
+        "ros2 launch localization localization.launch.py\n"
+        "ros2 launch robot_navigo navigation_bringup.launch.py\n"
+        "/planner_server\n"
+        "/controller_server\n"
+        "/bt_navigator\n"
+        "active [3]\n"
+        "/follow_waypoints\n"
+        "/cmd_vel\n"
+        f"status: {localization_status}\n"
+    )
+
+
+def test_start_is_already_ready_only_when_localization_is_valid(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    runs = []
+    monkeypatch.setattr(adapter, "_run", lambda action, timeout_seconds=0: runs.append((action, timeout_seconds)) or {"action": action, "returncode": 0})
+
+    monkeypatch.setattr(adapter, "status", lambda: {"returncode": 0, "stdout": _ready_status_stdout(localization_status="0")})
+    adapter.start()
+    assert runs == [("start", 180)]
+
+    runs.clear()
+    monkeypatch.setattr(adapter, "status", lambda: {"returncode": 0, "stdout": _ready_status_stdout(localization_status="3")})
+    result = adapter.start()
+    assert result["recovery"] == "already_ready"
+    assert runs == []

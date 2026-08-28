@@ -153,6 +153,62 @@ def test_task_start_rejects_transient_localization(tmp_path):
     assert error.value.code == "LOCALIZATION_NOT_STABLE"
 
 
+def test_wait_until_localization_stable_blocks_until_window(monkeypatch):
+    clock = {"t": 100.0}
+    monkeypatch.setattr("roamerx_edge.safety_policy.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        "roamerx_edge.safety_policy.time.sleep",
+        lambda dt: clock.__setitem__("t", clock["t"] + dt),
+    )
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=99.1,
+    )
+    SafetyPolicy(SafetyConfig(), state).wait_until_localization_stable()
+    assert clock["t"] >= 102.1
+
+
+def test_task_start_waits_then_accepts_fresh_normal_localization(tmp_path, monkeypatch):
+    clock = {"t": 100.0}
+    monkeypatch.setattr("roamerx_edge.safety_policy.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        "roamerx_edge.safety_policy.time.sleep",
+        lambda dt: clock.__setitem__("t", clock["t"] + dt),
+    )
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=99.1,
+        nav_ready=True,
+        control_mode="autonomous",
+        current_map_id="site-a-main",
+        current_map_version="v1",
+    )
+    acks = []
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda command_id, payload: acks.append(payload),
+        publish_result=lambda *args: None,
+    )
+
+    ack, _ = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert clock["t"] >= 102.1
+    store.close()
+
+
 def test_duplicate_command_is_not_executed_twice(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -730,4 +786,47 @@ def test_map_activation_succeeds_when_reload_is_deferred_after_mapping(tmp_path)
     assert result["payload"]["status"] == "succeeded"
     assert result["payload"]["result"]["map_reload"]["deferred"] is True
     assert state.localization_status == "initializing"
+    store.close()
+
+
+
+def test_nav_start_waits_for_in_flight_stack_command(tmp_path):
+    import threading
+
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.start"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    store = LocalStore(str(tmp_path / "edge.db"))
+
+    class Stack:
+        def __init__(self):
+            self.started = False
+
+        def start(self, command=None):
+            self.started = True
+            return {"action": "start", "returncode": 0}
+
+    stack = Stack()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=TaskExecutor(
+            store, FakeNavigation(), event_callback=lambda *args: None, start_result_callback=lambda *args: None
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        navigation_stack_adapter=stack,
+    )
+    processor._navigation_command_lock.acquire()
+
+    def release_soon():
+        time.sleep(0.3)
+        processor._navigation_command_lock.release()
+
+    threading.Thread(target=release_soon, daemon=True).start()
+    _, result = processor.handle_command(raw)
+    assert result["payload"]["status"] == "succeeded"
+    assert stack.started is True
     store.close()

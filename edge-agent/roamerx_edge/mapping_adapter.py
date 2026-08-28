@@ -105,6 +105,11 @@ class MappingAdapter:
         "ros2 launch robot_slam",
         "slam.launch.py",
     )
+    LIO_ODOMETRY_PROCESS_MARKERS = (
+        "lio_odometry.launch",
+        "__node:=lio_odometry",
+        "frontend.odometry_only:=true",
+    )
 
     def __init__(self, config: MappingConfig, media_client: MediaClient) -> None:
         self.config = config
@@ -1203,6 +1208,7 @@ class MappingAdapter:
         forbidden = {
             "/localization", "/planner_server", "/controller_server", "/bt_navigator",
             "/behavior_server", "/waypoint_follower", "/navigo_container",
+            "/lio_odometry",
         }
         remaining = sorted(name for name in self._ros_node_names() if name in forbidden)
         if remaining or self._find_slam_process_pids():
@@ -2183,9 +2189,15 @@ class MappingAdapter:
                 continue
             if pid == current_pid:
                 continue
+            if self._is_lio_odometry_process(args):
+                continue
             if any(re.search(pattern, args) for pattern in self.SLAM_PROCESS_PATTERNS):
                 pids.append(pid)
         return pids
+
+    @staticmethod
+    def _is_lio_odometry_process(args: str) -> bool:
+        return any(marker in args for marker in MappingAdapter.LIO_ODOMETRY_PROCESS_MARKERS)
 
     def _stop_orphan_slam_processes(self) -> None:
         pids = self._find_slam_process_pids()

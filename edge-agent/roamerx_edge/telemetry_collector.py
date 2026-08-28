@@ -68,6 +68,11 @@ class TelemetryCollector:
         self._pose: PoseSnapshot | None = None
         self._localization_quality: LocalizationQualitySnapshot | None = None
         self._localization_decision: dict = {}
+        # Progress of an in-flight localization recovery. Empty when not recovering.
+        self._localization_recovery: dict = {}
+        # Latest lidar-IMU vs 3588-IMU comparison. Monitoring only.
+        self._imu_cross_check: dict = {}
+        self._storage: dict = {}
         self._raw_rtk: dict = {}
         self._state_version = 0
         self.power_available = False
@@ -286,6 +291,25 @@ class TelemetryCollector:
         with self._lock:
             return dict(self._localization_decision)
 
+    def on_localization_recovery(self, payload: dict | None) -> None:
+        """Record recovery progress so a stuck recovery is visible from the platform.
+
+        Pass None or an empty dict once recovery ends.
+        """
+        with self._lock:
+            self._localization_recovery = dict(payload or {})
+            self._state_version += 1
+
+    def on_imu_cross_check(self, payload: dict | None) -> None:
+        """Record the dual-IMU comparison so both gyros are visible on the platform.
+
+        Deliberately not folded into `quality`: that object describes the NDT
+        match, while this describes the sensors feeding it.
+        """
+        with self._lock:
+            self._imu_cross_check = dict(payload or {})
+            self._state_version += 1
+
     def localization_diagnostics(self) -> dict:
         with self._lock:
             pose = self._pose
@@ -338,6 +362,17 @@ class TelemetryCollector:
         with self._lock:
             self._audio_sampled_monotonic = time.monotonic()
             self._audio_details = details
+
+    def on_storage(self, payload: dict | None) -> None:
+        """Record disk occupancy and the last retention pass.
+
+        Recordings and maps are the only things on this robot that grow
+        without bound, and retention now deletes some of them on its own. Both
+        halves belong upstream: the occupancy so the trend is visible before
+        it becomes an outage, the deletions so nothing disappears silently.
+        """
+        with self._lock:
+            self._storage = dict(payload or {})
 
     def latest_pose(self) -> PoseSnapshot | None:
         with self._lock:
@@ -402,6 +437,8 @@ class TelemetryCollector:
                         "prediction_errors": quality.prediction_errors,
                     } if quality else None,
                     "decision": dict(self._localization_decision),
+                    "recovery": dict(self._localization_recovery) or None,
+                    "imu_cross_check": dict(self._imu_cross_check) or None,
                     "raw_rtk": dict(self._raw_rtk) if self._raw_rtk else None,
                     "time_diagnostics": self._time_diagnostics_locked(now),
                 },
@@ -422,6 +459,7 @@ class TelemetryCollector:
                     **(self._audio_details if audio_fresh else {}),
                 },
                 "sensors": sensors,
+                "storage": dict(self._storage) or None,
                 "runtime": {
                     "ros_ready": True,
                     "nav_ready": self.safety_state.nav_ready,

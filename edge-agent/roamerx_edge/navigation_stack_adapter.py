@@ -18,10 +18,15 @@ class NavigationStackAdapter:
         return self._run("status", timeout_seconds=min(self.config.command_timeout_seconds, 20))
 
     def start(self, command: dict | None = None) -> dict:
-        return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 90))
+        status_payload = self.status()
+        if status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
+            status_payload["action"] = "start"
+            status_payload["recovery"] = "already_ready"
+            return status_payload
+        return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 180))
 
     def restart(self, command: dict | None = None) -> dict:
-        return self._run("restart", timeout_seconds=max(self.config.command_timeout_seconds, 90))
+        return self._run("restart", timeout_seconds=max(self.config.command_timeout_seconds, 180))
 
     def restart_localization(self) -> dict:
         """Restart only localization so a paused task can reseed it safely."""
@@ -125,6 +130,7 @@ class NavigationStackAdapter:
             "active [3]",
             "/follow_waypoints",
             "/cmd_vel",
+            "status: 3",
         )
         return all(token in stdout for token in required)
 
@@ -132,14 +138,26 @@ class NavigationStackAdapter:
         script = Path(self.config.script_path).expanduser()
         if not script.exists():
             raise ProtocolError("NAV_SCRIPT_MISSING", f"navigation script not found: {script}")
-        completed = subprocess.run(
-            [str(script), action],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-        )
+        try:
+            completed = subprocess.run(
+                [str(script), action],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            payload = {
+                "action": action,
+                "returncode": 124,
+                "stdout": (exc.stdout or "")[-6000:],
+                "stderr": (exc.stderr or "")[-6000:],
+            }
+            raise ProtocolError(
+                "NAV_COMMAND_FAILED",
+                payload["stderr"] or payload["stdout"] or f"navigation {action} timed out after {timeout_seconds}s",
+            ) from exc
         payload = {
             "action": action,
             "returncode": completed.returncode,

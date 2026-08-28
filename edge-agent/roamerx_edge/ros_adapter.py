@@ -9,6 +9,7 @@ from collections import deque
 from typing import Callable
 
 from .config import MappingConfig, RosConfig, SafetyConfig
+from .imu_cross_check import ImuCrossCheck, ImuCrossCheckConfig
 from .protocol import ProtocolError
 from .rtk_origin import RtkOriginPayloadCache
 from .safety_policy import RuntimeSafetyState
@@ -16,12 +17,46 @@ from .telemetry_collector import TelemetryCollector
 
 LOGGER = logging.getLogger(__name__)
 
+
+def follow_path_patrol_params(
+    *,
+    final_approach: bool,
+    local_obstacles: bool,
+) -> dict[str, bool | float]:
+    """MPPI settings for a patrol goal.
+
+    Cruise must not hug a slightly jagged through-poses polyline: PathAlign plus
+    path orientations turns click noise into left/right steering. CostCritic is
+    only useful when the local obstacle layer is actually painting. Final
+    approach slows down so the DiffDrive turning radius fits the 0.35 m window.
+    """
+    vx_max = 0.15 if final_approach else 0.30
+    vx_min = -0.15 if final_approach else -0.12
+    wz_max = 0.50 if final_approach else 0.35
+    return {
+        "FollowPath.vx_max": vx_max,
+        "FollowPath.vx_min": vx_min,
+        "FollowPath.vy_max": 0.5,
+        "FollowPath.wz_max": wz_max,
+        "FollowPath.wz_std": 0.08,
+        "FollowPath.GoalCritic.enabled": bool(final_approach),
+        "FollowPath.GoalAngleCritic.enabled": False,
+        "FollowPath.PreferForwardCritic.enabled": not final_approach,
+        "FollowPath.CostCritic.enabled": bool(local_obstacles),
+        "FollowPath.PathAlignCritic.enabled": bool(final_approach),
+        "FollowPath.PathAlignCritic.offset_from_furthest": 4,
+        "FollowPath.PathAlignCritic.use_path_orientations": False,
+        "FollowPath.PathFollowCritic.enabled": True,
+        "FollowPath.PathAngleCritic.enabled": True,
+        "FollowPath.PathAngleCritic.max_angle_to_furthest": 0.40,
+    }
+
 try:
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from geometry_msgs.msg import PoseWithCovarianceStamped
     from geometry_msgs.msg import Twist
-    from nav2_msgs.action import FollowWaypoints
+    from nav2_msgs.action import FollowWaypoints, NavigateThroughPoses
     from nav_msgs.msg import Odometry
     from action_msgs.srv import CancelGoal
     from lifecycle_msgs.srv import GetState
@@ -29,7 +64,7 @@ try:
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-    from sensor_msgs.msg import LaserScan, NavSatFix
+    from sensor_msgs.msg import Imu, LaserScan, NavSatFix
     from robots_dog_msgs.msg import Localization, UniRtkPvh
     from std_msgs.msg import Bool, String
     from std_srvs.srv import Trigger
@@ -40,6 +75,16 @@ try:
 except ImportError:
     ROS_AVAILABLE = False
     Node = object
+
+try:
+    if ROS_AVAILABLE:
+        from robots_dog_msgs.msg import HighLevelRobotState
+    else:
+        HighLevelRobotState = None
+except ImportError:
+    # Carries the 3588 BMI088 gyro. Only used for cross-checking the lidar IMU,
+    # so a missing definition must not cost the agent anything else.
+    HighLevelRobotState = None
 
 try:
     if ROS_AVAILABLE:
@@ -61,6 +106,7 @@ class RosAdapter(Node):
         telemetry: TelemetryCollector,
         safety_state: RuntimeSafetyState,
         mapping_config: MappingConfig | None = None,
+        imu_cross_check_config: ImuCrossCheckConfig | None = None,
     ) -> None:
         if not ROS_AVAILABLE:
             raise RuntimeError("ROS2 Python packages are not available")
@@ -70,12 +116,17 @@ class RosAdapter(Node):
         self.telemetry = telemetry
         self.safety_state = safety_state
         self._goal_handle = None
+        self._nav_cancel_action = ros_config.follow_waypoints_action
+        self._sent_pose_count = 0
         self._result_cb: Callable | None = None
         self._feedback_cb: Callable | None = None
         self._localization_failure_cb: Callable | None = None
         self._localization_recovery_cb: Callable | None = None
         self._trusted_pose_cb: Callable | None = None
         self._mapping_divergence_cb: Callable | None = None
+        self._imu_cross_check_cb: Callable | None = None
+        self._imu_cross_check = ImuCrossCheck(imu_cross_check_config)
+        self._imu_cross_check_lock = threading.Lock()
         self._last_trusted_pose: dict | None = None
         self._last_trusted_pose_report_monotonic = 0.0
         self._localization_sample_condition = threading.Condition()
@@ -120,6 +171,7 @@ class RosAdapter(Node):
         self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
+        self._subscribe_imu_cross_check()
         if mapping_config is not None:
             self.create_subscription(
                 NavSatFix,
@@ -159,6 +211,11 @@ class RosAdapter(Node):
                 "localization ScanMatchingStatus message is unavailable; quality telemetry subscription is disabled"
             )
         self._action_client = ActionClient(self, FollowWaypoints, ros_config.follow_waypoints_action)
+        through_poses_action = getattr(
+            ros_config, "navigate_through_poses_action", "/navigate_through_poses"
+        )
+        self._through_poses_client = ActionClient(self, NavigateThroughPoses, through_poses_action)
+        self._through_poses_action = through_poses_action
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
         self._rtk_initial_pose_client = self.create_client(Trigger, "/localization/seed_from_rtk")
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -367,6 +424,7 @@ class RosAdapter(Node):
             self._localization_recovery_armed = True
             threading.Thread(
                 target=self._localization_failure_cb,
+                args=("localization_lost",),
                 daemon=True,
                 name="localization-loss-handler",
             ).start()
@@ -424,6 +482,13 @@ class RosAdapter(Node):
             float(getattr(msg, "inlier_fraction", 0.0)),
         )
         self.telemetry.on_scan_matching_status(msg)
+        # Outdoor RTK-primary navigation still publishes NDT as a shadow health
+        # check. Open sky often has an empty/poor scan match even when GPS pose
+        # is centimetre-grade. That must not pause the task as localization loss.
+        if self._rtk_is_navigation_pose_source() or self._lio_is_navigation_pose_source():
+            self._ndt_failure_count = 0
+            self._ndt_failure_notified = False
+            return
         score = float(getattr(msg, "matching_error", float("inf")))
         healthy = bool(getattr(msg, "has_converged", False)) and math.isfinite(score) and (
             score < self.safety_config.ndt_failure_score
@@ -442,14 +507,26 @@ class RosAdapter(Node):
             self._localization_recovery_armed = True
             threading.Thread(
                 target=self._localization_failure_cb,
+                args=("ndt_degraded",),
                 daemon=True,
                 name="ndt-failure-handler",
             ).start()
 
+    def _rtk_is_navigation_pose_source(self) -> bool:
+        decision = self.telemetry.localization_decision()
+        return (
+            decision.get("active_source") == "rtk_imu"
+            and decision.get("rtk_usable") is True
+        )
+
+    def _lio_is_navigation_pose_source(self) -> bool:
+        decision = self.telemetry.localization_decision()
+        return decision.get("active_source") == "lio_imu"
+
     def _absolute_localization_stable(self) -> bool:
         decision = self.telemetry.localization_decision()
         return bool(
-            decision.get("active_source") in {"ndt_imu", "rtk_imu"}
+            decision.get("active_source") in {"ndt_imu", "rtk_imu", "lio_imu"}
             and decision.get("absolute_stable")
         )
 
@@ -474,6 +551,66 @@ class RosAdapter(Node):
             if x >= 0.18 and abs(y) <= 0.35:
                 nearest = distance if nearest is None else min(nearest, distance)
         self._front_obstacle_distance_m = nearest
+
+    def _subscribe_imu_cross_check(self) -> None:
+        """Subscribe both gyro feeds, if the pieces for the comparison exist.
+
+        Pure monitoring: nothing here feeds the localization or control path,
+        so every missing piece degrades to "no comparison" instead of an error.
+        """
+        config = self._imu_cross_check.config
+        if not config.enabled:
+            return
+        self.create_subscription(
+            Imu, config.lidar_imu_topic, self._on_lidar_imu, qos_profile_sensor_data
+        )
+        if HighLevelRobotState is None:
+            LOGGER.warning(
+                "robots_dog_msgs HighLevelRobotState is unavailable; "
+                "the 3588 IMU cross-check will only report the lidar side"
+            )
+            return
+        self.create_subscription(
+            HighLevelRobotState,
+            config.robot_state_topic,
+            self._on_high_level_robot_state,
+            qos_profile_sensor_data,
+        )
+
+    def _on_lidar_imu(self, msg) -> None:
+        # Also the evaluation trigger: this feed runs at 200 Hz and is always
+        # present, so driving the comparison from here is what lets a missing
+        # 3588 stream be reported as absent rather than simply going quiet.
+        gyro = msg.angular_velocity
+        now = time.monotonic()
+        with self._imu_cross_check_lock:
+            self._imu_cross_check.add_lidar_gyro(now, gyro.x, gyro.y, gyro.z)
+            if not self._imu_cross_check.due(now):
+                return
+            report = self._imu_cross_check.evaluate(now)
+        self._publish_imu_cross_check(report)
+
+    def _on_high_level_robot_state(self, msg) -> None:
+        gyro = msg.gyro
+        with self._imu_cross_check_lock:
+            self._imu_cross_check.add_body_gyro(time.monotonic(), gyro.x, gyro.y, gyro.z)
+
+    def _publish_imu_cross_check(self, report: dict) -> None:
+        try:
+            self.telemetry.on_imu_cross_check(report)
+        except Exception:
+            LOGGER.exception("failed to record IMU cross-check telemetry")
+        if self._imu_cross_check_cb is None:
+            return
+        try:
+            # Every report, not just the bad ones: the consumer needs the
+            # healthy ones to know when to re-arm its alert.
+            self._imu_cross_check_cb(report)
+        except Exception:
+            LOGGER.exception("IMU cross-check callback failed")
+
+    def set_imu_cross_check_callback(self, callback: Callable) -> None:
+        self._imu_cross_check_cb = callback
 
     def _on_sensor_health(self, msg) -> None:
         try:
@@ -554,7 +691,7 @@ class RosAdapter(Node):
     def send_waypoints(self, waypoints: list[dict], feedback_cb: Callable, result_cb: Callable) -> bool:
         if not self.wait_until_ready(timeout_seconds=30):
             return False
-        goal = FollowWaypoints.Goal()
+        poses = []
         for waypoint in waypoints:
             pose = PoseStamped()
             pose.header.frame_id = "map"
@@ -562,12 +699,29 @@ class RosAdapter(Node):
             pose.pose.position.x = float(waypoint["x"])
             pose.pose.position.y = float(waypoint["y"])
             yaw = float(waypoint.get("yaw", 0.0))
-            pose.pose.orientation.z = __import__("math").sin(yaw / 2)
-            pose.pose.orientation.w = __import__("math").cos(yaw / 2)
-            goal.poses.append(pose)
+            pose.pose.orientation.z = math.sin(yaw / 2)
+            pose.pose.orientation.w = math.cos(yaw / 2)
+            poses.append(pose)
         self._feedback_cb = feedback_cb
         self._result_cb = result_cb
-        future = self._action_client.send_goal_async(goal, feedback_callback=self._on_feedback)
+        self._sent_pose_count = len(poses)
+        use_through_poses = len(poses) > 1
+        if use_through_poses:
+            if not self._through_poses_client.wait_for_server(timeout_sec=5.0):
+                LOGGER.error("NavigateThroughPoses action server is unavailable")
+                return False
+            goal = NavigateThroughPoses.Goal()
+            goal.poses = poses
+            client = self._through_poses_client
+            feedback_cb_ros = self._on_through_poses_feedback
+            self._nav_cancel_action = self._through_poses_action
+        else:
+            goal = FollowWaypoints.Goal()
+            goal.poses = poses
+            client = self._action_client
+            feedback_cb_ros = self._on_feedback
+            self._nav_cancel_action = self.ros_config.follow_waypoints_action
+        future = client.send_goal_async(goal, feedback_callback=feedback_cb_ros)
         completed = threading.Event()
         future.add_done_callback(lambda _: completed.set())
         completed.wait(timeout=5)
@@ -581,6 +735,15 @@ class RosAdapter(Node):
     def _on_feedback(self, feedback_message) -> None:
         if self._feedback_cb:
             self._feedback_cb(int(feedback_message.feedback.current_waypoint), None)
+
+    def _on_through_poses_feedback(self, feedback_message) -> None:
+        if not self._feedback_cb:
+            return
+        remaining = int(getattr(feedback_message.feedback, "number_of_poses_remaining", 0) or 0)
+        sent = max(self._sent_pose_count, 1)
+        current = min(max(sent - remaining, 0), sent - 1)
+        distance = getattr(feedback_message.feedback, "distance_remaining", None)
+        self._feedback_cb(current, None if distance is None else float(distance))
 
     def _on_result(self, future) -> None:
         try:
@@ -975,10 +1138,10 @@ class RosAdapter(Node):
             # local handle is gone while Nav2 continues executing the goal.
             # A default CancelGoal request cancels every goal on this action.
             client = self.create_client(
-                CancelGoal, f"{self.ros_config.follow_waypoints_action}/_action/cancel_goal")
+                CancelGoal, f"{self._nav_cancel_action}/_action/cancel_goal")
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 2.0)):
                 self.destroy_client(client)
-                LOGGER.error("FollowWaypoints cancel service is unavailable")
+                LOGGER.error("%s cancel service is unavailable", self._nav_cancel_action)
                 return False
             future = client.call_async(CancelGoal.Request())
         completed = threading.Event()
@@ -987,7 +1150,7 @@ class RosAdapter(Node):
         response = future.result() if future.done() else None
         cancelled = bool(response and response.goals_canceling)
         if not cancelled:
-            LOGGER.error("FollowWaypoints cancellation was not acknowledged")
+            LOGGER.error("%s cancellation was not acknowledged", self._nav_cancel_action)
         return cancelled
 
     def stop_motion(self) -> None:
@@ -1019,22 +1182,100 @@ class RosAdapter(Node):
             final_approach, vx_min, vx_max, wz_max,
         )
 
-    def set_waypoint_profile(self, *, avoid_obstacles: bool, require_yaw: bool) -> None:
-        enabled = "true" if avoid_obstacles else "false"
+    def set_waypoint_profile(
+        self,
+        *,
+        avoid_obstacles: bool,
+        require_yaw: bool,
+        final_approach: bool = False,
+        live: bool = False,
+    ) -> None:
         yaw_message = Bool()
         yaw_message.data = bool(require_yaw)
         self._goal_yaw_required_pub.publish(yaw_message)
-        for node_name, parameter_name in (
-            ("/local_costmap/local_costmap", "obstacle_layer.enabled"),
-            ("/global_costmap/global_costmap", "obstacle_layer.enabled"),
-            ("/collision_monitor", "PolygonStop.enabled"),
-            ("/collision_monitor", "PolygonSlow.enabled"),
-        ):
+        outdoor = self._rtk_is_navigation_pose_source()
+        # Temporary smoothness test: keep lidar local avoidance off even
+        # when a waypoint asks for obstacles. Edge startup was turning it
+        # back on before RTK was classified as the pose source.
+        local_obstacles = False
+        global_obstacles = bool(avoid_obstacles) and not outdoor
+        # Last-point approach must be slow enough that the DiffDrive turning
+        # radius (v / wz_max) fits inside the 0.35 m goal window. At 0.5 m/s
+        # that radius is 1.0 m, so the dog orbits the final point instead of
+        # stopping. PreferForward is off on the last point so overshoot can
+        # reverse instead of looping.
+        # Apply FollowPath first. A live last-point switch must not wait on
+        # costmaps or retry controller_server for ~20s: that holds the task
+        # lock while the dog keeps cruising past the click.
+        params = follow_path_patrol_params(
+            final_approach=final_approach,
+            local_obstacles=local_obstacles,
+        )
+        follow_applied = False
+        try:
             self._set_remote_parameters(
-                node_name,
-                {parameter_name: bool(avoid_obstacles)},
+                "/controller_server",
+                params,
+                code="WAYPOINT_PROFILE_FAILED",
+                attempts=2 if live else 8,
+            )
+            follow_applied = True
+        except ProtocolError:
+            LOGGER.warning("unable to apply FollowPath waypoint speed profile")
+        if not live:
+            for node_name, parameter_name, value in (
+                ("/local_costmap/local_costmap", "obstacle_layer.enabled", local_obstacles),
+                ("/global_costmap/global_costmap", "obstacle_layer.enabled", global_obstacles),
+                ("/collision_monitor", "PolygonStop.enabled", local_obstacles),
+                ("/collision_monitor", "PolygonSlow.enabled", local_obstacles),
+            ):
+                try:
+                    self._set_remote_parameters(
+                        node_name,
+                        {parameter_name: value},
+                        code="WAYPOINT_PROFILE_FAILED",
+                        attempts=1,
+                    )
+                except ProtocolError:
+                    if node_name == "/global_costmap/global_costmap":
+                        LOGGER.info(
+                            "global costmap has no obstacle_layer; lidar avoidance stays on the local costmap"
+                        )
+                    else:
+                        LOGGER.warning(
+                            "unable to set %s on %s; keeping the FollowPath profile",
+                            parameter_name,
+                            node_name,
+                        )
+                    continue
+        LOGGER.info(
+            "waypoint profile final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s",
+            final_approach,
+            live,
+            follow_applied,
+            params["FollowPath.vx_min"],
+            params["FollowPath.vx_max"],
+            params["FollowPath.wz_max"],
+            params["FollowPath.PathAlignCritic.enabled"],
+            params["FollowPath.CostCritic.enabled"],
+        )
+
+    def apply_outdoor_gps_profile(self) -> None:
+        """Prefer a GPS line path; keep lidar for local slowdown/stop only."""
+        if not self._rtk_is_navigation_pose_source():
+            return
+        try:
+            self._set_remote_parameters(
+                "/planner_server",
+                {
+                    "GridBased.allow_straight_line_fallback": True,
+                    "GridBased.prefer_straight_line": True,
+                    "GridBased.tolerance": 2.0,
+                },
                 code="WAYPOINT_PROFILE_FAILED",
             )
+        except ProtocolError:
+            LOGGER.warning("outdoor GPS planner fallback was not applied")
 
     def set_goal_precision(self, *, enabled: bool) -> None:
         """Select the tight pose tolerances used only for the dock contact point."""
@@ -1044,19 +1285,32 @@ class RosAdapter(Node):
         yaw_tolerance = (
             self.safety_config.docking_goal_yaw_tolerance_rad if enabled else 0.25
         )
-        self._set_remote_parameters(
-            "/controller_server",
-            {
-                "general_goal_checker.xy_goal_tolerance": float(xy_tolerance),
-                "general_goal_checker.required_yaw_goal_tolerance": float(yaw_tolerance),
-            },
-            code="GOAL_PRECISION_PROFILE_FAILED",
-        )
+        try:
+            self._set_remote_parameters(
+                "/controller_server",
+                {
+                    "general_goal_checker.xy_goal_tolerance": float(xy_tolerance),
+                    "general_goal_checker.required_yaw_goal_tolerance": float(yaw_tolerance),
+                },
+                code="GOAL_PRECISION_PROFILE_FAILED",
+                attempts=2 if not enabled else 8,
+            )
+        except ProtocolError:
+            LOGGER.warning("unable to set goal precision enabled=%s", enabled)
+            if enabled:
+                raise
 
-    def _set_remote_parameters(self, node_name: str, values: dict[str, bool | float], *, code: str) -> None:
+    def _set_remote_parameters(
+        self,
+        node_name: str,
+        values: dict[str, bool | int | float],
+        *,
+        code: str,
+        attempts: int = 8,
+    ) -> None:
         """Set Nav2 parameters through its ROS service, without spawning ros2 CLI processes."""
         last_error = ""
-        for _ in range(8):
+        for _ in range(max(1, attempts)):
             client = self.create_client(SetParameters, f"{node_name}/set_parameters")
             try:
                 if not client.wait_for_service(timeout_sec=0.75):
@@ -1083,13 +1337,16 @@ class RosAdapter(Node):
         raise ProtocolError(code, last_error or f"unable to set parameters on {node_name}")
 
     @staticmethod
-    def _parameter_message(name: str, value: bool | float) -> ParameterMessage:
+    def _parameter_message(name: str, value: bool | int | float) -> ParameterMessage:
         parameter = ParameterMessage()
         parameter.name = name
         parameter.value = ParameterValue()
         if isinstance(value, bool):
             parameter.value.type = ParameterType.PARAMETER_BOOL
             parameter.value.bool_value = value
+        elif isinstance(value, int):
+            parameter.value.type = ParameterType.PARAMETER_INTEGER
+            parameter.value.integer_value = value
         else:
             parameter.value.type = ParameterType.PARAMETER_DOUBLE
             parameter.value.double_value = float(value)

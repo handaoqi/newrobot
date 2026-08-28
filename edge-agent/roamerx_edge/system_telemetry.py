@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import glob
+import json
 import logging
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from .config import ChargeControlConfig, TelemetryConfig
@@ -13,6 +17,8 @@ from .telemetry_collector import TelemetryCollector
 
 
 LOGGER = logging.getLogger(__name__)
+
+_GIB = 1024 ** 3
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,76 @@ class SystemTelemetryProbe:
             self._poll_audio()
         except Exception:
             LOGGER.warning("failed to read audio telemetry", exc_info=True)
+        try:
+            self._poll_storage()
+        except Exception:
+            LOGGER.warning("failed to read storage telemetry", exc_info=True)
+
+    def _poll_storage(self) -> None:
+        """Report free space, plus whatever retention last deleted.
+
+        This deliberately does not walk the bag and map trees - that costs
+        hundreds of stat calls on every probe interval. Occupancy comes from
+        statvfs, and the per-session detail comes from the report
+        mapping_rosbag.sh already wrote when it pruned.
+        """
+        probe = Path(self.config.storage_probe_path).expanduser()
+        payload: dict = {"path": str(probe), "available": False}
+        try:
+            usage = shutil.disk_usage(probe)
+        except OSError as exc:
+            payload["error"] = str(exc)
+            self.telemetry.on_storage(payload)
+            return
+        payload.update(
+            available=True,
+            total_bytes=usage.total,
+            used_bytes=usage.used,
+            free_bytes=usage.free,
+            free_gib=round(usage.free / _GIB, 2),
+            used_percent=round(usage.used / usage.total * 100, 1) if usage.total else None,
+        )
+        retention = self._latest_retention_report()
+        if retention:
+            payload["last_retention"] = retention
+        self.telemetry.on_storage(payload)
+
+    def _latest_retention_report(self) -> dict | None:
+        """Summarise the most recent retention pass across all bag roots."""
+        newest: dict | None = None
+        newest_at = 0.0
+        for path in sorted(glob.glob(self.config.storage_retention_report_glob)):
+            try:
+                report = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # A half-written or corrupt report is not worth an alarm; the
+                # occupancy numbers above are the part that matters.
+                continue
+            generated_at = float(report.get("generated_at_unix") or 0.0)
+            if generated_at < newest_at:
+                continue
+            deleted = [
+                {
+                    "path": entry.get("path"),
+                    "size_bytes": entry.get("size_bytes"),
+                    "reason": entry.get("reason"),
+                }
+                for root in report.get("roots", [])
+                for entry in root.get("deleted", [])
+            ]
+            newest_at = generated_at
+            newest = {
+                "report_path": path,
+                "generated_at_unix": generated_at,
+                "applied": bool(report.get("applied")),
+                "reclaimed_bytes": report.get("reclaimed_bytes", 0),
+                "failed_count": report.get("failed_count", 0),
+                # Bounded: a pass that removes dozens of sessions must not turn
+                # every status message into a manifest of them.
+                "deleted_count": len(deleted),
+                "deleted": deleted[:10],
+            }
+        return newest
 
     def _poll_power(self) -> None:
         result = self.runner(

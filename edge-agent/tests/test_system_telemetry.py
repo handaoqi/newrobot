@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from roamerx_edge.config import TelemetryConfig
@@ -151,3 +152,96 @@ def test_probe_decodes_unsigned_bms_current_as_signed_discharge():
 
     assert power["current_a"] == -1.88
     assert power["charging"] is False
+
+
+def make_storage_probe(tmp_path, **overrides):
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+    config = TelemetryConfig(
+        storage_probe_path=str(tmp_path),
+        storage_retention_report_glob=str(tmp_path / "rosbags" / "*" / ".retention.json"),
+        **overrides,
+    )
+    return collector, SystemTelemetryProbe(config, collector, runner=None)
+
+
+def write_report(tmp_path, root_name, *, generated_at, deleted, reclaimed=0):
+    report_dir = tmp_path / "rosbags" / root_name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / ".retention.json").write_text(
+        json.dumps({
+            "schema": "roamerx.storage-retention.v1",
+            "generated_at_unix": generated_at,
+            "applied": True,
+            "roots": [{"root": str(report_dir), "deleted": deleted}],
+            "reclaimed_bytes": reclaimed,
+            "failed_count": 0,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_storage_occupancy_is_reported_without_any_retention_history(tmp_path):
+    collector, probe = make_storage_probe(tmp_path)
+
+    probe._poll_storage()
+    storage = collector.build_status_snapshot()["storage"]
+
+    assert storage["available"] is True
+    assert storage["free_bytes"] > 0
+    assert 0 <= storage["used_percent"] <= 100
+    # Nothing has been deleted, and saying so is different from saying nothing.
+    assert "last_retention" not in storage
+
+
+def test_the_newest_retention_report_wins(tmp_path):
+    write_report(tmp_path, "mapping", generated_at=100.0,
+                 deleted=[{"path": "/bags/old", "size_bytes": 1, "reason": "older than 30d"}])
+    write_report(tmp_path, "navigation", generated_at=200.0, reclaimed=4096,
+                 deleted=[{"path": "/bags/newer", "size_bytes": 4096, "reason": "beyond budget"}])
+    collector, probe = make_storage_probe(tmp_path)
+
+    probe._poll_storage()
+    retention = collector.build_status_snapshot()["storage"]["last_retention"]
+
+    assert retention["generated_at_unix"] == 200.0
+    assert retention["reclaimed_bytes"] == 4096
+    assert [item["path"] for item in retention["deleted"]] == ["/bags/newer"]
+
+
+def test_a_long_deletion_list_is_summarised_not_dumped(tmp_path):
+    write_report(tmp_path, "mapping", generated_at=100.0, reclaimed=25,
+                 deleted=[{"path": f"/bags/{i}", "size_bytes": 1, "reason": "older than 30d"}
+                          for i in range(25)])
+    collector, probe = make_storage_probe(tmp_path)
+
+    probe._poll_storage()
+    retention = collector.build_status_snapshot()["storage"]["last_retention"]
+
+    assert retention["deleted_count"] == 25
+    assert len(retention["deleted"]) == 10
+
+
+def test_a_corrupt_report_does_not_cost_the_occupancy_numbers(tmp_path):
+    report_dir = tmp_path / "rosbags" / "mapping"
+    report_dir.mkdir(parents=True)
+    (report_dir / ".retention.json").write_text("{truncated", encoding="utf-8")
+    collector, probe = make_storage_probe(tmp_path)
+
+    probe.poll()
+    storage = collector.build_status_snapshot()["storage"]
+
+    assert storage["available"] is True
+    assert "last_retention" not in storage
+
+
+def test_a_missing_probe_path_is_reported_as_unavailable(tmp_path):
+    collector, probe = make_storage_probe(tmp_path / "gone")
+
+    probe._poll_storage()
+    storage = collector.build_status_snapshot()["storage"]
+
+    assert storage["available"] is False
+    assert storage["error"]

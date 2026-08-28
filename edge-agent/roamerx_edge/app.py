@@ -69,6 +69,7 @@ class EdgeAgentApplication:
                 self.telemetry,
                 self.safety_state,
                 config.mapping,
+                config.imu_cross_check,
             )
             self.ros_runtime = RosRuntime(navigation)
         self.navigation = navigation
@@ -102,7 +103,16 @@ class EdgeAgentApplication:
             navigation, "set_localization_recovery_callback", None
         )
         if callable(set_localization_recovery_callback):
-            set_localization_recovery_callback(self.task_executor.on_localization_recovered)
+            set_localization_recovery_callback(self._handle_task_localization_recovered)
+        # Deduplicates localization alerts the same way _mapping_divergence_notified
+        # does for SLAM divergence: one alert per episode, re-armed on recovery.
+        self._localization_alert_notified = False
+        # Separate latch from the localization one: a disagreeing gyro is a
+        # hardware finding that outlives any single localization episode.
+        self._imu_mismatch_notified = False
+        set_imu_cross_check_callback = getattr(navigation, "set_imu_cross_check_callback", None)
+        if callable(set_imu_cross_check_callback):
+            set_imu_cross_check_callback(self._handle_imu_cross_check_report)
         set_trusted_pose_callback = getattr(navigation, "set_trusted_pose_callback", None)
         if callable(set_trusted_pose_callback):
             set_trusted_pose_callback(self._persist_last_trusted_pose)
@@ -583,8 +593,108 @@ class EdgeAgentApplication:
             },
         )
 
-    def _handle_task_localization_loss(self) -> None:
-        """Pause a task, then reseed a fresh localization node from its last good pose."""
+    def _emit_localization_alert(self, event_type: str, severity: str, code: str, label: str, attributes: dict) -> None:
+        """Publish a localization alert, tolerating a broken alert path.
+
+        Alerting must never take down recovery, so every failure here is logged and
+        swallowed - same contract as the mapping divergence alert above.
+        """
+        try:
+            self.alerts.emit_system_alert(
+                event_type,
+                severity,
+                code,
+                attributes=attributes,
+                detection={"label": label, "class": event_type, "confidence": 1},
+                component="localization",
+            )
+        except Exception:
+            LOGGER.exception("failed to publish %s alert", event_type)
+
+    def _handle_imu_cross_check_report(self, report: dict) -> None:
+        """Report a sustained disagreement between the lidar IMU and the 3588 IMU.
+
+        Monitoring only - nothing here changes what localization consumes. The
+        alert fires once per episode and re-arms once the two agree again,
+        because a loose or failing IMU is a standing condition, not an event.
+        Every report arrives here, including healthy ones, so that re-arming is
+        driven by real evidence rather than by a timeout.
+        """
+        if report.get("status") == "ok":
+            self._imu_mismatch_notified = False
+            return
+        if report.get("status") != "mismatch" or self._imu_mismatch_notified:
+            # Absent or insufficient data says nothing about agreement, so it
+            # neither raises an alert nor clears one.
+            return
+        self._imu_mismatch_notified = True
+        stationary = bool(report.get("stationary"))
+        self._emit_localization_alert(
+            "imu_cross_check_mismatch",
+            "medium",
+            "IMU_CROSS_CHECK_MISMATCH",
+            "双 IMU 静止零偏差异过大" if stationary else "双 IMU 角速度不一致",
+            {"reason": "imu_cross_check_mismatch", **report},
+        )
+
+    def _localization_alert_attributes(self, reason: str) -> dict:
+        """Collect the diagnostics the platform needs to triage a localization alert."""
+        diagnostics_getter = getattr(self.navigation, "localization_diagnostics", None)
+        diagnostics = diagnostics_getter() if callable(diagnostics_getter) else {}
+        context = self.task_executor.context
+        return {
+            "reason": reason,
+            "localization_quality": diagnostics.get("quality"),
+            "localization_decision": diagnostics.get("decision"),
+            "raw_pose": diagnostics.get("raw_pose"),
+            "map_id": self.config.robot.current_map_id,
+            "map_version": self.config.robot.current_map_version,
+            "task_execution_id": context.task_execution_id if context else None,
+        }
+
+    def _report_localization_recovery_state(
+        self, reason: str, cycle: int, elapsed: float, max_cycles: int
+    ) -> None:
+        """Publish recovery progress so a task stuck in `paused` is not invisible."""
+        try:
+            self.telemetry.on_localization_recovery({
+                "reason": reason,
+                "cycle": cycle,
+                "max_cycles": max_cycles or None,
+                "elapsed_seconds": round(elapsed, 1),
+                "state": "recovering",
+            })
+        except Exception:
+            LOGGER.exception("failed to report localization recovery state")
+
+    def _handle_task_localization_recovered(self) -> None:
+        """Re-arm localization alerting, then resume the task as before."""
+        self._localization_alert_notified = False
+        try:
+            self.telemetry.on_localization_recovery(None)
+        except Exception:
+            LOGGER.exception("failed to clear localization recovery state")
+        self.task_executor.on_localization_recovered()
+
+    def _handle_task_localization_loss(self, reason: str = "localization_lost") -> None:
+        """Pause a task, then reseed a fresh localization node from its last good pose.
+
+        `reason` distinguishes a hard localization loss from NDT score degradation;
+        both funnel through the same recovery path but are reported separately.
+        """
+        # Alert before the early returns below: localization degrading is worth
+        # reporting even when no task is running and there is nothing to pause.
+        if not self._localization_alert_notified:
+            self._localization_alert_notified = True
+            severity = "high" if reason == "localization_lost" else "medium"
+            label = "定位丢失" if reason == "localization_lost" else "NDT 匹配退化"
+            self._emit_localization_alert(
+                reason,
+                severity,
+                reason.upper(),
+                label,
+                self._localization_alert_attributes(reason),
+            )
         self.task_executor.on_localization_lost()
         if (
             not self.task_executor.has_active_task()
@@ -595,18 +705,23 @@ class EdgeAgentApplication:
             return
         threading.Thread(
             target=self._recover_task_localization,
+            args=(reason,),
             daemon=True,
             name="task-localization-restart",
         ).start()
 
-    def _recover_task_localization(self) -> None:
+    def _recover_task_localization(self, reason: str = "localization_lost") -> None:
         try:
             attempts = max(1, int(self.config.safety.localization_recovery_attempts))
             quick_retry = max(0.5, self.config.safety.localization_recovery_retry_seconds)
             cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
+            max_cycles = max(0, int(self.config.safety.localization_recovery_max_cycles))
+            cycle = 0
+            started_at = time.time()
             first_cycle = True
             while first_cycle or self.task_executor.is_paused_for_localization():
                 first_cycle = False
+                cycle += 1
                 pose = self.navigation.latest_trusted_pose()
                 if not pose:
                     pose = self.store.load_last_trusted_pose(
@@ -649,14 +764,44 @@ class EdgeAgentApplication:
                                 time.sleep(quick_retry)
                 if not self.task_executor.is_paused_for_localization():
                     return
+                elapsed = time.time() - started_at
+                self._report_localization_recovery_state(reason, cycle, elapsed, max_cycles)
+                if max_cycles and cycle >= max_cycles:
+                    LOGGER.error(
+                        "localization recovery gave up after %d cycles (%.0fs); escalating",
+                        cycle,
+                        elapsed,
+                    )
+                    self._emit_localization_alert(
+                        "localization_recovery_failed",
+                        "critical",
+                        "LOCALIZATION_RECOVERY_FAILED",
+                        "定位恢复失败，需人工介入",
+                        {
+                            **self._localization_alert_attributes(reason),
+                            "recovery_cycles": cycle,
+                            "recovery_elapsed_seconds": round(elapsed, 1),
+                            "attempts_per_cycle": attempts,
+                        },
+                    )
+                    return
                 LOGGER.warning(
-                    "localization recovery cycle exhausted; task remains stopped and will retry in %.1fs",
+                    "localization recovery cycle %d%s exhausted after %.0fs; "
+                    "task remains stopped and will retry in %.1fs",
+                    cycle,
+                    "/%d" % max_cycles if max_cycles else " (unbounded)",
+                    elapsed,
                     cycle_retry,
                 )
                 time.sleep(cycle_retry)
         except Exception:
             LOGGER.exception("task localization recovery worker failed; task remains paused")
         finally:
+            # Whatever the outcome, no recovery is in flight once this worker exits.
+            try:
+                self.telemetry.on_localization_recovery(None)
+            except Exception:
+                LOGGER.exception("failed to clear localization recovery state")
             self._localization_recovery_lock.release()
 
 

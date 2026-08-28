@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
 from .config import SafetyConfig
 from .protocol import MessageEnvelope, ProtocolError
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -26,6 +29,38 @@ class SafetyPolicy:
     def __init__(self, config: SafetyConfig, state: RuntimeSafetyState) -> None:
         self.config = config
         self.state = state
+
+    def wait_until_localization_stable(self) -> None:
+        """Wait out a fresh localization-normal window instead of rejecting start.
+
+        Relocalization resets the normal timer. Operators then start the task
+        within a second; failing immediately with LOCALIZATION_NOT_STABLE is
+        worse than blocking the command thread for the remaining 3s.
+        """
+        required = float(self.config.localization_stable_seconds)
+        if required <= 0.0 or self.state.localization_status != "normal":
+            return
+        started = self.state.localization_normal_since_monotonic
+        if started <= 0.0:
+            return
+        remaining = required - (time.monotonic() - started)
+        if remaining <= 0.0:
+            return
+        LOGGER.info(
+            "waiting %.1fs for localization to stay normal before task start",
+            remaining,
+        )
+        deadline = time.monotonic() + remaining
+        while time.monotonic() < deadline:
+            if self.state.localization_status != "normal":
+                return
+            started = self.state.localization_normal_since_monotonic
+            if started <= 0.0:
+                return
+            still_needed = required - (time.monotonic() - started)
+            if still_needed <= 0.0:
+                return
+            time.sleep(min(0.2, still_needed))
 
     def validate_task_start(self, envelope: MessageEnvelope, has_active_task: bool) -> None:
         if has_active_task:

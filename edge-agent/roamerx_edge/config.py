@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+from .imu_cross_check import ImuCrossCheckConfig
 
 
 @dataclass
@@ -34,6 +36,7 @@ class RosConfig:
     odometry_topic: str = "/odom/localization_odom"
     battery_topic: str = ""
     follow_waypoints_action: str = "/follow_waypoints"
+    navigate_through_poses_action: str = "/navigate_through_poses"
     scan_topic: str = "/laser_scan"
     cmd_vel_raw_topic: str = "/cmd_vel_raw"
     cmd_vel_topic: str = "/cmd_vel"
@@ -57,6 +60,11 @@ class TelemetryConfig:
     charger_speaker_sink: str = "alsa_output.usb-SD_Audio_Device_2502171729-00.analog-stereo"
     nx_speaker_card: int = 0
     nx_speaker_control: str = "PCM"
+    # The filesystem holding maps and rosbags, and where mapping_rosbag.sh
+    # leaves its retention report. Both grow without an operator watching, so
+    # occupancy and any deletion have to reach the platform.
+    storage_probe_path: str = "/home/dogrobot/runtime/nx-edge/data"
+    storage_retention_report_glob: str = "/home/dogrobot/runtime/nx-edge/data/rosbags/*/.retention.json"
 
 
 @dataclass
@@ -70,6 +78,11 @@ class SafetyConfig:
     localization_recovery_attempts: int = 3
     localization_recovery_retry_seconds: float = 5.0
     localization_recovery_cycle_seconds: float = 30.0
+    # Number of full recovery cycles before the agent gives up and escalates.
+    # 0 keeps the historical unbounded retry - sometimes standing still and waiting
+    # for a human is the safest outcome - but the escalation alert still fires so the
+    # situation is visible instead of a task silently paused forever.
+    localization_recovery_max_cycles: int = 0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
     final_waypoint_tolerance_m: float = 0.35
@@ -304,6 +317,9 @@ class EdgeConfig:
     charge_control: ChargeControlConfig
     power_mode: PowerModeConfig
     audio_control: AudioControlConfig
+    # Defaulted so existing constructions of EdgeConfig keep working; the
+    # cross-check is pure monitoring and has no required configuration.
+    imu_cross_check: ImuCrossCheckConfig = field(default_factory=ImuCrossCheckConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "EdgeConfig":
@@ -325,4 +341,5 @@ class EdgeConfig:
             charge_control=ChargeControlConfig(**raw.get("charge_control", {})),
             power_mode=PowerModeConfig(**raw.get("power_mode", {})),
             audio_control=AudioControlConfig(**raw.get("audio_control", {})),
+            imu_cross_check=ImuCrossCheckConfig(**raw.get("imu_cross_check", {})),
         )

@@ -1,8 +1,9 @@
 from types import SimpleNamespace
+from math import atan2, hypot
 
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.protocol import decode_message
-from roamerx_edge.task_executor import TaskExecutor
+from roamerx_edge.task_executor import TaskExecutor, straighten_pass_through_waypoints
 
 
 class FakeNavigation:
@@ -27,6 +28,8 @@ class FakeNavigation:
         self.localization_policies = []
         self.waypoint_profiles = []
         self.goal_precisions = []
+        self.docking_profiles = []
+        self.live_profiles = []
 
     def prepare_for_navigation(self, timeout_seconds=12):
         self.stand_requests += 1
@@ -64,11 +67,12 @@ class FakeNavigation:
     def set_localization_policy(self, source, phase):
         self.localization_policies.append((source, phase))
 
-    def set_waypoint_profile(self, *, avoid_obstacles, require_yaw):
-        self.waypoint_profiles.append((avoid_obstacles, require_yaw))
+    def set_waypoint_profile(self, *, avoid_obstacles, require_yaw, final_approach=False, live=False):
+        self.waypoint_profiles.append((avoid_obstacles, require_yaw, final_approach))
+        self.live_profiles.append(live)
 
     def set_docking_profile(self, *, final_approach):
-        pass
+        self.docking_profiles.append(final_approach)
 
     def set_goal_precision(self, *, enabled):
         self.goal_precisions.append(enabled)
@@ -135,6 +139,10 @@ class FakeMapSetCoordinator:
     def activate(self, segment):
         self.activated.append(segment)
 
+def ids(batch):
+    return [waypoint["waypoint_id"] for waypoint in batch]
+
+
 def command(message_type, state_version=0, resume_index=None):
     import json
     from pathlib import Path
@@ -171,7 +179,7 @@ def test_pause_resume_cancel(tmp_path):
     assert nav.cancelled == 1
     resumed = executor.resume_task(executor.context.task_execution_id, 1)
     assert resumed["final_task_state"] == "running"
-    assert len(nav.sent[-1]) == 1
+    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
     cancelled = executor.cancel_task(executor.context.task_execution_id)
     assert cancelled["final_task_state"] == "cancelled"
     store.close()
@@ -192,7 +200,7 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     executor.start_task(command("task.start"))
 
     assert executor.context.current_waypoint_index == 1
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-2"]
+    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
     assert events[0][0] == "task.started"
     assert events[0][1]["initial_waypoint_index"] == 1
     assert events[1][0] == "task.progress"
@@ -231,7 +239,35 @@ def test_round_trip_starts_from_first_copy_when_start_and_end_overlap(tmp_path):
     executor.start_task(envelope)
 
     assert executor.context.current_waypoint_index == 0
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-1"]
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    store.close()
+
+
+def test_round_trip_starts_from_first_when_end_click_is_more_than_one_meter_off(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.32, y=1.32)
+    envelope = command("task.start")
+    waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    waypoints[:] = [
+        {"waypoint_id": "wp-1", "sequence": 0, "name": "点1", "x": 1.5705, "y": 0.0698, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-2", "sequence": 1, "name": "点2", "x": 6.1205, "y": 0.0198, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-3", "sequence": 2, "name": "点3", "x": 10.7705, "y": -0.1302, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-4", "sequence": 3, "name": "点4", "x": 10.7705, "y": 1.3198, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-5", "sequence": 4, "name": "点5", "x": 5.9705, "y": 1.1698, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-6", "sequence": 5, "name": "点6", "x": 1.3205, "y": 1.3198, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+    ]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert executor.context.current_waypoint_index == 0
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
     store.close()
 
 
@@ -264,15 +300,58 @@ def test_round_trip_resume_does_not_skip_outbound_legs_to_return_copy(tmp_path):
     )
 
     executor.start_task(envelope)
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[-1]] == ["wp-2"]
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    nav.feedback(1, None)
+    assert executor.context.current_waypoint_index == 1
 
-    nav.pose = SimpleNamespace(x=1.16, y=2.06)
+    # Robot is nearer the return copy of B (wp-4) than the outbound B (wp-2).
+    nav.pose = SimpleNamespace(x=2.05, y=3.02)
     executor.on_localization_lost()
     executor.on_localization_recovered()
 
     assert executor.context.current_waypoint_index == 1
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[-1]] == ["wp-2"]
+    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    store.close()
+
+
+def test_round_trip_keeps_running_after_outbound_through_poses_succeed(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.12, y=2.04)
+    envelope = command("task.start")
+    waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    waypoints.extend(
+        [
+            {**waypoints[1], "waypoint_id": "wp-4", "sequence": 3, "name": "B-return"},
+            {
+                "waypoint_id": "wp-5",
+                "sequence": 4,
+                "name": "A-return",
+                "x": 1.15,
+                "y": 2.05,
+                "yaw": 3.14,
+                "dwell_seconds": 0,
+                "actions": [],
+            },
+        ]
+    )
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    assert executor.context.state == "running"
+    assert "task.completed" not in [event[0] for event in events]
+    assert ids(nav.sent[-1]) == ["wp-4", "wp-5"]
     store.close()
 
 
@@ -298,7 +377,7 @@ def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
         "wp-1",
     ]
     assert executor.context.current_waypoint_index == 0
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-3"]
+    assert ids(nav.sent[0]) == ["wp-3", "wp-2", "wp-1"]
     store.close()
 
 
@@ -317,9 +396,11 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     )
 
     executor.start_task(envelope)
-    assert nav.waypoint_profiles[0] == (False, False)
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2"]
+    assert nav.waypoint_profiles[0] == (False, False, False)
     nav.result("succeeded", "", {"missed_waypoints": []})
-    assert nav.waypoint_profiles[-1] == (False, True)
+    assert ids(nav.sent[-1]) == ["wp-3"]
+    assert nav.waypoint_profiles[-1] == (True, False, True)
     store.close()
 
 
@@ -343,7 +424,7 @@ def test_docking_final_waypoint_requires_precise_position_and_heading(tmp_path):
     nav.result("succeeded", "", {"missed_waypoints": []})
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.goal_precisions[-1] is True
-    assert nav.waypoint_profiles[-1] == (False, True)
+    assert nav.waypoint_profiles[-1] == (False, True, True)
 
     final = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
     nav.pose = SimpleNamespace(x=final["x"] + 0.03, y=final["y"] - 0.02, yaw=final["yaw"] + 0.04)
@@ -369,7 +450,7 @@ def test_map_set_task_skips_segments_before_nearest_waypoint(tmp_path):
 
     assert coordinator.activated == [coordinator.build_segments(executor.context.route_snapshot)[1]]
     assert executor.context.current_segment_index == 1
-    assert [waypoint["waypoint_id"] for waypoint in nav.sent[0]] == ["wp-2"]
+    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
     store.close()
 
 
@@ -423,7 +504,7 @@ def test_localization_loss_cancel_timeout_stays_paused_and_auto_resumes(tmp_path
 
     executor.on_localization_recovered()
     assert executor.context.state == "running"
-    assert len(nav.sent[-1]) == 1
+    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
     recovery_event = next(event for event in reversed(events) if event[0] == "task.resuming")
     assert recovery_event[1]["reason_code"] == "LOCALIZATION_RECOVERED"
     store.close()
@@ -472,9 +553,9 @@ def test_navigation_success_finishes_start_command(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    for x, y in ((1.0, 2.0), (2.0, 3.0), (3.0, 4.0)):
-        nav.pose = SimpleNamespace(x=x, y=y)
-        nav.result("succeeded", "")
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    nav.result("succeeded", "")
     assert executor.context.state == "completed"
     assert results[0][1] == "succeeded"
     store.close()
@@ -498,9 +579,8 @@ def test_navigation_rosbag_follows_task_lifecycle(tmp_path):
     executor.start_task(envelope)
     assert recorder.started == [f"task_{executor.context.task_execution_id[:8]}"]
     assert executor.context.record_rosbag is True
-    for x, y in ((1.0, 2.0), (2.0, 3.0), (3.0, 4.0)):
-        nav.pose = SimpleNamespace(x=x, y=y)
-        nav.result("succeeded", "", {"missed_waypoints": []})
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
 
     assert recorder.stopped == 1
     assert results[0][2]["rosbag"]["size_bytes"] == 1024
@@ -525,6 +605,77 @@ def test_navigation_missed_waypoints_fails_task(tmp_path):
     store.close()
 
 
+def test_pass_through_waypoints_use_travel_heading(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.0, y=2.0)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    sent = nav.sent[0]
+    assert ids(sent) == ["wp-1", "wp-2", "wp-3"]
+    assert abs(sent[0]["yaw"] - atan2(1.0, 1.0)) < 1e-6
+    assert abs(sent[1]["yaw"] - atan2(1.0, 1.0)) < 1e-6
+    assert abs(sent[2]["yaw"] - atan2(1.0, 1.0)) < 1e-6
+    store.close()
+
+
+def test_straighten_pass_through_flattens_click_noise_but_keeps_real_turns():
+    noisy_line = [
+        {"waypoint_id": "a", "x": 0.0, "y": 0.0, "yaw": 0.0},
+        {"waypoint_id": "b", "x": 10.0, "y": 0.25, "yaw": 0.0},
+        {"waypoint_id": "c", "x": 20.0, "y": -0.18, "yaw": 0.0},
+        {"waypoint_id": "d", "x": 30.0, "y": 0.05, "yaw": 0.0},
+    ]
+    straight = straighten_pass_through_waypoints(noisy_line)
+    assert straight[0]["x"] == 0.0 and straight[0]["y"] == 0.0
+    assert straight[-1]["x"] == 30.0
+    assert hypot(straight[1]["x"] - 10.0, straight[1]["y"]) < 0.05
+    assert hypot(straight[2]["x"] - 20.0, straight[2]["y"]) < 0.05
+    assert hypot(straight[1]["x"] - noisy_line[1]["x"], straight[1]["y"] - noisy_line[1]["y"]) > 0.15
+
+    corner = [
+        {"waypoint_id": "a", "x": 0.0, "y": 0.0, "yaw": 0.0},
+        {"waypoint_id": "b", "x": 10.0, "y": 0.0, "yaw": 0.0},
+        {"waypoint_id": "c", "x": 10.0, "y": 10.0, "yaw": 0.0},
+    ]
+    kept = straighten_pass_through_waypoints(corner)
+    assert kept[1]["x"] == 10.0
+    assert kept[1]["y"] == 0.0
+
+
+def test_patrol_nav2_goal_uses_straightened_corridor(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=0.0, y=0.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [
+        {"waypoint_id": "wp-1", "sequence": 0, "name": "A", "x": 0.0, "y": 0.0, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-2", "sequence": 1, "name": "B", "x": 10.0, "y": 0.25, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-3", "sequence": 2, "name": "C", "x": 20.0, "y": -0.18, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+        {"waypoint_id": "wp-4", "sequence": 3, "name": "D", "x": 30.0, "y": 0.0, "yaw": 0.0, "dwell_seconds": 0, "actions": []},
+    ]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    sent = nav.sent[0]
+    assert ids(sent) == ["wp-1", "wp-2", "wp-3", "wp-4"]
+    assert sent[0]["y"] == 0.0
+    assert sent[-1]["y"] == 0.0
+    assert abs(sent[1]["y"]) < 0.05
+    assert abs(sent[2]["y"]) < 0.05
+    assert abs(sent[0]["yaw"]) < 1e-6
+    store.close()
+
+
 def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -537,12 +688,33 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    nav.feedback(2, None)
+    assert nav.waypoint_profiles[-1] == (True, False, True)
+    assert nav.live_profiles[-1] is True
+    assert nav.goal_precisions == []
     nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert nav.stop_commands >= 1
+    assert nav.goal_precisions == []
+    assert nav.docking_profiles == []
+    assert nav.stop_commands >= 1
     assert executor.context.state == "failed"
     assert results[0][1] == "failed"
     assert results[0][3] == "FINAL_POSE_OUT_OF_TOLERANCE"
+    store.close()
+
+
+def test_patrol_dispatches_remaining_waypoints_in_one_goal(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
     store.close()
 
 
