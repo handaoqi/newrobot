@@ -31,6 +31,9 @@
 #include <std_msgs/msg/string.hpp>
 
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/ModelCoefficients.h>
+#include <pcl/PointIndices.h>
+#include <pcl/segmentation/sac_segmentation.h>
 
 #include <pclomp/ndt_omp.h>
 #include <fast_gicp/gicp/fast_gicp.hpp>
@@ -93,6 +96,31 @@ public:
     scan_matching_coarse_max_fitness_score_ = static_cast<float>(std::max(
       static_cast<double>(ndt_max_fitness_score_),
       declare_parameter<double>("scan_matching.coarse_max_fitness_score", 2.00)));
+    scan_preprocess_min_range_m_ = std::max(
+      0.0, declare_parameter<double>("scan_preprocessing.min_range", 0.50));
+    scan_preprocess_max_range_m_ = std::max(
+      scan_preprocess_min_range_m_ + 0.10,
+      declare_parameter<double>("scan_preprocessing.max_range", 10.0));
+    scan_preprocess_fov_degree_ = std::clamp(
+      declare_parameter<double>("scan_preprocessing.fov_degree", 240.0), 1.0, 360.0);
+    scan_ground_filter_enable_ = declare_parameter<bool>(
+      "scan_preprocessing.ground_filter.enable", true);
+    scan_ground_distance_threshold_m_ = std::clamp(
+      declare_parameter<double>("scan_preprocessing.ground_filter.distance_threshold_m", 0.08),
+      0.01, 0.30);
+    scan_ground_max_tilt_deg_ = std::clamp(
+      declare_parameter<double>("scan_preprocessing.ground_filter.max_tilt_deg", 20.0),
+      1.0, 45.0);
+    scan_ground_min_inliers_ = static_cast<int>(std::max<int64_t>(
+      20, declare_parameter<int>("scan_preprocessing.ground_filter.min_inliers", 80)));
+    scan_ground_min_sensor_height_m_ = std::max(
+      0.05, declare_parameter<double>("scan_preprocessing.ground_filter.min_sensor_height_m", 0.20));
+    scan_ground_max_sensor_height_m_ = std::max(
+      scan_ground_min_sensor_height_m_ + 0.10,
+      declare_parameter<double>("scan_preprocessing.ground_filter.max_sensor_height_m", 1.20));
+    scan_ground_clearance_m_ = std::clamp(
+      declare_parameter<double>("scan_preprocessing.ground_filter.clearance_m", 0.15),
+      0.0, 0.30);
     enable_robot_odometry_prediction = declare_parameter<bool>("enable_robot_odometry_prediction", false);
     enable_lidar_odometry_prediction_ = declare_parameter<bool>("lidar_odometry_prediction.enable", false);
     lidar_odom_voxel_size_ = static_cast<float>(std::max(
@@ -137,12 +165,45 @@ public:
       100.0, declare_parameter<double>("lio_primary.suppressed_covariance_scale", 100.0)));
     lio_max_correction_jump_m_ = static_cast<float>(std::max(
       0.10, declare_parameter<double>("lio_primary.max_correction_jump_m", 1.50)));
+    lio_max_correction_yaw_rad_ = static_cast<float>(std::max(
+      1.0, declare_parameter<double>("lio_primary.max_correction_yaw_deg", 30.0))
+        * M_PI / 180.0);
     lio_correct_xy_variance_ = static_cast<float>(std::max(
       1e-4, declare_parameter<double>("lio_primary.correct_xy_variance", 0.010)));
     lio_correct_z_variance_ = static_cast<float>(std::max(
       1e-4, declare_parameter<double>("lio_primary.correct_z_variance", 0.020)));
     lio_correct_orientation_variance_ = static_cast<float>(std::max(
       1e-5, declare_parameter<double>("lio_primary.correct_orientation_variance", 0.001)));
+    lio_dynamic_covariance_enable_ = declare_parameter<bool>(
+      "lio_primary.dynamic_covariance.enable", true);
+    lio_dynamic_ndt_good_score_ = static_cast<float>(std::clamp(
+      declare_parameter<double>("lio_primary.dynamic_covariance.ndt_good_score", 0.10),
+      0.0, static_cast<double>(ndt_max_fitness_score_)));
+    lio_dynamic_vgicp_good_score_ = static_cast<float>(std::clamp(
+      declare_parameter<double>("lio_primary.dynamic_covariance.vgicp_good_score", 0.05),
+      0.0, static_cast<double>(ndt_max_fitness_score_)));
+    lio_dynamic_good_inlier_fraction_ = static_cast<float>(std::clamp(
+      declare_parameter<double>("lio_primary.dynamic_covariance.good_inlier_fraction", 0.50),
+      0.05, 1.0));
+    lio_dynamic_xy_variance_max_ = static_cast<float>(std::max(
+      static_cast<double>(lio_correct_xy_variance_),
+      declare_parameter<double>("lio_primary.dynamic_covariance.xy_variance_max", 0.25)));
+    lio_dynamic_z_variance_max_ = static_cast<float>(std::max(
+      static_cast<double>(lio_correct_z_variance_),
+      declare_parameter<double>("lio_primary.dynamic_covariance.z_variance_max", 0.50)));
+    lio_dynamic_orientation_variance_max_ = static_cast<float>(std::max(
+      static_cast<double>(lio_correct_orientation_variance_),
+      declare_parameter<double>("lio_primary.dynamic_covariance.orientation_variance_max", 0.05)));
+    lio_correction_translation_rate_mps_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>("lio_primary.correction_smoothing.translation_rate_mps", 0.25)));
+    lio_correction_rotation_rate_radps_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>("lio_primary.correction_smoothing.rotation_rate_degps", 8.0)
+        * M_PI / 180.0));
+    lio_correction_completion_translation_m_ = static_cast<float>(std::max(
+      0.001, declare_parameter<double>("lio_primary.correction_smoothing.completion_translation_m", 0.01)));
+    lio_correction_completion_rotation_rad_ = static_cast<float>(std::max(
+      0.001, declare_parameter<double>("lio_primary.correction_smoothing.completion_rotation_deg", 0.25)
+        * M_PI / 180.0));
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -401,11 +462,14 @@ public:
         std::bind(&HdlLocalizationNode::lio_odom_callback, this, std::placeholders::_1));
       RCLCPP_INFO(
         get_logger(),
-        "Indoor LIO primary enabled: topic=%s max_age=%.2fs drift_xy=%.2fm "
-        "drift_yaw=%.1fdeg hysteresis=%d jump=%.2fm (NDT/RTK gated auxiliaries)",
+        "FAST-LIO-only continuous source enabled: topic=%s max_age=%.2fs drift_xy=%.2fm "
+        "drift_yaw=%.1fdeg hysteresis=%d absolute_cap=%.2fm smoothing=[%.2fm/s, %.1fdeg/s] "
+        "dynamic_covariance=%s (NDT/RTK intermittent corrections)",
         lio_odom_topic_.c_str(), lio_max_age_s_, lio_drift_xy_m_,
         lio_drift_yaw_rad_ * 180.0 / M_PI, lio_drift_hysteresis_frames_,
-        lio_max_correction_jump_m_);
+        lio_max_correction_jump_m_, lio_correction_translation_rate_mps_,
+        lio_correction_rotation_rate_radps_ * 180.0 / M_PI,
+        lio_dynamic_covariance_enable_ ? "true" : "false");
     }
     if (use_gnss_fusion_) {
       gnss_sub = create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -459,6 +523,13 @@ public:
 
     initialize_params();
     raw_points_ptr_ = pcl::PointCloud<PointT>::Ptr(new pcl::PointCloud<PointT>());
+    RCLCPP_INFO(
+      get_logger(),
+      "Localization scan preprocessing: range=[%.2f, %.2f]m fov=%.1fdeg ground=%s "
+      "threshold=%.2fm clearance=%.2fm",
+      scan_preprocess_min_range_m_, scan_preprocess_max_range_m_,
+      scan_preprocess_fov_degree_, scan_ground_filter_enable_ ? "enabled" : "disabled",
+      scan_ground_distance_threshold_m_, scan_ground_clearance_m_);
     if (enable_lidar_odometry_prediction_) {
       lidar_odom_registration_ = std::make_unique<fast_gicp::FastGICP<PointT, PointT>>();
       lidar_odom_registration_->setNumThreads(lidar_odom_num_threads_);
@@ -689,6 +760,37 @@ private:
 
   enum class AuxiliaryGateStatus { reject, pending, accept };
 
+  struct CorrectionNoise {
+    float horizontal_variance = 0.01f;
+    float vertical_variance = 0.02f;
+    float orientation_variance = 0.001f;
+    float quality_penalty = 0.0f;
+  };
+
+  struct PendingLioCorrection {
+    bool active = false;
+    Eigen::Isometry3f target_map_T_lio = Eigen::Isometry3f::Identity();
+    CorrectionNoise noise;
+    std::string source = "none";
+    int64_t last_update_stamp_ns = 0;
+    float initial_translation_m = 0.0f;
+    float initial_rotation_rad = 0.0f;
+    float remaining_translation_m = 0.0f;
+    float remaining_rotation_rad = 0.0f;
+
+    void reset() {
+      active = false;
+      target_map_T_lio.setIdentity();
+      noise = CorrectionNoise{};
+      source = "none";
+      last_update_stamp_ns = 0;
+      initial_translation_m = 0.0f;
+      initial_rotation_rad = 0.0f;
+      remaining_translation_m = 0.0f;
+      remaining_rotation_rad = 0.0f;
+    }
+  };
+
   // Shared 0.30 m / 3-frame / no-jump gate for NDT/VGICP and RTK while LIO is
   // the indoor primary observation. Neither source is fused every UKF frame.
   struct AuxiliaryDriftGate {
@@ -774,6 +876,7 @@ private:
     lio_anchor_valid_ = false;
     lio_has_previous_pose_ = false;
     lio_corrected_this_frame_ = false;
+    pending_lio_correction_.reset();
     ndt_drift_gate_.reset();
     rtk_drift_gate_.reset();
   }
@@ -822,6 +925,156 @@ private:
     lio_has_previous_pose_ = lio_anchor_valid_;
   }
 
+  CorrectionNoise scanMatchCorrectionNoise(
+      const PoseEstimator::MatchResult& match) const {
+    CorrectionNoise noise;
+    noise.horizontal_variance = lio_correct_xy_variance_;
+    noise.vertical_variance = lio_correct_z_variance_;
+    noise.orientation_variance = lio_correct_orientation_variance_;
+    if (!lio_dynamic_covariance_enable_) {
+      return noise;
+    }
+
+    const bool vgicp = match.method_.find("vgicp") != std::string::npos;
+    const float good_score = vgicp
+      ? lio_dynamic_vgicp_good_score_ : lio_dynamic_ndt_good_score_;
+    const float score_span = std::max(1.0e-4f, ndt_max_fitness_score_ - good_score);
+    const float score_penalty = std::clamp(
+      (match.fitness_score_ - good_score) / score_span, 0.0f, 1.0f);
+    const float inlier_span = std::max(
+      1.0e-4f, lio_dynamic_good_inlier_fraction_ - 0.05f);
+    const float inlier_penalty = std::isfinite(last_ndt_inlier_fraction_)
+      ? std::clamp(
+          (lio_dynamic_good_inlier_fraction_ - last_ndt_inlier_fraction_) / inlier_span,
+          0.0f, 1.0f)
+      : 1.0f;
+    // Fitness and overlap describe different failure modes. Let the weaker
+    // one dominate, then square it so high-quality matches stay near the
+    // minimum noise while borderline matches are strongly de-weighted.
+    const float penalty = std::pow(std::max(score_penalty, inlier_penalty), 2.0f);
+    noise.quality_penalty = penalty;
+    noise.horizontal_variance = lio_correct_xy_variance_ + penalty *
+      (lio_dynamic_xy_variance_max_ - lio_correct_xy_variance_);
+    noise.vertical_variance = lio_correct_z_variance_ + penalty *
+      (lio_dynamic_z_variance_max_ - lio_correct_z_variance_);
+    noise.orientation_variance = lio_correct_orientation_variance_ + penalty *
+      (lio_dynamic_orientation_variance_max_ - lio_correct_orientation_variance_);
+    return noise;
+  }
+
+  bool scheduleLioAnchorCorrection(
+      const Eigen::Isometry3f& target_map_T_base,
+      const CorrectionNoise& noise,
+      const char* source,
+      const rclcpp::Time& stamp) {
+    if (!lio_anchor_valid_ || pending_lio_correction_.active ||
+        !target_map_T_base.matrix().allFinite()) {
+      return false;
+    }
+    Eigen::Isometry3f current_lio_T_base = Eigen::Isometry3f::Identity();
+    if (!currentLioPose(current_lio_T_base)) {
+      return false;
+    }
+    const Eigen::Isometry3f target_map_T_lio =
+      target_map_T_base * current_lio_T_base.inverse();
+    if (!target_map_T_lio.matrix().allFinite()) {
+      return false;
+    }
+    const Eigen::Vector3f translation_delta =
+      target_map_T_lio.translation() - lio_map_T_lio_.translation();
+    Eigen::Quaternionf current_orientation(lio_map_T_lio_.rotation());
+    Eigen::Quaternionf target_orientation(target_map_T_lio.rotation());
+    current_orientation.normalize();
+    target_orientation.normalize();
+    const float rotation_delta = current_orientation.angularDistance(target_orientation);
+    const float translation_m = translation_delta.norm();
+    pending_lio_correction_.active = true;
+    pending_lio_correction_.target_map_T_lio = target_map_T_lio;
+    pending_lio_correction_.noise = noise;
+    pending_lio_correction_.source = source;
+    pending_lio_correction_.last_update_stamp_ns = stamp.nanoseconds();
+    pending_lio_correction_.initial_translation_m = translation_m;
+    pending_lio_correction_.initial_rotation_rad = rotation_delta;
+    pending_lio_correction_.remaining_translation_m = translation_m;
+    pending_lio_correction_.remaining_rotation_rad = rotation_delta;
+    last_correction_xy_variance_ = noise.horizontal_variance;
+    last_correction_z_variance_ = noise.vertical_variance;
+    last_correction_orientation_variance_ = noise.orientation_variance;
+    last_correction_quality_penalty_ = noise.quality_penalty;
+    last_correction_progress_ = 0.0f;
+    return true;
+  }
+
+  bool advancePendingLioCorrection(const rclcpp::Time& stamp) {
+    if (!pending_lio_correction_.active || !lio_anchor_valid_) {
+      return false;
+    }
+    double dt = 0.10;
+    if (pending_lio_correction_.last_update_stamp_ns > 0) {
+      dt = static_cast<double>(
+        stamp.nanoseconds() - pending_lio_correction_.last_update_stamp_ns) * 1.0e-9;
+    }
+    if (!std::isfinite(dt) || dt <= 0.0) {
+      dt = 0.10;
+    }
+    dt = std::clamp(dt, 0.02, 0.25);
+    pending_lio_correction_.last_update_stamp_ns = stamp.nanoseconds();
+
+    const Eigen::Vector3f current_translation = lio_map_T_lio_.translation();
+    const Eigen::Vector3f target_translation =
+      pending_lio_correction_.target_map_T_lio.translation();
+    const Eigen::Vector3f translation_delta = target_translation - current_translation;
+    const float translation_m = translation_delta.norm();
+    const float translation_step = lio_correction_translation_rate_mps_ * static_cast<float>(dt);
+    const float translation_ratio = translation_m > 1.0e-6f
+      ? std::min(1.0f, translation_step / translation_m) : 1.0f;
+    lio_map_T_lio_.translation() =
+      current_translation + translation_ratio * translation_delta;
+
+    Eigen::Quaternionf current_orientation(lio_map_T_lio_.rotation());
+    Eigen::Quaternionf target_orientation(
+      pending_lio_correction_.target_map_T_lio.rotation());
+    current_orientation.normalize();
+    target_orientation.normalize();
+    if (current_orientation.coeffs().dot(target_orientation.coeffs()) < 0.0f) {
+      target_orientation.coeffs() *= -1.0f;
+    }
+    const float rotation_rad = current_orientation.angularDistance(target_orientation);
+    const float rotation_step = lio_correction_rotation_rate_radps_ * static_cast<float>(dt);
+    const float rotation_ratio = rotation_rad > 1.0e-6f
+      ? std::min(1.0f, rotation_step / rotation_rad) : 1.0f;
+    const Eigen::Quaternionf next_orientation =
+      current_orientation.slerp(rotation_ratio, target_orientation).normalized();
+    lio_map_T_lio_.linear() = next_orientation.toRotationMatrix();
+
+    pending_lio_correction_.remaining_translation_m =
+      (target_translation - lio_map_T_lio_.translation()).norm();
+    pending_lio_correction_.remaining_rotation_rad =
+      next_orientation.angularDistance(target_orientation);
+    const float translation_fraction = pending_lio_correction_.initial_translation_m > 1.0e-6f
+      ? pending_lio_correction_.remaining_translation_m /
+        pending_lio_correction_.initial_translation_m : 0.0f;
+    const float rotation_fraction = pending_lio_correction_.initial_rotation_rad > 1.0e-6f
+      ? pending_lio_correction_.remaining_rotation_rad /
+        pending_lio_correction_.initial_rotation_rad : 0.0f;
+    last_correction_progress_ = std::clamp(
+      1.0f - std::max(translation_fraction, rotation_fraction), 0.0f, 1.0f);
+
+    if (pending_lio_correction_.remaining_translation_m <=
+          lio_correction_completion_translation_m_ &&
+        pending_lio_correction_.remaining_rotation_rad <=
+          lio_correction_completion_rotation_rad_) {
+      lio_map_T_lio_ = pending_lio_correction_.target_map_T_lio;
+      last_correction_progress_ = 1.0f;
+      RCLCPP_INFO(get_logger(),
+        "%s global correction smoothing completed", pending_lio_correction_.source.c_str());
+      pending_lio_correction_.active = false;
+    }
+    // The current frame contains part of the queued global correction even if
+    // this step completed it. Its dynamic covariance must still be applied.
+    return true;
+  }
+
   bool applyLioPrimaryObservation(const rclcpp::Time& stamp) {
     lio_corrected_this_frame_ = false;
     if (!pose_estimator) {
@@ -854,6 +1107,15 @@ private:
       RCLCPP_INFO(get_logger(),
         "FAST-LIO2 anchored to the map at [%.3f, %.3f, %.3f]",
         pose_estimator->pos().x(), pose_estimator->pos().y(), pose_estimator->pos().z());
+    }
+    const bool correction_step_applied = advancePendingLioCorrection(stamp);
+    if (correction_step_applied) {
+      horizontal_variance = std::max(
+        horizontal_variance, pending_lio_correction_.noise.horizontal_variance);
+      vertical_variance = std::max(
+        vertical_variance, pending_lio_correction_.noise.vertical_variance);
+      orientation_variance = std::max(
+        orientation_variance, pending_lio_correction_.noise.orientation_variance);
     }
     const Eigen::Isometry3f T_map = lio_map_T_lio_ * T_lio;
     if (!T_map.matrix().allFinite()) {
@@ -899,6 +1161,17 @@ private:
         source, residual_xy, gnss_max_residual_);
       gate.reset();
       gate.last_decision = "jump_rejected";
+      return AuxiliaryGateStatus::reject;
+    }
+    if (residual_xy > lio_max_correction_jump_m_ ||
+        residual_yaw > lio_max_correction_yaw_rad_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "%s absolute correction rejected: xy=%.2fm/%.2fm yaw=%.1fdeg/%.1fdeg",
+        source, residual_xy, lio_max_correction_jump_m_,
+        residual_yaw * 180.0 / M_PI,
+        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+      gate.reset();
+      gate.last_decision = "absolute_correction_rejected";
       return AuxiliaryGateStatus::reject;
     }
 
@@ -966,7 +1239,8 @@ private:
   bool maybeCorrectLioDrift(
       const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp) {
     lio_corrected_this_frame_ = false;
-    if (!pose_estimator || !match.is_converged_ || !match.transform_.allFinite()) {
+    if (!pose_estimator || pending_lio_correction_.active ||
+        !match.is_converged_ || !match.transform_.allFinite()) {
       ndt_drift_gate_.resetConsecutive();
       return false;
     }
@@ -993,22 +1267,36 @@ private:
     if (status != AuxiliaryGateStatus::accept) {
       return false;
     }
-    pose_estimator->correct_absolute_pose(
-      ndt_position, ndt_orientation,
-      lio_correct_xy_variance_, lio_correct_z_variance_,
-      lio_correct_orientation_variance_);
-    reanchorLioToUkf();
+    Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
+    target_map_T_base.translation() = ndt_position;
+    target_map_T_base.linear() = ndt_orientation.toRotationMatrix();
+    const CorrectionNoise noise = scanMatchCorrectionNoise(match);
+    if (!scheduleLioAnchorCorrection(
+          target_map_T_base, noise, "NDT/VGICP", stamp)) {
+      ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "correction_schedule_rejected";
+      return false;
+    }
     ndt_drift_gate_.markCorrected();
     rtk_drift_gate_.resetConsecutive();
     lio_corrected_this_frame_ = true;
     RCLCPP_WARN(get_logger(),
-      "NDT/VGICP corrected LIO drift: xy=%.3fm yaw=%.1fdeg score=%.3f method=%s",
-      drift_xy, drift_yaw * 180.0 / M_PI, match.fitness_score_, match.method_.c_str());
+      "NDT/VGICP queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg score=%.3f "
+      "inlier=%.3f Rxy=%.4f Ryaw=%.5f method=%s",
+      drift_xy, drift_yaw * 180.0 / M_PI, match.fitness_score_,
+      last_ndt_inlier_fraction_, noise.horizontal_variance,
+      noise.orientation_variance, match.method_.c_str());
     return true;
   }
 
   bool maybeCorrectRtkDrift(const RtkObservation& observation) {
-    if (!pose_estimator || lio_corrected_this_frame_) {
+    if (observation.stamp_ns <= 0 ||
+        observation.stamp_ns == last_rtk_aux_observation_stamp_ns_) {
+      return false;
+    }
+    last_rtk_aux_observation_stamp_ns_ = observation.stamp_ns;
+    if (!pose_estimator || lio_corrected_this_frame_ ||
+        pending_lio_correction_.active) {
       if (lio_corrected_this_frame_) {
         rtk_drift_gate_.resetConsecutive();
       }
@@ -1046,26 +1334,47 @@ private:
     }
 
     Eigen::Quaternionf orientation = pose_estimator->quat();
-    float orientation_variance = 1.0e6f;
+    float orientation_variance = lio_orientation_variance_;
     if (gnss_use_heading_ && observation.heading_usable) {
       orientation = observation.orientation;
-      orientation_variance = lio_correct_orientation_variance_;
+      orientation_variance = static_cast<float>(std::max(
+        observation.heading_std_rad * observation.heading_std_rad,
+        static_cast<double>(lio_correct_orientation_variance_)));
       last_rtk_heading_fused_stamp_ns_ = observation.heading_stamp_ns;
       rtk_heading_fused_this_frame_ = true;
     }
-    pose_estimator->correct_absolute_pose(
-      rtk_position, orientation,
-      lio_correct_xy_variance_, lio_correct_z_variance_, orientation_variance);
-    reanchorLioToUkf();
+    const float horizontal_variance = static_cast<float>(std::max(
+      observation.horizontal_std_m * observation.horizontal_std_m,
+      static_cast<double>(lio_correct_xy_variance_)));
+    const float vertical_variance = gnss_use_elevation_
+      ? horizontal_variance : lio_z_variance_;
+    CorrectionNoise noise;
+    noise.horizontal_variance = horizontal_variance;
+    noise.vertical_variance = vertical_variance;
+    noise.orientation_variance = orientation_variance;
+    noise.quality_penalty = static_cast<float>(std::clamp(
+      observation.horizontal_std_m / std::max(gnss_max_horizontal_std_, 1.0e-3),
+      0.0, 1.0));
+    Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
+    target_map_T_base.translation() = rtk_position;
+    target_map_T_base.linear() = orientation.normalized().toRotationMatrix();
+    if (!scheduleLioAnchorCorrection(
+          target_map_T_base, noise, "RTK", timeOnStampClock(observation.stamp_ns, get_clock()->now()))) {
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "correction_schedule_rejected";
+      return false;
+    }
     rtk_drift_gate_.markCorrected();
     ndt_drift_gate_.resetConsecutive();
     rtk_position_fused_this_frame_ = true;
     lio_corrected_this_frame_ = true;
     last_rtk_map_position_ = rtk_position;
     RCLCPP_WARN(get_logger(),
-      "RTK corrected LIO drift: xy=%.3fm yaw=%.1fdeg quality=%s heading=%s",
+      "RTK queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg quality=%s "
+      "heading=%s Rxy=%.4f Ryaw=%.5f",
       drift_xy, drift_yaw * 180.0 / M_PI, observation.quality.c_str(),
-      observation.heading_usable ? "yes" : "no");
+      observation.heading_usable ? "yes" : "no",
+      noise.horizontal_variance, noise.orientation_variance);
     return true;
   }
 
@@ -1094,6 +1403,19 @@ private:
 
   void updateRtkAutoPrimary(const RtkObservation& observation, const rclcpp::Time& stamp) {
     if (!prefer_fixed_rtk_ || !source_arbiter_enable_) {
+      rtk_auto_primary_latched_ = false;
+      rtk_auto_primary_good_frames_ = 0;
+      rtk_auto_primary_bad_frames_ = 0;
+      return;
+    }
+    // Once map initialization has succeeded, FAST-LIO is the only continuous
+    // UKF driver. RTK remains an absolute, timestamp-deduplicated correction;
+    // it must not take ownership merely because LIO is temporarily stale.
+    if (enable_lio_primary_ && is_init_success_) {
+      if (rtk_auto_primary_latched_) {
+        RCLCPP_INFO(get_logger(),
+          "FAST-LIO-only policy active; RTK primary latch cleared");
+      }
       rtk_auto_primary_latched_ = false;
       rtk_auto_primary_good_frames_ = 0;
       rtk_auto_primary_bad_frames_ = 0;
@@ -1270,6 +1592,15 @@ private:
     if (!pose_estimator || !observation.usable) {
       return false;
     }
+    if (observation.stamp_ns <= 0 ||
+        observation.stamp_ns < last_rtk_primary_applied_stamp_ns_) {
+      return false;
+    }
+    if (observation.stamp_ns == last_rtk_primary_applied_stamp_ns_) {
+      // Keep the source valid between GNSS updates without correcting the UKF
+      // repeatedly with the same statistical sample.
+      return true;
+    }
     Eigen::Vector3f position = observation.position;
     if (!gnss_use_elevation_) {
       position.z() = 0.0f;
@@ -1289,6 +1620,7 @@ private:
     pose_estimator->inject_rtk_xy_yaw(
       position, observation.heading_usable, injected_yaw, !gnss_use_elevation_,
       horizontal_variance, vertical_variance, heading_variance);
+    last_rtk_primary_applied_stamp_ns_ = observation.stamp_ns;
     is_init_success_ = true;
     init_match_count_ = 0;
     last_rtk_map_position_ = position;
@@ -1453,9 +1785,17 @@ private:
         << "\",\"ndt_healthy\":" << (last_ndt_healthy_ ? "true" : "false")
         << ",\"ndt_score\":" << last_ndt_score_
         << ",\"lio_primary\":" << (enable_lio_primary_ ? "true" : "false")
+        << ",\"single_continuous_source_enforced\":" << (enable_lio_primary_ ? "true" : "false")
         << ",\"lio_healthy\":" << (lioOdomFresh(stamp) ? "true" : "false")
         << ",\"lio_anchored\":" << (lio_anchor_valid_ ? "true" : "false")
         << ",\"lio_corrected\":" << (lio_corrected_this_frame_ ? "true" : "false")
+        << ",\"correction_smoothing_active\":" << (pending_lio_correction_.active ? "true" : "false")
+        << ",\"correction_source\":\"" << pending_lio_correction_.source << "\""
+        << ",\"correction_progress\":" << last_correction_progress_
+        << ",\"correction_xy_variance\":" << last_correction_xy_variance_
+        << ",\"correction_z_variance\":" << last_correction_z_variance_
+        << ",\"correction_orientation_variance\":" << last_correction_orientation_variance_
+        << ",\"correction_quality_penalty\":" << last_correction_quality_penalty_
         << ",\"ndt_drift_frames\":" << ndt_drift_gate_.consecutive
         << ",\"rtk_drift_frames\":" << rtk_drift_gate_.consecutive
         << ",\"ndt_drift_decision\":\"" << ndt_drift_gate_.last_decision << "\""
@@ -1463,6 +1803,7 @@ private:
         << ",\"ndt_correction_latched\":" << (ndt_drift_gate_.correction_latched ? "true" : "false")
         << ",\"rtk_correction_latched\":" << (rtk_drift_gate_.correction_latched ? "true" : "false")
         << ",\"suppressed_covariance_scale\":" << lio_suppressed_covariance_scale_
+        << ",\"ndt_inlier_fraction\":" << last_ndt_inlier_fraction_
         << ",\"raw_imu_in_localization_ukf\":" << (use_imu ? "true" : "false")
         << ",\"absolute_stable\":" << (absolute_stable_ ? "true" : "false")
         << ",\"absolute_stable_samples\":" << absolute_stable_count_
@@ -1940,7 +2281,7 @@ private:
     // cloud conversion before the expensive PCL work. Promotion/demotion still
     // runs later in the same callback from the latest RTK sample.
     const bool skip_lidar_matching =
-      is_init_success_ && source_arbiter_enable_ && !bridge_active_ &&
+      is_init_success_ && !enable_lio_primary_ && source_arbiter_enable_ && !bridge_active_ &&
       rtk_auto_primary_latched_;
     if (skip_lidar_matching != lidar_matching_paused_for_rtk_) {
       lidar_matching_paused_for_rtk_ = skip_lidar_matching;
@@ -1976,7 +2317,8 @@ private:
         RCLCPP_ERROR(get_logger(), "cloud is empty!!");
         return;
       }
-      auto filtered = downsample(raw_points_ptr_);
+      auto preprocessed = preprocessScanForMapMatching(raw_points_ptr_);
+      auto filtered = downsample(preprocessed);
       TransformPoints(filtered, raw_points_ptr_);
     } else {
       raw_points_ptr_->clear();
@@ -2182,7 +2524,7 @@ private:
     // Only a latched fixed-RTK + heading solution pauses LiDAR matching.
     // A route waypoint that merely prefers rtk, or a float/usable position
     // without a valid heading, must keep NDT available as the fallback.
-    const bool rtk_primary = source_arbiter_enable_ && !bridge_active_ &&
+    const bool rtk_primary = !enable_lio_primary_ && source_arbiter_enable_ && !bridge_active_ &&
       rtk_auto_primary_latched_;
     if (rtk_primary) {
       resetLioAnchor();
@@ -2205,7 +2547,8 @@ private:
     if (run_ndt) {
       aligned = pose_estimator->correct(
         stamp, raw_points_ptr_,
-        is_init_success_ && !rtk_primary && !bridge_active_ && !lio_observation_applied);
+        is_init_success_ && !enable_lio_primary_ &&
+          !rtk_primary && !bridge_active_ && !lio_observation_applied);
       publish_scan_matching_status(points_msg->header, aligned);
       const PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
       last_ndt_score_ = match_result.fitness_score_;
@@ -2255,16 +2598,22 @@ private:
       active_source_ = "lio_imu";
       absolute_observation_updated = true;
       maybeCorrectRtkDrift(rtk_observation);
+    } else if (enable_lio_primary_ && is_init_success_) {
+      // A stale FAST-LIO stream is a localization outage, not permission for
+      // NDT or RTK to become a second continuous odometry source. Keep scan
+      // matching alive for diagnostics/relocalization, but do not drive UKF.
+      if (startBridge(rclcpp::Time(stamp))) {
+        bridge_pose_valid = !has_odom_delta || applyBridgeDelta(
+          odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp));
+      } else {
+        active_source_ = "unavailable";
+      }
     } else if (last_ndt_healthy_) {
       absolute_pose_valid = true;
       active_source_ = "ndt_imu";
       absolute_observation_updated = run_ndt;
-      if (enable_lio_primary_) {
-        maybeCorrectRtkDrift(rtk_observation);
-      } else {
-        applyRtkHeadingObservation(rtk_observation);
-        rtk_position_fused_this_frame_ = applyGnssCorrection(rclcpp::Time(stamp));
-      }
+      applyRtkHeadingObservation(rtk_observation);
+      rtk_position_fused_this_frame_ = applyGnssCorrection(rclcpp::Time(stamp));
     } else if (rtk_observation.usable) {
       absolute_pose_valid = applyRtkObservation(rtk_observation);
       active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
@@ -2299,6 +2648,9 @@ private:
       if (absolute_pose_valid) {
         runtime_relocalization_attempted_ = false;
         gnss_recovery_seed_pending_ = false;
+        last_rtk_primary_applied_stamp_ns_ = 0;
+        last_rtk_aux_observation_stamp_ns_ = 0;
+        last_absolute_observation_stamp_ns_ = 0;
       }
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "Localization source=%s match=%s score=%.3f ndt=%.3f vgicp=%.3f rtk=%s bridge=%.2fm",
@@ -2459,6 +2811,121 @@ private:
     voxel_filter_ptr_->filter(*filtered);
     filtered->header = cloud->header;
     return filtered;
+  }
+
+  pcl::PointCloud<PointT>::Ptr preprocessScanForMapMatching(
+      const pcl::PointCloud<PointT>::Ptr& cloud) const {
+    pcl::PointCloud<PointT>::Ptr cropped(new pcl::PointCloud<PointT>());
+    if (!cloud) {
+      return cropped;
+    }
+    cropped->reserve(cloud->size());
+    const double min_range_sq = scan_preprocess_min_range_m_ * scan_preprocess_min_range_m_;
+    const double max_range_sq = scan_preprocess_max_range_m_ * scan_preprocess_max_range_m_;
+    const double half_fov_rad = scan_preprocess_fov_degree_ * 0.5 * M_PI / 180.0;
+    const bool mask_fov = scan_preprocess_fov_degree_ < 359.9;
+    for (const auto& point : cloud->points) {
+      if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+        continue;
+      }
+      const double range_sq = static_cast<double>(point.x) * point.x
+        + static_cast<double>(point.y) * point.y
+        + static_cast<double>(point.z) * point.z;
+      if (range_sq <= min_range_sq || range_sq > max_range_sq) {
+        continue;
+      }
+      if (mask_fov && std::fabs(std::atan2(
+          static_cast<double>(point.y), static_cast<double>(point.x))) > half_fov_rad) {
+        continue;
+      }
+      cropped->push_back(point);
+    }
+    cropped->width = static_cast<std::uint32_t>(cropped->size());
+    cropped->height = 1;
+    cropped->is_dense = cloud->is_dense;
+    if (!scan_ground_filter_enable_ || cropped->empty()) {
+      return cropped;
+    }
+
+    Eigen::Vector3d gravity_up_lidar = Eigen::Vector3d::UnitZ();
+    {
+      std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+      if (has_lio_odom_) {
+        const auto& value = latest_lio_odom_.pose.pose.orientation;
+        Eigen::Quaterniond orientation(value.w, value.x, value.y, value.z);
+        if (orientation.coeffs().allFinite() && orientation.norm() > 1e-6) {
+          orientation.normalize();
+          gravity_up_lidar = orientation.toRotationMatrix().transpose()
+            * Eigen::Vector3d::UnitZ();
+        }
+      }
+    }
+    gravity_up_lidar.normalize();
+    pcl::PointCloud<PointT>::Ptr candidates(new pcl::PointCloud<PointT>());
+    candidates->reserve(cropped->size() / 2);
+    for (const auto& point : cropped->points) {
+      const double vertical = gravity_up_lidar.dot(
+        Eigen::Vector3d(point.x, point.y, point.z));
+      if (vertical <= -scan_ground_min_sensor_height_m_
+          && vertical >= -scan_ground_max_sensor_height_m_) {
+        candidates->push_back(point);
+      }
+    }
+    if (static_cast<int>(candidates->size()) < scan_ground_min_inliers_) {
+      return cropped;
+    }
+
+    pcl::SACSegmentation<PointT> segmentation;
+    pcl::PointIndices inliers;
+    pcl::ModelCoefficients coefficients;
+    segmentation.setOptimizeCoefficients(true);
+    segmentation.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+    segmentation.setMethodType(pcl::SAC_RANSAC);
+    segmentation.setAxis(gravity_up_lidar.cast<float>());
+    segmentation.setEpsAngle(scan_ground_max_tilt_deg_ * M_PI / 180.0);
+    segmentation.setDistanceThreshold(scan_ground_distance_threshold_m_);
+    segmentation.setMaxIterations(80);
+    segmentation.setInputCloud(candidates);
+    segmentation.segment(inliers, coefficients);
+    if (static_cast<int>(inliers.indices.size()) < scan_ground_min_inliers_
+        || coefficients.values.size() < 4) {
+      return cropped;
+    }
+
+    Eigen::Vector3d normal(
+      coefficients.values[0], coefficients.values[1], coefficients.values[2]);
+    double offset = coefficients.values[3];
+    const double normal_norm = normal.norm();
+    if (!normal.allFinite() || !std::isfinite(offset) || normal_norm < 1e-6) {
+      return cropped;
+    }
+    normal /= normal_norm;
+    offset /= normal_norm;
+    if (normal.dot(gravity_up_lidar) < 0.0) {
+      normal = -normal;
+      offset = -offset;
+    }
+    const double sensor_height = offset;
+    if (normal.dot(gravity_up_lidar) < std::cos(scan_ground_max_tilt_deg_ * M_PI / 180.0)
+        || sensor_height < scan_ground_min_sensor_height_m_
+        || sensor_height > scan_ground_max_sensor_height_m_) {
+      return cropped;
+    }
+
+    pcl::PointCloud<PointT>::Ptr filtered(new pcl::PointCloud<PointT>());
+    filtered->reserve(cropped->size());
+    for (const auto& point : cropped->points) {
+      const double signed_height = normal.dot(Eigen::Vector3d(point.x, point.y, point.z)) + offset;
+      if (signed_height >= -scan_ground_distance_threshold_m_
+          && signed_height <= scan_ground_clearance_m_) {
+        continue;
+      }
+      filtered->push_back(point);
+    }
+    filtered->width = static_cast<std::uint32_t>(filtered->size());
+    filtered->height = 1;
+    filtered->is_dense = cropped->is_dense;
+    return filtered->size() >= 20 ? filtered : cropped;
   }
 
   void resetLidarOdometryState() {
@@ -3183,6 +3650,7 @@ private:
       Eigen::Isometry3d(relative_transform.cast<double>())).transform;
     if (!aligned || aligned->empty()) {
       last_ndt_status_healthy_ = false;
+      last_ndt_inlier_fraction_ = 0.0f;
       status.has_converged = false;
       status.inlier_fraction = 0.0f;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2.0,
@@ -3215,6 +3683,7 @@ private:
     }
     status.inlier_fraction = static_cast<float>(num_inliers) / aligned->size();
     }
+    last_ndt_inlier_fraction_ = status.inlier_fraction;
     const bool score_valid = std::isfinite(status.matching_error) &&
       status.matching_error < ndt_max_fitness_score_;
     const bool inliers_valid = status.inlier_fraction >= 0.05f;
@@ -3507,8 +3976,10 @@ private:
                         map_dir.c_str(), error.c_str());
             return;
         }
-        RCLCPP_INFO(get_logger(), "Scan context database loaded: %zu keyframes from %s",
-                    scan_context_db_.size(), map_dir.c_str());
+        RCLCPP_INFO(get_logger(),
+                    "Scan context database loaded: %zu keyframes from %s (seed poses: %s)",
+                    scan_context_db_.size(), map_dir.c_str(),
+                    scan_context_db_.seed_pose_source().c_str());
     }
 
     void LoadMapCallBack(robots_dog_msgs::srv::LoadMap::Request::SharedPtr request, 
@@ -3729,6 +4200,7 @@ private:
   bool last_ndt_healthy_ = false;
   bool last_ndt_status_healthy_ = false;
   double last_ndt_score_ = std::numeric_limits<double>::infinity();
+  float last_ndt_inlier_fraction_ = 0.0f;
   rclcpp::Time last_ndt_update_time_{0, 0, RCL_ROS_TIME};
   Eigen::Vector3f last_rtk_map_position_ = Eigen::Vector3f::Zero();
   double last_rtk_map_yaw_ = 0.0;
@@ -3738,6 +4210,8 @@ private:
   std::string bridge_rejection_reason_;
   std::string odom_time_source_ = "not_used";
   int64_t last_absolute_observation_stamp_ns_ = 0;
+  int64_t last_rtk_primary_applied_stamp_ns_ = 0;
+  int64_t last_rtk_aux_observation_stamp_ns_ = 0;
   
   // transformation matrices 
   Eigen::Matrix3f init_rotation_matrix_ = Eigen::Matrix3f::Identity();
@@ -3850,9 +4324,21 @@ private:
   float lio_rearm_xy_m_ = 0.20f;
   float lio_suppressed_covariance_scale_ = 100.0f;
   float lio_max_correction_jump_m_ = 1.50f;
+  float lio_max_correction_yaw_rad_ = 30.0f * static_cast<float>(M_PI) / 180.0f;
   float lio_correct_xy_variance_ = 0.010f;
   float lio_correct_z_variance_ = 0.020f;
   float lio_correct_orientation_variance_ = 0.001f;
+  bool lio_dynamic_covariance_enable_ = true;
+  float lio_dynamic_ndt_good_score_ = 0.10f;
+  float lio_dynamic_vgicp_good_score_ = 0.05f;
+  float lio_dynamic_good_inlier_fraction_ = 0.50f;
+  float lio_dynamic_xy_variance_max_ = 0.25f;
+  float lio_dynamic_z_variance_max_ = 0.50f;
+  float lio_dynamic_orientation_variance_max_ = 0.05f;
+  float lio_correction_translation_rate_mps_ = 0.25f;
+  float lio_correction_rotation_rate_radps_ = 8.0f * static_cast<float>(M_PI) / 180.0f;
+  float lio_correction_completion_translation_m_ = 0.01f;
+  float lio_correction_completion_rotation_rad_ = 0.25f * static_cast<float>(M_PI) / 180.0f;
   mutable std::mutex lio_odom_mutex_;
   nav_msgs::msg::Odometry latest_lio_odom_;
   rclcpp::Time latest_lio_odom_stamp_{0, 0, RCL_ROS_TIME};
@@ -3860,6 +4346,12 @@ private:
   bool lio_anchor_valid_ = false;
   bool lio_has_previous_pose_ = false;
   bool lio_corrected_this_frame_ = false;
+  PendingLioCorrection pending_lio_correction_;
+  float last_correction_progress_ = 0.0f;
+  float last_correction_xy_variance_ = 0.0f;
+  float last_correction_z_variance_ = 0.0f;
+  float last_correction_orientation_variance_ = 0.0f;
+  float last_correction_quality_penalty_ = 0.0f;
   AuxiliaryDriftGate ndt_drift_gate_;
   AuxiliaryDriftGate rtk_drift_gate_;
   Eigen::Isometry3f lio_map_T_lio_ = Eigen::Isometry3f::Identity();
@@ -3878,6 +4370,16 @@ private:
   int scan_matching_max_iterations_ = 20;
   int scan_matching_num_threads_ = 2;
   float scan_matching_coarse_max_fitness_score_ = 2.00f;
+  double scan_preprocess_min_range_m_ = 0.50;
+  double scan_preprocess_max_range_m_ = 10.0;
+  double scan_preprocess_fov_degree_ = 240.0;
+  bool scan_ground_filter_enable_ = true;
+  double scan_ground_distance_threshold_m_ = 0.08;
+  double scan_ground_max_tilt_deg_ = 20.0;
+  int scan_ground_min_inliers_ = 80;
+  double scan_ground_min_sensor_height_m_ = 0.20;
+  double scan_ground_max_sensor_height_m_ = 1.20;
+  double scan_ground_clearance_m_ = 0.15;
   float lidar_odom_max_translation_per_scan_ = 0.80f;
   float lidar_odom_max_rotation_per_scan_rad_ = 0.70f;
   size_t lidar_odom_min_points_ = 200;
