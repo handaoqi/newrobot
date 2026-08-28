@@ -1540,6 +1540,7 @@ function localizationQuality() {
 
 function localizationSourceLabel(source) {
   const labels = {
+    lio_imu: 'LIO + IMU',
     ndt_imu: 'NDT + IMU',
     rtk_imu: 'RTK + IMU',
     imu_odom_bridge: 'IMU + 里程计桥接',
@@ -1656,10 +1657,33 @@ function localizationDecisionBasis(quality = localizationQuality()) {
   const rtkQuality = rtkQualityLabel(rawRtk.quality || decision.rtk_quality)
   const decisionQuality = rtkQualityLabel(decision.rtk_quality)
   const blockedReason = rtkBlockedReasonLabel(decision.rtk_blocked_reason)
-  const score = Number(quality?.matching_error)
-  const ndtDetail = Number.isFinite(score) ? `NDT健康（分数 ${score.toFixed(3)}）` : 'NDT质量未上报'
+  const decisionScore = Number(decision.ndt_score)
+  const qualityScore = Number(quality?.matching_error)
+  const score = Number.isFinite(decisionScore) ? decisionScore : qualityScore
+  const ndtHealthy = typeof decision.ndt_healthy === 'boolean'
+    ? decision.ndt_healthy
+    : Number.isFinite(score) && score < 0.5 && quality?.has_converged !== false
+  const ndtDetail = Number.isFinite(score)
+    ? `NDT${ndtHealthy ? '健康' : '不健康'}（分数 ${score.toFixed(3)}）`
+    : 'NDT质量未上报'
   const rtkDetail = `原始RTK ${rtkQuality}；融合${rtkUsable ? '可用' : '不可用'}（决策${decisionQuality}，${blockedReason}）`
 
+  if (source === 'lio_imu') {
+    const lioHealth = decision.lio_healthy === true
+      ? 'LIO健康'
+      : decision.lio_healthy === false ? 'LIO数据异常' : 'LIO状态未上报'
+    const anchor = decision.lio_anchored === true ? '已完成地图锚定' : '等待地图锚定'
+    const stable = decision.absolute_stable === true
+      ? `定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
+      : `等待定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
+    let correction = ndtHealthy ? 'NDT健康待命' : 'NDT当前不可用于修正'
+    if (decision.correction_smoothing_active === true) {
+      correction = `正在平滑应用${decision.correction_source || '外部'}修正`
+    } else if (decision.ndt_drift_decision === 'suppressed_low_drift') {
+      correction = '当前漂移较小，无需NDT修正'
+    }
+    return `LIO + IMU主定位，${lioHealth}，${anchor}，${stable}；${ndtDetail}，${correction}；${rtkDetail}。`
+  }
   if (source === 'rtk_imu') {
     return preferred === 'rtk'
       ? `RTK优先，${rtkDetail}；采用RTK + IMU。`
@@ -1674,7 +1698,23 @@ function localizationDecisionBasis(quality = localizationQuality()) {
     return `NDT不健康且${rtkDetail}；进入受限桥接 ${Number(decision.bridge_distance_m || 0).toFixed(2)}m / ${Number(decision.bridge_elapsed_s || 0).toFixed(1)}s。`
   }
   const rejection = decision.bridge_rejection_reason ? `桥接拒绝：${decision.bridge_rejection_reason}。` : ''
-  return `NDT不健康，${rtkDetail}；暂无绝对定位源。${rejection}`
+  if (source === 'unavailable') {
+    return `${ndtDetail}，${rtkDetail}；暂无绝对定位源。${rejection}`
+  }
+  return `当前定位源 ${localizationSourceLabel(source)}；${ndtDetail}；${rtkDetail}。${rejection}`
+}
+
+function localizationDecisionTone(decision = {}) {
+  const source = decision.active_source || ''
+  if (['ndt_imu', 'rtk_imu'].includes(source)) return 'ok'
+  if (source === 'lio_imu') {
+    return decision.lio_healthy === true
+      && decision.lio_anchored === true
+      && decision.absolute_stable === true ? 'ok' : 'warn'
+  }
+  if (source === 'imu_odom_bridge') return 'warn'
+  if (source === 'unavailable') return 'bad'
+  return source ? 'warn' : 'unknown'
 }
 
 function ndtQualityLabel(quality = localizationQuality()) {
@@ -1855,9 +1895,7 @@ function stateMachineSteps() {
       title: '定位决策',
       value: localizationSourceLabel(activeSource),
       detail: localizationDecisionBasis(quality),
-      state: ['ndt_imu', 'rtk_imu'].includes(activeSource)
-        ? 'ok'
-        : activeSource === 'imu_odom_bridge' ? 'warn' : activeSource ? 'bad' : 'unknown',
+      state: localizationDecisionTone(decision),
     },
     {
       key: 'localization-init',
