@@ -33,16 +33,4 @@ def generate_launch_description():
         #     output='screen',
         #     parameters=[config_file]
         # )
-        
-        # 静态TF: 由出厂标定 /front_lidar R/T 取逆得到，base_link -> livox_frame
-        Node(
-            name='lidar_tf',
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            arguments=[
-                '0.382765605', '-0.046855740', '0.513445457',
-                '0.007172121', '-0.043589169', '-0.009509268', '0.998978536',
-                'base_link', 'livox_frame'
-            ]
-        )
     ])
