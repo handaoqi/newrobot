@@ -12,6 +12,13 @@ x-backend: &backend
     MQTT_HOST: mqtt
     MQTT_PORT: "1883"
     MQTT_TLS_ENABLED: "false"
+    VALIDATION_OBJECT_STORE_BACKEND: s3
+    VALIDATION_OBJECT_STORE_ENDPOINT: http://validation-storage:9000
+    VALIDATION_OBJECT_STORE_PUBLIC_ENDPOINT: ${VALIDATION_OBJECT_STORE_PUBLIC_ENDPOINT:-http://localhost:9002}
+    VALIDATION_OBJECT_STORE_BUCKET: ${VALIDATION_OBJECT_STORE_BUCKET:-roamerx-validation}
+    VALIDATION_OBJECT_STORE_ACCESS_KEY: ${VALIDATION_OBJECT_STORE_ACCESS_KEY:-roamerx-validation}
+    VALIDATION_OBJECT_STORE_SECRET_KEY: ${VALIDATION_OBJECT_STORE_SECRET_KEY:-change-validation-storage-secret}
+    VALIDATION_GATEWAY_TOKEN: ${VALIDATION_GATEWAY_TOKEN:-change-validation-gateway-secret}
   volumes:
     - ./data/backend/db:/runtime/db
     - ./data/backend/media:/runtime/media
@@ -55,6 +62,60 @@ services:
       backend:
         condition: service_healthy
 
+  validation-storage:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: roamerx-validation-storage
+    command: ["server", "/data", "--console-address", ":9001"]
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${VALIDATION_OBJECT_STORE_ACCESS_KEY:-roamerx-validation}
+      MINIO_ROOT_PASSWORD: ${VALIDATION_OBJECT_STORE_SECRET_KEY:-change-validation-storage-secret}
+    ports:
+      - "${VALIDATION_OBJECT_STORE_PORT:-9002}:9000"
+      - "127.0.0.1:${VALIDATION_OBJECT_STORE_CONSOLE_PORT:-9003}:9001"
+    volumes:
+      - ./data/validation-objects:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  validation-storage-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    env_file:
+      - ./conf/platform.env
+    depends_on:
+      validation-storage:
+        condition: service_healthy
+    volumes:
+      - ./conf/validation-storage-cors.xml:/cors.xml:ro
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - >-
+        mc alias set validation http://validation-storage:9000
+        "$${VALIDATION_OBJECT_STORE_ACCESS_KEY:-roamerx-validation}"
+        "$${VALIDATION_OBJECT_STORE_SECRET_KEY:-change-validation-storage-secret}";
+        mc mb --ignore-existing "validation/$${VALIDATION_OBJECT_STORE_BUCKET:-roamerx-validation}";
+        mc anonymous set none "validation/$${VALIDATION_OBJECT_STORE_BUCKET:-roamerx-validation}";
+        mc cors set "validation/$${VALIDATION_OBJECT_STORE_BUCKET:-roamerx-validation}" /cors.xml
+    restart: "no"
+
+  validation-gateway:
+    build:
+      context: ${ROAMERX_SOURCE_ROOT:-../..}/platform/validation-gateway
+    image: roamerx/validation-gateway:local
+    container_name: roamerx-validation-gateway
+    restart: unless-stopped
+    environment:
+      ROAMERX_PLATFORM_INTERNAL_URL: http://backend:8000
+      ROAMERX_VALIDATION_GATEWAY_PORT: "8765"
+      ROAMERX_VALIDATION_GATEWAY_TOKEN: ${VALIDATION_GATEWAY_TOKEN:-change-validation-gateway-secret}
+    depends_on:
+      backend:
+        condition: service_healthy
+
   frontend:
     build:
       context: ${ROAMERX_SOURCE_ROOT:-../..}/platform/frontend
@@ -66,8 +127,12 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+      validation-gateway:
+        condition: service_started
       zlmediakit:
         condition: service_started
+    volumes:
+      - ./install/lichtblick-web/dist:/usr/share/nginx/html/foxglove:ro
 
   mqtt:
     image: eclipse-mosquitto:2

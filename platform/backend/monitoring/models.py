@@ -910,6 +910,7 @@ class RemoteCommand(BaseTimestampModel):
         ("nav.initial_pose", "设置初始定位"),
         ("nav.relocalize", "主动重定位"),
         ("map.activate", "切换活动地图"),
+        ("map.optimize", "离线回环优化"),
         ("sensor.restart", "重启传感器"),
         ("charge.start", "开始充电"),
         ("charge.stop", "断开充电"),
@@ -1242,3 +1243,263 @@ class VoiceRecognitionEvent(BaseTimestampModel):
         indexes = [
             models.Index(fields=["robot", "-created_at"], name="voice_rec_robot_time_idx"),
         ]
+
+
+class ValidationRecording(BaseTimestampModel):
+    """Immutable rosbag/MCAP input registered for replay validation."""
+
+    FORMAT_CHOICES = [("mcap", "MCAP"), ("sqlite3", "rosbag2 SQLite3")]
+    STATE_CHOICES = [
+        ("registered", "已登记"),
+        ("uploading", "上传中"),
+        ("ready", "可检查"),
+        ("invalid", "无效"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(
+        Robot, related_name="validation_recordings", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    task_execution = models.ForeignKey(
+        TaskExecution,
+        related_name="validation_recordings",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    label = models.CharField(max_length=160)
+    storage_format = models.CharField(max_length=16, choices=FORMAT_CHOICES, default="mcap")
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default="registered")
+    object_key = models.CharField(max_length=512, blank=True)
+    sha256 = models.CharField(max_length=64, blank=True)
+    size_bytes = models.PositiveBigIntegerField(default=0)
+    duration_seconds = models.FloatField(default=0)
+    start_time_ns = models.BigIntegerField(default=0)
+    end_time_ns = models.BigIntegerField(default=0)
+    topic_manifest = models.JSONField(default=list, blank=True)
+    recording_manifest = models.JSONField(default=dict, blank=True)
+    source_path_hint = models.CharField(max_length=512, blank=True)
+    upload_id = models.CharField(max_length=512, blank=True)
+    uploaded_at = models.DateTimeField(null=True, blank=True)
+    invalid_reason = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["state", "-created_at"], name="val_record_state_idx"),
+            models.Index(fields=["robot", "-created_at"], name="val_record_robot_idx"),
+        ]
+
+
+class ValidationProfile(BaseTimestampModel):
+    MODE_CHOICES = [("bag_replay", "Bag 重算"), ("matrix_scenario", "MATRiX/UE 场景仿真")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=128)
+    version = models.PositiveIntegerField(default=1)
+    mode = models.CharField(max_length=24, choices=MODE_CHOICES, default="bag_replay")
+    enabled = models.BooleanField(default=True)
+    description = models.TextField(blank=True)
+    required_topics = models.JSONField(default=list, blank=True)
+    replay_topics = models.JSONField(default=list, blank=True)
+    output_topics = models.JSONField(default=list, blank=True)
+    thresholds = models.JSONField(default=dict, blank=True)
+    runner_config = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["name", "-version"]
+        constraints = [
+            models.UniqueConstraint(fields=["name", "version"], name="uniq_validation_profile_ver")
+        ]
+
+
+class ValidationRunner(BaseTimestampModel):
+    KIND_CHOICES = [("cpu", "CPU Replay Runner"), ("matrix", "MATRiX/UE GPU Runner")]
+    STATE_CHOICES = [("offline", "离线"), ("idle", "空闲"), ("busy", "忙碌"), ("disabled", "停用")]
+
+    id = models.CharField(primary_key=True, max_length=64)
+    display_name = models.CharField(max_length=128, blank=True)
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES, default="cpu")
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default="offline")
+    capabilities = models.JSONField(default=list, blank=True)
+    version = models.CharField(max_length=128, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    private_address = models.CharField(max_length=256, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+
+
+class ValidationJob(BaseTimestampModel):
+    MODE_CHOICES = ValidationProfile.MODE_CHOICES
+    STATE_CHOICES = [
+        ("queued", "排队中"),
+        ("staging", "准备中"),
+        ("running", "运行中"),
+        ("analyzing", "分析中"),
+        ("uploading", "上传结果"),
+        ("cancelling", "取消中"),
+        ("completed", "已完成"),
+        ("cancelled", "已取消"),
+        ("infra_error", "基础设施失败"),
+    ]
+    VERDICT_CHOICES = [
+        ("NOT_EVALUATED", "未判定"),
+        ("PASS", "通过"),
+        ("WARN", "告警"),
+        ("FAIL", "失败"),
+    ]
+    TERMINAL_STATES = {"completed", "cancelled", "infra_error"}
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recording = models.ForeignKey(
+        ValidationRecording, related_name="validation_jobs", on_delete=models.PROTECT
+    )
+    profile = models.ForeignKey(ValidationProfile, related_name="validation_jobs", on_delete=models.PROTECT)
+    baseline_job = models.ForeignKey(
+        "self", related_name="comparison_jobs", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    mode = models.CharField(max_length=24, choices=MODE_CHOICES, default="bag_replay")
+    state = models.CharField(max_length=24, choices=STATE_CHOICES, default="queued")
+    verdict = models.CharField(max_length=16, choices=VERDICT_CHOICES, default="NOT_EVALUATED")
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    runner = models.ForeignKey(
+        ValidationRunner, related_name="validation_jobs", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="validation_jobs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    idempotency_key = models.CharField(max_length=128, blank=True)
+    attempt_count = models.PositiveIntegerField(default=0)
+    lease_token = models.UUIDField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    requested_config = models.JSONField(default=dict, blank=True)
+    resolved_config = models.JSONField(default=dict, blank=True)
+    summary = models.JSONField(default=dict, blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error_message = models.TextField(blank=True)
+    stack_git_sha = models.CharField(max_length=64, blank=True)
+    stack_image_digest = models.CharField(max_length=160, blank=True)
+    live_bridge_url = models.CharField(max_length=512, blank=True)
+    queued_at = models.DateTimeField(default=timezone.now)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["state", "queued_at"], name="val_job_queue_idx"),
+            models.Index(fields=["runner", "state"], name="val_job_runner_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["requested_by", "idempotency_key"],
+                condition=~Q(idempotency_key=""),
+                name="uniq_validation_idempotency",
+            ),
+            models.CheckConstraint(
+                condition=Q(progress_percent__gte=0) & Q(progress_percent__lte=100),
+                name="val_job_progress_range",
+            ),
+        ]
+
+
+class ValidationAttempt(BaseTimestampModel):
+    job = models.ForeignKey(ValidationJob, related_name="attempts", on_delete=models.CASCADE)
+    number = models.PositiveIntegerField()
+    runner = models.ForeignKey(ValidationRunner, related_name="attempts", on_delete=models.PROTECT)
+    state = models.CharField(max_length=24, default="staging")
+    lease_token = models.UUIDField(default=uuid.uuid4)
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error_message = models.TextField(blank=True)
+    runtime_metrics = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["number"]
+        constraints = [
+            models.UniqueConstraint(fields=["job", "number"], name="uniq_validation_attempt")
+        ]
+
+
+class ValidationArtifact(BaseTimestampModel):
+    ROLE_CHOICES = [
+        ("source", "输入录制"),
+        ("result_mcap", "结果 MCAP"),
+        ("report", "检查报告"),
+        ("log", "运行日志"),
+        ("metrics", "指标"),
+        ("evidence", "证据"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job = models.ForeignKey(ValidationJob, related_name="artifacts", on_delete=models.CASCADE)
+    role = models.CharField(max_length=24, choices=ROLE_CHOICES)
+    name = models.CharField(max_length=256)
+    object_key = models.CharField(max_length=512)
+    sha256 = models.CharField(max_length=64, blank=True)
+    size_bytes = models.PositiveBigIntegerField(default=0)
+    content_type = models.CharField(max_length=128, default="application/octet-stream")
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["role", "name"]
+        constraints = [
+            models.UniqueConstraint(fields=["job", "role", "name"], name="uniq_validation_artifact")
+        ]
+
+
+class ValidationCheckResult(BaseTimestampModel):
+    STATUS_CHOICES = [
+        ("PASS", "通过"),
+        ("WARN", "告警"),
+        ("FAIL", "失败"),
+        ("NOT_EVALUATED", "未判定"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job = models.ForeignKey(ValidationJob, related_name="check_results", on_delete=models.CASCADE)
+    rule_id = models.CharField(max_length=128)
+    title = models.CharField(max_length=256)
+    category = models.CharField(max_length=64)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES)
+    severity = models.CharField(max_length=16, default="error")
+    hard_failure = models.BooleanField(default=False)
+    metric_name = models.CharField(max_length=128, blank=True)
+    actual_value = models.JSONField(null=True, blank=True)
+    expected_value = models.JSONField(null=True, blank=True)
+    start_time_ns = models.BigIntegerField(null=True, blank=True)
+    end_time_ns = models.BigIntegerField(null=True, blank=True)
+    topics = models.JSONField(default=list, blank=True)
+    evidence = models.JSONField(default=dict, blank=True)
+    message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["category", "rule_id"]
+        constraints = [
+            models.UniqueConstraint(fields=["job", "rule_id"], name="uniq_validation_check")
+        ]
+
+
+class GoldenBaseline(BaseTimestampModel):
+    profile = models.ForeignKey(ValidationProfile, related_name="golden_baselines", on_delete=models.PROTECT)
+    job = models.OneToOneField(ValidationJob, related_name="golden_baseline", on_delete=models.PROTECT)
+    map_hash = models.CharField(max_length=64, blank=True)
+    route_hash = models.CharField(max_length=64, blank=True)
+    stack_image_digest = models.CharField(max_length=160)
+    active = models.BooleanField(default=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="approved_validation_baselines",
+        on_delete=models.PROTECT,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["profile", "active"], name="golden_profile_active_idx")]

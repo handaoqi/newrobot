@@ -15,6 +15,13 @@ For cloud Streamable HTTP, run the same program with `--transport streamable-htt
 
 Available tools: `robot_list_platform_devices`, `robot_direction`, `robot_speed`, `robot_action`, `robot_skill_run`, `robot_skill_status`, `robot_skill_cancel`, `robot_person_detection`, `robot_person_detection_status`, `robot_person_follow`, `robot_person_follow_status`, `robot_person_follow_stop`, and `robot_remote_control_capabilities`.
 
+Validation sandbox tools: `validation_recordings_list`, `validation_profiles_list`,
+`validation_job_create`, `validation_job_get`, `validation_job_cancel`,
+`validation_report_get`, and `validation_evidence_get`. They address only immutable
+platform recording IDs and isolated validation jobs. They do not accept filesystem
+paths, shell commands, environment variables, ROS domains, or container images and
+never route through the real-robot command topic.
+
 `robot_list_platform_devices` calls the platform's read-only device inventory endpoint with the MCP service token. It returns only fields needed for selection: platform ID, code, name, location, connection/status, and battery level. It never sends a robot command; `default_robot_id` is included when the service has a valid `ROAMERX_DEFAULT_ROBOT_ID` binding.
 
 `robot_skill_run` supports presets and a structured `steps` array. An AI client may store the original natural-language request in `description`, but must turn it into explicit steps before it reaches the robot. It waits up to 10 seconds, then returns the asynchronous command ID.

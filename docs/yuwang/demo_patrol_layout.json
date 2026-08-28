@@ -1,0 +1,178 @@
+{
+  "configById": {
+    "3D!demoscene": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 18,
+        "phi": 50,
+        "thetaOffset": 0,
+        "targetOffset": [
+          5,
+          4,
+          0
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/map": {
+          "visible": true,
+          "colorMode": "costmap",
+          "frameLocked": true
+        },
+        "/scan": {
+          "visible": true,
+          "pointSize": 3,
+          "colorMode": "flat",
+          "flatColor": "#f0f0f0ff"
+        },
+        "/odom": {
+          "visible": true,
+          "type": "arrow",
+          "color": "#e5484dff",
+          "historySize": 1
+        },
+        "/patrol/trajectory": {
+          "visible": true,
+          "lineWidth": 0.06,
+          "gradient": [
+            "#e5484dff",
+            "#e5484dff"
+          ]
+        },
+        "/plan": {
+          "visible": true,
+          "lineWidth": 0.08,
+          "gradient": [
+            "#b0b0b0ff",
+            "#b0b0b0ff"
+          ]
+        },
+        "/goal_pose": {
+          "visible": true,
+          "type": "arrow",
+          "color": "#22c55eff"
+        }
+      },
+      "layers": {},
+      "publish": {
+        "type": "point"
+      }
+    },
+    "Image!democam": {
+      "imageMode": {
+        "imageTopic": "/camera/front/image/compressed",
+        "synchronize": false
+      }
+    },
+    "Plot!democmd": {
+      "paths": [
+        {
+          "value": "/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "linear.x",
+          "color": "#3b82f6"
+        },
+        {
+          "value": "/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "angular.z",
+          "color": "#e5484d"
+        },
+        {
+          "value": "/odom.pose.pose.position.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "odom x",
+          "color": "#f5a524"
+        },
+        {
+          "value": "/odom.pose.pose.position.y",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "odom y",
+          "color": "#22c55e"
+        },
+        {
+          "value": "/battery_state.percentage",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "battery",
+          "color": "#a855f7"
+        }
+      ],
+      "showLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "legendDisplay": "floating",
+      "sidebarDimension": 240
+    },
+    "RawMessages!demostatus": {
+      "topicPath": "/patrol/status",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "DiagnosticSummary!demodiag": {
+      "minLevel": 0,
+      "pinnedIds": [],
+      "hardwareIdFilter": "",
+      "topicToRender": "/diagnostics",
+      "sortByLevel": true
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "first": {
+      "first": "3D!demoscene",
+      "second": "Image!democam",
+      "direction": "column",
+      "splitPercentage": 68
+    },
+    "second": {
+      "first": "Plot!democmd",
+      "second": {
+        "first": "RawMessages!demostatus",
+        "second": "DiagnosticSummary!demodiag",
+        "direction": "column",
+        "splitPercentage": 60
+      },
+      "direction": "column",
+      "splitPercentage": 50
+    },
+    "direction": "row",
+    "splitPercentage": 55
+  }
+}

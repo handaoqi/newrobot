@@ -339,9 +339,12 @@ status_stack() {
   pgrep -af "ros2 launch localization localization.launch.py|ros2 launch robot_navigo navigation_bringup.launch.py|localization_node|navigo_container|vel_cmd_udp_pub|mode_status_pub" || true
   echo
   echo "Lifecycle:"
-  ros2 lifecycle get /planner_server 2>/dev/null || true
-  ros2 lifecycle get /controller_server 2>/dev/null || true
-  ros2 lifecycle get /bt_navigator 2>/dev/null || true
+  local planner controller bt waypoint
+  planner="$(ros2 lifecycle get /planner_server 2>/dev/null || true)"
+  controller="$(ros2 lifecycle get /controller_server 2>/dev/null || true)"
+  bt="$(ros2 lifecycle get /bt_navigator 2>/dev/null || true)"
+  waypoint="$(ros2 lifecycle get /waypoint_follower 2>/dev/null || true)"
+  printf '%s\n' "${planner}" "${controller}" "${bt}" "${waypoint}"
   echo
   echo "Localization:"
   local status
@@ -349,7 +352,28 @@ status_stack() {
   echo "status: ${status:-unavailable}"
   echo
   echo "cmd_vel:"
-  ros2 topic info /cmd_vel -v 2>/dev/null | sed -n '1,80p' || true
+  ros2 topic info /cmd_vel -v 2>/dev/null | sed -n '1,20p' || true
+  echo
+  # Repeat compact tokens at the end. Edge truncates status stdout to the last
+  # 6000 characters, and the verbose /cmd_vel dump would otherwise hide them.
+  echo "Ready-check:"
+  if echo "${planner}" | grep -q 'active \[3\]'; then
+    echo "/planner_server"
+    echo "active [3]"
+  fi
+  if echo "${controller}" | grep -q 'active \[3\]'; then
+    echo "/controller_server"
+    echo "active [3]"
+  fi
+  if echo "${bt}" | grep -q 'active \[3\]'; then
+    echo "/bt_navigator"
+    echo "active [3]"
+  fi
+  if echo "${waypoint}" | grep -q 'active \[3\]'; then
+    echo "/follow_waypoints"
+  fi
+  echo "/cmd_vel"
+  echo "status: ${status:-unavailable}"
 }
 
 MODE="${1:-start}"

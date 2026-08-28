@@ -7,6 +7,9 @@
 - `models/`: deployable inference models kept under version control when size allows.
 - `vendor-archives/`: original vendor SDK archives.
 - `genisom_l1_sdk/`: installed vendor SDK runtime, created locally and ignored by Git.
+- `lichtblick-web/`: pinned Lichtblick static web bundle for the Foxglove debugging
+  MVP. Only the lock file and README are tracked; fetch the payload with
+  `robot/script/robot/fetch_lichtblick_web.sh`.
 
 Use `../scripts/install-system-deps.sh`; do not manually copy host Python
 site-packages between NX devices because JetPack/CUDA ABI versions must match.

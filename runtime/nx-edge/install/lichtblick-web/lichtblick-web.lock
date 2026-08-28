@@ -1,0 +1,6 @@
+# Pinned Lichtblick web bundle. Data only -- never sourced as shell.
+# Refresh with: robot/script/robot/fetch_lichtblick_web.sh --force
+# after updating version/url/sha256 together.
+version=1.28.1
+url=https://github.com/lichtblick-suite/lichtblick/releases/download/v1.28.1/lichtblick-web.tar.gz
+sha256=08a954bf95676180282d6d66c0d95ce82ff06c7e65090dd77dfbf2b6a10d13a8

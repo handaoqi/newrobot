@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import uuid
 from typing import Any
 
 import requests
@@ -62,6 +63,13 @@ def require_command_id(command_id: str, operation: str) -> str:
     return resolved
 
 
+def require_uuid(value: str, operation: str) -> str:
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"{operation} 需要有效 UUID") from exc
+
+
 def resolve_robot_id(robot_id: int | None) -> int:
     """Return an explicit robot ID or the installation-wide default.
 
@@ -109,6 +117,8 @@ MCP_SKILL_REGISTRY = {
         "也可以查看平台已登记的设备及其平台 ID，以便明确选择目标机器狗。"
         "还可以开启人员识别、查看识别到的人员，针对指定 track_id 或画面中央人员执行持续本地视觉跟随，"
         "也支持列出并执行预设组合动作；两者均可查询或停止。"
+        "对于已经上传的平台 MCAP，我还可以在隔离 CPU Runner 中创建、查询或取消导航定位回放检查，"
+        "并读取结构化规则、异常时间段和证据制品；该能力不能访问生产 ROS 域。"
     ),
     "safety": [
         "回答功能咨询时只说明能力，不发送控制命令。",
@@ -185,6 +195,20 @@ MCP_SKILL_REGISTRY = {
                 {"label": "取消组合动作"},
             ],
         },
+        {
+            "name": "仿真与回放检查",
+            "tools": [
+                "validation_recordings_list", "validation_profiles_list", "validation_job_create",
+                "validation_job_get", "validation_job_cancel", "validation_report_get",
+                "validation_evidence_get",
+            ],
+            "buttons": [
+                {"label": "查看可用录制", "read_only": True},
+                {"label": "创建隔离回放检查"},
+                {"label": "查询/取消检查作业"},
+                {"label": "读取报告与异常证据", "read_only": True},
+            ],
+        },
     ],
 }
 
@@ -194,6 +218,8 @@ SERVER_INSTRUCTIONS = (
     "robot_list_platform_devices；它是只读操作。"
     "回答咨询时不得发送控制命令。用户明确要求控制时直接调用对应工具，无需现场通道或行进路线的二次确认。"
     "人员跟随的视觉闭环仅在 Edge Agent 本地运行。"
+    "回放检查只能使用 validation_recordings_list 返回的 recording_id 和 validation_profiles_list 返回的 "
+    "profile_id；不得把文件路径、shell、环境变量、ROS Domain 或镜像作为参数。"
     "所有控制均经云平台、MQTT 和 Edge Agent。"
 )
 
@@ -263,6 +289,24 @@ class PlatformClient:
             "count": len(devices),
             "default_robot_id": configured_default_robot_id(),
         }
+
+    def validation_get(self, path: str) -> Any:
+        response = requests.get(f"{self.base_url}/api/{path.lstrip('/')}", headers=self._headers(), timeout=20)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(f"platform rejected validation query: {response.text}") from exc
+        return response.json()
+
+    def validation_post(self, path: str, payload: dict[str, Any]) -> Any:
+        response = requests.post(
+            f"{self.base_url}/api/{path.lstrip('/')}", json=payload, headers=self._headers(), timeout=20
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(f"platform rejected validation command: {response.text}") from exc
+        return response.json()
 
     def person_detection_status(self, robot_id: int | None) -> dict[str, Any]:
         return self.command(robot_id, "person-detection-status", {})
@@ -417,6 +461,102 @@ def robot_person_follow_stop(robot_id: int | None = None, wait_seconds: float = 
 def robot_remote_control_capabilities() -> dict[str, Any]:
     """客户询问“你能做什么”或遥控页有哪些功能时，返回完整且安全的功能清单；只读。"""
     return MCP_SKILL_REGISTRY
+
+
+@mcp.tool(name="validation_recordings_list")
+def validation_recordings_list(robot_id: int | None = None) -> dict[str, Any]:
+    """列出平台已校验为 ready、可用于隔离回放检查的 MCAP；只读。"""
+    path = "validation-recordings/?state=ready"
+    if robot_id is not None:
+        path += f"&robot_id={resolve_robot_id(robot_id)}"
+    recordings = client.validation_get(path)
+    safe = [
+        {
+            "id": item.get("id"), "label": item.get("label"), "robot_code": item.get("robot_code"),
+            "size_bytes": item.get("size_bytes"), "duration_seconds": item.get("duration_seconds"),
+            "storage_format": item.get("storage_format"), "created_at": item.get("created_at"),
+        }
+        for item in recordings
+    ]
+    return {"recordings": safe, "count": len(safe)}
+
+
+@mcp.tool(name="validation_profiles_list")
+def validation_profiles_list() -> dict[str, Any]:
+    """列出平台管理员发布的检查 Profile；只读。"""
+    profiles = client.validation_get("validation-profiles/")
+    safe = [
+        {
+            "id": item.get("id"), "name": item.get("name"), "version": item.get("version"),
+            "mode": item.get("mode"), "description": item.get("description"),
+            "required_topics": item.get("required_topics"),
+        }
+        for item in profiles
+    ]
+    return {"profiles": safe, "count": len(safe)}
+
+
+@mcp.tool(name="validation_job_create")
+def validation_job_create(
+    recording_id: str,
+    profile_id: str,
+    baseline_job_id: str = "",
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """使用平台录制 ID 和已发布 Profile 创建隔离回放检查；不接受路径或命令。"""
+    payload = {
+        "recording_id": require_uuid(recording_id, "创建检查作业"),
+        "profile_id": require_uuid(profile_id, "创建检查作业"),
+        "idempotency_key": str(idempotency_key or uuid.uuid4())[:128],
+    }
+    if baseline_job_id:
+        payload["baseline_job_id"] = require_uuid(baseline_job_id, "指定黄金基线")
+    return client.validation_post("validation-jobs/", payload)
+
+
+@mcp.tool(name="validation_job_get")
+def validation_job_get(job_id: str) -> dict[str, Any]:
+    """读取隔离回放检查的状态、进度和简要结果；只读。"""
+    return client.validation_get(f"validation-jobs/{require_uuid(job_id, '查询检查作业')}/")
+
+
+@mcp.tool(name="validation_job_cancel")
+def validation_job_cancel(job_id: str) -> dict[str, Any]:
+    """取消隔离 Runner 中的检查作业；不会向真实机器人发送命令。"""
+    resolved = require_uuid(job_id, "取消检查作业")
+    return client.validation_post(f"validation-jobs/{resolved}/cancel/", {})
+
+
+@mcp.tool(name="validation_report_get")
+def validation_report_get(job_id: str) -> dict[str, Any]:
+    """读取检查总判定、规则结果、版本指纹和证据制品；只读。"""
+    resolved = require_uuid(job_id, "读取检查报告")
+    return client.validation_get(f"validation-jobs/{resolved}/report/")
+
+
+@mcp.tool(name="validation_evidence_get")
+def validation_evidence_get(job_id: str, rule_id: str) -> dict[str, Any]:
+    """按规则 ID 返回一个异常的有限时间窗、话题和证据引用；只读。"""
+    report = validation_report_get(job_id)
+    resolved_rule = str(rule_id or "").strip()
+    if not resolved_rule:
+        raise ValueError("读取异常证据需要 rule_id")
+    check = next((item for item in report.get("checks", []) if item.get("rule_id") == resolved_rule), None)
+    if check is None:
+        raise ValueError(f"作业报告中不存在规则 {resolved_rule!r}")
+    return {
+        "job_id": report.get("id"),
+        "verdict": report.get("verdict"),
+        "check": check,
+        "artifacts": [
+            {
+                "id": item.get("id"), "role": item.get("role"), "name": item.get("name"),
+                "size_bytes": item.get("size_bytes"), "signed_download_path": item.get("signed_download_path"),
+            }
+            for item in report.get("artifacts", [])
+            if item.get("role") in {"report", "evidence", "result_mcap"}
+        ],
+    }
 
 
 def main() -> None:

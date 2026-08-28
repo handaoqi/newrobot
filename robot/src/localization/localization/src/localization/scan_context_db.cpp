@@ -85,6 +85,25 @@ bool jsonNumber(const std::string& text, const std::string& key, double& value) 
   return true;
 }
 
+bool jsonString(const std::string& text, const std::string& key, std::string& value) {
+  const std::string needle = "\"" + key + "\"";
+  const auto key_pos = text.find(needle);
+  if (key_pos == std::string::npos) {
+    return false;
+  }
+  const auto colon = text.find(':', key_pos + needle.size());
+  const auto quote = colon == std::string::npos ? std::string::npos : text.find('"', colon + 1);
+  if (quote == std::string::npos) {
+    return false;
+  }
+  const auto end = text.find('"', quote + 1);
+  if (end == std::string::npos) {
+    return false;
+  }
+  value = text.substr(quote + 1, end - quote - 1);
+  return true;
+}
+
 }  // namespace
 
 struct ScanContextDatabase::KeyframeRow {
@@ -97,6 +116,7 @@ struct ScanContextDatabase::KeyframeRow {
 
 void ScanContextDatabase::clear() {
   source_dir_.clear();
+  seed_pose_source_ = "raw";
   keyframe_indices_.clear();
   poses_.clear();
   descriptors_.clear();
@@ -220,6 +240,42 @@ bool ScanContextDatabase::load(const std::string& map_dir, std::string* error) {
   }
   if (rows.empty()) {
     return fail("keyframes/keyframes.csv contains no usable rows");
+  }
+
+  // The keyframe cloud remains stored in its original world frame, so its raw
+  // lidar pose must still be used to reconstruct the local descriptor. The
+  // relocalization seed, however, belongs to the selected navigation map. If
+  // post-save optimization was accepted, replace only the map-frame seed pose
+  // with trajectory_optimized.csv and leave the raw lidar pose untouched.
+  std::ifstream manifest_stream(map_dir + "/map_manifest.json");
+  if (manifest_stream) {
+    const std::string manifest((std::istreambuf_iterator<char>(manifest_stream)),
+                               std::istreambuf_iterator<char>());
+    std::string trajectory_source;
+    if (jsonString(manifest, "trajectory_source", trajectory_source) &&
+        trajectory_source == "optimized") {
+      std::vector<KeyframeRow> optimized_rows;
+      if (readKeyframeCsv(map_dir + "/trajectory_optimized.csv", optimized_rows)) {
+        std::unordered_map<int, const KeyframeRow*> optimized_by_index;
+        optimized_by_index.reserve(optimized_rows.size());
+        for (const auto& optimized : optimized_rows) {
+          optimized_by_index[optimized.index] = &optimized;
+        }
+        std::size_t replaced = 0;
+        for (auto& row : rows) {
+          const auto match = optimized_by_index.find(row.index);
+          if (match == optimized_by_index.end()) {
+            continue;
+          }
+          row.world_translation = match->second->world_translation;
+          row.world_rotation = match->second->world_rotation;
+          ++replaced;
+        }
+        if (replaced == rows.size()) {
+          seed_pose_source_ = "optimized";
+        }
+      }
+    }
   }
 
   descriptors_.reserve(rows.size());

@@ -76,6 +76,7 @@ class CommandProcessor:
             prepared_task_start = envelope.message_type == "task.start"
             if prepared_task_start:
                 self._release_manual_control_for_task()
+                self._ensure_navigation_stack_for_task()
                 self.safety.wait_until_localization_stable()
                 self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
                 docking = ((envelope.payload.get("command") or {}).get("docking") or {})
@@ -146,6 +147,27 @@ class CommandProcessor:
             self.store.save_command_result(command_id, result)
             self.publish_result(command_id, result)
             return ack if "ack" in dir() else {}, result
+
+    def _ensure_navigation_stack_for_task(self) -> None:
+        """Repair an unexpectedly stopped Nav2 stack before task validation.
+
+        Nav2 and localization stay warm between tasks. Starting them for every
+        route adds latency and resets useful state, but a task should still be
+        able to recover when the resident stack was stopped or crashed.
+        """
+        if self.safety.state.nav_ready or not self.navigation_stack_adapter:
+            return
+        self.navigation_stack_adapter.start({"reason": "task_start"})
+        self._await_navigation_stack_ready(
+            timeout_seconds=45.0,
+            message="navigation stack did not become ready for task start",
+        )
+
+    def _await_navigation_stack_ready(self, timeout_seconds: float, message: str) -> None:
+        wait_until_ready = getattr(self.task_executor.navigation, "wait_until_ready", None)
+        if not callable(wait_until_ready) or not wait_until_ready(timeout_seconds=timeout_seconds):
+            raise ProtocolError("NAV_STACK_NOT_READY", message)
+        self.safety.state.nav_ready = True
 
     def _release_manual_control_for_task(self) -> None:
         """Clear manual input before a navigation task takes control."""
@@ -267,12 +289,25 @@ class CommandProcessor:
                     raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
                 if envelope.message_type == "nav.start":
                     result_payload = self.navigation_stack_adapter.start(command)
+                    self._await_navigation_stack_ready(
+                        timeout_seconds=45.0,
+                        message="Nav2 did not become ready after nav.start",
+                    )
                 elif envelope.message_type == "nav.restart":
                     result_payload = self.navigation_stack_adapter.restart(command)
+                    self._await_navigation_stack_ready(
+                        timeout_seconds=45.0,
+                        message="Nav2 did not become ready after nav.restart",
+                    )
                 elif envelope.message_type == "nav.recover":
                     result_payload = self.navigation_stack_adapter.recover(command)
+                    self._await_navigation_stack_ready(
+                        timeout_seconds=45.0,
+                        message="Nav2 did not become ready after nav.recover",
+                    )
                 elif envelope.message_type == "nav.stop":
                     result_payload = self.navigation_stack_adapter.stop(command)
+                    self.safety.state.nav_ready = False
                 else:
                     raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
             finally:
@@ -569,6 +604,14 @@ class CommandProcessor:
             self.safety.state.localization_status = "initializing"
             self.safety.state.localization_normal_since_monotonic = 0.0
             result_payload["localization_reset_required"] = True
+        elif envelope.message_type == "map.optimize":
+            if not self.mapping_adapter:
+                raise ProtocolError("MAPPING_UNAVAILABLE", "mapping adapter is not configured")
+            context = self.task_executor.context
+            if context and context.state not in self.task_executor.TERMINAL_STATES:
+                raise ProtocolError("ROBOT_BUSY", "机器人正在执行任务，不能离线优化地图")
+            source_dir = self.map_activation_adapter.resolve_source_dir(command)
+            result_payload = self.mapping_adapter.optimize_historical_map(command, source_dir)
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
         return build_result(

@@ -154,6 +154,9 @@ int main(int argc, char** argv) {
       continue;
     }
     ++loaded_maps;
+    if (!quiet) {
+      std::cout << map_dir << ": seed_pose_source=" << database.seed_pose_source() << "\n";
+    }
 
     Totals totals;
     for (std::size_t slot = 0; slot < database.size(); ++slot) {

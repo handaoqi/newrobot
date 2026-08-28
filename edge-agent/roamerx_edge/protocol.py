@@ -17,7 +17,7 @@ NAV_COMMAND_TYPES = {
     "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",
     "nav.initial_pose", "nav.relocalize",
 }
-MAP_COMMAND_TYPES = {"map.activate"}
+MAP_COMMAND_TYPES = {"map.activate", "map.optimize"}
 SENSOR_COMMAND_TYPES = {"sensor.restart"}
 CHARGE_COMMAND_TYPES = {"charge.start", "charge.stop"}
 MOTION_CONTROL_COMMAND_TYPES = {"motion.start", "motion.stop"}
@@ -218,6 +218,13 @@ def validate_command(envelope: MessageEnvelope) -> None:
         for field in ("map_id", "map_version"):
             if not str(command.get(field, "")).strip():
                 raise ProtocolError("INVALID_MESSAGE", f"map.activate requires {field}")
+    if envelope.message_type == "map.optimize":
+        command = payload["command"]
+        if not str(command.get("source_map_id") or command.get("map_id") or "").strip():
+            raise ProtocolError("INVALID_MESSAGE", "map.optimize requires source_map_id")
+        selected = command.get("selected_candidates")
+        if not isinstance(selected, list) or not selected:
+            raise ProtocolError("INVALID_MESSAGE", "map.optimize requires selected_candidates")
     if envelope.message_type == "sensor.restart":
         sensor = str(payload["command"].get("sensor") or "").strip().lower()
         if sensor not in {"lidar", "imu", "lidar_imu", "rtk"}:

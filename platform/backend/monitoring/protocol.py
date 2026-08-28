@@ -34,6 +34,7 @@ COMMAND_TYPES = {
     "nav.initial_pose",
     "nav.relocalize",
     "map.activate",
+    "map.optimize",
     "sensor.restart",
     "charge.start",
     "charge.stop",

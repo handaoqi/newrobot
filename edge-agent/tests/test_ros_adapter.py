@@ -135,7 +135,7 @@ def test_rtk_primary_ignores_ndt_degradation():
     assert adapter._ndt_failure_count == 0
 
 
-def test_lio_primary_ignores_ndt_degradation():
+def test_lio_primary_ndt_degradation_triggers_recovery():
     adapter = object.__new__(RosAdapter)
     adapter.telemetry = FakeTelemetry({
         "active_source": "lio_imu",
@@ -146,13 +146,19 @@ def test_lio_primary_ignores_ndt_degradation():
     adapter._ndt_failure_notified = False
     adapter._localization_recovery_armed = False
     triggered = threading.Event()
+    reasons: list[str] = []
 
-    adapter._localization_failure_cb = lambda reason: triggered.set()
+    def _on_failure(reason):
+        reasons.append(reason)
+        triggered.set()
+
+    adapter._localization_failure_cb = _on_failure
     bad = SimpleNamespace(has_converged=False, matching_error=1.2, inlier_fraction=0.0)
     adapter._on_scan_matching_status(bad)
-    adapter._on_scan_matching_status(bad)
-    assert not triggered.is_set()
-    assert adapter._ndt_failure_count == 0
+
+    assert triggered.wait(1.0)
+    assert reasons == ["ndt_degraded"]
+    assert adapter._localization_recovery_armed is True
 
 
 def test_patrol_cruise_profile_does_not_hug_path_orientations():
@@ -243,3 +249,9 @@ def test_disabling_goal_precision_does_not_raise_on_timeout(monkeypatch):
 
     adapter._set_remote_parameters = _set
     adapter.set_goal_precision(enabled=False)
+
+
+def test_zero_timeout_ready_probe_still_waits_for_action_discovery():
+    assert RosAdapter._action_server_wait_timeout(0.0, 0.0) == 0.5
+    assert RosAdapter._action_server_wait_timeout(10.0, 0.2) == 0.2
+    assert RosAdapter._action_server_wait_timeout(10.0, 2.0) == 0.5

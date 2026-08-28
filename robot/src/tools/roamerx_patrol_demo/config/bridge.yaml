@@ -1,0 +1,67 @@
+/**:
+  ros__parameters:
+    port: 8765
+    # Loopback by default. foxglove_readonly.launch.py takes an `address`
+    # argument for the LAN case; binding 0.0.0.0 is never the default because
+    # the bridge has no authentication of its own.
+    address: "127.0.0.1"
+
+    # Read-only. The upstream default is
+    #   [clientPublish,parameters,parametersSubscribe,services,connectionGraph,assets]
+    # which lets any browser tab that can reach this port publish /cmd_vel and
+    # call services on the robot. Everything that can write is removed here and
+    # only connectionGraph (topic/node listing) is kept.
+    capabilities: ["connectionGraph"]
+    # Belt and braces: even if capabilities were widened by mistake, there is no
+    # topic a client is allowed to publish on.
+    #
+    # "^$" and not []: an empty YAML sequence carries no element type, and
+    # rclcpp rejects the whole file with "No parameter value set". "^$" matches
+    # only the empty string, and no topic, service or parameter has an empty
+    # name, so it denies everything while still being a typed string list.
+    client_topic_whitelist: ["^$"]
+    service_whitelist: ["^$"]
+    param_whitelist: ["^$"]
+
+    # Demo topics plus the real navigation topics, so the same bridge config
+    # serves both `foxglove_demo.sh live` and attaching to a replayed bag.
+    # Anchored regexes: "/odom" must not also match "/odometry_debug".
+    topic_whitelist:
+      - "^/clock$"
+      - "^/map$"
+      - "^/tf$"
+      - "^/tf_static$"
+      - "^/odom$"
+      - "^/odom/(localization_odom|nav2|mc_odom)$"
+      - "^/cmd_vel$"
+      - "^/cmd_vel_(raw|nav)$"
+      - "^/scan$"
+      - "^/laser_scan(_raw)?$"
+      - "^/front_lidar$"
+      - "^/imu/data$"
+      - "^/front_lidar/imu$"
+      - "^/camera/front/image/compressed$"
+      - "^/battery_state$"
+      - "^/diagnostics$"
+      - "^/plan$"
+      - "^/transformed_global_plan$"
+      - "^/goal_pose$"
+      - "^/patrol/(trajectory|status)$"
+      - "^/localization_info$"
+      - "^/localization/(policy|decision|scan_match_pose)$"
+      - "^/status$"
+      - "^/sensor_health$"
+      - "^/mode_switch_cmd$"
+      - "^/rtk_pvh$"
+      - "^/fix$"
+      - "^/rosout$"
+
+    min_qos_depth: 1
+    max_qos_depth: 10
+    send_buffer_limit: 10000000
+    num_threads: 0
+    # No robot description or mesh is served over this bridge yet, so every
+    # asset request is refused rather than resolved.
+    asset_uri_allowlist: ["^$"]
+    sysinfo: false
+    use_sim_time: false

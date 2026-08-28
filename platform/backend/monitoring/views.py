@@ -55,6 +55,7 @@ from .models import (
     Track,
 )
 from .permissions import IsAudioDeviceCredential, IsAuthenticatedOrDeviceCredential
+from .map_loop_review import LoopReviewError, audit_map_package, normalize_thresholds
 from .realtime import event_broker, sse_stream
 from .services.alert_service import AlertService
 from .services.command_service import CommandService
@@ -2311,6 +2312,78 @@ class MapDataSetActiveView(APIView):
             return Response({"detail": "地图不存在"}, status=status.HTTP_404_NOT_FOUND)
 
 
+class MapDataLoopReviewView(APIView):
+    """Audit Scan-Context candidates without changing the source map."""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        if not map_data.package_file:
+            return Response({"detail": "地图没有完整 ZIP 包，无法审核离线回环"}, status=status.HTTP_409_CONFLICT)
+        raw = {key: request.query_params.get(key) for key in normalize_thresholds({}) if request.query_params.get(key) is not None}
+        try:
+            review = audit_map_package(map_data.package_file.path, raw)
+        except LoopReviewError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        review.update(map_id=map_data.id, map_name=map_data.name, robot_id=map_data.robot_id)
+        return Response(review)
+
+
+class MapDataLoopOptimizeView(APIView):
+    """Queue a confirmed offline loop optimization that creates a new revision."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, pk):
+        source = get_object_or_404(MapData.objects.select_related("robot"), pk=pk)
+        if not source.robot:
+            return Response({"detail": "地图未关联机器狗"}, status=status.HTTP_409_CONFLICT)
+        if not source.package_file:
+            return Response({"detail": "地图没有完整 ZIP 包，不能执行离线优化"}, status=status.HTTP_409_CONFLICT)
+        if TaskExecution.objects.filter(robot=source.robot, state__in=TaskExecution.ACTIVE_STATES).exists():
+            return Response({"detail": "机器人正在执行任务，不能离线优化地图"}, status=status.HTTP_409_CONFLICT)
+        try:
+            thresholds = normalize_thresholds(request.data.get("thresholds"))
+            review = audit_map_package(source.package_file.path, thresholds)
+        except LoopReviewError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        requested = request.data.get("selected_candidate_ids")
+        if not isinstance(requested, list) or not requested:
+            return Response({"detail": "请至少选择一个通过阈值审核的回环"}, status=status.HTTP_400_BAD_REQUEST)
+        selected_ids = list(dict.fromkeys(str(item) for item in requested))
+        eligible = {item["candidate_id"]: item for item in review["candidates"] if item["eligible"]}
+        invalid = [item for item in selected_ids if item not in eligible]
+        if invalid:
+            return Response(
+                {"detail": "存在未通过阈值审核的候选", "invalid_candidate_ids": invalid},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(selected_ids) > int(thresholds["max_selected_loops"]):
+            return Response({"detail": "选择的回环数量超过审核上限"}, status=status.HTTP_400_BAD_REQUEST)
+        payload = _map_activation_payload(source, request)
+        payload.update({
+            "source_map_id": str(source.id),
+            "source_map_name": source.name,
+            "output_map_name": str(request.data.get("name") or f"{source.name}-回环优化").strip()[:128],
+            "thresholds": thresholds,
+            "selected_candidates": [eligible[item] for item in selected_ids],
+            "activate_after_upload": bool(request.data.get("activate_after_upload", False)),
+            "review_confirmed_at": timezone.now().isoformat(),
+        })
+        command = CommandService.create_robot_command(
+            robot=source.robot,
+            command_type="map.optimize",
+            payload=payload,
+            operator=request.user if request.user.is_authenticated else None,
+            expiry_seconds=3600,
+        )
+        return Response({
+            "detail": "离线回环优化命令已下发；源地图保持不变，成功后会上传为新地图版本。",
+            "review": {key: value for key, value in review.items() if key != "candidates"},
+            "selected_candidate_ids": selected_ids,
+            "command": RemoteCommandSerializer(command).data,
+        }, status=status.HTTP_202_ACCEPTED)
+
+
 class MapDataManualCleanView(APIView):
     """Create and immediately activate a manually cleaned map revision."""
     permission_classes = [permissions.AllowAny]
@@ -3212,9 +3285,16 @@ class DeviceMapUploadView(APIView):
             "package_sha256": hashlib.sha256(package_bytes).hexdigest(),
             "mapping_metrics": metadata.get("mapping_metrics", {}),
             "optimization": metadata.get("optimization", {}),
+            "optimization_review": metadata.get("optimization_review", {}),
+            "parent_map_id": metadata.get("parent_map_id", ""),
         }
         auto_activate = bool(metadata.get("auto_activate", False))
         with transaction.atomic():
+            parent_map = None
+            if str(metadata.get("parent_map_id") or "").isdigit():
+                parent_map = MapData.objects.filter(
+                    pk=int(metadata["parent_map_id"]), robot=robot
+                ).first()
             map_data = MapData.objects.create(
                 name=map_name,
                 robot=robot,
@@ -3229,6 +3309,11 @@ class DeviceMapUploadView(APIView):
                 origin_status=str(description.get("origin_status") or ""),
                 map_completeness=str(map_manifest.get("completeness") or ""),
                 mapping_metrics=description.get("mapping_metrics") if isinstance(description.get("mapping_metrics"), dict) else {},
+                parent_map=parent_map,
+                edit_metadata={
+                    "mode": "offline_loop_optimization",
+                    "review": description.get("optimization_review") or {},
+                } if parent_map else {},
             )
             map_data.yaml_file.save(f"{map_data.id}_map.yaml", ContentFile(extracted["map.yaml"]), save=False)
             if extracted.get("map.txt"):

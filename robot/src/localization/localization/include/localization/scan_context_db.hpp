@@ -53,9 +53,9 @@ public:
    * @brief Build the database from a map session directory.
    *
    * Reads keyframes/keyframes.csv plus each keyframes/scan_XXXXX.pcd. Keyframe clouds
-   * are stored in the world frame, so each is moved into its own lidar frame first -
-   * the same convention scan_context/index.json records as "frame": "lidar", and the
-   * reason descriptors stay comparable to a live scan.
+   * are stored in the original world frame, so each is moved into its own lidar frame
+   * using the immutable raw pose. If map_manifest.json selects the optimized trajectory,
+   * trajectory_optimized.csv supplies the map-frame seed pose returned to localization.
    *
    * @param map_dir  Map session directory, i.e. the parent of map.pcd.
    * @param error    Optional human-readable reason on failure.
@@ -69,6 +69,7 @@ public:
   std::size_t size() const { return keyframe_indices_.size(); }
   const ScanContextParams& params() const { return params_; }
   const std::string& source_dir() const { return source_dir_; }
+  const std::string& seed_pose_source() const { return seed_pose_source_; }
 
   /**
    * @brief Rank map keyframes against one scan already in the lidar frame.
@@ -129,6 +130,7 @@ private:
 
   ScanContextParams params_;
   std::string source_dir_;
+  std::string seed_pose_source_ = "raw";
   std::vector<int> keyframe_indices_;
   std::vector<Eigen::Matrix4d> poses_;
   /// Flattened rings*sectors descriptor per keyframe.

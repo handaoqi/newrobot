@@ -168,7 +168,7 @@ class EdgeAgentApplication:
         self.power_mode_controller.reconcile_startup()
         if self.ros_runtime:
             self.ros_runtime.start()
-            self.navigation.wait_until_ready(timeout_seconds=3.0)
+            self.navigation.wait_until_ready(timeout_seconds=10.0)
         self.mqtt.connect()
         if not self.mqtt.wait_connected(15):
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
@@ -280,6 +280,7 @@ class EdgeAgentApplication:
                     "motion.stop",
                     "audio.volume",
                     "map.activate",
+                    "map.optimize",
                     "map_set.v1",
                     "teleop.takeover_enter",
                     "teleop.takeover_exit",
@@ -377,7 +378,7 @@ class EdgeAgentApplication:
                 if mapping_status.get("process_alive"):
                     self.navigation.safety_state.nav_ready = False
                 else:
-                    self.navigation.wait_until_ready(timeout_seconds=0.0)
+                    self.navigation.wait_until_ready(timeout_seconds=0.5)
                 context = self.task_executor.context
                 snapshot = self.telemetry.build_status_snapshot(
                     context.task_execution_id if context and self.task_executor.has_active_task() else None
@@ -677,10 +678,12 @@ class EdgeAgentApplication:
         self.task_executor.on_localization_recovered()
 
     def _handle_task_localization_loss(self, reason: str = "localization_lost") -> None:
-        """Pause a task, then reseed a fresh localization node from its last good pose.
+        """Stop motion, then run the same bounded search as 主动重定位.
 
         `reason` distinguishes a hard localization loss from NDT score degradation;
         both funnel through the same recovery path but are reported separately.
+        Indoor LIO can keep status=3 with a false map lock, so NDT degradation is
+        treated as loss as well.
         """
         # Alert before the early returns below: localization degrading is worth
         # reporting even when no task is running and there is nothing to pause.
@@ -696,10 +699,8 @@ class EdgeAgentApplication:
                 self._localization_alert_attributes(reason),
             )
         self.task_executor.on_localization_lost()
-        if (
-            not self.task_executor.has_active_task()
-            or not self.task_executor.is_paused_for_localization()
-        ):
+        if self._mapping_blocks_auto_relocalize():
+            LOGGER.warning("localization lost during mapping; skipping auto relocalize")
             return
         if not self._localization_recovery_lock.acquire(blocking=False):
             return
@@ -710,10 +711,55 @@ class EdgeAgentApplication:
             name="task-localization-restart",
         ).start()
 
+    def _mapping_blocks_auto_relocalize(self) -> bool:
+        adapter = getattr(self, "mapping_adapter", None)
+        if adapter is None:
+            return False
+        status = getattr(adapter, "status", None)
+        if not callable(status):
+            return False
+        try:
+            return bool(status().get("process_alive"))
+        except Exception:
+            LOGGER.exception("failed to inspect mapping status before auto relocalize")
+            return False
+
+    def _hold_motion_for_relocalize(self) -> None:
+        cancel = getattr(self.navigation, "cancel_navigation", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                LOGGER.warning("auto relocalize could not cancel Nav2")
+        stop = getattr(self.navigation, "stop_motion", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                LOGGER.exception("auto relocalize could not zero cmd_vel")
+
+    def _localization_recovery_seed(self) -> dict | None:
+        pose = self.navigation.latest_trusted_pose()
+        if not pose:
+            pose = self.store.load_last_trusted_pose(
+                str(self.config.robot.current_map_id or ""),
+                str(self.config.robot.current_map_version or ""),
+            )
+        if pose:
+            return dict(pose)
+        latest_getter = getattr(self.navigation, "latest_pose", None)
+        latest = latest_getter() if callable(latest_getter) else None
+        if latest is None:
+            return None
+        return {
+            "x": float(latest.x),
+            "y": float(latest.y),
+            "z": float(getattr(latest, "z", 0.0) or 0.0),
+            "yaw": float(latest.yaw),
+        }
+
     def _recover_task_localization(self, reason: str = "localization_lost") -> None:
         try:
-            attempts = max(1, int(self.config.safety.localization_recovery_attempts))
-            quick_retry = max(0.5, self.config.safety.localization_recovery_retry_seconds)
             cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
             max_cycles = max(0, int(self.config.safety.localization_recovery_max_cycles))
             cycle = 0
@@ -722,12 +768,7 @@ class EdgeAgentApplication:
             while first_cycle or self.task_executor.is_paused_for_localization():
                 first_cycle = False
                 cycle += 1
-                pose = self.navigation.latest_trusted_pose()
-                if not pose:
-                    pose = self.store.load_last_trusted_pose(
-                        str(self.config.robot.current_map_id or ""),
-                        str(self.config.robot.current_map_version or ""),
-                    )
+                pose = self._localization_recovery_seed()
                 if not pose:
                     LOGGER.error(
                         "localization recovery has no trusted pose; retrying in %.1fs",
@@ -735,33 +776,32 @@ class EdgeAgentApplication:
                     )
                 else:
                     LOGGER.warning(
-                        "localization lost; recovering from trusted pose x=%.3f y=%.3f yaw=%.3f",
+                        "localization lost; active relocalize from x=%.3f y=%.3f yaw=%.3f",
                         float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
                     )
-                    for attempt in range(1, attempts + 1):
-                        if not self.task_executor.is_paused_for_localization():
-                            return
-                        try:
-                            if attempt == 1:
-                                self.navigation_stack_adapter.restart_localization()
-                            self.navigation.set_initial_pose({
-                                **pose,
-                                "frame_id": "map",
-                                "wait_seconds": 30.0,
-                                "required_normal_samples": 3,
-                                "require_absolute": True,
-                            })
-                            LOGGER.info("localization recovery accepted on attempt %d/%d", attempt, attempts)
-                            return
-                        except Exception as exc:
-                            LOGGER.warning(
-                                "localization recovery attempt %d/%d failed: %s",
-                                attempt,
-                                attempts,
-                                exc,
-                            )
-                            if attempt < attempts:
-                                time.sleep(quick_retry)
+                    if (
+                        self.task_executor.has_active_task()
+                        and not self.task_executor.is_paused_for_localization()
+                    ):
+                        return
+                    try:
+                        self._hold_motion_for_relocalize()
+                        relocalize = getattr(self.navigation, "active_relocalize", None)
+                        if not callable(relocalize):
+                            raise RuntimeError("active_relocalize is unavailable")
+                        relocalize({
+                            **pose,
+                            "source": "last_trusted",
+                            "max_attempts": 12,
+                        })
+                        LOGGER.info("active relocalize accepted on cycle %d", cycle)
+                        return
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "active relocalize cycle %d failed: %s",
+                            cycle,
+                            exc,
+                        )
                 if not self.task_executor.is_paused_for_localization():
                     return
                 elapsed = time.time() - started_at
@@ -781,7 +821,6 @@ class EdgeAgentApplication:
                             **self._localization_alert_attributes(reason),
                             "recovery_cycles": cycle,
                             "recovery_elapsed_seconds": round(elapsed, 1),
-                            "attempts_per_cycle": attempts,
                         },
                     )
                     return

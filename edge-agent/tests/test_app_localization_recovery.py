@@ -8,22 +8,38 @@ from roamerx_edge.app import EdgeAgentApplication
 class FakeNavigation:
     def __init__(self):
         self.attempts = 0
+        self.seeds = []
+        self.motion_holds = 0
 
     def latest_trusted_pose(self):
         return {"x": 1.0, "y": 2.0, "yaw": 0.3}
 
-    def set_initial_pose(self, _pose):
+    def active_relocalize(self, seed):
         self.attempts += 1
-        if self.attempts <= 3:
+        self.seeds.append(dict(seed))
+        if self.attempts <= 1:
             raise RuntimeError("not converged")
+        return {"mode": "stationary_bounded_search", "accepted": True}
+
+    def cancel_navigation(self):
+        self.motion_holds += 1
+        return True
+
+    def stop_motion(self):
+        return None
 
 
 class FakeTaskExecutor:
+    context = None
+
     def is_paused_for_localization(self):
         return True
 
     def has_active_task(self):
         return True
+
+    def on_localization_lost(self):
+        return None
 
 
 class IdleTaskExecutor:
@@ -82,19 +98,15 @@ def test_recovery_retries_a_new_cycle_after_three_quick_failures(monkeypatch):
     application.navigation = FakeNavigation()
     application.task_executor = FakeTaskExecutor()
     application.navigation_stack_adapter = SimpleNamespace(restarts=0)
-
-    def restart():
-        application.navigation_stack_adapter.restarts += 1
-
-    application.navigation_stack_adapter.restart_localization = restart
     _wire_recovery_collaborators(application)
     sleeps = []
     monkeypatch.setattr(app_module.time, "sleep", sleeps.append)
 
     application._recover_task_localization()
 
-    assert application.navigation.attempts == 4
-    assert application.navigation_stack_adapter.restarts == 2
+    assert application.navigation.attempts == 2
+    assert application.navigation.seeds[0]["source"] == "last_trusted"
+    assert application.navigation.motion_holds >= 1
     assert 30.0 in sleeps
     assert application._localization_recovery_lock.acquire(blocking=False)
     # One cycle failed outright, so exactly one progress report, then a clear on exit.
@@ -127,7 +139,20 @@ def test_recovery_escalates_once_the_cycle_budget_is_spent(monkeypatch):
     assert application._localization_recovery_lock.acquire(blocking=False)
 
 
-def test_localization_loss_does_not_start_task_recovery_without_active_task(monkeypatch):
+class RecordingThread:
+    created = []
+
+    def __init__(self, target=None, daemon=None, name=None, args=(), kwargs=None):
+        self.target = target
+        self.args = args
+        self.name = name
+        RecordingThread.created.append(self)
+
+    def start(self):
+        pass
+
+
+def test_localization_loss_starts_auto_relocalize_without_active_task(monkeypatch):
     application = object.__new__(EdgeAgentApplication)
     application.task_executor = IdleTaskExecutor()
     application.navigation = SimpleNamespace(localization_diagnostics=lambda: {"quality": "bad"})
@@ -140,24 +165,42 @@ def test_localization_loss_does_not_start_task_recovery_without_active_task(monk
         emit_system_alert=lambda *args, **kwargs: alerts.append((args, kwargs))
     )
     application._localization_recovery_lock = threading.Lock()
-
-    def unexpected_thread(**_kwargs):
-        raise AssertionError("recovery thread should not be created")
-
-    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+    RecordingThread.created = []
+    monkeypatch.setattr(app_module.threading, "Thread", RecordingThread)
 
     application._handle_task_localization_loss()
-    # Repeated losses must not spam the platform.
     application._handle_task_localization_loss()
 
     assert application.task_executor.loss_notifications == 2
-    assert application._localization_recovery_lock.acquire(blocking=False)
-    # Alerting happens even with no task to pause - degraded localization is still news.
+    assert [thread.name for thread in RecordingThread.created] == ["task-localization-restart"]
+    assert not application._localization_recovery_lock.acquire(blocking=False)
     assert len(alerts) == 1
     assert alerts[0][0][0] == "localization_lost"
     assert alerts[0][0][1] == "high"
     assert alerts[0][1]["attributes"]["localization_quality"] == "bad"
     assert alerts[0][1]["component"] == "localization"
+
+
+def test_mapping_session_skips_auto_relocalize(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.task_executor = FakeTaskExecutor()
+    application.navigation = SimpleNamespace(localization_diagnostics=lambda: {})
+    application.mapping_adapter = SimpleNamespace(status=lambda: {"process_alive": True})
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1")
+    )
+    application._localization_alert_notified = False
+    application.alerts = SimpleNamespace(emit_system_alert=lambda *args, **kwargs: None)
+    application._localization_recovery_lock = threading.Lock()
+
+    def unexpected_thread(**_kwargs):
+        raise AssertionError("recovery thread should not be created while mapping")
+
+    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+
+    application._handle_task_localization_loss()
+
+    assert application._localization_recovery_lock.acquire(blocking=False)
 
 
 def test_ndt_degradation_alerts_at_a_lower_severity(monkeypatch):
@@ -173,12 +216,14 @@ def test_ndt_degradation_alerts_at_a_lower_severity(monkeypatch):
         emit_system_alert=lambda *args, **kwargs: alerts.append(args)
     )
     application._localization_recovery_lock = threading.Lock()
-    monkeypatch.setattr(app_module.threading, "Thread", lambda **_kwargs: None)
+    RecordingThread.created = []
+    monkeypatch.setattr(app_module.threading, "Thread", RecordingThread)
 
     application._handle_task_localization_loss("ndt_degraded")
 
     assert alerts[0][0] == "ndt_degraded"
     assert alerts[0][1] == "medium"
+    assert [thread.name for thread in RecordingThread.created] == ["task-localization-restart"]
 
 
 def test_recovered_callback_rearms_alerting_and_clears_recovery_state():

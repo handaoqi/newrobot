@@ -8,6 +8,12 @@
 !runtime/*/
 !runtime/*/install/
 !runtime/*/install/**
+# The negations above force-track everything under runtime/*/install, which is
+# right for small vendor archives and manifests but wrong for the 40 MB
+# Lichtblick tarball and its ~150 MB unpacked tree. Only the lock file and README
+# are committed; fetch_lichtblick_web.sh reproduces the rest from the pinned URL.
+runtime/*/install/lichtblick-web/dist/
+runtime/*/install/lichtblick-web/*.tar.gz*
 **/log/
 *.py[cod]
 *.secret.yaml

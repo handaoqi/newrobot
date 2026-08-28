@@ -5,7 +5,7 @@ import {
   hasActiveMappingWorkflow,
   isActiveMappingState,
 } from '../utils/mappingWorkflowState'
-import { hasRescueMetadata } from '../utils/mapDescription'
+import { hasRescueMetadata, parseMapDescription } from '../utils/mapDescription'
 import {
   fetchMapSummaries,
   fetchMapSetSummaries,
@@ -16,6 +16,9 @@ import {
   downloadMap,
   setActiveMap,
   manuallyCleanMap,
+  fetchMapLoopReview,
+  optimizeMapLoops,
+  fetchRobotCommand,
   createMap,
   fetchRobotMappingStatus,
   startRobotMappingOrigin,
@@ -61,6 +64,23 @@ const mappingTrace = ref(null)
 const mappingTraceLoading = ref(false)
 const showMappingTrace = ref(true)
 const globalEnuBusy = ref(false)
+const showLoopReview = ref(false)
+const loopReviewLoading = ref(false)
+const loopOptimizeBusy = ref(false)
+const loopReview = ref(null)
+const selectedLoopCandidates = ref(new Set())
+const loopOptimizeStatus = ref('')
+const loopThresholds = ref({
+  max_rank: 1,
+  descriptor_distance_max: 0.30,
+  geometric_translation_max_m: 2.50,
+  yaw_consistency_max_deg: 34.38,
+  slam_distance_min_m: 2.0,
+  slam_distance_max_m: 20.0,
+  max_selected_loops: 30,
+  max_pose_correction_m: 5.0,
+  max_yaw_correction_deg: 20.0,
+})
 let cleanerImage = null
 let activeCleanerStroke = null
 let cleanerPanStart = null
@@ -307,7 +327,7 @@ const activeMapSync = computed(() => {
   return { state: 'mismatch', label: '平台与机器狗端不一致', className: 'status-offline' }
 })
 
-const selectedMapDescription = computed(() => parseDescription(selectedMap.value?.description))
+const selectedMapDescription = computed(() => parseMapDescription(selectedMap.value?.description))
 const selectedMapIsRescue = computed(() => hasRescueMetadata(selectedMap.value?.description))
 const selectedMapMetrics = computed(() => (
   selectedMap.value?.mapping_metrics && Object.keys(selectedMap.value.mapping_metrics).length
@@ -1358,6 +1378,69 @@ async function handleSetActive(map) {
   }
 }
 
+async function loadLoopReview() {
+  if (!selectedMap.value) return
+  loopReviewLoading.value = true
+  try {
+    loopReview.value = await fetchMapLoopReview(selectedMap.value.id, loopThresholds.value)
+    // Candidate application is intentionally opt-in: threshold passage is an
+    // audit result, not operator confirmation.
+    selectedLoopCandidates.value = new Set()
+  } catch (error) {
+    loopReview.value = null
+    alert(error.message || '回环审核加载失败')
+  } finally {
+    loopReviewLoading.value = false
+  }
+}
+
+async function openLoopReview() {
+  showLoopReview.value = true
+  loopOptimizeStatus.value = ''
+  await loadLoopReview()
+}
+
+function toggleLoopCandidate(candidateId) {
+  const next = new Set(selectedLoopCandidates.value)
+  if (next.has(candidateId)) next.delete(candidateId)
+  else next.add(candidateId)
+  selectedLoopCandidates.value = next
+}
+
+async function confirmLoopOptimization() {
+  if (!selectedMap.value || !selectedLoopCandidates.value.size || loopOptimizeBusy.value) return
+  const map = selectedMap.value
+  if (!confirm(`确认使用 ${selectedLoopCandidates.value.size} 个已审核回环优化“${map.name}”吗？\n源地图不会覆盖，结果会创建为新版本且默认不激活。`)) return
+  loopOptimizeBusy.value = true
+  loopOptimizeStatus.value = '命令已下发，正在设备端优化、重建和上传…'
+  try {
+    const queued = await optimizeMapLoops(map.id, {
+      thresholds: loopThresholds.value,
+      selected_candidate_ids: [...selectedLoopCandidates.value],
+      activate_after_upload: false,
+    })
+    const command = queued.command
+    const deadline = Date.now() + 30 * 60 * 1000
+    let latest = command
+    while (Date.now() < deadline && !['succeeded', 'failed', 'rejected', 'timed_out', 'expired'].includes(latest.status)) {
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      latest = await fetchRobotCommand(map.robot, command.id)
+      loopOptimizeStatus.value = `设备执行状态：${latest.status}`
+    }
+    if (latest.status !== 'succeeded') throw new Error(latest.error_message || `优化未完成：${latest.status}`)
+    const uploadedId = latest.result_payload?.upload_result?.id
+    await loadMaps()
+    if (uploadedId) selectedMapId.value = uploadedId
+    showLoopReview.value = false
+    alert('离线回环优化完成，新地图版本已上传；请核对轨迹与纠正量后再设为活动地图。')
+  } catch (error) {
+    loopOptimizeStatus.value = error.message || '离线优化失败'
+    alert(loopOptimizeStatus.value)
+  } finally {
+    loopOptimizeBusy.value = false
+  }
+}
+
 async function handleDelete(map) {
   if (!confirm(`确定要删除地图 "${map.name}" 吗？`)) return
   try {
@@ -1417,15 +1500,6 @@ async function handleUpload() {
   } finally {
     uploading.value = false
   }
-}
-
-function parseDescription(desc) {
-  try {
-    if (desc && (desc.startsWith('{') || desc.startsWith('['))) {
-      return JSON.parse(desc)
-    }
-  } catch {}
-  return { raw: desc || '' }
 }
 
 const cleanerCanvasStyle = computed(() => ({
@@ -1697,12 +1771,12 @@ async function saveCleaner() {
               <div><strong>分辨率:</strong> {{ selectedMap.resolution }} m/像素</div>
               <div><strong>大小:</strong> {{ formatSize(selectedMap.file_size) }}</div>
               <div v-if="selectedMap.width"><strong>尺寸:</strong> {{ selectedMap.width }} × {{ selectedMap.height }}</div>
-              <div v-if="selectedMap.coordinate_mode || parseDescription(selectedMap.description).coordinate_mode">
+              <div v-if="selectedMap.coordinate_mode || selectedMapDescription.coordinate_mode">
                 <strong>坐标:</strong>
-                {{ (selectedMap.coordinate_mode || parseDescription(selectedMap.description).coordinate_mode) === 'local_only' ? '无 RTK 原点 / 仅室内 NDT' : 'RTK 原点' }}
+                {{ (selectedMap.coordinate_mode || selectedMapDescription.coordinate_mode) === 'local_only' ? '无 RTK 原点 / 仅室内 NDT' : 'RTK 原点' }}
               </div>
-              <div v-if="selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope">
-                <strong>场景:</strong> {{ selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope }}
+              <div v-if="selectedMap.scene_scope || selectedMapDescription.scene_scope">
+                <strong>场景:</strong> {{ selectedMap.scene_scope || selectedMapDescription.scene_scope }}
               </div>
               <div v-if="selectedMapIsRescue" class="rescue-map-label">
                 <strong>质量:</strong> 发散救援地图，启用前必须现场核对
@@ -1743,6 +1817,9 @@ async function saveCleaner() {
                 </div>
                 <div v-if="selectedMapOptimization.fallback_error" class="mapping-progress-error">{{ selectedMapOptimization.fallback_error }}</div>
               </details>
+              <button class="btn btn-sm loop-review-button" type="button" @click="openLoopReview">
+                阈值审核与手工优化
+              </button>
             </div>
             <div class="map-artifact-panel">
               <div class="map-artifact-head">
@@ -1799,9 +1876,9 @@ async function saveCleaner() {
               </div>
             </div>
             <div v-if="selectedMap.description" class="map-description">
-              <template v-if="parseDescription(selectedMap.description).source">
-                <div><strong>来源:</strong> {{ parseDescription(selectedMap.description).source === 'edge_mapping' ? 'Edge Agent 建图' : parseDescription(selectedMap.description).source }}</div>
-                <div v-if="parseDescription(selectedMap.description).map_version"><strong>版本:</strong> {{ parseDescription(selectedMap.description).map_version }}</div>
+              <template v-if="selectedMapDescription.source">
+                <div><strong>来源:</strong> {{ selectedMapDescription.source === 'edge_mapping' ? 'Edge Agent 建图' : selectedMapDescription.source }}</div>
+                <div v-if="selectedMapDescription.map_version"><strong>版本:</strong> {{ selectedMapDescription.map_version }}</div>
               </template>
               <template v-else>
                 {{ selectedMap.description }}
@@ -2410,6 +2487,58 @@ async function saveCleaner() {
         </footer>
       </section>
     </div>
+
+    <div v-if="showLoopReview" class="cleaner-overlay">
+      <section class="loop-review-dialog" aria-modal="true" role="dialog">
+        <header class="cleaner-header">
+          <div>
+            <h3>离线回环阈值审核</h3>
+            <span>{{ selectedMap?.name }} · 源地图只读，优化结果另存新版本</span>
+          </div>
+          <button class="btn-close" type="button" :disabled="loopOptimizeBusy" @click="showLoopReview = false">×</button>
+        </header>
+        <div class="loop-threshold-grid">
+          <label>候选排名 ≤<input v-model.number="loopThresholds.max_rank" type="number" min="1" max="5"></label>
+          <label>指纹距离 ≤<input v-model.number="loopThresholds.descriptor_distance_max" type="number" min="0" step="0.01"></label>
+          <label>几何平移 ≤ m<input v-model.number="loopThresholds.geometric_translation_max_m" type="number" min="0" step="0.1"></label>
+          <label>航向差 ≤ °<input v-model.number="loopThresholds.yaw_consistency_max_deg" type="number" min="0" step="1"></label>
+          <label>SLAM 间距 ≥ m<input v-model.number="loopThresholds.slam_distance_min_m" type="number" min="0" step="0.5"></label>
+          <label>SLAM 间距 ≤ m<input v-model.number="loopThresholds.slam_distance_max_m" type="number" min="0" step="0.5"></label>
+          <button class="btn btn-sm" type="button" :disabled="loopReviewLoading || loopOptimizeBusy" @click="loadLoopReview">
+            {{ loopReviewLoading ? '审核中…' : '重新审核' }}
+          </button>
+        </div>
+        <div v-if="loopReview" class="loop-review-summary">
+          关键帧 {{ loopReview.keyframe_count }} · 候选 {{ loopReview.candidate_count }} · 通过 {{ loopReview.eligible_count }} · 已选 {{ selectedLoopCandidates.size }}
+        </div>
+        <div class="loop-candidate-table-wrap">
+          <table v-if="loopReview?.candidates?.length" class="loop-candidate-table">
+            <thead><tr><th>选</th><th>关键帧</th><th>排名</th><th>指纹距离</th><th>几何平移</th><th>SLAM 间距</th><th>航向差</th><th>审核</th></tr></thead>
+            <tbody>
+              <tr v-for="item in loopReview.candidates" :key="item.candidate_id" :class="{ eligible: item.eligible }">
+                <td><input type="checkbox" :checked="selectedLoopCandidates.has(item.candidate_id)" :disabled="!item.eligible || loopOptimizeBusy" @change="toggleLoopCandidate(item.candidate_id)"></td>
+                <td>{{ item.candidate_id }}</td><td>{{ item.rank }}</td>
+                <td>{{ Number(item.descriptor_distance).toFixed(3) }}</td>
+                <td>{{ Number(item.geometric_translation_m).toFixed(2) }} m</td>
+                <td>{{ Number(item.slam_distance_m).toFixed(2) }} m</td>
+                <td>{{ Number(item.yaw_consistency_deg).toFixed(1) }}°</td>
+                <td :title="item.failed_checks.join(', ')">{{ item.eligible ? '通过' : item.failed_checks.join(' / ') }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else-if="!loopReviewLoading" class="empty-state">当前地图包没有回环候选</div>
+        </div>
+        <footer class="cleaner-footer">
+          <span>{{ loopOptimizeStatus || '执行后会重建 PCD、PGM、轨迹和指纹定位验证，默认不自动启用。' }}</span>
+          <div>
+            <button class="btn" type="button" :disabled="loopOptimizeBusy" @click="showLoopReview = false">取消</button>
+            <button class="btn btn-primary" type="button" :disabled="loopOptimizeBusy || !selectedLoopCandidates.size" @click="confirmLoopOptimization">
+              {{ loopOptimizeBusy ? '优化并上传中…' : '确认优化' }}
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
   </section>
 </template>
 
@@ -2673,6 +2802,7 @@ async function saveCleaner() {
 .optimization-fallback, .optimization-failed { border-color: #f0a69a; background: #fff4f2; }
 .optimization-fallback .optimization-line, .optimization-failed .optimization-line { color: #b42318; }
 .optimization-panel details summary { cursor: pointer; color: #475467; }
+.loop-review-button { justify-self: start; }
 .optimization-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.4rem 0.8rem; padding-top: 0.5rem; }
 .optimization-grid span { display: flex; justify-content: space-between; gap: 0.6rem; color: #667085; }
 .optimization-grid strong { color: #1f2937; text-align: right; }
@@ -2872,6 +3002,34 @@ async function saveCleaner() {
   border-radius: 6px;
 }
 
+.loop-review-dialog {
+  width: min(1100px, 100%);
+  max-height: min(860px, calc(100vh - 2rem));
+  display: grid;
+  grid-template-rows: auto auto auto minmax(180px, 1fr) auto;
+  overflow: hidden;
+  background: #fff;
+  border-radius: 6px;
+}
+
+.loop-threshold-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+  padding: 0.75rem 1rem;
+  background: #f8fafc;
+  border-bottom: 1px solid #d9dee7;
+}
+.loop-threshold-grid label { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.75rem; color: #475467; }
+.loop-threshold-grid input { width: 6rem; padding: 0.35rem; border: 1px solid #cfd6e1; border-radius: 4px; }
+.loop-review-summary { padding: 0.55rem 1rem; color: #174ea6; font-size: 0.8rem; font-weight: 650; border-bottom: 1px solid #e5e7eb; }
+.loop-candidate-table-wrap { min-height: 0; overflow: auto; padding: 0.5rem 1rem; }
+.loop-candidate-table { width: 100%; border-collapse: collapse; font-size: 0.73rem; }
+.loop-candidate-table th, .loop-candidate-table td { padding: 0.42rem; border-bottom: 1px solid #e5e7eb; text-align: right; white-space: nowrap; }
+.loop-candidate-table th:nth-child(2), .loop-candidate-table td:nth-child(2), .loop-candidate-table th:last-child, .loop-candidate-table td:last-child { text-align: left; }
+.loop-candidate-table tr:not(.eligible) { color: #98a2b3; }
+.loop-candidate-table tr.eligible { background: #f0fdf4; color: #166534; }
+
 .cleaner-header,
 .cleaner-toolbar,
 .cleaner-footer {
@@ -2943,6 +3101,8 @@ async function saveCleaner() {
 @media (max-width: 720px) {
   .cleaner-overlay { padding: 0; }
   .cleaner-dialog { width: 100%; height: 100vh; border-radius: 0; }
+  .loop-review-dialog { width: 100%; max-height: 100vh; height: 100vh; border-radius: 0; }
+  .loop-threshold-grid { grid-template-columns: 1fr; }
   .cleaner-header, .cleaner-toolbar, .cleaner-footer { padding: 0.6rem; }
   .cleaner-toolbar { gap: 0.5rem; }
 }

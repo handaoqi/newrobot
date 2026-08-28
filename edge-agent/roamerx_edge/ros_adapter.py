@@ -485,7 +485,9 @@ class RosAdapter(Node):
         # Outdoor RTK-primary navigation still publishes NDT as a shadow health
         # check. Open sky often has an empty/poor scan match even when GPS pose
         # is centimetre-grade. That must not pause the task as localization loss.
-        if self._rtk_is_navigation_pose_source() or self._lio_is_navigation_pose_source():
+        # Indoor LIO-primary is different: status can stay 3 while the published
+        # pose has left the map, which is when the dog starts walking randomly.
+        if self._rtk_is_navigation_pose_source():
             self._ndt_failure_count = 0
             self._ndt_failure_notified = False
             return
@@ -638,6 +640,20 @@ class RosAdapter(Node):
             "front_obstacle_distance_m": self._front_obstacle_distance_m,
         }
 
+    _NAV_READY_SERVER_PROBE_SECONDS = 0.5
+
+    @staticmethod
+    def _action_server_wait_timeout(timeout_seconds: float, remaining: float) -> float:
+        """Keep a real discovery window even when the caller asked for 0s.
+
+        The periodic health reporter uses timeout 0 to mean "one probe".  Passing
+        that 0 through to ``wait_for_server`` makes Zenoh miss a freshly restarted
+        FollowWaypoints server, so the UI stays on Nav2 not ready.
+        """
+        if timeout_seconds <= 0:
+            return RosAdapter._NAV_READY_SERVER_PROBE_SECONDS
+        return min(RosAdapter._NAV_READY_SERVER_PROBE_SECONDS, max(0.0, remaining))
+
     def wait_until_ready(self, timeout_seconds: float = 10.0) -> bool:
         """Wait for Nav2's action server *and* all required lifecycle nodes.
 
@@ -653,22 +669,28 @@ class RosAdapter(Node):
             "/bt_navigator",
             "/waypoint_follower",
         )
+        previous = bool(self.safety_state.nav_ready)
         # A zero timeout is used by the periodic health reporter.  It must
-        # still perform one non-blocking probe rather than immediately
-        # reporting Nav2 as unavailable.
+        # still perform one probe with a short discovery window rather than
+        # immediately reporting Nav2 as unavailable.
         while True:
             remaining = max(0.0, deadline - time.monotonic())
-            if not self._action_client.wait_for_server(timeout_sec=min(0.5, remaining)):
+            server_timeout = self._action_server_wait_timeout(timeout_seconds, remaining)
+            if not self._action_client.wait_for_server(timeout_sec=server_timeout):
                 ready = False
             else:
                 ready = all(self._lifecycle_node_is_active(name) for name in required_nodes)
             if ready:
                 self.safety_state.nav_ready = True
+                if not previous:
+                    LOGGER.info("Nav2 ready: FollowWaypoints and lifecycle nodes are active")
                 return True
-            if time.monotonic() >= deadline:
+            if timeout_seconds <= 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.2)
         self.safety_state.nav_ready = False
+        if previous:
+            LOGGER.warning("Nav2 not ready: FollowWaypoints or a lifecycle node failed the ready probe")
         return False
 
     def _lifecycle_node_is_active(self, node_name: str) -> bool:

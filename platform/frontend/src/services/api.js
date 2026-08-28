@@ -245,6 +245,89 @@ export async function previewAlertSkill(skillKey, robotId) {
   })
 }
 
+export async function fetchValidationRecordings() {
+  return request('/validation-recordings/')
+}
+
+export async function fetchValidationProfiles() {
+  return request('/validation-profiles/')
+}
+
+export async function fetchValidationRunners() {
+  return request('/validation-runners/')
+}
+
+export async function fetchValidationJobs() {
+  return request('/validation-jobs/')
+}
+
+export async function fetchValidationJob(jobId) {
+  return request(`/validation-jobs/${jobId}/`)
+}
+
+export async function createValidationJob(payload) {
+  return request('/validation-jobs/', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function cancelValidationJob(jobId) {
+  return request(`/validation-jobs/${jobId}/cancel/`, { method: 'POST', body: '{}' })
+}
+
+export async function approveValidationBaseline(jobId) {
+  return request(`/validation-jobs/${jobId}/approve-baseline/`, { method: 'POST', body: '{}' })
+}
+
+export async function createValidationLiveTicket(jobId) {
+  return request(`/validation-jobs/${jobId}/live-ticket/`, { method: 'POST', body: '{}' })
+}
+
+export async function uploadValidationRecording(file, { label = '', robot = null } = {}) {
+  let initiation
+  try {
+    initiation = await request('/validation-recordings/uploads/initiate/', {
+      method: 'POST',
+      body: JSON.stringify({
+        label: label || file.name,
+        file_name: file.name,
+        ...(robot ? { robot } : {}),
+      }),
+    })
+  } catch (error) {
+    if (error.status !== 409) throw error
+    const form = new FormData()
+    form.append('file', file)
+    form.append('label', label || file.name)
+    form.append('storage_format', 'mcap')
+    if (robot) form.append('robot', String(robot))
+    return request('/validation-recordings/', { method: 'POST', body: form })
+  }
+
+  const recording = initiation.recording
+  const partSize = initiation.part_size_bytes
+  const partCount = Math.ceil(file.size / partSize)
+  const partNumbers = Array.from({ length: partCount }, (_, index) => index + 1)
+  const spec = await request(`/validation-recordings/${recording.id}/uploads/parts/`, {
+    method: 'POST',
+    body: JSON.stringify({ part_numbers: partNumbers }),
+  })
+  const parts = []
+  for (const item of spec.parts) {
+    const start = (item.part_number - 1) * partSize
+    const response = await fetch(item.url, {
+      method: 'PUT',
+      body: file.slice(start, Math.min(file.size, start + partSize)),
+    })
+    if (!response.ok) throw new Error(`第 ${item.part_number} 个分片上传失败`)
+    const etag = response.headers.get('ETag')
+    if (!etag) throw new Error('对象存储未暴露 ETag，请检查 MinIO CORS 配置')
+    parts.push({ part_number: item.part_number, etag })
+  }
+  return request(`/validation-recordings/${recording.id}/uploads/complete/`, {
+    method: 'POST',
+    body: JSON.stringify({ parts }),
+  })
+}
+
 export async function fetchSpeechCategories({ signal } = {}) {
   if (signal) return request('/speech-categories/', { signal })
   return listCache.get('speech-categories', () => request('/speech-categories/', { signal }))
@@ -576,6 +659,21 @@ export async function manuallyCleanMap(mapId, payload) {
   })
   listCache.invalidate('maps-summary')
   return result
+}
+
+export async function fetchMapLoopReview(mapId, thresholds = {}) {
+  const query = new URLSearchParams()
+  Object.entries(thresholds).forEach(([key, value]) => {
+    if (value !== '' && value !== null && value !== undefined) query.set(key, String(value))
+  })
+  return request(`/maps/${mapId}/loop-review/${query.size ? `?${query}` : ''}`)
+}
+
+export async function optimizeMapLoops(mapId, payload) {
+  return request(`/maps/${mapId}/loop-optimize/`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }
 
 export async function fetchRoutes({ signal } = {}) {

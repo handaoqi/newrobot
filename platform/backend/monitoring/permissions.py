@@ -1,3 +1,5 @@
+import hmac
+
 from django.contrib.auth.hashers import check_password
 from django.conf import settings
 from rest_framework.permissions import BasePermission
@@ -45,3 +47,21 @@ class IsAudioDeviceCredential(IsAuthenticatedOrDeviceCredential):
             return False
         request.device_robot = robot
         return True
+
+
+class IsValidationRunner(BasePermission):
+    message = "需要有效的 Validation Runner 凭证"
+
+    def has_permission(self, request, view):
+        expected = str(getattr(settings, "VALIDATION_RUNNER_TOKEN", ""))
+        received = request.headers.get("X-Validation-Runner-Token", "")
+        return bool(expected and received and hmac.compare_digest(expected, received))
+
+
+class IsValidationGateway(BasePermission):
+    message = "需要有效的 Validation Gateway 凭证"
+
+    def has_permission(self, request, view):
+        expected = str(getattr(settings, "VALIDATION_GATEWAY_TOKEN", ""))
+        received = request.headers.get("X-Validation-Gateway-Token", "")
+        return bool(expected and received and hmac.compare_digest(expected, received))

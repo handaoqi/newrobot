@@ -71,3 +71,10 @@ def test_start_is_already_ready_only_when_localization_is_valid(tmp_path, monkey
     result = adapter.start()
     assert result["recovery"] == "already_ready"
     assert runs == []
+
+
+def test_looks_ready_reads_tokens_after_verbose_cmd_vel_dump():
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path="/tmp/nav.sh"))
+    verbose = "cmd_vel:\n" + ("Node name: ecal2ros2\n" * 200)
+    stdout = verbose + _ready_status_stdout()
+    assert adapter._looks_ready(stdout[-6000:]) is True

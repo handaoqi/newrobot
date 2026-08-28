@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core import signing
 from django.utils import timezone
 from rest_framework import serializers
 from PIL import Image, ImageDraw
@@ -35,6 +36,14 @@ from .models import (
     Zone,
     Track,
     ScheduleRun,
+    GoldenBaseline,
+    ValidationArtifact,
+    ValidationAttempt,
+    ValidationCheckResult,
+    ValidationJob,
+    ValidationProfile,
+    ValidationRecording,
+    ValidationRunner,
 )
 
 from .services.map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
@@ -1324,3 +1333,108 @@ class AlertTimelineSerializer(serializers.Serializer):
     trajectory = serializers.ListField(child=serializers.DictField())
     task_events = serializers.ListField(child=serializers.DictField())
     media = serializers.DictField()
+
+
+class ValidationRecordingSerializer(serializers.ModelSerializer):
+    robot_code = serializers.CharField(source="robot.code", read_only=True, allow_null=True)
+
+    class Meta:
+        model = ValidationRecording
+        fields = [
+            "id", "robot", "robot_code", "task_execution", "label", "storage_format", "state",
+            "sha256", "size_bytes", "duration_seconds", "start_time_ns", "end_time_ns",
+            "topic_manifest", "recording_manifest", "uploaded_at", "invalid_reason",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "state", "sha256", "size_bytes", "uploaded_at", "invalid_reason", "created_at", "updated_at"
+        ]
+
+
+class ValidationProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ValidationProfile
+        fields = [
+            "id", "name", "version", "mode", "enabled", "description", "required_topics",
+            "replay_topics", "output_topics", "thresholds", "runner_config",
+        ]
+
+
+class ValidationRunnerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ValidationRunner
+        fields = [
+            "id", "display_name", "kind", "state", "capabilities", "version", "last_seen_at"
+        ]
+
+
+class ValidationCheckResultSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ValidationCheckResult
+        fields = [
+            "id", "rule_id", "title", "category", "status", "severity", "hard_failure",
+            "metric_name", "actual_value", "expected_value", "start_time_ns", "end_time_ns",
+            "topics", "evidence", "message",
+        ]
+
+
+class ValidationArtifactSerializer(serializers.ModelSerializer):
+    download_path = serializers.SerializerMethodField()
+    signed_download_path = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ValidationArtifact
+        fields = [
+            "id", "role", "name", "sha256", "size_bytes", "content_type", "metadata",
+            "download_path", "signed_download_path", "created_at",
+        ]
+
+    def get_download_path(self, obj):
+        return f"/api/validation-jobs/{obj.job_id}/artifacts/{obj.id}/"
+
+    def get_signed_download_path(self, obj):
+        token = signing.TimestampSigner(salt="validation-artifact").sign(str(obj.id))
+        return f"/api/validation-artifacts/{obj.id}/signed/?token={token}"
+
+
+class ValidationAttemptSerializer(serializers.ModelSerializer):
+    runner_name = serializers.CharField(source="runner.display_name", read_only=True)
+
+    class Meta:
+        model = ValidationAttempt
+        fields = [
+            "number", "runner", "runner_name", "state", "started_at", "finished_at",
+            "error_code", "error_message", "runtime_metrics",
+        ]
+
+
+class ValidationJobSerializer(serializers.ModelSerializer):
+    recording_label = serializers.CharField(source="recording.label", read_only=True)
+    profile_name = serializers.CharField(source="profile.name", read_only=True)
+    profile_version = serializers.IntegerField(source="profile.version", read_only=True)
+    runner_name = serializers.CharField(source="runner.display_name", read_only=True, allow_null=True)
+    checks = ValidationCheckResultSerializer(source="check_results", many=True, read_only=True)
+    artifacts = ValidationArtifactSerializer(many=True, read_only=True)
+    attempts = ValidationAttemptSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ValidationJob
+        fields = [
+            "id", "recording", "recording_label", "profile", "profile_name", "profile_version",
+            "baseline_job", "mode", "state", "verdict", "progress_percent", "runner", "runner_name",
+            "attempt_count", "requested_config", "resolved_config", "summary", "error_code",
+            "error_message", "stack_git_sha", "stack_image_digest", "live_bridge_url", "queued_at",
+            "started_at", "finished_at", "cancel_requested_at", "created_at", "updated_at",
+            "checks", "artifacts", "attempts",
+        ]
+
+
+class GoldenBaselineSerializer(serializers.ModelSerializer):
+    profile_name = serializers.CharField(source="profile.name", read_only=True)
+
+    class Meta:
+        model = GoldenBaseline
+        fields = [
+            "id", "profile", "profile_name", "job", "map_hash", "route_hash",
+            "stack_image_digest", "active", "approved_by", "created_at",
+        ]

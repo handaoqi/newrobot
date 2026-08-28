@@ -22,6 +22,18 @@ class FakePlatformClient:
     def wait_for_command(self, robot_id, command, wait_seconds):
         return {"command": command, "completed": True, "wait_seconds": wait_seconds}
 
+    def validation_get(self, path):
+        self.calls.append(("GET", path))
+        if path == "validation-profiles/":
+            return [{"id": "00000000-0000-0000-0000-000000000002", "name": "navigation-localization", "version": 1, "mode": "bag_replay"}]
+        if path.endswith("/report/"):
+            return {"id": path.split("/")[1], "verdict": "WARN", "checks": [{"rule_id": "tf.single_parent", "status": "PASS"}], "artifacts": []}
+        return []
+
+    def validation_post(self, path, payload):
+        self.calls.append(("POST", path, payload))
+        return {"id": "00000000-0000-0000-0000-000000000003", "state": "queued", **payload}
+
 
 def test_default_robot_id_is_loaded_from_installation_environment(monkeypatch):
     monkeypatch.setenv("ROAMERX_DEFAULT_ROBOT_ID", "42")
@@ -262,3 +274,48 @@ def test_invalid_control_values_fail_before_a_platform_request(monkeypatch):
         mcp_module.robot_skill_cancel(1)
 
     assert client.calls == []
+
+
+def test_validation_tools_only_send_platform_ids(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+
+    result = mcp_module.validation_job_create(
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        idempotency_key="ai-turn-7",
+    )
+
+    assert result["state"] == "queued"
+    assert client.calls == [(
+        "POST",
+        "validation-jobs/",
+        {
+            "recording_id": "00000000-0000-0000-0000-000000000001",
+            "profile_id": "00000000-0000-0000-0000-000000000002",
+            "idempotency_key": "ai-turn-7",
+        },
+    )]
+
+
+def test_validation_tools_reject_paths_and_non_uuid_values(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+
+    with pytest.raises(ValueError, match="有效 UUID"):
+        mcp_module.validation_job_create("/tmp/source.mcap", "profile")
+    with pytest.raises(ValueError, match="有效 UUID"):
+        mcp_module.validation_job_cancel("$(touch /tmp/not-allowed)")
+
+    assert client.calls == []
+
+
+def test_validation_evidence_returns_one_bounded_rule(monkeypatch):
+    client = FakePlatformClient()
+    monkeypatch.setattr(mcp_module, "client", client)
+    job_id = "00000000-0000-0000-0000-000000000003"
+
+    result = mcp_module.validation_evidence_get(job_id, "tf.single_parent")
+
+    assert result["check"] == {"rule_id": "tf.single_parent", "status": "PASS"}
+    assert result["artifacts"] == []

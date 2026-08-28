@@ -10,7 +10,8 @@
     "tablet:capture": "TABLET_CAPTURE=1 playwright test tests/tablet --reporter=line",
     "test:tablet": "playwright test tests/tablet",
     "test:tablet:update": "playwright test tests/tablet --update-snapshots",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:foxglove": "playwright test --config playwright.foxglove.config.js"
   },
   "dependencies": {
     "echarts": "^6.0.0",

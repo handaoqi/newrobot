@@ -73,6 +73,10 @@ class FakeNavigation:
     def obstacle_monitor_snapshot(self):
         return {}
 
+    def wait_until_ready(self, timeout_seconds=45):
+        self.wait_until_ready_timeout = timeout_seconds
+        return True
+
 
 class FakeTeleopControl:
     def __init__(self):
@@ -101,6 +105,9 @@ class FakePersonFollow:
 
 
 class FakeMapActivation:
+    def resolve_source_dir(self, command):
+        return Path("/maps/source")
+
     def activate(self, command):
         return {
             "map_id": command["map_id"],
@@ -117,6 +124,11 @@ class FakeMapActivation:
 class FakeNavigationStack:
     def __init__(self):
         self.reload_calls = []
+        self.start_calls = []
+
+    def start(self, command=None):
+        self.start_calls.append(command or {})
+        return {"action": "start", "returncode": 0}
 
     def reload_map(self, pcd_path, yaml_path):
         self.reload_calls.append((pcd_path, yaml_path))
@@ -206,6 +218,44 @@ def test_task_start_waits_then_accepts_fresh_normal_localization(tmp_path, monke
 
     assert ack["payload"]["ack"] == "accepted"
     assert clock["t"] >= 102.1
+    store.close()
+
+
+def test_task_start_repairs_nav_stack_only_when_not_ready(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=time.monotonic() - 10.0,
+        nav_ready=False,
+        control_mode="autonomous",
+        current_map_id="site-a-main",
+        current_map_version="v1",
+    )
+    stack = FakeNavigationStack()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        navigation_stack_adapter=stack,
+    )
+
+    ack, _ = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert stack.start_calls == [{"reason": "task_start"}]
+    assert navigation.wait_until_ready_timeout == 45
+    assert state.nav_ready is True
     store.close()
 
 
@@ -789,6 +839,42 @@ def test_map_activation_succeeds_when_reload_is_deferred_after_mapping(tmp_path)
     store.close()
 
 
+def test_map_optimize_uses_resolved_source_without_reloading_navigation(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "map.optimize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "source_map_id": "131",
+        "selected_candidates": [{"candidate_id": "10:50"}],
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+
+    class FakeOfflineMapping:
+        def optimize_historical_map(self, command, source_dir):
+            assert source_dir == Path("/maps/source")
+            return {"source_map_id": command["source_map_id"], "upload_result": {"id": 212}}
+
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState(localization_status="normal", nav_ready=True)),
+        task_executor=TaskExecutor(
+            store, FakeNavigation(), event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        mapping_adapter=FakeOfflineMapping(),
+        map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=FakeNavigationStack(),
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert result["payload"]["result"]["upload_result"]["id"] == 212
+    store.close()
+
+
 
 def test_nav_start_waits_for_in_flight_stack_command(tmp_path):
     import threading
@@ -829,4 +915,71 @@ def test_nav_start_waits_for_in_flight_stack_command(tmp_path):
     _, result = processor.handle_command(raw)
     assert result["payload"]["status"] == "succeeded"
     assert stack.started is True
+    store.close()
+
+
+def _nav_command(message_type: str) -> dict:
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = message_type
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {}
+    return raw
+
+
+def test_nav_start_waits_until_nav2_ready(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    state = RuntimeSafetyState(nav_ready=False)
+
+    class Stack:
+        def start(self, command=None):
+            return {"action": "start", "returncode": 0}
+
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        navigation_stack_adapter=Stack(),
+    )
+
+    _, result = processor.handle_command(_nav_command("nav.start"))
+
+    assert result["payload"]["status"] == "succeeded"
+    assert navigation.wait_until_ready_timeout == 45
+    assert state.nav_ready is True
+    store.close()
+
+
+def test_nav_start_fails_when_nav2_does_not_become_ready(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    navigation.wait_until_ready = lambda timeout_seconds=45: False
+    state = RuntimeSafetyState(nav_ready=False)
+
+    class Stack:
+        def start(self, command=None):
+            return {"action": "start", "returncode": 0}
+
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        navigation_stack_adapter=Stack(),
+    )
+
+    _, result = processor.handle_command(_nav_command("nav.start"))
+
+    assert result["payload"]["status"] == "failed"
+    assert result["payload"]["error_code"] == "NAV_STACK_NOT_READY"
+    assert state.nav_ready is False
     store.close()

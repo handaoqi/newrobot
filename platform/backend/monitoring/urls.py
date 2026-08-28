@@ -44,6 +44,8 @@ from .views import (
     MapDataDownloadView,
     MapDataSetActiveView,
     MapDataManualCleanView,
+    MapDataLoopReviewView,
+    MapDataLoopOptimizeView,
     MapDataMappingTraceView,
     MapDataPreviewView,
     MapSetListView,
@@ -98,6 +100,30 @@ from .views import (
     TaskExecutionResumeView,
     TaskExecutionTrajectoryView,
     ScheduleRunListView,
+)
+from .validation_views import (
+    ValidationArtifactDownloadView,
+    ValidationArtifactSignedDownloadView,
+    ValidationJobApproveBaselineView,
+    ValidationJobCancelView,
+    ValidationJobDetailView,
+    ValidationJobListCreateView,
+    ValidationJobLiveTicketView,
+    ValidationJobReportView,
+    ValidationLiveTicketVerifyView,
+    ValidationProfileListView,
+    ValidationRecordingListCreateView,
+    ValidationRecordingUploadCompleteView,
+    ValidationRecordingUploadInitiateView,
+    ValidationRecordingUploadPartsView,
+    ValidationRunnerArtifactFinalizeView,
+    ValidationRunnerArtifactPresignView,
+    ValidationRunnerArtifactUploadView,
+    ValidationRunnerClaimView,
+    ValidationRunnerCompleteView,
+    ValidationRunnerHeartbeatView,
+    ValidationRunnerListView,
+    ValidationRunnerSourceView,
 )
 
 urlpatterns = [
@@ -187,6 +213,8 @@ urlpatterns = [
     path("maps/<int:pk>/download/", MapDataDownloadView.as_view()),
     path("maps/<int:pk>/set_active/", MapDataSetActiveView.as_view()),
     path("maps/<int:pk>/manual-clean/", MapDataManualCleanView.as_view()),
+    path("maps/<int:pk>/loop-review/", MapDataLoopReviewView.as_view()),
+    path("maps/<int:pk>/loop-optimize/", MapDataLoopOptimizeView.as_view()),
     path("maps/<int:pk>/preview/", MapDataPreviewView.as_view()),
     path("maps/<int:pk>/mapping-trace/", MapDataMappingTraceView.as_view()),
     path("maps/robot/connect/", RobotConnectionView.as_view()),
@@ -198,4 +226,59 @@ urlpatterns = [
     path("zones/<int:pk>/", ZoneDetailView.as_view()),
     path("tracks/", TrackListView.as_view()),
     path("tracks/<int:pk>/", TrackDetailView.as_view()),
+    path("validation-recordings/", ValidationRecordingListCreateView.as_view()),
+    path("validation-recordings/uploads/initiate/", ValidationRecordingUploadInitiateView.as_view()),
+    path(
+        "validation-recordings/<uuid:recording_id>/uploads/parts/",
+        ValidationRecordingUploadPartsView.as_view(),
+    ),
+    path(
+        "validation-recordings/<uuid:recording_id>/uploads/complete/",
+        ValidationRecordingUploadCompleteView.as_view(),
+    ),
+    path("validation-profiles/", ValidationProfileListView.as_view()),
+    path("validation-runners/", ValidationRunnerListView.as_view()),
+    path("validation-jobs/", ValidationJobListCreateView.as_view()),
+    path("validation-jobs/<uuid:job_id>/", ValidationJobDetailView.as_view()),
+    path("validation-jobs/<uuid:job_id>/cancel/", ValidationJobCancelView.as_view()),
+    path("validation-jobs/<uuid:job_id>/report/", ValidationJobReportView.as_view()),
+    path("validation-jobs/<uuid:job_id>/live-ticket/", ValidationJobLiveTicketView.as_view()),
+    path(
+        "validation-jobs/<uuid:job_id>/approve-baseline/",
+        ValidationJobApproveBaselineView.as_view(),
+    ),
+    path(
+        "validation-jobs/<uuid:job_id>/artifacts/<uuid:artifact_id>/",
+        ValidationArtifactDownloadView.as_view(),
+    ),
+    path(
+        "validation-artifacts/<uuid:artifact_id>/signed/",
+        ValidationArtifactSignedDownloadView.as_view(),
+    ),
+    path(
+        "internal/validation-runners/<str:runner_id>/claim/",
+        ValidationRunnerClaimView.as_view(),
+    ),
+    path("internal/validation-live-ticket/verify/", ValidationLiveTicketVerifyView.as_view()),
+    path(
+        "internal/validation-runners/<str:runner_id>/jobs/<uuid:job_id>/heartbeat/",
+        ValidationRunnerHeartbeatView.as_view(),
+    ),
+    path(
+        "internal/validation-runners/<str:runner_id>/jobs/<uuid:job_id>/complete/",
+        ValidationRunnerCompleteView.as_view(),
+    ),
+    path("internal/validation-jobs/<uuid:job_id>/source/", ValidationRunnerSourceView.as_view()),
+    path(
+        "internal/validation-runners/<str:runner_id>/jobs/<uuid:job_id>/artifacts/",
+        ValidationRunnerArtifactUploadView.as_view(),
+    ),
+    path(
+        "internal/validation-runners/<str:runner_id>/jobs/<uuid:job_id>/artifacts/presign/",
+        ValidationRunnerArtifactPresignView.as_view(),
+    ),
+    path(
+        "internal/validation-runners/<str:runner_id>/jobs/<uuid:job_id>/artifacts/<uuid:artifact_id>/finalize/",
+        ValidationRunnerArtifactFinalizeView.as_view(),
+    ),
 ]

@@ -1,0 +1,182 @@
+{
+  "configById": {
+    "3D!nusscene": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 45,
+        "phi": 55,
+        "thetaOffset": 45,
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_link",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": false,
+          "axisScale": 1
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/LIDAR_TOP": {
+          "visible": true,
+          "pointSize": 2,
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "colorField": "intensity"
+        },
+        "/RADAR_FRONT": {
+          "visible": true,
+          "pointSize": 8,
+          "colorMode": "flat",
+          "flatColor": "#e5484dff"
+        },
+        "/drivable_area": {
+          "visible": true,
+          "frameLocked": true
+        },
+        "/semantic_map": {
+          "visible": true
+        },
+        "/markers/car": {
+          "visible": true
+        },
+        "/markers/annotations": {
+          "visible": true
+        },
+        "/pose": {
+          "visible": true,
+          "type": "axis"
+        }
+      },
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose"
+      }
+    },
+    "Image!nusfront": {
+      "imageMode": {
+        "imageTopic": "/CAM_FRONT/image_rect_compressed",
+        "calibrationTopic": "/CAM_FRONT/camera_info",
+        "annotations": {
+          "/CAM_FRONT/annotations": {
+            "visible": true
+          }
+        },
+        "synchronize": false
+      }
+    },
+    "Image!nusback": {
+      "imageMode": {
+        "imageTopic": "/CAM_BACK/image_rect_compressed",
+        "calibrationTopic": "/CAM_BACK/camera_info",
+        "annotations": {
+          "/CAM_BACK/annotations": {
+            "visible": true
+          }
+        },
+        "synchronize": false
+      }
+    },
+    "Plot!nuspose": {
+      "paths": [
+        {
+          "value": "/pose.pose.position.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "pose x",
+          "color": "#3b82f6"
+        },
+        {
+          "value": "/pose.pose.position.y",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "pose y",
+          "color": "#22c55e"
+        },
+        {
+          "value": "/gps.altitude",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "gps alt",
+          "color": "#f5a524"
+        }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240,
+      "xAxisVal": "timestamp"
+    },
+    "RawMessages!nusgps": {
+      "topicPath": "/gps",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "DiagnosticSummary!nusdiag": {
+      "minLevel": 0,
+      "pinnedIds": [],
+      "hardwareIdFilter": "",
+      "topicToRender": "/diagnostics",
+      "sortByLevel": true
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "first": {
+      "first": "3D!nusscene",
+      "second": {
+        "first": "Image!nusfront",
+        "second": "Image!nusback",
+        "direction": "row",
+        "splitPercentage": 50
+      },
+      "direction": "column",
+      "splitPercentage": 66
+    },
+    "second": {
+      "first": "Plot!nuspose",
+      "second": {
+        "first": "RawMessages!nusgps",
+        "second": "DiagnosticSummary!nusdiag",
+        "direction": "column",
+        "splitPercentage": 62
+      },
+      "direction": "column",
+      "splitPercentage": 42
+    },
+    "direction": "row",
+    "splitPercentage": 62
+  }
+}

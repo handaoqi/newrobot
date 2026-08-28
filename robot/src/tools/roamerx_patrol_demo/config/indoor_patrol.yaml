@@ -1,0 +1,17 @@
+roamerx_patrol_demo:
+  ros__parameters:
+    # 120 s is the release artifact length; foxglove_demo.sh overrides this to
+    # 10 s for the smoke run so a first-time user does not wait two minutes.
+    duration_sec: 120.0
+    # 50 Hz is the /clock rate. Individual topics are decimated from this tick
+    # inside patrol_publisher, so raising it raises clock resolution only.
+    publish_rate_hz: 50.0
+    linear_speed_mps: 0.35
+    angular_speed_rps: 0.6
+    topic_namespace: ""
+    # P1..P4 inside the 10 x 8 m demo map; the route closes back to (1,1).
+    waypoints: "7.0,1.0;7.0,6.0;2.0,6.0;2.0,3.0"
+    seed: 20260828
+    publish_camera: true
+    publish_scan: true
+    publish_imu: true
