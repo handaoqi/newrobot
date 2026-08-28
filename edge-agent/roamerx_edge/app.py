@@ -92,6 +92,7 @@ class EdgeAgentApplication:
             standup_confirmation_timeout_seconds=config.safety.standup_confirmation_timeout_seconds,
             map_set_coordinator=self.map_set_coordinator,
             obstacle_speech=config.obstacle_speech,
+            waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,
         )
         set_localization_failure_callback = getattr(
@@ -129,7 +130,11 @@ class EdgeAgentApplication:
         self.person_follow_controller = PersonFollowController(navigation, config.person_follow)
         self.sensor_control_adapter = SensorControlAdapter(config.sensor_control)
         self.power_mode_controller = PowerModeController(config.power_mode)
-        self.charge_control_adapter = ChargeControlAdapter(config.charge_control, self.power_mode_controller)
+        self.charge_control_adapter = ChargeControlAdapter(
+            config.charge_control,
+            self.power_mode_controller,
+            self.store,
+        )
         self.charge_control_adapter.set_low_battery_handler(self._handle_low_battery_charge)
         self._docking_undock_pending = False
         self.charge_control_adapter.set_full_charge_handler(self._finish_docking_undock)
@@ -535,20 +540,67 @@ class EdgeAgentApplication:
             except Exception:
                 LOGGER.exception("mapping divergence local speech failed command=%s", command)
 
-    def _handle_low_battery_charge(self) -> None:
-        """Stop autonomous motion before waiting for an operator to dock the robot."""
-        if not self.task_executor.has_active_task():
-            return
+    def _handle_low_battery_charge(self, episode_id: str, battery_percent: int) -> None:
+        """Stop patrol motion and ask the center for one idempotent docking task."""
         context = self.task_executor.context
-        try:
-            self.task_executor.cancel_task(context.task_execution_id if context else "")
-            LOGGER.warning("low battery cancelled active navigation before charge preparation")
-        except Exception:
-            LOGGER.exception("graceful low-battery task cancellation failed; forcing local exit")
+        execution_id = context.task_execution_id if context else ""
+        docking_active = bool(
+            self.task_executor.has_active_task()
+            and context
+            and (context.docking or {}).get("enabled")
+        )
+        action = "docking_already_active" if docking_active else "return_charge_requested"
+        if self.task_executor.has_active_task() and not docking_active:
             try:
-                self.task_executor.force_exit(context.task_execution_id if context else "")
+                self.task_executor.cancel_task(execution_id)
+                LOGGER.warning("low battery cancelled active navigation before automatic return")
             except Exception:
-                LOGGER.exception("failed to force low-battery task exit")
+                LOGGER.exception("graceful low-battery task cancellation failed; forcing local exit")
+                action = "return_charge_requested_after_force_exit"
+                try:
+                    self.task_executor.force_exit(execution_id)
+                except Exception:
+                    action = "navigation_stop_failed"
+                    LOGGER.exception("failed to force low-battery task exit")
+        pose = self.navigation.latest_pose()
+        pose_payload = {"frame_id": "map"}
+        if pose is not None:
+            pose_payload.update(
+                {
+                    "x": float(pose.x),
+                    "y": float(pose.y),
+                    "yaw": float(getattr(pose, "yaw", 0.0)),
+                }
+            )
+        self.mqtt.publish_alert(
+            {
+                "event_id": episode_id,
+                "event_type": "low_battery_return_charge",
+                "severity": "high",
+                "occurred_at": now_iso(),
+                "task_execution_id": execution_id or None,
+                "map_id": self.safety_state.current_map_id,
+                "map_version": self.safety_state.current_map_version,
+                "pose": pose_payload,
+                "source": {
+                    "component": "charge_control_adapter",
+                    "code": "LOW_BATTERY_RETURN_CHARGE",
+                    "model_version": self.config.robot.agent_version,
+                },
+                "detection": {
+                    "label": "低电量自动回充",
+                    "class": "low_battery",
+                    "confidence": 1.0,
+                },
+                "attributes": {
+                    "low_battery_episode_id": episode_id,
+                    "battery_percent": battery_percent,
+                    "threshold_percent": self.config.charge_control.low_battery_start_percent,
+                    "rearm_percent": self.config.charge_control.low_battery_rearm_percent,
+                    "action": action,
+                },
+            }
+        )
 
     def _publish_start_result(self, command_id: str, status: str, result: dict, code: str, message: str) -> None:
         context = self.task_executor.context

@@ -81,9 +81,29 @@ if "$DEPLOY_BACKEND"; then
     --exclude='media/' \
     "$PROJECT_DIR/backend/" "$CLOUD_HOST:$REMOTE_ROOT/backend/"
   echo "[deploy] Applying database migrations..."
-  ssh "$CLOUD_HOST" "set -a; source /opt/roamerx/shared/center.env; set +a; cd '$REMOTE_ROOT' && /root/miniconda/envs/py310/bin/python backend/manage.py migrate --noinput"
-  echo "[deploy] Restarting cloud API and device worker..."
-  ssh "$CLOUD_HOST" "systemctl restart roamerx-center-api.service roamerx-device-worker.service && sleep 3 && systemctl is-active roamerx-center-api.service roamerx-device-worker.service"
+  ssh "$CLOUD_HOST" bash -s -- "$REMOTE_ROOT" <<'REMOTE_MIGRATION_SCRIPT'
+set -euo pipefail
+remote_root="$1"
+services=(
+  roamerx-patrol-scheduler.service
+  roamerx-device-worker.service
+  roamerx-center-api.service
+)
+restore_services() {
+  systemctl start "${services[@]}" || true
+}
+trap restore_services EXIT
+systemctl stop "${services[@]}"
+set -a
+source /opt/roamerx/shared/center.env
+set +a
+cd "$remote_root"
+/root/miniconda/envs/py310/bin/python backend/manage.py migrate --noinput
+systemctl start "${services[@]}"
+trap - EXIT
+sleep 3
+systemctl is-active "${services[@]}"
+REMOTE_MIGRATION_SCRIPT
 fi
 
 if "$WITH_NGINX"; then

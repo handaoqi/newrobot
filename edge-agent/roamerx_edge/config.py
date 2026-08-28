@@ -85,7 +85,7 @@ class SafetyConfig:
     localization_recovery_max_cycles: int = 0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
-    final_waypoint_tolerance_m: float = 0.35
+    final_waypoint_tolerance_m: float = 0.45
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
 
@@ -100,6 +100,13 @@ class ObstacleSpeechConfig:
     collision_limit_ratio: float = 0.6
     minimum_blocked_task_seconds: float = 300.0
     navigation_retry_seconds: float = 5.0
+
+
+@dataclass
+class WaypointSpeechConfig:
+    status_dir: str = "/home/dogrobot/runtime/nx-edge/data/audio-status"
+    timeout_seconds: float = 120.0
+    poll_interval_seconds: float = 0.2
 
 
 @dataclass
@@ -251,6 +258,7 @@ class ChargeControlConfig:
     thermal_recovery_delay_seconds: float = 10.0
     thermal_retry_cooldown_seconds: float = 60.0
     low_battery_start_percent: int = 20
+    low_battery_rearm_percent: int = 25
     low_battery_confirmation_samples: int = 2
     low_battery_start_cooldown_seconds: float = 60.0
     manual_disconnect_auto_charge_pause_seconds: float = 300.0
@@ -318,6 +326,7 @@ class EdgeConfig:
     telemetry: TelemetryConfig
     safety: SafetyConfig
     obstacle_speech: ObstacleSpeechConfig
+    waypoint_speech: WaypointSpeechConfig
     storage: StorageConfig
     media: MediaConfig
     mapping: MappingConfig
@@ -342,6 +351,7 @@ class EdgeConfig:
             telemetry=TelemetryConfig(**raw.get("telemetry", {})),
             safety=SafetyConfig(**raw.get("safety", {})),
             obstacle_speech=ObstacleSpeechConfig(**raw.get("obstacle_speech", {})),
+            waypoint_speech=WaypointSpeechConfig(**raw.get("waypoint_speech", {})),
             storage=StorageConfig(**raw.get("storage", {})),
             media=MediaConfig(**raw.get("media", {})),
             mapping=MappingConfig(**raw.get("mapping", {})),

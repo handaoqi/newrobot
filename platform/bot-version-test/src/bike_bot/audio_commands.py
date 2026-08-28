@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -11,6 +13,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -118,7 +121,9 @@ class AudioCommandClient:
             self.report(command_id, "failed", {}, "audio_url is required")
             return
 
-        self.report(command_id, "running", {"audio_url": audio_url, "playback_policy": "latest_wins"}, "")
+        playback_policy = "blocking_fifo" if payload.get("blocking_fifo") else "latest_wins"
+        self.report(command_id, "running", {"audio_url": audio_url, "playback_policy": playback_policy}, "")
+        self._write_waypoint_status(command_id, payload, "running")
         started = subprocess.getoutput("date -Is")
         local_path = None
         try:
@@ -138,6 +143,7 @@ class AudioCommandClient:
             )
             if cancel_event.is_set():
                 raise PlaybackSuperseded("replaced during playback")
+            self._write_waypoint_status(command_id, payload, "finished")
             self.report(
                 command_id,
                 "finished",
@@ -145,6 +151,7 @@ class AudioCommandClient:
                 "",
             )
         except PlaybackSuperseded as exc:
+            self._write_waypoint_status(command_id, payload, "superseded", str(exc))
             self.report(
                 command_id,
                 "superseded",
@@ -153,6 +160,12 @@ class AudioCommandClient:
             )
         except Exception as exc:
             if cancel_event.is_set():
+                self._write_waypoint_status(
+                    command_id,
+                    payload,
+                    "superseded",
+                    "replaced by a newer announcement",
+                )
                 self.report(
                     command_id,
                     "superseded",
@@ -161,10 +174,45 @@ class AudioCommandClient:
                 )
                 return
             LOGGER.exception("audio command failed id=%s url=%s", command_id, audio_url)
+            self._write_waypoint_status(command_id, payload, "failed", str(exc))
             self.report(command_id, "failed", {"audio_url": audio_url, "started_at": started}, str(exc))
         finally:
             if local_path is not None:
                 local_path.unlink(missing_ok=True)
+
+    def _write_waypoint_status(
+        self,
+        command_id: int,
+        payload: dict,
+        status: str,
+        error_message: str = "",
+    ) -> None:
+        execution_id = str(payload.get("task_execution_id") or "")
+        waypoint_id = str(payload.get("waypoint_id") or "")
+        if payload.get("source") != "patrol_waypoint_speech" or not execution_id or not waypoint_id:
+            return
+        waypoint_key = hashlib.sha256(waypoint_id.encode("utf-8")).hexdigest()
+        target = Path(self.config.storage.audio_status_dir) / execution_id / f"{waypoint_key}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = {
+            "command_id": command_id,
+            "task_execution_id": execution_id,
+            "waypoint_id": waypoint_id,
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error_message": error_message,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{target.stem}-",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as temporary:
+            json.dump(content, temporary, ensure_ascii=False)
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(target)
 
     def handle_stream_audio_command(self, command: dict) -> None:
         """Apply remote live-stream audio capture and report its result."""

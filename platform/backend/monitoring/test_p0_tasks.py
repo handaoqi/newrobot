@@ -6,6 +6,7 @@ import uuid
 
 from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, SpeechCategory, SpeechTemplate, TaskExecution
 from .services.command_service import CommandService
+from .services.docking_service import dispatch_docking_task
 from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
 
 
@@ -99,6 +100,30 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(command.events.get().event_type, "created")
         execution.refresh_from_db()
         self.assertEqual(execution.state, "dispatching")
+
+    def test_low_battery_docking_episode_creates_exactly_one_return_task(self):
+        self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        self.robot.charging_map = self.map
+        self.robot.charging_route = self.route
+        self.robot.battery_level = 19
+        self.robot.save(
+            update_fields=["charging_map", "charging_route", "battery_level", "updated_at"]
+        )
+        episode_id = str(uuid.uuid4())
+
+        first = dispatch_docking_task(robot=self.robot, low_battery_episode_id=episode_id)
+        second = dispatch_docking_task(robot=self.robot, low_battery_episode_id=episode_id)
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(first.execution.id, second.execution.id)
+        self.assertEqual(first.command.id, second.command.id)
+        self.assertEqual(str(first.execution.loop_session_id), episode_id)
+        self.assertTrue(first.command.payload["docking"]["enabled"])
+        self.assertEqual(
+            first.command.payload["docking"]["low_battery_episode_id"], episode_id
+        )
 
     def test_force_exit_clears_active_execution_and_unblocks_next_task(self):
         execution = TaskExecutionService.create_execution(self.task, self.user)

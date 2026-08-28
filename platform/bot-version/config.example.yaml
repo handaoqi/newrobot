@@ -89,6 +89,7 @@ display:
 
 storage:
   telemetry_log_path: "data/telemetry/telemetry.jsonl"
+  audio_status_dir: "/home/dogrobot/runtime/nx-edge/data/audio-status"
 
 runtime:
   mode: "auto"

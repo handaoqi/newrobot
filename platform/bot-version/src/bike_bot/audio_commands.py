@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -55,10 +58,12 @@ class AudioCommandClient:
             return
 
         self.report(command_id, "running", {"audio_url": audio_url}, "")
+        self._write_waypoint_status(command_id, payload, "running")
         started = subprocess.getoutput("date -Is")
         try:
             local_path = self._download_audio(audio_url)
             player = self._play_audio(local_path)
+            self._write_waypoint_status(command_id, payload, "finished")
             self.report(
                 command_id,
                 "finished",
@@ -67,7 +72,42 @@ class AudioCommandClient:
             )
         except Exception as exc:
             LOGGER.exception("audio command failed id=%s url=%s", command_id, audio_url)
+            self._write_waypoint_status(command_id, payload, "failed", str(exc))
             self.report(command_id, "failed", {"audio_url": audio_url, "started_at": started}, str(exc))
+
+    def _write_waypoint_status(
+        self,
+        command_id: int,
+        payload: dict,
+        status: str,
+        error_message: str = "",
+    ) -> None:
+        execution_id = str(payload.get("task_execution_id") or "")
+        waypoint_id = str(payload.get("waypoint_id") or "")
+        if payload.get("source") != "patrol_waypoint_speech" or not execution_id or not waypoint_id:
+            return
+        waypoint_key = hashlib.sha256(waypoint_id.encode("utf-8")).hexdigest()
+        target = Path(self.config.storage.audio_status_dir) / execution_id / f"{waypoint_key}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = {
+            "command_id": command_id,
+            "task_execution_id": execution_id,
+            "waypoint_id": waypoint_id,
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error_message": error_message,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{target.stem}-",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as temporary:
+            json.dump(content, temporary, ensure_ascii=False)
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(target)
 
     def report(self, command_id: int, status: str, response_payload: dict, error_message: str) -> None:
         response = requests.post(

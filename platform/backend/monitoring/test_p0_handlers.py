@@ -207,10 +207,14 @@ class MessageHandlerTests(TestCase):
                 "task_execution_id": str(self.execution.id),
                 "state": "running",
                 "state_version": 4,
-                "current_waypoint_index": 1,
+                "current_waypoint_index": 0,
+                "current_waypoint_id": "wp-1",
                 "completed_waypoints": 1,
                 "total_waypoints": 2,
                 "reported_at": timezone.now().isoformat(),
+                "milestone": "waypoint_reached",
+                "execution_waypoint_index": 0,
+                "waypoint": {"waypoint_id": "wp-1", "map_point_number": 1, "x": 1.0, "y": 2.0, "yaw": 0.2},
             },
         )
         handle_mqtt_message("robots/rx-001/events/task", progress)
@@ -302,6 +306,24 @@ class MessageHandlerTests(TestCase):
             },
         )
         handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+        progress = self.envelope(
+            "task.progress",
+            {
+                "task_execution_id": str(self.execution.id),
+                "state": "running",
+                "state_version": 3,
+                "current_waypoint_index": 1,
+                "current_waypoint_id": "wp-2",
+                "completed_waypoints": 2,
+                "total_waypoints": 2,
+                "reported_at": timezone.now().isoformat(),
+                "milestone": "waypoint_reached",
+                "execution_waypoint_index": 1,
+                "waypoint": {"waypoint_id": "wp-2", "map_point_number": 2, "x": 3.0, "y": 4.0, "yaw": 0.4},
+            },
+            sequence=2,
+        )
+        handle_mqtt_message("robots/rx-001/events/task", progress)
         result = self.envelope(
             "command.result",
             {
@@ -312,9 +334,9 @@ class MessageHandlerTests(TestCase):
                 "finished_at": timezone.now().isoformat(),
                 "error_code": None,
                 "error_message": None,
-                "result": {"final_task_state": "completed", "state_version": 3, "completed_waypoints": 2, "total_waypoints": 2},
+                "result": {"final_task_state": "completed", "state_version": 4, "completed_waypoints": 2, "total_waypoints": 2},
             },
-            sequence=2,
+            sequence=3,
         )
         handle_mqtt_message("robots/rx-001/commands/x/result", result)
         command = RobotCommand.objects.get(payload__source="patrol_waypoint_speech")

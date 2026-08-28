@@ -29,6 +29,7 @@ from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
 from .services import tts_service
 from .services.alert_skill_service import resolve_alert_template
+from .services.docking_service import DockingDispatchError, dispatch_docking_task
 
 
 ResponsePublisher = Callable[[str, dict, int, bool], None]
@@ -41,8 +42,24 @@ def _public_media_url(saved_path: str) -> str:
     return f"{base_url}/{media_url}/{saved_path.lstrip('/')}"
 
 
-def _queue_waypoint_speech(execution: TaskExecution, robot: Robot, waypoint_index: int):
+def _queue_waypoint_speech(
+    execution: TaskExecution,
+    robot: Robot,
+    waypoint_index: int | None = None,
+    waypoint_id: str = "",
+):
     waypoints = (execution.route_snapshot or {}).get("waypoints") or []
+    if waypoint_id:
+        waypoint_index = next(
+            (
+                index
+                for index, waypoint in enumerate(waypoints)
+                if str(waypoint.get("waypoint_id") or "") == str(waypoint_id)
+            ),
+            None,
+        )
+    if waypoint_index is None:
+        return None
     if waypoint_index < 0 or waypoint_index >= len(waypoints):
         return None
     waypoint = waypoints[waypoint_index]
@@ -83,6 +100,7 @@ def _queue_waypoint_speech(execution: TaskExecution, robot: Robot, waypoint_inde
             "task_execution_id": str(execution.id),
             "waypoint_index": waypoint_index,
             "waypoint_id": waypoint.get("waypoint_id", ""),
+            "blocking_fifo": True,
         },
     )
 
@@ -118,6 +136,54 @@ def _queue_mapping_divergence_speech(robot: Robot, payload: dict):
             "content_type": "audio/mpeg",
             "tts_cache_hit": cache_hit,
             "mapping_session_id": session_id,
+            "alert_event_id": payload.get("event_id", ""),
+        },
+    )
+
+
+def _queue_low_battery_return_speech(robot: Robot, payload: dict):
+    episode_id = str((payload.get("attributes") or {}).get("low_battery_episode_id") or payload.get("event_id") or "")
+    duplicate_filter = {
+        "robot": robot,
+        "action": "play_audio",
+        "payload__source": "low_battery_return_charge_speech",
+        "payload__low_battery_episode_id": episode_id,
+    }
+    if RobotCommand.objects.filter(**duplicate_filter).exists():
+        return None
+    template = resolve_alert_template("low_battery_return_charge", "低电量自动回充")
+    if not template:
+        LOGGER.warning("low-battery return speech skill is disabled or has no template robot=%s", robot.code)
+        return None
+    try:
+        saved_path, cache_hit = tts_service.synthesize_speech(template.text)
+    except Exception:
+        LOGGER.exception("low-battery return speech synthesis failed robot=%s", robot.code)
+        return None
+    RobotCommand.objects.filter(
+        robot=robot,
+        action="play_audio",
+        status="queued",
+        payload__source="patrol_waypoint_speech",
+    ).update(
+        status="superseded",
+        error_message="低电量回充告警已中止巡检点位播报",
+        updated_at=timezone.now(),
+    )
+    return RobotCommand.objects.create(
+        robot=robot,
+        action="play_audio",
+        payload={
+            "audio_url": _public_media_url(saved_path),
+            "audio_name": template.name,
+            "text": template.text,
+            "source": "low_battery_return_charge_speech",
+            "alert_skill": "low_battery_return_charge",
+            "dual_output": True,
+            "priority": "critical",
+            "content_type": "audio/mpeg",
+            "tts_cache_hit": cache_hit,
+            "low_battery_episode_id": episode_id,
             "alert_event_id": payload.get("event_id", ""),
         },
     )
@@ -273,6 +339,42 @@ def _dispatch(
             source_code = str((payload.get("source") or {}).get("code") or "")
             if payload.get("event_type") == "slam_diverged" or source_code == "SLAM_DIVERGED":
                 _queue_mapping_divergence_speech(robot, payload)
+            if (
+                payload.get("event_type") == "low_battery_return_charge"
+                or source_code == "LOW_BATTERY_RETURN_CHARGE"
+            ):
+                _queue_low_battery_return_speech(robot, payload)
+                episode_id = str(
+                    (payload.get("attributes") or {}).get("low_battery_episode_id")
+                    or payload.get("event_id")
+                    or ""
+                )
+                try:
+                    docking = dispatch_docking_task(
+                        robot=robot,
+                        low_battery_episode_id=episode_id,
+                    )
+                    docking_result = {
+                        "status": "created" if docking.created else "already_active",
+                        "execution_id": str(docking.execution.id),
+                        "command_id": str(docking.command.id),
+                    }
+                except DockingDispatchError as exc:
+                    docking_result = {"status": "failed", "code": exc.code, "message": str(exc)}
+                    event.description = f"低电量回充任务未下发：{exc}（{exc.code}）"
+                    event.save(update_fields=["description", "updated_at"])
+                    LOGGER.warning(
+                        "low-battery docking dispatch failed robot=%s episode=%s code=%s message=%s",
+                        robot.code,
+                        episode_id,
+                        exc.code,
+                        exc,
+                    )
+                return {
+                    "created": created,
+                    "event_id": str(event.event_id),
+                    "docking": docking_result,
+                }
         return {"created": created, "event_id": str(event.event_id)}
     if message_type == "sync.request":
         return _handle_sync(envelope, robot, publish_response)
@@ -458,14 +560,6 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
             progress_fields.append("current_waypoint_index")
         if progress_fields:
             execution.save(update_fields=progress_fields + ["updated_at"])
-        # FollowWaypoints publishes feedback when it advances to the next
-        # waypoint, so the progress handler above announces every waypoint
-        # except the last one.  The final arrival is only known here, from the
-        # terminal task result.
-        if final_state == "completed":
-            final_index = len((execution.route_snapshot or {}).get("waypoints") or []) - 1
-            if final_index >= 0:
-                _queue_waypoint_speech(execution, robot, final_index)
         realtime_publisher.publish_task_event(str(execution.id), payload)
     return {"status": command.status}
 
@@ -487,7 +581,6 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         )
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
     if envelope.message_type == "task.progress":
-        previous_completed_waypoints = execution.completed_waypoints
         execution = TaskExecutionService.apply_progress(execution, payload)
         milestone = str(payload.get("milestone") or "")
         if milestone in {"target_dispatched", "waypoint_reached"} and execution.state_version == int(payload["state_version"]):
@@ -502,8 +595,14 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
                     "payload": payload,
                 },
             )
-        if execution.completed_waypoints > previous_completed_waypoints:
-            _queue_waypoint_speech(execution, robot, execution.completed_waypoints - 1)
+        if milestone == "waypoint_reached":
+            waypoint = payload.get("waypoint") or {}
+            _queue_waypoint_speech(
+                execution,
+                robot,
+                waypoint_index=payload.get("execution_waypoint_index"),
+                waypoint_id=str(waypoint.get("waypoint_id") or payload.get("current_waypoint_id") or ""),
+            )
     else:
         target = payload["state"]
         incoming_version = int(payload["state_version"])

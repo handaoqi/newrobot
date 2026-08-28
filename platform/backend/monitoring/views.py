@@ -59,6 +59,7 @@ from .map_loop_review import LoopReviewError, audit_map_package, normalize_thres
 from .realtime import event_broker, sse_stream
 from .services.alert_service import AlertService
 from .services.command_service import CommandService
+from .services.docking_service import DockingDispatchError, dispatch_docking_task
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services import asr_service, tts_service
@@ -1257,69 +1258,28 @@ class RobotChargingDockView(APIView):
             return Response({"detail": "请先选择充电地图和两点回充路线"}, status=status.HTTP_400_BAD_REQUEST)
         map_data = get_object_or_404(MapData, pk=map_id)
         route = get_object_or_404(PatrolRoute, pk=route_id, robot=robot, map_data=map_data)
-        if len(route.waypoints or []) != 2:
-            return Response({"detail": "回充路线必须固定为两个点"}, status=status.HTTP_400_BAD_REQUEST)
-        if robot.effective_connection_status() != "online":
-            return Response({"detail": "机器狗 Edge Agent 当前离线"}, status=status.HTTP_409_CONFLICT)
-        if robot.localization_status != "normal" or not robot.nav_ready:
-            return Response({"detail": "定位或导航栈未就绪，不能开始回充"}, status=status.HTTP_409_CONFLICT)
-
-        with transaction.atomic():
-            robot = Robot.objects.select_for_update().get(pk=robot.pk)
-            robot.charging_map = map_data
-            robot.charging_route = route
-            robot.save(update_fields=["charging_map", "charging_route", "updated_at"])
-            now = timezone.now()
-            task_name = f"一键回充 - {route.name}"
-            task, _ = PatrolTask.objects.get_or_create(
+        try:
+            result = dispatch_docking_task(
                 robot=robot,
+                operator=request.user if request.user.is_authenticated else None,
+                map_data=map_data,
                 route=route,
-                name=task_name,
-                defaults={
-                    "route_name": route.name,
-                    "scheduled_start": now,
-                    "scheduled_end": now + timedelta(hours=8),
-                    "enabled": True,
-                    "description": "机器人管理页面一键回充专用两点路线",
-                    "created_by": request.user if request.user.is_authenticated else None,
-                },
+                persist_configuration=True,
             )
-            task.route_name = route.name
-            task.scheduled_start = now
-            task.scheduled_end = now + timedelta(hours=8)
-            task.enabled = True
-            task.save(update_fields=["route_name", "scheduled_start", "scheduled_end", "enabled", "updated_at"])
-            try:
-                # Creating an execution and its start command is one operation.
-                # CommandService can reject the dispatch (for example, low
-                # battery); do not commit a created execution with no command,
-                # because it blocks every retry as ROBOT_BUSY.
-                with transaction.atomic():
-                    execution = TaskExecutionService.create_execution(
-                        task, request.user if request.user.is_authenticated else None
-                    )
-                    command = CommandService.create(
-                        execution,
-                        "task.start",
-                        request.user if request.user.is_authenticated else None,
-                        command_options={
-                            "docking": {
-                                "enabled": True,
-                                "final_waypoint_index": 1,
-                                "charge_retries": 3,
-                                "undock_seconds": 3,
-                            }
-                        },
-                    )
-            except TaskStateError as exc:
-                return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except DockingDispatchError as exc:
+            response_status = (
+                status.HTTP_400_BAD_REQUEST
+                if exc.code in {"DOCK_ROUTE_MISSING", "DOCK_ROUTE_MISMATCH", "DOCK_ROUTE_INVALID"}
+                else status.HTTP_409_CONFLICT
+            )
+            return Response({"detail": str(exc), "code": exc.code}, status=response_status)
         return Response(
             {
                 "charging_config": {"map_id": map_data.id, "map_name": map_data.name, "route_id": route.id, "route_name": route.name},
-                "execution": TaskExecutionSerializer(execution).data,
-                "command": RemoteCommandSerializer(command).data,
+                "execution": TaskExecutionSerializer(result.execution).data,
+                "command": RemoteCommandSerializer(result.command).data,
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
         )
 
 
@@ -1663,22 +1623,41 @@ class DeviceCommandPollView(APIView):
             if command is None and requested_action != "set_stream_audio":
                 command = (
                     RobotCommand.objects.select_for_update(skip_locked=True)
+                    .filter(
+                        robot=robot,
+                        action="play_audio",
+                        status="queued",
+                        payload__blocking_fifo=True,
+                    )
+                    .order_by("created_at")
+                    .first()
+                )
+            if command is None and requested_action != "set_stream_audio":
+                command = (
+                    RobotCommand.objects.select_for_update(skip_locked=True)
                     .filter(robot=robot, action="play_audio", status="queued")
                     .order_by("-created_at")
                     .first()
                 )
             if command is None:
                 return Response(status=status.HTTP_204_NO_CONTENT)
-            RobotCommand.objects.filter(
-                robot=robot,
-                action=command.action,
-                status="queued",
-                created_at__lt=command.created_at,
-            ).update(
-                status="superseded",
-                error_message="已被更新的播报替换",
-                updated_at=timezone.now(),
-            )
+            if not bool((command.payload or {}).get("blocking_fifo")):
+                blocking_command_ids = RobotCommand.objects.filter(
+                    robot=robot,
+                    action=command.action,
+                    status="queued",
+                    payload__blocking_fifo=True,
+                ).values("id")
+                RobotCommand.objects.filter(
+                    robot=robot,
+                    action=command.action,
+                    status="queued",
+                    created_at__lt=command.created_at,
+                ).exclude(id__in=blocking_command_ids).update(
+                    status="superseded",
+                    error_message="已被更新的播报替换",
+                    updated_at=timezone.now(),
+                )
             command.status = "sent"
             command.sent_at = timezone.now()
             command.save(update_fields=["status", "sent_at", "updated_at"])

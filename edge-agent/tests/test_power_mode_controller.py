@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from roamerx_edge.charge_control_adapter import ChargeControlAdapter
 from roamerx_edge.config import ChargeControlConfig, PowerModeConfig
+from roamerx_edge.local_store import LocalStore
 from roamerx_edge.power_mode_controller import PowerModeController
 
 
@@ -258,7 +259,7 @@ def test_thermal_recovery_retries_charge_once_after_delay(monkeypatch):
     assert calls == ["retry"]
 
 
-def test_low_battery_starts_charge_after_confirmation():
+def test_low_battery_requests_one_return_task_only_below_threshold():
     class FakePowerMode:
         def snapshot(self):
             return {"auto_charge_enabled": False}
@@ -268,7 +269,7 @@ def test_low_battery_starts_charge_after_confirmation():
         FakePowerMode(),
     )
     calls = []
-    adapter.start = lambda: calls.append("start") or {"charge": {}}
+    adapter.set_low_battery_handler(lambda episode_id, percent: calls.append((episode_id, percent)))
     sample = {
         "available": True,
         "percent": 20,
@@ -282,12 +283,61 @@ def test_low_battery_starts_charge_after_confirmation():
     adapter.observe_power(sample)
     assert calls == []
     adapter.observe_power(sample)
+    assert calls == []
+    sample["percent"] = 19
+    adapter.observe_power(sample)
+    adapter.observe_power(sample)
     for _ in range(50):
         if calls:
             break
         time.sleep(0.01)
 
-    assert calls == ["start"]
+    assert len(calls) == 1
+    assert calls[0][1] == 19
+    adapter.observe_power(sample)
+    adapter.observe_power(sample)
+    time.sleep(0.05)
+    assert len(calls) == 1
+
+
+def test_low_battery_episode_survives_restart_and_rearms_at_25_percent(tmp_path):
+    class FakePowerMode:
+        def snapshot(self):
+            return {"auto_charge_enabled": False}
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    config = ChargeControlConfig(low_battery_confirmation_samples=2)
+    first = ChargeControlAdapter(config, FakePowerMode(), store)
+    first_calls = []
+    first.set_low_battery_handler(lambda episode_id, percent: first_calls.append((episode_id, percent)))
+    first.observe_power({"available": True, "percent": 19})
+    first.observe_power({"available": True, "percent": 19})
+    for _ in range(50):
+        if first_calls:
+            break
+        time.sleep(0.01)
+    assert len(first_calls) == 1
+
+    restarted = ChargeControlAdapter(config, FakePowerMode(), store)
+    restarted_calls = []
+    restarted.set_low_battery_handler(
+        lambda episode_id, percent: restarted_calls.append((episode_id, percent))
+    )
+    restarted.observe_power({"available": True, "percent": 19})
+    restarted.observe_power({"available": True, "percent": 19})
+    time.sleep(0.05)
+    assert restarted_calls == []
+
+    restarted.observe_power({"available": True, "percent": 25})
+    restarted.observe_power({"available": True, "percent": 19})
+    restarted.observe_power({"available": True, "percent": 19})
+    for _ in range(50):
+        if restarted_calls:
+            break
+        time.sleep(0.01)
+    assert len(restarted_calls) == 1
+    assert restarted_calls[0][0] != first_calls[0][0]
+    store.close()
 
 
 def test_manual_disconnect_pauses_low_battery_auto_charge():
@@ -320,8 +370,8 @@ def test_manual_disconnect_pauses_low_battery_auto_charge():
     adapter.stop()
 
     calls = []
-    adapter.start = lambda: calls.append("start") or {"charge": {}}
-    sample = {"available": True, "percent": 20}
+    adapter.set_low_battery_handler(lambda episode_id, percent: calls.append((episode_id, percent)))
+    sample = {"available": True, "percent": 19}
     adapter.observe_power(sample)
     adapter.observe_power(sample)
     assert calls == []
@@ -334,7 +384,8 @@ def test_manual_disconnect_pauses_low_battery_auto_charge():
             break
         time.sleep(0.01)
 
-    assert calls == ["start"]
+    assert len(calls) == 1
+    assert calls[0][1] == 19
 
 
 def test_charge_waits_for_dock_before_stopping_motion():

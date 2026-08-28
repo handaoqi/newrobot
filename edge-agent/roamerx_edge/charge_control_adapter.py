@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 
 from .config import ChargeControlConfig
 from .power_mode_controller import PowerModeController
@@ -15,9 +16,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ChargeControlAdapter:
-    def __init__(self, config: ChargeControlConfig, power_mode: PowerModeController) -> None:
+    def __init__(
+        self,
+        config: ChargeControlConfig,
+        power_mode: PowerModeController,
+        store=None,
+    ) -> None:
         self.config = config
         self.power_mode = power_mode
+        self.store = store
         self._lock = threading.RLock()
         self._full_samples = 0
         self._completion_thread: threading.Thread | None = None
@@ -35,6 +42,8 @@ class ChargeControlAdapter:
         self._pending_charge = False
         self._low_battery_handler = None
         self._full_charge_handler = None
+        persisted = store.get_metadata("low_battery_episode") if store else None
+        self._low_battery_episode = persisted if isinstance(persisted, dict) else {}
 
     def set_low_battery_handler(self, handler) -> None:
         """Register the application-level safe-stop callback."""
@@ -242,8 +251,20 @@ class ChargeControlAdapter:
             if now < self._manual_disconnect_inhibit_until:
                 self._low_battery_samples = 0
                 return
-            if percent > self.config.low_battery_start_percent:
+            if percent >= self.config.low_battery_rearm_percent:
                 self._low_battery_samples = 0
+                if self._low_battery_episode.get("active"):
+                    self._low_battery_episode = {}
+                    self._persist_low_battery_episode()
+                    LOGGER.info(
+                        "battery recovered to %d%%; low-battery return latch re-armed",
+                        percent,
+                    )
+                return
+            if percent >= self.config.low_battery_start_percent:
+                self._low_battery_samples = 0
+                return
+            if self._low_battery_episode.get("active"):
                 return
             if (
                 self._pending_charge
@@ -265,25 +286,38 @@ class ChargeControlAdapter:
                 return
             self._low_battery_samples = 0
             self._last_low_battery_start_at = now
+            episode_id = str(uuid.uuid4())
+            self._low_battery_episode = {
+                "active": True,
+                "episode_id": episode_id,
+                "battery_percent": percent,
+                "triggered_at_epoch": time.time(),
+            }
+            self._persist_low_battery_episode()
             self._low_battery_start_thread = threading.Thread(
                 target=self._start_for_low_battery,
+                args=(episode_id, percent),
                 daemon=True,
                 name="low-battery-charge-start",
             )
             self._low_battery_start_thread.start()
 
-    def _start_for_low_battery(self) -> None:
+    def _persist_low_battery_episode(self) -> None:
+        if self.store:
+            self.store.set_metadata("low_battery_episode", self._low_battery_episode)
+
+    def _start_for_low_battery(self, episode_id: str, percent: int) -> None:
         try:
             LOGGER.warning(
-                "battery is at or below %d%%; starting automatic charge",
+                "battery is %d%% (below %d%%); requesting one automatic return-to-charge task episode=%s",
+                percent,
                 self.config.low_battery_start_percent,
+                episode_id,
             )
             if callable(self._low_battery_handler):
-                self._low_battery_handler()
-            result = self.start()
-            LOGGER.info("automatic low-battery charge prepared: %s", result.get("charge_stage", "starting"))
+                self._low_battery_handler(episode_id, percent)
         except Exception:
-            LOGGER.exception("automatic low-battery charge start failed")
+            LOGGER.exception("automatic low-battery return request failed episode=%s", episode_id)
 
     def _observe_thermal_recovery(self, power: dict) -> None:
         state = power.get("charge_state")

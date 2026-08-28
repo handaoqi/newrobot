@@ -131,6 +131,20 @@ const currentExecutionRound = computed(() => {
 const latestTargetMilestone = computed(() => [...waypointMilestones.value]
   .reverse()
   .find((event) => event.event_type === 'task.target_dispatched') || null)
+const reachedWaypointIds = computed(() => new Set(waypointMilestones.value
+  .filter((event) => event.event_type === 'task.waypoint_reached')
+  .map((event) => String(event.payload?.waypoint?.waypoint_id || event.payload?.current_waypoint_id || ''))
+  .filter(Boolean)))
+const activeTargetMilestone = computed(() => {
+  const target = latestTargetMilestone.value
+  const waypointId = String(target?.payload?.waypoint?.waypoint_id || target?.payload?.current_waypoint_id || '')
+  return waypointId && !reachedWaypointIds.value.has(waypointId) ? target : null
+})
+const currentTargetWaypointId = computed(() => String(
+  activeTargetMilestone.value?.payload?.waypoint?.waypoint_id
+  || activeTargetMilestone.value?.payload?.current_waypoint_id
+  || '',
+))
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   execution.value,
   trajectory.value,
@@ -383,8 +397,11 @@ function lossMarkerTitle(point) {
 
 function waypointClass(index) {
   if (!execution.value) return ''
-  if (index < Number(execution.value.completed_waypoints || 0)) return 'done'
-  if (index === currentWaypointIndex.value && isRunning.value) return 'current'
+  const waypointId = String(displayRouteWaypoints.value[index]?.waypoint_id || '')
+  if (waypointId && reachedWaypointIds.value.has(waypointId)) return 'done'
+  if (waypointId && waypointId === currentTargetWaypointId.value && isRunning.value) return 'current'
+  if (!waypointMilestones.value.length && index < Number(execution.value.completed_waypoints || 0)) return 'done'
+  if (!waypointMilestones.value.length && index === currentWaypointIndex.value && isRunning.value) return 'current'
   return ''
 }
 
@@ -1283,10 +1300,10 @@ watch(playUrlKey, () => {
                 <span v-for="(number, index) in executionWaypointOrder" :key="`${number}-${index}`">{{ number }}</span>
                 <small v-if="!executionWaypointOrder.length">暂无航点</small>
               </div>
-              <div v-if="latestTargetMilestone" class="guard-current-target">
+              <div v-if="activeTargetMilestone" class="guard-current-target">
                 <span>当前下发目标</span>
-                <strong>{{ latestTargetMilestone.payload?.waypoint?.map_point_number }}号点</strong>
-                <small>{{ formatTime(latestTargetMilestone.occurred_at) }} · {{ formatPose(latestTargetMilestone.payload?.waypoint) }}</small>
+                <strong>{{ activeTargetMilestone.payload?.waypoint?.map_point_number }}号点</strong>
+                <small>{{ formatTime(activeTargetMilestone.occurred_at) }} · {{ formatPose(activeTargetMilestone.payload?.waypoint) }}</small>
               </div>
               <div class="guard-waypoint-log">
                 <article v-for="event in waypointMilestones" :key="event.id">

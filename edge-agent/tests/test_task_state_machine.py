@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 from math import atan2, hypot
+import hashlib
+import json
+import time
 
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.protocol import decode_message
@@ -381,6 +384,83 @@ def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
     store.close()
 
 
+def test_reverse_execution_reports_each_actual_waypoint_identity(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["loop_execution"] = True
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+    nav.feedback(1, None)
+    nav.feedback(2, None)
+    nav.pose = SimpleNamespace(x=1.0, y=2.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    milestones = [
+        (event[1]["milestone"], event[1]["waypoint"]["waypoint_id"])
+        for event in events
+        if event[0] == "task.progress" and event[1].get("milestone")
+    ]
+    assert milestones == [
+        ("target_dispatched", "wp-3"),
+        ("waypoint_reached", "wp-3"),
+        ("target_dispatched", "wp-2"),
+        ("waypoint_reached", "wp-2"),
+        ("target_dispatched", "wp-1"),
+        ("waypoint_reached", "wp-1"),
+    ]
+    assert executor.context.state == "completed"
+    store.close()
+
+
+def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    first = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    first["speech_template_id"] = 7
+    status_dir = tmp_path / "audio-status"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(status_dir),
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.01,
+        ),
+    )
+
+    executor.start_task(envelope)
+    assert ids(nav.sent[0]) == ["wp-1"]
+    nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]))
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert len(nav.sent) == 1
+
+    waypoint_key = hashlib.sha256(b"wp-1").hexdigest()
+    status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
+    status_path.write_text(
+        json.dumps({"status": "finished", "waypoint_id": "wp-1"}),
+        encoding="utf-8",
+    )
+    for _ in range(100):
+        if len(nav.sent) == 2:
+            break
+        time.sleep(0.01)
+    executor._speech_wait_thread.join(timeout=1)
+    assert ids(nav.sent[1]) == ["wp-2", "wp-3"]
+    store.close()
+
+
 def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -702,6 +782,24 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     assert results[0][1] == "failed"
     assert results[0][3] == "FINAL_POSE_OUT_OF_TOLERANCE"
     store.close()
+
+
+def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
+    for distance, expected_state in ((0.42, "completed"), (0.46, "failed")):
+        store = LocalStore(str(tmp_path / f"edge-{distance}.db"))
+        nav = FakeNavigation()
+        executor = TaskExecutor(
+            store,
+            nav,
+            event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        )
+        executor.start_task(command("task.start"))
+        final = executor.context.route_snapshot["waypoints"][-1]
+        nav.pose = SimpleNamespace(x=float(final["x"]) + distance, y=float(final["y"]))
+        nav.result("succeeded", "", {"missed_waypoints": []})
+        assert executor.context.state == expected_state
+        store.close()
 
 
 def test_patrol_dispatches_remaining_waypoints_in_one_goal(tmp_path):

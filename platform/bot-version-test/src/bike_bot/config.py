@@ -168,6 +168,7 @@ class StorageConfig:
     run_stream_log_path: str = "data/logs/run_stream.log"
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 5
+    audio_status_dir: str = "/home/dogrobot/runtime/nx-edge/data/audio-status"
 
 
 @dataclass
@@ -229,6 +230,7 @@ class AppConfig:
         Path(self.storage.app_log_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.storage.stream_log_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.storage.run_stream_log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.storage.audio_status_dir).mkdir(parents=True, exist_ok=True)
         cache_path = self.model.tensorrt_engine_cache_path
         if cache_path:
             try:

@@ -29,6 +29,11 @@ DEFAULT_SPEECH_TEMPLATES = (
         "自动充电失败，请在机器人管理页查看问题提示，或手工更换电池",
         "设备管控",
     ),
+    (
+        "低电量自动回充",
+        "当前电量低于百分之二十，导航任务已停止，正在执行自动回充，请注意避让。",
+        "设备管控",
+    ),
 )
 
 DEFAULT_ALERT_SKILLS = (
@@ -36,6 +41,7 @@ DEFAULT_ALERT_SKILLS = (
     ("obstacle_detected", "发现障碍物"),
     ("avoidance", "后退尝试避障"),
     ("dissuasion", "劝阻离开线路"),
+    ("low_battery_return_charge", "低电量自动回充"),
 )
 
 

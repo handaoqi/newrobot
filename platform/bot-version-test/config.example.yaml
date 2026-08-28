@@ -92,6 +92,7 @@ display:
 
 storage:
   telemetry_log_path: /home/dogrobot/runtime/nx-edge/data/vision/telemetry/telemetry.jsonl
+  audio_status_dir: /home/dogrobot/runtime/nx-edge/data/audio-status
   app_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/bike-bot.log
   run_stream_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/run-stream.log
   stream_log_path: /home/dogrobot/runtime/nx-edge/data/vision/logs/ffmpeg-stream.log

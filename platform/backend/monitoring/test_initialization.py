@@ -36,9 +36,9 @@ class PlatformInitializationTests(TestCase):
 
         self.assertEqual(get_user_model().objects.filter(username="operator").count(), 1)
         self.assertEqual(Robot.objects.filter(code="RX-INIT-01").count(), 1)
-        self.assertEqual(AlertSkillBinding.objects.count(), 4)
+        self.assertEqual(AlertSkillBinding.objects.count(), 5)
         expected_names = {template[0] for template in DEFAULT_SPEECH_TEMPLATES}
-        self.assertEqual(len(expected_names), 11)
+        self.assertEqual(len(expected_names), 12)
         actual_templates = {
             name: (text, category)
             for name, text, category in SpeechTemplate.objects.filter(

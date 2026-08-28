@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from math import atan2, cos, hypot, isfinite, sin
+from pathlib import Path
 from typing import Callable, Protocol
 
 from .local_store import LocalStore
@@ -170,12 +173,13 @@ class TaskExecutor:
         *,
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
-        final_waypoint_tolerance_m: float = 0.35,
+        final_waypoint_tolerance_m: float = 0.45,
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         standup_confirmation_timeout_seconds: float = 12.0,
         map_set_coordinator=None,
         obstacle_speech=None,
+        waypoint_speech=None,
         rosbag_recorder=None,
         docking_arrived_handler=None,
     ) -> None:
@@ -189,6 +193,7 @@ class TaskExecutor:
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
         self.map_set_coordinator = map_set_coordinator
         self.obstacle_speech = obstacle_speech
+        self.waypoint_speech = waypoint_speech
         self.rosbag_recorder = rosbag_recorder
         self.docking_arrived_handler = docking_arrived_handler
         self._rosbag_state: dict = {}
@@ -210,6 +215,11 @@ class TaskExecutor:
         self._segment_avoidance_enabled = True
         self._dispatched_count = 0
         self._patrol_final_approach_applied = False
+        self._last_target_index = -1
+        self._last_reached_index = -1
+        self._speech_waiting_index: int | None = None
+        self._speech_wait_finished = False
+        self._speech_wait_thread: threading.Thread | None = None
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
         if self.context:
@@ -523,6 +533,10 @@ class TaskExecutor:
                 record_rosbag=bool(command.get("record_rosbag", False)),
                 docking=docking,
             )
+            self._last_target_index = initial_waypoint_index - 1
+            self._last_reached_index = initial_waypoint_index - 1
+            self._speech_waiting_index = None
+            self._speech_wait_finished = False
             self._persist()
             if reverse_return:
                 LOGGER.info(
@@ -696,13 +710,21 @@ class TaskExecutor:
         if self._segments:
             end = min(self._segments[self.context.current_segment_index].end_index, total)
         start_wp = waypoints[start_index]
-        if bool(start_wp.get("require_yaw", False)) or float(start_wp.get("dwell_seconds") or 0) > 0:
+        if (
+            bool(start_wp.get("require_yaw", False))
+            or float(start_wp.get("dwell_seconds") or 0) > 0
+            or bool(start_wp.get("speech_template_id"))
+        ):
             return start_index + 1
         for index in range(start_index + 1, end):
             if index == end - 1:
                 break
             waypoint = waypoints[index]
-            if bool(waypoint.get("require_yaw", False)) or float(waypoint.get("dwell_seconds") or 0) > 0:
+            if (
+                bool(waypoint.get("require_yaw", False))
+                or float(waypoint.get("dwell_seconds") or 0) > 0
+                or bool(waypoint.get("speech_template_id"))
+            ):
                 return index + 1
         return self._through_poses_end_index(waypoints, start_index, end)
 
@@ -932,7 +954,12 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.pausing")
-            if previous_state != "accepted" and not self.navigation.cancel_navigation():
+            waiting_for_speech = self._speech_waiting_index is not None
+            if (
+                previous_state != "accepted"
+                and not waiting_for_speech
+                and not self.navigation.cancel_navigation()
+            ):
                 raise ProtocolError("NAVIGATION_CANCEL_FAILED", "Nav2 action cancel failed")
             stop_motion = getattr(self.navigation, "stop_motion", None)
             if callable(stop_motion):
@@ -968,6 +995,23 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.resuming")
+            if self._speech_waiting_index is not None:
+                reached_index = self._speech_waiting_index
+                speech_finished = self._speech_wait_finished
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                if speech_finished:
+                    self._speech_waiting_index = None
+                    self._speech_wait_finished = False
+                    self._continue_after_waypoint(reached_index)
+                return {
+                    "final_task_state": "running",
+                    "state_version": self.context.state_version,
+                    "resume_from_waypoint_index": reached_index,
+                    "waiting_for_waypoint_speech": not speech_finished,
+                }
             self._send_from(resume_index)
             return {
                 "final_task_state": "running",
@@ -1035,13 +1079,14 @@ class TaskExecutor:
         completed_waypoints: int | None = None,
     ) -> None:
         apply_final = False
-        progress = None
+        progress_updates: list[dict] = []
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
             current_waypoint_index += self._goal_offset
-            self.context.current_waypoint_index = current_waypoint_index
             total = len(self.context.route_snapshot["waypoints"])
+            if current_waypoint_index < 0 or current_waypoint_index >= total:
+                return
             if (
                 not self._is_docking_task()
                 and current_waypoint_index == total - 1
@@ -1050,44 +1095,75 @@ class TaskExecutor:
             ):
                 self._patrol_final_approach_applied = True
                 apply_final = True
-            self.context.state_version += 1
-            self._persist()
-            waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index] if current_waypoint_index < total else None
-            pose = self.navigation.latest_pose()
-            robot_pose = None
-            if pose is not None:
-                robot_pose = {
-                    "x": float(pose.x),
-                    "y": float(pose.y),
-                    "yaw": float(getattr(pose, "yaw", 0.0)),
-                    "sampled_at": getattr(pose, "sampled_at", None),
-                }
-            progress = {
-                "task_execution_id": self.context.task_execution_id,
-                "state": "running",
-                "state_version": self.context.state_version,
-                "current_waypoint_index": current_waypoint_index,
-                "current_waypoint_id": waypoint["waypoint_id"] if waypoint else "",
-                "completed_waypoints": current_waypoint_index if completed_waypoints is None else completed_waypoints,
-                "total_waypoints": total,
-                "distance_remaining_m": distance_remaining_m,
-                "estimated_time_remaining_s": None,
-                "reported_at": now_iso(),
-                "milestone": milestone or None,
-                "execution_waypoint_order": [
-                    point.get("map_point_number", int(point.get("sequence", 0)) + 1)
-                    for point in self.context.route_snapshot["waypoints"]
-                ],
-                "waypoint": {
-                    "waypoint_id": waypoint.get("waypoint_id"),
-                    "map_point_number": waypoint.get("map_point_number", int(waypoint.get("sequence", 0)) + 1),
-                    "name": waypoint.get("name") or "",
-                    "x": float(waypoint["x"]),
-                    "y": float(waypoint["y"]),
-                    "yaw": float(waypoint["yaw"]),
-                } if waypoint else None,
-                "robot_pose": robot_pose,
-            }
+            if milestone == "target_dispatched":
+                if current_waypoint_index > self._last_target_index:
+                    progress_updates.append(
+                        self._build_progress_locked(
+                            current_waypoint_index,
+                            "target_dispatched",
+                            max(current_waypoint_index, self._last_reached_index + 1),
+                            distance_remaining_m,
+                        )
+                    )
+                    self._last_target_index = current_waypoint_index
+            elif milestone == "waypoint_reached":
+                while self._last_reached_index < current_waypoint_index:
+                    reached_index = self._last_reached_index + 1
+                    if reached_index > self._last_target_index:
+                        progress_updates.append(
+                            self._build_progress_locked(
+                                reached_index,
+                                "target_dispatched",
+                                reached_index,
+                                distance_remaining_m,
+                            )
+                        )
+                        self._last_target_index = reached_index
+                    progress_updates.append(
+                        self._build_progress_locked(
+                            reached_index,
+                            "waypoint_reached",
+                            reached_index + 1,
+                            0.0,
+                        )
+                    )
+                    self._last_reached_index = reached_index
+            else:
+                if current_waypoint_index > self._last_target_index:
+                    while self._last_target_index < current_waypoint_index:
+                        if self._last_reached_index < self._last_target_index:
+                            self._last_reached_index = self._last_target_index
+                            progress_updates.append(
+                                self._build_progress_locked(
+                                    self._last_reached_index,
+                                    "waypoint_reached",
+                                    self._last_reached_index + 1,
+                                    0.0,
+                                )
+                            )
+                        next_target_index = self._last_target_index + 1
+                        progress_updates.append(
+                            self._build_progress_locked(
+                                next_target_index,
+                                "target_dispatched",
+                                max(next_target_index, self._last_reached_index + 1),
+                                distance_remaining_m,
+                            )
+                        )
+                        self._last_target_index = next_target_index
+                else:
+                    progress_updates.append(
+                        self._build_progress_locked(
+                            current_waypoint_index,
+                            "",
+                            (
+                                completed_waypoints
+                                if completed_waypoints is not None
+                                else max(current_waypoint_index, self._last_reached_index + 1)
+                            ),
+                            distance_remaining_m,
+                        )
+                    )
         if apply_final:
             try:
                 self._apply_patrol_final_approach()
@@ -1096,14 +1172,65 @@ class TaskExecutor:
                     "final-approach navigation profile failed; continuing the current goal"
                 )
         with self._lock:
-            if not self.context or self.context.state != "running" or progress is None:
+            if not self.context or self.context.state != "running":
                 if apply_final:
                     try:
                         self._restore_navigation_profile()
                     except Exception:
                         LOGGER.exception("failed to restore profile after late final approach")
                 return
-            self.event_callback("task.progress", progress, "")
+            for progress in progress_updates:
+                self.event_callback("task.progress", progress, "")
+
+    def _build_progress_locked(
+        self,
+        waypoint_index: int,
+        milestone: str,
+        completed_waypoints: int,
+        distance_remaining_m: float | None,
+    ) -> dict:
+        waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
+        self.context.current_waypoint_index = waypoint_index
+        self.context.state_version += 1
+        self._persist()
+        pose = self.navigation.latest_pose()
+        robot_pose = None
+        if pose is not None:
+            robot_pose = {
+                "x": float(pose.x),
+                "y": float(pose.y),
+                "yaw": float(getattr(pose, "yaw", 0.0)),
+                "sampled_at": getattr(pose, "sampled_at", None),
+            }
+        return {
+            "task_execution_id": self.context.task_execution_id,
+            "state": "running",
+            "state_version": self.context.state_version,
+            "current_waypoint_index": waypoint_index,
+            "current_waypoint_id": waypoint.get("waypoint_id", ""),
+            "completed_waypoints": completed_waypoints,
+            "total_waypoints": len(self.context.route_snapshot["waypoints"]),
+            "distance_remaining_m": distance_remaining_m,
+            "estimated_time_remaining_s": None,
+            "reported_at": now_iso(),
+            "milestone": milestone or None,
+            "execution_waypoint_order": [
+                point.get("map_point_number", int(point.get("sequence", 0)) + 1)
+                for point in self.context.route_snapshot["waypoints"]
+            ],
+            "execution_waypoint_index": waypoint_index,
+            "waypoint": {
+                "waypoint_id": waypoint.get("waypoint_id"),
+                "map_point_number": waypoint.get(
+                    "map_point_number", int(waypoint.get("sequence", 0)) + 1
+                ),
+                "name": waypoint.get("name") or "",
+                "x": float(waypoint["x"]),
+                "y": float(waypoint["y"]),
+                "yaw": float(waypoint["yaw"]),
+            },
+            "robot_pose": robot_pose,
+        }
 
     def on_navigation_result(self, status: str, error_message: str = "", details: dict | None = None) -> None:
         with self._lock:
@@ -1140,66 +1267,19 @@ class TaskExecutor:
                     )
                     return
 
+                speech_required = bool(reached_waypoint.get("speech_template_id"))
+                if speech_required:
+                    self._clear_waypoint_speech_status(reached_index)
                 self.on_feedback(
-                    0,
+                    reached_index - self._goal_offset,
                     0.0,
                     milestone="waypoint_reached",
                     completed_waypoints=reached_index + 1,
                 )
-
-                next_waypoint_index = reached_index + 1
-                self.context.current_waypoint_index = next_waypoint_index
-                self.context.state_version += 1
-                self._persist()
-                total_waypoints = len(self.context.route_snapshot["waypoints"])
-                if next_waypoint_index < total_waypoints:
-                    if self._segments:
-                        current_segment = self._segments[self.context.current_segment_index]
-                        if next_waypoint_index >= current_segment.end_index:
-                            next_segment_index = self.context.current_segment_index + 1
-                            next_segment = self._segments[next_segment_index]
-                            self._emit("task.map_switching")
-                            try:
-                                self.map_set_coordinator.activate(next_segment)
-                            except Exception as exc:
-                                self._fail("MAP_SWITCH_FAILED", str(exc))
-                                return
-                            self._send_segment(next_segment_index, next_waypoint_index)
-                            return
-                    self._send_from(next_waypoint_index)
+                if speech_required:
+                    self._start_waypoint_speech_wait(reached_index)
                     return
-                pose_error = self._final_pose_error()
-                self._restore_navigation_profile()
-                if pose_error:
-                    self._fail(*pose_error)
-                    return
-                if self._is_docking_task() and callable(self.docking_arrived_handler):
-                    try:
-                        self.docking_arrived_handler(dict(self.context.docking or {}))
-                    except Exception as exc:
-                        self._fail("DOCK_CHARGE_START_FAILED", str(exc))
-                        return
-                self._stop_task_rosbag()
-                self._navigation_prepared = False
-                self.context.state = "completed"
-                self.context.current_waypoint_index = len(self.context.route_snapshot["waypoints"])
-                self.context.state_version += 1
-                self._persist()
-                self._emit("task.completed")
-                self.store.clear_task_context(self.context.task_execution_id, "completed")
-                self.start_result_callback(
-                    self.context.start_command_id,
-                    "succeeded",
-                    {
-                        "final_task_state": "completed",
-                        "state_version": self.context.state_version,
-                        "completed_waypoints": self.context.current_waypoint_index,
-                        "total_waypoints": self.context.current_waypoint_index,
-                        "rosbag": self._rosbag_state,
-                    },
-                    "",
-                    "",
-                )
+                self._continue_after_waypoint(reached_index)
             elif status == "cancelled":
                 self._stop_obstacle_monitor()
                 self._stop_task_rosbag()
@@ -1211,6 +1291,149 @@ class TaskExecutor:
                     return
                 self._stop_obstacle_monitor()
                 self._fail("NAVIGATION_FAILED", error_message or status)
+
+    def _continue_after_waypoint(self, reached_index: int) -> None:
+        with self._lock:
+            if not self.context or self.context.state != "running":
+                return
+            next_waypoint_index = reached_index + 1
+            self.context.current_waypoint_index = next_waypoint_index
+            self.context.state_version += 1
+            self._persist()
+            total_waypoints = len(self.context.route_snapshot["waypoints"])
+            if next_waypoint_index < total_waypoints:
+                if self._segments:
+                    current_segment = self._segments[self.context.current_segment_index]
+                    if next_waypoint_index >= current_segment.end_index:
+                        next_segment_index = self.context.current_segment_index + 1
+                        next_segment = self._segments[next_segment_index]
+                        self._emit("task.map_switching")
+                        try:
+                            self.map_set_coordinator.activate(next_segment)
+                        except Exception as exc:
+                            self._fail("MAP_SWITCH_FAILED", str(exc))
+                            return
+                        self._send_segment(next_segment_index, next_waypoint_index)
+                        return
+                self._send_from(next_waypoint_index)
+                return
+            pose_error = self._final_pose_error()
+            self._restore_navigation_profile()
+            if pose_error:
+                self._fail(*pose_error)
+                return
+            if self._is_docking_task() and callable(self.docking_arrived_handler):
+                try:
+                    self.docking_arrived_handler(dict(self.context.docking or {}))
+                except Exception as exc:
+                    self._fail("DOCK_CHARGE_START_FAILED", str(exc))
+                    return
+            self._stop_task_rosbag()
+            self._navigation_prepared = False
+            self.context.state = "completed"
+            self.context.current_waypoint_index = total_waypoints
+            self.context.state_version += 1
+            self._persist()
+            self._emit("task.completed")
+            self.store.clear_task_context(self.context.task_execution_id, "completed")
+            self.start_result_callback(
+                self.context.start_command_id,
+                "succeeded",
+                {
+                    "final_task_state": "completed",
+                    "state_version": self.context.state_version,
+                    "completed_waypoints": total_waypoints,
+                    "total_waypoints": total_waypoints,
+                    "rosbag": self._rosbag_state,
+                },
+                "",
+                "",
+            )
+
+    def _waypoint_speech_status_path(self, waypoint_index: int) -> Path | None:
+        if not self.context or not self.waypoint_speech:
+            return None
+        waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
+        waypoint_key = hashlib.sha256(
+            str(waypoint.get("waypoint_id") or waypoint_index).encode("utf-8")
+        ).hexdigest()
+        return (
+            Path(self.waypoint_speech.status_dir)
+            / self.context.task_execution_id
+            / f"{waypoint_key}.json"
+        )
+
+    def _clear_waypoint_speech_status(self, waypoint_index: int) -> None:
+        path = self._waypoint_speech_status_path(waypoint_index)
+        if not path:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("failed to clear stale waypoint speech status path=%s", path)
+
+    def _start_waypoint_speech_wait(self, waypoint_index: int) -> None:
+        self._speech_waiting_index = waypoint_index
+        self._speech_wait_finished = False
+        self._speech_wait_thread = threading.Thread(
+            target=self._wait_for_waypoint_speech,
+            args=(self.context.task_execution_id, waypoint_index),
+            daemon=True,
+            name=f"waypoint-speech-{waypoint_index}",
+        )
+        self._speech_wait_thread.start()
+
+    def _wait_for_waypoint_speech(self, execution_id: str, waypoint_index: int) -> None:
+        path = self._waypoint_speech_status_path(waypoint_index)
+        if not path:
+            with self._lock:
+                self._fail("WAYPOINT_SPEECH_UNAVAILABLE", "waypoint speech status channel is not configured")
+            return
+        deadline = time.monotonic() + float(self.waypoint_speech.timeout_seconds)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if (
+                    not self.context
+                    or self.context.task_execution_id != execution_id
+                    or self.context.state in self.TERMINAL_STATES | {"cancelling"}
+                ):
+                    return
+            try:
+                status = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                status = {}
+            state = str(status.get("status") or "")
+            if state == "finished":
+                with self._lock:
+                    if not self.context or self.context.task_execution_id != execution_id:
+                        return
+                    if self.context.state == "paused":
+                        self._speech_wait_finished = True
+                        return
+                    if self.context.state != "running":
+                        return
+                    self._speech_waiting_index = None
+                    self._speech_wait_finished = False
+                    self._continue_after_waypoint(waypoint_index)
+                return
+            if state in {"failed", "superseded"}:
+                with self._lock:
+                    if self.context and self.context.task_execution_id == execution_id:
+                        self._speech_waiting_index = None
+                        self._fail(
+                            "WAYPOINT_SPEECH_FAILED",
+                            str(status.get("error_message") or f"waypoint speech {state}"),
+                        )
+                return
+            time.sleep(float(self.waypoint_speech.poll_interval_seconds))
+        with self._lock:
+            if self.context and self.context.task_execution_id == execution_id:
+                self._speech_waiting_index = None
+                self._fail(
+                    "WAYPOINT_SPEECH_TIMEOUT",
+                    f"waypoint {waypoint_index} speech did not finish within {self.waypoint_speech.timeout_seconds:.0f}s",
+                )
 
     def _is_docking_task(self) -> bool:
         return bool(self.context and (self.context.docking or {}).get("enabled"))

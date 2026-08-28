@@ -85,7 +85,9 @@ class SafetyPolicy:
             and self.state.battery_percent is not None
             and self.state.battery_percent < self.config.low_battery_percent
         ):
-            raise ProtocolError("LOW_BATTERY", f"battery={self.state.battery_percent}")
+            docking = envelope.payload["command"].get("docking") or {}
+            if not bool(docking.get("enabled")):
+                raise ProtocolError("LOW_BATTERY", f"battery={self.state.battery_percent}")
         required_map = envelope.payload["command"].get("map") or {}
         map_set = (envelope.payload["command"].get("route_snapshot") or {}).get("map_set") or {}
         if self.state.current_map_local_state not in {"applied", ""}:
