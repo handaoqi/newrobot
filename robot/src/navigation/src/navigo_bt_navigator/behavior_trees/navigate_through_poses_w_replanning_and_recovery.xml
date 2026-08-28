@@ -10,7 +10,7 @@
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
             <ReactiveSequence>
-              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="1.0"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
             </ReactiveSequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
@@ -28,6 +28,15 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
+          <!--
+            Clearing the costmaps only helps when the map is right and the obstacles
+            are stale. If the pose itself has drifted, every later recovery moves the
+            robot from a wrong belief, so ask localization to re-anchor first.
+            Server: /reinitialize_global_localization in localization_nodelet.cpp -
+            without it BtServiceNode::on_configure throws and this whole tree fails
+            to load. It only arms one pass; the ICP runs in the lidar callback.
+          -->
+          <ReinitializeGlobalLocalization name="ReinitializeLocalization-Subtree" service_name="/reinitialize_global_localization"/>
           <Spin spin_dist="1.57"/>
           <BackUp backup_dist="0.30" backup_speed="0.05"/>
           <Wait wait_duration="2"/>

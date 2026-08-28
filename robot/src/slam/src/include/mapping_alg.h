@@ -13,6 +13,7 @@
 #include "ikd_tree/ikd_tree.h"
 #include "pcd2grid.h"
 #include "process/imu_process.h"
+#include "process/ground_filter.h"
 #include "process/lidar_process.h"
 #include "so3_math.h"
 
@@ -483,7 +484,14 @@ namespace robot::slam
         double                             dynamic_filter_voxel_size_ = 0.20;
         int                                dynamic_filter_min_scan_observations_ = 1;
         std::size_t                        dynamic_filter_shard_count_ = 64;
+        GroundFilterConfig                 ground_filter_config_;
+        GroundFilter                       ground_filter_;
+        std::size_t                        ground_filter_frames_ = 0;
+        std::size_t                        ground_filter_failures_ = 0;
+        std::size_t                        ground_filter_removed_points_ = 0;
         bool                               keyframe_record_enable_ = true;
+        bool                               odometry_only_ = false;
+        std::string                        lio_odometry_topic_ = "/odom/lio_odom";
         bool                               mapping_capture_enabled_ = false;
         bool                               slam_pose_ready_ = false;
         double                             keyframe_min_distance_m_ = 0.8;
@@ -588,6 +596,7 @@ namespace robot::slam
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr    pubLaserCloudMap_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubOdomAftMapped_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubLocalizationOdom_;
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubLioOdom_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubPath_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          pubGlobalOptimizedOdom_;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubGlobalOptimizedPath_;

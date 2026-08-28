@@ -1,6 +1,8 @@
 #ifndef FAST_GICP_FAST_GICP_IMPL_HPP
 #define FAST_GICP_FAST_GICP_IMPL_HPP
 
+#include <algorithm>
+#include <limits>
 #include <fast_gicp/so3/so3.hpp>
 
 namespace fast_gicp {
@@ -126,22 +128,32 @@ void FastGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
   std::vector<float> k_sq_dists(1);
 
 #pragma omp parallel for num_threads(num_threads_) firstprivate(k_indices, k_sq_dists) schedule(guided, 8)
-  for (int i = 0; i < input_->size(); i++) {
+  for (int i = 0; i < static_cast<int>(input_->size()); i++) {
     PointTarget pt;
-    pt.getVector4fMap() = trans_f * input_->at(i).getVector4fMap();
+    pt.getVector4fMap() = trans_f * input_->points[i].getVector4fMap();
 
-    target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+    int found = 0;
+#pragma omp critical(fast_gicp_kdtree_search)
+    {
+      found = target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+    }
 
-    sq_distances_[i] = k_sq_dists[0];
-    correspondences_[i] = k_sq_dists[0] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices[0] : -1;
+    sq_distances_[i] = found > 0 ? k_sq_dists[0] : std::numeric_limits<float>::max();
+    const int target_index = (found > 0) ? k_indices[0] : -1;
+    correspondences_[i] =
+      (target_index >= 0 &&
+       target_index < static_cast<int>(target_->size()) &&
+       target_index < static_cast<int>(target_covs_.size()) &&
+       sq_distances_[i] < corr_dist_threshold_ * corr_dist_threshold_)
+        ? target_index
+        : -1;
 
     if (correspondences_[i] < 0) {
       continue;
     }
 
-    const int target_index = correspondences_[i];
     const auto& cov_A = source_covs_[i];
-    const auto& cov_B = target_covs_[target_index];
+    const auto& cov_B = target_covs_[correspondences_[i]];
 
     Eigen::Matrix4d RCR = cov_B + trans.matrix() * cov_A * trans.matrix().transpose();
     RCR(3, 3) = 1.0;
@@ -156,24 +168,27 @@ double FastGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& tr
   update_correspondences(trans);
 
   double sum_errors = 0.0;
-  std::vector<Eigen::Matrix<double, 6, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 6>>> Hs(num_threads_);
-  std::vector<Eigen::Matrix<double, 6, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 1>>> bs(num_threads_);
-  for (int i = 0; i < num_threads_; i++) {
+  const int worker_threads = std::max(num_threads_, 1);
+  std::vector<Eigen::Matrix<double, 6, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 6>>> Hs(worker_threads);
+  std::vector<Eigen::Matrix<double, 6, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 1>>> bs(worker_threads);
+  for (int i = 0; i < worker_threads; i++) {
     Hs[i].setZero();
     bs[i].setZero();
   }
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
-  for (int i = 0; i < input_->size(); i++) {
+  for (int i = 0; i < static_cast<int>(input_->size()); i++) {
     int target_index = correspondences_[i];
-    if (target_index < 0) {
+    if (target_index < 0 ||
+        target_index >= static_cast<int>(target_->size()) ||
+        target_index >= static_cast<int>(target_covs_.size())) {
       continue;
     }
 
-    const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_A = input_->points[i].getVector4fMap().template cast<double>();
     const auto& cov_A = source_covs_[i];
 
-    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_B = target_->points[target_index].getVector4fMap().template cast<double>();
     const auto& cov_B = target_covs_[target_index];
 
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
@@ -194,14 +209,15 @@ double FastGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& tr
     Eigen::Matrix<double, 6, 6> Hi = jlossexp.transpose() * mahalanobis_[i] * jlossexp;
     Eigen::Matrix<double, 6, 1> bi = jlossexp.transpose() * mahalanobis_[i] * error;
 
-    Hs[omp_get_thread_num()] += Hi;
-    bs[omp_get_thread_num()] += bi;
+    const int thread_id = std::min(std::max(omp_get_thread_num(), 0), worker_threads - 1);
+    Hs[thread_id] += Hi;
+    bs[thread_id] += bi;
   }
 
   if (H && b) {
     H->setZero();
     b->setZero();
-    for (int i = 0; i < num_threads_; i++) {
+    for (int i = 0; i < worker_threads; i++) {
       (*H) += Hs[i];
       (*b) += bs[i];
     }
@@ -215,16 +231,18 @@ double FastGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d
   double sum_errors = 0.0;
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
-  for (int i = 0; i < input_->size(); i++) {
+  for (int i = 0; i < static_cast<int>(input_->size()); i++) {
     int target_index = correspondences_[i];
-    if (target_index < 0) {
+    if (target_index < 0 ||
+        target_index >= static_cast<int>(target_->size()) ||
+        target_index >= static_cast<int>(target_covs_.size())) {
       continue;
     }
 
-    const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_A = input_->points[i].getVector4fMap().template cast<double>();
     const auto& cov_A = source_covs_[i];
 
-    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_B = target_->points[target_index].getVector4fMap().template cast<double>();
     const auto& cov_B = target_covs_[target_index];
 
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
@@ -245,21 +263,39 @@ bool FastGICP<PointSource, PointTarget>::calculate_covariances(
   if (kdtree.getInputCloud() != cloud) {
     kdtree.setInputCloud(cloud);
   }
-  covariances.resize(cloud->size());
+  const int cloud_size = static_cast<int>(cloud->size());
+  covariances.resize(cloud_size);
 
 #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
-  for (int i = 0; i < cloud->size(); i++) {
+  for (int i = 0; i < cloud_size; i++) {
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
-    kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, k_correspondences_);
-    for (int j = 0; j < k_indices.size(); j++) {
-      neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
+    int found = 0;
+    // PCL's KdTreeFLANN is not safe for concurrent queries. Parallel searches
+    // returned indices past cloud->size() and localization aborted with
+    // std::out_of_range from PointCloud::at().
+#pragma omp critical(fast_gicp_kdtree_search)
+    {
+      found = kdtree.nearestKSearch(cloud->points[i], k_correspondences_, k_indices, k_sq_distances);
     }
 
+    int valid = 0;
+    Eigen::Matrix<double, 4, -1> neighbors(4, std::max(found, 1));
+    for (int j = 0; j < found; j++) {
+      const int idx = k_indices[j];
+      if (idx < 0 || idx >= cloud_size) {
+        continue;
+      }
+      neighbors.col(valid++) = cloud->points[idx].getVector4fMap().template cast<double>();
+    }
+    if (valid < 3) {
+      covariances[i] = Eigen::Matrix4d::Identity() * 1e-3;
+      continue;
+    }
+    neighbors.conservativeResize(Eigen::NoChange, valid);
+
     neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / static_cast<double>(valid);
 
     if (regularization_method_ == RegularizationMethod::NONE) {
       covariances[i] = cov;
@@ -274,9 +310,6 @@ bool FastGICP<PointSource, PointTarget>::calculate_covariances(
       Eigen::Vector3d values;
 
       switch (regularization_method_) {
-        default:
-          std::cerr << "here must not be reached" << std::endl;
-          abort();
         case RegularizationMethod::PLANE:
           values = Eigen::Vector3d(1, 1, 1e-3);
           break;
@@ -286,6 +319,9 @@ bool FastGICP<PointSource, PointTarget>::calculate_covariances(
         case RegularizationMethod::NORMALIZED_MIN_EIG:
           values = svd.singularValues() / svd.singularValues().maxCoeff();
           values = values.array().max(1e-3);
+          break;
+        default:
+          values = svd.singularValues().array().max(1e-3);
           break;
       }
 

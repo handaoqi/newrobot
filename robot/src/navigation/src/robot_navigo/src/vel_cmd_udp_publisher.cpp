@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -10,6 +11,8 @@
 #include <unordered_map>
 
 #include "geometry_msgs/msg/twist.hpp"
+#include "remote_velocity_mode.hpp"
+#include "robots_dog_msgs/msg/localization.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -72,10 +75,13 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     // lowest observed responsive command while remaining below the normal
     // navigation floor (0.55) for final docking corrections.
     this->declare_parameter("remote_fine_min_stick", 0.45);
-    this->declare_parameter("turn_linear_limit_yaw_rate", 0.35);
-    this->declare_parameter("turn_max_linear_speed", 0.10);
+    this->declare_parameter("turn_linear_limit_yaw_rate", 1.0);
+    this->declare_parameter("turn_max_linear_speed", 0.5);
     this->declare_parameter("manual_override_ms", 650);
     this->declare_parameter("remote_control_only", false);
+    this->declare_parameter("localization_topic",
+                            std::string("/localization_info"));
+    this->declare_parameter("localization_timeout_ms", 500);
     this->get_parameter("platform", platform_);
     this->get_parameter("client_ip", client_ip_);
     this->get_parameter("server_ip", server_ip_);
@@ -98,6 +104,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     this->get_parameter("turn_max_linear_speed", turn_max_linear_speed_);
     this->get_parameter("manual_override_ms", manual_override_ms_);
     this->get_parameter("remote_control_only", remote_control_only_);
+    this->get_parameter("localization_topic", localization_topic_);
+    this->get_parameter("localization_timeout_ms", localization_timeout_ms_);
 
     const char* velocity_topic = remote_control_only_ ? "/teleop_cmd_vel" : "/cmd_vel";
     planner_vel_cmd_subscriber_ =
@@ -120,6 +128,15 @@ class VelCmdUdpPublisher : public rclcpp::Node {
           "/mode_switch_cmd", 10,
           std::bind(&VelCmdUdpPublisher::HandleModeSwitchCallback, this,
                     std::placeholders::_1));
+      localization_subscriber_ =
+          this->create_subscription<robots_dog_msgs::msg::Localization>(
+              localization_topic_, 10,
+              std::bind(&VelCmdUdpPublisher::HandleLocalizationCallback, this,
+                        std::placeholders::_1));
+      RCLCPP_INFO(this->get_logger(),
+                  "navigation cmd_vel is held at zero unless localization "
+                  "status=3 (topic %s, timeout %dms)",
+                  localization_topic_.c_str(), localization_timeout_ms_);
     }
 
     const std::unordered_map<std::string, std::pair<std::string, std::string>>
@@ -259,6 +276,21 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         std::fabs(msg->linear.y) < 1e-6 &&
         std::fabs(msg->angular.z) < 1e-6;
 
+    if (!LocalizationAllowsNavLocked()) {
+      if (!is_zero_command) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "dropping planner cmd_vel while localization is not Normal "
+            "(status=%u seen=%s)",
+            last_loc_status_, loc_info_seen_ ? "true" : "false");
+      }
+      if (nav_active_) {
+        HoldPlannerVelocityLocked(std::chrono::steady_clock::now(),
+                                  "localization not Normal");
+      }
+      return;
+    }
+
     if (!nav_active_ && is_zero_command) {
       return;
     }
@@ -268,7 +300,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
         last_cmd_ = *msg;
         last_cmd_time_ = std::chrono::steady_clock::now();
         nav_active_ = true;
-        if (low_posture_lock_) {
+        if (requested_posture_ == robot_navigo::RequestedPosture::kLow) {
           // The operator explicitly selected the low posture. Preserve it
           // and pass the stick through; only an explicit stand action exits.
           PublishMotionState("low_posture_moving");
@@ -325,7 +357,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     if (action == "stand_up") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      low_posture_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kStanding;
       StartStandUp("Teleop stand_up");
       geometry_msgs::msg::Twist hold_cmd;
       last_cmd_ = hold_cmd;
@@ -336,6 +368,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     if (action == "lie_down") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kLow;
       ret = sdk_highlevel_.lieDown();
       nav_active_ = false;
       standing_up_ = false;
@@ -349,6 +382,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       RemoteSetCmd(zsibot::CmdCode::CMD_CRAWL_FORWARD);
       crawl_mode_ = true;
       manual_crawl_lock_ = true;
+      requested_posture_ = robot_navigo::RequestedPosture::kLow;
+      remote_move_mode_requested_ = false;
       crawl_zero_sent_ = false;
       nav_active_ = true;
       standing_up_ = false;
@@ -361,6 +396,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     } else if (action == "passive") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kNone;
       ret = sdk_connected_ ? sdk_highlevel_.passive() : 0;
       if (!sdk_connected_) {
         RemoteSetRemote({}, {});
@@ -372,6 +408,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     } else if (action == "release_remote") {
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kNone;
       ret = sdk_connected_ ? sdk_highlevel_.passive() : 0;
       if (!sdk_connected_) {
         RemoteSetRemote({}, {});
@@ -415,6 +452,23 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     manual_override_until_ = last_cmd_time_ +
         std::chrono::milliseconds(manual_override_ms_);
     if (!nav_active_) {
+      const bool is_zero_command = robot_navigo::IsZeroPlanarVelocity(
+          msg->linear.x, msg->linear.y, msg->angular.z);
+      if (is_zero_command) {
+        // Button release/stop frames must not turn a selected posture into a
+        // stand-up request.
+        last_cmd_.reset();
+        return;
+      }
+      if (requested_posture_ == robot_navigo::RequestedPosture::kLow) {
+        // The UI enters its prone/crawl posture with CMD_SIT_DOWN. Preserve
+        // that posture and pass the deliberate stick command through; only
+        // an explicit stand_up action changes requested_posture_.
+        standing_up_ = false;
+        nav_active_ = true;
+        PublishMotionState("low_posture_moving");
+        return;
+      }
       // The virtual remote accepts stand-up only after the remote-control
       // function mode has been selected.  The former SDK/navigation path sent
       // only CMD_STAND_UP, which left the dog in PASSIVE/idle safety mode.
@@ -473,8 +527,63 @@ class VelCmdUdpPublisher : public rclcpp::Node {
                : -1;
   }
 
+  void HandleLocalizationCallback(
+      const robots_dog_msgs::msg::Localization::SharedPtr msg) {
+    if (!msg) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(mutex_);
+    loc_info_seen_ = true;
+    last_loc_status_ = msg->status;
+    last_loc_time_ = std::chrono::steady_clock::now();
+  }
+
+  bool LocalizationAllowsNavLocked() const {
+    if (remote_control_only_ || manual_teleop_active_) {
+      return true;
+    }
+    if (std::chrono::steady_clock::now() < manual_override_until_) {
+      return true;
+    }
+    if (!loc_info_seen_) {
+      return false;
+    }
+    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - last_loc_time_)
+                            .count();
+    if (age_ms > localization_timeout_ms_) {
+      return false;
+    }
+    return last_loc_status_ == 3;
+  }
+
+  void HoldPlannerVelocityLocked(
+      const std::chrono::steady_clock::time_point& now, const char* reason) {
+    last_cmd_ = geometry_msgs::msg::Twist{};
+    last_cmd_time_ = now;
+    queued_stand_cmd_.reset();
+    if (crawl_mode_ || !sdk_connected_) {
+      RemoteSetRemote({}, {});
+      crawl_zero_sent_ = true;
+    } else {
+      (void)sdk_highlevel_.move(0.0f, 0.0f, 0.0f);
+    }
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "holding zero velocity: %s (loc status=%u seen=%s)", reason,
+        last_loc_status_, loc_info_seen_ ? "true" : "false");
+  }
+
   void PublishLatestVelocity() {
     std::lock_guard<std::mutex> lk(mutex_);
+
+    if (!LocalizationAllowsNavLocked()) {
+      if (nav_active_) {
+        HoldPlannerVelocityLocked(std::chrono::steady_clock::now(),
+                                  "localization not Normal");
+      }
+      return;
+    }
 
     if (!nav_active_ || !last_cmd_) {
       return;
@@ -587,6 +696,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   }
 
   void StartStandUp(const char* reason) {
+    requested_posture_ = robot_navigo::RequestedPosture::kStanding;
     if (!sdk_connected_) {
       // The robot may already be owned by the vendor SDK app. In that case
       // HighLevel::standUp()/move() return 0x3007 even though Nav2 is healthy.
@@ -632,6 +742,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       manual_teleop_active_ = true;
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kStanding;
       RemoteSetRemote({}, {});
       RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -639,6 +750,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       emergency_stop_latched_ = false;
       nav_active_ = true;
       standing_up_ = true;
+      remote_move_mode_requested_ = false;
       stand_start_time_ = std::chrono::steady_clock::now();
       queued_stand_cmd_.reset();
       last_cmd_ = geometry_msgs::msg::Twist{};
@@ -651,7 +763,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       manual_teleop_active_ = true;
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      low_posture_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kNone;
       RemoteSetRemote({}, {});
       RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -675,6 +787,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       if (remote_executor_ && remote_executor_->GetModel() == zsibot::Model::MODEL_XG) {
         crawl_mode_ = false;
         manual_crawl_lock_ = false;
+        requested_posture_ = robot_navigo::RequestedPosture::kNone;
         last_cmd_.reset();
         PublishMotionState("crawl_unsupported_xg");
         RCLCPP_ERROR(this->get_logger(),
@@ -684,6 +797,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       RemoteSetCmd(zsibot::CmdCode::CMD_CRAWL_FORWARD);
       crawl_mode_ = true;
       manual_crawl_lock_ = true;
+      requested_posture_ = robot_navigo::RequestedPosture::kLow;
+      remote_move_mode_requested_ = false;
       crawl_zero_sent_ = false;
       nav_active_ = true;
       standing_up_ = false;
@@ -702,7 +817,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       RemoteSetCmd(zsibot::CmdCode::CMD_EMERGENCY_STOP);
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      low_posture_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kNone;
       manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
@@ -719,7 +834,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       RemoteSetCmd(zsibot::CmdCode::CMD_SIT_DOWN);
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      low_posture_lock_ = true;
+      requested_posture_ = robot_navigo::RequestedPosture::kLow;
+      remote_move_mode_requested_ = false;
       manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
@@ -733,7 +849,7 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
       crawl_mode_ = false;
       manual_crawl_lock_ = false;
-      low_posture_lock_ = false;
+      requested_posture_ = robot_navigo::RequestedPosture::kNone;
       manual_teleop_active_ = false;
       nav_active_ = false;
       standing_up_ = false;
@@ -791,17 +907,14 @@ class VelCmdUdpPublisher : public rclcpp::Node {
           last_cmd_time_ = now;
         }
         queued_stand_cmd_.reset();
-        // On this platform CMD_STAND_UP leaves the virtual remote in
-        // emergency-stop mode. A stick frame is ignored until MOVE_MODE is
-        // selected, so make that transition before forwarding Nav2 velocity.
-        RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        RemoteSetCmd(zsibot::CmdCode::CMD_MOVE_MODE);
-        remote_move_mode_requested_ = true;
-        last_remote_move_mode_request_ = now;
+        // Reaching CM_STAND_UP completes the posture action. Do not request
+        // MOVE_MODE until a fresh non-zero velocity arrives: the dog-side FSM
+        // rejects an immediate standup -> rlmix transition while the posture
+        // is still settling, and may fall back to PASSIVE.
+        remote_move_mode_requested_ = false;
         PublishMotionState("standing");
         RCLCPP_INFO(this->get_logger(),
-                    "stand-up settled; requested virtual-remote MOVE_MODE before velocity control");
+                    "stand-up confirmed; holding standing posture until a non-zero velocity command");
         return;
       } else if (elapsed >= std::chrono::milliseconds(standup_retry_ms_)) {
         if (ctrl_mode ==
@@ -841,8 +954,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     // Do not transmit virtual-stick velocity while the vendor controller is
     // in an emergency-stop or posture state.
     const auto remote_ctrl_mode = RemoteControlMode();
-    if (remote_ctrl_mode ==
-        static_cast<int32_t>(zsibot::ControlMode::CM_EMERGENCY_STOP)) {
+    const auto mode_disposition =
+        robot_navigo::DecideRemoteVelocityDisposition(requested_posture_,
+                                                       remote_ctrl_mode);
+    if (mode_disposition ==
+        robot_navigo::RemoteVelocityDisposition::kEmergencyStop) {
       RemoteSetRemote({}, {});
       emergency_stop_latched_ = true;
       nav_active_ = false;
@@ -856,9 +972,39 @@ class VelCmdUdpPublisher : public rclcpp::Node {
                             "holding zero and issuing no recovery commands");
       return;
     }
-    // For other posture states, retry MOVE_MODE at a bounded rate so a
-    // dropped command can recover without flooding the controller.
-    if (remote_ctrl_mode != static_cast<int32_t>(zsibot::ControlMode::CM_MOVE_MODE)) {
+    const auto cmd_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_cmd_time_);
+    const bool has_live_motion_command = robot_navigo::HasLiveMotionCommand(
+        last_cmd_->linear.x, last_cmd_->linear.y, last_cmd_->angular.z,
+        cmd_age.count(), cmd_timeout_ms_);
+    if (!has_live_motion_command) {
+      // A posture command carries an intentional zero Twist. Keep the current
+      // posture and do not turn that zero into a MOVE_MODE request.
+      if (!crawl_zero_sent_) {
+        RemoteSetRemote({}, {});
+        crawl_zero_sent_ = true;
+      }
+      return;
+    }
+    if (mode_disposition ==
+        robot_navigo::RemoteVelocityDisposition::kWaitForLowPosture) {
+      // CMD_SIT_DOWN transitions asynchronously. Hold zero until the
+      // controller reports CM_SIT_DOWN, and never request MOVE_MODE here:
+      // MOVE_MODE exits the low posture and physically stands the dog.
+      if (!crawl_zero_sent_) {
+        RemoteSetRemote({}, {});
+        crawl_zero_sent_ = true;
+      }
+      RCLCPP_INFO_THROTTLE(
+          this->get_logger(), *this->get_clock(), 1000,
+          "low posture requested; waiting for CM_SIT_DOWN readback (current mode=%d)",
+          remote_ctrl_mode);
+      return;
+    }
+    // Outside a preserved low posture, retry MOVE_MODE at a bounded rate so
+    // a dropped command can recover without flooding the controller.
+    if (mode_disposition ==
+        robot_navigo::RemoteVelocityDisposition::kRequestMoveMode) {
       if (!remote_move_mode_requested_ ||
           now - last_remote_move_mode_request_ >= std::chrono::seconds(1)) {
         RemoteSetCmd(zsibot::CmdCode::CMD_REMOTE_CONTROL_RIGHT);
@@ -873,15 +1019,6 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
 
-    const auto cmd_age = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_cmd_time_);
-    if (cmd_age > std::chrono::milliseconds(cmd_timeout_ms_)) {
-      if (!crawl_zero_sent_) {
-        RemoteSetRemote({}, {});
-        crawl_zero_sent_ = true;
-      }
-      return;
-    }
     const auto normalize_stick = [this](float value, double max_value) {
       float stick = std::clamp(static_cast<float>(value / max_value), -1.0f, 1.0f);
       // The robot ignores small virtual-stick values. Keep a deliberate UI
@@ -947,8 +1084,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   double remote_full_scale_vy_ = 2.25;
   double remote_full_scale_yaw_rate_ = 5.25;
   float remote_fine_min_stick_ = 0.45f;
-  double turn_linear_limit_yaw_rate_ = 0.35;
-  double turn_max_linear_speed_ = 0.10;
+  double turn_linear_limit_yaw_rate_ = 1.0;
+  double turn_max_linear_speed_ = 0.5;
   float remote_min_stick_ = 0.55f;
   bool sdk_connected_ = false;
   bool remote_control_only_ = false;
@@ -963,6 +1100,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
       remote_teleop_action_subscriber_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr fine_control_subscriber_;
+  rclcpp::Subscription<robots_dog_msgs::msg::Localization>::SharedPtr
+      localization_subscriber_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr motion_state_publisher_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr control_mode_publisher_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -980,7 +1119,8 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   bool fine_control_ = false;
   std::chrono::steady_clock::time_point last_remote_move_mode_request_{};
   bool manual_crawl_lock_ = false;
-  bool low_posture_lock_ = false;
+  robot_navigo::RequestedPosture requested_posture_ =
+      robot_navigo::RequestedPosture::kNone;
   bool crawl_zero_sent_ = false;
   std::chrono::steady_clock::time_point stand_start_time_;
   std::chrono::steady_clock::time_point manual_override_until_;
@@ -988,6 +1128,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   std::chrono::steady_clock::time_point last_cmd_time_;
   std::optional<geometry_msgs::msg::Twist> queued_stand_cmd_;
   std::chrono::steady_clock::time_point queued_stand_cmd_time_;
+  std::string localization_topic_ = "/localization_info";
+  int localization_timeout_ms_ = 500;
+  bool loc_info_seen_ = false;
+  uint8_t last_loc_status_ = 0;
+  std::chrono::steady_clock::time_point last_loc_time_{};
 };
 
 int main(int argc, char* argv[]) {

@@ -94,6 +94,8 @@ public:
 
     void process(const pcl::PointCloud<livox_pcl::Point>& msg, robot::slam::CloudPtr& pcl_out);
     void set(bool feat_en, int lid_type, double bld, int pfilt_num);
+    void setFovDegree(double fov);
+    void setMaxRange(double range);
 
     robot::slam::PointCloudType pl_full, pl_corn, pl_surf;
     robot::slam::PointCloudType pl_buff[128];  // maximum 128 line lidar
@@ -101,11 +103,15 @@ public:
     float                       time_unit_scale;
     int                         lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
     double                      blind;
+    double                      max_range;
+    double                      fov_degree;
     bool                        feature_enabled, given_offset_time;
     // ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
     void avia_handler(const pcl::PointCloud<livox_pcl::Point>& msg);
+    bool inFov(float x, float y) const;
+    bool inRange(float x, float y, float z) const;
     void give_feature(robot::slam::PointCloudType& pl, vector<orgtype>& types);
     int  plane_judge(const robot::slam::PointCloudType& pl, vector<orgtype>& types, uint i, uint& i_nex, Eigen::Vector3d& curr_direct);
     bool small_plane(const robot::slam::PointCloudType& pl, vector<orgtype>& types, uint i_cur, uint& i_nex, Eigen::Vector3d& curr_direct);
@@ -120,4 +126,7 @@ private:
     double edgea, edgeb;
     double smallp_intersect, smallp_ratio;
     double vx, vy, vz;
+    bool   fov_filter_en_;
+    double fov_half_rad_;
+    double max_range_squared_;
 };

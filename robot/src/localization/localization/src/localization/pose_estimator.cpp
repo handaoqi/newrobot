@@ -1,7 +1,10 @@
 #include <localization/pose_estimator.hpp>
 
 #include <pcl/filters/voxel_grid.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <stdexcept>
 #include <localization/pose_system.hpp>
 #include <localization/odom_system.hpp>
 #include <kkl/alg/unscented_kalman_filter.hpp>
@@ -16,9 +19,20 @@ namespace localization {
  * @param cool_time_duration  during "cool time", prediction is not performed
  * @param bias_acc            initial acceleration bias
  * @param bias_gyro           initial gyro bias
+ * @param gyro_bias_process_noise  process noise of the gyro bias states
+ * @param gyro_bias_initial_cov    initial covariance of the gyro bias states
+ *
+ * WARNING - do not feed StaticIMUInit::GetInitBa() into bias_acc.
+ * static_imu_init.cpp assigns init_bias_acce_ = mean_acce_ with the gravity
+ * estimation commented out, so GetInitBa() is the raw accelerometer mean and its
+ * norm is ~9.81 m/s^2, not an accelerometer bias. PoseSystem::f() already removes
+ * gravity in the world frame, so passing it here subtracts gravity twice and the
+ * filter diverges within seconds. Fix static_imu_init.cpp:66-68 first if the
+ * accelerometer bias is ever needed.
  */
-PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const rclcpp::Time& stamp, 
-    const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration, Eigen::Vector3d bias_acc, Eigen::Vector3d bias_gyro)
+PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registration, const rclcpp::Time& stamp,
+    const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat, double cool_time_duration, Eigen::Vector3d bias_acc, Eigen::Vector3d bias_gyro,
+    double gyro_bias_process_noise, double gyro_bias_initial_cov)
     : init_stamp(stamp), registration(registration), cool_time_duration(cool_time_duration) {
 
   prev_stamp = rclcpp::Time((int64_t)0, init_stamp.get_clock_type());
@@ -30,8 +44,13 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
   process_noise.middleRows(0, 3) *= 0.5;     // 1.0
   process_noise.middleRows(3, 3) *= 1.0;
   process_noise.middleRows(6, 4) *= 0.5;
+  // Accelerometer bias stays frozen on purpose: it is barely observable here.
+  // The dead-reckoning bridge zeroes the acceleration input, imu_data_filter_num_
+  // keeps only 1/5 of the samples, and PoseSystem already notes that acceleration
+  // contributes little because of its noise. Releasing it just lets the filter
+  // trade accelerometer bias against gravity and pitch.
   process_noise.middleRows(10, 3) *= 1e-6;
-  process_noise.middleRows(13, 3) *= 1e-6;
+  process_noise.middleRows(13, 3) *= gyro_bias_process_noise;
 
   Eigen::MatrixXf measurement_noise = Eigen::MatrixXf::Identity(7, 7);
   measurement_noise.middleRows(0, 3) *= 0.01;
@@ -41,11 +60,16 @@ PoseEstimator::PoseEstimator(pcl::Registration<PointT, PointT>::Ptr& registratio
   mean.middleRows(0, 3) = pos;
   mean.middleRows(3, 3).setZero();
   mean.middleRows(6, 4) = Eigen::Vector4f(quat.w(), quat.x(), quat.y(), quat.z());
+  // bias_acc is deliberately ignored - see the WARNING above the constructor.
   mean.middleRows(10, 3).setZero();
   mean.middleRows(13, 3) = bias_gyro.cast<float>();
   // mean.middleRows(13, 3).setZero();
 
   Eigen::MatrixXf cov = Eigen::MatrixXf::Identity(16, 16) * 0.01;
+  // The gyro bias now starts from a measured value instead of zero, so its prior
+  // must be tightened accordingly; 0.01 means sigma = 0.1 rad/s = 5.7 deg/s, which
+  // is an order of magnitude looser than the bias it is describing.
+  cov.block<3, 3>(13, 13) = Eigen::Matrix3f::Identity() * static_cast<float>(gyro_bias_initial_cov);
 
   PoseSystem system;
   ukf.reset(new kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>(system, 16, 6, 7, process_noise, measurement_noise, mean, cov));
@@ -72,6 +96,7 @@ void PoseEstimator::predict(const rclcpp::Time& stamp) {
   ukf->system.dt = dt;
 
   ukf->predict();
+  normalizeAndGuardUkf();
 }
 
 /**
@@ -94,6 +119,10 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
     RCLCPP_INFO(rclcpp::get_logger("PoseEstimator"), "dt < 0.0, not predict!");
     return;
   }
+  if (!acc.allFinite() || !gyro.allFinite()) {
+    prev_stamp = stamp;
+    return;
+  }
   prev_stamp = stamp;
 
   ukf->setProcessNoiseCov(process_noise * dt);
@@ -104,6 +133,7 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   control.tail<3>() = gyro;
   
   ukf->predict(control);
+  normalizeAndGuardUkf();
 }
 
 void PoseEstimator::set_initial_biases(const Eigen::Vector3f& acc_bias, const Eigen::Vector3f& gyro_bias){
@@ -113,6 +143,32 @@ void PoseEstimator::set_initial_biases(const Eigen::Vector3f& acc_bias, const Ei
   // state layout: [px,py,pz, vx,vy,vz, qw,qx,qy,qz, bax,bay,baz, bgx,bgy,bgz]
   ukf->mean.middleRows(10, 3) = acc_bias;
   ukf->mean.middleRows(13, 3) = gyro_bias;
+  normalizeAndGuardUkf();
+}
+
+void PoseEstimator::normalizeAndGuardUkf() {
+  if (!ukf || ukf->mean.size() < 10) {
+    return;
+  }
+  Eigen::Quaternionf q(ukf->mean[6], ukf->mean[7], ukf->mean[8], ukf->mean[9]);
+  if (!std::isfinite(q.norm()) || q.norm() < 1e-6f) {
+    q = Eigen::Quaternionf::Identity();
+  } else {
+    q.normalize();
+  }
+  ukf->mean[6] = q.w();
+  ukf->mean[7] = q.x();
+  ukf->mean[8] = q.y();
+  ukf->mean[9] = q.z();
+  if (!ukf->mean.allFinite() || !ukf->cov.allFinite()) {
+    RCLCPP_ERROR(logger_, "UKF state became non-finite; resetting covariance");
+    for (int i = 0; i < ukf->mean.size(); ++i) {
+      if (!std::isfinite(ukf->mean(i))) {
+        ukf->mean(i) = 0.0f;
+      }
+    }
+    ukf->cov = Eigen::MatrixXf::Identity(ukf->cov.rows(), ukf->cov.cols()) * 0.01f;
+  }
 }
 
 /**
@@ -181,6 +237,95 @@ void PoseEstimator::invalidate_lidar_odometry_prediction() {
   lidar_odom_pred_error = boost::none;
 }
 
+void PoseEstimator::configure_scan_matching(
+    pcl::Registration<PointT, PointT>::Ptr refine,
+    pcl::PointCloud<PointT>::ConstPtr global_map,
+    float local_map_xy_radius,
+    float local_map_z_radius,
+    int min_local_map_points,
+    float max_fitness_score,
+    float coarse_max_fitness_score) {
+  refine_registration_ = refine;
+  global_map_ = global_map;
+  local_map_xy_radius_ = std::max(3.0f, local_map_xy_radius);
+  local_map_z_radius_ = std::max(1.0f, local_map_z_radius);
+  min_local_map_points_ = std::max(50, min_local_map_points);
+  max_fitness_score_ = std::max(0.001f, max_fitness_score);
+  coarse_max_fitness_score_ = std::max(max_fitness_score_, coarse_max_fitness_score);
+}
+
+pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::cropLocalMap(
+    const Eigen::Vector3f& center) const {
+  pcl::PointCloud<PointT>::Ptr local(new pcl::PointCloud<PointT>());
+  if (!global_map_ || global_map_->empty()) {
+    return local;
+  }
+  const float xy_r2 = local_map_xy_radius_ * local_map_xy_radius_;
+  local->points.reserve(global_map_->points.size() / 4);
+  for (const auto& point : global_map_->points) {
+    const float dx = point.x - center.x();
+    const float dy = point.y - center.y();
+    if (dx * dx + dy * dy > xy_r2) {
+      continue;
+    }
+    if (std::abs(point.z - center.z()) > local_map_z_radius_) {
+      continue;
+    }
+    local->points.push_back(point);
+  }
+  local->width = static_cast<uint32_t>(local->points.size());
+  local->height = 1;
+  local->is_dense = false;
+  return local;
+}
+
+namespace {
+struct AlignAttempt {
+  bool usable_as_seed = false;
+  bool acceptable = false;
+  bool converged = false;
+  double fitness = std::numeric_limits<double>::infinity();
+  float correction_m = std::numeric_limits<float>::infinity();
+  Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+  pcl::PointCloud<pcl::PointXYZI>::Ptr aligned;
+};
+
+AlignAttempt runAlign(
+    pcl::Registration<pcl::PointXYZI, pcl::PointXYZI>::Ptr& reg,
+    const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud,
+    const Eigen::Matrix4f& guess,
+    double seed_max_fitness,
+    double accept_max_fitness,
+    float max_correction_m) {
+  AlignAttempt attempt;
+  attempt.aligned.reset(new pcl::PointCloud<pcl::PointXYZI>());
+  if (!reg || !cloud || cloud->empty() || !guess.allFinite()) {
+    return attempt;
+  }
+  try {
+    reg->setInputSource(cloud);
+    reg->align(*attempt.aligned, guess);
+    attempt.fitness = reg->getFitnessScore();
+    attempt.transform = reg->getFinalTransformation();
+    attempt.converged = reg->hasConverged();
+  } catch (const std::exception&) {
+    return attempt;
+  }
+  const Eigen::Matrix4f correction = guess.inverse() * attempt.transform;
+  attempt.correction_m = correction.block<3, 1>(0, 3).norm();
+  const bool finite = attempt.transform.allFinite() &&
+    std::isfinite(attempt.fitness) && std::isfinite(attempt.correction_m);
+  attempt.usable_as_seed = attempt.converged && finite &&
+    attempt.fitness < seed_max_fitness && attempt.correction_m < max_correction_m;
+  attempt.acceptable = attempt.converged && finite &&
+    attempt.fitness < accept_max_fitness && attempt.correction_m < max_correction_m;
+  if (!finite && attempt.aligned) {
+    attempt.aligned->clear();
+  }
+  return attempt;
+}
+}  // namespace
+
 /**
  * @brief correct
  * @param cloud   input cloud
@@ -192,9 +337,7 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     bool apply_observation) {
   Eigen::Matrix4f imu_guess = matrix();
   Eigen::Matrix4f init_guess = imu_guess;
-  // Eigen::Matrix4f no_guess = last_observation;
   Eigen::Matrix4f odom_guess = imu_guess;
-  // Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
 
   // The chassis orientation is reliable during in-place turns, while its
   // translation scale does not agree closely enough with lidar localization.
@@ -211,44 +354,85 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     }
   }
 
-  pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
-  registration->setInputSource(cloud);
-  registration->align(*aligned, init_guess);
-  double ndt_score = registration->getFitnessScore();
+  constexpr float kMaxInitCorrectionM = 5.0f;
+  constexpr float kMaxRefineCorrectionM = 1.5f;
 
-  // Keep this acceptance gate aligned with the configured NDT fitness limit.
-  // The node-level health policy accepts scores below 9.0, but this former
-  // hard-coded 0.5 check silently discarded the aligned cloud first, making
-  // that policy unreachable during initialisation or relocalisation.
-  constexpr double kNdtMaxFitnessScore = 9.0;
-  if (ndt_score > kNdtMaxFitnessScore) {
-    RCLCPP_INFO(rclcpp::get_logger("PoseEstimator"), "ndt_score > %.1f, ndt_score: %f",
-                kNdtMaxFitnessScore, ndt_score);
+  AlignAttempt ndt = runAlign(
+    registration, cloud, init_guess,
+    coarse_max_fitness_score_, max_fitness_score_, kMaxInitCorrectionM);
+
+  match_result_.ndt_score_ = static_cast<float>(ndt.fitness);
+  match_result_.refine_score_ = std::numeric_limits<float>::infinity();
+  match_result_.transform_ = ndt.transform;
+  match_result_.fitness_score_ = static_cast<float>(ndt.fitness);
+  match_result_.method_ = "ndt";
+
+  AlignAttempt refine;
+  if (refine_registration_) {
+    const Eigen::Matrix4f refine_guess = ndt.usable_as_seed ? ndt.transform : init_guess;
+    auto local_map = cropLocalMap(refine_guess.block<3, 1>(0, 3));
+    if (static_cast<int>(local_map->size()) >= min_local_map_points_) {
+      refine_registration_->setInputTarget(local_map);
+      refine = runAlign(
+        refine_registration_, cloud, refine_guess,
+        coarse_max_fitness_score_, max_fitness_score_, kMaxRefineCorrectionM);
+      const Eigen::Matrix4f from_init = init_guess.inverse() * refine.transform;
+      const float from_init_m = from_init.block<3, 1>(0, 3).norm();
+      const bool bounded_from_init = refine.transform.allFinite() &&
+        std::isfinite(from_init_m) && from_init_m < kMaxInitCorrectionM;
+      refine.usable_as_seed = refine.usable_as_seed && bounded_from_init;
+      refine.acceptable = refine.acceptable && bounded_from_init;
+      match_result_.refine_score_ = static_cast<float>(refine.fitness);
+    } else {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_WARN_THROTTLE(
+        logger_, steady_clock, 2000,
+        "Skipping VGICP refine: local map has %zu points (need %d) around [%.2f, %.2f, %.2f]",
+        local_map->size(), min_local_map_points_,
+        refine_guess(0, 3), refine_guess(1, 3), refine_guess(2, 3));
+    }
   }
 
-  Eigen::Matrix4f trans = registration->getFinalTransformation();
-  match_result_.fitness_score_ = ndt_score;
-
-  const Eigen::Matrix4f correction = init_guess.inverse() * trans;
-  const float correction_distance = correction.block<3, 1>(0, 3).norm();
-  const bool transform_valid = trans.allFinite() && std::isfinite(correction_distance);
-  const bool match_valid = registration->hasConverged() && std::isfinite(ndt_score) &&
-                           ndt_score < kNdtMaxFitnessScore && transform_valid && correction_distance < 5.0f;
-  match_result_.is_converged_ = match_valid;
-
-  if (!match_valid) {
-    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"),
-                "Rejecting NDT correction: converged=%d score=%.6f correction_distance=%.3f finite=%d",
-                registration->hasConverged(), ndt_score, correction_distance, transform_valid);
-    // The registration output may contain NaN points. Returning an empty cloud
-    // prevents downstream nearest-neighbor checks and TF publication from
-    // consuming an invalid transform.
-    aligned->clear();
-    return aligned;
+  AlignAttempt chosen;
+  if (refine.acceptable) {
+    chosen = refine;
+    match_result_.method_ = ndt.usable_as_seed ? "ndt_vgicp" : "vgicp";
+  } else if (ndt.acceptable) {
+    chosen = ndt;
+    match_result_.method_ = "ndt";
   }
+
+  match_result_.is_converged_ = chosen.acceptable;
+  if (chosen.acceptable) {
+    match_result_.fitness_score_ = static_cast<float>(chosen.fitness);
+    match_result_.transform_ = chosen.transform;
+  } else if (refine.converged && std::isfinite(refine.fitness) &&
+             (!ndt.converged || refine.fitness < ndt.fitness)) {
+    match_result_.fitness_score_ = static_cast<float>(refine.fitness);
+    match_result_.transform_ = refine.transform;
+    match_result_.method_ = "vgicp_rejected";
+  } else {
+    match_result_.method_ = "ndt_rejected";
+  }
+
+  if (!chosen.acceptable) {
+    RCLCPP_WARN(logger_,
+                "Rejecting scan match: ndt(conv=%d score=%.3f corr=%.2fm) "
+                "vgicp(conv=%d score=%.3f corr=%.2fm)",
+                ndt.converged, ndt.fitness, ndt.correction_m,
+                refine.converged, refine.fitness, refine.correction_m);
+    pcl::PointCloud<PointT>::Ptr empty(new pcl::PointCloud<PointT>());
+    return empty;
+  }
+
+  pcl::PointCloud<PointT>::Ptr aligned = chosen.aligned;
+  if (!aligned) {
+    aligned.reset(new pcl::PointCloud<PointT>());
+  }
+  const Eigen::Matrix4f trans = chosen.transform;
 
   last_correction_stamp = stamp;
-  
+
   Eigen::Vector3f p = trans.block<3, 1>(0, 3);
   Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
 
@@ -261,25 +445,23 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
   last_observation = trans;
 
-  // wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
-
   if (!apply_observation) {
     return aligned;
   }
 
   ukf->correct(observation);
-  imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
+  normalizeAndGuardUkf();
+  imu_pred_error = imu_guess.inverse() * trans;
 
   if (lidar_odometry_prediction_enabled_) {
     if (lidar_odometry_available) {
-      lidar_odom_pred_error =
-        lidar_odometry_prediction_.inverse() * registration->getFinalTransformation();
+      lidar_odom_pred_error = lidar_odometry_prediction_.inverse() * trans;
     } else {
       lidar_odom_pred_error = boost::none;
     }
     // An accepted map match is the new absolute anchor. Subsequent accepted
     // scan-to-scan deltas advance this anchor until the next NDT correction.
-    lidar_odometry_prediction_ = registration->getFinalTransformation();
+    lidar_odometry_prediction_ = trans;
     lidar_odometry_prediction_initialized_ = true;
   }
 
@@ -299,7 +481,7 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     }
 
     odom_ukf->correct(observation);
-    odom_pred_error = odom_guess.inverse() * registration->getFinalTransformation();
+    odom_pred_error = odom_guess.inverse() * trans;
   }
 
   return aligned;
@@ -386,6 +568,64 @@ void PoseEstimator::apply_position_correction(const Eigen::Vector3f& correction)
   }
 }
 
+void PoseEstimator::inject_rtk_xy_yaw(
+    const Eigen::Vector3f& position,
+    bool set_yaw,
+    float yaw,
+    bool freeze_z,
+    float horizontal_variance,
+    float vertical_variance,
+    float yaw_variance) {
+  if (!ukf) {
+    return;
+  }
+  ukf->mean[0] = position.x();
+  ukf->mean[1] = position.y();
+  ukf->mean[3] = 0.0f;
+  ukf->mean[4] = 0.0f;
+  if (freeze_z) {
+    ukf->mean[2] = position.z();
+    ukf->mean[5] = 0.0f;
+  }
+  Eigen::MatrixXf covariance = ukf->getCov();
+  covariance(0, 0) = std::max(horizontal_variance, 1e-4f);
+  covariance(1, 1) = std::max(horizontal_variance, 1e-4f);
+  covariance(3, 3) = std::max(horizontal_variance, 1e-4f);
+  covariance(4, 4) = std::max(horizontal_variance, 1e-4f);
+  if (freeze_z) {
+    covariance(2, 2) = std::max(vertical_variance, 1e-4f);
+    covariance(5, 5) = std::max(vertical_variance, 1e-4f);
+  }
+  ukf->setCov(covariance);
+  if (set_yaw) {
+    const Eigen::Quaternionf current = quat();
+    const Eigen::Matrix3f rotation = current.toRotationMatrix();
+    const float current_yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+    const float dyaw = std::atan2(std::sin(yaw - current_yaw), std::cos(yaw - current_yaw));
+    Eigen::Quaternionf q = Eigen::AngleAxisf(dyaw, Eigen::Vector3f::UnitZ()) * current;
+    q.normalize();
+    if (q.coeffs().dot(current.coeffs()) < 0.0f) {
+      q.coeffs() *= -1.0f;
+    }
+    ukf->mean[6] = q.w();
+    ukf->mean[7] = q.x();
+    ukf->mean[8] = q.y();
+    ukf->mean[9] = q.z();
+    // For small yaw errors qz is approximately yaw/2.
+    covariance(9, 9) = std::max(yaw_variance * 0.25f, 1e-5f);
+  }
+  ukf->setCov(covariance);
+  if (odom_ukf) {
+    odom_ukf->mean[0] = ukf->mean[0];
+    odom_ukf->mean[1] = ukf->mean[1];
+    if (freeze_z) {
+      odom_ukf->mean[2] = ukf->mean[2];
+    }
+  }
+  normalizeAndGuardUkf();
+  last_observation = matrix();
+}
+
 void PoseEstimator::correct_absolute_pose(
     const Eigen::Vector3f& position,
     const Eigen::Quaternionf& orientation,
@@ -412,6 +652,7 @@ void PoseEstimator::correct_absolute_pose(
   ukf->setMeasurementNoiseCov(noise);
   ukf->correct(observation);
   ukf->setMeasurementNoiseCov(previous_noise);
+  normalizeAndGuardUkf();
   last_observation = matrix();
 }
 
@@ -454,6 +695,29 @@ float PoseEstimator::yaw_sigma() const {
   }
   const auto& covariance = ukf->getCov();
   return 2.0f * std::sqrt(std::max(0.0f, covariance(9, 9)));
+}
+
+std::array<double, 36> PoseEstimator::pose_covariance() const {
+  std::array<double, 36> output{};
+  if (!ukf) {
+    output[0] = output[7] = output[14] = 1.0e6;
+    output[21] = output[28] = output[35] = 1.0e6;
+    return output;
+  }
+  const auto& covariance = ukf->getCov();
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      output[row * 6 + col] = std::isfinite(covariance(row, col))
+        ? static_cast<double>(covariance(row, col)) : 0.0;
+    }
+  }
+  const double roll_variance = std::max(1e-5, 4.0 * static_cast<double>(covariance(7, 7)));
+  const double pitch_variance = std::max(1e-5, 4.0 * static_cast<double>(covariance(8, 8)));
+  const double yaw_variance = std::max(1e-5, 4.0 * static_cast<double>(covariance(9, 9)));
+  output[21] = std::isfinite(roll_variance) ? roll_variance : 1.0e6;
+  output[28] = std::isfinite(pitch_variance) ? pitch_variance : 1.0e6;
+  output[35] = std::isfinite(yaw_variance) ? yaw_variance : 1.0e6;
+  return output;
 }
 
 } 

@@ -4,6 +4,7 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom/nav2
+    transform_tolerance: 1.0
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -95,7 +96,7 @@ behavior_server:
       plugin: "navigo_behaviors/AssistedTeleop"
     global_frame: odom
     robot_base_frame: base_link
-    transform_tolerance: 0.30
+    transform_tolerance: 1.00
     use_sim_time: false
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
@@ -115,6 +116,7 @@ local_costmap:
       height: 8
       resolution: 0.05
       footprint: "[[0.315,0.18],[0.315,-0.18],[-0.315,-0.18],[-0.315,0.18]]"
+      transform_tolerance: 1.00
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "navigo_costmap_2d::InflationLayer"
@@ -122,7 +124,9 @@ local_costmap:
         inflation_radius: 0.50
       obstacle_layer:
         plugin: "navigo_costmap_2d::ObstacleLayer"
-        enabled: True
+        # Temporary outdoor test: lidar local avoidance off so TF-stale
+        # costmap painting cannot weave the robot off the GPS line.
+        enabled: False
         footprint_clearing_enabled: true
         observation_persistence: 0.3
         observation_sources: scan
@@ -155,31 +159,18 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: False
       footprint: "[[0.315,0.18],[0.315,-0.18],[-0.315,-0.18],[-0.315,0.18]]"
+      transform_tolerance: 1.00
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "inflation_layer"]
       static_layer:
         plugin: "navigo_costmap_2d::StaticLayer"
         map_subscribe_transient_local: False
         footprint_clearing_enabled: True
         restore_cleared_footprint: True
-      obstacle_layer:
-        plugin: "navigo_costmap_2d::ObstacleLayer"
-        enabled: True
-        footprint_clearing_enabled: true
-        observation_persistence: 0.5
-        observation_sources: scan
-        scan:
-          topic: /laser_scan
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          inf_is_valid: true
-          data_type: "LaserScan"
-          raytrace_max_range: 4.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 3.0
-          obstacle_min_range: 0.18
+      # Outdoor GPS patrol must not paint lidar hits onto the global map.
+      # That is what made NavFn refuse a valid RTK waypoint (点7).
+      # Local costmap + collision_monitor keep real-time lidar avoidance.
       inflation_layer:
         plugin: "navigo_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -207,11 +198,12 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "navigo_navfn_planner/NavfnPlanner"
-      # Only allow one-cell discretization fallback. A wider value lets NavFn
-      # report success at a substitute endpoint far from the requested goal.
-      tolerance: 0.05
+      # Occupancy planning can still try; GPS patrol falls back to a straight line.
+      tolerance: 2.0
       use_astar: false
       allow_unknown: true
+      allow_straight_line_fallback: true
+      prefer_straight_line: true
 
 controller_server:
   ros__parameters:
@@ -225,7 +217,7 @@ controller_server:
     progress_checker:
       plugin: "navigo_path_controller::SimpleProgressChecker"
       required_movement_radius: 0.15
-      movement_time_allowance: 6.0
+      movement_time_allowance: 20.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "navigo_path_controller::SimpleGoalChecker"
@@ -249,20 +241,22 @@ controller_server:
       batch_size: 1000
       vx_std: 0.2
       vy_std: 0.2
-      wz_std: 0.4
-      vx_max: 0.5 # XG firmware rejects larger combined motion commands
+      # GPS straight-line paths are 0.25 m. Keep yaw noise well below wz_max so
+      # MPPI does not sample bang-bang left/right turns on an already-straight path.
+      # Patrol cruise is applied by Edge Agent (0.30 / 0.35); keep the YAML
+      # fallback in the same range so idle Nav2 is not more aggressive.
+      wz_std: 0.08
+      vx_max: 0.30
       vx_min: -0.12
-      vy_max: 0.5 #0.5
-      # MID-360 scans span roughly 100ms. Faster turns distort a scan enough
-      # to push outdoor NDT matching outside its stable basin.
-      wz_max: 0.5
-      ax_max: 2.0
-      ay_max: 2.0
-      ax_min: -2.0
-      az_max: 2.0
+      vy_max: 0.5
+      wz_max: 0.35
+      ax_max: 1.0
+      ay_max: 1.0
+      ax_min: -1.0
+      az_max: 0.8
       iteration_count: 1
       prune_distance: 2.0   #1.7
-      transform_tolerance: 0.50
+      transform_tolerance: 1.00
       temperature: 0.3
       gamma: 0.015 #0.015
       motion_model: "DiffDrive"
@@ -273,60 +267,72 @@ controller_server:
         time_step: 3
       AckermannConstraints:
         min_turning_r: 0.1667
-      critics: [ "ConstraintCritic", "CostCritic", "GoalCritic", "PathAlignCritic", "GoalAngleCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic" ] #
+      critics: [ "ConstraintCritic", "CostCritic", "GoalCritic", "PathAlignCritic", "GoalAngleCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic", "TwirlingCritic" ] #
       ConstraintCritic:
         enabled: true
         cost_power: 1
         cost_weight: 4.0
       GoalCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
         cost_weight: 5.0
         threshold_to_consider: 1.4
       GoalAngleCritic:
-        enabled: true
+        # Patrol waypoint yaw is 0 (east). Requiring that heading within 0.5 m
+        # of every pass-through point makes the robot reverse and spin in place.
+        enabled: false
         cost_power: 1
         cost_weight: 3.0
         threshold_to_consider: 0.5
       PreferForwardCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
         # Do not over-penalize a turn around a temporary obstacle.
         cost_weight: 5.0
         threshold_to_consider: 0.5
       CostCritic:
-        enabled: true
+        enabled: false
         cost_power: 2
-        cost_weight: 35.0
+        # Was 35: outdoor grass/scan noise made MPPI weave off the RTK path.
+        cost_weight: 18.0
         critical_cost: 300.0
         consider_footprint: true
         collision_cost: 1000000.0
         near_goal_distance: 1.0
         trajectory_point_step: 2
       PathAlignCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
-        cost_weight: 8.0 #14.0
+        cost_weight: 12.0
         max_path_occupancy_ratio: 0.20
         trajectory_point_step: 4
         threshold_to_consider: 0.5
-        offset_from_furthest: 20
+        # Was 20, tuned for NavFn 0.05 m points (~1 m). Straight-line GPS paths
+        # are 0.25 m, so 20 points delayed alignment until ~5 m and the dog weaved.
+        offset_from_furthest: 4
+        # Path yaw from hand-clicked vias weaves even when XY is almost straight.
         use_path_orientations: false
       PathFollowCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
-        cost_weight: 5.0 # 25
+        cost_weight: 10.0 # 25
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
         cost_weight: 2.0
         offset_from_furthest: 4
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
+        # Was 1.0 (~57 deg): heading already "close enough" skipped this critic
+        # on a straight GPS line, so sampled yaw commands were not pulled back.
+        max_angle_to_furthest: 0.40
         mode: 0
         forward_preference: true
+      TwirlingCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 8.0
 
 
 smoother_server:
@@ -374,29 +380,32 @@ collision_monitor:
     odom_frame_id: "odom"
     cmd_vel_in_topic: "cmd_vel_raw"
     cmd_vel_out_topic: "cmd_vel"
-    transform_tolerance: 0.5
+    transform_tolerance: 1.0
     source_timeout: 1.0
     base_shift_correction: false
     stop_pub_timeout: 2.0
-    stop_confirmation_cycles: 2
+    stop_confirmation_cycles: 1
     allow_rotation_recovery: true
     allow_reverse_recovery: true
+    localization_topic: "/localization_info"
+    localization_timeout: 2.00
+    require_healthy_localization: true
     polygons: ["PolygonStop", "PolygonSlow"]
     PolygonStop:
       type: "polygon"
       # Last-resort collision brake. Start in front of the body so lidar zero
       # returns and self-reflections do not trigger an emergency stop.
-      points: [0.72, 0.20, 0.72, -0.20, 0.58, -0.20, 0.58, 0.20]
+      points: [0.90, 0.22, 0.90, -0.22, 0.55, -0.22, 0.55, 0.22]
       action_type: "stop"
-      max_points: 15
-      visualize: false
+      max_points: 3
+      visualize: true
       polygon_pub_topic: "polygon_stop"
       enabled: true
     PolygonSlow:
       type: "polygon"
-      points: [1.00, 0.28, 1.00, -0.28, 0.58, -0.28, 0.58, 0.28]
+      points: [1.20, 0.30, 1.20, -0.30, 0.55, -0.30, 0.55, 0.30]
       action_type: "slowdown"
-      max_points: 20
+      max_points: 5
       slowdown_ratio: 0.70
       visualize: true
       polygon_pub_topic: "polygon_slowdown"

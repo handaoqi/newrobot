@@ -90,6 +90,16 @@ start_legacy() {
   wait_uart_owner 'dog_(lying_down|status_unknown)'
 }
 
+legacy_status_without_preempting_arc() {
+  # ARC and the legacy helper share /dev/ttyUSB0. A telemetry-only status
+  # request must not stop a running ARC controller, otherwise normal polling
+  # interrupts motion/teleop and causes robot-launch to restart arc_platform.
+  if robot-launch egg arc_platform 2>/dev/null | grep -qi 'running'; then
+    return 0
+  fi
+  return 1
+}
+
 case "${ACTION}" in
   arc)
     start_arc
@@ -98,6 +108,9 @@ case "${ACTION}" in
     start_legacy lying
     ;;
   legacy-status)
+    if legacy_status_without_preempting_arc; then
+      exit 0
+    fi
     trap 'start_arc || true' EXIT
     start_legacy unknown
     sleep 3

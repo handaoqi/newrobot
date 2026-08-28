@@ -5,9 +5,20 @@ PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 BAG_ROOT="${BAG_ROOT:-/home/dogrobot/runtime/nx-edge/data/rosbags/mapping}"
 STATE_DIR="${STATE_DIR:-/tmp/roamerx_mapping_rosbag-${UID:-$(id -u)}}"
 MIN_FREE_GB="${MIN_FREE_GB:-10}"
+# Retention runs only when the disk is close to the refusal threshold below.
+# Steady-state recording never deletes anything; this exists so that running
+# out of space degrades into "the oldest unreferenced bags go" instead of
+# "mapping stops working".
+PRUNE_TOOL="${PRUNE_TOOL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prune_runtime_storage.py}"
+PRUNE_ENABLED="${PRUNE_ENABLED:-1}"
+PRUNE_TRIGGER_GB="${PRUNE_TRIGGER_GB:-$((MIN_FREE_GB * 2))}"
 PID_FILE="${STATE_DIR}/recorder.pid"
 SESSION_FILE="${STATE_DIR}/session.env"
 LOG_FILE="${STATE_DIR}/recorder.log"
+# Kept beside the bags rather than in STATE_DIR: the state dir is under /tmp and
+# is per-uid, and the Edge Agent has to be able to find this report to report
+# deletions upstream. The leading dot keeps it out of the session scan.
+RETENTION_REPORT="${RETENTION_REPORT:-${BAG_ROOT}/.retention.json}"
 ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-}"
 
 mkdir -p "${BAG_ROOT}" "${STATE_DIR}"
@@ -66,6 +77,66 @@ print(json.dumps({
 PY
 }
 
+run_prune() {
+  # $1: "apply" to actually delete, anything else for a dry run.
+  # $2+: extra flags for the retention tool.
+  # The JSON report goes to stdout; callers that own stdout must redirect it.
+  local mode="$1"
+  shift
+  if [ ! -f "${PRUNE_TOOL}" ]; then
+    echo "ERROR: retention tool not found: ${PRUNE_TOOL}" >&2
+    return 1
+  fi
+  local -a args=("${PRUNE_TOOL}" --bag-root "${BAG_ROOT}")
+  local in_flight
+  # The bag being written right now is the one deletion would hurt most, and
+  # it is too new to be referenced by any map manifest yet.
+  in_flight="$( { load_session; is_running && printf '%s' "${BAG_DIR}"; } )" || true
+  [ -n "${in_flight}" ] && args+=(--exclude "${in_flight}")
+  [ "${mode}" = "apply" ] && args+=(--apply)
+  args+=("$@")
+  python3 "${args[@]}"
+}
+
+reclaim_space_if_needed() {
+  local available_gb trigger_kb available_kb
+  available_kb="$(df -Pk "${BAG_ROOT}" | awk 'NR==2 {print $4}')"
+  trigger_kb=$((PRUNE_TRIGGER_GB * 1024 * 1024))
+  if [ "${PRUNE_ENABLED}" != "1" ] || [ "${available_kb}" -ge "${trigger_kb}" ]; then
+    return 0
+  fi
+  available_gb=$((available_kb / 1024 / 1024))
+  echo "NOTICE: ${available_gb}GB free is under the ${PRUNE_TRIGGER_GB}GB retention trigger; pruning old recordings" >&2
+  # Bags only. Map sessions are addressable by name from the cloud platform
+  # (map_activation_adapter._resolve_source_dir resolves map_dir/<version>),
+  # so removing one is a decision for an operator with the platform's map list
+  # in front of them - `mapping_rosbag.sh prune --apply` does that on request.
+  if ! run_prune apply --skip-maps >"${RETENTION_REPORT}" 2>>"${LOG_FILE}"; then
+    # Never block a recording on cleanup: the free-space gate below is still
+    # the authority on whether there is room.
+    echo "WARNING: retention pass failed; see ${LOG_FILE}" >&2
+    return 0
+  fi
+  python3 - "${RETENTION_REPORT}" >&2 <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        report = json.load(handle)
+except (OSError, ValueError) as exc:
+    print(f"WARNING: unreadable retention report: {exc}")
+    raise SystemExit(0)
+
+freed = report.get("reclaimed_bytes", 0) / 1024 ** 3
+for root in report.get("roots", []):
+    for entry in root.get("deleted", []):
+        print(f"RECLAIMED {entry['path']} "
+              f"({entry['size_bytes'] / 1024 ** 3:.2f}GiB, {entry['reason']})")
+print(f"RECLAIMED total {freed:.2f}GiB across {report.get('failed_count', 0)} failures")
+PY
+}
+
 start_recording() {
   if is_running; then
     print_status
@@ -73,10 +144,11 @@ start_recording() {
   fi
   rm -f "${PID_FILE}"
   local available_kb required_kb label stamp bag_dir
+  reclaim_space_if_needed
   available_kb="$(df -Pk "${BAG_ROOT}" | awk 'NR==2 {print $4}')"
   required_kb=$((MIN_FREE_GB * 1024 * 1024))
   if [ "${available_kb}" -lt "${required_kb}" ]; then
-    echo "ERROR: less than ${MIN_FREE_GB}GB free under ${BAG_ROOT}" >&2
+    echo "ERROR: less than ${MIN_FREE_GB}GB free under ${BAG_ROOT} after retention" >&2
     exit 2
   fi
   label="${1:-mapping}"
@@ -156,5 +228,17 @@ case "${1:-status}" in
   start) start_recording "${2:-mapping}" ;;
   stop) stop_recording ;;
   status) print_status ;;
-  *) echo "Usage: $0 {start [label]|stop|status}" >&2; exit 2 ;;
+  # Dry run unless --apply is passed, so this is safe to poll for reporting.
+  # Remaining arguments go straight to the retention tool (--skip-maps,
+  # --bag-max-total-gib, ...).
+  prune)
+    shift
+    if [ "${1:-}" = "--apply" ]; then
+      shift
+      run_prune apply "$@"
+    else
+      run_prune dry "$@"
+    fi
+    ;;
+  *) echo "Usage: $0 {start [label]|stop|status|prune [--apply] [tool args...]}" >&2; exit 2 ;;
 esac

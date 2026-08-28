@@ -34,6 +34,20 @@ if [ -z "${PCD_MAP}" ]; then
   fi
 fi
 
+# Select the FAST-LIO range profile from the activated map metadata. Legacy
+# maps without a manifest use the conservative indoor profile.
+NAVIGATION_SCENE_SCOPE="${ROAMERX_NAVIGATION_SCENE_SCOPE:-indoor}"
+ACTIVE_MAP_DIR="$(dirname "$(readlink -f "${PCD_MAP}" 2>/dev/null || printf '%s' "${PCD_MAP}")")"
+ACTIVE_MAP_MANIFEST="${ACTIVE_MAP_DIR}/map_manifest.json"
+if [ -f "${ACTIVE_MAP_MANIFEST}" ]; then
+  NAVIGATION_SCENE_SCOPE="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("scene_scope") or "indoor").lower())' "${ACTIVE_MAP_MANIFEST}" 2>/dev/null || printf 'indoor')"
+fi
+case "${NAVIGATION_SCENE_SCOPE}" in
+  indoor|transition|outdoor) ;;
+  *) NAVIGATION_SCENE_SCOPE="indoor" ;;
+esac
+export ROAMERX_NAVIGATION_SCENE_SCOPE="${NAVIGATION_SCENE_SCOPE}"
+
 bash "${SCRIPT_DIR}/wait_for_valid_time.sh"
 
 set +u
@@ -44,7 +58,7 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|restart-localization|status|load-map|full-stop}"
+  echo "Usage: $0 {start|stop|restart|restart-localization|ensure-localization-odom|stop-localization|status|load-map|full-stop}"
   echo
   echo "Env:"
   echo "  PROJECT_DIR=${PROJECT_DIR}"
@@ -71,9 +85,12 @@ kill_pattern() {
   fi
 }
 
+is_localization_node_alive() {
+  pgrep -f "/localization/lib/localization/localization_node" >/dev/null 2>&1
+}
+
 is_localization_running() {
-  pgrep -f "ros2 launch localization localization.launch.py" >/dev/null 2>&1 || \
-    pgrep -f "localization_node" >/dev/null 2>&1
+  is_localization_node_alive
 }
 
 is_navigation_running() {
@@ -126,7 +143,9 @@ stop_stack() {
 stop_localization() {
   echo "Stopping localization..."
   kill_pattern "ros2 launch localization localization.launch.py"
+  kill_pattern "ros2 launch robot_slam lio_odometry.launch.py"
   kill_pattern "localization_node"
+  kill_pattern "__node:=lio_odometry"
 }
 
 wait_for_node() {
@@ -217,15 +236,46 @@ restart_localization_only() {
   echo "Localization restarted; waiting for trusted-pose recovery."
 }
 
+ensure_localization_odom() {
+  if ! is_localization_running; then
+    echo "Starting localization odometry for mapping preparation..."
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
+      >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
+    if ! wait_for_node "/localization" 15; then
+      echo "ERROR: localization node did not start for mapping preparation." >&2
+      return 1
+    fi
+  fi
+
+  echo "Waiting for /odom/localization_odom..."
+  for _ in $(seq 1 15); do
+    if timeout 3 ros2 topic echo /odom/localization_odom --once >/dev/null 2>&1; then
+      echo "Localization odometry OK: /odom/localization_odom"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: localization is running but /odom/localization_odom has no data." >&2
+  return 1
+}
+
 start_stack() {
-  "${SCRIPT_DIR}/ensure_navigation_sensors.sh"
+  WAIT_SECONDS="${NAV_SENSOR_WAIT_SECONDS:-25}" "${SCRIPT_DIR}/ensure_navigation_sensors.sh"
   if ! is_rtk_running; then
     ensure_rtk
   fi
   if is_running; then
-    echo "RTK, navigation sensors, localization, and Nav2 already appear to be running."
-    echo "Use '$0 restart' to stop and start again."
-    return 0
+    if localization_is_valid; then
+      echo "RTK, navigation sensors, localization, and Nav2 already appear to be running."
+      echo "Use '$0 restart' to stop and start again."
+      return 0
+    fi
+    echo "Nav2 is running but localization is not status=3; waiting for initialization."
+    if wait_for_localization; then
+      return 0
+    fi
+    echo "ERROR: localization is running but not valid. Initialize or relocalize first." >&2
+    return 1
   fi
 
   if [ ! -f "${MAP_YAML}" ]; then
@@ -238,7 +288,12 @@ start_stack() {
   fi
 
   local localization_started=false
-  if ! is_localization_running; then
+  if ! is_localization_node_alive; then
+    if pgrep -f "ros2 launch localization localization.launch.py" >/dev/null 2>&1; then
+      echo "Localization node is dead; clearing leftover launch and restarting."
+      stop_localization
+      kill_pattern "static_transform_publisher.*base_link livox_frame"
+    fi
     echo "Starting localization..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
       >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
@@ -255,8 +310,11 @@ start_stack() {
   elif localization_is_valid; then
     echo "Localization is already valid; preserving its current map and pose."
   else
-    echo "ERROR: localization is running but not valid. Initialize or relocalize first; refusing to reset its pose." >&2
-    return 1
+    echo "Localization is running but not yet status=3; waiting for initialization."
+    if ! wait_for_localization; then
+      echo "ERROR: localization is running but not valid. Initialize or relocalize first; refusing to reset its pose." >&2
+      return 1
+    fi
   fi
 
   if is_navigation_running; then
@@ -309,6 +367,12 @@ case "${MODE}" in
     ;;
   restart-localization)
     restart_localization_only
+    ;;
+  ensure-localization-odom)
+    ensure_localization_odom
+    ;;
+  stop-localization)
+    stop_localization
     ;;
   full-stop)
     stop_stack

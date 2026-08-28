@@ -249,6 +249,8 @@ namespace robot::slam
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("preprocess.blind", 0.01);
+        this->declare_parameter<double>("preprocess.max_range", 100.0);
+        this->declare_parameter<double>("preprocess.fov_degree", 360.0);
         this->declare_parameter<int>("preprocess.lidar_type", AVIA);
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
@@ -293,6 +295,13 @@ namespace robot::slam
         this->declare_parameter<double>("health_guard.warn_abs_z", 0.5);
         this->declare_parameter<int>("health_guard.pose_guard_frames", 3);
         this->declare_parameter<int>("health_guard.no_effective_points_limit", 10);
+        this->declare_parameter<bool>("ground_filter.enable", true);
+        this->declare_parameter<double>("ground_filter.distance_threshold_m", 0.08);
+        this->declare_parameter<double>("ground_filter.max_tilt_deg", 20.0);
+        this->declare_parameter<int>("ground_filter.min_inliers", 80);
+        this->declare_parameter<double>("ground_filter.min_sensor_height_m", 0.20);
+        this->declare_parameter<double>("ground_filter.max_sensor_height_m", 1.20);
+        this->declare_parameter<double>("ground_filter.clearance_m", 0.15);
 
         this->declare_parameter<string>("pcd2pgm.file_name", "map");
         this->declare_parameter<double>("pcd2pgm.thre_z_min", 0.2);
@@ -307,6 +316,8 @@ namespace robot::slam
         this->declare_parameter<double>("dynamic_filter.voxel_size", 0.20);
         this->declare_parameter<int>("dynamic_filter.min_scan_observations", 1);
         this->declare_parameter<int>("dynamic_filter.shard_count", 64);
+        this->declare_parameter<bool>("frontend.odometry_only", false);
+        this->declare_parameter<string>("frontend.odometry_topic", "/odom/lio_odom");
         this->declare_parameter<bool>("keyframe_record.enable", true);
         this->declare_parameter<double>("keyframe_record.min_distance_m", 0.8);
         this->declare_parameter<double>("keyframe_record.min_yaw_rad", 0.35);
@@ -359,6 +370,8 @@ namespace robot::slam
         int dynamic_filter_shard_count = 64;
         this->get_parameter_or<int>("dynamic_filter.shard_count", dynamic_filter_shard_count, 64);
         dynamic_filter_shard_count_ = static_cast<std::size_t>(std::clamp(dynamic_filter_shard_count, 8, 512));
+        this->get_parameter_or<bool>("frontend.odometry_only", odometry_only_, false);
+        this->get_parameter_or<string>("frontend.odometry_topic", lio_odometry_topic_, "/odom/lio_odom");
         this->get_parameter_or<bool>("keyframe_record.enable", keyframe_record_enable_, true);
         this->get_parameter_or<double>("keyframe_record.min_distance_m", keyframe_min_distance_m_, 0.8);
         this->get_parameter_or<double>("keyframe_record.min_yaw_rad", keyframe_min_yaw_rad_, 0.35);
@@ -416,6 +429,10 @@ namespace robot::slam
         this->get_parameter_or<double>("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
+        double scan_max_range = 100.0;
+        this->get_parameter_or<double>("preprocess.max_range", scan_max_range, 100.0);
+        double scan_fov_degree = 360.0;
+        this->get_parameter_or<double>("preprocess.fov_degree", scan_fov_degree, 360.0);
         this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
@@ -474,6 +491,35 @@ namespace robot::slam
         this->get_parameter_or<double>("health_guard.warn_abs_z", health_warn_abs_z_m_, 0.5);
         this->get_parameter_or<int>("health_guard.pose_guard_frames", health_pose_guard_frames_, 3);
         this->get_parameter_or<int>("health_guard.no_effective_points_limit", health_no_effective_limit_, 10);
+        this->get_parameter_or<bool>("ground_filter.enable", ground_filter_config_.enable, true);
+        this->get_parameter_or<double>("ground_filter.distance_threshold_m", ground_filter_config_.distance_threshold_m, 0.08);
+        this->get_parameter_or<double>("ground_filter.max_tilt_deg", ground_filter_config_.max_tilt_deg, 20.0);
+        this->get_parameter_or<int>("ground_filter.min_inliers", ground_filter_config_.min_inliers, 80);
+        this->get_parameter_or<double>("ground_filter.min_sensor_height_m", ground_filter_config_.min_sensor_height_m, 0.20);
+        this->get_parameter_or<double>("ground_filter.max_sensor_height_m", ground_filter_config_.max_sensor_height_m, 1.20);
+        this->get_parameter_or<double>("ground_filter.clearance_m", ground_filter_config_.clearance_m, 0.15);
+        ground_filter_.setConfig(ground_filter_config_);
+
+        if (odometry_only_)
+        {
+            keyframe_record_enable_ = false;
+            mapping_capture_enabled_ = false;
+            use_gnss_fusion_ = false;
+            gnss_fusion_config_enabled_ = false;
+            global_factor_graph_config_.enable = false;
+            pub_world_points_flag_ = false;
+            pub_body_points_flag_ = false;
+            map_pub_en = false;
+            path_en = false;
+            state_.store(SlamState::WARMUP);
+            // Navigation LIO keeps the full Mid-360 scan; front-FOV crop is mapping-only.
+            scan_fov_degree = 360.0;
+            RCLCPP_INFO(this->get_logger(),
+                "FAST-LIO2 odometry-only mode: frontend only, topic=%s, loop/backend/map IO disabled, scan FOV=360",
+                lio_odometry_topic_.c_str());
+        }
+        p_pre->setFovDegree(scan_fov_degree);
+        p_pre->setMaxRange(scan_max_range);
 
 #ifdef ROOT_DIR
         data_path_ = std::string(ROOT_DIR) + "/map";
@@ -483,13 +529,24 @@ namespace robot::slam
 #endif
         if (!configured_data_path.empty())
             data_path_ = std::filesystem::path(configured_data_path).lexically_normal().string();
-        if (!checkDirExist(data_path_))
+        if (!odometry_only_ && !checkDirExist(data_path_))
         {
             RCLCPP_INFO(this->get_logger(), "Create map directory failed!!!!!!.");
             return;
         }
 
-        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d range=[%.2f, %.2f]m scan_fov=%.1f deg (%s)",
+            p_pre->lidar_type, p_pre->blind, p_pre->max_range, p_pre->fov_degree,
+            p_pre->fov_degree < 359.9 ? "crop incoming scan around lidar +X" : "full scan");
+        RCLCPP_INFO(this->get_logger(),
+            "Ground filter %s: threshold=%.2fm clearance=%.2fm tilt<=%.1fdeg inliers>=%d sensor_height=[%.2f, %.2f]m",
+            ground_filter_config_.enable ? "enabled" : "disabled",
+            ground_filter_config_.distance_threshold_m,
+            ground_filter_config_.clearance_m,
+            ground_filter_config_.max_tilt_deg,
+            ground_filter_config_.min_inliers,
+            ground_filter_config_.min_sensor_height_m,
+            ground_filter_config_.max_sensor_height_m);
 
         path.header.stamp    = this->get_clock()->now();
         path.header.frame_id = "map";
@@ -523,12 +580,15 @@ namespace robot::slam
 
         sub_imu_ptr_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
-        sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-            gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
-        sub_enu_odom_ptr_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            enu_odom_topic, 20, std::bind(&MappingAlg::enuOdometryCallBack, this, std::placeholders::_1));
-        sub_rtk_pvh_ptr_ = this->create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
-            rtk_pvh_topic, 20, std::bind(&MappingAlg::rtkPvhCallBack, this, std::placeholders::_1));
+        if (!odometry_only_)
+        {
+            sub_gnss_ptr_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+                gnss_topic, 20, std::bind(&MappingAlg::gnssCallBack, this, std::placeholders::_1));
+            sub_enu_odom_ptr_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                enu_odom_topic, 20, std::bind(&MappingAlg::enuOdometryCallBack, this, std::placeholders::_1));
+            sub_rtk_pvh_ptr_ = this->create_subscription<robots_dog_msgs::msg::UniRtkPvh>(
+                rtk_pvh_topic, 20, std::bind(&MappingAlg::rtkPvhCallBack, this, std::placeholders::_1));
+        }
         if (odom_guard_enable_)
         {
             odom_guard_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -544,7 +604,11 @@ namespace robot::slam
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/body_points", 20);
         pubLaserCloudMap_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map_points", 20);
         pubOdomAftMapped_       = this->create_publisher<nav_msgs::msg::Odometry>("/slam_odom", 20);
-        pubLocalizationOdom_    = this->create_publisher<nav_msgs::msg::Odometry>("/odom/localization_odom", 20);
+        if (!odometry_only_)
+        {
+            pubLocalizationOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom/localization_odom", 20);
+        }
+        pubLioOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(lio_odometry_topic_, 20);
         pubPath_                = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubGlobalOptimizedOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/slam/global_optimized_odom", 20);
         pubGlobalOptimizedPath_ = this->create_publisher<nav_msgs::msg::Path>("/slam/global_optimized_path", 10);
@@ -554,15 +618,18 @@ namespace robot::slam
             "/slam/divergence_event", rclcpp::QoS(1).transient_local());
         tf_broadcaster_         = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        state_service_ = this->create_service<robots_dog_msgs::srv::MapState>(
-            "/slam_state_service", std::bind(&MappingAlg::stateCallBack, this, std::placeholders::_1, std::placeholders::_2));
-        start_mapping_service_ = this->create_service<std_srvs::srv::Trigger>(
-            "/slam/start_mapping", std::bind(&MappingAlg::startMappingCallBack, this, std::placeholders::_1, std::placeholders::_2));
-        save_map_service_ = this->create_service<std_srvs::srv::Trigger>(
-            "/slam/save_map", std::bind(&MappingAlg::saveMapCallBack, this, std::placeholders::_1, std::placeholders::_2));
-        global_optimize_service_ = this->create_service<std_srvs::srv::Trigger>(
-            "/slam/global_optimize", std::bind(&MappingAlg::globalOptimizeCallBack, this,
-                std::placeholders::_1, std::placeholders::_2));
+        if (!odometry_only_)
+        {
+            state_service_ = this->create_service<robots_dog_msgs::srv::MapState>(
+                "/slam_state_service", std::bind(&MappingAlg::stateCallBack, this, std::placeholders::_1, std::placeholders::_2));
+            start_mapping_service_ = this->create_service<std_srvs::srv::Trigger>(
+                "/slam/start_mapping", std::bind(&MappingAlg::startMappingCallBack, this, std::placeholders::_1, std::placeholders::_2));
+            save_map_service_ = this->create_service<std_srvs::srv::Trigger>(
+                "/slam/save_map", std::bind(&MappingAlg::saveMapCallBack, this, std::placeholders::_1, std::placeholders::_2));
+            global_optimize_service_ = this->create_service<std_srvs::srv::Trigger>(
+                "/slam/global_optimize", std::bind(&MappingAlg::globalOptimizeCallBack, this,
+                    std::placeholders::_1, std::placeholders::_2));
+        }
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&MappingAlg::map_publish_callback, this));
@@ -954,6 +1021,9 @@ namespace robot::slam
         written_keyframes_ = 0;
         written_keyframe_points_ = 0;
         dropped_keyframes_ = 0;
+        ground_filter_frames_ = 0;
+        ground_filter_failures_ = 0;
+        ground_filter_removed_points_ = 0;
         keyframe_trajectory_m_ = 0.0;
         active_map_subdir_.clear();
         map_export_completed_ = false;
@@ -2488,20 +2558,33 @@ namespace robot::slam
             odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
         }
         pubOdomAftMapped->publish(odomAftMapped);
-        pubLocalizationOdom_->publish(odomAftMapped);
+        if (pubLocalizationOdom_)
+        {
+            pubLocalizationOdom_->publish(odomAftMapped);
+        }
+        if (pubLioOdom_)
+        {
+            nav_msgs::msg::Odometry lio_odom = odomAftMapped;
+            lio_odom.header.frame_id = "lio_odom";
+            lio_odom.child_frame_id = "base_link";
+            pubLioOdom_->publish(lio_odom);
+        }
 
-        geometry_msgs::msg::TransformStamped trans;
-        trans.header.frame_id         = "map";
-        trans.child_frame_id          = "body";
-        trans.header.stamp            = get_ros_time(lidar_end_time);
-        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-        trans.transform.rotation.w    = odomAftMapped.pose.pose.orientation.w;
-        trans.transform.rotation.x    = odomAftMapped.pose.pose.orientation.x;
-        trans.transform.rotation.y    = odomAftMapped.pose.pose.orientation.y;
-        trans.transform.rotation.z    = odomAftMapped.pose.pose.orientation.z;
-        tf_br->sendTransform(trans);
+        if (!odometry_only_ && tf_br)
+        {
+            geometry_msgs::msg::TransformStamped trans;
+            trans.header.frame_id         = "map";
+            trans.child_frame_id          = "body";
+            trans.header.stamp            = get_ros_time(lidar_end_time);
+            trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+            trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+            trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+            trans.transform.rotation.w    = odomAftMapped.pose.pose.orientation.w;
+            trans.transform.rotation.x    = odomAftMapped.pose.pose.orientation.x;
+            trans.transform.rotation.y    = odomAftMapped.pose.pose.orientation.y;
+            trans.transform.rotation.z    = odomAftMapped.pose.pose.orientation.z;
+            tf_br->sendTransform(trans);
+        }
     }
 
     void MappingAlg::publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -2671,6 +2754,33 @@ namespace robot::slam
                 {
                     RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                     return;
+                }
+
+                if (ground_filter_config_.enable && p_imu->initialization_ready())
+                {
+                    const Mat3d lidar_to_world =
+                        (state_point.rot * state_point.offset_R_L_I).toRotationMatrix();
+                    const Vec3d gravity_up_lidar = lidar_to_world.transpose() * Vec3d::UnitZ();
+                    CloudPtr filtered_cloud(new PointCloudType());
+                    const GroundFilterResult ground_result = ground_filter_.filter(
+                        feats_undistort, gravity_up_lidar, filtered_cloud);
+                    ++ground_filter_frames_;
+                    if (ground_result.plane_found && filtered_cloud->size() >= 5)
+                    {
+                        ground_filter_removed_points_ += ground_result.removed_points;
+                        feats_undistort = filtered_cloud;
+                        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "Ground filter removed %zu/%zu points (inliers=%zu)",
+                            ground_result.removed_points, ground_result.input_points,
+                            ground_result.plane_inliers);
+                    }
+                    else if (!ground_result.plane_found)
+                    {
+                        ++ground_filter_failures_;
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "Ground plane unavailable; preserving the full scan (candidates=%zu inliers=%zu)",
+                            ground_result.candidate_points, ground_result.plane_inliers);
+                    }
                 }
 
                 flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
@@ -3924,6 +4034,8 @@ namespace robot::slam
     void MappingAlg::writeSaveProgress(
         const std::string& stage, double progress_percent, const std::string& error) const
     {
+        if (odometry_only_)
+            return;
         std::lock_guard<std::mutex> progress_lock(progress_file_mutex_);
         if (active_map_subdir_.empty())
             return;
@@ -3988,6 +4100,10 @@ namespace robot::slam
                << ", \"pose_anomaly_streak\": " << pose_anomaly_streak_
                << ", \"odom_guard_rejected_updates\": " << odom_guard_rejected_updates_
                << ", \"odom_guard_clamped_z_updates\": " << odom_guard_clamped_z_updates_
+               << ", \"ground_filter_enabled\": " << (ground_filter_config_.enable ? "true" : "false")
+               << ", \"ground_filter_frames\": " << ground_filter_frames_
+               << ", \"ground_filter_failures\": " << ground_filter_failures_
+               << ", \"ground_filter_removed_points\": " << ground_filter_removed_points_
                << ", \"frame_delta_m\": " << health_frame_delta_m_
                << ", \"speed_mps\": " << health_speed_mps_
                << ", \"pose_z_m\": " << health_pose_z_m_

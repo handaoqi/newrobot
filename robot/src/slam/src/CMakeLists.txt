@@ -21,25 +21,34 @@ endif()
 add_definitions(-DROOT_DIR="${ROAMERX_DATA_ROOT}")
 message(STATUS "RoamerX runtime data root: ${ROAMERX_DATA_ROOT}")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  include(ProcessorCount)
-  ProcessorCount(N)
-  message("Processer number:  ${N}")
+# Pick the OpenMP thread count from the actual core count. This used to be gated on
+# CMAKE_SYSTEM_PROCESSOR matching x86, which silently left every aarch64 target
+# (the Jetson Orin NX this runs on) at MP_PROC_NUM=1 with MP_EN undefined - the
+# parallel path was dead code on the only hardware that ships.
+# Override with -DROAMERX_MP_PROC_NUM=<n> to tune against CPU contention; 0 disables.
+set(ROAMERX_MP_PROC_NUM "" CACHE STRING
+    "OpenMP threads for the LIO front end; empty = auto from core count, 0 = disable")
 
-  if(N GREATER 4)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=3)
-    message("core for MP: 3")
-  elseif(N GREATER 3)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=2)
-    message("core for MP: 2")
-  else()
-    add_definitions(-DMP_PROC_NUM=1)
-  endif()
+include(ProcessorCount)
+ProcessorCount(N)
+message(STATUS "Processor number: ${N}")
+
+if(NOT ROAMERX_MP_PROC_NUM STREQUAL "")
+  set(_mp_proc_num ${ROAMERX_MP_PROC_NUM})
+  message(STATUS "MP_PROC_NUM overridden by cache variable: ${_mp_proc_num}")
+elseif(N GREATER 4)
+  set(_mp_proc_num 3)
+elseif(N GREATER 3)
+  set(_mp_proc_num 2)
 else()
-  add_definitions(-DMP_PROC_NUM=1)
+  set(_mp_proc_num 1)
 endif()
+
+if(_mp_proc_num GREATER 1)
+  add_definitions(-DMP_EN)
+endif()
+add_definitions(-DMP_PROC_NUM=${_mp_proc_num})
+message(STATUS "core for MP: ${_mp_proc_num}")
 
 find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
@@ -119,6 +128,30 @@ if(BUILD_TESTING)
   ament_add_gtest(enu_conversion_test test/enu_conversion_test.cpp)
   if(TARGET enu_conversion_test)
     target_include_directories(enu_conversion_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+  endif()
+  ament_add_gtest(lidar_fov_filter_test
+    test/lidar_fov_filter_test.cpp
+    src/process/lidar_process.cpp
+  )
+  if(TARGET lidar_fov_filter_test)
+    target_include_directories(lidar_fov_filter_test PRIVATE
+      ${PCL_INCLUDE_DIRS}
+      ${EIGEN3_INCLUDE_DIR}
+      ${CMAKE_CURRENT_LIST_DIR}/include
+    )
+    target_link_libraries(lidar_fov_filter_test ${PCL_LIBRARIES})
+  endif()
+  ament_add_gtest(ground_filter_test
+    test/ground_filter_test.cpp
+    src/process/ground_filter.cpp
+  )
+  if(TARGET ground_filter_test)
+    target_include_directories(ground_filter_test PRIVATE
+      ${PCL_INCLUDE_DIRS}
+      ${EIGEN3_INCLUDE_DIR}
+      ${CMAKE_CURRENT_LIST_DIR}/include
+    )
+    target_link_libraries(ground_filter_test ${PCL_LIBRARIES})
   endif()
 endif()
 

@@ -25,6 +25,30 @@ localization:
       max_rotation_per_scan_rad: 0.70
       min_points: 200
       num_threads: 2
+    # Indoor primary: FAST-LIO2 frontend odom into the UKF every frame.
+    # NDT/VGICP and RTK are the same class of auxiliary: they do not enter the
+    # UKF every frame. One correction fires only after 0.30 m drift (or 5 deg
+    # yaw), a healthy match / fixed RTK, 3 consecutive stable frames, and no
+    # violent source jump.
+    lio_primary:
+      enable: true
+      topic: "/odom/lio_odom"
+      max_age: 0.30
+      max_step_m: 1.50
+      xy_variance: 0.0025
+      z_variance: 0.010
+      orientation_variance: 0.0004
+      drift_xy_m: 0.30
+      drift_yaw_deg: 5.0
+      drift_hysteresis_frames: 3
+      stable_xy_tolerance_m: 0.10
+      stable_yaw_tolerance_deg: 2.0
+      rearm_xy_m: 0.20
+      suppressed_covariance_scale: 100.0
+      max_correction_jump_m: 1.50
+      correct_xy_variance: 0.010
+      correct_z_variance: 0.020
+      correct_orientation_variance: 0.001
     # navigation_bringup's odom_to_tf_broadcaster is the sole owner of
     # map->odom and odom->base_link.  It converts /odom/localization_odom to
     # /odom/nav2, so do not also publish a controller-odometry TF chain here.
@@ -40,13 +64,17 @@ localization:
     global_map_points_topic: "/global_map_points"
 
     # IMU parameters
-    use_imu: true
+    # FAST-LIO already tightly couples this Mid-360 IMU with each scan. The
+    # localization UKF consumes /odom/lio_odom and must not integrate it again.
+    use_imu: false
     invert_acc: false
     invert_gyro: false
     imu_acc_scale: 9.81 # 若 /front_lidar/imu 已是 m/s^2，实测后改为 1.0
 
     gnss_fusion:
       enable: true
+      # Used only when LIO primary is off. Indoor LIO-primary treats RTK as a
+      # gated auxiliary (same 0.30 m / 3-frame / no-jump rule as NDT).
       gain: 0.20
       max_correction_step: 0.30
       max_residual: 5.0
@@ -61,13 +89,25 @@ localization:
       # Fixed-RTK recovery requires a valid dual-antenna heading. Invalid or
       # high-variance heading samples are rejected instead of changing pose.
       use_heading: true
+      # Fallback only. Mapping writes heading_offset_deg into gnss_origin.yaml
+      # (currently 180 for the dual-antenna mount). Localization loads that
+      # value when the origin file is present so RTK yaw matches the map.
       heading_offset_deg: 0.0
       heading_max_std_deg: 5.0
       heading_min_baseline_m: 0.20
       heading_max_age: 1.5
+      # Low-pass dual-antenna heading before injecting pose yaw.
+      # Keep this short so Nav2 does not steer from a lagged heading.
+      heading_filter_tau_s: 0.15
 
     source_arbiter:
       enable: true
+      # Outdoor: if LIO odom is stale, fixed RTK + heading can still latch as
+      # the navigation pose source. Indoor LIO-primary keeps RTK as a gated
+      # auxiliary even when the solution is fixed.
+      prefer_fixed_rtk: true
+      rtk_primary_promote_samples: 2
+      rtk_primary_demote_samples: 3
       # LiDAR is approximately 10 Hz: every fifth moving frame gives 2 Hz NDT.
       moving_ndt_stride: 5
       # Do not abandon a healthy NDT source on a single noisy moving scan.
@@ -87,6 +127,12 @@ localization:
     imu_init_max_gyro_var: 0.05          # IMU陀螺仪最大方差阈值
     imu_init_max_acce_var: 0.5           # IMU加速度计最大方差阈值
 
+    # 陀螺零偏在 UKF 中的调参。标定出的零偏现在会注入状态量第 13-15 维，
+    # 过程噪声取 1e-6 等于冻结在线估计(改动前的行为)，1e-4 对齐建图侧的 b_gyr_cov。
+    # 做成参数是为了免重编译扫参，回放调参见 docs/IMU_DRIFT_DIAGNOSIS_AND_REMEDIATION_PLAN.md
+    gyro_bias_process_noise: 0.0001      # 陀螺零偏过程噪声
+    gyro_bias_initial_cov: 0.0001        # 陀螺零偏初始协方差
+
     # numeric parameters
     imu_data_filter_num: 5
     globalmap_voxel_size: 0.15
@@ -100,9 +146,25 @@ localization:
     ndt_neighbor_search_method: "DIRECT7"
     ndt_neighbor_search_radius: 1.0
     ndt_resolution: 0.15
-    # Upper mean squared point-to-map distance accepted by NDT.
+    # Upper mean squared point-to-map distance accepted by scan matching.
     # Inlier and transform-continuity checks remain separate acceptance gates.
     ndt_max_fitness_score: 0.50
+    # Indoor navigation: NDT coarse-locks on the full map, then FastVGICP
+    # snaps the current scan onto local planar structure (walls/floor).
+    # NDT voxels smear indoor planes; VGICP on the whole building PCD is too
+    # expensive, so the refine step uses an 18 m local crop.
+    scan_matching:
+      refine_enable: true
+      local_map_xy_radius: 18.0
+      local_map_z_radius: 4.0
+      min_local_map_points: 400
+      vgicp_resolution: 0.50
+      max_correspondence_distance: 1.00
+      max_iterations: 20
+      num_threads: 2
+      # NDT may seed VGICP even when its own fitness is worse than the final
+      # gate. VGICP (or NDT if refine fails) must still beat ndt_max_fitness_score.
+      coarse_max_fitness_score: 2.00
 
     # initial pose parameters
     specify_init_pose: true
@@ -136,3 +198,17 @@ localization:
     runtime_relocalization_failure_threshold: 10
     runtime_relocalization_retry_seconds: 5.0
 
+    # Scan Context 位置识别重定位。上面那条 global ICP 没有任何偏航搜索，种子永远是
+    # "最后一个可信位姿"，所以偏航一旦偏出 ICP 收敛域就再也回不来；冷启动同样被迫从建图
+    # 原点开机。地图会话里的 keyframes/ 本来就够重建 Scan Context 描述子，扇区维即偏航，
+    # 循环移位搜索天然给出 360° 假设。
+    relocalization:
+      # 默认关闭。本包没有单元测试，只能靠回放和实机验证，验证通过前不改变现网行为。
+      use_scan_context: false
+      top_k: 5
+      # 每次闸门触发只验 1 个种子，单帧 ICP 次数与开启前完全一致；失败后由上面的
+      # runtime_relocalization_retry_seconds 重挂，游标顺延到下一个候选。
+      max_seeds_per_attempt: 1
+      # 103 张实测地图的留一法结果：正确检索的描述子距离 p90 为 0.33，错误检索的中位数
+      # 是 0.26，两者重叠，卡阈值只会误杀正确候选。0 表示不卡，由 ICP 验证做唯一门限。
+      max_descriptor_distance: 0.0

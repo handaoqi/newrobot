@@ -13,10 +13,20 @@
         enu_odom_topic: "/gnss/enu_odom"
         time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
         time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+    frontend:
+        # Navigation starts a second mapping process with this true. Formal
+        # mapping keeps the default false so loop/backend/map IO stay on.
+        odometry_only: false
+        odometry_topic: "/odom/lio_odom"
     preprocess:
         lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
         scan_line: 4
         blind: 0.5
+        # Launch profiles override this to 10 m indoors and 25 m outdoors.
+        max_range: 10.0
+        # Keep the front 240 degrees, i.e. mask only the rear +/-60 degree
+        # operator sector. Navigation LIO overrides this to the full 360.
+        fov_degree: 240.0
         timestamp_unit: 3
         scan_rate: 10
     mapping:
@@ -24,6 +34,7 @@
         gyr_cov: 0.1
         b_acc_cov: 0.0001
         b_gyr_cov: 0.0001
+        # Local-map cube size hint in original FAST-LIO; it does not crop scans.
         fov_degree:    360.0
         det_range:     100.0
         extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
@@ -83,6 +94,16 @@
         warn_abs_z: 0.0
         pose_guard_frames: 3
         no_effective_points_limit: 10
+    ground_filter:
+        # Gravity-constrained plane removal runs after IMU deskew and before
+        # the FAST-LIO laser update. Failure is fail-open and never stops SLAM.
+        enable: true
+        distance_threshold_m: 0.08
+        max_tilt_deg: 20.0
+        min_inliers: 80
+        min_sensor_height_m: 0.20
+        max_sensor_height_m: 1.20
+        clearance_m: 0.15
     dynamic_filter:
         # Preserve the raw map. Transient obstacles are removed explicitly in
         # the platform's manual map cleanup workflow after saving.

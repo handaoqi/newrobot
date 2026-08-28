@@ -1,6 +1,7 @@
 #ifndef FAST_GICP_FAST_VGICP_IMPL_HPP
 #define FAST_GICP_FAST_VGICP_IMPL_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -80,15 +81,16 @@ void FastVGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Is
   }
 
 #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
-  for (int i = 0; i < input_->size(); i++) {
-    const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
+  for (int i = 0; i < static_cast<int>(input_->size()); i++) {
+    const Eigen::Vector4d mean_A = input_->points[i].getVector4fMap().template cast<double>();
     Eigen::Vector4d transed_mean_A = trans * mean_A;
     Eigen::Vector3i coord = voxelmap_->voxel_coord(transed_mean_A);
 
     for (const auto& offset : offsets) {
       auto voxel = voxelmap_->lookup_voxel(coord + offset);
       if (voxel != nullptr) {
-        corrs[omp_get_thread_num()].push_back(std::make_pair(i, voxel));
+        const int thread_id = std::min(std::max(omp_get_thread_num(), 0), num_threads_ - 1);
+        corrs[thread_id].push_back(std::make_pair(i, voxel));
       }
     }
   }
@@ -133,11 +135,15 @@ double FastVGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& t
   }
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
-  for (int i = 0; i < voxel_correspondences_.size(); i++) {
+  for (int i = 0; i < static_cast<int>(voxel_correspondences_.size()); i++) {
     const auto& corr = voxel_correspondences_[i];
     auto target_voxel = corr.second;
+    if (corr.first < 0 || corr.first >= static_cast<int>(input_->size()) ||
+        corr.first >= static_cast<int>(source_covs_.size())) {
+      continue;
+    }
 
-    const Eigen::Vector4d mean_A = input_->at(corr.first).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_A = input_->points[corr.first].getVector4fMap().template cast<double>();
     const auto& cov_A = source_covs_[corr.first];
 
     const Eigen::Vector4d mean_B = corr.second->mean;
@@ -162,7 +168,7 @@ double FastVGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& t
     Eigen::Matrix<double, 6, 6> Hi = w * jlossexp.transpose() * voxel_mahalanobis_[i] * jlossexp;
     Eigen::Matrix<double, 6, 1> bi = w * jlossexp.transpose() * voxel_mahalanobis_[i] * error;
 
-    int thread_num = omp_get_thread_num();
+    int thread_num = std::min(std::max(omp_get_thread_num(), 0), num_threads_ - 1);
     Hs[thread_num] += Hi;
     bs[thread_num] += bi;
   }
@@ -183,11 +189,15 @@ template <typename PointSource, typename PointTarget>
 double FastVGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d& trans) {
   double sum_errors = 0.0;
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors)
-  for (int i = 0; i < voxel_correspondences_.size(); i++) {
+  for (int i = 0; i < static_cast<int>(voxel_correspondences_.size()); i++) {
     const auto& corr = voxel_correspondences_[i];
     auto target_voxel = corr.second;
+    if (corr.first < 0 || corr.first >= static_cast<int>(input_->size()) ||
+        corr.first >= static_cast<int>(source_covs_.size())) {
+      continue;
+    }
 
-    const Eigen::Vector4d mean_A = input_->at(corr.first).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_A = input_->points[corr.first].getVector4fMap().template cast<double>();
     const auto& cov_A = source_covs_[corr.first];
 
     const Eigen::Vector4d mean_B = corr.second->mean;

@@ -189,6 +189,7 @@ add_executable(vel_cmd_udp_pub
 ament_target_dependencies(vel_cmd_udp_pub
         geometry_msgs
         std_msgs
+        robots_dog_msgs
         rclcpp)
 target_link_libraries(vel_cmd_udp_pub
         ${GENISOM_L1_SDK_LIB}
@@ -196,6 +197,7 @@ target_link_libraries(vel_cmd_udp_pub
 )
 target_include_directories(vel_cmd_udp_pub
   PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GENISOM_L1_SDK_ROOT}/include
     /usr/local/include/zsibot/include
 )
@@ -322,6 +324,18 @@ install(DIRECTORY launch params map rviz
         GROUP_READ GROUP_WRITE GROUP_EXECUTE
         WORLD_READ WORLD_WRITE WORLD_EXECUTE
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_remote_velocity_mode
+    test/test_remote_velocity_mode.cpp
+  )
+  target_include_directories(test_remote_velocity_mode
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      /usr/local/include/zsibot/include
+  )
+endif()
 
 ament_package()
 

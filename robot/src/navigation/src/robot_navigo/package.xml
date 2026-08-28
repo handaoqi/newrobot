@@ -29,6 +29,7 @@
   <exec_depend>navigo_bt_navigator</exec_depend>
   <exec_depend>navigo_core</exec_depend>
   <exec_depend>navigo_costmap_2d</exec_depend>
+  <build_depend>robots_dog_msgs</build_depend>
   <exec_depend>robots_dog_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
@@ -44,6 +45,7 @@
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

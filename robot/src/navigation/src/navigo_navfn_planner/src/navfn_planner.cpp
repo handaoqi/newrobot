@@ -23,6 +23,7 @@
 
 #include "navigo_navfn_planner/navfn_planner.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -90,6 +91,12 @@ NavfnPlanner::configure(
   declare_parameter_if_not_declared(
     node, name + ".use_final_approach_orientation", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".use_final_approach_orientation", use_final_approach_orientation_);
+  declare_parameter_if_not_declared(
+    node, name + ".allow_straight_line_fallback", rclcpp::ParameterValue(true));
+  node->get_parameter(name + ".allow_straight_line_fallback", allow_straight_line_fallback_);
+  declare_parameter_if_not_declared(
+    node, name + ".prefer_straight_line", rclcpp::ParameterValue(true));
+  node->get_parameter(name + ".prefer_straight_line", prefer_straight_line_);
 
   // Create a planner based on the new costmap size
   planner_ = std::make_unique<NavFn>(
@@ -144,13 +151,20 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
 
   nav_msgs::msg::Path path;
 
+  if (prefer_straight_line_) {
+    path = makeStraightLinePlan(start, goal);
+    return path;
+  }
+
   // Corner case of the start(x,y) = goal(x,y)
   if (start.pose.position.x == goal.pose.position.x &&
     start.pose.position.y == goal.pose.position.y)
   {
     unsigned int mx, my;
     costmap_->worldToMap(start.pose.position.x, start.pose.position.y, mx, my);
-    if (costmap_->getCost(mx, my) == navigo_costmap_2d::LETHAL_OBSTACLE) {
+    if (costmap_->getCost(mx, my) == navigo_costmap_2d::LETHAL_OBSTACLE &&
+      !allow_straight_line_fallback_)
+    {
       RCLCPP_WARN(logger_, "Failed to create a unique pose path because of obstacles");
       return path;
     }
@@ -175,6 +189,13 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     RCLCPP_WARN(
       logger_, "%s: failed to create plan with "
       "tolerance %.2f.", name_.c_str(), tolerance_);
+    if (allow_straight_line_fallback_) {
+      path = makeStraightLinePlan(start, goal);
+      RCLCPP_WARN(
+        logger_,
+        "%s: occupancy planner failed; using GPS straight-line path to (%.2f, %.2f)",
+        name_.c_str(), goal.pose.position.x, goal.pose.position.y);
+    }
   }
 
 
@@ -184,6 +205,40 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
   std::cout << "It took " << time_span.count() * 1000 << std::endl;
 #endif
 
+  return path;
+}
+
+nav_msgs::msg::Path
+NavfnPlanner::makeStraightLinePlan(
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal)
+{
+  nav_msgs::msg::Path path;
+  path.header.stamp = clock_->now();
+  path.header.frame_id = global_frame_;
+
+  const double dx = goal.pose.position.x - start.pose.position.x;
+  const double dy = goal.pose.position.y - start.pose.position.y;
+  const double dist = std::hypot(dx, dy);
+  const double yaw = std::atan2(dy, dx);
+  const auto orientation = navigo_util::geometry_utils::orientationAroundZAxis(yaw);
+  const int samples = dist < 1e-3 ? 1 : std::max(2, static_cast<int>(std::ceil(dist / 0.25)));
+
+  for (int i = 0; i < samples; ++i) {
+    const double t = samples == 1 ? 1.0 : static_cast<double>(i) / static_cast<double>(samples - 1);
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = start.pose.position.x + t * dx;
+    pose.pose.position.y = start.pose.position.y + t * dy;
+    pose.pose.position.z = 0.0;
+    pose.pose.orientation = use_final_approach_orientation_ && i + 1 == samples
+      ? start.pose.orientation
+      : orientation;
+    path.poses.push_back(pose);
+  }
+  if (path.poses.empty()) {
+    path.poses.push_back(start);
+  }
   return path;
 }
 
@@ -540,6 +595,10 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
         allow_unknown_ = parameter.as_bool();
       } else if (name == name_ + ".use_final_approach_orientation") {
         use_final_approach_orientation_ = parameter.as_bool();
+      } else if (name == name_ + ".allow_straight_line_fallback") {
+        allow_straight_line_fallback_ = parameter.as_bool();
+      } else if (name == name_ + ".prefer_straight_line") {
+        prefer_straight_line_ = parameter.as_bool();
       }
     }
   }

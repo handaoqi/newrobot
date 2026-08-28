@@ -233,6 +233,8 @@ def generate_launch_description():
             'output_odom_frame': 'odom',
             'output_base_frame': 'base_link',
             'publish_map_to_odom': True,
+            # Publish the lidar/odom stamp first, then now(). tf2 rejects older
+            # stamps after a newer one, so never publish a lookback after now().
             'use_current_time': True,
         }],
         output='screen'
@@ -249,7 +251,7 @@ def generate_launch_description():
         ],
         parameters=[{
             'target_frame': 'base_link',
-            'transform_tolerance': 0.35,
+            'transform_tolerance': 1.00,
             'min_height': 0.05,
             'max_height': 1.60,
             'angle_min': -3.14159,
@@ -318,7 +320,12 @@ def generate_launch_description():
                 ])),
                 package='robot_navigo',
                 executable='vel_cmd_udp_pub',
-                parameters=[{'platform': LaunchConfiguration('platform')}],
+                parameters=[{
+                    'platform': LaunchConfiguration('platform'),
+                    # Do not dump forward speed while turning at Nav2 wz_max.
+                    'turn_linear_limit_yaw_rate': 1.0,
+                    'turn_max_linear_speed': 0.5,
+                }],
                 output='screen'
             ),
             # Node(

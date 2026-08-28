@@ -85,6 +85,7 @@ add_executable(${PROJECT_NAME}_node
   src/localization/pose_estimator.cpp
   src/localization/static_imu_init.cpp
   src/localization/global_localization.cpp
+  src/localization/scan_context_db.cpp
 )
 ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
@@ -111,6 +112,21 @@ rosidl_target_interfaces(${PROJECT_NAME}_node
   rosidl_typesupport_cpp
 )
 
+# Offline scoring for the scan context retrieval. Links only PCL and Eigen, so it runs
+# against recorded maps without a ROS graph, a map service or the robot.
+add_executable(${PROJECT_NAME}_scan_context_check
+  tools/scan_context_check.cpp
+  src/localization/scan_context_db.cpp
+)
+ament_target_dependencies(${PROJECT_NAME}_scan_context_check
+  pcl_ros
+  pcl_conversions
+)
+target_include_directories(${PROJECT_NAME}_scan_context_check PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
 install(
   TARGETS
     ${PROJECT_NAME}_lib
@@ -121,6 +137,7 @@ install(
 install(
   TARGETS
     ${PROJECT_NAME}_node
+    ${PROJECT_NAME}_scan_context_check
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 

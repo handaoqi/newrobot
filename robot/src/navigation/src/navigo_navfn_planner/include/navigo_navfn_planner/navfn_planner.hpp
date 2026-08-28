@@ -100,6 +100,10 @@ protected:
     const geometry_msgs::msg::Pose & goal, double tolerance,
     nav_msgs::msg::Path & plan);
 
+  nav_msgs::msg::Path makeStraightLinePlan(
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal);
+
   /**
    * @brief Compute the navigation function given a seed point in the world to start from
    * @param world_point Point in world coordinate frame
@@ -207,6 +211,10 @@ protected:
 
   // Whether or not the planner should be allowed to plan through unknown space
   bool allow_unknown_, use_final_approach_orientation_;
+  // Outdoor GPS patrol: if NavFn cannot thread the occupancy map, emit a
+  // straight-line path and let lidar collision monitoring handle obstacles.
+  bool allow_straight_line_fallback_{true};
+  bool prefer_straight_line_{true};
 
   // If the goal is obstructed, the tolerance specifies how many meters the planner
   // can relax the constraint in x and y before failing

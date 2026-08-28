@@ -15,12 +15,15 @@
 #ifndef NAVIGO_COLLISION_MONITOR__COLLISION_MONITOR_NODE_HPP_
 #define NAVIGO_COLLISION_MONITOR__COLLISION_MONITOR_NODE_HPP_
 
+#include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <memory>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "robots_dog_msgs/msg/localization.hpp"
 
 #include "tf2/time.h"
 #include "tf2_ros/buffer.h"
@@ -186,6 +189,15 @@ protected:
    */
   void publishPolygons() const;
 
+  /**
+   * @brief True when localization is Normal (status=3) and the last sample
+   * is within localization_timeout. Operator recovery via reverse/rotate is
+   * still handled by the stop polygon, not this gate.
+   */
+  bool localizationAllowsMotion() const;
+
+  void localizationCallback(robots_dog_msgs::msg::Localization::ConstSharedPtr msg);
+
   // ----- Variables -----
 
   /// @brief TF buffer
@@ -222,6 +234,15 @@ protected:
   /// @brief Permit recovery commands that move away from a front stop polygon
   bool allow_rotation_recovery_;
   bool allow_reverse_recovery_;
+
+  /// @brief Zero cmd_vel when localization is not Normal
+  bool require_healthy_localization_;
+  double localization_timeout_;
+  rclcpp::Subscription<robots_dog_msgs::msg::Localization>::SharedPtr localization_sub_;
+  mutable std::mutex localization_mutex_;
+  bool loc_seen_;
+  uint8_t loc_status_;
+  rclcpp::Time last_loc_stamp_;
 };  // class CollisionMonitor
 
 }  // namespace navigo_collision_monitor

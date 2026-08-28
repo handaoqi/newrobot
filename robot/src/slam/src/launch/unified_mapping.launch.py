@@ -6,6 +6,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -13,6 +14,9 @@ def generate_launch_description():
     mapping_type = LaunchConfiguration('mapping_type')
     slam_params_file = LaunchConfiguration('slam_params_file')
     origin_params_file = LaunchConfiguration('origin_params_file')
+    max_range = ParameterValue(
+        PythonExpression(["25.0 if '", mapping_type, "' == 'outdoor' else 10.0"]),
+        value_type=float)
     return LaunchDescription([
         DeclareLaunchArgument(
             'mapping_type', default_value=os.environ.get('ROAMERX_MAPPING_TYPE', 'indoor'),
@@ -29,5 +33,8 @@ def generate_launch_description():
             condition=IfCondition(PythonExpression(["'", mapping_type, "' == 'outdoor'"]))),
         Node(
             package='robot_slam', executable='mapping', name='mapping',
-            parameters=[slam_params_file]),
+            parameters=[slam_params_file, {
+                'preprocess.max_range': max_range,
+                'preprocess.fov_degree': 240.0,
+            }]),
     ])

@@ -15,6 +15,7 @@ find_package(nav2_common REQUIRED)
 find_package(navigo_util REQUIRED)
 find_package(navigo_costmap_2d REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(robots_dog_msgs REQUIRED)
 
 ### Header ###
 
@@ -37,6 +38,7 @@ set(dependencies
   navigo_util
   navigo_costmap_2d
   nav2_msgs
+  robots_dog_msgs
 )
 
 set(executable_name collision_monitor)

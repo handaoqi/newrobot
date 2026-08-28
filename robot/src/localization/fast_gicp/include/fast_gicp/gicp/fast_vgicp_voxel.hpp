@@ -11,8 +11,15 @@ static std::vector<Eigen::Vector3i, Eigen::aligned_allocator<Eigen::Vector3i>> n
   switch(search_method) {
       // clang-format off
     default:
-      std::cerr << "unsupported neighbor search method" << std::endl;
-      abort();
+      return std::vector<Eigen::Vector3i, Eigen::aligned_allocator<Eigen::Vector3i>>{
+        Eigen::Vector3i(0, 0, 0),
+        Eigen::Vector3i(1, 0, 0),
+        Eigen::Vector3i(-1, 0, 0),
+        Eigen::Vector3i(0, 1, 0),
+        Eigen::Vector3i(0, -1, 0),
+        Eigen::Vector3i(0, 0, 1),
+        Eigen::Vector3i(0, 0, -1)
+      };
     case NeighborSearchMethod::DIRECT1:
       return std::vector<Eigen::Vector3i, Eigen::aligned_allocator<Eigen::Vector3i>>{
         Eigen::Vector3i(0, 0, 0)
@@ -128,8 +135,8 @@ public:
 
   void create_voxelmap(const pcl::PointCloud<PointT>& cloud, const std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covs) {
     voxels_.clear();
-    for(int i = 0; i < cloud.size(); i++) {
-      Eigen::Vector3i coord = voxel_coord(cloud.at(i).getVector4fMap().template cast<double>());
+    for(int i = 0; i < static_cast<int>(cloud.size()); i++) {
+      Eigen::Vector3i coord = voxel_coord(cloud.points[i].getVector4fMap().template cast<double>());
 
       auto found = voxels_.find(coord);
       if(found == voxels_.end()) {
@@ -147,7 +154,7 @@ public:
       }
 
       auto& voxel = found->second;
-      voxel->append(cloud.at(i).getVector4fMap().template cast<double>(), covs[i]);
+      voxel->append(cloud.points[i].getVector4fMap().template cast<double>(), covs[i]);
     }
 
     for(auto& voxel : voxels_) {

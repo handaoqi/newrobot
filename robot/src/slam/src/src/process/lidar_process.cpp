@@ -1,5 +1,8 @@
 #include "process/lidar_process.h"
 
+#include <algorithm>
+#include <cmath>
+
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
 
@@ -7,7 +10,12 @@ Preprocess::Preprocess()
     : feature_enabled(0),
       lidar_type(AVIA),
       blind(0.01),
-      point_filter_num(1)
+      max_range(100.0),
+      point_filter_num(1),
+      fov_degree(360.0),
+      fov_filter_en_(false),
+      fov_half_rad_(M_PI),
+      max_range_squared_(10000.0)
 {
     inf_bound         = 10;
     N_SCANS           = 6;
@@ -42,6 +50,41 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
     lidar_type       = lid_type;
     blind            = bld;
     point_filter_num = pfilt_num;
+}
+
+void Preprocess::setFovDegree(double fov)
+{
+    fov_degree = std::clamp(fov, 0.0, 360.0);
+    if (fov_degree >= 359.9)
+    {
+        fov_filter_en_ = false;
+        fov_half_rad_  = M_PI;
+        return;
+    }
+    fov_filter_en_ = true;
+    fov_half_rad_  = fov_degree * 0.5 * M_PI / 180.0;
+}
+
+void Preprocess::setMaxRange(double range)
+{
+    max_range = std::max(range, blind + 0.01);
+    max_range_squared_ = max_range * max_range;
+}
+
+bool Preprocess::inRange(float x, float y, float z) const
+{
+    const double squared = static_cast<double>(x) * x
+        + static_cast<double>(y) * y + static_cast<double>(z) * z;
+    return squared > blind * blind && squared <= max_range_squared_;
+}
+
+bool Preprocess::inFov(float x, float y) const
+{
+    if (!fov_filter_en_)
+    {
+        return true;
+    }
+    return std::abs(std::atan2(static_cast<double>(y), static_cast<double>(x))) <= fov_half_rad_;
 }
 
 void Preprocess::process(const pcl::PointCloud<livox_pcl::Point>& msg, robot::slam::CloudPtr& pcl_out)
@@ -83,8 +126,10 @@ void Preprocess::avia_handler(const pcl::PointCloud<livox_pcl::Point>& msg)
                 pl_full[i].curvature = msg.points[i].timestamp / float(1000000);  // use curvature as time of each laser points
 
                 bool is_new = false;
-                if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
-                    || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
+                if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
+                        || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
+                    && inFov(pl_full[i].x, pl_full[i].y)
+                    && inRange(pl_full[i].x, pl_full[i].y, pl_full[i].z))
                 {
                     pl_buff[msg.points[i].line].push_back(pl_full[i]);
                 }
@@ -137,7 +182,8 @@ void Preprocess::avia_handler(const pcl::PointCloud<livox_pcl::Point>& msg)
 
                     if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
                             || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
-                        && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
+                        && inRange(pl_full[i].x, pl_full[i].y, pl_full[i].z)
+                        && inFov(pl_full[i].x, pl_full[i].y))
                     {
                         pl_surf.push_back(pl_full[i]);
                     }

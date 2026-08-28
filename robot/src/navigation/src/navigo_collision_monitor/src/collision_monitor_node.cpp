@@ -34,7 +34,10 @@ CollisionMonitor::CollisionMonitor(const rclcpp::NodeOptions & options)
   process_active_(false), robot_action_prev_{DO_NOTHING, {-1.0, -1.0, -1.0}},
   stop_stamp_{0, 0, get_clock()->get_clock_type()}, stop_pub_timeout_(1.0, 0.0),
   stop_confirmation_cycles_(1), stop_detection_count_(0),
-  allow_rotation_recovery_(false), allow_reverse_recovery_(false)
+  allow_rotation_recovery_(false), allow_reverse_recovery_(false),
+  require_healthy_localization_(true), localization_timeout_(0.50),
+  loc_seen_(false), loc_status_(0),
+  last_loc_stamp_{0, 0, get_clock()->get_clock_type()}
 {
 }
 
@@ -70,6 +73,21 @@ CollisionMonitor::on_configure(const rclcpp_lifecycle::State & /*state*/)
     std::bind(&CollisionMonitor::cmdVelInCallback, this, std::placeholders::_1));
   cmd_vel_out_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
     cmd_vel_out_topic, 1);
+
+  if (require_healthy_localization_) {
+    std::string localization_topic;
+    navigo_util::declare_parameter_if_not_declared(
+      shared_from_this(), "localization_topic",
+      rclcpp::ParameterValue(std::string("/localization_info")));
+    localization_topic = get_parameter("localization_topic").as_string();
+    localization_sub_ = this->create_subscription<robots_dog_msgs::msg::Localization>(
+      localization_topic, 10,
+      std::bind(&CollisionMonitor::localizationCallback, this, std::placeholders::_1));
+    RCLCPP_INFO(
+      get_logger(),
+      "Collision monitor will zero cmd_vel unless localization status=3 (topic %s, timeout %.2fs)",
+      localization_topic.c_str(), localization_timeout_);
+  }
 
   return navigo_util::CallbackReturn::SUCCESS;
 }
@@ -133,6 +151,7 @@ CollisionMonitor::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 
   cmd_vel_in_sub_.reset();
   cmd_vel_out_pub_.reset();
+  localization_sub_.reset();
 
   polygons_.clear();
   sources_.clear();
@@ -236,6 +255,12 @@ bool CollisionMonitor::getParameters(
   navigo_util::declare_parameter_if_not_declared(
     node, "allow_reverse_recovery", rclcpp::ParameterValue(false));
   allow_reverse_recovery_ = get_parameter("allow_reverse_recovery").as_bool();
+  navigo_util::declare_parameter_if_not_declared(
+    node, "require_healthy_localization", rclcpp::ParameterValue(true));
+  require_healthy_localization_ = get_parameter("require_healthy_localization").as_bool();
+  navigo_util::declare_parameter_if_not_declared(
+    node, "localization_timeout", rclcpp::ParameterValue(0.50));
+  localization_timeout_ = get_parameter("localization_timeout").as_double();
 
   if (!configurePolygons(base_frame_id, transform_tolerance)) {
     return false;
@@ -363,6 +388,27 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
 
   // Do nothing if main worker in non-active state
   if (!process_active_) {
+    return;
+  }
+
+  if (!localizationAllowsMotion()) {
+    uint8_t status = 0;
+    bool seen = false;
+    {
+      std::lock_guard<std::mutex> lock(localization_mutex_);
+      status = loc_status_;
+      seen = loc_seen_;
+    }
+    Action stop_action{STOP, {0.0, 0.0, 0.0}};
+    if (robot_action_prev_.action_type != STOP) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Zeroing cmd_vel: localization is not Normal (status=%u seen=%s)",
+        status, seen ? "true" : "false");
+    }
+    publishVelocity(stop_action);
+    publishPolygons();
+    robot_action_prev_ = stop_action;
     return;
   }
 
@@ -530,6 +576,34 @@ void CollisionMonitor::publishPolygons() const
       polygon->publish();
     }
   }
+}
+
+void CollisionMonitor::localizationCallback(
+  robots_dog_msgs::msg::Localization::ConstSharedPtr msg)
+{
+  if (!msg) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(localization_mutex_);
+  loc_seen_ = true;
+  loc_status_ = msg->status;
+  last_loc_stamp_ = this->now();
+}
+
+bool CollisionMonitor::localizationAllowsMotion() const
+{
+  if (!require_healthy_localization_) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(localization_mutex_);
+  if (!loc_seen_) {
+    return false;
+  }
+  const double age = (this->now() - last_loc_stamp_).seconds();
+  if (!std::isfinite(age) || age > localization_timeout_) {
+    return false;
+  }
+  return loc_status_ == 3;
 }
 
 }  // namespace navigo_collision_monitor

@@ -6,6 +6,10 @@
 #ifndef KKL_UNSCENTED_KALMAN_FILTER_X_HPP
 #define KKL_UNSCENTED_KALMAN_FILTER_X_HPP
 
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <limits>
 #include <random>
 #include <Eigen/Dense>
 
@@ -99,6 +103,7 @@ public:
 
     mean = mean_pred;
     cov = cov_pred;
+    finalizeUpdate("predict");
   }
 
   /**
@@ -132,6 +137,7 @@ public:
 
     mean = mean_pred;
     cov = cov_pred;
+    finalizeUpdate("predict");
   }
 
   /**
@@ -174,7 +180,12 @@ public:
       sigma += ext_weights[i] * (diffA * diffB.transpose());
     }
 
-    kalman_gain = sigma * expected_measurement_cov.inverse();
+    Eigen::LDLT<MatrixXt> measurement_ldlt(expected_measurement_cov);
+    if (measurement_ldlt.info() != Eigen::Success) {
+      finalizeUpdate("correct_skipped_singular_measurement");
+      return;
+    }
+    kalman_gain = sigma * measurement_ldlt.solve(MatrixXt::Identity(K, K));
     const auto& K = kalman_gain;
 
     VectorXt ext_mean = ext_mean_pred + K * (measurement - expected_measurement_mean);
@@ -182,6 +193,7 @@ public:
 
     mean = ext_mean.topLeftCorner(N, 1);
     cov = ext_cov.topLeftCorner(N, N);
+    finalizeUpdate("correct");
   }
 
   /*			getter			*/
@@ -232,20 +244,59 @@ public:
   MatrixXt expected_measurements;
 
 private:
+  void finalizeUpdate(const char* where) {
+    ensurePositiveFinite(cov);
+    if (!mean.allFinite() || !cov.allFinite()) {
+      recoverFromNonFinite(where);
+    }
+  }
+
+  void recoverFromNonFinite(const char* where) {
+    std::cerr << "[UKF] non-finite state in " << where << "; resetting covariance" << std::endl;
+    for (int i = 0; i < mean.size(); ++i) {
+      if (!std::isfinite(mean(i))) {
+        mean(i) = T(0);
+      }
+    }
+    cov = MatrixXt::Identity(N, N) * T(0.01);
+  }
+
   /**
    * @brief compute sigma points
    * @param mean          mean
    * @param cov           covariance
    * @param sigma_points  calculated sigma points
    */
-  void computeSigmaPoints(const VectorXt& mean, const MatrixXt& cov, MatrixXt& sigma_points) {
+  void computeSigmaPoints(const VectorXt& mean, const MatrixXt& cov_in, MatrixXt& sigma_points) {
     const int n = mean.size();
-    assert(cov.rows() == n && cov.cols() == n);
+    if (cov_in.rows() != n || cov_in.cols() != n || sigma_points.cols() != n) {
+      return;
+    }
 
+    MatrixXt scaled = (n + lambda) * cov_in;
     Eigen::LLT<MatrixXt> llt;
-    llt.compute((n + lambda) * cov);
-    MatrixXt l = llt.matrixL();
+    llt.compute(scaled);
+    if (llt.info() != Eigen::Success) {
+      MatrixXt repaired = cov_in;
+      ensurePositiveFinite(repaired);
+      scaled = (n + lambda) * repaired;
+      llt.compute(scaled);
+    }
+    if (llt.info() != Eigen::Success) {
+      sigma_points.row(0) = mean;
+      for (int i = 0; i < n; i++) {
+        const T delta = std::sqrt(std::max(T(1e-9), scaled(i, i)));
+        VectorXt plus = mean;
+        VectorXt minus = mean;
+        plus(i) += delta;
+        minus(i) -= delta;
+        sigma_points.row(1 + i * 2) = plus;
+        sigma_points.row(1 + i * 2 + 1) = minus;
+      }
+      return;
+    }
 
+    MatrixXt l = llt.matrixL();
     sigma_points.row(0) = mean;
     for (int i = 0; i < n; i++) {
       sigma_points.row(1 + i * 2) = mean + l.col(i);
@@ -254,23 +305,49 @@ private:
   }
 
   /**
-   * @brief make covariance matrix positive finite
-   * @param cov  covariance matrix
+   * @brief make covariance matrix symmetric, finite, and positive definite
+   *
+   * The previous implementation returned immediately, so Cholesky of a
+   * quaternion-UKF covariance that had lost positive-definiteness aborted
+   * the localization node right after the first IMU predict.
    */
   void ensurePositiveFinite(MatrixXt& cov) {
-    return;
-    const double eps = 1e-9;
-
-    Eigen::EigenSolver<MatrixXt> solver(cov);
-    MatrixXt D = solver.pseudoEigenvalueMatrix();
-    MatrixXt V = solver.pseudoEigenvectors();
-    for (int i = 0; i < D.rows(); i++) {
-      if (D(i, i) < eps) {
-        D(i, i) = eps;
+    const int n = cov.rows();
+    if (n == 0 || cov.cols() != n) {
+      return;
+    }
+    for (int i = 0; i < n; ++i) {
+      for (int j = 0; j < n; ++j) {
+        if (!std::isfinite(cov(i, j))) {
+          cov(i, j) = (i == j) ? T(0.01) : T(0);
+        }
       }
     }
+    cov = T(0.5) * (cov + cov.transpose().eval());
 
-    cov = V * D * V.inverse();
+    Eigen::LLT<MatrixXt> llt(cov);
+    if (llt.info() == Eigen::Success) {
+      return;
+    }
+
+    Eigen::SelfAdjointEigenSolver<MatrixXt> solver(cov);
+    const T eps = T(1e-9);
+    if (solver.info() != Eigen::Success) {
+      cov = MatrixXt::Identity(n, n) * T(0.01);
+      return;
+    }
+    VectorXt eigenvalues = solver.eigenvalues();
+    bool changed = false;
+    for (int i = 0; i < n; ++i) {
+      if (eigenvalues(i) < eps) {
+        eigenvalues(i) = eps;
+        changed = true;
+      }
+    }
+    if (changed) {
+      cov = solver.eigenvectors() * eigenvalues.asDiagonal() * solver.eigenvectors().transpose();
+      cov = T(0.5) * (cov + cov.transpose().eval());
+    }
   }
 
 public:
