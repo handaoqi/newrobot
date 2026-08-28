@@ -1,5 +1,11 @@
+import json
+import subprocess
+
+import pytest
+
 from roamerx_edge.config import NavigationStackConfig
 from roamerx_edge.navigation_stack_adapter import NavigationStackAdapter
+from roamerx_edge.protocol import ProtocolError
 
 
 def test_reload_map_is_deferred_when_mapping_stopped_consumers(tmp_path, monkeypatch):
@@ -78,3 +84,26 @@ def test_looks_ready_reads_tokens_after_verbose_cmd_vel_dump():
     verbose = "cmd_vel:\n" + ("Node name: ecal2ros2\n" * 200)
     stdout = verbose + _ready_status_stdout()
     assert adapter._looks_ready(stdout[-6000:]) is True
+
+
+def test_timeout_output_is_decoded_before_building_protocol_error(tmp_path, monkeypatch):
+    script = tmp_path / "nav.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(script)))
+
+    def raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=[str(script), "start"],
+            timeout=180,
+            output=b"partial stdout \xff",
+            stderr=b"sensor lock timed out",
+        )
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+
+    with pytest.raises(ProtocolError) as captured:
+        adapter._run("start", timeout_seconds=180)
+
+    assert captured.value.code == "NAV_COMMAND_FAILED"
+    assert captured.value.message == "sensor lock timed out"
+    json.dumps({"error_message": captured.value.message})

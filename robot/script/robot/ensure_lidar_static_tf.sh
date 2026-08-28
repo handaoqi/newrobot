@@ -6,18 +6,21 @@ LOCK_FILE="${LIDAR_TF_LOCK_FILE:-/tmp/roamerx-lidar-static-tf.lock}"
 LOG_FILE="${LIDAR_TF_LOG_FILE:-/tmp/lidar_tf.log}"
 PROCESS_PATTERN='/static_transform_publisher .*base_link livox_frame'
 
+# Several sensor entrypoints may run concurrently during login, mapping, or
+# navigation startup. Serialize the check-and-start sequence so they cannot
+# each create a publisher before the other process becomes visible to pgrep.
+# The publisher is long-lived, so it must not inherit the lock descriptor.
+if [ "${LIDAR_TF_LOCK_HELD:-0}" != "1" ]; then
+  exec flock --exclusive --close "${LOCK_FILE}" \
+    env LIDAR_TF_LOCK_HELD=1 "$0" "$@"
+fi
+
 set +u
 source /opt/ros/humble/setup.bash
 source "${PROJECT_DIR}/install/setup.bash"
 set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
-
-# Several sensor entrypoints may run concurrently during login, mapping, or
-# navigation startup. Serialize the check-and-start sequence so they cannot
-# each create a publisher before the other process becomes visible to pgrep.
-exec 9>"${LOCK_FILE}"
-flock -x 9
 
 if pgrep -f "${PROCESS_PATTERN}" >/dev/null 2>&1; then
   exit 0

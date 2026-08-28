@@ -7,8 +7,14 @@ SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
 SENSOR_LOCK_FILE="${NAVIGATION_SENSOR_LOCK_FILE:-/tmp/roamerx-navigation-sensors.lock}"
-exec 7>"${SENSOR_LOCK_FILE}"
-flock -x 7
+if [ "${NAVIGATION_SENSOR_LOCK_HELD:-0}" != "1" ]; then
+  # Let flock retain the lock while this script runs, but close its lock fd in
+  # the child.  The sensor helpers intentionally start long-lived background
+  # processes; inheriting the fd there would keep the lock held forever after
+  # this script returns and make every later navigation restart hang.
+  exec flock --exclusive --close "${SENSOR_LOCK_FILE}" \
+    env NAVIGATION_SENSOR_LOCK_HELD=1 "$0" "$@"
+fi
 
 "${SCRIPT_DIR}/ensure_mapping_sensors.sh"
 

@@ -7,6 +7,15 @@ SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 # charging-standby cycle. Avoid treating a healthy cold start as a failure.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
+SENSOR_LOCK_FILE="${MAPPING_SENSOR_LOCK_FILE:-/tmp/roamerx-mapping-sensors.lock}"
+if [ "${MAPPING_SENSOR_LOCK_HELD:-0}" != "1" ]; then
+  # Sensor launchers run in the background.  Keep the lock in flock itself
+  # and close its fd in this script so those long-lived children cannot retain
+  # the lock after readiness checks finish.
+  exec flock --exclusive --close "${SENSOR_LOCK_FILE}" \
+    env MAPPING_SENSOR_LOCK_HELD=1 "$0" "$@"
+fi
+
 set +u
 source /opt/ros/humble/setup.bash
 source /opt/robot-driver/install/setup.bash
@@ -14,10 +23,6 @@ source "${PROJECT_DIR}/install/setup.bash"
 set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
-
-SENSOR_LOCK_FILE="${MAPPING_SENSOR_LOCK_FILE:-/tmp/roamerx-mapping-sensors.lock}"
-exec 8>"${SENSOR_LOCK_FILE}"
-flock -x 8
 
 if ! pgrep -x rmw_zenohd >/dev/null 2>&1; then
   echo "ERROR: rmw_zenohd is not running" >&2

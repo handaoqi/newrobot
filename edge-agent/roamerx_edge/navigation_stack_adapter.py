@@ -134,6 +134,15 @@ class NavigationStackAdapter:
         )
         return all(token in stdout for token in required)
 
+    @staticmethod
+    def _decode_subprocess_output(value: str | bytes | None) -> str:
+        """Normalize TimeoutExpired output so command results stay JSON-safe."""
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value
+
     def _run(self, action: str, *, timeout_seconds: int) -> dict:
         script = Path(self.config.script_path).expanduser()
         if not script.exists():
@@ -151,8 +160,8 @@ class NavigationStackAdapter:
             payload = {
                 "action": action,
                 "returncode": 124,
-                "stdout": (exc.stdout or "")[-6000:],
-                "stderr": (exc.stderr or "")[-6000:],
+                "stdout": self._decode_subprocess_output(exc.stdout)[-6000:],
+                "stderr": self._decode_subprocess_output(exc.stderr)[-6000:],
             }
             raise ProtocolError(
                 "NAV_COMMAND_FAILED",
