@@ -58,8 +58,11 @@ localization:
     tf_future_offset: 0.25
     
     # topic name
-    odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom 
+    odom_topic: "/odom/localization_odom"        #"/odom/current_pose"   /odom/localization_odom
     aligned_points_topic: "/aligned_points"
+    # NDT/FastVGICP 的绝对配准结果。/status 里的 relative_pose 是刻意降级成的帧间增量
+    # （给连续性门限用），回放时无法还原绝对校验位姿，所以单开一个话题。
+    scan_match_pose_topic: "/localization/scan_match_pose"
     localization_info_topic: "/localization_info"
     global_map_points_topic: "/global_map_points"
 

@@ -27,6 +27,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 
 #include <pcl/filters/voxel_grid.h>
@@ -172,6 +173,8 @@ public:
     lidar_odom_topic_                   = declare_parameter<std::string>("lidar_odometry_prediction.topic", "/odom/lidar_odom");
     std::string aligned_points_topic    = declare_parameter<std::string>("aligned_points_topic", "/aligned_points");
     std::string status_topic            = declare_parameter<std::string>("status_topic", "/status");
+    // Absolute NDT/VGICP result. /status carries only the frame-to-frame delta.
+    std::string scan_match_pose_topic   = declare_parameter<std::string>("scan_match_pose_topic", "/localization/scan_match_pose");
     std::string localization_info_topic = declare_parameter<std::string>("localization_info_topic", "/localization_info");
     std::string global_map_points_topic = declare_parameter<std::string>("global_map_points_topic", "/global_map_points");
     std::string gnss_topic              = declare_parameter<std::string>("gnss_topic", "/fix");
@@ -443,6 +446,7 @@ public:
     lidar_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(lidar_odom_topic_, 5);
     aligned_pub = create_publisher<sensor_msgs::msg::PointCloud2>(aligned_points_topic, 5);
     status_pub  = create_publisher<localization::msg::ScanMatchingStatus>(status_topic, 5);
+    scan_match_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(scan_match_pose_topic, 5);
 
     localization_state_srv_ = this->create_service<robots_dog_msgs::srv::LocalizationState>(
             "/localization_state/service",
@@ -3259,6 +3263,25 @@ private:
       status.prediction_labels.back().data = "lidar_odom";
       status.prediction_errors.push_back(tf2::eigenToTransform(Eigen::Isometry3d(pose_estimator->lidar_odometry_prediction_error().get().cast<double>())).transform);
     }
+    // NDT/VGICP produced an absolute map pose in final_transform, but the
+    // ScanMatchingStatus above deliberately reduces it to a frame-to-frame delta
+    // for its continuity gate, so the absolute match cannot be recovered from a
+    // recorded bag. Publish it on its own topic rather than extending
+    // ScanMatchingStatus: the Edge Agent subscribes to that message
+    // (ros_adapter.py scan_matching_status_topic), and a new field would change
+    // its type hash and force a lockstep restart of both sides.
+    if (final_transform.allFinite()) {
+      const geometry_msgs::msg::Transform matched =
+        tf2::eigenToTransform(Eigen::Isometry3d(final_transform.cast<double>())).transform;
+      geometry_msgs::msg::PoseStamped scan_match_pose;
+      scan_match_pose.header.stamp = header.stamp;
+      scan_match_pose.header.frame_id = "map";
+      scan_match_pose.pose.position.x = matched.translation.x;
+      scan_match_pose.pose.position.y = matched.translation.y;
+      scan_match_pose.pose.position.z = matched.translation.z;
+      scan_match_pose.pose.orientation = matched.rotation;
+      scan_match_pose_pub_->publish(scan_match_pose);
+    }
     status_pub->publish(status);
   }
 
@@ -3617,6 +3640,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            lio_odom_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         aligned_pub;
   rclcpp::Publisher<localization::msg::ScanMatchingStatus>::SharedPtr status_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr scan_match_pose_pub_;
   rclcpp::Publisher<robots_dog_msgs::msg::Localization>::SharedPtr    localization_info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         global_map_pub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr              localization_policy_sub_;

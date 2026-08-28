@@ -12,6 +12,8 @@ export STATE_DIR="${STATE_DIR:-/tmp/roamerx_navigation_rosbag}"
 # pruned segment MPPI was tracking (see navigo_mppi_controller/controller.cpp).
 # /cmd_vel_raw -> /cmd_vel spans collision_monitor, so its interventions show up
 # as the difference between the two.
-export ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-/localization_info /status /laser_scan /odom/nav2 /plan /transformed_global_plan /cmd_vel /cmd_vel_raw}"
+# /status carries the scan-match quality flags but only a frame-to-frame delta
+# pose, so /localization/scan_match_pose carries the absolute NDT/VGICP result.
+export ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-/localization_info /status /localization/scan_match_pose /laser_scan /odom/nav2 /plan /transformed_global_plan /cmd_vel /cmd_vel_raw}"
 
 exec "$(dirname "$0")/mapping_rosbag.sh" "$@"
