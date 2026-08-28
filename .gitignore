@@ -33,6 +33,7 @@ known_hosts*
 /.codex-dev-agent/
 /.npm/
 /.dbus/
+/.dotnet/
 /.cache/
 /.config/
 /.local/
