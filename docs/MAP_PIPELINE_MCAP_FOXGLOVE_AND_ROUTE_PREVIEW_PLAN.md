@@ -67,7 +67,10 @@ fi
 
 **这是本方案里最紧急的一项，优先级高于 mcap 切换本身。**
 
-### 1.2 切换到 mcap
+### 1.2 切换到 mcap（2026-08-28 已实现）
+
+> **实现状态**：已落代码，默认即 mcap + Zstd/Fastest。本节原来的两句判断经实测后是错的，
+> 已就地更正——见下面的"实测"与"坑"。
 
 前置条件**已满足**（已实机验证）：
 
@@ -75,20 +78,62 @@ fi
 /opt/ros/humble/lib/librosbag2_storage_mcap.so           存在
 ros-humble-rosbag2-storage-mcap  0.15.16-1jammy          已安装
 ros-humble-mcap-vendor           0.15.16-1jammy          已安装
+rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_readers()
 ```
 
-当前 `mapping_rosbag.sh:110` 的 `ros2 bag record` **不带 `-s` 参数**，默认走 sqlite3，产出 `.db3`。
+#### 实测（NX，8 核，真实包 `20260808_002915_task_0f7411c4`，317 s / 1727 MB）
 
-**改动点**
+五种写入器都用 `ros2 bag convert` 跑同一个源包，读侧成本完全相同，差值即写入器本身：
 
-1. `robot/script/robot/mapping_rosbag.sh` — `ros2 bag record` 加 `-s mcap`。建议做成可配置（`ROSBAG_STORAGE=${ROSBAG_STORAGE:-mcap}`），便于回退。
-2. `edge-agent/roamerx_edge/recording_manifest.py:84` — 当前直接用 `sqlite3.connect(f"file:{db}?mode=ro", uri=True)` 打开 `.db3` 查 `/fix` 时间戳区间（`_rtk_valid_intervals`）。这段必须改为走 `rosbag2_py.SequentialReader`，才能同时支持两种格式。
-3. **存量兼容**：磁盘上 59 个 `.db3` 包不能失效。`recording_manifest.py` 需要按 `metadata.yaml` 里的 `storage_identifier` 分派，`.db3` 走旧路径、`.mcap` 走新路径。
-4. `robot/script/robot/replay_mapping_rosbag.sh` 和 `replay_navigation_inputs.py`（后者硬编码了 `storage_id="sqlite3"`）需同步适配。
+| 写入器 | user | sys | CPU 合计 | 体积 |
+| --- | --- | --- | --- | --- |
+| sqlite3（切换前） | 4.29 | **9.24** | **13.53 s** | 1727 MB |
+| mcap，不给配置 | 1.45 | 4.43 | 5.87 s | 1716 MB |
+| mcap `compression: None` | 1.57 | 4.46 | 6.03 s | 1716 MB |
+| mcap Lz4/Fastest | 4.48 | 2.91 | 7.38 s | 981 MB |
+| **mcap Zstd/Fastest（已采用）** | 5.53 | 2.58 | **8.11 s** | **865 MB** |
+| mcap Zstd/Default | 8.35 | 2.59 | 10.94 s | 733 MB |
 
-**收益**：mcap 是 Foxglove 的原生格式，可直接拖进 Foxglove 打开，无需转换；压缩率和随机读性能均优于 sqlite3，对 34 GB 的存量问题也有帮助。
+原文写的"压缩率和随机读性能均优于 sqlite3"只有一半对。准确的说法是：**sqlite3 是 CPU 最贵的一档，
+而且一分钱压缩都没换到**——它 68% 的开销在 `sys`，每条消息一次 B-tree 行插入，带自己的 page cache
+和 journal。即使开 Zstd/Default，mcap 总 CPU 仍比 sqlite3 低 19%。选 Zstd/Fastest：CPU 低 40%，
+体积减半，19.4 GB/h → 9.7 GB/h。
 
-**风险**：低。`.gitignore:24-26` 已经同时排除 `*.bag` / `*.db3` / `*.mcap`，不会误提交。
+#### 坑：只给 `-s mcap` 拿不到任何体积收益
+
+原文改动点 1 建议的"加 `-s mcap`"是不够的。实测默认输出与显式 `compression: "None"` 只差 6 字节
+（1716291991 vs 1716291997），文件头里也没有压缩标记（只有显式 Zstd 那份才有 `zstd`）。
+压缩必须显式命名，否则只是"更快但同样占 19.4 GB/h"。
+
+#### 实现落点
+
+| 文件 | 改动 |
+| --- | --- |
+| `robot/script/robot/rosbag_storage_mcap.yaml` | 新增。`compression: Zstd` / `compressionLevel: Fastest` / `chunkSize: 786432`（768 KiB 而非默认 4 MiB：mcap 按 chunk 落盘，这把掉电敞口压到 ~0.14 s；上表 865 MB 已含小 chunk 的压缩惩罚） |
+| `robot/script/robot/mapping_rosbag.sh` | `ROSBAG_STORAGE=${ROSBAG_STORAGE:-mcap}`，`ros2 bag record` 加 `-s` 与（仅 mcap 时）`--storage-config-file`；`stop` 的 SIGTERM 分支补注释与告警 |
+| `edge-agent/roamerx_edge/recording_manifest.py` | `_rtk_valid_intervals` 按 `storage_identifier` 分派：`sqlite3` 走原有直连查询（存量包零风险），其余走 `rosbag2_py.SequentialReader` + `StorageFilter(["/fix"])`。`import rosbag2_py` 在函数内且 `try/except`，因为 `scripts/test_agents.sh` 用裸 `python3` 跑 |
+| `robot/script/robot/replay_navigation_inputs.py` | `storage_id="sqlite3"` → `""`（按 `metadata.yaml` 自动判别，新旧包通吃） |
+| `robot/src/tools/roamerx_patrol_demo/.../bag_contract.py` | `db3_files` → `data_files`，同时接受 `*.db3` 与 `*.mcap`；`test_bag_contract.py` 补两例 |
+
+`replay_mapping_rosbag.sh` 无需改动：它用 `ros2 bag play "$BAG_DIR"` 读 `metadata.yaml`，本就格式无关。
+`prune_runtime_storage.py` 同理，按目录字节数算。
+
+**回退**：`ROSBAG_STORAGE=sqlite3` 一个环境变量。存量 59 个 `.db3` 包的读取路径全部保留，不做转换。
+
+**未采用**：`--compression-mode/--compression-format` 是 rosbag2 在存储插件之外再套一层 zstd，
+产出必须先解压才能读的 `.db3.zstd`，与 mcap 内建分块压缩重复且更差。
+
+**验证**（2026-08-28，未启动任何服务）：把上述真实包转成 mcap（1.7 G → 826 M），对产物跑
+`ros2 bag info`（storage id `mcap`、317.07 s、167278 条，与源包逐条相等）、
+`write_recording_manifest()`（`rtk_valid_intervals` 与 sqlite3 原包**逐字段相同**：3162 个样本，
+起止时间戳到纳秒一致）、`inspect_bag_directory()`、`replay_navigation_inputs.py`（`ROS_DOMAIN_ID=77`，
+发出 609 条）。产物已删除。**尚未做实录验证**，见 §1.2 遗留。
+
+**遗留**：需要一次有人看着的实录，核对码率是否落在 ~2.7 MB/s、`stop` 走的是 SIGINT 而非 30 秒超时。
+mcap 关闭时要写 summary 段，超时后的 `kill -TERM` 会留下需要 `mcap recover` 的文件，而 sqlite3 被硬杀
+只丢最后一个事务——这是本次切换唯一的行为退化，已在脚本注释与告警里标注。
+
+**风险**：低。`.gitignore:52-54` 已经同时排除 `*.bag` / `*.db3` / `*.mcap`，不会误提交。
 
 ### 1.3 生命周期管理（2026-08-25 已实现）
 

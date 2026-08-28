@@ -11,6 +11,14 @@ MIN_FREE_GB="${MIN_FREE_GB:-10}"
 # "mapping stops working".
 PRUNE_TOOL="${PRUNE_TOOL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prune_runtime_storage.py}"
 PRUNE_ENABLED="${PRUNE_ENABLED:-1}"
+# mcap costs less CPU than sqlite3 *and* halves the bag, measured on this NX:
+# 8.11s vs 13.53s of CPU and 865 MB vs 1727 MB for the same 317 s recording.
+# See rosbag_storage_mcap.yaml for the full table and for why the config file is
+# mandatory - `-s mcap` on its own compresses nothing.
+# Set ROSBAG_STORAGE=sqlite3 to fall back; every reader in this repo dispatches
+# on metadata.yaml, so the two formats coexist and old .db3 bags stay readable.
+ROSBAG_STORAGE="${ROSBAG_STORAGE:-mcap}"
+ROSBAG_STORAGE_CONF="${ROSBAG_STORAGE_CONF:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rosbag_storage_mcap.yaml}"
 PRUNE_TRIGGER_GB="${PRUNE_TRIGGER_GB:-$((MIN_FREE_GB * 2))}"
 PID_FILE="${STATE_DIR}/recorder.pid"
 SESSION_FILE="${STATE_DIR}/session.env"
@@ -162,11 +170,33 @@ start_recording() {
   source "${PROJECT_DIR}/install/setup.bash"
   set -u
 
-  # Both phases run robot_slam, so the odometry pair below is always available:
-  # /odom/lio_odom is the FAST-LIO2 frontend output that feeds the localization
-  # UKF (config.yaml lio_primary.topic), /slam_odom is the backend-corrected
-  # pose. Recording only the latter makes frontend drift indistinguishable from
-  # a bad backend correction.
+  # Both phases run robot_slam, so the odometry below is always available.
+  # /odom/lio_odom and /slam_odom carry the same FAST-LIO2 frontend pose:
+  # mapping_alg.cpp publish_odometry() copies odomAftMapped into both and only
+  # relabels frame_id (map->body vs lio_odom->base_link). Both are still worth
+  # recording because the localization UKF subscribes to /odom/lio_odom
+  # specifically (config.yaml lio_primary.topic), so a replay has to reproduce
+  # that topic's own stream and arrival timing.
+  # /odom/localization_odom changes owner by phase: robot_slam republishes
+  # odomAftMapped on it while mapping, and the localization UKF owns it during
+  # navigation (mapping_alg.cpp only creates that publisher when
+  # !frontend.odometry_only).
+  #
+  # The /slam/* group is the only record of what the GTSAM backend did; the
+  # frontend never sees its result (publish_odometry logs
+  # frontend_pose_correction=disabled), so loop closure is invisible in the three
+  # odometry topics above. global_optimized_path is the whole corrected
+  # trajectory to diff against /path, global_optimized_odom adds the covariance
+  # for its last pose, and global_optimization_status is the staged JSON carrying
+  # loop_closure_count and the per-class factor counts. All three fire only from
+  # writeGlobalOptimizationOutputs()/globalOptimizeCallBack() at map save, so the
+  # recorder has to still be running when the session is saved.
+  # divergence_event is not save-time and not mapping-only: it fires whenever
+  # SLAM drops into SAFE_HOLD, including under frontend.odometry_only during
+  # navigation.
+  # The two String topics are published transient_local depth 1; rosbag2 adapts
+  # to the offered QoS, and a transient_local publisher satisfies a volatile
+  # subscriber, so no --qos-profile-overrides is needed.
   local -a topics=(
     /front_lidar
     /front_lidar/imu
@@ -176,6 +206,10 @@ start_recording() {
     /odom/lio_odom
     /odom/localization_odom
     /slam_odom
+    /slam/global_optimized_odom
+    /slam/global_optimized_path
+    /slam/global_optimization_status
+    /slam/divergence_event
     /tf
     /tf_static
   )
@@ -185,7 +219,20 @@ start_recording() {
     topics+=("${extra_topics[@]}")
   fi
 
+  # Only mcap reads this file; passing it with -s sqlite3 makes rosbag2 abort.
+  local -a storage_args=(-s "${ROSBAG_STORAGE}")
+  if [ "${ROSBAG_STORAGE}" = "mcap" ]; then
+    if [ -f "${ROSBAG_STORAGE_CONF}" ]; then
+      storage_args+=(--storage-config-file "${ROSBAG_STORAGE_CONF}")
+    else
+      # Recording uncompressed is far better than not recording, but the whole
+      # point of mcap here is the compression, so say so.
+      echo "WARNING: ${ROSBAG_STORAGE_CONF} is missing; mcap will not compress" >&2
+    fi
+  fi
+
   setsid ros2 bag record \
+    "${storage_args[@]}" \
     -o "${bag_dir}" \
     "${topics[@]}" \
     >"${LOG_FILE}" 2>&1 < /dev/null &
@@ -210,12 +257,19 @@ stop_recording() {
   if is_running; then
     local pid
     pid="$(cat "${PID_FILE}")"
+    # SIGINT is the graceful path and is what closes an mcap file properly: the
+    # writer appends the summary section on shutdown, and a bag without it needs
+    # `mcap recover` before it can be read. The SIGTERM below is the 30-second
+    # escape hatch and does leave such a file, where sqlite3 would only have lost
+    # its last transaction. The timeout is generous enough that reaching it means
+    # something is already wrong, so it is left as is rather than made longer.
     kill -INT -- "-${pid}" 2>/dev/null || kill -INT "${pid}" 2>/dev/null || true
     for _ in $(seq 1 30); do
       kill -0 "${pid}" 2>/dev/null || break
       sleep 1
     done
     if kill -0 "${pid}" 2>/dev/null; then
+      echo "WARNING: recorder ignored SIGINT for 30s; SIGTERM may truncate ${BAG_DIR}" >&2
       kill -TERM -- "-${pid}" 2>/dev/null || true
     fi
   fi

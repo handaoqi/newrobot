@@ -38,8 +38,10 @@ def main():
     }
 
     reader = rosbag2_py.SequentialReader()
+    # An empty storage_id makes rosbag2 use the plugin named in metadata.yaml,
+    # so this reads both the mcap bags recorded now and the older sqlite3 ones.
     reader.open(
-        rosbag2_py.StorageOptions(uri=args.bag, storage_id="sqlite3"),
+        rosbag2_py.StorageOptions(uri=args.bag, storage_id=""),
         rosbag2_py.ConverterOptions("cdr", "cdr"),
     )
     first_ns = None

@@ -1,0 +1,27 @@
+# mcap storage plugin options for ros2 bag record (--storage-config-file).
+#
+# Measured on this NX against a real 317 s / 1727 MB navigation bag, converting
+# with ros2 bag convert so every run pays the same sqlite3 read cost and the
+# difference is the writer alone:
+#
+#   writer                 user    sys    CPU    size
+#   sqlite3 (previous)     4.29    9.24   13.53s 1727 MB
+#   mcap, no config        1.45    4.43    5.87s 1716 MB
+#   mcap Lz4/Fastest       4.48    2.91    7.38s  981 MB
+#   mcap Zstd/Fastest      5.53    2.58    8.11s  865 MB   <- this file
+#   mcap Zstd/Default      8.35    2.59   10.94s  733 MB
+#
+# sqlite3 was the most expensive writer and compressed nothing. Note the second
+# row: giving `-s mcap` without this file produces output byte-for-byte the same
+# size as compression "None" (1716291991 vs 1716291997) with no zstd marker in
+# the file header, i.e. faster but still 19.4 GB/hour. The compression has to be
+# named explicitly.
+compression: "Zstd"
+# Zstd/Default buys another 15% off the size for 35% more CPU; at 5.4 MB/s the
+# disk is the scarce resource but not that scarce.
+compressionLevel: "Fastest"
+# 768 KiB rather than the 4 MiB default. mcap flushes a whole chunk at a time,
+# so an unclean shutdown loses whatever is buffered; this bounds that to ~0.14 s
+# at the measured 5.39 MB/s. The 865 MB above was measured with this value, so
+# the small-chunk compression penalty is already priced in.
+chunkSize: 786432

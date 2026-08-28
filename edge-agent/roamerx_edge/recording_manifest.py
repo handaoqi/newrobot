@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+LOGGER = logging.getLogger(__name__)
 
 REQUIRED_TOPICS = (
     "/front_lidar",
@@ -75,6 +78,15 @@ def write_recording_manifest(bag_dir: str | Path, output_path: str | Path | None
 
 
 def _rtk_valid_intervals(bag: Path, info: dict) -> list[dict]:
+    """Timestamps of every /fix message in the bag, whatever the storage format.
+
+    Bags recorded before the mcap switch are sqlite3 and keep the direct .db3
+    query below: it needs no ROS runtime and is what the existing bags on disk
+    were validated against. Anything else goes through rosbag2_py, which reads
+    the plugin out of metadata.yaml.
+    """
+    if str(info.get("storage_identifier") or "sqlite3") != "sqlite3":
+        return _rtk_valid_intervals_rosbag2(bag)
     db_files = [bag / name for name in (info.get("relative_file_paths") or []) if str(name).endswith(".db3")]
     if not db_files:
         db_files = list(bag.glob("*.db3"))
@@ -99,6 +111,41 @@ def _rtk_valid_intervals(bag: Path, info: dict) -> list[dict]:
         return []
     finally:
         connection.close()
+    return _intervals_from_stamps(stamps)
+
+
+def _rtk_valid_intervals_rosbag2(bag: Path) -> list[dict]:
+    # Imported lazily: scripts/test_agents.sh runs on a bare python3 and this
+    # module must stay importable without a ROS environment. Every failure
+    # degrades to "no intervals", matching what the sqlite3 path already does.
+    try:
+        import rosbag2_py
+    except ImportError:
+        LOGGER.warning("rosbag2_py unavailable; skipping RTK intervals for %s", bag)
+        return []
+    reader = rosbag2_py.SequentialReader()
+    try:
+        # An empty storage_id makes rosbag2 pick the plugin named in
+        # metadata.yaml, so this one call covers mcap and sqlite3 alike.
+        reader.open(
+            rosbag2_py.StorageOptions(uri=str(bag), storage_id=""),
+            rosbag2_py.ConverterOptions("cdr", "cdr"),
+        )
+        reader.set_filter(rosbag2_py.StorageFilter(topics=["/fix"]))
+        stamps = []
+        while reader.has_next():
+            _topic, _data, stamp_ns = reader.read_next()
+            stamps.append(int(stamp_ns) / 1e9)
+    except Exception as exc:  # noqa: BLE001 - storage plugins raise RuntimeError
+        LOGGER.warning("could not read /fix timestamps from %s: %s", bag, exc)
+        return []
+    finally:
+        del reader
+    stamps.sort()
+    return _intervals_from_stamps(stamps)
+
+
+def _intervals_from_stamps(stamps: list[float]) -> list[dict]:
     if not stamps:
         return []
     return [{"start_unix": stamps[0], "end_unix": stamps[-1], "sample_count": len(stamps), "source": "bag_fix_timestamps"}]
