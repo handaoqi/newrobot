@@ -1334,7 +1334,7 @@ watch(playUrlKey, () => {
 .guard-playback-controls button.active { border-color: #52d99c; background: rgba(16, 110, 73, .92); }
 .guard-playback-controls button:disabled { cursor: not-allowed; opacity: .48; }
 .guard-playback-controls small { position: absolute; top: calc(100% + 5px); left: 50%; width: max-content; max-width: 260px; padding: 4px 7px; color: #dbe8ee; background: rgba(10, 29, 41, .72); font-size: 11px; transform: translateX(-50%); }
-.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) minmax(360px, 1.15fr); align-items: center; gap: 12px; padding: 16px; }
+.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) minmax(240px, .65fr); align-items: center; gap: 12px; padding: 16px; }
 .guard-task-bar > div { display: grid; gap: 5px; min-width: 0; }
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1587,7 +1587,7 @@ watch(playUrlKey, () => {
     white-space: nowrap;
   }
   .guard-task-bar {
-    grid-template-columns: minmax(180px, 1.2fr) minmax(100px, .5fr) minmax(360px, 1.15fr);
+    grid-template-columns: minmax(180px, 1.2fr) minmax(100px, .5fr) minmax(240px, .65fr);
     gap: 10px;
     padding: 12px;
   }
@@ -1603,7 +1603,7 @@ watch(playUrlKey, () => {
     font-size: 12px;
   }
   .guard-task-actions {
-    grid-template-columns: repeat(3, minmax(108px, 1fr));
+    grid-template-columns: repeat(3, minmax(72px, 1fr));
     gap: 8px;
   }
   .guard-task-selector select {
