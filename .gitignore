@@ -21,6 +21,34 @@
 id_rsa*
 id_ed25519*
 known_hosts*
+
+# Repository root is also the development user's home directory. Keep local
+# shell, editor, agent and package-manager state out of project commits.
+/.Xauthority
+/.bash_history
+/.viminfo
+/.claude/
+/.claude.json
+/.codex/
+/.codex-dev-agent/
+/.npm/
+/.dbus/
+/.cache/
+/.config/
+/.local/
+/.ros/
+/.ssh/
+/.vscode-server/
+/.wget-hsts
+/.codex-robot-write-test
+/.bashrc.before-*
+/.profile.before-*
+
+# Local permission probes and generated symlink inventories.
+**/*.write_test
+**/_wtest
+/symlink_install_manifest.txt
+/robot/symlink_install_manifest.txt
 *.bag
 *.db3
 *.mcap
