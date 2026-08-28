@@ -905,3 +905,25 @@ def test_collision_monitor_speed_reduction_triggers_first_obstacle_speech(tmp_pa
     assert speech_events[0][1]["template_name"] == "发现障碍物"
     executor.stop()
     store.close()
+
+
+def test_report_docking_charge_emits_without_name_error(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    events = []
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    executor.context.docking = {"enabled": True, "final_waypoint_index": 1}
+
+    executor.report_docking_charge(
+        "task.docking_contact_checking", message="已到充电桩，正在检查蓝牙与极片"
+    )
+
+    docking_events = [event for event in events if event[0] == "task.docking_contact_checking"]
+    assert len(docking_events) == 1
+    executor.stop()
+    store.close()

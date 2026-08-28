@@ -357,12 +357,6 @@ class TaskExecutor:
             },
             "",
         )
-
-    def report_docking_charge(self, event_type: str, *, message: str = "", extra: dict | None = None) -> None:
-        """Publish charge-contact milestones for the platform docking dialog."""
-        with self._lock:
-            if self._is_docking_task():
-                self._emit(event_type, message=message, extra=extra)
         LOGGER.info(
             "obstacle speech episode=%s stage=%s attempt=%s distance=%s raw_planar=%s actual_planar=%s",
             self._obstacle_episode_id,
@@ -372,6 +366,12 @@ class TaskExecutor:
             observation.get("requested_planar_speed_mps"),
             observation.get("actual_planar_speed_mps"),
         )
+
+    def report_docking_charge(self, event_type: str, *, message: str = "", extra: dict | None = None) -> None:
+        """Publish charge-contact milestones for the platform docking dialog."""
+        with self._lock:
+            if self._is_docking_task():
+                self._emit(event_type, message=message, extra=extra)
 
     def report_startup_interruption(self) -> None:
         """Close the command lifecycle after an active task is recovered."""
