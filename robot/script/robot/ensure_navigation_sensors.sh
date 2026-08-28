@@ -6,6 +6,10 @@ SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 # Keep this aligned with the LiDAR/IMU cold-start readiness window.
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
 
+SENSOR_LOCK_FILE="${NAVIGATION_SENSOR_LOCK_FILE:-/tmp/roamerx-navigation-sensors.lock}"
+exec 7>"${SENSOR_LOCK_FILE}"
+flock -x 7
+
 "${SCRIPT_DIR}/ensure_mapping_sensors.sh"
 
 set +u

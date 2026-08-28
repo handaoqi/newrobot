@@ -292,7 +292,6 @@ start_stack() {
     if pgrep -f "ros2 launch localization localization.launch.py" >/dev/null 2>&1; then
       echo "Localization node is dead; clearing leftover launch and restarting."
       stop_localization
-      kill_pattern "static_transform_publisher.*base_link livox_frame"
     fi
     echo "Starting localization..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \

@@ -16,21 +16,18 @@ export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 stop_legacy_localization() {
   pkill -f '[r]os2 launch localization localization.launch.py' || true
   pkill -f '[l]ocalization_node' || true
-  pkill -f '[s]tatic_transform_publisher.*base_link livox_frame' || true
   sleep 2
 }
 
 case "${1:-status}" in
   start)
-    # Nav2 is deliberately not started here. This only changes the TF owner.
+    # Nav2 is deliberately not started here. This only changes the
+    # localization map/odom TF owner; the LiDAR extrinsic stays sensor-owned.
     stop_legacy_localization
+    "${SCRIPT_DIR}/ensure_lidar_static_tf.sh"
     setsid ros2 run localization localization_node --ros-args -r __node:=localization \
       --params-file "${PROJECT_DIR}/install/localization/share/localization/config/config.yaml" \
       -p send_tf_transforms:=false >"${LOG_DIR}/ndt_measurement.log" 2>&1 < /dev/null &
-    setsid ros2 run tf2_ros static_transform_publisher \
-      0.382765605 -0.046855740 0.513445457 \
-      0.007172121 -0.043589169 -0.009509268 0.998978536 \
-      base_link livox_frame >"${LOG_DIR}/lidar_tf.log" 2>&1 < /dev/null &
     sleep 2
     timeout 25 ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \
       "{pcd_path: '${MAP_PCD}'}" >"${LOG_DIR}/load_map.log"
@@ -40,6 +37,7 @@ case "${1:-status}" in
   rollback)
     "${SCRIPT_DIR}/start_official_ukf_shadow.sh" stop
     stop_legacy_localization
+    "${SCRIPT_DIR}/ensure_lidar_static_tf.sh"
     setsid ros2 launch localization localization.launch.py >"${LOG_DIR}/legacy_localization.log" 2>&1 < /dev/null &
     sleep 2
     timeout 25 ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \

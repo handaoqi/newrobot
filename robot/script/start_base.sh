@@ -3,10 +3,12 @@
 # 用法: bash /home/dogrobot/robot/script/start_base.sh
 
 set -e
+PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
+SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 export ROS_DOMAIN_ID=24
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
-echo "=== 1/3 启动 zenoh 路由器 ==="
+echo "=== 1/2 启动 zenoh 路由器 ==="
 source /opt/ros/humble/setup.bash
 if ! pgrep -f rmw_zenohd > /dev/null 2>&1; then
     ros2 run rmw_zenoh_cpp rmw_zenohd &>/tmp/zenoh.log &
@@ -16,46 +18,8 @@ else
     echo "zenoh 已在运行"
 fi
 
-echo "=== 2/3 启动雷达驱动 ==="
-source /opt/robot-driver/install/setup.bash
-if ! pgrep -f livox_driver_node > /dev/null 2>&1; then
-    setsid nohup ros2 launch livox_driver lidar.launch.py &>/tmp/livox.log < /dev/null &
-    sleep 3
-    echo "雷达驱动已启动"
-else
-    echo "雷达驱动已在运行"
-fi
-
-echo "=== 3/4 启动雷达到机身静态 TF ==="
-if ! pgrep -f "/static_transform_publisher .*base_link livox_frame" > /dev/null 2>&1; then
-    setsid nohup ros2 run tf2_ros static_transform_publisher \
-        0.382765605 -0.046855740 0.513445457 \
-        0.007172121 -0.043589169 -0.009509268 0.998978536 \
-        base_link livox_frame &>/tmp/lidar_tf.log < /dev/null &
-    sleep 1
-    echo "雷达 TF 已启动"
-else
-    echo "雷达 TF 已在运行"
-fi
-
-echo "=== 4/4 启动点云转激光（导航避障用） ==="
-sleep 2  # 等雷达稳定
-if ! pgrep -f "/pointcloud_to_laserscan_node" > /dev/null 2>&1; then
-    setsid nohup ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node \
-        --ros-args \
-        -r cloud_in:=/front_lidar \
-        -r scan:=/laser_scan \
-        -p target_frame:=base_link \
-        -p transform_tolerance:=0.35 \
-        -p min_height:=0.05 \
-        -p max_height:=1.60 \
-        -p range_min:=0.45 \
-        -p range_max:=4.0 &>/tmp/pcl2laser.log < /dev/null &
-    sleep 1
-    echo "点云转激光已启动"
-else
-    echo "点云转激光已在运行"
-fi
+echo "=== 2/2 确保雷达、静态 TF 和导航激光链路 ==="
+WAIT_SECONDS="${WAIT_SECONDS:-90}" "${SCRIPT_DIR}/ensure_navigation_sensors.sh"
 
 echo ""
 echo "=== 基础服务已全部启动 ==="
