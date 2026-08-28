@@ -33,6 +33,11 @@ import {
   guardDutyTaskOptions,
   initialGuardDutyExecution,
 } from '../utils/guardDutyTaskSelection'
+import {
+  activeGuardDutyTarget,
+  guardDutyRouteState,
+  guardDutyWaypointStates,
+} from '../utils/guardDutyWaypointState'
 
 const overview = ref(null)
 const robots = ref([])
@@ -112,7 +117,6 @@ const displayRouteWaypoints = computed(() => {
   if (routeMapId && mapData.value?.id && String(routeMapId) !== String(mapData.value.id)) return []
   return routeWaypoints.value
 })
-const currentWaypointIndex = computed(() => Number(execution.value?.current_waypoint_index || 0))
 const waypointMilestones = computed(() => (execution.value?.events || [])
   .filter((event) => ['task.target_dispatched', 'task.waypoint_reached'].includes(event.event_type))
   .sort((left, right) => Number(left.state_version || 0) - Number(right.state_version || 0)))
@@ -128,22 +132,15 @@ const currentExecutionRound = computed(() => {
   if (!execution.value?.id) return 0
   return Math.max(1, Number(execution.value.round_number || 1))
 })
-const latestTargetMilestone = computed(() => [...waypointMilestones.value]
-  .reverse()
-  .find((event) => event.event_type === 'task.target_dispatched') || null)
-const reachedWaypointIds = computed(() => new Set(waypointMilestones.value
-  .filter((event) => event.event_type === 'task.waypoint_reached')
-  .map((event) => String(event.payload?.waypoint?.waypoint_id || event.payload?.current_waypoint_id || ''))
-  .filter(Boolean)))
-const activeTargetMilestone = computed(() => {
-  const target = latestTargetMilestone.value
-  const waypointId = String(target?.payload?.waypoint?.waypoint_id || target?.payload?.current_waypoint_id || '')
-  return waypointId && !reachedWaypointIds.value.has(waypointId) ? target : null
-})
-const currentTargetWaypointId = computed(() => String(
-  activeTargetMilestone.value?.payload?.waypoint?.waypoint_id
-  || activeTargetMilestone.value?.payload?.current_waypoint_id
-  || '',
+const waypointStates = computed(() => guardDutyWaypointStates(
+  displayRouteWaypoints.value,
+  waypointMilestones.value,
+))
+const routeStatusClass = computed(() => `is-${guardDutyRouteState(waypointMilestones.value)}`)
+const activeTargetMilestone = computed(() => activeGuardDutyTarget(
+  waypointMilestones.value,
+  displayRouteWaypoints.value,
+  waypointStates.value,
 ))
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   execution.value,
@@ -396,13 +393,10 @@ function lossMarkerTitle(point) {
 }
 
 function waypointClass(index) {
-  if (!execution.value) return ''
-  const waypointId = String(displayRouteWaypoints.value[index]?.waypoint_id || '')
-  if (waypointId && reachedWaypointIds.value.has(waypointId)) return 'done'
-  if (waypointId && waypointId === currentTargetWaypointId.value && isRunning.value) return 'current'
-  if (!waypointMilestones.value.length && index < Number(execution.value.completed_waypoints || 0)) return 'done'
-  if (!waypointMilestones.value.length && index === currentWaypointIndex.value && isRunning.value) return 'current'
-  return ''
+  const state = waypointStates.value[index]
+  if (state === 'target') return 'is-target'
+  if (state === 'reached') return 'is-reached'
+  return 'is-idle'
 }
 
 function eventImage(event) {
@@ -1292,12 +1286,12 @@ watch(playUrlKey, () => {
               <span class="loss">定位丢失点 {{ localizationLossMarkers.length }}</span>
             </div>
             <section class="guard-route-log">
-              <div class="guard-route-summary">
+              <div class="guard-route-summary" :class="routeStatusClass">
                 <div><span>本次轮次</span><strong>第 {{ currentExecutionRound || 1 }} 轮</strong></div>
                 <div><span>计划路线</span><strong>{{ execution?.route_name || routeData?.name || '--' }}</strong></div>
               </div>
               <div class="guard-route-order" aria-label="本轮计划航点顺序">
-                <span v-for="(number, index) in executionWaypointOrder" :key="`${number}-${index}`">{{ number }}</span>
+                <span v-for="(number, index) in executionWaypointOrder" :key="`${number}-${index}`" :class="waypointClass(index)">{{ number }}</span>
                 <small v-if="!executionWaypointOrder.length">暂无航点</small>
               </div>
               <div v-if="activeTargetMilestone" class="guard-current-target">
@@ -1435,7 +1429,7 @@ watch(playUrlKey, () => {
 .guard-runtime-grid span { color: #72838e; font-size: 11px; }
 .guard-runtime-grid strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .guard-loop-message { margin: 0; color: #657681; font-size: 12px; line-height: 1.5; }
-.guard-map-panel { padding: 16px; }
+.guard-map-panel { --guard-waypoint-idle: #2563eb; --guard-waypoint-target: #e79a18; --guard-waypoint-reached: #159a63; padding: 16px; }
 .guard-map-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .guard-map-head h2 { margin: 4px 0 0; font-size: 20px; }
 .guard-map-head small { color: #71818c; white-space: nowrap; }
@@ -1444,9 +1438,9 @@ watch(playUrlKey, () => {
 .guard-map-layer { position: relative; width: 100%; background: #fff; }
 .guard-map-layer img { display: block; width: 100%; height: auto; user-select: none; }
 .guard-map-lines, .guard-map-markers { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.guard-map-waypoint { position: absolute; display: grid; place-items: center; width: 20px; height: 20px; border: 2px solid #fff; border-radius: 50%; color: #fff; background: #2563eb; box-shadow: 0 2px 6px rgba(15, 35, 48, .38); font-size: 10px; font-weight: 900; transform: translate(-50%, -50%); }
-.guard-map-waypoint.done { background: #10b981; }
-.guard-map-waypoint.current { background: #f59e0b; }
+.guard-map-waypoint { position: absolute; display: grid; place-items: center; width: 20px; height: 20px; border: 2px solid #fff; border-radius: 50%; color: #fff; background: var(--guard-waypoint-idle); box-shadow: 0 2px 6px rgba(15, 35, 48, .38); font-size: 10px; font-weight: 900; transform: translate(-50%, -50%); }
+.guard-map-waypoint.is-target { background: var(--guard-waypoint-target); }
+.guard-map-waypoint.is-reached { background: var(--guard-waypoint-reached); }
 .guard-map-robot { position: absolute; z-index: 5; width: 28px; height: 28px; transform: translate(-50%, -50%); }
 .guard-map-robot::before { content: ''; position: absolute; inset: 3px; border: 3px solid #fff; border-radius: 50%; background: #ec4a3f; box-shadow: 0 2px 8px rgba(236, 74, 63, .5); }
 .guard-map-robot > .robot-dog-icon { position: absolute; inset: 1px; z-index: 6; display: block; }
@@ -1474,11 +1468,16 @@ watch(playUrlKey, () => {
 .guard-map-legend .loss::before { width: 8px; height: 8px; border-radius: 50%; background: #dc2626; }
 .guard-route-log { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #dde5e9; }
 .guard-route-summary { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; }
-.guard-route-summary > div { display: grid; gap: 2px; min-width: 0; }
+.guard-route-summary > div { display: grid; gap: 2px; min-width: 0; padding: 8px 10px; color: #fff; background: var(--guard-waypoint-idle); transition: background-color .2s ease; }
+.guard-route-summary.is-target > div { background: var(--guard-waypoint-target); }
+.guard-route-summary.is-reached > div { background: var(--guard-waypoint-reached); }
 .guard-route-summary span, .guard-current-target > span { color: #71818c; font-size: 10px; }
-.guard-route-summary strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.guard-route-summary > div > span { color: rgba(255, 255, 255, .82); }
+.guard-route-summary strong { overflow: hidden; color: #fff; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .guard-route-order { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-.guard-route-order span { display: grid; place-items: center; width: 24px; height: 24px; color: #fff; background: #2563eb; font-size: 11px; font-weight: 900; }
+.guard-route-order span { display: grid; place-items: center; width: 24px; height: 24px; color: #fff; background: var(--guard-waypoint-idle); font-size: 11px; font-weight: 900; }
+.guard-route-order span.is-target { background: var(--guard-waypoint-target); }
+.guard-route-order span.is-reached { background: var(--guard-waypoint-reached); }
 .guard-route-order span:not(:last-child)::after { content: ''; }
 .guard-route-order small { color: #71818c; font-size: 11px; }
 .guard-current-target { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 9px 10px; border-left: 3px solid #e79a18; background: #fff7e7; }
@@ -1486,8 +1485,8 @@ watch(playUrlKey, () => {
 .guard-current-target small { grid-column: 1 / -1; color: #6f7d86; font-size: 10px; }
 .guard-waypoint-log { display: grid; max-height: 260px; overflow-y: auto; border-top: 1px solid #e1e7ea; }
 .guard-waypoint-log article { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 8px; padding: 9px 2px; border-bottom: 1px solid #edf1f3; }
-.guard-waypoint-log article > i { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #e79a18; }
-.guard-waypoint-log article > i.is-reached { background: #159a63; }
+.guard-waypoint-log article > i { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--guard-waypoint-target); }
+.guard-waypoint-log article > i.is-reached { background: var(--guard-waypoint-reached); }
 .guard-waypoint-log article > div { display: grid; gap: 2px; min-width: 0; }
 .guard-waypoint-log strong { font-size: 11px; }
 .guard-waypoint-log span, .guard-waypoint-log small, .guard-waypoint-log p { color: #71818c; font-size: 10px; line-height: 1.4; }
@@ -1584,6 +1583,9 @@ watch(playUrlKey, () => {
 :global([data-theme="dark"] .guard-page .guard-waypoint-log p),
 :global([data-theme="dark"] .guard-page .guard-loading) {
   color: var(--muted);
+}
+:global([data-theme="dark"] .guard-page .guard-route-summary > div > span) {
+  color: rgba(255, 255, 255, .82);
 }
 @media (min-width: 981px) {
   .guard-video-label {
