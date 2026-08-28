@@ -26,6 +26,7 @@ def finalize_map_package(
     map_dir: str | Path,
     *,
     requested_scene_scope: str = "indoor",
+    auto_loop_optimization_enabled: bool = False,
     bag_dir: str | Path | None = None,
     raw_recording: str = "",
 ) -> dict[str, Any]:
@@ -48,8 +49,9 @@ def finalize_map_package(
             LOGGER.warning("recording manifest not written for %s: %s", bag_dir, exc)
 
     loop_result = {"scan_context_count": 0, "loop_closure_count": 0, "trajectory_source": "raw"}
+    apply_loops = bool(auto_loop_optimization_enabled)
     try:
-        loop_result = finalize_loop_closure(root)
+        loop_result = finalize_loop_closure(root, apply_to_graph=apply_loops)
     except Exception:
         LOGGER.exception("loop closure failed for %s; keeping raw map", root)
 
@@ -85,6 +87,7 @@ def finalize_map_package(
         "point_cloud_count": len(list((root / "keyframes").glob("scan_*.pcd"))) if (root / "keyframes").is_dir() else 0,
         "preintegration_count": preintegration_count,
         "scan_context_count": scan_context_count,
+        "loop_detected_count": int(loop_result.get("detected_loop_count") or 0),
         "loop_closure_count": int(loop_result.get("loop_closure_count") or 0),
         "loop_candidate_count": int(loop_result.get("candidate_count") or 0),
         "loop_rejected_count": int(loop_result.get("rejected_loop_count") or 0),
@@ -93,6 +96,9 @@ def finalize_map_package(
         "loop_status": loop_result.get("loop_status") or "skipped",
         "use_gps": constraints["scene_scope"] != "indoor",
         "use_imu_factor": True,
+        "use_loop": apply_loops,
+        "auto_loop_optimization_enabled": apply_loops,
+        "loop_optimization_policy": "automatic" if apply_loops else "manual_review",
         "raw_recording": raw_recording or str(bag_dir or recording.get("bag_dir") or ""),
         "recording_topics_complete": not bool(recording.get("missing_required_topics")),
     }

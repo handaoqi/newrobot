@@ -63,6 +63,9 @@ struct GlobalFactorGraphConfig
     double imu_gyro_bias_random_walk_sigma = 1e-4;
     double imu_velocity_prior_sigma = 0.30;
     double imu_bias_prior_sigma = 0.10;
+    // Reject an IMU interval when the displacement implied by its endpoint
+    // FAST-LIO velocities disagrees with the FAST-LIO pose displacement.
+    double imu_kinematic_gate_max_residual_mps = 0.25;
     double gravity_magnitude = 9.81;
     double rtk_position_sigma_floor = 0.20;
     double rtk_heading_sigma_floor_rad = 0.035;
@@ -70,6 +73,7 @@ struct GlobalFactorGraphConfig
     double loop_rotation_sigma_rad = 0.08;
     double robust_huber_k = 1.345;
     bool use_imu_factor = true;
+    bool use_loop = true;
     double max_pose_jump_m = 25.0;
     double max_abs_z_change_m = 1.5;
 };
@@ -81,10 +85,15 @@ struct GlobalFactorGraphResult
     std::vector<gtsam::Pose3> optimized_poses;
     std::vector<gtsam::Matrix6> covariances;
     std::size_t factor_count = 0;
+    // Sequential FAST-LIO2 keyframe pose-delta constraints. These are not NDT
+    // registration results; ndt_factor_count is retained as a compatibility alias.
+    std::size_t lio_between_factor_count = 0;
     std::size_t ndt_factor_count = 0;
     std::size_t imu_factor_count = 0;
     std::size_t imu_bias_factor_count = 0;
     std::size_t imu_velocity_prior_factor_count = 0;
+    std::size_t imu_kinematic_rejected_factor_count = 0;
+    double max_imu_kinematic_residual_mps = 0.0;
     std::size_t rtk_position_factor_count = 0;
     std::size_t rtk_heading_factor_count = 0;
     std::size_t loop_closure_factor_count = 0;

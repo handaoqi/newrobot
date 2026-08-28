@@ -13,7 +13,7 @@ import yaml
 
 import roamerx_edge.mapping_adapter as mapping_adapter_module
 from roamerx_edge.config import MappingConfig
-from roamerx_edge.mapping_adapter import MappingAdapter, MappingSession
+from roamerx_edge.mapping_adapter import MappingAdapter, MappingSession, _parse_scan_context_check
 from roamerx_edge.protocol import ProtocolError
 
 
@@ -29,9 +29,33 @@ def make_adapter(tmp_path, **overrides):
     overrides.setdefault("deployment_manifest", str(tmp_path / "missing-deployment.json"))
     overrides.setdefault("mapping_session_params_file", str(tmp_path / "mapping-origin-session.yaml"))
     overrides.setdefault("mapping_environment_file", str(tmp_path / "mapping-session.env"))
+    overrides.setdefault(
+        "localization_scan_context_check_binary",
+        str(tmp_path / "missing-scan-context-check"),
+    )
     config = MappingConfig(map_dir=str(tmp_path), **overrides)
     media = SimpleNamespace(robot_id="test-dog")
     return MappingAdapter(config, media)
+
+
+def test_scan_context_validation_output_is_structured_for_manual_threshold_review():
+    parsed = _parse_scan_context_check(
+        "TOTAL: 76/81 answerable  top1 98.7%  topk 100.0%  "
+        "top1_err_med 0.53 m  yaw_err_med 0.32 deg  yaw_err_p90 14.75 deg  "
+        "dist_hit_p90 0.07  dist_miss_med 0.10\n"
+    )
+
+    assert parsed == {
+        "queries": 81,
+        "answerable": 76,
+        "top1_hit_percent": 98.7,
+        "topk_hit_percent": 100.0,
+        "top1_position_error_median_m": 0.53,
+        "yaw_error_median_deg": 0.32,
+        "yaw_error_p90_deg": 14.75,
+        "descriptor_hit_p90": 0.07,
+        "descriptor_miss_median": 0.10,
+    }
 
 
 def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch):
@@ -124,6 +148,9 @@ def test_outdoor_runtime_uses_locked_origin_and_records_hash(tmp_path):
     assert converter["origin_sha256"] == runtime["origin_sha256"]
     assert adapter.session.origin_sha256 == runtime["origin_sha256"]
     assert "ROAMERX_MAPPING_TYPE=outdoor" in Path(
+        adapter.config.mapping_environment_file
+    ).read_text()
+    assert "ROAMERX_AUTO_LOOP_OPTIMIZATION=false" in Path(
         adapter.config.mapping_environment_file
     ).read_text()
 
@@ -557,6 +584,61 @@ def test_disabled_visibility_filter_packages_raw_map(tmp_path):
         "mode": "manual_cleanup",
         "source": str(session),
     }
+
+
+def test_quality_rejected_optimization_restores_complete_raw_map_set(tmp_path):
+    session = tmp_path / "20260828_190000_001"
+    session.mkdir()
+    raw_values = {
+        "map_raw.pcd": b"raw-pcd",
+        "map_raw.pgm": b"raw-pgm",
+        "map_raw.yaml": b"raw-yaml",
+        "map_raw.txt": b"raw-trajectory",
+    }
+    optimized_values = {
+        "map.pcd": b"optimized-pcd",
+        "map.pgm": b"optimized-pgm",
+        "map.yaml": b"optimized-yaml",
+        "map.txt": b"optimized-trajectory",
+    }
+    for name, value in {**raw_values, **optimized_values}.items():
+        (session / name).write_bytes(value)
+
+    result = MappingAdapter._restore_raw_map_products(session)
+
+    assert result["restored"] is True
+    for active_name, raw_name in (
+        ("map.pcd", "map_raw.pcd"),
+        ("map.pgm", "map_raw.pgm"),
+        ("map.yaml", "map_raw.yaml"),
+        ("map.txt", "map_raw.txt"),
+    ):
+        assert (session / active_name).read_bytes() == raw_values[raw_name]
+    assert (session / "map_optimized_rejected.pcd").read_bytes() == b"optimized-pcd"
+
+
+def test_quality_rejected_map_does_not_replace_local_active_links(tmp_path, monkeypatch):
+    session = tmp_path / "20260828_191000_001"
+    session.mkdir()
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "map.pcd").write_bytes(b"raw-fallback")
+    (session / "optimization_summary.json").write_text(json.dumps({
+        "stage": "quality_rejected",
+        "auto_activation_allowed": False,
+        "inertial_smoothing_guard": {
+            "passed": False,
+            "reasons": ["max_xy_correction_m_above_limit"],
+        },
+    }))
+    adapter = make_adapter(tmp_path, visibility_filter_enabled=False)
+    monkeypatch.setattr(adapter, "_generate_map_preview", lambda _base: None)
+
+    _package, metadata = adapter._package_map({}, session)
+
+    assert metadata["auto_activate"] is False
+    assert not (tmp_path / "map.pcd").exists()
+    assert not (tmp_path / "map.yaml").exists()
 
 
 def test_map_package_keeps_gnss_origin(tmp_path, monkeypatch):

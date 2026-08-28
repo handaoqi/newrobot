@@ -156,6 +156,17 @@ class MappingConfig:
     visibility_filter_max_hit_observations: int = 10
     visibility_filter_max_source_bytes: int = 268435456
     visibility_filter_output_suffix: str = "keyframe_visibility_loose03x"
+    # Scan Context detection and diagnostics always run after a save. Applying
+    # accepted loop closures to the factor graph is an explicit policy choice;
+    # keep it off until Map Management has reviewed the candidate thresholds.
+    auto_loop_optimization_enabled: bool = False
+    localization_scan_context_check_binary: str = (
+        "/home/dogrobot/robot/install/localization/lib/localization/"
+        "localization_scan_context_check"
+    )
+    pcd2grid_binary: str = (
+        "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/pcd2grid_streaming"
+    )
     auto_activate_uploaded_map: bool = True
     # A cloud map must remain usable for 3D NDT localization on a robot that
     # does not already have the source session directory.

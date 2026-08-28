@@ -76,6 +76,11 @@ media:
   map_upload_timeout_seconds: 1800
 
 mapping:
+  # Always retain loop candidates for Map Management review, but do not warp
+  # the exported navigation map automatically.
+  auto_loop_optimization_enabled: false
+  localization_scan_context_check_binary: /home/dogrobot/robot/install/localization/lib/localization/localization_scan_context_check
+  pcd2grid_binary: /home/dogrobot/robot/install/robot_slam/lib/robot_slam/pcd2grid_streaming
   log_dir: /tmp/roamerx_mapping_logs
   map_dir: "/home/dogrobot/runtime/nx-edge/data/jszr/map"
   ros_setup: "/opt/ros/humble/setup.bash"

@@ -14,9 +14,13 @@ def generate_launch_description():
     mapping_type = LaunchConfiguration('mapping_type')
     slam_params_file = LaunchConfiguration('slam_params_file')
     origin_params_file = LaunchConfiguration('origin_params_file')
+    auto_loop_optimization = LaunchConfiguration('auto_loop_optimization')
     max_range = ParameterValue(
         PythonExpression(["25.0 if '", mapping_type, "' == 'outdoor' else 10.0"]),
         value_type=float)
+    use_loop = ParameterValue(
+        PythonExpression(["'", auto_loop_optimization, "'.lower() == 'true'"]),
+        value_type=bool)
     return LaunchDescription([
         DeclareLaunchArgument(
             'mapping_type', default_value=os.environ.get('ROAMERX_MAPPING_TYPE', 'indoor'),
@@ -27,6 +31,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'origin_params_file', default_value=os.environ.get(
                 'ROAMERX_MAPPING_ORIGIN_PARAMS', '/dev/null')),
+        DeclareLaunchArgument(
+            'auto_loop_optimization', default_value=os.environ.get(
+                'ROAMERX_AUTO_LOOP_OPTIMIZATION', 'false'),
+            choices=['true', 'false']),
         Node(
             package='robot_slam', executable='slam_enu_converter', name='slam_enu_converter',
             parameters=[origin_params_file],
@@ -36,5 +44,6 @@ def generate_launch_description():
             parameters=[slam_params_file, {
                 'preprocess.max_range': max_range,
                 'preprocess.fov_degree': 240.0,
+                'global_optimization.use_loop': use_loop,
             }]),
     ])

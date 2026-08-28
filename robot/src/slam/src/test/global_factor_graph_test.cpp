@@ -47,6 +47,7 @@ TEST(GlobalFactorGraphTest, StationaryImuCompensatesGravity)
 
     ASSERT_TRUE(result.success) << result.error;
     ASSERT_EQ(result.optimized_poses.size(), 2U);
+    EXPECT_EQ(result.lio_between_factor_count, 1U);
     EXPECT_EQ(result.ndt_factor_count, 1U);
     EXPECT_EQ(result.imu_factor_count, 1U);
     EXPECT_EQ(result.imu_bias_factor_count, 1U);
@@ -69,6 +70,53 @@ TEST(GlobalFactorGraphTest, CanDisableImuStateExplicitly)
     EXPECT_EQ(result.imu_bias_factor_count, 0U);
     EXPECT_EQ(result.imu_velocity_prior_factor_count, 0U);
     EXPECT_EQ(result.factor_count, 2U);
+}
+
+TEST(GlobalFactorGraphTest, CanDisableLoopFactors)
+{
+    GlobalFactorGraphConfig config;
+    config.use_imu_factor = false;
+    config.use_loop = false;
+    GlobalFactorGraph graph(config);
+
+    auto keyframes = stationaryKeyframes();
+    keyframes[1].initial_pose = gtsam::Pose3(gtsam::Rot3(), gtsam::Point3(1.0, 0.0, 0.0));
+
+    GlobalGraphLoopClosure loop;
+    loop.from = 0;
+    loop.to = 1;
+    loop.relative_pose = gtsam::Pose3();
+    loop.covariance = gtsam::Matrix6::Identity() * 0.01;
+
+    const auto disabled = graph.optimize(keyframes, {loop});
+    ASSERT_TRUE(disabled.success) << disabled.error;
+    EXPECT_EQ(disabled.loop_closure_factor_count, 0U);
+
+    config.use_loop = true;
+    GlobalFactorGraph enabled(config);
+    const auto applied = enabled.optimize(keyframes, {loop});
+    ASSERT_TRUE(applied.success) << applied.error;
+    EXPECT_EQ(applied.loop_closure_factor_count, 1U);
+}
+
+TEST(GlobalFactorGraphTest, RejectsImuIntervalWithInconsistentEndpointVelocity)
+{
+    GlobalFactorGraphConfig config;
+    config.use_imu_factor = true;
+    config.imu_kinematic_gate_max_residual_mps = 0.25;
+    GlobalFactorGraph graph(config);
+
+    auto keyframes = stationaryKeyframes();
+    keyframes[1].initial_velocity = gtsam::Vector3(1.0, 0.0, 0.0);
+
+    const auto result = graph.optimize(keyframes, {});
+
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.imu_factor_count, 0U);
+    EXPECT_EQ(result.imu_kinematic_rejected_factor_count, 1U);
+    EXPECT_EQ(result.imu_velocity_prior_factor_count, 2U);
+    EXPECT_NEAR(result.max_imu_kinematic_residual_mps, 0.5, 1e-9);
+    EXPECT_NEAR(result.optimized_poses.back().translation().norm(), 0.0, 1e-5);
 }
 
 }  // namespace

@@ -411,6 +411,7 @@ namespace robot::slam
         bool                               use_gnss_fusion_ = false;
         bool                               gnss_fusion_config_enabled_ = false;
         bool                               use_gps_config_enabled_ = true;
+        bool                               use_loop_config_enabled_ = false;
         double                             gnss_max_age_ = 1.5;
         double                             gnss_max_horizontal_std_ = 1.5;
         int                                gnss_min_status_ = 0;

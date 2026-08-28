@@ -167,3 +167,35 @@ def test_lidar_frame_revisit_with_odometry_gap_is_accepted(tmp_path):
         rows = list(csv.DictReader(stream))
     pairs = {(int(row["from"]), int(row["to"])) for row in rows}
     assert (0, 31) in pairs or (31, 0) in pairs
+
+
+def test_manual_review_loop_detection_does_not_write_graph_closures(tmp_path):
+    local = _l_shape()
+    poses = []
+    clouds = []
+    for index in range(32):
+        if index == 0:
+            poses.append((0.0, 0.0, 0.0))
+            clouds.append(_to_world(local, 0.0, 0.0, 0.0))
+        elif index == 31:
+            poses.append((8.0, 0.0, 0.0))
+            clouds.append(_to_world(local, 8.0, 0.0, 0.0))
+        else:
+            poses.append((0.2 * index, 1.5, 0.4))
+            clouds.append(_to_world(_unique_blob(index), 0.2 * index, 1.5, 0.4))
+    _write_session(tmp_path, poses, clouds)
+
+    result = finalize_loop_closure(tmp_path, apply_to_graph=False)
+
+    assert result["apply_to_graph"] is False
+    assert result["loop_status"] == "pending_manual_review"
+    assert result["loop_closure_count"] == 0
+    assert result["detected_loop_count"] >= 1
+    assert result["candidate_count"] >= 1
+    assert (tmp_path / "map.pcd").read_bytes() == b"raw-lio-map"
+    with (tmp_path / "loop_closures.csv").open(encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows == []
+    with (tmp_path / "scan_context" / "loop_candidates.csv").open(encoding="utf-8") as stream:
+        candidates = list(csv.DictReader(stream))
+    assert any(row["accepted"] in {"True", "true", "1"} for row in candidates)

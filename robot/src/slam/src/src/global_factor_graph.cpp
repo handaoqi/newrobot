@@ -238,16 +238,46 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
         {
             const Key previous = gtsam::Symbol('x', i - 1);
             const Key current = gtsam::Symbol('x', i);
-            const Pose3 ndt_delta = keyframes[i - 1].initial_pose.between(keyframes[i].initial_pose);
-            const auto ndt_sigmas = (gtsam::Vector(6) <<
+            const Pose3 lio_delta = keyframes[i - 1].initial_pose.between(keyframes[i].initial_pose);
+            // This relative pose comes from the tightly-coupled FAST-LIO2 ESKF
+            // trajectory. The ndt_* noise parameter names are legacy configuration
+            // keys and do not imply that an NDT registration is performed here.
+            const auto lio_sigmas = (gtsam::Vector(6) <<
                 config_.ndt_rotation_sigma_rad, config_.ndt_rotation_sigma_rad, config_.ndt_rotation_sigma_rad,
                 config_.ndt_translation_sigma, config_.ndt_translation_sigma, config_.ndt_translation_sigma).finished();
             graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                previous, current, ndt_delta, robustDiagonal(ndt_sigmas, config_.robust_huber_k)));
+                previous, current, lio_delta, robustDiagonal(lio_sigmas, config_.robust_huber_k)));
+            ++result.lio_between_factor_count;
+            // Deprecated telemetry alias used by older edge/frontend versions.
             ++result.ndt_factor_count;
 
             const auto& frame = keyframes[i];
+            bool imu_kinematics_valid = true;
             if (config_.use_imu_factor && frame.has_imu_preintegration)
+            {
+                const auto& previous_frame = keyframes[i - 1];
+                const double pose_dt = frame.stamp - previous_frame.stamp;
+                if (std::isfinite(pose_dt) && pose_dt > 1e-6
+                    && frame.initial_velocity.allFinite()
+                    && previous_frame.initial_velocity.allFinite())
+                {
+                    const gtsam::Vector3 pose_displacement =
+                        frame.initial_pose.translation() - previous_frame.initial_pose.translation();
+                    const gtsam::Vector3 velocity_displacement =
+                        0.5 * (previous_frame.initial_velocity + frame.initial_velocity) * pose_dt;
+                    const double residual_mps =
+                        (pose_displacement - velocity_displacement).norm() / pose_dt;
+                    if (std::isfinite(residual_mps))
+                    {
+                        result.max_imu_kinematic_residual_mps = std::max(
+                            result.max_imu_kinematic_residual_mps, residual_mps);
+                        imu_kinematics_valid =
+                            config_.imu_kinematic_gate_max_residual_mps <= 0.0
+                            || residual_mps <= config_.imu_kinematic_gate_max_residual_mps;
+                    }
+                }
+            }
+            if (config_.use_imu_factor && frame.has_imu_preintegration && imu_kinematics_valid)
             {
                 gtsam::PreintegratedCombinedMeasurements preintegrated(imu_params, frame.imu_bias_hat);
                 double integrated_time = 0.0;
@@ -285,6 +315,8 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
             }
             else if (config_.use_imu_factor)
             {
+                if (frame.has_imu_preintegration && !imu_kinematics_valid)
+                    ++result.imu_kinematic_rejected_factor_count;
                 graph.add(gtsam::PriorFactor<gtsam::Vector3>(
                     gtsam::Symbol('v', i), frame.initial_velocity,
                     gtsam::noiseModel::Isotropic::Sigma(
@@ -317,17 +349,20 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
             }
         }
 
-        for (const auto& loop : loop_closures)
+        if (config_.use_loop)
         {
-            if (loop.from >= keyframes.size() || loop.to >= keyframes.size() || loop.from == loop.to)
-                continue;
-            gtsam::Matrix6 covariance = loop.covariance;
-            if (!covariance.allFinite() || (covariance.diagonal().array() <= 0.0).any())
-                covariance = diagonalCovariance(config_.loop_translation_sigma, config_.loop_rotation_sigma_rad);
-            graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                gtsam::Symbol('x', loop.from), gtsam::Symbol('x', loop.to), loop.relative_pose,
-                robustCovariance(covariance, config_.robust_huber_k)));
-            ++result.loop_closure_factor_count;
+            for (const auto& loop : loop_closures)
+            {
+                if (loop.from >= keyframes.size() || loop.to >= keyframes.size() || loop.from == loop.to)
+                    continue;
+                gtsam::Matrix6 covariance = loop.covariance;
+                if (!covariance.allFinite() || (covariance.diagonal().array() <= 0.0).any())
+                    covariance = diagonalCovariance(config_.loop_translation_sigma, config_.loop_rotation_sigma_rad);
+                graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                    gtsam::Symbol('x', loop.from), gtsam::Symbol('x', loop.to), loop.relative_pose,
+                    robustCovariance(covariance, config_.robust_huber_k)));
+                ++result.loop_closure_factor_count;
+            }
         }
 
         result.factor_count = graph.size();

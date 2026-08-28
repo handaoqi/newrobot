@@ -14,9 +14,14 @@ def _write_trajectory(path, rows):
             "index", "timestamp", "world_x", "world_y", "world_z",
             "world_qx", "world_qy", "world_qz", "world_qw",
         ])
-        for index, stamp, x, y, yaw in rows:
+        for row in rows:
+            if len(row) == 5:
+                index, stamp, x, y, yaw = row
+                z = 0.0
+            else:
+                index, stamp, x, y, z, yaw = row
             writer.writerow([
-                index, stamp, x, y, 0.0, 0.0, 0.0,
+                index, stamp, x, y, z, 0.0, 0.0,
                 math.sin(yaw / 2.0), math.cos(yaw / 2.0),
             ])
 
@@ -30,13 +35,13 @@ def test_summary_aligns_keyframes_and_normalizes_yaw(tmp_path):
     ])
     _write_trajectory(tmp_path / "trajectory_optimized.csv", [
         (0, 10.0, 0.1, 0.0, optimized_yaw),
-        (1, 11.0, 1.3, 1.4, 0.1),
+        (1, 11.0, 1.18, 1.05, 0.04),
     ])
     (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
         "factor_count": 9,
         "ndt_factor_count": 1,
-        "imu_factor_count": 0,
-        "imu_bias_factor_count": 0,
+        "imu_factor_count": 1,
+        "imu_bias_factor_count": 1,
         "imu_velocity_prior_factor_count": 1,
         "rtk_position_factor_count": 1,
         "rtk_heading_factor_count": 1,
@@ -55,10 +60,16 @@ def test_summary_aligns_keyframes_and_normalizes_yaw(tmp_path):
 
     assert summary["stage"] == "completed"
     assert summary["corrections"][0]["delta"]["yaw_deg"] == pytest.approx(2.0, abs=1e-3)
-    assert summary["corrections"][1]["delta"]["position_m"] == pytest.approx(0.5)
+    assert summary["corrections"][1]["delta"]["position_m"] == pytest.approx(
+        math.hypot(0.18, 0.05), abs=1e-5
+    )
     assert summary["graph_error"]["reduction_percent"] == pytest.approx(70.0)
     assert summary["candidate_count"] == 2
     assert summary["accepted_loop_count"] == 1
+    assert summary["optimization_mode"] == "fast_lio2_slam_anchored"
+    assert summary["factors"]["lio_between"] == 1
+    assert summary["factors"]["ndt_registration"] == 0
+    assert summary["factors"]["ndt_is_legacy_alias"] is True
     assert summary["factors"]["imu_velocity_prior"] == 1
     assert "corrections" not in summary_without_corrections(summary)
 
@@ -79,3 +90,133 @@ def test_indoor_summary_rejects_any_rtk_factor(tmp_path):
     assert summary["gps_factor_gate_valid"] is False
     assert summary["stage"] == "fallback"
     assert summary["auto_activation_allowed"] is False
+
+
+def test_inertial_only_smoothing_passes_continuity_guard(tmp_path):
+    _write_trajectory(tmp_path / "trajectory_raw.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 1.0, 0.0, 0.0),
+        (2, 12.0, 2.0, 0.0, 0.0),
+    ])
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 1.04, 0.01, 0.01),
+        (2, 12.0, 2.08, 0.02, 0.02),
+    ])
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 7,
+        "lio_between_factor_count": 2,
+        "ndt_factor_count": 2,
+        "imu_factor_count": 2,
+        "error_before": 8.0,
+        "error_after": 2.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="indoor")
+
+    assert summary["optimization_mode"] == "fast_lio2_inertial_smoothing"
+    assert summary["inertial_smoothing_guard"]["checked"] is True
+    assert summary["inertial_smoothing_guard"]["passed"] is True
+    assert summary["auto_activation_allowed"] is True
+
+
+def test_inertial_only_smoothing_blocks_large_vertical_correction(tmp_path):
+    _write_trajectory(tmp_path / "trajectory_raw.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 1.0, 0.0, 0.0, 0.0),
+    ])
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 1.02, 0.0, 0.70, 0.0),
+    ])
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 4,
+        "lio_between_factor_count": 1,
+        "ndt_factor_count": 1,
+        "imu_factor_count": 1,
+        "error_before": 3.0,
+        "error_after": 1.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="indoor")
+
+    guard = summary["inertial_smoothing_guard"]
+    assert guard["checked"] is True
+    assert guard["passed"] is False
+    assert "max_abs_z_correction_m_above_limit" in guard["reasons"]
+    assert summary["auto_activation_allowed"] is False
+
+
+def test_loop_anchored_optimization_does_not_bypass_correction_guard(tmp_path):
+    _write_trajectory(tmp_path / "trajectory_raw.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 1.0, 0.0, 0.0),
+    ])
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 11.0, 2.75, 0.0, math.radians(4.0)),
+    ])
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 5,
+        "lio_between_factor_count": 1,
+        "imu_factor_count": 1,
+        "loop_closure_factor_count": 1,
+        "error_before": 100.0,
+        "error_after": 1.0,
+    }))
+    (tmp_path / "loop_closures.csv").write_text("from,to,score\n1,0,0.9\n")
+
+    summary = build_optimization_summary(tmp_path, mapping_type="indoor")
+
+    guard = summary["inertial_smoothing_guard"]
+    assert summary["candidate_applied"] is True
+    assert summary["applied"] is False
+    assert summary["stage"] == "quality_rejected"
+    assert guard["checked"] is True
+    assert guard["passed"] is False
+    assert "max_xy_correction_m_above_limit" in guard["reasons"]
+    assert "max_yaw_correction_deg_above_limit" in guard["reasons"]
+    assert summary["trajectory_source"] == "raw"
+    assert summary["auto_activation_allowed"] is False
+
+
+def test_continuity_guard_reports_offending_pair_and_normalized_rate(tmp_path):
+    _write_trajectory(tmp_path / "trajectory_raw.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.3, 0.0, math.radians(20.0)),
+        (2, 11.0, 0.6, 0.0, math.radians(40.0)),
+    ])
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.46, 0.0, math.radians(20.0)),
+        (2, 11.0, 0.76, 0.0, math.radians(40.0)),
+    ])
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 7,
+        "lio_between_factor_count": 2,
+        "imu_factor_count": 2,
+        "imu_kinematic_rejected_factor_count": 1,
+        "max_imu_kinematic_residual_mps": 0.42,
+        "error_before": 5.0,
+        "error_after": 1.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="indoor")
+
+    guard = summary["inertial_smoothing_guard"]
+    assert summary["stage"] == "quality_rejected"
+    assert "max_adjacent_xy_step_m_above_limit" in guard["reasons"]
+    assert guard["worst_adjacent_xy_correction"] == {
+        "from_index": 0,
+        "to_index": 1,
+        "from_stamp": 10.0,
+        "to_stamp": 10.5,
+        "delta_t_s": 0.5,
+        "xy_correction_step_m": 0.16,
+        "xy_correction_rate_mps": 0.32,
+        "raw_xy_distance_m": 0.3,
+        "raw_yaw_step_deg": pytest.approx(20.0, abs=5e-4),
+    }
+    assert summary["factors"]["imu_kinematic_rejected"] == 1
+    assert summary["factors"]["max_imu_kinematic_residual_mps"] == pytest.approx(0.42)
+    assert "adjacent_corrections" not in summary_without_corrections(summary)

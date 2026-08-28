@@ -16,6 +16,7 @@ from .config import EdgeConfig
 from .manual_map_cleanup import ManualMapCleanupError, build_manual_cleanup_map
 from .map_coordinate import MapConstraintError, constraints_from_manifest, validate_map_constraints
 from .map_package_finalize import load_map_manifest
+from .map_version_pointer import MapVersionPointerError, activate_map_version
 from .protocol import ProtocolError
 from .safety_policy import RuntimeSafetyState
 
@@ -78,18 +79,15 @@ class MapActivationAdapter:
                 )
             self._validate_map_constraints(source_dir, command)
 
-            switched = {}
-            for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
-                source = source_dir / name
-                target = self.map_dir / name
-                if target.exists() or target.is_symlink():
-                    target.unlink()
-                # Optional metadata is map-scoped. Leaving a previous map's
-                # GNSS origin active silently applies the wrong ENU transform.
-                if not source.exists():
-                    continue
-                target.symlink_to(source)
-                switched[name] = str(source)
+            try:
+                switched = activate_map_version(
+                    self.map_dir,
+                    source_dir,
+                    required_files=self.REQUIRED_FILES,
+                    optional_files=self.OPTIONAL_FILES,
+                )
+            except MapVersionPointerError as exc:
+                raise ProtocolError("MAP_ACTIVATION_POINTER_FAILED", str(exc)) from exc
 
             self._verify_switched_files(source_dir)
             self.config.robot.current_map_id = map_id
@@ -160,7 +158,7 @@ class MapActivationAdapter:
         missing_files = []
         for name in self.REQUIRED_FILES + self.OPTIONAL_FILES:
             target = self.map_dir / name
-            if target.exists() or target.is_symlink():
+            if target.exists():
                 try:
                     active_files[name] = str(target.resolve())
                 except OSError:
@@ -188,6 +186,8 @@ class MapActivationAdapter:
             "sha256": None,
             "local_map_dir": str(self.map_dir),
             "source_dir": next(iter(source_dirs), ""),
+            "version_pointer": str((self.map_dir / "current").resolve())
+            if (self.map_dir / "current").is_symlink() else "",
             "active_files": active_files,
             "local_state": local_state,
             "applied_at": self.applied_at,
@@ -250,6 +250,10 @@ class MapActivationAdapter:
             return self._download_package_source(package_url, command)
 
         raise ProtocolError("MAP_SOURCE_NOT_FOUND", "selected map has no local source directory on this robot")
+
+    def resolve_source_dir(self, command: dict) -> Path:
+        """Resolve a map source for read-only workflows such as offline review."""
+        return self._resolve_source_dir(command)
 
     def _download_package_source(self, package_url: str, command: dict) -> Path:
         if not package_url.startswith(("http://", "https://")):

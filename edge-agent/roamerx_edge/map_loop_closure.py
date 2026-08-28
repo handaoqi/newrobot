@@ -3,7 +3,9 @@
 Keyframe clouds are stored in the world frame. Descriptors and geometric
 checks run in the lidar frame so already-aligned map points cannot generate
 hundreds of identity-yaw false loops. Python does not rebuild map.pcd; the
-C++ GTSAM service owns the final trajectory when accepted loops exist.
+C++ GTSAM service owns the final trajectory. Indoor saves still detect
+Scan-Context but write an empty loop_closures.csv when automatic application
+is disabled. Candidates and thresholds remain available for Map Management.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import csv
 import json
 import math
 import struct
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -34,7 +37,7 @@ MAX_OPTIMIZED_JUMP_M = 5.0
 IDENTITY_XYZW = (0.0, 0.0, 0.0, 1.0)
 
 
-def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
+def finalize_loop_closure(map_dir: str | Path, *, apply_to_graph: bool = True) -> dict[str, Any]:
     started_at = time.time()
     root = Path(map_dir)
     keyframes = _load_keyframes(root)
@@ -53,8 +56,10 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
         return {
             "scan_context_count": 0,
             "loop_closure_count": 0,
+            "detected_loop_count": 0,
+            "apply_to_graph": apply_to_graph,
             "trajectory_source": "raw",
-            "loop_status": "no_keyframes",
+            "loop_status": "disabled" if not apply_to_graph else "no_keyframes",
             "candidate_count": 0,
             "rejected_loop_count": 0,
             "detection_duration_seconds": round(time.time() - started_at, 3),
@@ -149,6 +154,12 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
         "yaw_search_steps": YAW_SEARCH_STEPS,
         "loop_min_slam_xy_m": LOOP_MIN_SLAM_XY_M,
         "loop_max_slam_xy_m": LOOP_MAX_SLAM_XY_M,
+        "accept_descriptor_distance_max": ACCEPT_DISTANCE,
+        "geometric_xy_limit_m": GEOM_XY_LIMIT_M,
+        "geometric_yaw_limit_rad": GEOM_YAW_LIMIT_RAD,
+        "geometric_overlap_min": GEOM_OVERLAP_MIN,
+        "max_accepted_loops": MAX_ACCEPTED_LOOPS,
+        "automatic_application_enabled": bool(apply_to_graph),
         "keyframe_count": len(keyframes),
         "quaternion_order": "xyzw",
     }
@@ -172,7 +183,8 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
         )
         writer.writeheader()
         writer.writerows(candidates)
-    _write_loop_closures_csv(root, accepted)
+    graph_loops = accepted if apply_to_graph else []
+    _write_loop_closures_csv(root, graph_loops)
 
     if not optimized_path.exists() and raw_path.exists():
         optimized_path.write_bytes(raw_path.read_bytes())
@@ -185,9 +197,14 @@ def finalize_loop_closure(map_dir: str | Path) -> dict[str, Any]:
 
     return {
         "scan_context_count": len(keyframes),
-        "loop_closure_count": len(accepted),
+        "loop_closure_count": len(graph_loops),
+        "detected_loop_count": len(accepted),
+        "apply_to_graph": apply_to_graph,
         "trajectory_source": "raw",
-        "loop_status": "accepted" if accepted else "no_valid_loop",
+        "loop_status": (
+            ("pending_manual_review" if accepted else "no_valid_loop") if not apply_to_graph
+            else ("accepted" if graph_loops else "no_valid_loop")
+        ),
         "candidate_count": len(candidates),
         "rejected_loop_count": sum(not row["accepted"] for row in candidates),
         "detection_duration_seconds": round(time.time() - started_at, 3),
@@ -650,6 +667,199 @@ def _optimize_se2(keyframes: list[dict[str, Any]], loops: list[dict[str, Any]]) 
         item["lidar_qy"] = 0.0
         updated.append(item)
     return updated
+
+
+def optimize_reviewed_loop_closures(
+    map_dir: str | Path,
+    selected_candidates: list[dict[str, Any]],
+    thresholds: dict[str, Any],
+    *,
+    grid_converter: str | Path,
+) -> dict[str, Any]:
+    """Apply operator-confirmed loops to an immutable copied map directory.
+
+    This is an offline SE(2) pose graph: the sequential constraints are the
+    tightly-coupled FAST-LIO2 keyframe deltas and the additional constraints
+    are the reviewed Scan-Context matches. Roll, pitch and Z remain from LIO.
+    """
+    import numpy as np
+    from scipy.optimize import least_squares
+
+    root = Path(map_dir)
+    keyframes = _load_keyframes(root)
+    if len(keyframes) < 2:
+        raise RuntimeError("offline optimization requires at least two keyframes")
+    if not selected_candidates:
+        raise RuntimeError("no reviewed loop candidates selected")
+    started = time.monotonic()
+    raw_poses = np.asarray([[kf["lidar_x"], kf["lidar_y"], kf["yaw"]] for kf in keyframes], dtype=float)
+
+    def relative(left, right):
+        cosine, sine = math.cos(left[2]), math.sin(left[2])
+        dx, dy = right[0] - left[0], right[1] - left[1]
+        return np.asarray([cosine * dx + sine * dy, -sine * dx + cosine * dy, _wrap_angle(right[2] - left[2])])
+
+    sequential = [(index - 1, index, relative(raw_poses[index - 1], raw_poses[index])) for index in range(1, len(raw_poses))]
+    loops = []
+    for candidate in selected_candidates:
+        query = int(candidate.get("query_index", -1))
+        match = int(candidate.get("match_index", -1))
+        if query < 0 or match < 0 or query >= len(raw_poses) or match >= len(raw_poses) or query == match:
+            raise RuntimeError(f"invalid reviewed loop endpoints: {query}:{match}")
+        slam_distance = math.hypot(raw_poses[query][0] - raw_poses[match][0], raw_poses[query][1] - raw_poses[match][1])
+        geometric_translation = math.hypot(
+            float(candidate.get("geometric_dx_m") or 0.0),
+            float(candidate.get("geometric_dy_m") or 0.0),
+        )
+        checks = (
+            int(candidate.get("rank") or 999) <= int(thresholds.get("max_rank", 1)),
+            float(candidate.get("descriptor_distance") or 999.0) <= float(thresholds.get("descriptor_distance_max", 0.30)),
+            bool(candidate.get("geometric_verified")),
+            geometric_translation <= float(thresholds.get("geometric_translation_max_m", 2.50)),
+            float(thresholds.get("slam_distance_min_m", 2.0)) <= slam_distance <= float(thresholds.get("slam_distance_max_m", 20.0)),
+            float(candidate.get("yaw_consistency_deg") or 999.0) <= float(thresholds.get("yaw_consistency_max_deg", 34.38)),
+            str(candidate.get("detector_rejection_reason") or "") != "duplicate_pair",
+        )
+        if not all(checks):
+            raise RuntimeError(f"loop candidate failed device-side threshold audit: {query}:{match}")
+        loops.append((query, match, np.asarray([
+            float(candidate.get("geometric_dx_m") or candidate.get("dx") or 0.0),
+            float(candidate.get("geometric_dy_m") or candidate.get("dy") or 0.0),
+            float(candidate.get("geometric_dyaw_rad") or candidate.get("dyaw") or 0.0),
+        ]), candidate))
+
+    def unpack(values):
+        poses = raw_poses.copy()
+        poses[1:] = values.reshape((-1, 3))
+        return poses
+
+    def residual(values):
+        poses = unpack(values)
+        output = []
+        for left, right, measured in sequential:
+            error = relative(poses[left], poses[right]) - measured
+            error[2] = _wrap_angle(error[2])
+            output.extend((error / np.asarray([0.15, 0.15, 0.08])).tolist())
+        for left, right, measured, _candidate in loops:
+            error = relative(poses[left], poses[right]) - measured
+            error[2] = _wrap_angle(error[2])
+            output.extend((error / np.asarray([0.50, 0.50, 0.15])).tolist())
+        return np.asarray(output)
+
+    initial = raw_poses[1:].reshape(-1)
+    error_before = float(np.dot(residual(initial), residual(initial)))
+    result = least_squares(residual, initial, loss="huber", f_scale=1.345, max_nfev=100)
+    optimized_poses = unpack(result.x)
+    error_after = float(np.dot(residual(result.x), residual(result.x)))
+    optimized = []
+    position_corrections = []
+    yaw_corrections = []
+    for keyframe, pose, raw_pose in zip(keyframes, optimized_poses, raw_poses):
+        item = dict(keyframe)
+        item["lidar_x"], item["lidar_y"], item["yaw"] = [float(value) for value in pose]
+        # Preserve measured roll/pitch and apply the optimized yaw as a planar
+        # correction. The keyframe cloud reprojector uses this same transform.
+        item["lidar_qx"], item["lidar_qy"] = 0.0, 0.0
+        item["lidar_qz"], item["lidar_qw"] = math.sin(item["yaw"] / 2.0), math.cos(item["yaw"] / 2.0)
+        item["world_x"], item["world_y"] = item["lidar_x"], item["lidar_y"]
+        item["world_qx"], item["world_qy"] = item["lidar_qx"], item["lidar_qy"]
+        item["world_qz"], item["world_qw"] = item["lidar_qz"], item["lidar_qw"]
+        optimized.append(item)
+        position_corrections.append(math.hypot(pose[0] - raw_pose[0], pose[1] - raw_pose[1]))
+        yaw_corrections.append(abs(math.degrees(_wrap_angle(pose[2] - raw_pose[2]))))
+
+    max_position = max(position_corrections, default=0.0)
+    max_yaw = max(yaw_corrections, default=0.0)
+    position_limit = float(thresholds.get("max_pose_correction_m", 5.0))
+    yaw_limit = float(thresholds.get("max_yaw_correction_deg", 20.0))
+    if not result.success or error_after > error_before + 1e-6:
+        raise RuntimeError(f"pose graph did not converge safely: {result.message}")
+    if max_position > position_limit or max_yaw > yaw_limit:
+        raise RuntimeError(
+            f"optimized correction exceeds guard: {max_position:.3f}m/{max_yaw:.2f}deg "
+            f"> {position_limit:.3f}m/{yaw_limit:.2f}deg"
+        )
+
+    corrections = []
+    for raw, after, position_m, yaw_deg in zip(keyframes, optimized, position_corrections, yaw_corrections):
+        raw_pose = {"x": raw["lidar_x"], "y": raw["lidar_y"], "z": raw["lidar_z"], "yaw": raw["yaw"], "qx": raw["lidar_qx"], "qy": raw["lidar_qy"], "qz": raw["lidar_qz"], "qw": raw["lidar_qw"]}
+        optimized_pose = {"x": after["lidar_x"], "y": after["lidar_y"], "z": after["lidar_z"], "yaw": after["yaw"], "qx": after["lidar_qx"], "qy": after["lidar_qy"], "qz": after["lidar_qz"], "qw": after["lidar_qw"]}
+        dx, dy = after["lidar_x"] - raw["lidar_x"], after["lidar_y"] - raw["lidar_y"]
+        signed_yaw = math.degrees(_wrap_angle(after["yaw"] - raw["yaw"]))
+        corrections.append({
+            "index": raw["index"], "stamp": raw["timestamp"],
+            "raw": {key: round(float(value), 7) for key, value in raw_pose.items()},
+            "optimized": {key: round(float(value), 7) for key, value in optimized_pose.items()},
+            "delta": {"x": round(dx, 5), "y": round(dy, 5), "z": 0.0, "position_m": round(position_m, 5), "yaw_rad": round(math.radians(signed_yaw), 6), "yaw_deg": round(signed_yaw, 4)},
+            "significant": position_m >= 0.30 or yaw_deg >= 3.0,
+            "constraint_source": ["fast_lio2", "loop_closure"],
+        })
+
+    _write_loop_closures_csv(root, [{
+        "query_index": left,
+        "match_index": right,
+        "dx": float(measured[0]),
+        "dy": float(measured[1]),
+        "dyaw": float(measured[2]),
+        "distance": float(candidate.get("descriptor_distance") or candidate.get("distance") or 0.0),
+    } for left, right, measured, candidate in loops])
+    _write_trajectory_csv(root / "trajectory_optimized.csv", optimized)
+    if not _rebuild_map_from_optimized_keyframes(root, keyframes, optimized):
+        raise RuntimeError("failed to rebuild map.pcd from optimized keyframes")
+    converter = Path(grid_converter).expanduser()
+    if not converter.is_file():
+        raise RuntimeError(f"grid converter not found: {converter}")
+    subprocess.run(
+        [str(converter), str(root / "map.pcd"), str(root / "map"), "0.05", "0.05", "0.75", "200000000"],
+        check=True, capture_output=True, text=True, timeout=1800,
+    )
+    with (root / "map.txt").open("w", encoding="utf-8") as stream:
+        stream.write("# path\n")
+        for pose in optimized_poses:
+            stream.write(f"{pose[0]:.2f} {pose[1]:.2f} {pose[2]:.2f}\n")
+
+    def stats(values):
+        array = np.asarray(values, dtype=float)
+        return {
+            "mean": round(float(np.mean(array)), 5),
+            "rms": round(float(np.sqrt(np.mean(array * array))), 5),
+            "p95": round(float(np.percentile(array, 95)), 5),
+            "max": round(float(np.max(array)), 5),
+        }
+
+    summary = {
+        "schema": "roamerx.optimization-summary.v1",
+        "stage": "completed",
+        "success": True,
+        "applied": True,
+        "candidate_applied": True,
+        "trigger_source": "manual_map_management",
+        "completed_at_unix": round(time.time(), 3),
+        "optimization_mode": "offline_fast_lio2_se2_pose_graph",
+        "trajectory_source": "optimized",
+        "keyframe_count": len(keyframes),
+        "candidate_count": len(selected_candidates),
+        "accepted_loop_count": len(loops),
+        "rejected_loop_count": 0,
+        "factors": {"total": len(sequential) + len(loops), "lio_between": len(sequential), "ndt": len(sequential), "imu": 0, "rtk_position": 0, "rtk_heading": 0, "loop_closure": len(loops)},
+        "graph_error": {"before": round(error_before, 6), "after": round(error_after, 6), "reduction_percent": round((error_before - error_after) / max(error_before, 1e-9) * 100.0, 2)},
+        "correction": {"position_m": stats(position_corrections), "yaw_deg": stats(yaw_corrections)},
+        "quality_guard": {"passed": True, "max_pose_correction_m": position_limit, "max_yaw_correction_deg": yaw_limit},
+        "review_thresholds": thresholds,
+        "selected_candidate_ids": [str(candidate.get("candidate_id") or f"{left}:{right}") for left, right, _measured, candidate in loops],
+        "timing": {"optimization_and_rebuild_seconds": round(time.monotonic() - started, 3)},
+        "corrections": corrections,
+    }
+    manifest_path = root / "map_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    summary["mapping_type"] = "indoor" if str(manifest.get("scene_scope") or "indoor") == "indoor" else "outdoor"
+    summary["auto_activation_allowed"] = True
+    (root / "optimization_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    manifest["optimization"] = {key: value for key, value in summary.items() if key not in {"corrections"}}
+    manifest["trajectory_source"] = "optimized"
+    manifest["parent_map_id"] = str(thresholds.get("source_map_id") or "")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
 
 
 def _trajectory_jump_m(raw: list[dict[str, Any]], optimized: list[dict[str, Any]]) -> float:

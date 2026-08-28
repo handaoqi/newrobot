@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -21,6 +22,34 @@ from pathlib import Path
 import yaml
 
 LOGGER = logging.getLogger(__name__)
+
+SCAN_CONTEXT_TOTAL_RE = re.compile(
+    r"TOTAL:\s+(?P<answerable>\d+)/(?P<queries>\d+) answerable\s+"
+    r"top1 (?P<top1>[0-9.]+)%\s+topk (?P<topk>[0-9.]+)%\s+"
+    r"top1_err_med (?P<position>[0-9.]+) m\s+"
+    r"yaw_err_med (?P<yaw_med>[0-9.]+) deg\s+"
+    r"yaw_err_p90 (?P<yaw_p90>[0-9.]+) deg\s+"
+    r"dist_hit_p90 (?P<hit_distance>[0-9.]+)\s+"
+    r"dist_miss_med (?P<miss_distance>[0-9.]+)"
+)
+
+
+def _parse_scan_context_check(output: str) -> dict:
+    match = SCAN_CONTEXT_TOTAL_RE.search(output or "")
+    if not match:
+        return {}
+    values = match.groupdict()
+    return {
+        "queries": int(values["queries"]),
+        "answerable": int(values["answerable"]),
+        "top1_hit_percent": float(values["top1"]),
+        "topk_hit_percent": float(values["topk"]),
+        "top1_position_error_median_m": float(values["position"]),
+        "yaw_error_median_deg": float(values["yaw_med"]),
+        "yaw_error_p90_deg": float(values["yaw_p90"]),
+        "descriptor_hit_p90": float(values["hit_distance"]),
+        "descriptor_miss_median": float(values["miss_distance"]),
+    }
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write then replace using a unique tmp name so concurrent persist cannot steal the file."""
@@ -46,6 +75,8 @@ from . import __version__ as edge_agent_version
 from .keyframe_visibility_filter import filter_with_keyframe_visibility
 from .map_coordinate import MapConstraintError, SCENE_SCOPES, normalize_text
 from .map_optimization_summary import build_optimization_summary, summary_without_corrections
+from .map_loop_closure import optimize_reviewed_loop_closures
+from .map_version_pointer import MapVersionPointerError, activate_map_version
 from .map_package_finalize import finalize_map_package
 from .map_preview import generate_map_preview
 from .media_client import MediaClient
@@ -83,6 +114,13 @@ class MappingAdapter:
     OPTIONAL_FILES = (
         "map.pcd",
         "map_raw.pcd",
+        "map_raw.pgm",
+        "map_raw.yaml",
+        "map_raw.txt",
+        "map_optimized_rejected.pcd",
+        "map_optimized_rejected.pgm",
+        "map_optimized_rejected.yaml",
+        "map_optimized_rejected.txt",
         "map_preview.png",
         "preview.png",
         "map.txt",
@@ -93,6 +131,7 @@ class MappingAdapter:
         "trajectory_raw.csv",
         "trajectory_optimized.csv",
         "optimization_summary.json",
+        "localization_validation.json",
         "divergence_event.json",
         "rescue_metadata.json",
         "save_progress.json",
@@ -457,6 +496,62 @@ class MappingAdapter:
             )
             self._ensure_slam_process()
         return self._save_active_mapping(command)
+
+    def optimize_historical_map(self, command: dict, source_dir: Path) -> dict:
+        """Create, validate and upload an immutable manually optimized revision."""
+        if self.session or self._any_slam_process_alive:
+            raise ProtocolError("MAPPING_ACTIVE", "建图进程运行中，不能执行离线地图优化")
+        source_dir = source_dir.resolve()
+        required = ["map.pcd", "map.pgm", "map.yaml", "keyframes/keyframes.csv", "scan_context/loop_candidates.csv"]
+        missing = [name for name in required if not (source_dir / name).is_file()]
+        if missing:
+            raise ProtocolError("MAP_OFFLINE_DATA_MISSING", f"离线优化缺少文件: {', '.join(missing)}")
+        if not list((source_dir / "keyframes").glob("scan_*.pcd")):
+            raise ProtocolError("MAP_KEYFRAME_CLOUDS_MISSING", "离线优化需要机器狗本地关键帧点云，云端精简包不能单独执行")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = self.map_dir / f"{stamp}_{int(time.time_ns() / 1_000_000) % 1000:03d}"
+        if output_dir.exists():
+            raise ProtocolError("MAP_VERSION_EXISTS", f"目标地图版本已存在: {output_dir.name}")
+        try:
+            shutil.copytree(source_dir, output_dir, symlinks=False)
+            thresholds = dict(command.get("thresholds") or {})
+            thresholds["source_map_id"] = str(command.get("source_map_id") or command.get("map_id") or "")
+            summary = optimize_reviewed_loop_closures(
+                output_dir,
+                list(command.get("selected_candidates") or []),
+                thresholds,
+                grid_converter=self.config.pcd2grid_binary,
+            )
+            self._run_post_save_localization_validation(output_dir)
+            package_command = dict(command)
+            package_command.update(
+                map_name=command.get("output_map_name") or f"{source_dir.name}-回环优化",
+                _manual_optimization=True,
+                parent_map_id=str(command.get("source_map_id") or command.get("map_id") or ""),
+                activate_after_upload=bool(command.get("activate_after_upload", False)),
+            )
+            package_path, metadata = self._package_map(package_command, output_dir)
+            metadata["parent_map_id"] = package_command["parent_map_id"]
+            metadata["optimization_review"] = {
+                "confirmed_at": command.get("review_confirmed_at"),
+                "thresholds": command.get("thresholds") or {},
+                "selected_candidate_ids": summary.get("selected_candidate_ids") or [],
+            }
+            upload_result = self.media_client.upload_map_package(str(package_path), metadata)
+            return {
+                "source_map_id": package_command["parent_map_id"],
+                "source_dir": str(source_dir),
+                "output_dir": str(output_dir),
+                "package_path": str(package_path),
+                "optimization": summary_without_corrections(summary),
+                "upload_result": upload_result,
+                "activated": bool(metadata.get("auto_activate")),
+            }
+        except ProtocolError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("offline map optimization failed for %s", source_dir)
+            raise ProtocolError("MAP_OFFLINE_OPTIMIZATION_FAILED", str(exc)) from exc
 
     def _save_active_mapping(self, command: dict) -> dict:
         progress_dir = self._find_latest_progress_dir()
@@ -1066,6 +1161,8 @@ class MappingAdapter:
             params_path.unlink(missing_ok=True)
         environment = (
             f"ROAMERX_MAPPING_TYPE={mapping_type}\n"
+            "ROAMERX_AUTO_LOOP_OPTIMIZATION="
+            f"{'true' if self.config.auto_loop_optimization_enabled else 'false'}\n"
             f"ROAMERX_SLAM_PARAMS={Path(self.config.slam_params_file).expanduser()}\n"
             f"ROAMERX_MAPPING_ORIGIN_PARAMS={params_path if mapping_type == 'outdoor' else '/dev/null'}\n"
         )
@@ -1547,14 +1644,23 @@ class MappingAdapter:
             manifest = finalize_map_package(
                 work_dir,
                 requested_scene_scope=scene_scope,
+                auto_loop_optimization_enabled=bool(
+                    self.config.auto_loop_optimization_enabled
+                ),
                 bag_dir=self._rosbag_dir,
                 raw_recording=str(self._rosbag_dir or ""),
             )
         except MapConstraintError as exc:
             raise ProtocolError(exc.code, exc.message) from exc
-        # Scan-Context writes loop_closures.csv after the SLAM save returns.
-        # Always invoke the C++ graph: NDT/IMU/RTK optimization remains useful
-        # when Scan-Context accepts no loop. On failure keep the raw LIO map.
+        # The C++ optimizer rewrites the complete navigation product set. Keep
+        # the pre-optimization set so a quality-rejected loop can be rolled
+        # back without mixing a raw cloud with an optimized grid/trajectory.
+        self._snapshot_raw_map_products(work_dir)
+        # Scan Context always writes descriptors and candidates. Loop factors
+        # enter the graph only when the explicit automatic policy is enabled;
+        # the default manual-review policy writes an empty loop_closures.csv.
+        # Always invoke the C++ graph because LIO+IMU smoothing remains useful
+        # independently of loop closure policy.
         optimization_started = time.monotonic()
         fallback_error = ""
         if int(manifest.get("keyframe_count") or 0) > 1:
@@ -1586,10 +1692,33 @@ class MappingAdapter:
             timing=timing,
             fallback_error=fallback_error,
         )
+        if summary.get("candidate_applied") and not summary.get("applied"):
+            selection = self._restore_raw_map_products(work_dir)
+            summary["map_output_selection"] = selection
+            if not selection["restored"]:
+                summary["stage"] = "fallback"
+                summary["success"] = False
+                summary["auto_activation_allowed"] = False
+                missing = ", ".join(selection["missing"])
+                summary["fallback_error"] = (
+                    f"{summary.get('fallback_error')}; raw map rollback incomplete: {missing}"
+                ).strip("; ")
+            _atomic_write_text(
+                work_dir / "optimization_summary.json",
+                json.dumps(summary, ensure_ascii=False, indent=2),
+            )
         compact_summary = summary_without_corrections(summary)
         manifest["optimization"] = compact_summary
         manifest["trajectory_source"] = summary.get("trajectory_source") or manifest.get("trajectory_source") or "raw"
         manifest["use_gps"] = bool(summary.get("use_gps"))
+        # Persist the selected trajectory before the offline checker loads the
+        # Scan Context database; optimized maps must return optimized seeds.
+        _atomic_write_text(
+            work_dir / "map_manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        validation = self._run_post_save_localization_validation(work_dir)
+        manifest["localization_validation"] = validation
         _atomic_write_text(
             work_dir / "map_manifest.json",
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1598,6 +1727,105 @@ class MappingAdapter:
         if manifest.get("completeness") == "complete":
             self._mark_progress_completed(work_dir)
         return manifest
+
+    def _run_post_save_localization_validation(self, work_dir: Path) -> dict:
+        """Measure offline relocalization readiness without auto-accepting it.
+
+        Threshold decisions intentionally remain manual. This check verifies
+        descriptor retrieval and optimized seed coordinates; it does not claim
+        to be a live NDT initialization test because keyframe scans are already
+        part of the exported map.
+        """
+        binary = Path(self.config.localization_scan_context_check_binary).expanduser()
+        payload = {
+            "schema": "roamerx.localization-validation.v1",
+            "test_type": "offline_scan_context_leave_one_out",
+            "threshold_policy": "manual_review",
+            "live_ndt_initialization_tested": False,
+            "measured_at_unix": round(time.time(), 3),
+        }
+        if not binary.is_file():
+            payload.update(status="unavailable", error=f"checker not found: {binary}")
+        else:
+            try:
+                completed = subprocess.run(
+                    [
+                        str(binary), "--quiet", "--top-k", "5", "--radius", "2.0",
+                        "--min-gap", "1", str(work_dir),
+                    ],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                )
+                metrics = _parse_scan_context_check(completed.stdout)
+                payload.update(
+                    status="measured" if completed.returncode == 0 and metrics else "failed",
+                    returncode=completed.returncode,
+                    metrics=metrics,
+                    output=(completed.stdout or "")[-4000:],
+                    error=(completed.stderr or "")[-2000:],
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                payload.update(status="failed", error=str(exc))
+        _atomic_write_text(
+            work_dir / "localization_validation.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        return payload
+
+    @staticmethod
+    def _snapshot_raw_map_products(work_dir: Path) -> dict:
+        copied = []
+        for active_name, raw_name in (
+            ("map.pcd", "map_raw.pcd"),
+            ("map.pgm", "map_raw.pgm"),
+            ("map.yaml", "map_raw.yaml"),
+            ("map.txt", "map_raw.txt"),
+        ):
+            source = work_dir / active_name
+            target = work_dir / raw_name
+            if source.is_file() and not target.exists():
+                shutil.copy2(source, target)
+                copied.append(raw_name)
+        return {"copied": copied}
+
+    @staticmethod
+    def _restore_raw_map_products(work_dir: Path) -> dict:
+        restored = []
+        missing = []
+        for active_name, raw_name, rejected_name in (
+            ("map.pcd", "map_raw.pcd", "map_optimized_rejected.pcd"),
+            ("map.pgm", "map_raw.pgm", "map_optimized_rejected.pgm"),
+            ("map.yaml", "map_raw.yaml", "map_optimized_rejected.yaml"),
+            ("map.txt", "map_raw.txt", "map_optimized_rejected.txt"),
+        ):
+            active = work_dir / active_name
+            raw = work_dir / raw_name
+            rejected = work_dir / rejected_name
+            if not raw.is_file():
+                missing.append(raw_name)
+                continue
+            if active.is_file() and not rejected.exists():
+                shutil.copy2(active, rejected)
+            shutil.copy2(raw, active)
+            restored.append(active_name)
+        return {
+            "selected": "raw",
+            "restored": not missing,
+            "restored_files": restored,
+            "missing": missing,
+            "rejected_candidate_preserved": all(
+                (work_dir / name).is_file()
+                for name in (
+                    "map_optimized_rejected.pcd",
+                    "map_optimized_rejected.pgm",
+                    "map_optimized_rejected.yaml",
+                    "map_optimized_rejected.txt",
+                )
+            ),
+        }
 
     @staticmethod
     def _write_optimization_status(work_dir: Path, payload: dict) -> None:
@@ -1772,6 +2000,7 @@ class MappingAdapter:
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
             "optimization_summary.json",
+            "localization_validation.json",
             "divergence_event.json",
             "loop_closures.csv",
             "scan_context/index.json",
@@ -1839,6 +2068,14 @@ class MappingAdapter:
             "map.yaml",
             "map.pgm",
             "map.pcd",
+            "map_raw.pcd",
+            "map_raw.pgm",
+            "map_raw.yaml",
+            "map_raw.txt",
+            "map_optimized_rejected.pcd",
+            "map_optimized_rejected.pgm",
+            "map_optimized_rejected.yaml",
+            "map_optimized_rejected.txt",
             "map.txt",
             "gnss_origin.yaml",
             "mapping_trace.json",
@@ -1848,6 +2085,7 @@ class MappingAdapter:
             "trajectory_optimized.csv",
             "trajectory_covariance.json",
             "optimization_summary.json",
+            "localization_validation.json",
             "divergence_event.json",
             "rescue_metadata.json",
             "save_progress.json",
@@ -1884,10 +2122,6 @@ class MappingAdapter:
                 "Keeping mapping rosbag on robot at %s; not embedding it in the upload package",
                 bag_dir,
             )
-        # A rescue map must be inspected before it can replace the active
-        # navigation map. Normal saves retain the existing auto-activation flow.
-        if not is_rescue:
-            self._refresh_current_map_links(filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES))
         map_manifest = self._read_json(filtered_base / "map_manifest.json")
         if not map_manifest and filtered_base != base:
             map_manifest = self._read_json(base / "map_manifest.json")
@@ -1895,6 +2129,22 @@ class MappingAdapter:
         if not optimization_summary and filtered_base != base:
             optimization_summary = self._read_json(base / "optimization_summary.json")
         optimization = summary_without_corrections(optimization_summary) if optimization_summary else {}
+        local_activation_allowed = bool(
+            not is_rescue and optimization.get("auto_activation_allowed", True)
+        )
+        manual_revision = bool(command.get("_manual_optimization"))
+        activate_manual_revision = bool(command.get("activate_after_upload", False))
+        if local_activation_allowed and (not manual_revision or activate_manual_revision):
+            self._refresh_current_map_links(
+                filtered_base, list(self.REQUIRED_FILES + self.OPTIONAL_FILES)
+            )
+        else:
+            LOGGER.warning(
+                "Map %s saved but not selected as the local navigation map: stage=%s reasons=%s",
+                filtered_base,
+                optimization.get("stage"),
+                (optimization.get("inertial_smoothing_guard") or {}).get("reasons"),
+            )
         mapping_metrics = self._build_mapping_metrics(
             base,
             progress,
@@ -1911,9 +2161,12 @@ class MappingAdapter:
             "source_map_dir": str(filtered_base),
             "raw_map_dir": str(base),
             "auto_activate": bool(
-                self.config.auto_activate_uploaded_map
-                and not is_rescue
-                and optimization.get("auto_activation_allowed", True)
+                local_activation_allowed
+                and (
+                    activate_manual_revision
+                    if manual_revision
+                    else self.config.auto_activate_uploaded_map
+                )
             ),
             "route_hint": self.session.route_hint if self.session else "",
             "frame_id": "map",
@@ -1931,6 +2184,7 @@ class MappingAdapter:
             "origin_status": map_manifest.get("origin_status", ""),
             "mapping_metrics": mapping_metrics,
             "optimization": optimization,
+            "parent_map_id": str(command.get("parent_map_id") or ""),
             "local_rosbag_dir": str(bag_dir) if bag_dir and bag_dir.is_dir() else "",
         }
         return package_path, metadata
@@ -2092,20 +2346,19 @@ class MappingAdapter:
         return output, result
 
     def _refresh_current_map_links(self, base: Path, files: list[str]) -> None:
-        for name in files:
-            if name not in self.REQUIRED_FILES + self.OPTIONAL_FILES:
-                continue
-            source = base / name
-            if not source.exists():
-                continue
-            target = self.map_dir / name
-            if target.resolve() == source.resolve():
-                continue
-            tmp_link = self.map_dir / f".{name}.tmp-link"
-            if tmp_link.exists() or tmp_link.is_symlink():
-                tmp_link.unlink()
-            tmp_link.symlink_to(source)
-            tmp_link.replace(target)
+        selected = tuple(
+            name for name in self.OPTIONAL_FILES
+            if name in files
+        )
+        try:
+            activate_map_version(
+                self.map_dir,
+                base,
+                required_files=self.REQUIRED_FILES,
+                optional_files=selected,
+            )
+        except MapVersionPointerError as exc:
+            raise ProtocolError("MAP_ACTIVATION_POINTER_FAILED", str(exc)) from exc
         LOGGER.info("Current map links refreshed to %s with files=%s", base, files)
 
     def _set_state(self, state: str) -> None:

@@ -36,6 +36,11 @@ def test_finalize_local_only_map_writes_manifest_and_keeps_raw(tmp_path):
     assert manifest["scene_scope"] == "indoor"
     assert manifest["mapping_type"] == "indoor"
     assert manifest["use_gps"] is False
+    assert manifest["use_loop"] is False
+    assert manifest["auto_loop_optimization_enabled"] is False
+    assert manifest["loop_optimization_policy"] == "manual_review"
+    assert manifest["loop_status"] == "no_valid_loop"
+    assert manifest["loop_closure_count"] == 0
     assert manifest["localization_mode"] == "ndt"
     assert manifest["quaternion_order"] == "xyzw"
     assert (session / "map_raw.pcd").read_bytes() == b"raw-pcd"
@@ -68,11 +73,30 @@ def test_outdoor_manifest_carries_origin_lock_audit_fields(tmp_path):
 
     assert manifest["mapping_type"] == "outdoor"
     assert manifest["coordinate_mode"] == "rtk_fixed"
+    assert manifest["use_loop"] is False
+    assert manifest["auto_loop_optimization_enabled"] is False
+    assert manifest["loop_optimization_policy"] == "manual_review"
     assert manifest["origin_lock_session_id"] == "origin-123"
     assert manifest["origin_position_spread_m"] == pytest.approx(0.012)
     assert manifest["origin_confirmed_heading_deg"] == pytest.approx(93.2)
     assert manifest["origin_heading_offset_deg"] == pytest.approx(180.0)
     assert manifest["origin_heading_confirmed_at_unix"] == pytest.approx(1240.0)
+
+
+def test_explicit_auto_loop_policy_is_scene_independent(tmp_path):
+    session = tmp_path / "explicit-loop-policy"
+    session.mkdir()
+
+    manifest = finalize_map_package(
+        session,
+        requested_scene_scope="indoor",
+        auto_loop_optimization_enabled=True,
+    )
+
+    assert manifest["use_gps"] is False
+    assert manifest["use_loop"] is True
+    assert manifest["auto_loop_optimization_enabled"] is True
+    assert manifest["loop_optimization_policy"] == "automatic"
 
 
 def test_recording_manifest_lists_required_topics(tmp_path):

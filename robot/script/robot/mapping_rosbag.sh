@@ -204,6 +204,14 @@ start_recording() {
   local -a topics=(
     /front_lidar
     /front_lidar/imu
+    # Preserve commanded and executed motion context so an offline optimizer
+    # can distinguish an estimator velocity glitch from a real stop/reverse.
+    /cmd_vel_raw
+    /cmd_vel
+    /teleop_cmd_vel
+    /mode_switch_cmd
+    /highlevel_robotstate
+    /robot_motion_state
     /fix
     /rtk_pvh
     /rtk/ntrip_status

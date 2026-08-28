@@ -123,7 +123,8 @@
         # Bound the background disk writer so storage stalls cannot consume RAM.
         max_queue_size: 8
     global_optimization:
-        # Batch optimize NDT, standard IMU preintegration, RTK and Scan-Context loops.
+        # Batch optimize FAST-LIO2 keyframe deltas, standard IMU preintegration,
+        # RTK and Scan-Context loops. No NDT registration runs in this stage.
         # First save always exports the raw LIO cloud as map.pcd/map_raw.pcd.
         # IMU acceleration is calibrated to m/s^2 and gravity is modeled in the
         # GTSAM pose/velocity/bias state instead of as a Pose3-between delta.
@@ -131,6 +132,7 @@
         max_iterations: 80
         prior_translation_sigma: 0.01
         prior_rotation_sigma_rad: 0.01
+        # Legacy key names: covariance for the FAST-LIO2 keyframe-between factor.
         ndt_translation_sigma: 0.15
         ndt_rotation_sigma_rad: 0.08
         imu_accelerometer_noise_sigma: 0.10
@@ -140,11 +142,18 @@
         imu_gyro_bias_random_walk_sigma: 0.0001
         imu_velocity_prior_sigma: 0.30
         imu_bias_prior_sigma: 0.10
+        # Drop only IMU intervals whose endpoint FAST-LIO velocities cannot
+        # explain the observed FAST-LIO pose displacement. The pose chain stays.
+        imu_kinematic_gate_max_residual_mps: 0.25
         gravity_magnitude: 9.81
         # Outdoor launch keeps this enabled; the indoor state command forces
         # GPS off while retaining the standard IMU pose/velocity/bias factors.
         use_gps: true
         use_imu_factor: true
+        # Automatic loop application is disabled by default for every scene.
+        # unified_mapping.launch.py only overrides this from the explicit
+        # ROAMERX_AUTO_LOOP_OPTIMIZATION deployment policy.
+        use_loop: false
         max_pose_jump_m: 25.0
         max_abs_z_change_m: 1.5
         rtk_position_sigma_floor: 0.20

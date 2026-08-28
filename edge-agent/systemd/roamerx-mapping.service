@@ -12,6 +12,7 @@ Group=robot
 Environment=ROS_DOMAIN_ID=24
 Environment=RMW_IMPLEMENTATION=rmw_zenoh_cpp
 Environment=ROAMERX_MAPPING_TYPE=indoor
+Environment=ROAMERX_AUTO_LOOP_OPTIMIZATION=false
 Environment=ROAMERX_SLAM_PARAMS=/home/dogrobot/robot/install/robot_slam/share/robot_slam/config/config.yaml
 Environment=ROAMERX_MAPPING_ORIGIN_PARAMS=/dev/null
 EnvironmentFile=-/home/dogrobot/runtime/nx-edge/conf/mapping-session.env

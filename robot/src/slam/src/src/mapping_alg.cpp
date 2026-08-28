@@ -337,6 +337,7 @@ namespace robot::slam
         this->declare_parameter<double>("global_optimization.imu_gyro_bias_random_walk_sigma", 0.0001);
         this->declare_parameter<double>("global_optimization.imu_velocity_prior_sigma", 0.30);
         this->declare_parameter<double>("global_optimization.imu_bias_prior_sigma", 0.10);
+        this->declare_parameter<double>("global_optimization.imu_kinematic_gate_max_residual_mps", 0.25);
         this->declare_parameter<double>("global_optimization.gravity_magnitude", G_m_s2);
         this->declare_parameter<double>("global_optimization.rtk_position_sigma_floor", 0.20);
         this->declare_parameter<double>("global_optimization.rtk_heading_sigma_floor_rad", 0.035);
@@ -345,6 +346,7 @@ namespace robot::slam
         this->declare_parameter<double>("global_optimization.robust_huber_k", 1.345);
         this->declare_parameter<bool>("global_optimization.use_imu_factor", true);
         this->declare_parameter<bool>("global_optimization.use_gps", true);
+        this->declare_parameter<bool>("global_optimization.use_loop", false);
         this->declare_parameter<double>("global_optimization.max_pose_jump_m", 25.0);
         this->declare_parameter<double>("global_optimization.max_abs_z_change_m", 1.5);
         this->declare_parameter<string>("storage.data_path", "");
@@ -393,6 +395,8 @@ namespace robot::slam
         this->get_parameter_or<double>("global_optimization.imu_gyro_bias_random_walk_sigma", global_factor_graph_config_.imu_gyro_bias_random_walk_sigma, 0.0001);
         this->get_parameter_or<double>("global_optimization.imu_velocity_prior_sigma", global_factor_graph_config_.imu_velocity_prior_sigma, 0.30);
         this->get_parameter_or<double>("global_optimization.imu_bias_prior_sigma", global_factor_graph_config_.imu_bias_prior_sigma, 0.10);
+        this->get_parameter_or<double>("global_optimization.imu_kinematic_gate_max_residual_mps",
+            global_factor_graph_config_.imu_kinematic_gate_max_residual_mps, 0.25);
         this->get_parameter_or<double>("global_optimization.gravity_magnitude", global_factor_graph_config_.gravity_magnitude, G_m_s2);
         this->get_parameter_or<double>("global_optimization.rtk_position_sigma_floor", global_factor_graph_config_.rtk_position_sigma_floor, 0.20);
         this->get_parameter_or<double>("global_optimization.rtk_heading_sigma_floor_rad", global_factor_graph_config_.rtk_heading_sigma_floor_rad, 0.035);
@@ -401,6 +405,8 @@ namespace robot::slam
         this->get_parameter_or<double>("global_optimization.robust_huber_k", global_factor_graph_config_.robust_huber_k, 1.345);
         this->get_parameter_or<bool>("global_optimization.use_imu_factor", global_factor_graph_config_.use_imu_factor, true);
         this->get_parameter_or<bool>("global_optimization.use_gps", use_gps_config_enabled_, true);
+        this->get_parameter_or<bool>("global_optimization.use_loop", global_factor_graph_config_.use_loop, false);
+        use_loop_config_enabled_ = global_factor_graph_config_.use_loop;
         this->get_parameter_or<double>("global_optimization.max_pose_jump_m", global_factor_graph_config_.max_pose_jump_m, 25.0);
         this->get_parameter_or<double>("global_optimization.max_abs_z_change_m", global_factor_graph_config_.max_abs_z_change_m, 1.5);
         global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
@@ -690,6 +696,8 @@ namespace robot::slam
                     // Legacy direct starts are indoor-compatible. Outdoor starts
                     // enter WARMUP first, preserving the prelocked ENU origin here.
                     use_gnss_fusion_ = false;
+                    global_factor_graph_config_.use_loop = false;
+                    global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
                     gnss_origin_initialized_ = false;
                     gnss_origin_prelocked_ = false;
                     gnss_alignment_locked_ = false;
@@ -714,6 +722,8 @@ namespace robot::slam
                 reset();
                 mapping_capture_enabled_ = false;
                 use_gnss_fusion_ = gnss_fusion_config_enabled_;
+                global_factor_graph_config_.use_loop = use_loop_config_enabled_;
+                global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
                 if (!gnss_origin_prelocked_)
                 {
                     state_.store(SlamState::ERROR);
@@ -737,6 +747,8 @@ namespace robot::slam
                 reset();
                 mapping_capture_enabled_ = false;
                 use_gnss_fusion_ = false;
+                global_factor_graph_config_.use_loop = false;
+                global_factor_graph_ = std::make_unique<GlobalFactorGraph>(global_factor_graph_config_);
                 gnss_origin_initialized_ = false;
                 gnss_origin_prelocked_ = false;
                 gnss_alignment_locked_ = false;
@@ -860,13 +872,19 @@ namespace robot::slam
                  << ",\"updated_at_unix\":" << std::fixed << std::setprecision(3) << updated_at_unix
                  << ",\"use_gps\":" << (use_gnss_fusion_ ? "true" : "false")
                  << ",\"use_imu_factor\":" << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                 << ",\"use_loop\":" << (global_factor_graph_config_.use_loop ? "true" : "false")
                  << ",\"gravity_magnitude\":" << global_factor_graph_config_.gravity_magnitude
                  << ",\"keyframe_count\":" << mapping_keyframes_.size()
                  << ",\"factor_count\":" << global_factor_graph_result_.factor_count
+                 << ",\"sequential_pose_factor\":\"fast_lio2_between\""
+                 << ",\"lio_between_factor_count\":" << global_factor_graph_result_.lio_between_factor_count
                  << ",\"ndt_factor_count\":" << global_factor_graph_result_.ndt_factor_count
+                 << ",\"ndt_registration_factor_count\":0"
                  << ",\"imu_factor_count\":" << global_factor_graph_result_.imu_factor_count
                  << ",\"imu_bias_factor_count\":" << global_factor_graph_result_.imu_bias_factor_count
                  << ",\"imu_velocity_prior_factor_count\":" << global_factor_graph_result_.imu_velocity_prior_factor_count
+                 << ",\"imu_kinematic_rejected_factor_count\":" << global_factor_graph_result_.imu_kinematic_rejected_factor_count
+                 << ",\"max_imu_kinematic_residual_mps\":" << global_factor_graph_result_.max_imu_kinematic_residual_mps
                  << ",\"rtk_position_factor_count\":" << global_factor_graph_result_.rtk_position_factor_count
                  << ",\"rtk_heading_factor_count\":" << global_factor_graph_result_.rtk_heading_factor_count
                  << ",\"loop_closure_count\":" << global_factor_graph_result_.loop_closure_factor_count;
@@ -3310,6 +3328,7 @@ namespace robot::slam
         trajectory << "index,timestamp,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw\n";
         covariance << "{\n  \"schema_version\": 2,\n  \"ordering\": \"rotation_xyz,translation_xyz\",\n  \"use_imu_factor\": "
                    << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                   << ",\n  \"use_loop\": " << (global_factor_graph_config_.use_loop ? "true" : "false")
                    << ",\n  \"gravity_magnitude\": " << global_factor_graph_config_.gravity_magnitude
                    << ",\n  \"poses\": [\n";
         nav_msgs::msg::Path optimized_path;
@@ -3343,10 +3362,18 @@ namespace robot::slam
             optimized_path.poses.push_back(pose_stamped);
         }
         covariance << "  ],\n  \"factor_count\": " << global_factor_graph_result_.factor_count
+                   << ",\n  \"sequential_pose_factor\": \"fast_lio2_between\""
+                   << ",\n  \"lio_between_factor_count\": " << global_factor_graph_result_.lio_between_factor_count
                    << ",\n  \"ndt_factor_count\": " << global_factor_graph_result_.ndt_factor_count
+                   << ",\n  \"ndt_factor_count_legacy_alias\": true"
+                   << ",\n  \"ndt_registration_factor_count\": 0"
                    << ",\n  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count
                    << ",\n  \"imu_bias_factor_count\": " << global_factor_graph_result_.imu_bias_factor_count
                    << ",\n  \"imu_velocity_prior_factor_count\": " << global_factor_graph_result_.imu_velocity_prior_factor_count
+                   << ",\n  \"imu_kinematic_rejected_factor_count\": "
+                   << global_factor_graph_result_.imu_kinematic_rejected_factor_count
+                   << ",\n  \"max_imu_kinematic_residual_mps\": "
+                   << global_factor_graph_result_.max_imu_kinematic_residual_mps
                    << ",\n  \"rtk_position_factor_count\": " << global_factor_graph_result_.rtk_position_factor_count
                    << ",\n  \"rtk_heading_factor_count\": " << global_factor_graph_result_.rtk_heading_factor_count
                    << ",\n  \"loop_closure_factor_count\": " << global_factor_graph_result_.loop_closure_factor_count
@@ -3396,10 +3423,14 @@ namespace robot::slam
             json << "{\"stage\":\"trajectory_optimized\",\"success\":true,\"use_gps\":"
                  << (use_gnss_fusion_ ? "true" : "false")
                  << ",\"use_imu_factor\":" << (global_factor_graph_config_.use_imu_factor ? "true" : "false")
+                 << ",\"use_loop\":" << (global_factor_graph_config_.use_loop ? "true" : "false")
                  << ",\"gravity_magnitude\":" << global_factor_graph_config_.gravity_magnitude
                  << ",\"keyframe_count\":" << mapping_keyframes_.size()
                  << ",\"factor_count\":" << global_factor_graph_result_.factor_count
+                 << ",\"sequential_pose_factor\":\"fast_lio2_between\""
+                 << ",\"lio_between_factor_count\":" << global_factor_graph_result_.lio_between_factor_count
                  << ",\"ndt_factor_count\":" << global_factor_graph_result_.ndt_factor_count
+                 << ",\"ndt_registration_factor_count\":0"
                  << ",\"imu_factor_count\":" << global_factor_graph_result_.imu_factor_count
                  << ",\"imu_bias_factor_count\":" << global_factor_graph_result_.imu_bias_factor_count
                  << ",\"imu_velocity_prior_factor_count\":" << global_factor_graph_result_.imu_velocity_prior_factor_count
@@ -3428,9 +3459,23 @@ namespace robot::slam
             keyframe_writer_error_ = "cannot read loop_closures.csv";
             return false;
         }
-        if (loop_closures.empty())
+        if (!global_factor_graph_config_.use_loop)
+        {
+            if (!loop_closures.empty())
+                RCLCPP_INFO(get_logger(),
+                    "Ignoring %zu Scan-Context loops (global_optimization.use_loop=false)",
+                    loop_closures.size());
+            else
+                RCLCPP_INFO(get_logger(),
+                    "Scan-Context loops disabled (global_optimization.use_loop=false); GTSAM uses LIO+IMU only");
+            loop_closures.clear();
+            loop_status_ = "disabled";
+            if (std::filesystem::exists(std::filesystem::path(map_subdir) / "scan_context" / "index.json"))
+                scan_context_count_ = mapping_keyframes_.size();
+        }
+        else if (loop_closures.empty())
             RCLCPP_INFO(get_logger(),
-                "No loop closures; continuing NDT/IMU/RTK global optimization");
+                "No loop closures; continuing FAST-LIO2-between/IMU/RTK global optimization");
         std::vector<GlobalGraphKeyframe> graph_keyframes;
         graph_keyframes.reserve(mapping_keyframes_.size());
         for (const auto& keyframe : mapping_keyframes_)
@@ -3517,9 +3562,9 @@ namespace robot::slam
         global_pose_covariances_ = global_factor_graph_result_.covariances;
         global_optimization_applied_ = true;
         RCLCPP_INFO(get_logger(),
-            "Historical GTSAM optimization completed: keyframes=%zu factors=%zu ndt=%zu imu=%zu imu_bias=%zu rtk_xy=%zu rtk_heading=%zu loops=%zu error %.3f -> %.3f",
+            "Historical GTSAM optimization completed: keyframes=%zu factors=%zu lio_between=%zu imu=%zu imu_bias=%zu rtk_xy=%zu rtk_heading=%zu loops=%zu error %.3f -> %.3f",
             mapping_keyframes_.size(), global_factor_graph_result_.factor_count,
-            global_factor_graph_result_.ndt_factor_count, global_factor_graph_result_.imu_factor_count,
+            global_factor_graph_result_.lio_between_factor_count, global_factor_graph_result_.imu_factor_count,
             global_factor_graph_result_.imu_bias_factor_count,
             global_factor_graph_result_.rtk_position_factor_count, global_factor_graph_result_.rtk_heading_factor_count,
             global_factor_graph_result_.loop_closure_factor_count,
@@ -3828,6 +3873,19 @@ namespace robot::slam
             json.replace(first, last - first, value);
             return true;
         };
+        auto insert_raw = [](std::string& json, const std::string& key, const std::string& value) {
+            if (json.find("\"" + key + "\"") != std::string::npos)
+                return true;
+            const auto closing = json.find_last_of('}');
+            if (closing == std::string::npos || closing == 0)
+                return false;
+            const auto previous = json.find_last_not_of(" \t\r\n", closing - 1);
+            if (previous == std::string::npos)
+                return false;
+            const std::string separator = json[previous] == '{' ? "" : ",";
+            json.insert(previous + 1, separator + "\n  \"" + key + "\": " + value);
+            return true;
+        };
         if (!existing.empty())
         {
             replace_string(existing, "trajectory_source", trajectory_source);
@@ -3840,14 +3898,32 @@ namespace robot::slam
                 std::to_string(global_factor_graph_result_.loop_closure_factor_count));
             replace_number(existing, "global_factor_count",
                 std::to_string(global_factor_graph_result_.factor_count));
+            if (!replace_string(existing, "sequential_pose_factor", "fast_lio2_between"))
+                insert_raw(existing, "sequential_pose_factor", "\"fast_lio2_between\"");
+            if (!replace_number(existing, "lio_between_factor_count",
+                    std::to_string(global_factor_graph_result_.lio_between_factor_count)))
+                insert_raw(existing, "lio_between_factor_count",
+                    std::to_string(global_factor_graph_result_.lio_between_factor_count));
             replace_number(existing, "ndt_factor_count",
                 std::to_string(global_factor_graph_result_.ndt_factor_count));
+            if (!replace_number(existing, "ndt_factor_count_legacy_alias", "true"))
+                insert_raw(existing, "ndt_factor_count_legacy_alias", "true");
+            if (!replace_number(existing, "ndt_registration_factor_count", "0"))
+                insert_raw(existing, "ndt_registration_factor_count", "0");
             replace_number(existing, "imu_factor_count",
                 std::to_string(global_factor_graph_result_.imu_factor_count));
             replace_number(existing, "imu_bias_factor_count",
                 std::to_string(global_factor_graph_result_.imu_bias_factor_count));
             replace_number(existing, "imu_velocity_prior_factor_count",
                 std::to_string(global_factor_graph_result_.imu_velocity_prior_factor_count));
+            if (!replace_number(existing, "imu_kinematic_rejected_factor_count",
+                    std::to_string(global_factor_graph_result_.imu_kinematic_rejected_factor_count)))
+                insert_raw(existing, "imu_kinematic_rejected_factor_count",
+                    std::to_string(global_factor_graph_result_.imu_kinematic_rejected_factor_count));
+            if (!replace_number(existing, "max_imu_kinematic_residual_mps",
+                    std::to_string(global_factor_graph_result_.max_imu_kinematic_residual_mps)))
+                insert_raw(existing, "max_imu_kinematic_residual_mps",
+                    std::to_string(global_factor_graph_result_.max_imu_kinematic_residual_mps));
             replace_number(existing, "rtk_position_factor_count",
                 std::to_string(global_factor_graph_result_.rtk_position_factor_count));
             replace_number(existing, "rtk_heading_factor_count",
@@ -3855,6 +3931,10 @@ namespace robot::slam
             replace_number(existing, "use_gps", use_gnss_fusion_ ? "true" : "false");
             replace_number(existing, "use_imu_factor",
                 global_factor_graph_config_.use_imu_factor ? "true" : "false");
+            if (!replace_number(existing, "use_loop",
+                    global_factor_graph_config_.use_loop ? "true" : "false"))
+                insert_raw(existing, "use_loop",
+                    global_factor_graph_config_.use_loop ? "true" : "false");
             replace_number(existing, "error_before", std::to_string(global_factor_graph_result_.error_before));
             replace_number(existing, "error_after", std::to_string(global_factor_graph_result_.error_after));
             std::ofstream output(path, std::ios::out | std::ios::trunc);
@@ -3891,13 +3971,22 @@ namespace robot::slam
                << "  \"scan_context_count\": " << scan_context_count_ << ",\n"
                << "  \"loop_closure_count\": " << global_factor_graph_result_.loop_closure_factor_count << ",\n"
                << "  \"global_factor_count\": " << global_factor_graph_result_.factor_count << ",\n"
+               << "  \"sequential_pose_factor\": \"fast_lio2_between\",\n"
+               << "  \"lio_between_factor_count\": " << global_factor_graph_result_.lio_between_factor_count << ",\n"
                << "  \"ndt_factor_count\": " << global_factor_graph_result_.ndt_factor_count << ",\n"
+               << "  \"ndt_factor_count_legacy_alias\": true,\n"
+               << "  \"ndt_registration_factor_count\": 0,\n"
                << "  \"use_gps\": " << (use_gnss_fusion_ ? "true" : "false") << ",\n"
                << "  \"use_imu_factor\": " << (global_factor_graph_config_.use_imu_factor ? "true" : "false") << ",\n"
+               << "  \"use_loop\": " << (global_factor_graph_config_.use_loop ? "true" : "false") << ",\n"
                << "  \"imu_factor_count\": " << global_factor_graph_result_.imu_factor_count << ",\n"
                << "  \"imu_bias_factor_count\": " << global_factor_graph_result_.imu_bias_factor_count << ",\n"
                << "  \"imu_velocity_prior_factor_count\": "
                << global_factor_graph_result_.imu_velocity_prior_factor_count << ",\n"
+               << "  \"imu_kinematic_rejected_factor_count\": "
+               << global_factor_graph_result_.imu_kinematic_rejected_factor_count << ",\n"
+               << "  \"max_imu_kinematic_residual_mps\": "
+               << global_factor_graph_result_.max_imu_kinematic_residual_mps << ",\n"
                << "  \"rtk_position_factor_count\": " << global_factor_graph_result_.rtk_position_factor_count << ",\n"
                << "  \"rtk_heading_factor_count\": " << global_factor_graph_result_.rtk_heading_factor_count << ",\n"
                << "  \"gravity_magnitude\": " << global_factor_graph_config_.gravity_magnitude << ",\n"

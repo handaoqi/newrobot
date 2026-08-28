@@ -1,5 +1,6 @@
 import hashlib
 import io
+from pathlib import Path
 import zipfile
 from types import SimpleNamespace
 
@@ -67,6 +68,28 @@ def test_activation_removes_stale_map_scoped_gnss_metadata(tmp_path):
 
     assert not (tmp_path / "gnss_origin.yaml").exists()
     assert "gnss_origin.yaml" not in result["switched_files"]
+
+
+def test_activation_switches_all_required_files_through_one_version_pointer(tmp_path):
+    first = _source_map(tmp_path, "first")
+    second = _source_map(tmp_path, "second")
+    config_path = tmp_path / "edge.yaml"
+    config_path.write_text("robot: {}\n")
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(map_dir=str(tmp_path)),
+        robot=SimpleNamespace(current_map_id="", current_map_version=""),
+    )
+    adapter = MapActivationAdapter(config, RuntimeSafetyState(), str(config_path))
+
+    adapter.activate({"map_id": "1", "map_version": "v1", "local_map_dir": str(first)})
+    adapter.activate({"map_id": "2", "map_version": "v2", "local_map_dir": str(second)})
+
+    assert (tmp_path / "current").is_symlink()
+    assert (tmp_path / "current").resolve() == second
+    for name in adapter.REQUIRED_FILES:
+        assert (tmp_path / name).readlink() == Path("current") / name
+        assert (tmp_path / name).resolve() == second / name
+    assert adapter.status()["version_pointer"] == str(second)
 
 
 def test_mapping_start_pose_comes_from_first_trajectory_sample(tmp_path):
