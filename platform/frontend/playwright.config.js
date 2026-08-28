@@ -45,6 +45,7 @@ export default defineConfig({
       use: {
         ...commonUse,
         browserName: 'webkit',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
         viewport: { width: 768, height: 1024 },
         screen: { width: 768, height: 1024 },
       },
@@ -54,6 +55,7 @@ export default defineConfig({
       use: {
         ...commonUse,
         browserName: 'chromium',
+        userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         viewport: { width: 800, height: 1280 },
         screen: { width: 800, height: 1280 },
       },
@@ -63,6 +65,7 @@ export default defineConfig({
       use: {
         ...commonUse,
         browserName: 'webkit',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
         viewport: { width: 834, height: 1194 },
         screen: { width: 834, height: 1194 },
       },
@@ -72,6 +75,7 @@ export default defineConfig({
       use: {
         ...commonUse,
         browserName: 'chromium',
+        userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         viewport: { width: 2000, height: 1200 },
         screen: { width: 2000, height: 1200 },
       },

@@ -1100,17 +1100,19 @@ watch(playUrlKey, () => {
                 </option>
               </select>
             </label>
-            <div>
+            <div class="guard-task-state">
               <span>执行状态</span>
               <strong>{{ taskStateText }}</strong>
             </div>
-            <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
-              {{ busy ? '处理中...' : '开始巡检' }}
-            </button>
-            <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
-              {{ actions.control.label }}
-            </button>
-            <button class="guard-danger" :disabled="busy || localizationBusy || !execution?.id || !actions.forceExit" @click="forceExitTask">强制退出</button>
+            <div class="guard-task-actions">
+              <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
+                {{ busy ? '处理中...' : '开始巡检' }}
+              </button>
+              <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
+                {{ actions.control.label }}
+              </button>
+              <button class="guard-danger" :disabled="busy || localizationBusy || !execution?.id || !actions.forceExit" @click="forceExitTask">强制退出</button>
+            </div>
           </div>
 
           <div class="guard-localization-bar">
@@ -1332,10 +1334,12 @@ watch(playUrlKey, () => {
 .guard-playback-controls button.active { border-color: #52d99c; background: rgba(16, 110, 73, .92); }
 .guard-playback-controls button:disabled { cursor: not-allowed; opacity: .48; }
 .guard-playback-controls small { position: absolute; top: calc(100% + 5px); left: 50%; width: max-content; max-width: 260px; padding: 4px 7px; color: #dbe8ee; background: rgba(10, 29, 41, .72); font-size: 11px; transform: translateX(-50%); }
-.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) repeat(3, auto); align-items: center; gap: 14px; padding: 16px; }
+.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) minmax(330px, 1fr); align-items: center; gap: 14px; padding: 16px; }
 .guard-task-bar > div { display: grid; gap: 5px; min-width: 0; }
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; min-width: 0; }
+.guard-task-actions > button { width: 100%; min-width: 0; font-size: 12px; white-space: nowrap; }
 .guard-task-selector { display: grid; gap: 5px; min-width: 0; }
 .guard-task-selector select { width: 100%; min-width: 0; height: 38px; padding: 0 32px 0 10px; border: 1px solid #c8d3d9; color: #1c303c; background: #fff; font: inherit; font-weight: 800; text-overflow: ellipsis; }
 .guard-task-selector select:disabled { cursor: not-allowed; opacity: .65; }
@@ -1565,6 +1569,154 @@ watch(playUrlKey, () => {
   color: var(--muted);
 }
 @media (min-width: 981px) {
+  .guard-video-label {
+    gap: 2px;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .guard-video-label span {
+    font-size: 10px;
+  }
+  .guard-playback-controls {
+    gap: 5px;
+    padding: 7px;
+  }
+  .guard-playback-controls button {
+    padding-inline: 8px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .guard-task-bar {
+    grid-template-columns: minmax(180px, 1.2fr) minmax(100px, .5fr) minmax(330px, 1fr);
+    gap: 10px;
+    padding: 12px;
+  }
+  .guard-task-bar > div,
+  .guard-task-selector {
+    gap: 3px;
+  }
+  .guard-task-bar span {
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .guard-task-bar strong {
+    font-size: 12px;
+  }
+  .guard-task-actions {
+    grid-template-columns: repeat(3, minmax(96px, 1fr));
+    gap: 8px;
+  }
+  .guard-task-selector select {
+    height: 34px;
+    padding-left: 8px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .guard-primary,
+  .guard-secondary,
+  .guard-danger,
+  .guard-initialize {
+    min-height: 40px;
+    padding-inline: 14px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .guard-localization-bar {
+    gap: 12px;
+    padding: 10px 12px;
+  }
+  .guard-localization-copy {
+    gap: 3px 8px;
+  }
+  .guard-localization-copy > span,
+  .guard-localization-copy > small {
+    font-size: 10px;
+  }
+  .guard-localization-copy > strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .guard-initialize {
+    min-width: 120px;
+  }
+  .guard-loop-panel {
+    gap: 10px;
+    padding: 12px;
+  }
+  .guard-loop-inline {
+    grid-template-columns: 110px minmax(0, 1fr);
+  }
+  .guard-loop-heading {
+    gap: 8px;
+  }
+  .guard-loop-heading .guard-eyebrow {
+    font-size: 10px;
+    letter-spacing: .05em;
+    white-space: nowrap;
+  }
+  .guard-loop-heading h2 {
+    margin-top: 3px;
+    font-size: 17px;
+    white-space: nowrap;
+  }
+  .guard-loop-light {
+    width: 11px;
+    height: 11px;
+  }
+  .guard-loop-controls {
+    grid-template-columns: minmax(0, 1fr) minmax(96px, 110px) minmax(92px, 104px);
+    gap: 8px;
+  }
+  .guard-loop-settings {
+    gap: 8px;
+  }
+  .guard-loop-settings label,
+  .guard-countdown-clock span {
+    gap: 4px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .guard-loop-settings input {
+    height: 36px;
+    padding-inline: 8px;
+    font-size: 12px;
+  }
+  .guard-countdown-clock {
+    gap: 3px;
+  }
+  .guard-countdown-clock strong {
+    height: 36px;
+    font-size: 16px;
+    white-space: nowrap;
+  }
+  .guard-loop-inline .guard-loop-toggle {
+    height: 36px;
+    min-height: 36px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .guard-loop-inline .guard-runtime-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(180px, 1.7fr);
+  }
+  .guard-runtime-grid > div {
+    gap: 3px;
+    padding: 8px;
+  }
+  .guard-runtime-grid span {
+    font-size: 9px;
+    white-space: nowrap;
+  }
+  .guard-runtime-grid strong,
+  .guard-loop-inline .guard-runtime-status strong {
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .guard-loop-inline .guard-loop-message {
+    overflow: hidden;
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .guard-side {
     gap: 14px;
     font-size: 11px;
@@ -1606,7 +1758,7 @@ watch(playUrlKey, () => {
     white-space: nowrap;
   }
   .guard-alert-actions > .guard-pending-events {
-    min-width: 38px;
+    min-width: 44px;
     height: 32px;
     padding-inline: 5px;
   }
@@ -1711,8 +1863,9 @@ watch(playUrlKey, () => {
   .guard-grid { grid-template-columns: 1fr; }
   .guard-side { grid-template-columns: 1fr 220px; align-items: start; }
   .guard-video-stage, .guard-video, .guard-video-empty { min-height: 56vw; }
-  .guard-task-bar { grid-template-columns: 1fr 1fr; }
-  .guard-task-selector { grid-column: 1 / -1; }
+  .guard-task-bar { grid-template-columns: 1fr; }
+  .guard-task-selector, .guard-task-state, .guard-task-actions { grid-column: 1 / -1; }
+  .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .guard-localization-bar { align-items: stretch; flex-direction: column; }
   .guard-initialize { width: 100%; }
   .guard-loop-inline { grid-template-columns: 1fr; }
@@ -1725,7 +1878,9 @@ watch(playUrlKey, () => {
     min-height: 0;
     aspect-ratio: 16 / 9;
   }
-  .guard-task-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guard-task-bar { grid-template-columns: minmax(0, 1fr); }
+  .guard-task-selector, .guard-task-state, .guard-task-actions { grid-column: 1; }
+  .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .guard-primary, .guard-secondary, .guard-danger, .guard-initialize { width: 100%; min-width: 0; }
   .guard-loop-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .guard-loop-inline .guard-loop-toggle { grid-column: 1 / -1; height: auto; min-height: 44px; }
@@ -1757,8 +1912,9 @@ watch(playUrlKey, () => {
   .guard-page { padding: 14px; }
   .guard-header { align-items: start; flex-direction: column; }
   .guard-grid, .guard-side { grid-template-columns: 1fr; }
-  .guard-task-bar { grid-template-columns: 1fr 1fr; }
-  .guard-task-selector { grid-column: 1 / -1; }
+  .guard-task-bar { grid-template-columns: 1fr; }
+  .guard-task-selector, .guard-task-state, .guard-task-actions { grid-column: 1; }
+  .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .guard-primary, .guard-secondary, .guard-danger { width: 100%; }
   .guard-loop-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .guard-loop-toggle { grid-column: 1 / -1; }

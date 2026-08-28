@@ -76,7 +76,7 @@ const robotStatus = {
     localization_status: 'normal',
     nav_ready: true,
     control_mode: 'auto',
-    battery_percent: 78,
+    battery_percent: 63,
     speed_mps: 0,
     sampled_at: '2026-08-24T08:30:00+08:00',
     audio: {

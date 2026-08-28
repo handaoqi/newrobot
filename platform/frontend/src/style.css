@@ -3039,9 +3039,8 @@ a { color: inherit; }
 }
 
 @media (max-width: 1200px) {
-  .dashboard-shell, .page-grid, .data-grid, .analytics-grid { grid-template-columns: 1fr; }
+  .page-grid, .data-grid, .analytics-grid { grid-template-columns: 1fr; }
   .robot-management-grid { grid-template-columns: 1fr; }
-  .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
   .analytics-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .login-shell {
     grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
@@ -3054,29 +3053,6 @@ a { color: inherit; }
 }
 
 @media (max-width: 900px) {
-  .dashboard-shell { grid-template-columns: 1fr; }
-  .sidebar { padding-bottom: 20px; }
-  .menu-list {
-    display: flex;
-    overflow-x: auto;
-    padding-bottom: 6px;
-  }
-  .menu-item { flex: 0 0 auto; }
-  .menu-group { position: relative; width: auto; flex: 0 0 auto; }
-  .menu-group-header { width: auto; }
-  .menu-submenu {
-    position: absolute;
-    z-index: 30;
-    top: calc(100% + 6px);
-    left: 0;
-    width: 156px;
-    padding: 8px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--panel);
-    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
-  }
-  .menu-subitem { width: 100%; }
   .main-layout { padding: 18px; }
   .main-header, .panel-head, .section-head, .table-card, .task-card, .robot-item, .event-card, .trend-footer {
     align-items: flex-start;
@@ -3306,7 +3282,6 @@ a { color: inherit; }
 /* Tablet portrait workspace: keep controls touchable and let content reflow
    instead of shrinking the desktop canvas. */
 @media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
-  .dashboard-shell,
   .page-grid,
   .data-grid,
   .analytics-grid {
@@ -3414,14 +3389,9 @@ a { color: inherit; }
   }
 }
 
-/* Large touch tablets: use the same drawer navigation as portrait tablets,
-   while retaining the horizontal workspace that fits a 2000x1200 viewport. */
+/* Large landscape tablets retain the permanent left navigation and use the
+   wider workspace dimensions available at 2000x1200. */
 @media (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
-  .dashboard-shell {
-    grid-template-columns: minmax(0, 1fr);
-    font-size: 16px;
-  }
-
   .main-layout {
     min-width: 0;
     padding: 24px clamp(24px, 3vw, 56px);

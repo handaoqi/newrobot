@@ -13,12 +13,25 @@ const expandedMenus = ref({})
 const tabletMenuOpen = ref(false)
 const tabletMenuButton = ref(null)
 const tabletSidebar = ref(null)
+const mobileDevice = ref(detectMobileDevice())
+const portraitViewport = ref(typeof window !== 'undefined' && window.matchMedia('(orientation: portrait)').matches)
 const mappingAlert = ref(null)
 const robots = ref([])
 let mappingPollTimer = null
 let mappingAlertEventSource = null
 let lastMappingAlertKey = ''
 let mappingStatusRefreshing = false
+let portraitMediaQuery = null
+
+function detectMobileDevice() {
+  if (typeof navigator === 'undefined') return false
+  if (navigator.userAgentData?.mobile === true) return true
+  const userAgent = String(navigator.userAgent || '')
+  const iPadOS = navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1
+  return iPadOS || /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent)
+}
+
+const drawerNavigation = computed(() => mobileDevice.value && portraitViewport.value)
 
 const menuItems = [
   { label: '保安值守', path: '/dashboard/guard-duty' },
@@ -64,6 +77,7 @@ function expandActiveMenu() {
 }
 
 async function openTabletMenu() {
+  if (!drawerNavigation.value) return
   expandActiveMenu()
   tabletMenuOpen.value = true
   document.body.classList.add('tablet-menu-locked')
@@ -87,6 +101,10 @@ function handleTabletMenuKeydown(event) {
   if (event.key === 'Escape' && tabletMenuOpen.value) {
     closeTabletMenu({ returnFocus: true })
   }
+}
+
+function handlePortraitChange(event) {
+  portraitViewport.value = event.matches
 }
 
 function isMenuActive(item) {
@@ -201,6 +219,9 @@ function setupMappingAlertStream() {
 
 onMounted(() => {
   expandActiveMenu()
+  portraitMediaQuery = window.matchMedia('(orientation: portrait)')
+  portraitViewport.value = portraitMediaQuery.matches
+  portraitMediaQuery.addEventListener?.('change', handlePortraitChange)
   document.addEventListener('keydown', handleTabletMenuKeydown)
   refreshMappingAlerts()
   mappingPollTimer = window.setInterval(refreshMappingAlerts, 2000)
@@ -208,6 +229,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  portraitMediaQuery?.removeEventListener?.('change', handlePortraitChange)
   document.removeEventListener('keydown', handleTabletMenuKeydown)
   document.body.classList.remove('tablet-menu-locked')
   if (mappingPollTimer) window.clearInterval(mappingPollTimer)
@@ -221,10 +243,17 @@ watch(() => route.path, () => {
   if (mappingAlert.value?.diverged) return
   refreshMappingAlerts()
 })
+
+watch(drawerNavigation, (enabled) => {
+  if (!enabled) closeTabletMenu()
+})
 </script>
 
 <template>
-  <div class="dashboard-shell">
+  <div
+    class="dashboard-shell"
+    :class="drawerNavigation ? 'drawer-navigation' : 'desktop-navigation'"
+  >
     <header class="tablet-app-bar">
       <button
         ref="tabletMenuButton"
@@ -245,7 +274,7 @@ watch(() => route.path, () => {
     </header>
 
     <button
-      v-if="tabletMenuOpen"
+      v-if="drawerNavigation && tabletMenuOpen"
       class="tablet-menu-backdrop"
       type="button"
       aria-label="关闭导航菜单"
@@ -256,7 +285,7 @@ watch(() => route.path, () => {
       id="dashboard-navigation"
       ref="tabletSidebar"
       class="sidebar"
-      :class="{ 'tablet-open': tabletMenuOpen }"
+      :class="{ 'tablet-open': drawerNavigation && tabletMenuOpen }"
       aria-label="平台导航"
     >
       <div class="brand-block">
@@ -413,10 +442,13 @@ watch(() => route.path, () => {
   background: #7a4e00;
 }
 
-@media (max-width: 1024px) and (orientation: portrait),
-  (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
+@media (orientation: portrait) {
   :global(body.tablet-menu-locked) {
     overflow: hidden;
+  }
+
+  .dashboard-shell.drawer-navigation {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .tablet-app-bar {
@@ -587,7 +619,7 @@ watch(() => route.path, () => {
   }
 }
 
-@media (max-width: 1024px) and (orientation: portrait) {
+@media (orientation: portrait) {
   .tablet-app-bar {
     position: fixed;
     top: 12px;
@@ -634,5 +666,90 @@ watch(() => route.path, () => {
   .main-header {
     margin-bottom: 20px;
   }
+}
+
+/* Device mode wins over viewport-width breakpoints. A narrow desktop keeps the
+   permanent vertical sidebar; only a portrait mobile device uses the drawer. */
+.dashboard-shell.desktop-navigation {
+  grid-template-columns: clamp(180px, 18vw, 224px) minmax(0, 1fr);
+  font-size: 14px;
+}
+
+.desktop-navigation .tablet-app-bar,
+.desktop-navigation .tablet-menu-backdrop {
+  display: none;
+}
+
+.desktop-navigation .sidebar {
+  position: static;
+  inset: auto;
+  width: auto;
+  max-height: none;
+  overflow: visible;
+  padding: 22px 18px;
+  border-right: 1px solid var(--line);
+  border-bottom: 0;
+  border-left: 0;
+  transform: none;
+  visibility: visible;
+  pointer-events: auto;
+  transition: none;
+}
+
+.desktop-navigation .sidebar .menu-list {
+  display: grid;
+  overflow: visible;
+  gap: 8px;
+  margin-top: 27px;
+  padding-bottom: 0;
+}
+
+.desktop-navigation .sidebar .menu-item,
+.desktop-navigation .sidebar .menu-group,
+.desktop-navigation .sidebar .menu-group-header,
+.desktop-navigation .sidebar .menu-subitem {
+  width: 100%;
+  flex: initial;
+}
+
+.desktop-navigation .sidebar .menu-group,
+.desktop-navigation .sidebar .menu-subgroup {
+  position: static;
+  min-width: 0;
+}
+
+.desktop-navigation .sidebar .menu-submenu {
+  position: static;
+  z-index: auto;
+  top: auto;
+  left: auto;
+  width: 100%;
+  padding: 6px 0 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.desktop-navigation .sidebar .menu-third-level {
+  padding-left: 20px;
+}
+
+.desktop-navigation .main-layout {
+  min-width: 0;
+  padding: 19px;
+}
+
+.desktop-navigation .desktop-page-heading {
+  display: block;
+}
+
+.desktop-navigation .main-header {
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.desktop-navigation .header-actions {
+  width: auto;
 }
 </style>

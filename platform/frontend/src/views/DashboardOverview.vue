@@ -5,6 +5,7 @@ import { useAsyncPoller } from '../composables/useAsyncPoller'
 import AppToast from '../components/AppToast.vue'
 import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
+import { resolveBatteryPercent } from '../utils/battery'
 import {
   API_BASE,
   createSpeechCategory,
@@ -61,7 +62,7 @@ const speechTemplates = ref([])
 const alertSkills = ref([])
 const alertSkillSaving = ref('')
 const alertSkillPreviewing = ref('')
-const robotAudioStatus = ref(null)
+const robotLiveStatus = ref(null)
 const selectedCategoryFilter = ref('all')
 const selectedSpeakerTemplateId = ref(null)
 const selectedRecordingId = ref(null)
@@ -103,8 +104,13 @@ const { toastMessage, toastVariant, visible, showToast } = useToast()
 
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 const latestRobot = computed(() => selectedRobot.value || overview.value?.latest_robot || null)
-const speaker3588Status = computed(() => robotAudioStatus.value?.speaker_3588 || null)
-const speakerNxStatus = computed(() => robotAudioStatus.value?.speaker_nx || null)
+const speaker3588Status = computed(() => robotLiveStatus.value?.audio?.speaker_3588 || null)
+const speakerNxStatus = computed(() => robotLiveStatus.value?.audio?.speaker_nx || null)
+const displayedBatteryPercent = computed(() => {
+  if (switchingRobot.value) return null
+  return resolveBatteryPercent(robotLiveStatus.value, latestRobot.value)
+})
+const displayedBatteryLabel = computed(() => displayedBatteryPercent.value === null ? '--' : `${displayedBatteryPercent.value}%`)
 const speechLibraryItems = computed(() => [
   ...speechTemplates.value.map((item) => ({ ...item, title: item.name, source_type: 'tts' })),
   ...savedRecordings.value.map((item) => ({ ...item, name: item.title, text: item.transcript, source_type: 'recording' })),
@@ -797,6 +803,7 @@ async function exitTakeover(options = {}) {
 async function chooseRobot(robotId, announce = true) {
   if (!robotId || switchingRobot.value || selectedRobot.value?.id === robotId) return
   switchingRobot.value = true
+  robotLiveStatus.value = null
   liveDetectionState.value = { detections: [] }
   try {
     const [robotDetail, liveStatus] = await Promise.all([
@@ -804,7 +811,7 @@ async function chooseRobot(robotId, announce = true) {
       fetchRobotStatus(robotId).catch(() => null),
     ])
     selectedRobot.value = robotDetail
-    robotAudioStatus.value = liveStatus?.status?.audio || null
+    robotLiveStatus.value = liveStatus?.status || null
     streamUnavailable.value = false
     if (announce) showToast(`已切换至 ${selectedRobot.value.name}`)
   } finally {
@@ -812,20 +819,20 @@ async function chooseRobot(robotId, announce = true) {
   }
 }
 
-async function refreshAudioStatus({ signal } = {}) {
+async function refreshRobotStatus({ signal } = {}) {
   const robotId = latestRobot.value?.id
   if (!robotId) return
   try {
     const liveStatus = await fetchRobotStatus(robotId, { signal })
     if (latestRobot.value?.id === robotId) {
-      robotAudioStatus.value = liveStatus?.status?.audio || null
+      robotLiveStatus.value = liveStatus?.status || null
     }
   } catch (_error) {
     // Retain the last valid device sample during a transient request failure.
   }
 }
 
-const audioStatusPoller = useAsyncPoller((signal) => refreshAudioStatus({ signal }), { intervalMs: 5_000 })
+const robotStatusPoller = useAsyncPoller((signal) => refreshRobotStatus({ signal }), { intervalMs: 5_000 })
 const liveDetectionPoller = useAsyncPoller((signal) => refreshLiveDetections({ signal }), { intervalMs: 400 })
 
 onMounted(async () => {
@@ -1047,7 +1054,7 @@ function handleVisibilityChange() {
           </button>
           <div class="footer-card">
             <strong>设备电量</strong>
-            <span>{{ latestRobot?.battery_level }}%</span>
+            <span data-testid="device-battery">{{ displayedBatteryLabel }}</span>
           </div>
           <button class="danger-btn" :disabled="commandSending" @click="emergencyStop">
             {{ commandSending ? '下发中...' : '紧急停止' }}
