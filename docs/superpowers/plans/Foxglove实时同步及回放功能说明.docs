@@ -1,0 +1,304 @@
+# Foxglove 实时同步及回放功能说明
+
+> 面向产品、测试、实施和最终用户的说明稿
+> 日期：2026-08-28
+> 当前状态：已完成方案，功能尚未开发
+> 使用约束：完全离线、自托管、无 Foxglove 账户；先完成桌面端，再开放 Web 端
+
+## 一、先说重点
+
+### 1. 最终会得到什么
+
+这套功能用于在一台操作员电脑上观察和复盘机器狗 ROS2 数据，不从页面控制机器狗运动。
+
+- [ ] 机器狗执行任务时，桌面端或浏览器通过只读 WebSocket 实时显示地图、机器人位置、规划路径、实际轨迹、巡逻状态、雷达/相机和健康状态。
+- [ ] 任务结束后，用户可以打开历史 Bag，执行播放、暂停、回到起点、倍速、拖动跳转、单步和循环；所有面板使用同一时间轴。
+- [ ] 系统提供一个无需真实机器狗的 120 秒“室内巡逻”示例，可一条命令发布、录制、校验和转换数据。
+- [ ] 每次正式录制都交付完整的 ROS2 SQLite3 Bag 目录，其中必须同时有 `metadata.yaml` 和一个或多个 `.db3` 文件。
+- [ ] 为改善浏览器兼容性，还会从 SQLite3 Bag 生成一个 MCAP 派生文件；原始 `.db3` 不被替换或删除。
+- [ ] 所有软件、依赖、布局和扩展均可从离线包安装，运行时不访问 Foxglove 云端，也不要求登录账户。
+
+### 2. 为什么先做桌面端
+
+桌面端能先隔离浏览器权限、跨域、WebSocket 混合内容和大文件内存等问题，更适合验证 ROS 数据本身是否正确。桌面验收通过后，完全相同的示例数据、话题契约、布局和 `.foxe` 扩展再进入自托管 Web 验收。
+
+阶段门禁如下：
+
+1. 先确认离线宿主和三种 Bag 路径的真实兼容性。
+2. 完成桌面实时显示和自定义巡逻面板。
+3. 完成演示 Bag、历史回放和桌面端完整验收。
+4. 只有桌面验收全通过，才部署 Web 版本。
+5. 最后完成异常、性能、两小时稳定性和断网交付验收。
+
+不需要拆成多个独立计划。桌面和 Web 是同一方案的两个里程碑，必须共享同一数据契约，避免两套实现产生差异。
+
+### 3. 默认使用哪个产品
+
+默认使用 **Lichtblick Desktop/Web 1.28.1**。它是 Foxglove Studio 开源代码的社区延续，支持 Foxglove WebSocket、`.foxe` 扩展、ROS2 `.db3` 和 MCAP，并且可完全离线自托管。
+
+它不是当前官方 Foxglove 云产品。官方 Foxglove 3.0.0 的无账户桌面模式和自托管 Web 都涉及 Enterprise 或定制许可，因此不会成为本项目的默认依赖。如果公司已经购买相应许可，可在完成默认方案后增加官方宿主兼容验收。
+
+### 4. 历史 Bag 怎么播放
+
+系统保留三种方式，用户界面会明确告诉用户当前是哪一种：
+
+| 方式 | 适用场景 | 用户体验 | 结论 |
+|---|---|---|---|
+| 直接打开 `.db3` 文件集 | 标准 ROS2 消息、小中型 Bag | 原生时间轴；操作最简单 | 需要桌面/Web 实测通过后才启用 |
+| `ros2 bag play` + `foxglove_bridge` | 需要让 ROS2 算法节点参与回放 | 流式稳定；播放进程在本机 | 用于节点在环，Humble 不提供完整浏览器 seek 服务 |
+| SQLite3 转 MCAP 后直接打开 | 正式演示、浏览器、自定义消息 | schema 自包含，跳转和跨平台更可靠 | 默认推荐 |
+
+无论采用哪一种回放方式，标准交付仍是完整的 SQLite3 Bag 目录。MCAP 是派生物，不是用来掩盖缺少 `metadata.yaml` 的孤立 `.db3`。
+
+### 5. 页面会长什么样
+
+- 顶部：数据源、实时/回放模式、连接状态和错误摘要。
+- 主区域：地图、机器人位姿、目标点、全局路径和实际巡逻轨迹。
+- 传感器：相机、LaserScan 或 PointCloud2、IMU 和里程计曲线。
+- 状态：当前任务、巡逻点、阶段、成功/失败、电池和 diagnostics。
+- 话题：名称、类型、频率、延迟、最新更新时间、缺失和 QoS 问题。
+- 底部：Bag 当前时间、总时长、播放速度、跳转和循环。
+- 告警：WebSocket、时间、TF、话题、文件和性能问题。
+
+地图、3D、TF、路径、雷达、相机、曲线、原始消息和时间轴直接复用宿主成熟面板。只开发机器狗专用的“巡逻概览”面板，不重复造播放器和 3D 引擎。
+
+## 二、已经从项目里确认的事实
+
+### 1. 当前环境
+
+- Ubuntu 22.04.5 LTS，aarch64，ROS2 Humble。
+- Python 3.10.12，Node.js 22.22.3，npm 10.9.8；没有 pnpm。
+- `foxglove_bridge` 3.4.3、rosbag2 0.15.16、MCAP storage plugin 0.15.16 已安装。
+- 生产 ROS Domain ID 为 24；离线回放沿用隔离 Domain 77。
+- 前端是 Vue 3 + Vite 4，测试使用 Node test 和 Playwright。
+- 当前 NX 有约 15 GiB 内存、45 GiB 可用磁盘；检查时系统内存压力较高，因此推荐在操作员电脑渲染，在 NX 上只按需运行 bridge。
+
+### 2. 当前已有能力
+
+- `mapping_rosbag.sh` 和 `navigation_rosbag.sh` 已能录制标准 SQLite3 Bag，并处理磁盘门禁、信号清理、状态和保留策略。
+- `replay_mapping_rosbag.sh` 已能在 Domain 77 回放，但尚未发布 `/clock`，也没有浏览器控制接口。
+- `recording_manifest.py` 已能检查 metadata 和固定话题，可以扩展为正式的 Bag 契约校验器。
+- 现场已有多个完整 SQLite3 Bag 和一个 MCAP，可直接用于第一轮只读兼容性验证。
+- 当前视频是 RTSP → ZLMediaKit → FLV/HLS，不是 ROS `/camera/...` 话题。
+- 当前没有确认到标准 `/battery_state`、`/diagnostics`、`/clock` 和 ROS 相机 publisher；示例程序会提供这些标准消息，实机端按实际适配。
+
+### 3. 真实话题摘要
+
+已从代码、现存 Bag 或 ROS graph 确认的核心话题包括：
+
+- `/tf`、`/tf_static`
+- `/odom/localization_odom`、`/odom/nav2`、`/odom/mc_odom`
+- `/cmd_vel`、`/cmd_vel_raw`
+- `/front_lidar`、`/laser_scan`、`/front_lidar/imu`
+- `/fix`、`/rtk_pvh`、`/rtk/ntrip_status`
+- `/plan`、`/transformed_global_plan`
+- `/status`、`/localization_info` 和定位策略/健康话题
+
+导航运行时会有 `/map`；`/goal_pose` 的生产 publisher 仍要在导航运行态重新确认。所有话题名称都做成配置，不把设计稿里的示例名称直接写死。
+
+### 4. 坐标、时间和 QoS
+
+- 生产坐标主链为 `map → odom → base_link`，激光等传感器通过静态 TF 挂到 `base_link`。
+- 实时真机使用 wall/ROS time，`use_sim_time=false`。
+- 节点在环回放使用 `ros2 bag play --clock 40`；相关算法节点在启动前设置 `use_sim_time=true`。
+- 传感器通常是 best-effort/volatile；`/tf_static` 必须 reliable/transient-local；不能用一份统一 QoS 覆盖全部话题。
+- 文件回放界面用 Bag 的 log time 作为统一横轴；header stamp 用来计算延迟、乱序和 TF 问题。
+
+## 三、室内巡逻示例
+
+示例默认运行 120 秒，固定随机种子，不需要真机和 Nav2：
+
+1. 发布 10 m × 8 m 的简单室内地图。
+2. 机器人从 `(1,1)` 出发。
+3. 依次到达四个巡逻点。
+4. 在第二个点停留 5 秒。
+5. 在第三个点前模拟障碍绕行，diagnostics 短暂 WARN 后恢复。
+6. 连续发布 odom、TF、路径、速度和任务状态。
+7. 默认发布 LaserScan、IMU、电池、diagnostics 和 640×360、2 Hz 的压缩相机图像。
+8. 返回起点并发布 `COMPLETED`。
+9. 录制成 SQLite3 Bag，再校验并转换出 MCAP。
+
+示例可配置 namespace、频率、巡逻点、速度、时长、传感器开关、Bag 根目录、Bag 名称和随机种子。默认正式 Bag 不超过 80 MiB；超过时先降低相机质量或频率，不删除 TF、时钟和里程计等关键数据。
+
+合格制品结构：
+
+```text
+indoor_patrol_20260828_001/
+├── metadata.yaml
+└── indoor_patrol_20260828_001_0.db3
+
+indoor_patrol_20260828_001-derived/
+├── indoor_patrol_20260828_001.mcap
+├── manifest.json
+└── SHA256SUMS
+```
+
+正式大 Bag 不提交普通 Git。仓库只保存生成器、配置、10 秒测试 fixture、manifest 规则和下载/离线发布说明；120 秒制品放入离线发布包或受控共享盘。
+
+## 四、操作流程
+
+以下命令表示开发完成后的用户合同，目前新增脚本还不存在。
+
+### 1. 一条命令完成演示
+
+```bash
+cd /home/dogrobot
+ROS_DOMAIN_ID=77 robot/script/robot/foxglove_demo.sh all \
+  --duration 120 \
+  --output /home/dogrobot/runtime/nx-edge/data/rosbags/demo
+```
+
+该命令依次执行环境预检、发布 demo、启动只读 bridge、录制 SQLite3、正常停止、检查 Bag、转换 MCAP 和生成 SHA-256。任何阶段失败都停止本脚本启动的进程，不会杀死其他 ROS 节点；半成品保留为 `.partial-*` 供排查，不会标记 READY。
+
+### 2. 只启动实时数据
+
+```bash
+cd /home/dogrobot/robot
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=77 ros2 launch roamerx_patrol_demo indoor_patrol_demo.launch.py
+```
+
+另开终端：
+
+```bash
+cd /home/dogrobot/robot
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=77 ros2 launch roamerx_patrol_demo foxglove_readonly.launch.py
+```
+
+桌面端连接 `ws://127.0.0.1:8765`。跨机器访问时使用机器人专网 IP；跨网段/HTTPS 页面统一通过 Nginx 使用 WSS，不能放宽为任意 Origin。
+
+### 3. 检查和回放 Bag
+
+```bash
+ros2 bag info /home/dogrobot/runtime/nx-edge/data/rosbags/demo/indoor_patrol_20260828_001
+
+ROS_DOMAIN_ID=77 ros2 bag play \
+  /home/dogrobot/runtime/nx-edge/data/rosbags/demo/indoor_patrol_20260828_001 \
+  --clock 40 --start-paused --rate 1.0
+```
+
+桌面/Web 文件模式优先打开生成的 MCAP。DB3 直接打开功能只有在目标版本兼容性报告通过后才显示为支持。
+
+## 五、异常时用户会看到什么
+
+| 问题 | 系统行为 |
+|---|---|
+| 路径不存在或越过允许目录 | 加载前拒绝，不创建/读取其他文件 |
+| 缺少 `metadata.yaml` | 显示“不完整 rosbag2 目录”，只建议复制后 reindex，不修改原件 |
+| DB3 损坏或录制未结束 | 完整性检查失败，不转换、不生成 READY |
+| 缺话题 | 其余内容继续播放；话题健康表标出缺失项 |
+| 自定义消息无法解码 | 显示 schema 不可用，并引导转 MCAP 或使用 bridge |
+| ROS Domain ID 错误 | preflight 显示期望值 77 和实际值，阻止连接生产域 24 |
+| QoS 不兼容 | 显示发布端/订阅端差异和 override 建议 |
+| `/clock` 缺失、停滞或回退 | 区分文件 log time 与节点在环；seek 时清空旧统计，不让页面崩溃 |
+| TF 断裂、循环或 frame 不存在 | 隐藏受影响图元，显示具体父子 frame；其他面板继续工作 |
+| WebSocket 断开 | 0.5～8 秒有限退避重连，最多 5 次，可手动取消 |
+| 相机/点云过载 | 保留最新帧、降低刷新率，不让消息队列无限增长 |
+| 重复点击连接/播放 | 幂等处理，只创建一个连接或播放器 |
+| 加载中取消 | 1 秒内回到空闲，释放句柄、timer、socket 和子进程 |
+| 浏览器刷新 | 恢复布局和非敏感配置，不自动取得本地文件权限或自动播放 |
+
+## 六、性能和安全承诺
+
+### 性能基线
+
+- Web 冷首屏不超过 5 秒，热启动不超过 2 秒。
+- LAN WebSocket p95 建立不超过 2 秒。
+- odom/Laser 从发布到可视化 p95 不超过 250 ms；状态不超过 500 ms。
+- 120 秒 MCAP 在 3 秒内可播放；1.7 GiB Bag 在 10 秒内可播放。
+- demo seek 后 500 ms 内恢复；1.7 GiB Bag 2 秒内恢复。
+- 稳定 30 分钟后的内存增长率小于 20 MiB/小时；20 次模式切换后回到基线 +15% 以内。
+- 默认 LaserScan 10 Hz、相机 2 Hz；PointCloud 默认最多 5 Hz、只排队最新一帧。
+
+### 安全边界
+
+- bridge 默认只读，禁止 client publish、service call 和参数写入。
+- Web 只能读取用户手势选择的文件；远端文件服务只能访问配置的 Bag 根目录。
+- 所有路径 `realpath` 后检查 containment；拒绝 `..`、越界、错误扩展和超限大小。
+- 单实例只加载一个 Bag；10 GiB 警告、15 GiB 拒绝；缓存上限 512 MiB。
+- 不使用 `eval`，不执行 Bag 中的代码，不向浏览器暴露其他本地文件。
+- 页面退出、播放结束和模式切换时释放订阅、文件句柄、timer、socket 和子进程。
+
+## 七、测试和验收
+
+### 1. 单元测试
+
+- 配置解析和话题映射。
+- 纳秒时间、clock 回退和乱序。
+- 播放/连接状态机和重复操作。
+- 消息适配、巡逻 JSON schema 和异常值。
+- 频率、延迟、陈旧判断和资源清理。
+
+命令：
+
+```bash
+cd /home/dogrobot/platform/foxglove-extension
+npm ci --offline
+npm test
+
+cd /home/dogrobot/robot
+source /opt/ros/humble/setup.bash
+colcon test --packages-select roamerx_patrol_demo --event-handlers console_direct+
+colcon test-result --verbose
+```
+
+### 2. 集成测试
+
+- ROS 发布器 → `foxglove_bridge` → WebSocket → 面板。
+- `ros2 bag record` → `ros2 bag info` → `ros2 bag play`。
+- SQLite3 → MCAP 后的 topic count、起止时间和 schema 一致。
+- `/clock`、`use_sim_time`、TF、地图、轨迹、相机和雷达同步。
+- 实时和回放互斥切换、断连重连和取消。
+
+### 3. 完整验收
+
+完整验收必须逐步证明：启动示例、连接实时、看到地图/位置/路径/状态、录制完整 DB3、停止实时、历史回放、播放控制、多面板同步、数据与实时阶段一致，然后注入断连、缺话题、TF 错误和损坏 Bag。
+
+判定标准包括：最终位置误差不超过 0.10 m，多面板相对时间不超过 100 ms，seek 响应达到性能基线，异常不导致白屏或后台无响应，断网时无任何外部请求。
+
+## 八、实施节奏和工作量
+
+| 阶段 | 交付 | 预计工作量 |
+|---|---|---:|
+| M0 兼容性门禁 | 宿主锁定、DB3/bridge/MCAP 报告、API 探针 | 3～5 人日 |
+| M1 桌面实时 | `.foxe`、只读 bridge、实时布局和话题健康 | 6～8 人日 |
+| M2 桌面回放 | demo、DB3、MCAP、一键脚本、桌面 E2E | 7～10 人日 |
+| M3 自托管 Web | 离线镜像、同源入口、安全和 Web E2E | 6～9 人日 |
+| M4 加固交付 | 故障、性能、2 小时稳定性、文档和发布包 | 4～6 人日 |
+
+合计 26～38 人日，建议由前端/扩展、ROS2、测试/部署三个角色协作，日历约 4～6 周。Web 开发不能绕过桌面端验收门禁。
+
+## 九、完成标准
+
+- [ ] 完全断网、无 Foxglove 账户时，桌面端和 Web 均可用。
+- [ ] 实时 ROS2 数据连接、断连和重连稳定。
+- [ ] 地图、位姿、轨迹、导航状态和传感器同步显示。
+- [ ] 完整 SQLite3 Bag 目录可录制、校验和稳定回放。
+- [ ] 播放、暂停、倍速、跳转、单步、循环和时间同步通过验收。
+- [ ] `/clock`、TF、QoS 和 `use_sim_time` 行为正确。
+- [ ] 无真机室内巡逻示例可重复生成同一语义数据。
+- [ ] MCAP 与 DB3 的话题数、消息数和时间范围一致。
+- [ ] 常见异常有可行动提示，页面和后台不会无响应。
+- [ ] 新用户按 README 可从零完成安装、实时观察、录制和回放。
+- [ ] 单元、集成、桌面 E2E、Web E2E、性能和断网测试全部归档。
+
+更完整的技术事实、真实话题 QoS、准确文件路径、每个开发任务的红/绿测试、风险和回滚见：
+
+`/home/dogrobot/docs/superpowers/plans/2026-08-28-foxglove-web-ros2-bag-debugging.md`
+
+## 十、依据与已知限制
+
+本说明基于仓库文档/源码/Bag 元数据和 2026-08-28 查询的一手资料。关键外部依据：
+
+- [Foxglove Local data](https://docs.foxglove.dev/docs/visualization/connecting/local-data)
+- [Foxglove Playback](https://docs.foxglove.dev/docs/visualization/playback)
+- [Foxglove Extensions](https://docs.foxglove.dev/docs/extensions)
+- [Foxglove standalone license](https://docs.foxglove.dev/docs/standalone-license)
+- [Foxglove self-hosted embedded visualization](https://docs.foxglove.dev/docs/embed/self-hosted)
+- [rosbag2](https://github.com/ros2/rosbag2)
+- [Lichtblick v1.28.1](https://github.com/lichtblick-suite/lichtblick/releases/tag/v1.28.1)
+
+原设计资料中的 `@foxglove/studio-web` 安装方式当前无有效 npm 包；“Web 可直接打开所有 DB3”“Web 与桌面 100% 一致”也没有实测依据。因此本方案以兼容性门禁和明确降级路径为准，不提前宣称未验证能力。
