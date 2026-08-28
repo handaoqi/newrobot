@@ -93,3 +93,15 @@ export function localizationRecoveryLabel(state) {
     ended: '任务已结束',
   }[state] || '状态未知'
 }
+
+export function isLocalizationLossPause(execution) {
+  if (!['pausing', 'paused'].includes(execution?.state)) return false
+  const events = [...(execution?.events || [])].reverse()
+  const latestPause = events.find((event) => ['task.pausing', 'task.paused'].includes(event.event_type))
+  return ['LOCALIZATION_LOST', 'ABSOLUTE_LOCALIZATION_REQUIRED'].includes(latestPause?.reason_code)
+}
+
+export function localizationRecoveryStillRunning(execution) {
+  const markers = buildLocalizationLossMarkers(execution)
+  return markers.some((point) => point.recoveryState === 'recovering')
+}

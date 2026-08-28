@@ -15,15 +15,29 @@ export function isExecutionActive(state) {
   return ACTIVE_STATES.has(state)
 }
 
-export function executionActions(state) {
+export const FORCE_EXIT_CONFIRM_TEXT = [
+  '强制退出会停止当前导航，并清理该机器人的全部未结束任务。',
+  '退出后请等待约 40 秒：任务应变为已取消，定位丢失点不再显示“正在停止并重定位”。',
+  '确认自动恢复已停后，再到路径规划设初始定位。不要立即点继续或下发初始位。',
+].join('')
+
+export const FORCE_EXIT_WAIT_HINT = [
+  '任务已强制退出。请等待约 40 秒，确认任务已取消、定位丢失点不再显示“正在停止并重定位”，再去路径规划设初始定位。',
+  '不要点继续，也不要在自动恢复还在跑时下发初始位。',
+].join('')
+
+export function executionActions(state, options = {}) {
   const executing = state === 'running' || state === 'resuming'
   const pauseable = ['created', 'dispatching', 'accepted', 'running', 'resuming'].includes(state)
   const paused = state === 'pausing' || state === 'paused'
   const interrupted = state === 'interrupted'
   const exiting = state === 'cancelling'
   const ended = TERMINAL_STATES.has(state)
+  const localizationPaused = Boolean(options.localizationPaused) && (paused || interrupted)
   const control = pauseable
     ? { enabled: true, action: 'pause', label: '暂停' }
+    : localizationPaused
+      ? { enabled: false, action: null, label: '请先强制退出' }
     : paused || interrupted
       ? { enabled: true, action: 'resume', label: '继续' }
       : ended

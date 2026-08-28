@@ -19,6 +19,14 @@ test('combined control follows running and paused states', () => {
   assert.equal(executionActions('cancelling').statusLabel, '任务退出中')
 })
 
+test('localization-loss pause disables continue until force exit', () => {
+  assert.deepEqual(
+    executionActions('paused', { localizationPaused: true }).control,
+    { enabled: false, action: null, label: '请先强制退出' },
+  )
+  assert.deepEqual(executionActions('paused').control, { enabled: true, action: 'resume', label: '继续' })
+})
+
 test('all persisted in-flight states are active', () => {
   for (const state of ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted']) {
     assert.equal(isExecutionActive(state), true)

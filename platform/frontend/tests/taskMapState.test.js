@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   buildLocalizationLossMarkers,
   currentRobotMapPose,
+  isLocalizationLossPause,
+  localizationRecoveryStillRunning,
 } from '../src/services/taskMapState.js'
 
 test('loss markers use persisted trusted pose and stay on their task map', () => {
@@ -36,6 +38,43 @@ test('loss markers use persisted trusted pose and stay on their task map', () =>
   assert.equal(markers.length, 1)
   assert.equal(markers[0].recoveryState, 'recovered')
   assert.equal(buildLocalizationLossMarkers(execution, [], 18).length, 0)
+})
+
+test('paused localization-loss tasks stay in recovering until the task is cancelled', () => {
+  const execution = {
+    state: 'paused',
+    map_data: 17,
+    events: [
+      {
+        id: 1,
+        event_type: 'task.pausing',
+        reason_code: 'LOCALIZATION_LOST',
+        state_version: 8,
+        occurred_at: '2026-08-25T13:44:55Z',
+        payload: { map_id: '17', last_trusted_pose: { x: 1.4, y: 1.2, yaw: -1.0 } },
+      },
+      {
+        id: 2,
+        event_type: 'task.paused',
+        reason_code: 'LOCALIZATION_LOST',
+        state_version: 9,
+        payload: {},
+      },
+    ],
+  }
+  assert.equal(isLocalizationLossPause(execution), true)
+  assert.equal(localizationRecoveryStillRunning(execution), true)
+
+  const cancelled = {
+    ...execution,
+    state: 'cancelled',
+    events: [
+      ...execution.events,
+      { id: 3, event_type: 'task.cancelled', state_version: 10, payload: {} },
+    ],
+  }
+  assert.equal(isLocalizationLossPause(cancelled), false)
+  assert.equal(localizationRecoveryStillRunning(cancelled), false)
 })
 
 test('robot marker exposes lost telemetry as untrusted and falls back to trusted loss point', () => {
