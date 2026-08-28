@@ -2,14 +2,18 @@
 #
 # Measured on this NX against a real 317 s / 1727 MB navigation bag, converting
 # with ros2 bag convert so every run pays the same sqlite3 read cost and the
-# difference is the writer alone:
+# difference is the writer alone. The last column subtracts the "mcap, no
+# config" row and divides by the 317 s of recorded time, i.e. what compression
+# alone would cost one core if this ran live:
 #
-#   writer                 user    sys    CPU    size
-#   sqlite3 (previous)     4.29    9.24   13.53s 1727 MB
-#   mcap, no config        1.45    4.43    5.87s 1716 MB
-#   mcap Lz4/Fastest       4.48    2.91    7.38s  981 MB
-#   mcap Zstd/Fastest      5.53    2.58    8.11s  865 MB   <- this file
-#   mcap Zstd/Default      8.35    2.59   10.94s  733 MB
+#   writer                 user     sys   CPU      size    compress @ realtime
+#   sqlite3 (previous)      4.29    9.24   13.53s  1727 MB   -
+#   mcap, no config         1.45    4.43    5.87s  1716 MB   -
+#   mcap Lz4/Fastest        4.48    2.91    7.38s   981 MB    0.5%
+#   mcap Zstd/Fastest       5.56    2.74    8.30s   865 MB    0.8%
+#   mcap Zstd/Default       8.67    2.24   10.90s   733 MB    1.6%
+#   mcap Zstd/Slow         83.14    2.52   85.65s   557 MB   25.2%   <- this file
+#   mcap Zstd/Slowest    1182.94    4.68 1187.62s   462 MB  373%
 #
 # sqlite3 was the most expensive writer and compressed nothing. Note the second
 # row: giving `-s mcap` without this file produces output byte-for-byte the same
@@ -18,16 +22,39 @@
 # named explicitly.
 #
 # That table runs at 40x realtime and only ranks the writers; it overstates what
-# live recording gains. Recording the same live stream both ways gave 344 KB vs
-# 537 KB per point cloud frame (1.56x, not the 2.0x above) and 16.6% vs 20.0% of
-# a core. Compression is a minority of that: both writers pay the same fixed cost
-# to subscribe to 23 topics and deserialize.
+# live recording gains. Recording the same live stream both ways at Zstd/Fastest
+# gave 344 KB vs 537 KB per point cloud frame (1.56x, not the 2.0x above) and
+# 16.6% vs 20.0% of a core. Compression is a minority of that: both writers pay
+# the same fixed cost to subscribe to 23 topics and deserialize. Scaling that
+# live measurement by the size and CPU columns above puts Zstd/Slow at roughly
+# 222 KB per frame (2.2 MB/s, 8.0 GB/hour) and ~41% of a core.
 compression: "Zstd"
-# Zstd/Default buys another 15% off the size for 35% more CPU; at 5.4 MB/s the
-# disk is the scarce resource but not that scarce.
-compressionLevel: "Fastest"
-# 768 KiB rather than the 4 MiB default. mcap flushes a whole chunk at a time,
-# so an unclean shutdown loses whatever is buffered; this bounds that to ~0.14 s
-# at the measured 5.39 MB/s. The 865 MB above was measured with this value, so
-# the small-chunk compression penalty is already priced in.
-chunkSize: 786432
+# compressionLevel is an enum, not a number: Fastest | Fast | Default | Slow |
+# Slowest. Anything else makes the plugin fail to load with a bare
+# "yaml-cpp: bad conversion" and rosbag2 then aborts with "No storage could be
+# initialized" - it does not fall back to a default.
+#
+# Slow is 3.10x against sqlite3 where Fastest is 2.00x, and costs ~25% of a core
+# instead of ~1%. That is affordable here only because recording is opt-in per
+# task (mapping_adapter.py starts with _record_rosbag = False), so it runs during
+# debug sessions rather than continuously. Drop to Default (2.36x, ~2%) if a
+# session ever has to record while the CPU is contended. Slowest is not an
+# option: 373% of a core cannot keep up with realtime at all.
+compressionLevel: "Slow"
+# chunkSize interacts with compressionLevel, so the two cannot be tuned apart.
+# At Zstd/Fastest it makes no difference at all (768 KiB -> 865.0 MB, 4 MiB ->
+# 864.8 MB, 0.02%), but at Zstd/Slow the wider zstd window has enough history to
+# exploit and the chunk has to be big enough to feed it:
+#
+#   chunkSize   size @ Zstd/Slow   loss window on unclean shutdown
+#     768 KiB       606.8 MB          0.14 s
+#       4 MiB       557.0 MB          0.77 s   <- this file
+#      16 MiB       544.3 MB          3.10 s
+#
+# mcap flushes a whole chunk at a time, so an unclean shutdown loses whatever is
+# buffered; the window is chunkSize divided by the *uncompressed* input rate
+# (1727 MB / 317 s = 5.45 MB/s), which the compression level does not change.
+# 4 MiB is the knee: 16 MiB buys another 2.3% for 4x the exposure. Note that the
+# normal stop path is SIGINT, which flushes cleanly - this window only opens on
+# power loss or the 30-second SIGTERM escape hatch in mapping_rosbag.sh.
+chunkSize: 4194304

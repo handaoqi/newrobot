@@ -69,8 +69,9 @@ fi
 
 ### 1.2 切换到 mcap（2026-08-28 已实现）
 
-> **实现状态**：已落代码，默认即 mcap + Zstd/Fastest。本节原来的两句判断经实测后是错的，
-> 已就地更正——见下面的"实测"与"坑"。
+> **实现状态**：已落代码，默认即 mcap + Zstd/**Slow** + chunkSize 4 MiB。本节原来的两句判断
+> 经实测后是错的，已就地更正——见下面的"实测"与"坑"。
+> 首版落的是 Zstd/Fastest；2026-08-28 补测全部压缩级别后改成 Slow，理由见"压缩级别与 chunk 复测"。
 
 前置条件**已满足**（已实机验证）：
 
@@ -91,15 +92,50 @@ rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_r
 | mcap，不给配置 | 1.45 | 4.43 | 5.87 s | 1716 MB |
 | mcap `compression: None` | 1.57 | 4.46 | 6.03 s | 1716 MB |
 | mcap Lz4/Fastest | 4.48 | 2.91 | 7.38 s | 981 MB |
-| **mcap Zstd/Fastest（已采用）** | 5.53 | 2.58 | **8.11 s** | **865 MB** |
+| mcap Zstd/Fastest（首版采用） | 5.53 | 2.58 | **8.11 s** | **865 MB** |
 | mcap Zstd/Default | 8.35 | 2.59 | 10.94 s | 733 MB |
 
 原文写的"压缩率和随机读性能均优于 sqlite3"只有一半对。准确的说法是：**sqlite3 是 CPU 最贵的一档，
 而且一分钱压缩都没换到**——它 68% 的开销在 `sys`，每条消息一次 B-tree 行插入，带自己的 page cache
-和 journal。即使开 Zstd/Default，mcap 总 CPU 仍比 sqlite3 低 19%。据此选了 Zstd/Fastest。
+和 journal。即使开 Zstd/Default，mcap 总 CPU 仍比 sqlite3 低 19%。首版据此选了 Zstd/Fastest。
 
 > 本表是 `ros2 bag convert` 的 40× 顺序回放，只能用来**排序**几种写入器。它推出的"CPU 低 40%、
 > 体积减半"在实录中都偏乐观，真实数字见下面的"实录复核"，以那张表为准。
+
+#### 压缩级别与 chunk 复测（2026-08-28，把 Fastest 换成 Slow）
+
+上表只测到 Default 就收手了，于是补全整个级别枚举。仍是同一个源包、同一套 `ros2 bag convert`，
+`chunkSize` 统一 4 MiB。末列 = （CPU 合计 − "不给配置"那行的 5.87 s）÷ 317 s，即压缩本身在实时录制下
+要占一个核的多少：
+
+| compressionLevel | user | sys | CPU 合计 | 体积 | 相对 sqlite3 | 压缩占一个核 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Fastest | 5.56 | 2.74 | 8.30 s | 864.8 MB | 2.00× | 0.8% |
+| Default | 8.67 | 2.24 | 10.90 s | 733.4 MB | 2.36× | 1.6% |
+| **Slow（已采用）** | 83.14 | 2.52 | **85.65 s** | **557.0 MB** | **3.10×** | **25.2%** |
+| Slowest | 1182.94 | 4.68 | 1187.62 s | 462.3 MB | 3.74× | **373%** |
+
+Slowest 直接出局：需要 3.7 个核才跟得上实时，不是"慢一点"而是根本录不了。
+选 Slow 而不是 Default 的依据是**录制并非常驻**——`mapping_adapter.py:161` 里
+`self._record_rosbag = False`，只有显式 `record_rosbag` 命令才开，所以这 25% 只在调试时段付出，
+而包要留存和外发很久。若哪次调试必须在 CPU 紧张时录，降回 Default 即可。
+
+`chunkSize` 不能和级别分开调。在 Fastest 下它**完全没有影响**（768 KiB → 865.0 MB，
+4 MiB → 864.8 MB，差 0.02%），但在 Slow 下 zstd 的窗口更宽、有历史可用，chunk 就必须喂得够大：
+
+| chunkSize | Slow 下体积 | 非正常退出的丢失窗口 |
+| --- | --- | --- |
+| 768 KiB（首版） | 606.8 MB | 0.14 s |
+| **4 MiB（已采用）** | **557.0 MB** | 0.77 s |
+| 16 MiB | 544.3 MB | 3.10 s |
+
+丢失窗口 = `chunkSize` ÷ **未压缩**输入率（1727 MB / 317 s = 5.45 MB/s），与压缩级别无关。
+4 MiB 是拐点：再翻到 16 MiB 只多省 2.3%，敞口却是 4 倍。而且正常停止走的是 SIGINT，会干净 flush，
+这个窗口只在掉电或 `mapping_rosbag.sh` 那条 30 秒 SIGTERM 兜底时才打开。
+
+> **坑**：`compressionLevel` 是枚举而非数字，合法值只有 `Fastest | Fast | Default | Slow | Slowest`。
+> 写错（比如照别处抄来的 `SlowestReasonable`）时插件只报一句 `yaml-cpp: bad conversion`，
+> 接着 rosbag2 直接 `No storage could be initialized. Abort`——**不会退回默认值**，录制整个失败。
 
 #### 坑：只给 `-s mcap` 拿不到任何体积收益
 
@@ -111,7 +147,7 @@ rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_r
 
 | 文件 | 改动 |
 | --- | --- |
-| `robot/script/robot/rosbag_storage_mcap.yaml` | 新增。`compression: Zstd` / `compressionLevel: Fastest` / `chunkSize: 786432`（768 KiB 而非默认 4 MiB：mcap 按 chunk 落盘，这把掉电敞口压到 ~0.14 s；上表 865 MB 已含小 chunk 的压缩惩罚） |
+| `robot/script/robot/rosbag_storage_mcap.yaml` | 新增。`compression: Zstd` / `compressionLevel: Slow` / `chunkSize: 4194304`（依据见"压缩级别与 chunk 复测"） |
 | `robot/script/robot/mapping_rosbag.sh` | `ROSBAG_STORAGE=${ROSBAG_STORAGE:-mcap}`，`ros2 bag record` 加 `-s` 与（仅 mcap 时）`--storage-config-file`；`stop` 的 SIGTERM 分支补注释与告警 |
 | `edge-agent/roamerx_edge/recording_manifest.py` | `_rtk_valid_intervals` 按 `storage_identifier` 分派：`sqlite3` 走原有直连查询（存量包零风险），其余走 `rosbag2_py.SequentialReader` + `StorageFilter(["/fix"])`。`import rosbag2_py` 在函数内且 `try/except`，因为 `scripts/test_agents.sh` 用裸 `python3` 跑 |
 | `robot/script/robot/replay_navigation_inputs.py` | `storage_id="sqlite3"` → `""`（按 `metadata.yaml` 自动判别，新旧包通吃） |
@@ -137,18 +173,20 @@ rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_r
 `navigation_rosbag.sh` 实录（生产入口，23 个话题，负载由 `/front_lidar` 点云主导），
 再用 `ROSBAG_STORAGE=sqlite3` 录同一条流做对照，按点云帧数归一化：
 
-| | mcap Zstd/Fastest | sqlite3 | 差 |
-| --- | --- | --- | --- |
-| 每点云帧 | **344 KB** | 537 KB | 小 36% |
-| 落盘码率 | **3.44 MB/s**（12.4 GB/h） | 5.38 MB/s（19.4 GB/h） | 小 36% |
-| 录制进程 CPU（t=35 s） | **16.6%** | 20.0% | 低 17% |
-| `stop` 耗时 | **1.13 s** | 1.20 s | 均走 SIGINT |
+| | mcap Zstd/Fastest | sqlite3 | 差 | Zstd/Slow（推算） |
+| --- | --- | --- | --- | --- |
+| 每点云帧 | **344 KB** | 537 KB | 小 36% | ~222 KB |
+| 落盘码率 | **3.44 MB/s**（12.4 GB/h） | 5.38 MB/s（19.4 GB/h） | 小 36% | ~2.2 MB/s（8.0 GB/h） |
+| 录制进程 CPU（t=35 s） | **16.6%** | 20.0% | 低 17% | ~41% |
+| `stop` 耗时 | **1.13 s** | 1.20 s | 均走 SIGINT | 未测 |
+
+前三列是实测；末列是把实测值按上面级别复测表的体积比（557.0/864.8）和 CPU 差折算的**推算值，未实录**。
+按这个推算，Slow 下 mcap 比 sqlite3 小 2.4 倍但 CPU 高一倍——这是明知的取舍，理由见级别复测那节。
 
 **上面 `bag convert` 表里的两个数在实录中都偏乐观，以本表为准**：体积不是减半而是小 36%
 （1.56× 而非 2.0×），CPU 不是低 40% 而是低 17%——实录要为 23 个话题的订阅和反序列化付固定成本，
-两种写入器都逃不掉，压缩只是其中一小块。结论方向不变：mcap 同时更小且更省 CPU。
-`rosbag_storage_mcap.yaml` 注释里"约占 1.7% 一个核"说的是压缩本身（由 40× 顺序回放折算），
-不是录制进程总开销，实录整体是 16%。
+两种写入器都逃不掉，压缩只是其中一小块。同理，级别复测表里 Slow 的 25.2% 说的是**压缩本身**，
+录制进程总开销要在实录的 16.6% 基线上换掉 Fastest 那 0.8% 再加进去。
 
 其余各项均通过：文件头有 `zstd` 标记；`ros2 bag info` 读出完整 20846 条、90.017 s，
 `storage_identifier: mcap`；`write_recording_manifest()` 走新增的 `_rtk_valid_intervals_rosbag2`
