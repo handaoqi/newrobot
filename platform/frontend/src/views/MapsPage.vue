@@ -5,6 +5,7 @@ import {
   hasActiveMappingWorkflow,
   isActiveMappingState,
 } from '../utils/mappingWorkflowState'
+import { hasRescueMetadata } from '../utils/mapDescription'
 import {
   fetchMapSummaries,
   fetchMapSetSummaries,
@@ -307,6 +308,7 @@ const activeMapSync = computed(() => {
 })
 
 const selectedMapDescription = computed(() => parseDescription(selectedMap.value?.description))
+const selectedMapIsRescue = computed(() => hasRescueMetadata(selectedMap.value?.description))
 const selectedMapMetrics = computed(() => (
   selectedMap.value?.mapping_metrics && Object.keys(selectedMap.value.mapping_metrics).length
     ? selectedMap.value.mapping_metrics
@@ -1702,7 +1704,7 @@ async function saveCleaner() {
               <div v-if="selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope">
                 <strong>场景:</strong> {{ selectedMap.scene_scope || parseDescription(selectedMap.description).scene_scope }}
               </div>
-              <div v-if="parseDescription(selectedMap.description).rescue" class="rescue-map-label">
+              <div v-if="selectedMapIsRescue" class="rescue-map-label">
                 <strong>质量:</strong> 发散救援地图，启用前必须现场核对
               </div>
             </div>
