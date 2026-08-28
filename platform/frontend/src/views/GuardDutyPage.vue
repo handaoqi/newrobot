@@ -1334,12 +1334,12 @@ watch(playUrlKey, () => {
 .guard-playback-controls button.active { border-color: #52d99c; background: rgba(16, 110, 73, .92); }
 .guard-playback-controls button:disabled { cursor: not-allowed; opacity: .48; }
 .guard-playback-controls small { position: absolute; top: calc(100% + 5px); left: 50%; width: max-content; max-width: 260px; padding: 4px 7px; color: #dbe8ee; background: rgba(10, 29, 41, .72); font-size: 11px; transform: translateX(-50%); }
-.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) minmax(330px, 1fr); align-items: center; gap: 14px; padding: 16px; }
+.guard-task-bar { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(140px, .8fr) minmax(360px, 1.15fr); align-items: center; gap: 12px; padding: 16px; }
 .guard-task-bar > div { display: grid; gap: 5px; min-width: 0; }
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; min-width: 0; }
-.guard-task-actions > button { width: 100%; min-width: 0; font-size: 12px; white-space: nowrap; }
+.guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; }
+.guard-task-actions > button { width: 100%; min-width: 0; padding-inline: 10px; font-size: 11px; white-space: nowrap; }
 .guard-task-selector { display: grid; gap: 5px; min-width: 0; }
 .guard-task-selector select { width: 100%; min-width: 0; height: 38px; padding: 0 32px 0 10px; border: 1px solid #c8d3d9; color: #1c303c; background: #fff; font: inherit; font-weight: 800; text-overflow: ellipsis; }
 .guard-task-selector select:disabled { cursor: not-allowed; opacity: .65; }
@@ -1587,7 +1587,7 @@ watch(playUrlKey, () => {
     white-space: nowrap;
   }
   .guard-task-bar {
-    grid-template-columns: minmax(180px, 1.2fr) minmax(100px, .5fr) minmax(330px, 1fr);
+    grid-template-columns: minmax(180px, 1.2fr) minmax(100px, .5fr) minmax(360px, 1.15fr);
     gap: 10px;
     padding: 12px;
   }
@@ -1603,7 +1603,7 @@ watch(playUrlKey, () => {
     font-size: 12px;
   }
   .guard-task-actions {
-    grid-template-columns: repeat(3, minmax(96px, 1fr));
+    grid-template-columns: repeat(3, minmax(108px, 1fr));
     gap: 8px;
   }
   .guard-task-selector select {
@@ -1914,7 +1914,8 @@ watch(playUrlKey, () => {
   .guard-grid, .guard-side { grid-template-columns: 1fr; }
   .guard-task-bar { grid-template-columns: 1fr; }
   .guard-task-selector, .guard-task-state, .guard-task-actions { grid-column: 1; }
-  .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+  .guard-task-actions > button { padding-inline: 6px; font-size: 10px; }
   .guard-primary, .guard-secondary, .guard-danger { width: 100%; }
   .guard-loop-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .guard-loop-toggle { grid-column: 1 / -1; }

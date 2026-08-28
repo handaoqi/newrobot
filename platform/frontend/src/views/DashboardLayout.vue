@@ -14,14 +14,12 @@ const tabletMenuOpen = ref(false)
 const tabletMenuButton = ref(null)
 const tabletSidebar = ref(null)
 const mobileDevice = ref(detectMobileDevice())
-const portraitViewport = ref(typeof window !== 'undefined' && window.matchMedia('(orientation: portrait)').matches)
 const mappingAlert = ref(null)
 const robots = ref([])
 let mappingPollTimer = null
 let mappingAlertEventSource = null
 let lastMappingAlertKey = ''
 let mappingStatusRefreshing = false
-let portraitMediaQuery = null
 
 function detectMobileDevice() {
   if (typeof navigator === 'undefined') return false
@@ -31,7 +29,7 @@ function detectMobileDevice() {
   return iPadOS || /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent)
 }
 
-const drawerNavigation = computed(() => mobileDevice.value && portraitViewport.value)
+const drawerNavigation = computed(() => mobileDevice.value)
 
 const menuItems = [
   { label: '保安值守', path: '/dashboard/guard-duty' },
@@ -101,10 +99,6 @@ function handleTabletMenuKeydown(event) {
   if (event.key === 'Escape' && tabletMenuOpen.value) {
     closeTabletMenu({ returnFocus: true })
   }
-}
-
-function handlePortraitChange(event) {
-  portraitViewport.value = event.matches
 }
 
 function isMenuActive(item) {
@@ -219,9 +213,6 @@ function setupMappingAlertStream() {
 
 onMounted(() => {
   expandActiveMenu()
-  portraitMediaQuery = window.matchMedia('(orientation: portrait)')
-  portraitViewport.value = portraitMediaQuery.matches
-  portraitMediaQuery.addEventListener?.('change', handlePortraitChange)
   document.addEventListener('keydown', handleTabletMenuKeydown)
   refreshMappingAlerts()
   mappingPollTimer = window.setInterval(refreshMappingAlerts, 2000)
@@ -229,7 +220,6 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  portraitMediaQuery?.removeEventListener?.('change', handlePortraitChange)
   document.removeEventListener('keydown', handleTabletMenuKeydown)
   document.body.classList.remove('tablet-menu-locked')
   if (mappingPollTimer) window.clearInterval(mappingPollTimer)
@@ -442,7 +432,7 @@ watch(drawerNavigation, (enabled) => {
   background: #7a4e00;
 }
 
-@media (orientation: portrait) {
+@media (min-width: 0px) {
   :global(body.tablet-menu-locked) {
     overflow: hidden;
   }
@@ -451,7 +441,7 @@ watch(drawerNavigation, (enabled) => {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .tablet-app-bar {
+  .drawer-navigation .tablet-app-bar {
     position: sticky;
     z-index: 1100;
     top: 0;
@@ -467,7 +457,7 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: blur(22px);
   }
 
-  .tablet-menu-button {
+  .drawer-navigation .tablet-menu-button {
     display: grid;
     place-content: center;
     gap: 5px;
@@ -481,16 +471,16 @@ watch(drawerNavigation, (enabled) => {
     transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
   }
 
-  .tablet-menu-button:hover {
+  .drawer-navigation .tablet-menu-button:hover {
     border-color: var(--cyan);
     background: var(--menu-active-bg);
   }
 
-  .tablet-menu-button[aria-expanded="true"] {
+  .drawer-navigation .tablet-menu-button[aria-expanded="true"] {
     transform: rotate(90deg);
   }
 
-  .tablet-menu-button span {
+  .drawer-navigation .tablet-menu-button span {
     display: block;
     width: 21px;
     height: 2px;
@@ -499,13 +489,13 @@ watch(drawerNavigation, (enabled) => {
     transition: transform 0.2s ease, opacity 0.2s ease;
   }
 
-  .tablet-app-title {
+  .drawer-navigation .tablet-app-title {
     display: grid;
     min-width: 0;
     gap: 2px;
   }
 
-  .tablet-app-title span {
+  .drawer-navigation .tablet-app-title span {
     overflow: hidden;
     color: var(--muted);
     font-size: 12px;
@@ -513,14 +503,14 @@ watch(drawerNavigation, (enabled) => {
     white-space: nowrap;
   }
 
-  .tablet-app-title strong {
+  .drawer-navigation .tablet-app-title strong {
     overflow: hidden;
     font-size: 18px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .tablet-user {
+  .drawer-navigation .tablet-user {
     max-width: 120px;
     overflow: hidden;
     color: var(--muted);
@@ -529,7 +519,7 @@ watch(drawerNavigation, (enabled) => {
     white-space: nowrap;
   }
 
-  .tablet-menu-backdrop {
+  .drawer-navigation .tablet-menu-backdrop {
     position: fixed;
     z-index: 1150;
     inset: 0;
@@ -543,7 +533,7 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: blur(2px);
   }
 
-  .sidebar {
+  .drawer-navigation .sidebar {
     position: fixed;
     z-index: 1200;
     inset: 0 auto 0 0;
@@ -559,36 +549,36 @@ watch(drawerNavigation, (enabled) => {
     transition: transform 0.22s ease, visibility 0.22s ease;
   }
 
-  .sidebar.tablet-open {
+  .drawer-navigation .sidebar.tablet-open {
     transform: translateX(0);
     visibility: visible;
     pointer-events: auto;
   }
 
-  .sidebar .menu-list {
+  .drawer-navigation .sidebar .menu-list {
     display: grid;
     overflow: visible;
     gap: 8px;
     padding-bottom: 0;
   }
 
-  .sidebar .menu-item,
-  .sidebar .menu-group,
-  .sidebar .menu-group-header,
-  .sidebar .menu-subitem {
+  .drawer-navigation .sidebar .menu-item,
+  .drawer-navigation .sidebar .menu-group,
+  .drawer-navigation .sidebar .menu-group-header,
+  .drawer-navigation .sidebar .menu-subitem {
     width: 100%;
   }
 
-  .sidebar .menu-group {
+  .drawer-navigation .sidebar .menu-group {
     position: static;
   }
 
-  .sidebar .menu-subgroup {
+  .drawer-navigation .sidebar .menu-subgroup {
     width: 100%;
     min-width: 0;
   }
 
-  .sidebar .menu-submenu {
+  .drawer-navigation .sidebar .menu-submenu {
     position: static;
     width: 100%;
     padding: 6px 0 0 12px;
@@ -597,30 +587,30 @@ watch(drawerNavigation, (enabled) => {
     box-shadow: none;
   }
 
-  .sidebar .menu-third-level {
+  .drawer-navigation .sidebar .menu-third-level {
     padding-left: 20px;
   }
 
-  .desktop-page-heading {
+  .drawer-navigation .desktop-page-heading {
     display: none;
   }
 
-  .main-header {
+  .drawer-navigation .main-header {
     justify-content: flex-end;
     margin-bottom: 14px;
   }
 
-  .header-actions {
+  .drawer-navigation .header-actions {
     width: 100%;
   }
 
-  .mapping-live-alert {
+  .drawer-navigation .mapping-live-alert {
     align-items: flex-start;
   }
 }
 
-@media (orientation: portrait) {
-  .tablet-app-bar {
+@media (min-width: 0px) {
+  .drawer-navigation .tablet-app-bar {
     position: fixed;
     top: 12px;
     right: 12px;
@@ -635,24 +625,24 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: none;
   }
 
-  .tablet-app-title,
-  .tablet-user {
+  .drawer-navigation .tablet-app-title,
+  .drawer-navigation .tablet-user {
     display: none;
   }
 
-  .tablet-menu-button {
+  .drawer-navigation .tablet-menu-button {
     box-shadow: 0 10px 28px rgba(25, 55, 90, 0.22);
     backdrop-filter: blur(18px);
   }
 
-  .sidebar {
+  .drawer-navigation .sidebar {
     inset: 0 0 0 auto;
     border-right: 0;
     border-left: 1px solid var(--line);
     transform: translateX(105%);
   }
 
-  .main-layout {
+  .drawer-navigation .main-layout {
     padding-top: 78px;
   }
 }
@@ -668,8 +658,9 @@ watch(drawerNavigation, (enabled) => {
   }
 }
 
-/* Device mode wins over viewport-width breakpoints. A narrow desktop keeps the
-   permanent vertical sidebar; only a portrait mobile device uses the drawer. */
+/* Device mode wins over viewport-width breakpoints. A desktop keeps the
+   permanent vertical sidebar at every width; every mobile orientation uses
+   the right-side drawer. */
 .dashboard-shell.desktop-navigation {
   grid-template-columns: clamp(180px, 18vw, 224px) minmax(0, 1fr);
   font-size: 14px;
