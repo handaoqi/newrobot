@@ -115,7 +115,9 @@ void TrajectoryVisualizer::reset()
 
 void TrajectoryVisualizer::visualize(const nav_msgs::msg::Path & plan)
 {
-  if (trajectories_publisher_->get_subscription_count() > 0) {
+  // Empty when the caller left marker building disabled; publishing an empty
+  // MarkerArray at the control rate would only tell a subscriber to clear.
+  if (!points_->markers.empty() && trajectories_publisher_->get_subscription_count() > 0) {
     trajectories_publisher_->publish(std::move(points_));
   }
 

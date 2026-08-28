@@ -108,17 +108,27 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   RCLCPP_INFO(logger_, "Control loop execution time: %ld [ms]", duration);
 #endif
 
-  if (visualize_) {
-    visualize(std::move(transformed_plan));
-  }
+  visualize(std::move(transformed_plan));
 
   return cmd;
 }
 
 void MPPIController::visualize(nav_msgs::msg::Path transformed_plan)
 {
-  trajectory_visualizer_.add(optimizer_.getGeneratedTrajectories(), "Candidate Trajectories");
-  trajectory_visualizer_.add(optimizer_.getOptimizedTrajectory(), "Optimal Trajectory");
+  // The two marker arrays are the expensive half: batch_size trajectories over
+  // time_steps samples, decimated by TrajectoryVisualizer's steps, is still a
+  // few thousand Marker constructions per control cycle at controller_frequency
+  // 20 Hz. They stay behind `visualize`, which is false in navigo_params.yaml.
+  //
+  // The transformed plan is one Path copy and is the only record of which local
+  // segment the controller was tracking, so diagnostic rosbags need it without
+  // paying for the markers. TrajectoryVisualizer publishes nothing when no one
+  // is subscribed, so leaving this call unconditional costs nothing in normal
+  // operation.
+  if (visualize_) {
+    trajectory_visualizer_.add(optimizer_.getGeneratedTrajectories(), "Candidate Trajectories");
+    trajectory_visualizer_.add(optimizer_.getOptimizedTrajectory(), "Optimal Trajectory");
+  }
   trajectory_visualizer_.visualize(std::move(transformed_plan));
 }
 

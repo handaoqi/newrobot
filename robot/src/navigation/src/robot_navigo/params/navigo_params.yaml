@@ -235,6 +235,11 @@ controller_server:
     # MPPI parameters
     FollowPath:
       plugin: "navigo_mppi_controller::MPPIController"
+      # Candidate/optimal trajectory markers on /trajectories only. Keep it off:
+      # rebuilding them at controller_frequency costs thousands of Marker
+      # constructions per cycle. /transformed_global_plan (the local segment
+      # being tracked, which navigation_rosbag.sh records) is published
+      # regardless of this flag.
       visualize: false
       time_steps: 56
       model_dt: 0.05
@@ -260,6 +265,8 @@ controller_server:
       temperature: 0.3
       gamma: 0.015 #0.015
       motion_model: "DiffDrive"
+      # Dead knobs: no code in navigo_mppi_controller reads either name. The
+      # marker switch is `visualize` above.
       visualize_all_sampled_traj: false
       visualize_optimized_traj: false
       TrajectoryVisualizer:

@@ -162,12 +162,18 @@ start_recording() {
   source "${PROJECT_DIR}/install/setup.bash"
   set -u
 
+  # Both phases run robot_slam, so the odometry pair below is always available:
+  # /odom/lio_odom is the FAST-LIO2 frontend output that feeds the localization
+  # UKF (config.yaml lio_primary.topic), /slam_odom is the backend-corrected
+  # pose. Recording only the latter makes frontend drift indistinguishable from
+  # a bad backend correction.
   local -a topics=(
     /front_lidar
     /front_lidar/imu
     /fix
     /rtk_pvh
     /rtk/ntrip_status
+    /odom/lio_odom
     /odom/localization_odom
     /slam_odom
     /tf

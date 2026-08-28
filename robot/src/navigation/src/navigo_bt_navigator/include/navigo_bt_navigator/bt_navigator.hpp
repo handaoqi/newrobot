@@ -85,7 +85,8 @@ protected:
   navigo_util::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & state) override;
 
   // To handle all the BT related execution
-  std::unique_ptr<navigo_bt_navigator::Navigator<nav2_msgs::action::NavigateToPose>> pose_navigator_;
+  std::unique_ptr<navigo_bt_navigator::Navigator<nav2_msgs::action::NavigateToPose>>
+  pose_navigator_;
   std::unique_ptr<navigo_bt_navigator::Navigator<nav2_msgs::action::NavigateThroughPoses>>
   poses_navigator_;
   navigo_bt_navigator::NavigatorMuxer plugin_muxer_;
