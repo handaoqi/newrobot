@@ -96,8 +96,10 @@ rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_r
 
 原文写的"压缩率和随机读性能均优于 sqlite3"只有一半对。准确的说法是：**sqlite3 是 CPU 最贵的一档，
 而且一分钱压缩都没换到**——它 68% 的开销在 `sys`，每条消息一次 B-tree 行插入，带自己的 page cache
-和 journal。即使开 Zstd/Default，mcap 总 CPU 仍比 sqlite3 低 19%。选 Zstd/Fastest：CPU 低 40%，
-体积减半，19.4 GB/h → 9.7 GB/h。
+和 journal。即使开 Zstd/Default，mcap 总 CPU 仍比 sqlite3 低 19%。据此选了 Zstd/Fastest。
+
+> 本表是 `ros2 bag convert` 的 40× 顺序回放，只能用来**排序**几种写入器。它推出的"CPU 低 40%、
+> 体积减半"在实录中都偏乐观，真实数字见下面的"实录复核"，以那张表为准。
 
 #### 坑：只给 `-s mcap` 拿不到任何体积收益
 
@@ -127,11 +129,36 @@ rosbag2 0.15.16，mcap 同时注册在 get_registered_writers()/get_registered_r
 `ros2 bag info`（storage id `mcap`、317.07 s、167278 条，与源包逐条相等）、
 `write_recording_manifest()`（`rtk_valid_intervals` 与 sqlite3 原包**逐字段相同**：3162 个样本，
 起止时间戳到纳秒一致）、`inspect_bag_directory()`、`replay_navigation_inputs.py`（`ROS_DOMAIN_ID=77`，
-发出 609 条）。产物已删除。**尚未做实录验证**，见 §1.2 遗留。
+发出 609 条）。产物已删除。实录验证见下节。
 
-**遗留**：需要一次有人看着的实录，核对码率是否落在 ~2.7 MB/s、`stop` 走的是 SIGINT 而非 30 秒超时。
-mcap 关闭时要写 summary 段，超时后的 `kill -TERM` 会留下需要 `mcap recover` 的文件，而 sqlite3 被硬杀
-只丢最后一个事务——这是本次切换唯一的行为退化，已在脚本注释与告警里标注。
+#### 实录复核（2026-08-28，同一条实时流做 A/B，未启停任何服务）
+
+`ros2 bag record` 只是订阅方，所以这一步不需要拉起 slam/localization/navigation。经
+`navigation_rosbag.sh` 实录（生产入口，23 个话题，负载由 `/front_lidar` 点云主导），
+再用 `ROSBAG_STORAGE=sqlite3` 录同一条流做对照，按点云帧数归一化：
+
+| | mcap Zstd/Fastest | sqlite3 | 差 |
+| --- | --- | --- | --- |
+| 每点云帧 | **344 KB** | 537 KB | 小 36% |
+| 落盘码率 | **3.44 MB/s**（12.4 GB/h） | 5.38 MB/s（19.4 GB/h） | 小 36% |
+| 录制进程 CPU（t=35 s） | **16.6%** | 20.0% | 低 17% |
+| `stop` 耗时 | **1.13 s** | 1.20 s | 均走 SIGINT |
+
+**上面 `bag convert` 表里的两个数在实录中都偏乐观，以本表为准**：体积不是减半而是小 36%
+（1.56× 而非 2.0×），CPU 不是低 40% 而是低 17%——实录要为 23 个话题的订阅和反序列化付固定成本，
+两种写入器都逃不掉，压缩只是其中一小块。结论方向不变：mcap 同时更小且更省 CPU。
+`rosbag_storage_mcap.yaml` 注释里"约占 1.7% 一个核"说的是压缩本身（由 40× 顺序回放折算），
+不是录制进程总开销，实录整体是 16%。
+
+其余各项均通过：文件头有 `zstd` 标记；`ros2 bag info` 读出完整 20846 条、90.017 s，
+`storage_identifier: mcap`；`write_recording_manifest()` 走新增的 `_rtk_valid_intervals_rosbag2`
+分支，取到 892 个 `/fix` 样本、与 `ros2 bag info` 的计数相等，`missing_required_topics` 为空；
+`ROSBAG_STORAGE=sqlite3` 回退演练产出 `.db3` 且命令行不带 `--storage-config-file`。
+临时包写在 `/tmp` 而非 `runtime/nx-edge/data/`，验完即删。
+
+**唯一未消除的行为退化**：mcap 关闭时要写 summary 段，若 30 秒内 SIGINT 没退出，
+`kill -TERM` 会留下需要 `mcap recover` 的文件，而 sqlite3 被硬杀只丢最后一个事务。
+实录中 `stop` 只用了 1.13 s，离 30 s 超时很远，故维持现有超时不变，已在脚本注释与告警里标注。
 
 **风险**：低。`.gitignore:52-54` 已经同时排除 `*.bag` / `*.db3` / `*.mcap`，不会误提交。
 

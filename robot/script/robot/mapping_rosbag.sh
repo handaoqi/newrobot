@@ -11,10 +11,12 @@ MIN_FREE_GB="${MIN_FREE_GB:-10}"
 # "mapping stops working".
 PRUNE_TOOL="${PRUNE_TOOL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prune_runtime_storage.py}"
 PRUNE_ENABLED="${PRUNE_ENABLED:-1}"
-# mcap costs less CPU than sqlite3 *and* halves the bag, measured on this NX:
-# 8.11s vs 13.53s of CPU and 865 MB vs 1727 MB for the same 317 s recording.
-# See rosbag_storage_mcap.yaml for the full table and for why the config file is
-# mandatory - `-s mcap` on its own compresses nothing.
+# mcap costs less CPU than sqlite3 *and* writes a smaller bag. Measured live on
+# this NX by recording the same stream both ways: 344 KB vs 537 KB per point
+# cloud frame (3.44 vs 5.38 MB/s, i.e. 12.4 vs 19.4 GB/hour) and 16.6% vs 20.0%
+# of a core for the recorder process.
+# See rosbag_storage_mcap.yaml for the writer comparison and for why the config
+# file is mandatory - `-s mcap` on its own compresses nothing.
 # Set ROSBAG_STORAGE=sqlite3 to fall back; every reader in this repo dispatches
 # on metadata.yaml, so the two formats coexist and old .db3 bags stay readable.
 ROSBAG_STORAGE="${ROSBAG_STORAGE:-mcap}"

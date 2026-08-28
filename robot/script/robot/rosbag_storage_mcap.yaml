@@ -16,6 +16,12 @@
 # size as compression "None" (1716291991 vs 1716291997) with no zstd marker in
 # the file header, i.e. faster but still 19.4 GB/hour. The compression has to be
 # named explicitly.
+#
+# That table runs at 40x realtime and only ranks the writers; it overstates what
+# live recording gains. Recording the same live stream both ways gave 344 KB vs
+# 537 KB per point cloud frame (1.56x, not the 2.0x above) and 16.6% vs 20.0% of
+# a core. Compression is a minority of that: both writers pay the same fixed cost
+# to subscribe to 23 topics and deserialize.
 compression: "Zstd"
 # Zstd/Default buys another 15% off the size for 35% more CPU; at 5.4 MB/s the
 # disk is the scarce resource but not that scarce.
