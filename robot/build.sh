@@ -11,9 +11,10 @@ BUILD_JOBS="${ROAMERX_BUILD_JOBS:-2}"
 export MAKEFLAGS="${MAKEFLAGS:--j${BUILD_JOBS}}"
 
 usage() {
-  echo "Usage: $0 [clean] all [debug]"
+  echo "Usage: $0 [clean] all [debug|relwithdebinfo]"
   echo "./build.sh all             [build all project packages]"
   echo "./build.sh all debug       [build all packages in Debug mode]"
+  echo "./build.sh all relwithdebinfo [build all packages with symbols and optimization]"
   echo "./build.sh clean all       [clean build/install/log, then build all]"
   echo "./build.sh clean all debug [clean then build all in Debug mode]"
 }
@@ -38,6 +39,9 @@ for arg in "$@"; do
       ;;
     debug)
       CMAKE_DEBUG_ARGS="-DCMAKE_BUILD_TYPE=Debug"
+      ;;
+    relwithdebinfo)
+      CMAKE_DEBUG_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS=-fno-omit-frame-pointer"
       ;;
     *)
       echo "Unknown argument: $arg"
