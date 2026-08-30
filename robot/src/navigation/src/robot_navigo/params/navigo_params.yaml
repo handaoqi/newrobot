@@ -198,12 +198,14 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "navigo_navfn_planner/NavfnPlanner"
-      # Occupancy planning can still try; GPS patrol falls back to a straight line.
-      tolerance: 2.0
+      # Indoor default: stay on the occupancy map and accept at most a small
+      # reachable-cell adjustment. Edge switches to the 2.0 m straight-line
+      # RTK profile only for outdoor/transition maps with a fixed GNSS origin.
+      tolerance: 0.5
       use_astar: false
       allow_unknown: true
-      allow_straight_line_fallback: true
-      prefer_straight_line: true
+      allow_straight_line_fallback: false
+      prefer_straight_line: false
 
 controller_server:
   ros__parameters:

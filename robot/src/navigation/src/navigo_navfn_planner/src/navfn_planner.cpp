@@ -92,10 +92,10 @@ NavfnPlanner::configure(
     node, name + ".use_final_approach_orientation", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".use_final_approach_orientation", use_final_approach_orientation_);
   declare_parameter_if_not_declared(
-    node, name + ".allow_straight_line_fallback", rclcpp::ParameterValue(true));
+    node, name + ".allow_straight_line_fallback", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".allow_straight_line_fallback", allow_straight_line_fallback_);
   declare_parameter_if_not_declared(
-    node, name + ".prefer_straight_line", rclcpp::ParameterValue(true));
+    node, name + ".prefer_straight_line", rclcpp::ParameterValue(false));
   node->get_parameter(name + ".prefer_straight_line", prefer_straight_line_);
 
   // Create a planner based on the new costmap size
@@ -231,9 +231,15 @@ NavfnPlanner::makeStraightLinePlan(
     pose.pose.position.x = start.pose.position.x + t * dx;
     pose.pose.position.y = start.pose.position.y + t * dy;
     pose.pose.position.z = 0.0;
-    pose.pose.orientation = use_final_approach_orientation_ && i + 1 == samples
-      ? start.pose.orientation
-      : orientation;
+    pose.pose.orientation = orientation;
+    if (i + 1 == samples) {
+      // Match the occupancy-planner semantics: normally preserve the exact
+      // commanded goal yaw. The optional final-approach mode instead keeps
+      // the path tangent so callers can request a no-turn arrival.
+      pose.pose.orientation = use_final_approach_orientation_
+        ? orientation
+        : goal.pose.orientation;
+    }
     path.poses.push_back(pose);
   }
   if (path.poses.empty()) {

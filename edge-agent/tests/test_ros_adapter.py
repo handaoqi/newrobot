@@ -538,6 +538,15 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     assert final["FollowPath.PathAlignCritic.use_path_orientations"] is False
     assert final["FollowPath.PreferForwardCritic.enabled"] is False
     assert final["FollowPath.GoalCritic.enabled"] is True
+    assert final["FollowPath.GoalAngleCritic.enabled"] is False
+
+    heading_final = follow_path_patrol_params(
+        final_approach=True,
+        local_obstacles=False,
+        require_yaw=True,
+    )
+    assert heading_final["FollowPath.GoalAngleCritic.enabled"] is True
+    assert heading_final["FollowPath.PathAlignCritic.enabled"] is False
 
     with_obstacles = follow_path_patrol_params(final_approach=False, local_obstacles=True)
     assert with_obstacles["FollowPath.CostCritic.enabled"] is True
@@ -597,6 +606,34 @@ def test_live_final_approach_skips_costmaps_and_retries_controller_once(monkeypa
         ("/controller_server", 2, order[0][2]),
     ]
     assert order[0][2]["FollowPath.vx_max"] == 0.15
+
+
+def test_planner_profile_restores_indoor_defaults_and_enables_outdoor_rtk():
+    adapter = object.__new__(RosAdapter)
+    calls = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: calls.append(
+        (node, dict(values))
+    )
+
+    adapter.apply_outdoor_gps_profile(outdoor=False)
+    assert calls[-1] == (
+        "/planner_server",
+        {
+            "GridBased.allow_straight_line_fallback": False,
+            "GridBased.prefer_straight_line": False,
+            "GridBased.tolerance": 0.5,
+        },
+    )
+
+    adapter.apply_outdoor_gps_profile(outdoor=True)
+    assert calls[-1] == (
+        "/planner_server",
+        {
+            "GridBased.allow_straight_line_fallback": True,
+            "GridBased.prefer_straight_line": True,
+            "GridBased.tolerance": 2.0,
+        },
+    )
 
 
 def test_disabling_goal_precision_does_not_raise_on_timeout(monkeypatch):

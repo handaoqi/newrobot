@@ -211,10 +211,10 @@ protected:
 
   // Whether or not the planner should be allowed to plan through unknown space
   bool allow_unknown_, use_final_approach_orientation_;
-  // Outdoor GPS patrol: if NavFn cannot thread the occupancy map, emit a
-  // straight-line path and let lidar collision monitoring handle obstacles.
-  bool allow_straight_line_fallback_{true};
-  bool prefer_straight_line_{true};
+  // Indoor-safe defaults. Edge explicitly enables the straight-line profile
+  // for outdoor/transition RTK maps.
+  bool allow_straight_line_fallback_{false};
+  bool prefer_straight_line_{false};
 
   // If the goal is obstructed, the tolerance specifies how many meters the planner
   // can relax the constraint in x and y before failing

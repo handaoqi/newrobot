@@ -211,6 +211,8 @@ class TaskExecutor:
         self._segments = []
         self._lock = threading.RLock()
         self._goal_offset = 0
+        self._departure_heading_index: int | None = None
+        self._departure_heading_completed_index: int | None = None
         self._last_progress_emit_at: float | None = None
         self._obstacle_monitor_stop = threading.Event()
         self._obstacle_monitor_thread = None
@@ -1462,7 +1464,13 @@ class TaskExecutor:
                         f"Nav2 reported missed waypoints: {absolute_missed}",
                     )
                     return
-                reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
+                departure_heading_completed = self._departure_heading_index is not None
+                if departure_heading_completed:
+                    reached_index = self._departure_heading_index
+                    self._departure_heading_index = None
+                    self._departure_heading_completed_index = reached_index
+                else:
+                    reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
                 reached_waypoint = self.context.route_snapshot["waypoints"][reached_index]
                 total_waypoints = len(self.context.route_snapshot["waypoints"])
                 # A FollowWaypoints success only means Nav2's goal checker
@@ -1477,6 +1485,12 @@ class TaskExecutor:
                         "continuing with stationary localization policy",
                         reached_index,
                     )
+                # A waypoint is considered arrived only after the robot has
+                # turned in place toward the next waypoint.  Localization
+                # settling and waypoint speech must happen after this turn,
+                # so the next navigation goal starts from the correct heading.
+                if not departure_heading_completed and self._dispatch_departure_heading(reached_index):
+                    return
                 self._set_localization_policy(reached_waypoint, "stationary")
                 speech_required = bool(reached_waypoint.get("speech_template_id"))
                 if speech_required:
@@ -1527,9 +1541,50 @@ class TaskExecutor:
                 self._stop_obstacle_monitor()
                 self._fail("NAVIGATION_FAILED", error_message or status)
 
+    def _dispatch_departure_heading(self, reached_index: int) -> bool:
+        """Rotate in place toward the next waypoint before departing."""
+        if not self.context:
+            return False
+        if self._is_docking_task():
+            return False
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        next_index = reached_index + 1
+        if next_index >= len(waypoints):
+            return False
+        current, target = waypoints[reached_index], waypoints[next_index]
+        dx, dy = float(target["x"]) - float(current["x"]), float(target["y"]) - float(current["y"])
+        if hypot(dx, dy) < 1e-3:
+            return False
+        pose = self.navigation.latest_pose() if self.navigation else None
+        goal = {
+            "x": float(getattr(pose, "x", current["x"])),
+            "y": float(getattr(pose, "y", current["y"])),
+            "yaw": atan2(dy, dx),
+            "require_yaw": True,
+            "waypoint_id": current.get("waypoint_id"),
+            "map_point_number": current.get("map_point_number"),
+        }
+        setter = getattr(self.navigation, "set_waypoint_profile", None)
+        if callable(setter):
+            setter(avoid_obstacles=False, require_yaw=True, final_approach=True)
+        self._departure_heading_index = reached_index
+        self._goal_offset, self._dispatched_count = reached_index, 1
+        accepted = self.navigation.send_waypoints([goal], self.on_feedback, self.on_navigation_result)
+        if not accepted:
+            self._departure_heading_index = None
+            self._restore_navigation_profile()
+            return False
+        self.on_feedback(0, milestone="departure_heading_dispatched")
+        LOGGER.info("departure heading dispatched at waypoint %d toward %d yaw=%.3f", reached_index, next_index, goal["yaw"])
+        return True
+
     def _continue_after_waypoint(self, reached_index: int) -> None:
         with self._lock:
             if not self.context or self.context.state != "running":
+                return
+            if self._departure_heading_completed_index == reached_index:
+                self._departure_heading_completed_index = None
+            elif self._departure_heading_index is None and self._dispatch_departure_heading(reached_index):
                 return
             next_waypoint_index = reached_index + 1
             self.context.current_waypoint_index = next_waypoint_index
@@ -1761,7 +1816,19 @@ class TaskExecutor:
             )
         outdoor_setter = getattr(self.navigation, "apply_outdoor_gps_profile", None)
         if callable(outdoor_setter):
-            outdoor_setter()
+            map_info = self.context.route_snapshot.get("map") or {}
+            scene_scope = str(
+                self.context.route_snapshot.get("scene_scope")
+                or map_info.get("scene_scope")
+                or ""
+            ).lower()
+            coordinate_mode = str(map_info.get("coordinate_mode") or "").lower()
+            outdoor_setter(
+                outdoor=(
+                    coordinate_mode == "rtk_fixed"
+                    and scene_scope in {"outdoor", "transition"}
+                )
+            )
         if self._is_docking_task():
             precision_setter = getattr(self.navigation, "set_goal_precision", None)
             if callable(precision_setter):

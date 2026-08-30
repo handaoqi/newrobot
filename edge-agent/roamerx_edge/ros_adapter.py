@@ -23,6 +23,7 @@ def follow_path_patrol_params(
     *,
     final_approach: bool,
     local_obstacles: bool,
+    require_yaw: bool = False,
 ) -> dict[str, bool | float]:
     """MPPI settings for a patrol goal.
 
@@ -41,10 +42,13 @@ def follow_path_patrol_params(
         "FollowPath.wz_max": wz_max,
         "FollowPath.wz_std": 0.08,
         "FollowPath.GoalCritic.enabled": bool(final_approach),
-        "FollowPath.GoalAngleCritic.enabled": False,
+        # A heading-constrained stop needs an explicit terminal-angle cost.
+        # PathAlign targets the path tangent instead and made the robot orbit
+        # short goals while the goal checker waited for the requested yaw.
+        "FollowPath.GoalAngleCritic.enabled": bool(final_approach and require_yaw),
         "FollowPath.PreferForwardCritic.enabled": not final_approach,
         "FollowPath.CostCritic.enabled": bool(local_obstacles),
-        "FollowPath.PathAlignCritic.enabled": bool(final_approach),
+        "FollowPath.PathAlignCritic.enabled": bool(final_approach and not require_yaw),
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
         "FollowPath.PathAlignCritic.use_path_orientations": False,
         "FollowPath.PathFollowCritic.enabled": True,
@@ -2047,6 +2051,7 @@ class RosAdapter(Node):
         params = follow_path_patrol_params(
             final_approach=final_approach,
             local_obstacles=local_obstacles,
+            require_yaw=require_yaw,
         )
         follow_applied = False
         try:
@@ -2097,22 +2102,35 @@ class RosAdapter(Node):
             params["FollowPath.CostCritic.enabled"],
         )
 
-    def apply_outdoor_gps_profile(self) -> None:
-        """Prefer a GPS line path; keep lidar for local slowdown/stop only."""
-        if not self._rtk_is_navigation_pose_source():
-            return
+    def apply_outdoor_gps_profile(self, *, outdoor: bool | None = None) -> None:
+        """Select an outdoor RTK line planner or restore the indoor map planner."""
+        use_outdoor_profile = (
+            self._rtk_is_navigation_pose_source() if outdoor is None else bool(outdoor)
+        )
+        params = (
+            {
+                "GridBased.allow_straight_line_fallback": True,
+                "GridBased.prefer_straight_line": True,
+                "GridBased.tolerance": 2.0,
+            }
+            if use_outdoor_profile
+            else {
+                "GridBased.allow_straight_line_fallback": False,
+                "GridBased.prefer_straight_line": False,
+                "GridBased.tolerance": 0.5,
+            }
+        )
         try:
             self._set_remote_parameters(
                 "/planner_server",
-                {
-                    "GridBased.allow_straight_line_fallback": True,
-                    "GridBased.prefer_straight_line": True,
-                    "GridBased.tolerance": 2.0,
-                },
+                params,
                 code="WAYPOINT_PROFILE_FAILED",
             )
         except ProtocolError:
-            LOGGER.warning("outdoor GPS planner fallback was not applied")
+            LOGGER.warning(
+                "%s planner profile was not applied",
+                "outdoor RTK" if use_outdoor_profile else "indoor occupancy",
+            )
 
     def set_goal_precision(self, *, enabled: bool) -> None:
         """Select the tight pose tolerances used only for the dock contact point."""

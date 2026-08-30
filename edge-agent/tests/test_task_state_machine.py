@@ -272,7 +272,9 @@ def test_navigation_feedback_switches_each_waypoint_correction_policy(tmp_path):
     executor.start_task(envelope)
     assert ids(nav.sent[-1]) == ["wp-1"]
     nav.result("succeeded", "", {"missed_waypoints": []})
+    nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-2"]
+    nav.result("succeeded", "", {"missed_waypoints": []})
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-3"]
 
@@ -449,6 +451,7 @@ def test_round_trip_keeps_running_after_outbound_through_poses_succeed(tmp_path)
 
     nav.pose = SimpleNamespace(x=3.0, y=4.0)
     nav.result("succeeded", "", {"missed_waypoints": []})
+    nav.result("succeeded", "", {"missed_waypoints": []})
 
     assert executor.context.state == "running"
     assert "task.completed" not in [event[0] for event in events]
@@ -542,7 +545,9 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
     assert ids(nav.sent[0]) == ["wp-1"]
     nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]))
     nav.result("succeeded", "", {"missed_waypoints": []})
-    assert len(nav.sent) == 1
+    assert ids(nav.sent[1]) == ["wp-1"]
+    assert len(nav.sent) == 2
+    nav.result("succeeded", "", {"missed_waypoints": []})
 
     waypoint_key = hashlib.sha256(b"wp-1").hexdigest()
     status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
@@ -551,11 +556,12 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
         encoding="utf-8",
     )
     for _ in range(100):
-        if len(nav.sent) == 2:
+        if len(nav.sent) == 3:
             break
         time.sleep(0.01)
     executor._speech_wait_thread.join(timeout=1)
-    assert ids(nav.sent[1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[1]) == ["wp-1"]
+    assert ids(nav.sent[2]) == ["wp-2", "wp-3"]
     store.close()
 
 
@@ -663,8 +669,15 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     assert ids(nav.sent[0]) == ["wp-1"]
     assert nav.waypoint_profiles[0] == (False, False, True)
     nav.result("succeeded", "", {"missed_waypoints": []})
+    assert ids(nav.sent[1]) == ["wp-1"]
+    assert nav.sent[1][0]["require_yaw"] is True
+    assert nav.sent[1][0]["yaw"] == atan2(
+        points[1]["y"] - points[0]["y"], points[1]["x"] - points[0]["x"]
+    )
+    nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-2"]
     assert nav.waypoint_profiles[-1] == (False, True, True)
+    nav.result("succeeded", "", {"missed_waypoints": []})
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-3"]
     assert nav.waypoint_profiles[-1] == (True, False, True)
