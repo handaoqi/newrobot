@@ -171,6 +171,7 @@ class TaskContext:
     docking: dict | None = None
     round_number: int = 1
     loop_total: int = 1
+    loop_base_waypoints: list[dict] | None = None
 
 
 class TaskExecutor:
@@ -560,6 +561,7 @@ class TaskExecutor:
             route = dict(command["route_snapshot"])
             route.setdefault("map", dict(command.get("map") or {}))
             route["waypoints"] = [dict(waypoint) for waypoint in route.get("waypoints") or []]
+            base_waypoints = [dict(point) for point in route["waypoints"]]
             self._assert_map_constraints(route)
             docking = dict(command.get("docking") or {})
             # Docking is deliberately ordered: waypoint 0 establishes the
@@ -594,6 +596,7 @@ class TaskExecutor:
                 docking=docking,
                 round_number=max(1, int(command.get("round_number", 1))),
                 loop_total=max(1, int(command.get("loop_total", 1))),
+                loop_base_waypoints=base_waypoints,
             )
             self._last_target_index = initial_waypoint_index - 1
             self._last_reached_index = initial_waypoint_index - 1
@@ -1471,6 +1474,26 @@ class TaskExecutor:
                 return
             if self.context.round_number < self.context.loop_total:
                 self.context.round_number += 1
+                base = [dict(point) for point in (self.context.loop_base_waypoints or self.context.route_snapshot["waypoints"])]
+                pose = self.navigation.latest_pose()
+                if pose is not None and len(base) > 1:
+                    start = base[0]
+                    end = base[-1]
+                    start_distance = hypot(float(pose.x) - float(start["x"]), float(pose.y) - float(start["y"]))
+                    end_distance = hypot(float(pose.x) - float(end["x"]), float(pose.y) - float(end["y"]))
+                    # Near the original start: continue forward. Otherwise
+                    # return through the route in reverse order.
+                    if start_distance <= 1.0 or start_distance <= end_distance:
+                        ordered = base
+                        direction = "forward"
+                    else:
+                        ordered = list(reversed(base))
+                        direction = "reverse"
+                    self.context.route_snapshot["waypoints"] = ordered
+                    self.context.route_snapshot["execution_order"] = direction
+                    LOGGER.info("loop round %d waypoint order=%s start_distance=%.2f end_distance=%.2f", self.context.round_number, direction, start_distance, end_distance)
+                else:
+                    self.context.route_snapshot["waypoints"] = base
                 self.context.current_waypoint_index = 0
                 self.context.state_version += 1
                 self._last_target_index = -1
