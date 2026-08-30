@@ -7,7 +7,7 @@ source /opt/ros/humble/setup.bash
 # Source/build ownership is independent from robot runtime data ownership.
 export ROAMERX_DATA_ROOT="${ROAMERX_DATA_ROOT:-/home/dogrobot/runtime/nx-edge/data/jszr}"
 BUILD_WORKERS="${ROAMERX_BUILD_WORKERS:-1}"
-BUILD_JOBS="${ROAMERX_BUILD_JOBS:-2}"
+BUILD_JOBS="${ROAMERX_BUILD_JOBS:-3}"
 export MAKEFLAGS="${MAKEFLAGS:--j${BUILD_JOBS}}"
 
 # All builds of this workspace must use the same install mode.  In particular,
