@@ -3129,11 +3129,15 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
     expiry_seconds = 180
 
     def build_payload(self, request, robot: Robot) -> dict:
+        seed_source = str(request.data.get("seed_source") or "last_trusted").strip()
+        if seed_source not in {"last_trusted", "mapping_start", "global"}:
+            raise ValueError("主动重定位方式必须是可信位姿、建图起点或全局搜索")
         payload = {
             "reason": "operator_active_relocalization",
-            "seed_source": request.data.get("seed_source") or "last_trusted",
+            "seed_source": seed_source,
             "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
             "map_version": request.data.get("map_version") or robot.current_map_version or "",
+            "wait_seconds": float(request.data.get("wait_seconds") or 90.0),
         }
         supplied = [request.data.get(field) is not None for field in ("x", "y", "yaw")]
         if any(supplied):
@@ -3152,9 +3156,9 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
             return Response({"detail": "机器狗 Edge Agent 当前离线。"}, status=status.HTTP_409_CONFLICT)
         try:
             payload = self.build_payload(request, robot)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as error:
             return Response(
-                {"detail": "主动重定位的 x、y、yaw 必须同时为数值。"},
+                {"detail": str(error) or "主动重定位的 x、y、yaw 必须同时为数值。"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         command = CommandService.create_robot_command(

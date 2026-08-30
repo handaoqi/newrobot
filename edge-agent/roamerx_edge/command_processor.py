@@ -280,8 +280,13 @@ class CommandProcessor:
                     pose.setdefault("wait_seconds", 30.0)
                     result_payload = self.localization_adapter.set_initial_pose(pose)
             else:
-                seed = self._resolve_localization_seed(command)
-                result_payload = self.localization_adapter.active_relocalize(seed)
+                if str(command.get("seed_source") or "last_trusted") == "global":
+                    result_payload = self.localization_adapter.global_relocalize(
+                        wait_seconds=float(command.get("wait_seconds", 90.0)),
+                    )
+                else:
+                    seed = self._resolve_localization_seed(command)
+                    result_payload = self.localization_adapter.active_relocalize(seed)
         else:
             wait_seconds = 90.0 if envelope.message_type in {
                 "nav.start", "nav.restart", "nav.recover",
@@ -334,8 +339,6 @@ class CommandProcessor:
             seed = self.map_activation_adapter.mapping_start_pose() if self.map_activation_adapter else {}
         else:
             seed = self.store.load_last_trusted_pose(map_id, map_version) or {}
-            if not seed and self.map_activation_adapter:
-                seed = self.map_activation_adapter.mapping_start_pose()
         if not all(seed.get(field) is not None for field in ("x", "y", "yaw")):
             raise ProtocolError(
                 "RELOCALIZATION_SEED_UNAVAILABLE",

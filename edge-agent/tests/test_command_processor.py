@@ -18,6 +18,7 @@ class FakeNavigation:
         self.teleop_velocities = []
         self.pose = SimpleNamespace(x=3.0, y=4.0)
         self.rtk_initial_pose_requests = 0
+        self.global_relocalize_requests = []
 
     def send_waypoints(self, waypoints, feedback_cb, result_cb):
         self.result_cb = result_cb
@@ -43,6 +44,10 @@ class FakeNavigation:
     def active_relocalize(self, pose):
         self.initial_pose = pose
         return {"mode": "stationary_bounded_search", "motion_commanded": False, **pose}
+
+    def global_relocalize(self, wait_seconds=90.0):
+        self.global_relocalize_requests.append(wait_seconds)
+        return {"mode": "global_position_yaw_search", "motion_commanded": False}
 
     def teleop_action(self, action):
         self.teleop_actions.append(action)
@@ -575,6 +580,57 @@ def test_active_relocalization_uses_map_scoped_trusted_pose(tmp_path):
     assert result["payload"]["status"] == "succeeded"
     assert navigation.initial_pose == {"x": 8.0, "y": 9.0, "yaw": -0.4}
     assert result["payload"]["result"]["motion_commanded"] is False
+    store.close()
+
+
+def test_active_relocalization_global_does_not_require_seed(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.relocalize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"seed_source": "global", "wait_seconds": 42.0}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert navigation.global_relocalize_requests == [42.0]
+    store.close()
+
+
+def test_last_trusted_seed_never_falls_back_to_mapping_start(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState(current_map_id="149", current_map_version="v1")),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        map_activation_adapter=FakeMapActivation(),
+    )
+
+    with pytest.raises(ProtocolError) as exc:
+        processor._resolve_localization_seed({"seed_source": "last_trusted"})
+
+    assert exc.value.code == "RELOCALIZATION_SEED_UNAVAILABLE"
     store.close()
 
 

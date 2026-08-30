@@ -47,6 +47,13 @@ struct ScanContextCandidate {
   Eigen::Matrix4d seed_pose = Eigen::Matrix4d::Identity();
 };
 
+enum class ScanContextDistanceMetric {
+  kMeanAbsoluteHeight,
+  kSectorCosine,
+  /// Rank places with sector cosine, but estimate yaw with absolute height distance.
+  kSectorCosineAbsoluteYaw,
+};
+
 class ScanContextDatabase {
 public:
   /**
@@ -99,7 +106,9 @@ public:
     int top_k,
     double max_distance,
     int exclude_index = -1,
-    int min_index_gap = 0) const;
+    int min_index_gap = 0,
+    ScanContextDistanceMetric metric = ScanContextDistanceMetric::kMeanAbsoluteHeight,
+    int prefilter_candidates = 0) const;
 
   /// Max-height descriptor of a lidar-frame cloud, row-major [ring][sector].
   std::vector<float> describe(const pcl::PointCloud<pcl::PointXYZI>& scan) const;
@@ -109,6 +118,12 @@ public:
 
   /// Mean absolute difference between `query` and `target` shifted by `shift` sectors.
   double descriptorDistance(
+    const std::vector<float>& query,
+    const std::vector<float>& target,
+    int shift) const;
+
+  /// Standard Scan Context distance: one minus mean cosine similarity of valid sectors.
+  double descriptorCosineDistance(
     const std::vector<float>& query,
     const std::vector<float>& target,
     int shift) const;
@@ -134,6 +149,13 @@ public:
   bool loadKeyframeScan(
     std::size_t slot,
     pcl::PointCloud<pcl::PointXYZI>& scan,
+    std::string* error = nullptr) const;
+
+  /// Merge center +/- half_window scans into the center keyframe's lidar frame.
+  bool loadKeyframeSubmap(
+    std::size_t center_slot,
+    int half_window,
+    pcl::PointCloud<pcl::PointXYZI>& submap,
     std::string* error = nullptr) const;
 
 private:

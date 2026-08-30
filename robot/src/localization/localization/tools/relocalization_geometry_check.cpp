@@ -16,8 +16,10 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -188,6 +190,12 @@ int main(int argc, char** argv) {
   double radius_m = 2.0;
   double max_descriptor_distance = 0.0;
   bool quiet = false;
+  localization::ScanContextDistanceMetric scan_context_metric =
+    localization::ScanContextDistanceMetric::kMeanAbsoluteHeight;
+  int prefilter_candidates = 0;
+  int query_half_window = 0;
+  int target_half_window = 0;
+  int yaw_neighbors = 0;
   localization::RelocalizationGeometryConfig geometry_config;
   std::vector<std::string> map_dirs;
 
@@ -204,6 +212,30 @@ int main(int argc, char** argv) {
       radius_m = next(radius_m);
     } else if (arg == "--max-distance") {
       max_descriptor_distance = next(max_descriptor_distance);
+    } else if (arg == "--metric") {
+      if (i + 1 >= argc) {
+        std::cerr << "--metric requires abs, cosine or hybrid\n";
+        return 2;
+      }
+      const std::string name = argv[++i];
+      if (name == "cosine") {
+        scan_context_metric = localization::ScanContextDistanceMetric::kSectorCosine;
+      } else if (name == "hybrid") {
+        scan_context_metric = localization::ScanContextDistanceMetric::kSectorCosineAbsoluteYaw;
+      } else if (name == "abs") {
+        scan_context_metric = localization::ScanContextDistanceMetric::kMeanAbsoluteHeight;
+      } else {
+        std::cerr << "unknown metric " << name << "\n";
+        return 2;
+      }
+    } else if (arg == "--prefilter") {
+      prefilter_candidates = static_cast<int>(next(prefilter_candidates));
+    } else if (arg == "--query-window") {
+      query_half_window = std::max(0, static_cast<int>(next(query_half_window)));
+    } else if (arg == "--target-window") {
+      target_half_window = std::max(0, static_cast<int>(next(target_half_window)));
+    } else if (arg == "--yaw-neighbors") {
+      yaw_neighbors = std::max(0, static_cast<int>(next(yaw_neighbors)));
     } else if (arg == "--voxel") {
       geometry_config.voxel_size_m = static_cast<float>(next(geometry_config.voxel_size_m));
     } else if (arg == "--max-correspondence") {
@@ -274,13 +306,14 @@ int main(int argc, char** argv) {
       ++totals.answerable;
 
       pcl::PointCloud<pcl::PointXYZI> query_scan;
-      if (!database.loadKeyframeScan(query_slot, query_scan, &error)) {
+      if (!database.loadKeyframeSubmap(
+          query_slot, query_half_window, query_scan, &error)) {
         ++totals.rejections["query_load_failed"];
         continue;
       }
       const auto candidates = database.queryDescriptor(
         database.keyframeDescriptor(query_slot), top_k, max_descriptor_distance,
-        query_index, min_gap);
+        query_index, min_gap, scan_context_metric, prefilter_candidates);
 
       bool retrieval_hit = false;
       bool selected = false;
@@ -296,15 +329,37 @@ int main(int argc, char** argv) {
         retrieval_hit = retrieval_hit || retrieval_correct;
 
         pcl::PointCloud<pcl::PointXYZI> candidate_scan;
-        if (!database.loadKeyframeScan(candidate_slot, candidate_scan, &error)) {
+        if (!database.loadKeyframeSubmap(
+            candidate_slot, target_half_window, candidate_scan, &error)) {
           ++totals.rejections["candidate_load_failed"];
           continue;
         }
 
         const Eigen::Matrix4d map_to_candidate = database.keyframePose(candidate_slot).inverse();
-        const Eigen::Matrix4f initial =
-          (map_to_candidate * candidate.seed_pose).cast<float>();
-        const auto result = verifier.verify(query_scan, candidate_scan, initial);
+        localization::RelocalizationGeometryResult result;
+        double total_geometry_ms = 0.0;
+        double best_rejected_rmse = std::numeric_limits<double>::infinity();
+        for (int yaw_attempt = 0; yaw_attempt <= yaw_neighbors * 2; ++yaw_attempt) {
+          const int signed_step = yaw_attempt == 0 ? 0 :
+            ((yaw_attempt + 1) / 2) * (yaw_attempt % 2 == 1 ? 1 : -1);
+          Eigen::Matrix4d adjusted_seed = candidate.seed_pose;
+          const double yaw_delta = signed_step * (2.0 * M_PI / database.params().sectors);
+          adjusted_seed.block<3, 3>(0, 0) =
+            Eigen::AngleAxisd(yaw_delta, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+            adjusted_seed.block<3, 3>(0, 0);
+          const Eigen::Matrix4f initial = (map_to_candidate * adjusted_seed).cast<float>();
+          auto attempt_result = verifier.verify(query_scan, candidate_scan, initial);
+          total_geometry_ms += attempt_result.elapsed_ms;
+          if (attempt_result.accepted) {
+            result = std::move(attempt_result);
+            break;
+          }
+          if (attempt_result.rmse_m < best_rejected_rmse) {
+            best_rejected_rmse = attempt_result.rmse_m;
+            result = std::move(attempt_result);
+          }
+        }
+        result.elapsed_ms = total_geometry_ms;
         ++totals.candidates_checked;
         totals.candidate_elapsed_ms.push_back(result.elapsed_ms);
         recordMetrics(retrieval_correct ? totals.correct_pairs : totals.wrong_pairs, result);

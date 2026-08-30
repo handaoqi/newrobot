@@ -59,6 +59,24 @@ def test_accepts_nav_relocalize_with_mapping_start_seed():
     assert envelope.message_type == "nav.relocalize"
 
 
+def test_accepts_nav_relocalize_with_global_seed():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.relocalize"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"seed_source": "global"}
+    assert decode_message(payload).payload["command"]["seed_source"] == "global"
+
+
+def test_nav_relocalize_rejects_unknown_seed_source():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.relocalize"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"seed_source": "guess"}
+    with pytest.raises(ProtocolError) as exc:
+        decode_message(payload)
+    assert exc.value.code == "INVALID_MESSAGE"
+
+
 def test_nav_relocalize_rejects_partial_pose():
     payload = json.loads(FIXTURE.read_text())
     payload["message_type"] = "nav.relocalize"

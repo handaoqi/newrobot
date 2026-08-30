@@ -50,6 +50,7 @@ import {
   localizationRecoveryLabel,
 } from '../services/taskMapState'
 import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
+import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
 const maps = ref([])
@@ -65,6 +66,7 @@ const routes = ref([])
 const speechCategories = ref([])
 const speechTemplates = ref([])
 const selectedMap = ref(null)
+const selectedMapVersion = () => expectedLegacyMapVersion(selectedMap.value?.id)
 const selectedRoute = ref(null)
 const waypoints = ref([])
 const waypointNames = ref([])
@@ -1220,7 +1222,7 @@ async function sendNavigationCommand(action) {
   try {
     await sendRobotNavigationCommand(robotId, action, {
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
+      map_version: selectedMapVersion(),
     })
     await refreshNavigationStatus()
   } catch (error) {
@@ -1269,9 +1271,15 @@ async function initializeLocalization() {
   localizationInitMessage.value = '正在重启导航/定位栈'
   navError.value = ''
   try {
+    const currentDecision = localizationQuality()?.decision || {}
+    if (robotMapMatches() && localizationLabel() === 'normal' && currentDecision.initialization?.verified === true) {
+      localizationInitState.value = 'done'
+      localizationInitMessage.value = '当前地图定位已经过连续帧验证，无需覆盖初始位姿'
+      return
+    }
     await sendRobotNavigationCommand(robotId, 'restart', {
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
+      map_version: selectedMapVersion(),
     })
     await sleep(2500)
     await refreshNavigationStatus()
@@ -1280,11 +1288,12 @@ async function initializeLocalization() {
     const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
     localizationInitMessage.value = useFixedRtk
       ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
-      : 'RTK Fix 不可用，正在下发建图起点位姿'
-    await sendRobotNavigationCommand(robotId, 'initial-pose', {
-      seed_source: useFixedRtk ? 'rtk' : 'mapping_start',
+      : 'RTK Fix 不可用，正在搜索全图位置与 360° 航向'
+    await sendRobotNavigationCommand(robotId, useFixedRtk ? 'initial-pose' : 'relocalize', {
+      seed_source: useFixedRtk ? 'rtk' : 'global',
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
+      map_version: selectedMapVersion(),
+      wait_seconds: 90,
     })
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
@@ -1321,9 +1330,9 @@ async function activeRelocalize() {
   navError.value = ''
   try {
     const payload = {
-      seed_source: 'last_trusted',
+      seed_source: manualInitialPose.value ? 'last_trusted' : 'global',
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
+      map_version: selectedMapVersion(),
     }
     if (manualInitialPose.value) {
       payload.x = Number(manualInitialPose.value.x)
@@ -1459,7 +1468,7 @@ async function publishInitialPose(confirmRequired = true, manageBusy = true) {
       y: Number(manualInitialPose.value.y),
       yaw: Number(manualInitialPose.value.yaw || 0),
       map_id: selectedMap.value?.id,
-      map_version: selectedMap.value?.description || '',
+      map_version: selectedMapVersion(),
     })
     initialPoseMode.value = false
     await refreshNavigationStatus()
@@ -1473,7 +1482,9 @@ async function publishInitialPose(confirmRequired = true, manageBusy = true) {
 function robotMapMatches() {
   const mapId = navStatus.value?.status?.map_id || navStatus.value?.current_map_id
   if (!mapId || !selectedMap.value?.id) return true
+  const mapVersion = navStatus.value?.status?.map_version || navStatus.value?.current_map_version
   return String(mapId) === String(selectedMap.value.id)
+    && (!mapVersion || String(mapVersion) === selectedMapVersion())
 }
 
 function robotDisplayPosition() {
@@ -1818,6 +1829,9 @@ function localizationDebugRows() {
   const command = navStatus.value?.command
   const quality = localizationQuality()
   const decision = quality?.decision || {}
+  const ndtDrift = decision.ndt_drift || {}
+  const initialization = decision.initialization || {}
+  const globalRelocalization = decision.global_relocalization || {}
   const telemetry = normalizeRoutePlannerTelemetry(status)
   const sensors = telemetry.sensors
   const rtk = telemetry.rtk
@@ -1849,6 +1863,12 @@ function localizationDebugRows() {
     ['NDT · 收敛', qualityFresh ? ndtConvergedText(quality) : (quality ? '已过期' : '—')],
     ['NDT · 内点率', qualityFresh ? formatNumber(quality.inlier_fraction, 3) : (quality ? `已过期 ${formatNumber(quality.inlier_fraction, 3)}` : '—')],
     ['NDT · 匹配位移', qualityFresh ? `${formatNumber(quality.relative_translation_m, 3)} m` : '—'],
+    ['NDT · 漂移XY', `${formatNumber(ndtDrift.xy_m, 3)} m（dx ${formatNumber(ndtDrift.dx_m, 3)} / dy ${formatNumber(ndtDrift.dy_m, 3)}）`],
+    ['NDT · 航向漂移', `${formatNumber(ndtDrift.yaw_deg, 2)}° / 阈值 ${formatNumber(ndtDrift.threshold_yaw_deg, 1)}°`],
+    ['NDT · 漂移校正门', `${ndtDrift.decision || decision.ndt_drift_decision || '—'} · ${Number(ndtDrift.stable_frames || 0)}/${Number(ndtDrift.required_stable_frames || 3)}帧`],
+    ['初始化 · 验证', `${initialization.state || '未上报'} · ${initialization.verified === true ? '已验证' : '未验证'} · ${Number(initialization.stable_frames || 0)}/${Number(initialization.required_stable_frames || 3)}帧`],
+    ['初始化 · 航向匹配', `种子 ${formatNumber(initialization.seed_yaw_deg, 2)}° → 匹配 ${formatNumber(initialization.matched_yaw_deg, 2)}°（修正 ${formatNumber(initialization.yaw_correction_deg, 2)}°）`],
+    ['全局重定位', `${globalRelocalization.mode || 'disabled'} / ${globalRelocalization.state || 'idle'}${globalRelocalization.keyframe >= 0 ? ` / KF ${globalRelocalization.keyframe}` : ''}`],
     ['IMU · 状态', sensorOnlineLabel(imu)],
     ['IMU · 频率', sensorFrequencyLabel(imu)],
     ['IMU · 时间偏差', sensorTimeOffsetLabel(imu)],

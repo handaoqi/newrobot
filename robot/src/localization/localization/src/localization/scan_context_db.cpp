@@ -399,6 +399,54 @@ bool ScanContextDatabase::loadKeyframeScan(
   return true;
 }
 
+bool ScanContextDatabase::loadKeyframeSubmap(
+    std::size_t center_slot,
+    int half_window,
+    pcl::PointCloud<pcl::PointXYZI>& submap,
+    std::string* error) const {
+  submap.clear();
+  const auto fail = [&error](const std::string& reason) {
+    if (error != nullptr) {
+      *error = reason;
+    }
+    return false;
+  };
+  if (center_slot >= size()) {
+    return fail("keyframe center slot is out of range");
+  }
+  const std::size_t window = static_cast<std::size_t>(std::max(0, half_window));
+  const std::size_t begin = center_slot > window ? center_slot - window : 0;
+  const std::size_t end = std::min(size(), center_slot + window + 1);
+  const Eigen::Matrix4d world_to_center = poses_[center_slot].inverse();
+
+  for (std::size_t slot = begin; slot < end; ++slot) {
+    pcl::PointCloud<pcl::PointXYZI> local_scan;
+    std::string scan_error;
+    if (!loadKeyframeScan(slot, local_scan, &scan_error)) {
+      return fail(scan_error);
+    }
+    const Eigen::Matrix4d neighbor_to_center = world_to_center * poses_[slot];
+    submap.reserve(submap.size() + local_scan.size());
+    for (const auto& point : local_scan) {
+      const Eigen::Vector4d transformed = neighbor_to_center *
+        Eigen::Vector4d(point.x, point.y, point.z, 1.0);
+      pcl::PointXYZI output;
+      output.x = static_cast<float>(transformed.x());
+      output.y = static_cast<float>(transformed.y());
+      output.z = static_cast<float>(transformed.z());
+      output.intensity = point.intensity;
+      submap.push_back(output);
+    }
+  }
+  if (submap.empty()) {
+    return fail("keyframe submap has no finite points");
+  }
+  submap.width = static_cast<std::uint32_t>(submap.size());
+  submap.height = 1;
+  submap.is_dense = true;
+  return true;
+}
+
 std::vector<float> ScanContextDatabase::describe(
     const pcl::PointCloud<pcl::PointXYZI>& scan) const {
   const int rings = params_.rings;
@@ -467,6 +515,35 @@ double ScanContextDatabase::descriptorDistance(
   return total / std::max(1, rings * sectors);
 }
 
+double ScanContextDatabase::descriptorCosineDistance(
+    const std::vector<float>& query,
+    const std::vector<float>& target,
+    int shift) const {
+  const int rings = params_.rings;
+  const int sectors = params_.sectors;
+  double similarity = 0.0;
+  int valid_sectors = 0;
+  for (int sector = 0; sector < sectors; ++sector) {
+    const int shifted = (sector + shift) % sectors;
+    double dot = 0.0;
+    double query_norm = 0.0;
+    double target_norm = 0.0;
+    for (int ring = 0; ring < rings; ++ring) {
+      const double query_value = query[static_cast<std::size_t>(ring) * sectors + sector];
+      const double target_value = target[static_cast<std::size_t>(ring) * sectors + shifted];
+      dot += query_value * target_value;
+      query_norm += query_value * query_value;
+      target_norm += target_value * target_value;
+    }
+    if (query_norm <= 1e-12 || target_norm <= 1e-12) {
+      continue;
+    }
+    similarity += dot / std::sqrt(query_norm * target_norm);
+    ++valid_sectors;
+  }
+  return valid_sectors > 0 ? 1.0 - similarity / valid_sectors : 1.0;
+}
+
 std::vector<ScanContextCandidate> ScanContextDatabase::query(
     const pcl::PointCloud<pcl::PointXYZI>& scan,
     int top_k,
@@ -484,7 +561,9 @@ std::vector<ScanContextCandidate> ScanContextDatabase::queryDescriptor(
     int top_k,
     double max_distance,
     int exclude_index,
-    int min_index_gap) const {
+    int min_index_gap,
+    ScanContextDistanceMetric metric,
+    int prefilter_candidates) const {
   std::vector<ScanContextCandidate> results;
   if (descriptors_.empty() || top_k <= 0 ||
       query_descriptor.size() != static_cast<std::size_t>(params_.cells())) {
@@ -512,7 +591,13 @@ std::vector<ScanContextCandidate> ScanContextDatabase::queryDescriptor(
     return results;
   }
 
-  const std::size_t shortlist = std::min(ranked.size(), static_cast<std::size_t>(top_k) * 3);
+  // A fixed prefilter size makes Top-K monotonic during evaluation and deployment:
+  // asking for more returned candidates must not silently change which places were
+  // scored. Zero preserves the legacy top_k*3 behavior for old callers.
+  const std::size_t requested_shortlist = prefilter_candidates > 0 ?
+    static_cast<std::size_t>(prefilter_candidates) : static_cast<std::size_t>(top_k) * 3;
+  const std::size_t shortlist = std::min(ranked.size(), std::max(
+    static_cast<std::size_t>(top_k), requested_shortlist));
   std::partial_sort(ranked.begin(), ranked.begin() + shortlist, ranked.end());
 
   const int sectors = params_.sectors;
@@ -521,9 +606,22 @@ std::vector<ScanContextCandidate> ScanContextDatabase::queryDescriptor(
   for (std::size_t i = 0; i < shortlist; ++i) {
     const std::size_t slot = ranked[i].second;
     double best_distance = std::numeric_limits<double>::max();
+    double best_absolute_distance = std::numeric_limits<double>::max();
     int best_shift = 0;
+    int best_absolute_shift = 0;
     for (int shift = 0; shift < sectors; ++shift) {
-      const double distance = descriptorDistance(query_descriptor, descriptors_[slot], shift);
+      const double absolute_distance = descriptorDistance(
+        query_descriptor, descriptors_[slot], shift);
+      if (absolute_distance < best_absolute_distance) {
+        best_absolute_distance = absolute_distance;
+        best_absolute_shift = shift;
+      }
+      const bool cosine_metric =
+        metric == ScanContextDistanceMetric::kSectorCosine ||
+        metric == ScanContextDistanceMetric::kSectorCosineAbsoluteYaw;
+      const double distance = cosine_metric ?
+        descriptorCosineDistance(query_descriptor, descriptors_[slot], shift) :
+        absolute_distance;
       if (distance < best_distance) {
         best_distance = distance;
         best_shift = shift;
@@ -533,7 +631,9 @@ std::vector<ScanContextCandidate> ScanContextDatabase::queryDescriptor(
     ScanContextCandidate candidate;
     candidate.keyframe_index = keyframe_indices_[slot];
     candidate.distance = best_distance;
-    candidate.yaw_offset_rad = wrapAngle(best_shift * (2.0 * M_PI / sectors));
+    const int yaw_shift = metric == ScanContextDistanceMetric::kSectorCosineAbsoluteYaw ?
+      best_absolute_shift : best_shift;
+    candidate.yaw_offset_rad = wrapAngle(yaw_shift * (2.0 * M_PI / sectors));
 
     // Sign settled empirically over 8577 co-located keyframe pairs across 21 recorded
     // maps: yaw_query = yaw_match + yaw_offset holds to 3.66 deg median, which is the

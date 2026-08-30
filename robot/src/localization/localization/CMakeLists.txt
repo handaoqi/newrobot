@@ -219,6 +219,17 @@ if(BUILD_TESTING)
   target_include_directories(relocalization_geometry_policy_test PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+  ament_add_gtest(scan_context_distance_test
+    test/scan_context_distance_test.cpp
+    src/localization/scan_context_db.cpp
+  )
+  ament_target_dependencies(scan_context_distance_test
+    pcl_ros
+    pcl_conversions
+  )
+  target_include_directories(scan_context_distance_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
 endif()
 
 ament_package()

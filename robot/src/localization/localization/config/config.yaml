@@ -257,17 +257,20 @@ localization:
     init_T: [1.0, 0.0, 0.0, -0.011, 0.0, 1.0, 0.0, -0.02329, 0.0, 0.0, 1.0, 0.04412, 0.0, 0.0, 0.0, 1.0] # 雷达到imu的变换矩阵
 
     # initial pose initialization parameters 
-    init_match_count_threshold: 2         
+    init_match_count_threshold: 3
     # Use the same upper mean-squared residual limit as normal NDT matching.
     # A stricter stale initialisation-only gate would otherwise reject a match
     # that the running localization policy considers valid.
     init_match_score_threshold: 0.50
+    init_match_min_inlier_fraction: 0.50
+    init_match_stable_xy_m: 0.10
+    init_match_stable_yaw_deg: 2.0
 
     # Global localization parameters
     use_global_localization_init: true
     init_pose_change_threshold: 0.01      
     init_quat_change_threshold: 0.01      
-    global_localization_timeout: 10.0
+    global_localization_timeout: 60.0
     # Coalesce the edge agent's trusted-pose recovery burst before starting ICP.
     # Map loading waits longer so a persisted /initialpose can supersede the
     # configured seed without launching an obsolete background job first.
@@ -286,12 +289,16 @@ localization:
       # 兼容旧配置；新部署使用 scan_context_runtime_mode。true 等价于 active。
       use_scan_context: false
       # disabled: 不加载/运行；shadow: 后台运行检索和真实 GICP/ICP 但不写入位姿；
-      # active: 几何门通过后才允许把候选送入全图 ICP。当前地图回归尚未达到 95%，保持关闭。
-      scan_context_runtime_mode: disabled
-      top_k: 5
-      # 每次闸门触发只验 1 个种子，单帧 ICP 次数与开启前完全一致；失败后由上面的
-      # runtime_relocalization_retry_seconds 重挂，游标顺延到下一个候选。
-      max_seeds_per_attempt: 1
+      # active: 几何门通过后才允许把候选送入全图 ICP。地图149先以 shadow 采集现场样本；
+      # 自动成功率>=95%、误接受=0、误差<=0.30m/5deg 后才改为 active。
+      scan_context_runtime_mode: shadow
+      active_map_paths:
+        - /home/dogrobot/runtime/nx-edge/data/jszr/map/20260828_205712_005
+      top_k: 10
+      max_seeds_per_attempt: 10
+      prefilter_candidates: 60
+      target_half_window: 1
+      yaw_neighbors: 2
       # 103 张实测地图的留一法结果：正确检索的描述子距离 p90 为 0.33，错误检索的中位数
       # 是 0.26，两者重叠，卡阈值只会误杀正确候选。0 表示不卡，由 ICP 验证做唯一门限。
       max_descriptor_distance: 0.0

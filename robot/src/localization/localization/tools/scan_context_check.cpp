@@ -19,6 +19,8 @@
  *   --radius M       hit threshold in metres    (default 2.0)
  *   --max-distance D descriptor cutoff, 0 = off (default 0, so the full curve is visible)
  *   --min-gap N      hide keyframes within N indices of the query (default 1, self only)
+ *   --metric NAME    abs, cosine or hybrid         (default abs)
+ *   --prefilter N    fixed ring-key candidate pool (default 0 = legacy top-k*3)
  *   --quiet          per-map summary only
  *
  * --min-gap is the difficulty dial. At 1 the query's own temporal neighbours are still in
@@ -112,6 +114,9 @@ int main(int argc, char** argv) {
   double max_distance = 0.0;
   int min_gap = 1;
   bool quiet = false;
+  localization::ScanContextDistanceMetric metric =
+    localization::ScanContextDistanceMetric::kMeanAbsoluteHeight;
+  int prefilter_candidates = 0;
   std::vector<std::string> map_dirs;
 
   for (int i = 1; i < argc; ++i) {
@@ -127,6 +132,24 @@ int main(int argc, char** argv) {
       max_distance = next(max_distance);
     } else if (arg == "--min-gap") {
       min_gap = static_cast<int>(next(min_gap));
+    } else if (arg == "--metric") {
+      if (i + 1 >= argc) {
+        std::cerr << "--metric requires abs, cosine or hybrid\n";
+        return 2;
+      }
+      const std::string name = argv[++i];
+      if (name == "cosine") {
+        metric = localization::ScanContextDistanceMetric::kSectorCosine;
+      } else if (name == "hybrid") {
+        metric = localization::ScanContextDistanceMetric::kSectorCosineAbsoluteYaw;
+      } else if (name == "abs") {
+        metric = localization::ScanContextDistanceMetric::kMeanAbsoluteHeight;
+      } else {
+        std::cerr << "unknown metric " << name << "\n";
+        return 2;
+      }
+    } else if (arg == "--prefilter") {
+      prefilter_candidates = static_cast<int>(next(prefilter_candidates));
     } else if (arg == "--quiet") {
       quiet = true;
     } else if (arg.rfind("--", 0) == 0) {
@@ -163,7 +186,8 @@ int main(int argc, char** argv) {
       const Eigen::Matrix4d& truth = database.keyframePose(slot);
       const int query_index = database.keyframeIndex(slot);
       const auto candidates = database.queryDescriptor(
-        database.keyframeDescriptor(slot), top_k, max_distance, query_index, min_gap);
+        database.keyframeDescriptor(slot), top_k, max_distance, query_index, min_gap,
+        metric, prefilter_candidates);
 
       ++totals.queries;
 

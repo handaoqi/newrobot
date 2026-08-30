@@ -107,15 +107,29 @@ export async function activateAndRelocalizeMap({
   }
 
   onProgress('地图已应用，正在使用最近可信位置重定位')
-  const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-    map_id: String(mapId),
-    map_version: mapVersion,
-    seed_source: 'last_trusted',
-  })
-  await waitForRobotCommand(robotId, relocalizeCommand, {
-    timeoutMs: 180_000,
-    onProgress: latest => onProgress(`自动重定位：${latest.status || 'created'}`),
-  })
+  try {
+    const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+      seed_source: 'last_trusted',
+    })
+    await waitForRobotCommand(robotId, relocalizeCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`可信位置重定位：${latest.status || 'created'}`),
+    })
+  } catch {
+    onProgress('无可用可信位姿，正在搜索全图位置与 360° 航向')
+    const globalCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+      seed_source: 'global',
+      wait_seconds: 90,
+    })
+    await waitForRobotCommand(robotId, globalCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`全局重定位：${latest.status || 'created'}`),
+    })
+  }
 
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {

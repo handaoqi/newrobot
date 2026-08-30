@@ -142,6 +142,18 @@ double quantile(std::vector<double> values, double fraction) {
   return values[lower] * (1.0 - weight) + values[upper] * weight;
 }
 
+float normalizedYaw(float yaw) {
+  return std::atan2(std::sin(yaw), std::cos(yaw));
+}
+
+float yawFromRotation(const Eigen::Matrix3f& rotation) {
+  return std::atan2(rotation(1, 0), rotation(0, 0));
+}
+
+float yawDifference(float lhs, float rhs) {
+  return normalizedYaw(lhs - rhs);
+}
+
 }  // namespace
 
 class HdlLocalizationNode : public rclcpp::Node {
@@ -437,10 +449,16 @@ public:
     get_parameter("init_T", init_T);
     
     // Initial pose initialization parameters 
-    declare_parameter<int>("init_match_count_threshold", 5);
+    declare_parameter<int>("init_match_count_threshold", 3);
     get_parameter("init_match_count_threshold", init_match_count_threshold_);
     declare_parameter<float>("init_match_score_threshold", 0.15);
     get_parameter("init_match_score_threshold", init_match_score_threshold_);
+    init_match_min_inlier_fraction_ = static_cast<float>(std::clamp(
+      declare_parameter<double>("init_match_min_inlier_fraction", 0.50), 0.0, 1.0));
+    init_match_stable_xy_m_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>("init_match_stable_xy_m", 0.10)));
+    init_match_stable_yaw_rad_ = static_cast<float>(std::max(
+      0.1, declare_parameter<double>("init_match_stable_yaw_deg", 2.0)) * M_PI / 180.0);
     
     // Global localization parameters
     declare_parameter<bool>("use_global_localization_init", true);
@@ -488,12 +506,20 @@ public:
         "relocalization.use_scan_context is deprecated; treating true as runtime_mode=active");
     }
     use_scan_context_ = scan_context_runtime_mode_ != "disabled";
+    scan_context_active_map_paths_ = declare_parameter<std::vector<std::string>>(
+      "relocalization.active_map_paths", std::vector<std::string>{});
     declare_parameter<int>("relocalization.top_k", 5);
     get_parameter("relocalization.top_k", scan_context_top_k_);
     scan_context_top_k_ = std::max(1, scan_context_top_k_);
     declare_parameter<int>("relocalization.max_seeds_per_attempt", 1);
     get_parameter("relocalization.max_seeds_per_attempt", scan_context_max_seeds_);
     scan_context_max_seeds_ = std::max(1, scan_context_max_seeds_);
+    scan_context_prefilter_candidates_ = static_cast<int>(std::max<std::int64_t>(
+      0, declare_parameter<int>("relocalization.prefilter_candidates", 60)));
+    scan_context_target_half_window_ = static_cast<int>(std::max<std::int64_t>(
+      0, declare_parameter<int>("relocalization.target_half_window", 1)));
+    scan_context_yaw_neighbors_ = static_cast<int>(std::max<std::int64_t>(
+      0, declare_parameter<int>("relocalization.yaw_neighbors", 2)));
     // Offline leave-one-out over 103 recorded maps put the descriptor distance of correct
     // retrievals (p90 0.33) on top of that of wrong ones (median 0.26), so a cutoff here
     // discards good candidates without excluding bad ones. 0 disables it and leaves the
@@ -671,6 +697,10 @@ public:
       "/reinitialize_global_localization",
       std::bind(&HdlLocalizationNode::reinitialize_global_localization_callback, this,
         std::placeholders::_1, std::placeholders::_2));
+    global_relocalize_service_ = create_service<std_srvs::srv::Trigger>(
+      "/localization/global_relocalize",
+      std::bind(&HdlLocalizationNode::global_relocalize_callback, this,
+        std::placeholders::_1, std::placeholders::_2));
     localization_policy_sub_ = create_subscription<std_msgs::msg::String>(
       "/localization/policy", 10,
       std::bind(&HdlLocalizationNode::localization_policy_callback, this, std::placeholders::_1));
@@ -766,6 +796,7 @@ private:
     Eigen::Matrix4d fallback_seed = Eigen::Matrix4d::Identity();
     bool use_scan_context = false;
     bool apply_scan_context = false;
+    bool allow_fallback = true;
   };
 
   struct GlobalRelocalizationResult {
@@ -774,6 +805,13 @@ private:
     Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
     double elapsed_ms = 0.0;
     std::string source = "none";
+    bool candidate_accepted = false;
+    int candidate_keyframe = -1;
+    double candidate_distance = 0.0;
+    double candidate_yaw_deg = 0.0;
+    double candidate_rmse_m = 0.0;
+    double candidate_overlap = 0.0;
+    std::string rejection_reason = "no_candidate";
   };
 
   localization::StaticIMUInit static_imu_init_;
@@ -794,6 +832,17 @@ private:
   // A decimated initialization must never count the same previous NDT result
   // more than once on intervening lightweight callbacks.
   bool init_match_result_pending_ = false;
+  float init_match_min_inlier_fraction_ = 0.50f;
+  float init_match_stable_xy_m_ = 0.10f;
+  float init_match_stable_yaw_rad_ = 2.0f * M_PI / 180.0f;
+  bool has_previous_init_match_pose_ = false;
+  Eigen::Vector2f previous_init_match_xy_ = Eigen::Vector2f::Zero();
+  float previous_init_match_yaw_ = 0.0f;
+  float initialization_seed_yaw_ = 0.0f;
+  float initialization_match_yaw_ = 0.0f;
+  float initialization_yaw_correction_rad_ = 0.0f;
+  bool initialization_verified_ = false;
+  std::string initialization_state_ = "uninitialized";
 
   /**
    * @brief Build a PoseEstimator seeded with the calibrated gyro bias.
@@ -837,6 +886,17 @@ private:
       scan_matching_coarse_max_fitness_score_);
     estimator->configure_refine_policy(scan_matching_refine_policy_);
     return estimator;
+  }
+
+  void resetInitializationValidation(const std::string& state = "validating") {
+    init_match_count_ = 0;
+    init_match_result_pending_ = false;
+    has_previous_init_match_pose_ = false;
+    initialization_verified_ = false;
+    initialization_state_ = state;
+    initialization_seed_yaw_ = yawFromRotation(last_init_quat_.toRotationMatrix());
+    initialization_match_yaw_ = initialization_seed_yaw_;
+    initialization_yaw_correction_rad_ = 0.0f;
   }
 
   /**
@@ -1543,13 +1603,20 @@ private:
     }
     const Eigen::Vector3f ndt_position = match.transform_.block<3, 1>(0, 3);
     const Eigen::Vector3f ukf_position = pose_estimator->pos();
-    const float drift_xy = (ndt_position.head<2>() - ukf_position.head<2>()).norm();
-    Eigen::Quaternionf ndt_orientation(match.transform_.block<3, 3>(0, 0));
-    ndt_orientation.normalize();
-    const float drift_yaw = pose_estimator->quat().angularDistance(ndt_orientation);
-    const bool drifted = drift_xy >= lio_drift_xy_m_ || drift_yaw >= lio_drift_yaw_rad_;
     const Eigen::Vector2f correction_xy =
       ndt_position.head<2>() - ukf_position.head<2>();
+    const float drift_xy = correction_xy.norm();
+    Eigen::Quaternionf ndt_orientation(match.transform_.block<3, 3>(0, 0));
+    ndt_orientation.normalize();
+    const float ndt_yaw = yawFromRotation(ndt_orientation.toRotationMatrix());
+    const float lio_yaw = yawFromRotation(pose_estimator->quat().toRotationMatrix());
+    const float drift_yaw = std::fabs(yawDifference(ndt_yaw, lio_yaw));
+    last_ndt_drift_x_m_ = correction_xy.x();
+    last_ndt_drift_y_m_ = correction_xy.y();
+    last_ndt_drift_xy_m_ = drift_xy;
+    last_ndt_drift_yaw_rad_ = drift_yaw;
+    last_ndt_orientation_delta_rad_ = pose_estimator->quat().angularDistance(ndt_orientation);
+    const bool drifted = drift_xy >= lio_drift_xy_m_ || drift_yaw >= lio_drift_yaw_rad_;
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       ndt_drift_gate_, "NDT/VGICP", true, drifted, ndt_position,
       correction_xy, drift_xy, drift_yaw,
@@ -2288,6 +2355,36 @@ private:
         << ",\"rtk_drift_decision\":\"" << rtk_drift_gate_.last_decision << "\""
         << ",\"ndt_correction_latched\":" << (ndt_drift_gate_.correction_latched ? "true" : "false")
         << ",\"rtk_correction_latched\":" << (rtk_drift_gate_.correction_latched ? "true" : "false")
+        << ",\"ndt_drift\":{\"dx_m\":" << last_ndt_drift_x_m_
+        << ",\"dy_m\":" << last_ndt_drift_y_m_
+        << ",\"xy_m\":" << last_ndt_drift_xy_m_
+        << ",\"yaw_deg\":" << last_ndt_drift_yaw_rad_ * 180.0 / M_PI
+        << ",\"orientation_delta_deg\":" << last_ndt_orientation_delta_rad_ * 180.0 / M_PI
+        << ",\"threshold_xy_m\":" << lio_drift_xy_m_
+        << ",\"threshold_yaw_deg\":" << lio_drift_yaw_rad_ * 180.0 / M_PI
+        << ",\"stable_frames\":" << ndt_drift_gate_.consecutive
+        << ",\"required_stable_frames\":" << lio_drift_hysteresis_frames_
+        << ",\"decision\":\"" << ndt_drift_gate_.last_decision << "\"}"
+        << ",\"initialization\":{\"state\":\"" << initialization_state_
+        << "\",\"verified\":" << (initialization_verified_ ? "true" : "false")
+        << ",\"stable_frames\":" << init_match_count_
+        << ",\"required_stable_frames\":" << init_match_count_threshold_
+        << ",\"score\":" << last_ndt_score_
+        << ",\"inlier_fraction\":" << last_ndt_inlier_fraction_
+        << ",\"seed_yaw_deg\":" << initialization_seed_yaw_ * 180.0 / M_PI
+        << ",\"matched_yaw_deg\":" << initialization_match_yaw_ * 180.0 / M_PI
+        << ",\"yaw_correction_deg\":" << initialization_yaw_correction_rad_ * 180.0 / M_PI
+        << "}"
+        << ",\"global_relocalization\":{\"mode\":\"" << scan_context_effective_runtime_mode_
+        << "\",\"state\":\"" << global_relocalization_state_
+        << "\",\"required\":" << (global_search_required_ ? "true" : "false")
+        << ",\"candidate_applied\":" << (global_candidate_applied_ ? "true" : "false")
+        << ",\"keyframe\":" << global_candidate_keyframe_
+        << ",\"descriptor_distance\":" << global_candidate_distance_
+        << ",\"yaw_deg\":" << global_candidate_yaw_deg_
+        << ",\"rmse_m\":" << global_candidate_rmse_m_
+        << ",\"overlap\":" << global_candidate_overlap_
+        << ",\"rejection_reason\":\"" << global_candidate_rejection_reason_ << "\"}"
         << ",\"suppressed_covariance_scale\":" << lio_suppressed_covariance_scale_
         << ",\"ndt_inlier_fraction\":" << last_ndt_inlier_fraction_
         << ",\"raw_imu_in_localization_ukf\":" << (use_imu ? "true" : "false")
@@ -2541,7 +2638,9 @@ private:
     has_trusted_ndt_pose_ = false;
     resetLioAnchor();
     is_init_success_ = false;
-    init_match_count_ = 0;
+    global_search_required_ = false;
+    global_candidate_applied_ = false;
+    resetInitializationValidation();
     localization_state_ = 1;
     is_extrapolating_ = false;
     gl_once_gate_ = false;
@@ -2594,7 +2693,9 @@ private:
     last_pose_source_ = "service_relocalization";
     advanceGlobalRelocalizationGeneration("service relocalization");
     is_init_success_ = false;
-    init_match_count_ = 0;
+    global_search_required_ = false;
+    global_candidate_applied_ = false;
+    resetInitializationValidation();
     localization_state_ = 1;
     gl_once_gate_ = true;
     // Marked as attempted so the retry rearm at the top of points_callback owns
@@ -2613,6 +2714,42 @@ private:
     RCLCPP_WARN(get_logger(),
       "Global relocalization armed by service request from last trusted pose x=%.3f y=%.3f",
       last_init_pos_.x(), last_init_pos_.y());
+  }
+
+  void global_relocalize_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+    bool database_ready = false;
+    {
+      std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+      database_ready = !scan_context_db_.empty();
+    }
+    if (!use_global_localization_init_ ||
+        scan_context_effective_runtime_mode_ == "disabled" || !database_ready) {
+      response->success = false;
+      response->message = "Scan Context global relocalization is unavailable for the active map";
+      initialization_state_ = "global_unavailable";
+      return;
+    }
+
+    advanceGlobalRelocalizationGeneration("explicit global relocalization");
+    is_init_success_ = false;
+    resetInitializationValidation("global_searching");
+    localization_state_ = 1;
+    global_search_required_ = true;
+    global_candidate_applied_ = false;
+    gl_once_gate_ = true;
+    runtime_relocalization_attempted_ = false;
+    consecutive_match_failures_ = 0;
+    last_pose_source_ = "global_search";
+    response->success = true;
+    response->message = scan_context_effective_runtime_mode_ == "active"
+      ? "Global position and 360-degree yaw search armed"
+      : "Global search armed in shadow mode; navigation remains blocked until active rollout";
+    RCLCPP_WARN(get_logger(),
+      "Explicit global relocalization armed (mode=%s); mapping-start fallback is disabled",
+      scan_context_effective_runtime_mode_.c_str());
   }
 
   void rtk_initial_pose_callback(
@@ -3031,23 +3168,55 @@ private:
       PoseEstimator::MatchResult init_result = pose_estimator->GetMatchState();
       RCLCPP_INFO(get_logger(), "init_result.is_converged_ : %d", init_result.is_converged_);
       RCLCPP_INFO(get_logger(), "init_result.fitness_score_ : %f", init_result.fitness_score_);
-      // Check if current frame meets initialization criteria
-      if (init_result.is_converged_ && init_result.fitness_score_ < init_match_score_threshold_) {
+      const Eigen::Vector2f init_match_xy = init_result.transform_.block<2, 1>(0, 3);
+      initialization_match_yaw_ = yawFromRotation(init_result.transform_.block<3, 3>(0, 0));
+      initialization_yaw_correction_rad_ = yawDifference(
+        initialization_match_yaw_, initialization_seed_yaw_);
+      const bool pose_stable = !has_previous_init_match_pose_ ||
+        ((init_match_xy - previous_init_match_xy_).norm() <= init_match_stable_xy_m_ &&
+         std::fabs(yawDifference(initialization_match_yaw_, previous_init_match_yaw_)) <=
+           init_match_stable_yaw_rad_);
+      const bool global_seed_ready = !global_search_required_ || global_candidate_applied_;
+      const bool quality_ok = init_result.is_converged_ && init_result.transform_.allFinite() &&
+        init_result.fitness_score_ < init_match_score_threshold_ &&
+        last_ndt_inlier_fraction_ >= init_match_min_inlier_fraction_ && global_seed_ready;
+      if (quality_ok && pose_stable) {
         init_match_count_++;
-        RCLCPP_INFO(get_logger(), "Init match count: %d/%d (score: %.6f)", init_match_count_, init_match_count_threshold_, init_result.fitness_score_);
+        initialization_state_ = "validating";
+        RCLCPP_INFO(get_logger(),
+          "Init match count: %d/%d score=%.6f inlier=%.3f stable_xy<=%.2fm stable_yaw<=%.1fdeg yaw_correction=%+.2fdeg",
+          init_match_count_, init_match_count_threshold_, init_result.fitness_score_,
+          last_ndt_inlier_fraction_, init_match_stable_xy_m_,
+          init_match_stable_yaw_rad_ * 180.0 / M_PI,
+          initialization_yaw_correction_rad_ * 180.0 / M_PI);
         // Check if we have enough consecutive successful matches
         if (init_match_count_ >= init_match_count_threshold_) {
           advanceGlobalRelocalizationGeneration("local initialization success");
           is_init_success_ = true;
+          initialization_verified_ = true;
+          initialization_state_ = "localized";
+          global_search_required_ = false;
           clearLioMotionAnomaly("verified NDT relocalization");
           initialized_this_frame = true;
           localization_state_ = 2;
           RCLCPP_INFO(get_logger(), "Init Pose Successful!!!");
-          init_match_count_ = 0;  // Reset counter
+          init_match_count_ = init_match_count_threshold_;
         }
       } else {
-        init_match_count_ = 0;
-        RCLCPP_INFO(get_logger(), "Init match criteria not met, resetting counter");
+        init_match_count_ = quality_ok ? 1 : 0;
+        initialization_state_ = global_seed_ready ? "validating" : "global_search_required";
+        RCLCPP_INFO(get_logger(),
+          "Init match rejected: quality=%s stable=%s global_seed_ready=%s score=%.3f inlier=%.3f",
+          quality_ok ? "true" : "false", pose_stable ? "true" : "false",
+          global_seed_ready ? "true" : "false", init_result.fitness_score_,
+          last_ndt_inlier_fraction_);
+      }
+      if (quality_ok) {
+        previous_init_match_xy_ = init_match_xy;
+        previous_init_match_yaw_ = initialization_match_yaw_;
+        has_previous_init_match_pose_ = true;
+      } else {
+        has_previous_init_match_pose_ = false;
       }
       RCLCPP_INFO(get_logger(), "Wait Init Pose!!! Current count: %d/%d", init_match_count_, init_match_count_threshold_);
       }
@@ -3290,6 +3459,15 @@ private:
       active_source_ = "unavailable";
     }
 
+    // Registration may report a plausible single frame before the initialization
+    // gate has accumulated its three stable observations. Never expose that as a
+    // normal navigation pose; doing so lets Nav2 start on an unverified map/yaw.
+    if (!is_init_success_) {
+      absolute_pose_valid = false;
+      bridge_pose_valid = false;
+      active_source_ = "unavailable";
+    }
+
     if (absolute_pose_valid) {
       if (stable_source_ != active_source_) {
         stable_source_ = active_source_;
@@ -3325,7 +3503,7 @@ private:
         pose_estimator ? pose_estimator->GetMatchState().refine_score_ : -1.0f,
         rtk_observation.quality.c_str(), bridge_distance_m_);
     } else {
-      localization_state_ = 4;
+      localization_state_ = is_init_success_ ? 4 : 1;
       consecutive_match_failures_++;
       // Keep the estimator and its odometry anchor alive. Recreating it here
       // freezes the seed at the last NDT yaw, making recovery impossible while
@@ -3347,7 +3525,9 @@ private:
         has_set_init_pose_ = true;
         last_pose_source_ = "runtime_last_valid";
         is_init_success_ = false;
-        init_match_count_ = 0;
+        global_search_required_ = false;
+        global_candidate_applied_ = false;
+        resetInitializationValidation();
         gl_once_gate_ = true;
         runtime_relocalization_attempted_ = true;
         {
@@ -3442,7 +3622,9 @@ private:
       // operator-provided pose. Local NDT alone can only recover small pose
       // errors, while the manual pose is often only approximate.
       is_init_success_ = false;
-      init_match_count_ = 0;
+      global_search_required_ = false;
+      global_candidate_applied_ = false;
+      resetInitializationValidation();
       localization_state_ = 1;
       gl_once_gate_ = true;
       is_extrapolating_ = false;
@@ -3846,8 +4028,11 @@ private:
       {
         std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
         if (!scan_context_db_.empty()) {
-          candidates = scan_context_db_.query(
-            *job.cloud, scan_context_top_k_, scan_context_max_distance_);
+          const auto descriptor = scan_context_db_.describe(*job.cloud);
+          candidates = scan_context_db_.queryDescriptor(
+            descriptor, scan_context_top_k_, scan_context_max_distance_, -1, 0,
+            ScanContextDistanceMetric::kMeanAbsoluteHeight,
+            scan_context_prefilter_candidates_);
         }
       }
       if (candidates.empty()) {
@@ -3884,8 +4069,8 @@ private:
             std::size_t candidate_slot = 0;
             if (scan_context_db_.findKeyframeSlot(candidate.keyframe_index, candidate_slot)) {
               candidate_map_pose = scan_context_db_.keyframePose(candidate_slot);
-              candidate_loaded = scan_context_db_.loadKeyframeScan(
-                candidate_slot, candidate_scan, &load_error);
+              candidate_loaded = scan_context_db_.loadKeyframeSubmap(
+                candidate_slot, scan_context_target_half_window_, candidate_scan, &load_error);
             } else {
               load_error = "candidate keyframe index is absent from the database";
             }
@@ -3897,27 +4082,54 @@ private:
             continue;
           }
 
-          const Eigen::Matrix4f initial_source_to_target =
-            (candidate_map_pose.inverse() * candidate.seed_pose).cast<float>();
-          const auto geometry = geometry_verifier.verify(
-            *job.cloud, candidate_scan, initial_source_to_target);
+          RelocalizationGeometryResult geometry;
+          Eigen::Matrix4d accepted_seed = candidate.seed_pose;
+          bool geometry_accepted = false;
+          const double sector_yaw = 2.0 * M_PI /
+            static_cast<double>(std::max(1, scan_context_db_.params().sectors));
+          for (int yaw_neighbor = -scan_context_yaw_neighbors_;
+               yaw_neighbor <= scan_context_yaw_neighbors_; ++yaw_neighbor) {
+            Eigen::Matrix4d yaw_adjusted_seed = candidate.seed_pose;
+            const double adjusted_yaw = candidate.yaw_offset_rad + yaw_neighbor * sector_yaw;
+            yaw_adjusted_seed.block<3, 3>(0, 0) =
+              Eigen::AngleAxisd(adjusted_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+              candidate_map_pose.block<3, 3>(0, 0);
+            const Eigen::Matrix4f initial_source_to_target =
+              (candidate_map_pose.inverse() * yaw_adjusted_seed).cast<float>();
+            geometry = geometry_verifier.verify(
+              *job.cloud, candidate_scan, initial_source_to_target);
+            if (geometry.accepted) {
+              accepted_seed = candidate_map_pose * geometry.source_to_target.cast<double>();
+              geometry_accepted = true;
+              break;
+            }
+          }
+          result.candidate_keyframe = candidate.keyframe_index;
+          result.candidate_distance = candidate.distance;
+          result.candidate_yaw_deg = candidate.yaw_offset_rad * 180.0 / M_PI;
+          result.candidate_rmse_m = geometry.rmse_m;
+          result.candidate_overlap = geometry.bidirectional_overlap;
+          result.rejection_reason = geometry.rejection_reason.empty()
+            ? "none" : geometry.rejection_reason;
           RCLCPP_INFO(get_logger(),
             "Scan context geometry keyframe=%d accepted=%s reason=%s "
             "rmse=%.3fm inliers=%d overlap=%.3f hessian=%.1f "
             "icp_delta=%.3fm/%.2fdeg elapsed=%.1fms mode=%s",
-            candidate.keyframe_index, geometry.accepted ? "true" : "false",
+            candidate.keyframe_index, geometry_accepted ? "true" : "false",
             geometry.rejection_reason.empty() ? "none" : geometry.rejection_reason.c_str(),
             geometry.rmse_m, geometry.inlier_count, geometry.bidirectional_overlap,
             geometry.hessian_condition, geometry.icp_translation_disagreement_m,
             geometry.icp_rotation_disagreement_rad * 180.0 / M_PI,
-            geometry.elapsed_ms, scan_context_runtime_mode_.c_str());
-          if (!geometry.accepted || !job.apply_scan_context) {
+            geometry.elapsed_ms, scan_context_effective_runtime_mode_.c_str());
+          if (!geometry_accepted) {
             continue;
           }
-
-          const Eigen::Matrix4d verified_seed = candidate_map_pose *
-            geometry.source_to_target.cast<double>();
-          if (runGlobalLocalizationIcp(job, verified_seed, result.pose)) {
+          result.candidate_accepted = true;
+          result.rejection_reason = job.apply_scan_context ? "none" : "shadow_not_applied";
+          if (!job.apply_scan_context) {
+            break;
+          }
+          if (runGlobalLocalizationIcp(job, accepted_seed, result.pose)) {
             result.success = true;
             result.source = "scan_context_gicp_verified";
             break;
@@ -3930,7 +4142,7 @@ private:
       }
     }
 
-    if (!result.success &&
+    if (!result.success && job.allow_fallback &&
         runGlobalLocalizationIcp(job, job.fallback_seed, result.pose)) {
       result.success = true;
       result.source = "last_trusted_pose";
@@ -3981,8 +4193,10 @@ private:
     job.map = global_map_points_ptr_;
     job.fallback_seed.block<3, 1>(0, 3) = last_init_pos_.cast<double>();
     job.fallback_seed.block<3, 3>(0, 0) = last_init_quat_.toRotationMatrix().cast<double>();
-    job.use_scan_context = use_scan_context_;
-    job.apply_scan_context = scan_context_runtime_mode_ == "active";
+    job.use_scan_context = scan_context_effective_runtime_mode_ != "disabled";
+    job.apply_scan_context = scan_context_effective_runtime_mode_ == "active";
+    job.allow_fallback = !global_search_required_;
+    global_relocalization_state_ = "searching";
     {
       std::lock_guard<std::mutex> lock(global_relocalization_job_mutex_);
       // Capacity-one mailbox: a newer request replaces a queued request. The
@@ -4025,6 +4239,16 @@ private:
     if (!result) {
       return;
     }
+    global_candidate_keyframe_ = result->candidate_keyframe;
+    global_candidate_distance_ = result->candidate_distance;
+    global_candidate_yaw_deg_ = result->candidate_yaw_deg;
+    global_candidate_rmse_m_ = result->candidate_rmse_m;
+    global_candidate_overlap_ = result->candidate_overlap;
+    global_candidate_rejection_reason_ = result->rejection_reason;
+    if (result->candidate_accepted && scan_context_effective_runtime_mode_ == "shadow") {
+      global_relocalization_state_ = "shadow_candidate_verified";
+      initialization_state_ = global_search_required_ ? "shadow_blocked" : initialization_state_;
+    }
     const auto disposition = decideGlobalRelocalizationResult(
       global_relocalization_generation_, result->generation, result->success,
       result->elapsed_ms, global_localization_timeout_);
@@ -4046,7 +4270,10 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "Background global localization failed once; keeping the last trusted pose");
-      if (runtime_relocalization_attempted_ && has_valid_pose_history_) {
+      if (!result->candidate_accepted) {
+        global_relocalization_state_ = "failed";
+      }
+      if (!global_search_required_ && runtime_relocalization_attempted_ && has_valid_pose_history_) {
         pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
         is_extrapolating_ = true;
       }
@@ -4062,7 +4289,9 @@ private:
     has_trusted_ndt_pose_ = false;
     resetLioAnchor();
     is_init_success_ = false;
-    init_match_count_ = 0;
+    resetInitializationValidation("validating_global_candidate");
+    global_candidate_applied_ = true;
+    global_relocalization_state_ = "candidate_applied";
     localization_state_ = 1;
     RCLCPP_INFO(
       get_logger(),
@@ -4777,9 +5006,28 @@ private:
             std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
             scan_context_db_.clear();
             scan_context_cursor_ = 0;
+            scan_context_effective_runtime_mode_ = "disabled";
             return;
         }
-        const std::string map_dir = std::filesystem::path(map_path).parent_path().string();
+        std::error_code canonical_error;
+        const std::string map_dir = std::filesystem::weakly_canonical(
+          std::filesystem::path(map_path), canonical_error).parent_path().string();
+        const bool map_allowed = scan_context_active_map_paths_.empty() || std::any_of(
+          scan_context_active_map_paths_.begin(), scan_context_active_map_paths_.end(),
+          [&](const std::string& allowed_path) {
+            std::error_code allowed_error;
+            return std::filesystem::weakly_canonical(allowed_path, allowed_error).string() == map_dir;
+          });
+        if (!map_allowed) {
+            std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+            scan_context_db_.clear();
+            scan_context_cursor_ = 0;
+            scan_context_effective_runtime_mode_ = "disabled";
+            RCLCPP_INFO(get_logger(),
+              "Scan context rollout disabled for non-allowlisted map %s", map_dir.c_str());
+            return;
+        }
+        scan_context_effective_runtime_mode_ = scan_context_runtime_mode_;
         ScanContextDatabase loaded_database;
         std::string error;
         if (!loaded_database.load(map_dir, &error)) {
@@ -4787,6 +5035,7 @@ private:
                 std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
                 scan_context_db_.clear();
                 scan_context_cursor_ = 0;
+                scan_context_effective_runtime_mode_ = "disabled";
             }
             RCLCPP_WARN(get_logger(), "Scan context relocalization unavailable for %s: %s",
                         map_dir.c_str(), error.c_str());
@@ -4874,7 +5123,7 @@ private:
         advanceGlobalRelocalizationGeneration("map reset", map_relocalization_settle_s_);
         is_init_success_ = false;
         localization_state_ = 0; 
-        init_match_count_ = 0;
+        global_candidate_applied_ = false;
         gl_once_gate_ = true;
         consecutive_match_failures_ = 0;
         runtime_relocalization_attempted_ = false;
@@ -4883,7 +5132,12 @@ private:
         has_set_init_pose_ = false;
         last_init_pos_ = Eigen::Vector3f(init_pos_x_, init_pos_y_, init_pos_z_);
         last_init_quat_ = Eigen::Quaternionf(init_ori_w_, init_ori_x_, init_ori_y_, init_ori_z_);
-        seedPositionFromGnss(get_clock()->now(), "map initialization");
+        const bool seeded_from_rtk = seedPositionFromGnss(
+          get_clock()->now(), "map initialization", true, true);
+        global_search_required_ = scan_context_effective_runtime_mode_ != "disabled" &&
+          !seeded_from_rtk;
+        resetInitializationValidation(
+          global_search_required_ ? "global_search_required" : "validating");
         pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
         has_trusted_ndt_pose_ = false;
         resetLidarOdometryState();
@@ -4929,6 +5183,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 globalmap_sub;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              rtk_initial_pose_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              global_relocalize_service_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr                                reinitialize_global_localization_service_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
@@ -5035,8 +5290,13 @@ private:
   uint64_t ndt_frame_counter_ = 0;
   bool last_ndt_healthy_ = false;
   bool last_ndt_status_healthy_ = false;
-  double last_ndt_score_ = std::numeric_limits<double>::infinity();
+  double last_ndt_score_ = -1.0;
   float last_ndt_inlier_fraction_ = 0.0f;
+  float last_ndt_drift_x_m_ = 0.0f;
+  float last_ndt_drift_y_m_ = 0.0f;
+  float last_ndt_drift_xy_m_ = 0.0f;
+  float last_ndt_drift_yaw_rad_ = 0.0f;
+  float last_ndt_orientation_delta_rad_ = 0.0f;
   rclcpp::Time last_ndt_update_time_{0, 0, RCL_ROS_TIME};
   std::int64_t last_ndt_match_start_steady_ns_ = 0;
   std::string last_point_cloud_schedule_reason_ = "idle";
@@ -5060,9 +5320,14 @@ private:
   ScanContextDatabase scan_context_db_;
   bool use_scan_context_ = false;
   std::string scan_context_runtime_mode_ = "disabled";
+  std::string scan_context_effective_runtime_mode_ = "disabled";
+  std::vector<std::string> scan_context_active_map_paths_;
   RelocalizationGeometryConfig relocalization_geometry_config_;
   int scan_context_top_k_ = 5;
   int scan_context_max_seeds_ = 1;
+  int scan_context_prefilter_candidates_ = 60;
+  int scan_context_target_half_window_ = 1;
+  int scan_context_yaw_neighbors_ = 2;
   double scan_context_max_distance_ = 0.0;
   /// Candidate the next gate firing starts from. Advancing it across firings is what
   /// makes the existing rearm walk the list instead of re-verifying a rejected seed.
@@ -5107,6 +5372,15 @@ private:
   std::chrono::steady_clock::time_point last_global_localization_attempt_{};
   int consecutive_match_failures_ = 0;
   bool runtime_relocalization_attempted_ = false;
+  bool global_search_required_ = false;
+  bool global_candidate_applied_ = false;
+  std::string global_relocalization_state_ = "idle";
+  int global_candidate_keyframe_ = -1;
+  double global_candidate_distance_ = 0.0;
+  double global_candidate_yaw_deg_ = 0.0;
+  double global_candidate_rmse_m_ = 0.0;
+  double global_candidate_overlap_ = 0.0;
+  std::string global_candidate_rejection_reason_ = "none";
   // Sensor data validity tracking
   rclcpp::Time last_lidar_data_time_;
   rclcpp::Time last_imu_data_time_;

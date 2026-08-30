@@ -225,6 +225,9 @@ class RosAdapter(Node):
         self._through_poses_action = through_poses_action
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
         self._rtk_initial_pose_client = self.create_client(Trigger, "/localization/seed_from_rtk")
+        self._global_relocalize_client = self.create_client(
+            Trigger, "/localization/global_relocalize"
+        )
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self._teleop_cmd_vel_pub = self.create_publisher(Twist, "/teleop_cmd_vel", 10)
         self._teleop_action_pub = self.create_publisher(String, "/teleop_action", 10)
@@ -1100,6 +1103,53 @@ class RosAdapter(Node):
                 "z": latest.z,
                 "yaw": latest.yaw,
             },
+        }
+
+    def global_relocalize(self, wait_seconds: float = 90.0) -> dict:
+        """Run map-wide position and 360-degree yaw search without a guessed pose."""
+        if not self._global_relocalize_client.wait_for_service(timeout_sec=3.0):
+            raise ProtocolError(
+                "GLOBAL_RELOCALIZATION_UNAVAILABLE",
+                "/localization/global_relocalize service is unavailable",
+            )
+        with self._localization_sample_condition:
+            sample_sequence = self._localization_sample_sequence
+        future = self._global_relocalize_client.call_async(Trigger.Request())
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(timeout=5.0) or not future.done():
+            raise ProtocolError(
+                "GLOBAL_RELOCALIZATION_TIMEOUT", "global relocalization service timed out"
+            )
+        response = future.result()
+        if response is None or not response.success:
+            raise ProtocolError(
+                "GLOBAL_RELOCALIZATION_UNAVAILABLE",
+                response.message if response else "global relocalization returned no response",
+            )
+        latest = self._wait_for_fresh_normal_samples(
+            after_sequence=sample_sequence,
+            required_samples=3,
+            timeout_seconds=wait_seconds,
+        )
+        if latest is None:
+            raise ProtocolError(
+                "GLOBAL_RELOCALIZATION_NOT_VERIFIED",
+                f"{response.message}; no verified 3-frame localization within {wait_seconds:.1f}s",
+            )
+        return {
+            "mode": "global_position_yaw_search",
+            "source": "scan_context",
+            "service": "/localization/global_relocalize",
+            "message": response.message,
+            "localization_status": latest.localization_status,
+            "localized_pose": {
+                "x": latest.x,
+                "y": latest.y,
+                "z": latest.z,
+                "yaw": latest.yaw,
+            },
+            "motion_commanded": False,
         }
 
     def _wait_for_fresh_normal_samples(
