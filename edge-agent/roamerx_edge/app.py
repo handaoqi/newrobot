@@ -831,6 +831,27 @@ class EdgeAgentApplication:
             "yaw": float(latest.yaw),
         }
 
+    def _localization_waypoint_seeds(self) -> list[dict]:
+        """Return ordered, de-duplicated waypoint seeds around the pending point."""
+        getter = getattr(self.task_executor, "current_localization_waypoint", None)
+        current = getter() if callable(getter) else None
+        if not current or current.get("waypoint_index") is None:
+            return []
+        points = self.task_executor.context.route_snapshot.get("waypoints", []) if self.task_executor.context else []
+        index = int(current.get("waypoint_index", 0))
+        indexes = [index, index - 1, index + 1, 0, len(points) - 1]
+        seeds, seen = [], set()
+        for candidate_index in indexes:
+            if candidate_index < 0 or candidate_index >= len(points):
+                continue
+            point = dict(points[candidate_index])
+            key = (round(float(point.get("x", 0)), 3), round(float(point.get("y", 0)), 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            seeds.append({"x": float(point["x"]), "y": float(point["y"]), "z": float(point.get("z", 0.0) or 0.0), "yaw": float(point.get("yaw", 0.0) or 0.0), "source": "waypoint", "waypoint_index": candidate_index})
+        return seeds
+
     def _recover_task_localization(self, reason: str = "localization_lost") -> None:
         try:
             cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
@@ -841,40 +862,32 @@ class EdgeAgentApplication:
             while first_cycle or self.task_executor.is_paused_for_localization():
                 first_cycle = False
                 cycle += 1
-                pose = self._localization_recovery_seed()
-                if not pose:
+                waypoint_seeds = self._localization_waypoint_seeds()
+                fallback_seed = None if waypoint_seeds else self._localization_recovery_seed()
+                seeds = waypoint_seeds or ([fallback_seed] if fallback_seed else [])
+                if not seeds:
                     LOGGER.error(
                         "localization recovery has no trusted pose; retrying in %.1fs",
                         cycle_retry,
                     )
                 else:
-                    LOGGER.warning(
-                        "localization lost; active relocalize from x=%.3f y=%.3f yaw=%.3f",
-                        float(pose["x"]), float(pose["y"]), float(pose["yaw"]),
-                    )
                     if (
                         self.task_executor.has_active_task()
                         and not self.task_executor.is_paused_for_localization()
                     ):
                         return
-                    try:
-                        self._hold_motion_for_relocalize()
-                        relocalize = getattr(self.navigation, "active_relocalize", None)
-                        if not callable(relocalize):
-                            raise RuntimeError("active_relocalize is unavailable")
-                        relocalize({
-                            **pose,
-                            "source": "last_trusted",
-                            "max_attempts": 12,
-                        })
-                        LOGGER.info("active relocalize accepted on cycle %d", cycle)
-                        return
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "active relocalize cycle %d failed: %s",
-                            cycle,
-                            exc,
-                        )
+                    relocalize = getattr(self.navigation, "active_relocalize", None)
+                    for seed in seeds:
+                        LOGGER.warning("localization lost; try waypoint seed index=%s x=%.3f y=%.3f yaw=%.3f", seed.get("waypoint_index"), seed["x"], seed["y"], seed["yaw"])
+                        try:
+                            self._hold_motion_for_relocalize()
+                            if not callable(relocalize):
+                                raise RuntimeError("active_relocalize is unavailable")
+                            relocalize({**seed, "max_attempts": 12})
+                            LOGGER.info("active relocalize accepted on cycle %d waypoint=%s", cycle, seed.get("waypoint_index"))
+                            return
+                        except Exception as exc:
+                            LOGGER.warning("active relocalize cycle %d waypoint=%s failed: %s", cycle, seed.get("waypoint_index"), exc)
                     if cycle == 1:
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)
                         if callable(global_relocalize):
