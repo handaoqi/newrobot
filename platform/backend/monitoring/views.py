@@ -3514,6 +3514,9 @@ class PatrolRouteExecuteView(APIView):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             loop_execution, loop_session_id, round_number = parse_loop_execution_context(request.data)
+            loop_total = int(request.data.get("loop_total", 1) or 1)
+            if not 1 <= loop_total <= 100:
+                raise ValueError("loop_total 必须在 1 到 100 之间")
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         route = get_object_or_404(
@@ -3566,6 +3569,7 @@ class PatrolRouteExecuteView(APIView):
                     command_options={
                         "record_rosbag": record_rosbag,
                         "loop_execution": loop_execution,
+                        "loop_total": loop_total,
                     },
                 )
         except TaskStateError as exc:

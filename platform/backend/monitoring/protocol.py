@@ -81,6 +81,7 @@ UPLINK_MESSAGE_TYPES = {
     "command.ack",
     "command.result",
     "task.progress",
+    "task.round_started",
     "task.obstacle_speech",
     "task.accepted",
     "task.started",

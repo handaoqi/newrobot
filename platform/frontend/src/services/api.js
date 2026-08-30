@@ -725,6 +725,7 @@ export async function executeRoute(routeId, {
   loopExecution = false,
   loopSessionId = null,
   roundNumber = 1,
+  loopTotal = 1,
 } = {}) {
   const result = await request(`/routes/${routeId}/execute/`, {
     method: 'POST',
@@ -733,6 +734,7 @@ export async function executeRoute(routeId, {
       loop_execution: loopExecution,
       loop_session_id: loopSessionId,
       round_number: roundNumber,
+      loop_total: loopTotal,
     }),
   })
   listCache.invalidate('routes-summary')

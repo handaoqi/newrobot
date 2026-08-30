@@ -170,6 +170,7 @@ class TaskContext:
     record_rosbag: bool = False
     docking: dict | None = None
     round_number: int = 1
+    loop_total: int = 1
 
 
 class TaskExecutor:
@@ -592,6 +593,7 @@ class TaskExecutor:
                 record_rosbag=bool(command.get("record_rosbag", False)),
                 docking=docking,
                 round_number=max(1, int(command.get("round_number", 1))),
+                loop_total=max(1, int(command.get("loop_total", 1))),
             )
             self._last_target_index = initial_waypoint_index - 1
             self._last_reached_index = initial_waypoint_index - 1
@@ -1466,6 +1468,19 @@ class TaskExecutor:
             self._restore_navigation_profile()
             if pose_error:
                 self._fail(*pose_error)
+                return
+            if self.context.round_number < self.context.loop_total:
+                self.context.round_number += 1
+                self.context.current_waypoint_index = 0
+                self.context.state_version += 1
+                self._last_target_index = -1
+                self._last_reached_index = -1
+                self._goal_offset = 0
+                self._dispatched_count = 0
+                self._patrol_final_approach_applied = False
+                self._persist()
+                self._emit("task.round_started", extra={"round_number": self.context.round_number, "loop_total": self.context.loop_total})
+                self._send_from(0)
                 return
             if self._is_docking_task() and callable(self.docking_arrived_handler):
                 try:

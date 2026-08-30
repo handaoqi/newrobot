@@ -556,6 +556,12 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
             {"type": "obstacle_speech", "payload": payload, "audio_command_id": command.id if command else None},
         )
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
+    if envelope.message_type == "task.round_started":
+        execution.round_number = max(execution.round_number, int(payload.get("round_number") or execution.round_number))
+        execution.state_version = max(execution.state_version, int(payload.get("state_version") or execution.state_version))
+        execution.save(update_fields=["round_number", "state_version", "updated_at"])
+        realtime_publisher.publish_task_event(str(execution.id), {"type": "round_started", "payload": payload})
+        return {"state": execution.state, "state_version": execution.state_version, "round_number": execution.round_number}
     if envelope.message_type == "task.progress":
         execution = TaskExecutionService.apply_progress(execution, payload)
         milestone = str(payload.get("milestone") or "")
