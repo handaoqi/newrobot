@@ -91,6 +91,8 @@ class CommandProcessor:
                 # completed task's stale version, causing progress events to be
                 # discarded by the center as out-of-order.
                 self.task_executor.prepare_task_start(envelope)
+                if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
+                    self.task_executor.initialize_before_navigation()
             ack = build_ack(
                 envelope,
                 accepted=True,

@@ -65,7 +65,8 @@ class SafetyPolicy:
     def validate_task_start(self, envelope: MessageEnvelope, has_active_task: bool) -> None:
         if has_active_task:
             raise ProtocolError("ROBOT_BUSY", "another motion task is active")
-        if self.state.localization_status != "normal":
+        smart_initialize = bool((envelope.payload.get("command") or {}).get("smart_initialize", True))
+        if self.state.localization_status != "normal" and not smart_initialize:
             raise ProtocolError("LOCALIZATION_NOT_READY", self.state.localization_status)
         stable_for = time.monotonic() - self.state.localization_normal_since_monotonic
         if stable_for < self.config.localization_stable_seconds:

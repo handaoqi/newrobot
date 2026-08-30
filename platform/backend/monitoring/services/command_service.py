@@ -58,6 +58,7 @@ class CommandService:
                 "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
                 "round_number": execution.round_number,
                 "loop_total": max(1, int(command_options.get("loop_total", 1))),
+                "smart_initialize": bool(command_options.get("smart_initialize", True)),
                 "docking": dict(command_options.get("docking") or {}),
             }
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)

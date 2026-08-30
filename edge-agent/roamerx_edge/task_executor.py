@@ -766,6 +766,33 @@ class TaskExecutor:
             else:
                 self._send_from(self.context.current_waypoint_index)
 
+    def initialize_before_navigation(self) -> None:
+        """Require a verified absolute pose before the first Nav2 goal."""
+        if not self.context or self.context.state != "accepted":
+            raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
+        diagnostics = getattr(self.navigation, "localization_diagnostics", lambda: {})()
+        quality = (diagnostics or {}).get("quality") or {}
+        if (diagnostics or {}).get("localization_status") == "normal" and quality.get("absolute_stable", True):
+            return
+        points = self.context.route_snapshot.get("waypoints") or []
+        index = min(max(0, self.context.current_waypoint_index), max(0, len(points) - 1))
+        waypoint = dict(points[index]) if points else None
+        relocalize = getattr(self.navigation, "active_relocalize", None)
+        if waypoint and callable(relocalize):
+            try:
+                relocalize({"x": float(waypoint["x"]), "y": float(waypoint["y"]), "yaw": float(waypoint.get("yaw", 0.0)), "max_attempts": 12, "source": "startup_waypoint"})
+                return
+            except Exception as exc:
+                LOGGER.warning("startup waypoint localization failed: %s", exc)
+        global_relocalize = getattr(self.navigation, "global_relocalize", None)
+        if callable(global_relocalize):
+            try:
+                global_relocalize(wait_seconds=90.0)
+                return
+            except Exception as exc:
+                LOGGER.warning("startup global localization failed: %s", exc)
+        raise ProtocolError("INITIALIZATION_FAILED", "startup waypoint and global localization both failed")
+
     def start_task(self, envelope: MessageEnvelope) -> None:
         """Compatibility entry point used by tests and direct callers."""
         self.prepare_task_start(envelope)
