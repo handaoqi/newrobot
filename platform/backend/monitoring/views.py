@@ -1880,7 +1880,9 @@ class TelemetryIngestView(APIView):
         robot.camera_id = camera_id
         robot.stream_id = stream_id
         robot.play_urls = video.get("play_urls") or robot.play_urls
-        robot.today_alerts += len(payload.get("detections", []))
+        # The business event center is intentionally limited to bicycle alerts.
+        bicycle_detections = [d for d in payload.get("detections", []) if is_bicycle_detection(d)]
+        robot.today_alerts += len(bicycle_detections)
         robot.save()
 
         telemetry = RobotTelemetry.objects.create(
@@ -1901,7 +1903,7 @@ class TelemetryIngestView(APIView):
         frame_width = video.get("frame_width")
         frame_height = video.get("frame_height")
         queued_audio_command_ids = []
-        for detection in payload.get("detections", []):
+        for detection in bicycle_detections:
             bbox = detection.get("bbox") or {}
             event = InspectionEvent.objects.create(
                 robot=robot,
