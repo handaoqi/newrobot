@@ -491,6 +491,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="metrics-grid">
           <div class="metric-card"><strong>{{ currentIndex + 1 }} / {{ execution.total_waypoints || waypoints.length }}</strong><span>当前航点</span></div>
+          <div class="metric-card"><strong>第 {{ execution.round_number || 1 }} 轮</strong><span>循环轮次</span></div>
           <div class="metric-card"><strong>{{ progress }}%</strong><span>任务进度</span></div>
           <div class="metric-card"><strong>{{ robotStatus?.connection_status || 'unknown' }}</strong><span>设备连接</span></div>
           <div class="metric-card"><strong>{{ powerLabel(robotStatus?.status) }}</strong><span>真实电量</span></div>
