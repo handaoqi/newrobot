@@ -991,6 +991,56 @@ def test_patrol_dispatches_remaining_waypoints_in_one_goal(tmp_path):
     store.close()
 
 
+def test_single_speech_waypoint_uses_final_approach_profile(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["waypoints"][0].update(
+        {"speech_template_id": 6, "speech_template_name": "森林火灾"}
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert nav.waypoint_profiles[-1] == (True, False, True)
+    assert nav.live_profiles[-1] is False
+    store.close()
+
+
+def test_repeated_nav2_feedback_is_throttled_to_one_progress_update_per_second(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    initial_version = executor.context.state_version
+    initial_progress_count = len([event for event in events if event[0] == "task.progress"])
+
+    for _ in range(50):
+        nav.feedback(0, 4.0)
+
+    assert executor.context.state_version == initial_version
+    assert len([event for event in events if event[0] == "task.progress"]) == initial_progress_count
+
+    executor._last_progress_emit_at -= 1.1
+    nav.feedback(0, 3.9)
+
+    assert executor.context.state_version == initial_version + 1
+    assert len([event for event in events if event[0] == "task.progress"]) == initial_progress_count + 1
+    store.close()
+
+
 def test_restart_reports_interrupted_task_and_closes_start_command(tmp_path):
     db_path = str(tmp_path / "edge.db")
     store = LocalStore(db_path)

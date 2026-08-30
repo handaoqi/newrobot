@@ -37,6 +37,9 @@ ROUND_TRIP_START_MARGIN_M = 2.0
 # then builds a left-right polyline, and MPPI hugs that heading. Flatten clicks
 # whose lateral error is below this threshold; keep real turns.
 WAYPOINT_STRAIGHTEN_M = 0.40
+# Nav2 feedback arrives around 20 Hz.  UI progress does not need that rate,
+# and persisting every sample can monopolize the platform SQLite writer.
+TASK_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 
 
 def _waypoint_xy(waypoint: dict) -> tuple[float, float] | None:
@@ -205,6 +208,7 @@ class TaskExecutor:
         self._segments = []
         self._lock = threading.RLock()
         self._goal_offset = 0
+        self._last_progress_emit_at: float | None = None
         self._obstacle_monitor_stop = threading.Event()
         self._obstacle_monitor_thread = None
         self._obstacle_progress_anchor = None
@@ -561,6 +565,7 @@ class TaskExecutor:
             )
             self._last_target_index = initial_waypoint_index - 1
             self._last_reached_index = initial_waypoint_index - 1
+            self._last_progress_emit_at = None
             self._last_localization_policy = None
             self._speech_waiting_index = None
             self._speech_wait_finished = False
@@ -882,11 +887,15 @@ class TaskExecutor:
                     max_shift,
                 )
         single = len(batch) == 1
-        patrol_final = (not self._is_docking_task()) and last_index == len(waypoints) - 1
-        self._patrol_final_approach_applied = False
+        # A one-pose batch is a real stop even when it is not the route's
+        # overall last point (speech, dwell and localization boundaries split
+        # patrols this way).  Cruise speed has a larger turning radius than
+        # the 0.35 m goal window and can make the dog orbit such a waypoint.
+        initial_final_approach = single and not self._is_docking_task()
+        self._patrol_final_approach_applied = initial_final_approach
         self._apply_navigation_profile(
             index,
-            force_final=single and patrol_final,
+            force_final=initial_final_approach,
             force_require_yaw=single and bool(waypoints[last_index].get("require_yaw", False)),
         )
         self._set_localization_policy(batch[0], "moving")
@@ -1161,13 +1170,14 @@ class TaskExecutor:
                 return
             current_waypoint_index += self._goal_offset
             total = len(self.context.route_snapshot["waypoints"])
+            dispatched_final_index = self._goal_offset + max(self._dispatched_count, 1) - 1
             if current_waypoint_index < 0 or current_waypoint_index >= total:
                 return
             if milestone != "waypoint_reached":
                 policy_waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index]
             if (
                 not self._is_docking_task()
-                and current_waypoint_index == total - 1
+                and current_waypoint_index == dispatched_final_index
                 and not self._patrol_final_approach_applied
                 and milestone != "waypoint_reached"
             ):
@@ -1229,7 +1239,11 @@ class TaskExecutor:
                             )
                         )
                         self._last_target_index = next_target_index
-                else:
+                elif (
+                    self._last_progress_emit_at is None
+                    or time.monotonic() - self._last_progress_emit_at
+                    >= TASK_PROGRESS_MIN_INTERVAL_SECONDS
+                ):
                     progress_updates.append(
                         self._build_progress_locked(
                             current_waypoint_index,
@@ -1272,6 +1286,7 @@ class TaskExecutor:
         waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
         self.context.current_waypoint_index = waypoint_index
         self.context.state_version += 1
+        self._last_progress_emit_at = time.monotonic()
         self._persist()
         pose = self.navigation.latest_pose()
         robot_pose = None
