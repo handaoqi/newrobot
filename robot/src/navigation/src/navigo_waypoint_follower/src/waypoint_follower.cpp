@@ -14,6 +14,7 @@
 
 #include "navigo_waypoint_follower/waypoint_follower.hpp"
 
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <streambuf>
@@ -174,7 +175,11 @@ namespace navigo_waypoint_follower
             if (action_server_->is_cancel_requested())
             {
                 auto cancel_future = nav_to_pose_client_->async_cancel_all_goals();
-                callback_group_executor_.spin_until_future_complete(cancel_future);
+                // Never let a broken/stale inner goal block the outer action
+                // forever.  The outer goal is terminated below either way;
+                // the next task can then be accepted cleanly.
+                callback_group_executor_.spin_until_future_complete(
+                    cancel_future, std::chrono::seconds(2));
                 // for result callback processing
                 callback_group_executor_.spin_some();
                 action_server_->terminate_all();

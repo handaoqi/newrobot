@@ -1441,7 +1441,11 @@ class TaskExecutor:
 
     def on_navigation_result(self, status: str, error_message: str = "", details: dict | None = None) -> None:
         with self._lock:
-            if not self.context or self.context.state in {"pausing", "cancelling", "paused", "cancelled"}:
+            # Result callbacks can arrive after cancellation or after a
+            # terminal failure (the Nav2 waypoint server may finish its
+            # worker thread later).  Never let such a stale success advance
+            # the route or dispatch the next waypoint.
+            if not self.context or self.context.state in self.TERMINAL_STATES | {"pausing", "cancelling", "paused"}:
                 return
             if status == "succeeded":
                 self._stop_obstacle_monitor()

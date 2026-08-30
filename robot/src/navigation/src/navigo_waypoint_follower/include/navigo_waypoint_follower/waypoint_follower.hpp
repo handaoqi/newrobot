@@ -29,6 +29,7 @@
 #include "robots_dog_msgs/msg/start_navigation.hpp"
 #include "robots_dog_msgs/msg/trajectory.hpp"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -266,7 +267,11 @@ namespace navigo_waypoint_follower
         rclcpp::executors::SingleThreadedExecutor                               callback_group_executor_;
         std::shared_future<rclcpp_action::ClientGoalHandle<ClientT>::SharedPtr> future_goal_handle_;
         bool                                                                    stop_on_failure_;
-        ActionStatus                                                            current_goal_status_;
+        // Result callbacks run on the callback-group executor while the
+        // waypoint loop runs on SimpleActionServer's worker thread.  This
+        // must be atomic: a cancel/result race previously left the worker
+        // observing PROCESSING forever after Nav2 had already finished.
+        std::atomic<ActionStatus>                                              current_goal_status_{ActionStatus::UNKNOWN};
         int                                                                     loop_rate_;
         std::vector<int>                                                        failed_ids_;
 
