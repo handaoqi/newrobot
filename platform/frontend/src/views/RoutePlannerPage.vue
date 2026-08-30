@@ -1427,13 +1427,12 @@ function routeExecutionOptionText(route) {
 }
 
 function toggleInitialPoseMode() {
-  initialPoseMode.value = !initialPoseMode.value
   if (initialPoseMode.value) {
-    initialPoseStep.value = manualInitialPose.value ? 'heading' : 'position'
-    navError.value = manualInitialPose.value ? '请点击狗头朝向，或重新选择位置' : '请点击机器狗真实位置'
-  } else {
+    initialPoseMode.value = false
     navError.value = ''
+    return
   }
+  resetInitialPosePosition()
 }
 
 function resetInitialPosePosition() {
