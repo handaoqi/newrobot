@@ -809,7 +809,7 @@ class EdgeAgentApplication:
     def _localization_recovery_seed(self) -> dict | None:
         waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
         waypoint = waypoint_getter() if callable(waypoint_getter) else None
-        if waypoint and waypoint.get("x") is not None and waypoint.get("y") is not None:
+        if waypoint and waypoint.get("waypoint_index") is not None and waypoint.get("x") is not None and waypoint.get("y") is not None:
             LOGGER.info("localization seed: current waypoint index=%s round=%s", waypoint.get("waypoint_index"), waypoint.get("round_number"))
             return {"x": float(waypoint["x"]), "y": float(waypoint["y"]), "z": float(waypoint.get("z", 0.0) or 0.0), "yaw": float(waypoint.get("yaw", 0.0) or 0.0), "source": "current_waypoint"}
         pose = self.navigation.latest_trusted_pose()
