@@ -226,6 +226,7 @@ class TaskExecutor:
         self._speech_waiting_index: int | None = None
         self._speech_wait_finished = False
         self._speech_wait_thread: threading.Thread | None = None
+        self._waypoint_localization_ready_index: int | None = None
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
         if self.context:
@@ -489,6 +490,7 @@ class TaskExecutor:
             if self._speech_waiting_index is not None:
                 reached_index = self._speech_waiting_index
                 speech_finished = self._speech_wait_finished
+                self._waypoint_localization_ready_index = reached_index
                 self.context.state = "running"
                 self.context.state_version += 1
                 self._persist()
@@ -496,6 +498,7 @@ class TaskExecutor:
                 if speech_finished:
                     self._speech_waiting_index = None
                     self._speech_wait_finished = False
+                    self._waypoint_localization_ready_index = None
                     self._continue_after_waypoint(reached_index)
                 return
             self._send_from(resume_index)
@@ -561,6 +564,7 @@ class TaskExecutor:
             self._last_localization_policy = None
             self._speech_waiting_index = None
             self._speech_wait_finished = False
+            self._waypoint_localization_ready_index = None
             self._persist()
             if reverse_return:
                 LOGGER.info(
@@ -1051,6 +1055,7 @@ class TaskExecutor:
             if self._speech_waiting_index is not None:
                 reached_index = self._speech_waiting_index
                 speech_finished = self._speech_wait_finished
+                self._waypoint_localization_ready_index = reached_index
                 self.context.state = "running"
                 self.context.state_version += 1
                 self._persist()
@@ -1058,6 +1063,7 @@ class TaskExecutor:
                 if speech_finished:
                     self._speech_waiting_index = None
                     self._speech_wait_finished = False
+                    self._waypoint_localization_ready_index = None
                     self._continue_after_waypoint(reached_index)
                 return {
                     "final_task_state": "running",
@@ -1336,6 +1342,13 @@ class TaskExecutor:
                         reached_index,
                     )
                 self._set_localization_policy(reached_waypoint, "stationary")
+                speech_required = bool(reached_waypoint.get("speech_template_id"))
+                if speech_required:
+                    self._clear_waypoint_speech_status(reached_index)
+                    # Speech and localization settling run independently; the
+                    # next waypoint is gated on both completion conditions.
+                    self._waypoint_localization_ready_index = None
+                    self._start_waypoint_speech_wait(reached_index)
                 if not self._absolute_localization_ready():
                     self.navigation.stop_motion()
                     self._restore_navigation_profile()
@@ -1350,10 +1363,7 @@ class TaskExecutor:
                         message="waypoint reached by FAST-LIO; waiting for the requested correction source",
                     )
                     return
-
-                speech_required = bool(reached_waypoint.get("speech_template_id"))
-                if speech_required:
-                    self._clear_waypoint_speech_status(reached_index)
+                self._waypoint_localization_ready_index = reached_index
                 self.on_feedback(
                     reached_index - self._goal_offset,
                     0.0,
@@ -1361,8 +1371,13 @@ class TaskExecutor:
                     completed_waypoints=reached_index + 1,
                 )
                 if speech_required:
-                    self._start_waypoint_speech_wait(reached_index)
+                    if self._speech_wait_finished:
+                        self._speech_waiting_index = None
+                        self._speech_wait_finished = False
+                        self._waypoint_localization_ready_index = None
+                        self._continue_after_waypoint(reached_index)
                     return
+                self._waypoint_localization_ready_index = None
                 self._continue_after_waypoint(reached_index)
             elif status == "cancelled":
                 self._stop_obstacle_monitor()
@@ -1497,8 +1512,12 @@ class TaskExecutor:
                         return
                     if self.context.state != "running":
                         return
+                    self._speech_wait_finished = True
+                    if self._waypoint_localization_ready_index != waypoint_index:
+                        return
                     self._speech_waiting_index = None
                     self._speech_wait_finished = False
+                    self._waypoint_localization_ready_index = None
                     self._continue_after_waypoint(waypoint_index)
                 return
             if state in {"failed", "superseded"}:

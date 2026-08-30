@@ -46,6 +46,7 @@
 - 已完成：NDT/VGICP 最终校正函数再次强制检查 `is_converged`、fitness `< ndt_max_fitness_score`、状态健康和内点率 ≥ 0.05，避免其他调用路径绕过质量门。
 - 已完成：RTK 最终校正函数再次强制检查 FIX、位置有限、时间戳、时效和水平标准差；无合格 RTK/NDT 源时不会进入校正。
 - 已完成：Edge Agent 在等待锚点平滑结束期间持续发送零速度，避免活动中的 Nav2 控制器覆盖一次性停止指令。
+- 已完成：航点语音等待与定位校正并行执行；通过航点级同步标志，只有语音完成且 `correction_smoothing_active=false`、绝对定位稳定后才发送下一航点。
 - 已完成：对应任务状态测试，导航相关 39 项测试通过。
 - 已完成：`localization` 包以 `RelWithDebInfo` 编译通过。
 - 已确认：路径规划页和任务执行页已消费 `correction_smoothing_active`、校正源、候选源、稳定帧等定位决策字段，前端生产构建通过。
