@@ -3098,15 +3098,23 @@ class RobotNavigationInitialPoseView(APIView):
                 if all(supplied)
                 else {}
             )
+            wait_seconds = float(request.data.get("wait_seconds") or 30.0)
         except (TypeError, ValueError, KeyError):
-            return Response({"detail": "初始定位需要同时提供数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "初始定位坐标和等待时间必须是数值。"}, status=status.HTTP_400_BAD_REQUEST)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            return Response({"detail": "初始定位等待时间必须是正数。"}, status=status.HTTP_400_BAD_REQUEST)
+        start_navigation = request.data.get("start_navigation", False)
+        if not isinstance(start_navigation, bool):
+            return Response({"detail": "start_navigation 必须是布尔值。"}, status=status.HTTP_400_BAD_REQUEST)
         command = CommandService.create_robot_command(
             robot=robot,
             command_type="nav.initial_pose",
             payload={
-                "reason": "manual_initial_pose",
+                "reason": "outdoor_rtk_initialization" if seed_source == "rtk" else "manual_initial_pose",
                 "frame_id": request.data.get("frame_id") or "map",
                 "seed_source": seed_source,
+                "wait_seconds": min(wait_seconds, 120.0),
+                "start_navigation": start_navigation,
                 **coordinates,
                 "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
                 "map_version": request.data.get("map_version") or robot.current_map_version or "",

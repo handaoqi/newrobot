@@ -652,11 +652,16 @@ async function initializeLocalization() {
   try {
     const mapId = presetTask.value?.map_id || routeData.value?.map_data
     if (!mapId) throw new Error('没有可初始化的地图，请先为值守任务配置路线地图')
+    if (String(mapData.value?.id || '') !== String(mapId)) {
+      mapData.value = await fetchMapDetail(mapId)
+    }
     const mapVersion = expectedLegacyMapVersion(mapId)
     const initialization = await initializeProgressiveLocalization({
       mapId,
       robotId: robot.id,
       mapVersion,
+      sceneScope: routeData.value?.scene_scope || mapData.value?.scene_scope || 'indoor',
+      coordinateMode: mapData.value?.coordinate_mode || '',
       waypoints: routeData.value?.waypoints || [],
       onProgress: message => { localizationInitMessage.value = message },
       dependencies: {
@@ -678,7 +683,9 @@ async function initializeLocalization() {
         throw new Error(latestCommand.error_message || latestCommand.error_code || '渐进定位初始化失败')
       }
       if (isCurrentCommand && latestCommand.status === 'succeeded') {
-        localizationInitMessage.value = '原点航向/1米范围、航点及全局匹配已完成，正在等待定位收敛'
+        localizationInitMessage.value = initialization.selectedSource === 'rtk_fixed'
+          ? 'RTK固定解与本地NDT验证已完成，正在等待定位和导航栈同步'
+          : '原点航向/1米范围、航点及全局匹配已完成，正在等待定位收敛'
         if (navigationReadyForMap(latest, mapId, mapVersion)) {
           localizationInitState.value = 'success'
           localizationInitMessage.value = '已重新初始化到最优定位点，导航栈已就绪'

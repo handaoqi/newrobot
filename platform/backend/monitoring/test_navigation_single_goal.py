@@ -83,3 +83,24 @@ class NavigationSingleGoalTests(TestCase):
         self.assertEqual(response.status_code, 202, response.data)
         command = RemoteCommand.objects.get(pk=response.data["id"])
         self.assertEqual(command.payload["wait_seconds"], 180.0)
+
+    def test_rtk_initial_pose_forwards_validation_budget_and_navigation_start(self):
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/navigation/initial-pose/",
+            {
+                "seed_source": "rtk",
+                "map_id": "7",
+                "map_version": "v3",
+                "wait_seconds": 30,
+                "start_navigation": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        command = RemoteCommand.objects.get(pk=response.data["id"])
+        self.assertEqual(command.command_type, "nav.initial_pose")
+        self.assertEqual(command.payload["reason"], "outdoor_rtk_initialization")
+        self.assertEqual(command.payload["seed_source"], "rtk")
+        self.assertEqual(command.payload["wait_seconds"], 30.0)
+        self.assertIs(command.payload["start_navigation"], True)

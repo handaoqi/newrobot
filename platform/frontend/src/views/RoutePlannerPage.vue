@@ -53,7 +53,10 @@ import {
 } from '../services/taskMapState'
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
-import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
+import {
+  initializeProgressiveLocalization,
+  shouldInitializeFromRtk,
+} from '../services/progressiveLocalization'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
 const maps = ref([])
@@ -1345,13 +1348,15 @@ async function initializeLocalization() {
 
   navCommandBusy.value = 'localization-init'
   localizationInitState.value = 'restarting'
-  localizationInitMessage.value = '正在下发当前地图，并准备从原点重新初始化定位'
+  localizationInitMessage.value = '正在下发当前地图，并按地图类型重新初始化定位'
   navError.value = ''
   try {
     const initialization = await initializeProgressiveLocalization({
       mapId: selectedMap.value?.id,
       robotId,
       mapVersion: selectedMapVersion(),
+      sceneScope: routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor',
+      coordinateMode: selectedMap.value?.coordinate_mode || '',
       waypoints: waypoints.value.map(point => {
         const normalized = normalizeStoredWaypoint(point)
         return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
@@ -1403,6 +1408,38 @@ async function activeRelocalize() {
   localizationInitMessage.value = '正在静止搜索定位候选'
   navError.value = ''
   try {
+    const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
+    const coordinateMode = selectedMap.value?.coordinate_mode || ''
+    if (!manualInitialPose.value && shouldInitializeFromRtk({ sceneScope, coordinateMode })) {
+      const initialization = await initializeProgressiveLocalization({
+        mapId: selectedMap.value?.id,
+        robotId,
+        mapVersion: selectedMapVersion(),
+        sceneScope,
+        coordinateMode,
+        waypoints: waypoints.value.map(point => {
+          const normalized = normalizeStoredWaypoint(point)
+          return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
+        }),
+        onProgress: message => { localizationInitMessage.value = message },
+        dependencies: {
+          activateRouteMap,
+          sendRobotNavigationCommand,
+          waitForRobotCommand,
+        },
+      })
+      const outcome = applyInitialPoseOutcome(initialization.command)
+      for (let index = 0; index < 35; index += 1) {
+        await sleep(2000)
+        await refreshNavigationStatus()
+        if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
+          localizationInitState.value = 'done'
+          localizationInitMessage.value = initialPoseOutcomeMessage('室外主动重定位完成', outcome)
+          return
+        }
+      }
+      throw new Error('室外主动重定位未在限定时间内收敛')
+    }
     const payload = {
       seed_source: manualInitialPose.value ? 'last_trusted' : 'global',
       map_id: selectedMap.value?.id,

@@ -682,9 +682,14 @@ def test_nav_initial_pose_uses_fixed_rtk_seed(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.initial_pose"
     raw["payload"].pop("task_execution_id", None)
-    raw["payload"]["command"] = {"seed_source": "rtk", "wait_seconds": 12.0}
+    raw["payload"]["command"] = {
+        "seed_source": "rtk",
+        "wait_seconds": 12.0,
+        "start_navigation": True,
+    }
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()
+    stack = FakeNavigationStack()
     executor = TaskExecutor(
         store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
     )
@@ -696,6 +701,7 @@ def test_nav_initial_pose_uses_fixed_rtk_seed(tmp_path):
         publish_ack=lambda *args: None,
         publish_result=lambda *args: None,
         localization_adapter=navigation,
+        navigation_stack_adapter=stack,
     )
 
     _, result = processor.handle_command(raw)
@@ -703,6 +709,8 @@ def test_nav_initial_pose_uses_fixed_rtk_seed(tmp_path):
     assert navigation.rtk_initial_pose_requests == 1
     assert result["payload"]["result"]["source"] == "rtk_fixed"
     assert result["payload"]["result"]["wait_seconds"] == 12.0
+    assert result["payload"]["result"]["navigation_start"]["action"] == "start"
+    assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
     store.close()
 
 
