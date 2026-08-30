@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -105,6 +106,15 @@ static char* dirname(char* path)
 
 namespace navigo_map_server
 {
+    // GraphicsMagick owns process-global state.  Calling InitializeMagick from
+    // every map load/save (especially from composable lifecycle callbacks) is
+    // not idempotent and can crash during component teardown. Initialize it
+    // exactly once and never terminate it from an individual component.
+    void initialize_graphicsmagick_once()
+    {
+        static std::once_flag flag;
+        std::call_once(flag, []() { Magick::InitializeMagick(nullptr); });
+    }
     using navigo_util::geometry_utils::orientationAroundZAxis;
 
     // === Map input part ===
@@ -216,7 +226,7 @@ namespace navigo_map_server
 
     void loadMapFromFile(const LoadParameters& load_parameters, nav_msgs::msg::OccupancyGrid& map)
     {
-        Magick::InitializeMagick(nullptr);
+        initialize_graphicsmagick_once();
 
         nav_msgs::msg::OccupancyGrid msg;
 
@@ -401,7 +411,7 @@ namespace navigo_map_server
     void checkSaveParameters(SaveParameters& save_parameters)
     {
         // Magick must me initialized before any activity with images
-        Magick::InitializeMagick(nullptr);
+        initialize_graphicsmagick_once();
 
         // Checking map file name
         if (save_parameters.map_file_name == "")
