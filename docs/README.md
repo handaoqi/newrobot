@@ -11,6 +11,7 @@
 | [系统总体架构](ROAMERX_SYSTEM_ARCHITECTURE.md) | 云平台、前端、Edge 和运动控制的组件边界与业务链路 |
 | [前端总体架构](前端总体架构.md) | 前端技术栈、模块/路由/API/状态、异步视频、播放器生命周期、响应式、测试、部署与安全约束 |
 | [巡检任务与路径规划架构](INSPECTION_TASK_ROUTE_ARCHITECTURE.md) | 地图、路线、任务、执行和统一机器狗图示 |
+| [Navigo 与标准 Nav2 双栈回退方案](NAVIGO_TO_STANDARD_NAV2_DUAL_STACK_FALLBACK_PLAN.md) | 自研与官方组件差异、双栈切换、自动回退、安全门槛和分阶段验收 |
 | [路径规划 RTK 与地图管理执行计划](ROUTE_PLANNER_RTK_AND_MAPPING_EXECUTION_PLAN.md) | RTK 状态、时间基准、定位初始化、原点锁定和实机验收 |
 | [地图管理 RTK、里程计与诊断录制计划](MAP_ORIGIN_RTK_ODOM_DIAGNOSTIC_PLAN.md) | 室外 RTK 质量、建图全程里程计源切换和同步诊断 rosbag |
 | [SLAM 采集与世界位姿计划](SLAM_DATA_CAPTURE_AND_WORLD_POSE_PLAN.md) | 建图话题、完整世界位姿、IMU 预积分、Scan-Context 与无 RTK 场景限制 |

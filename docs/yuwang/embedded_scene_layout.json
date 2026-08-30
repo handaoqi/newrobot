@@ -1,0 +1,146 @@
+{
+  "configById": {
+    "3D!scene": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 20,
+        "phi": 52,
+        "thetaOffset": 0,
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "base_link",
+      "scene": {
+        "enableStats": false,
+        "backgroundColor": "#eef3fb",
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.6,
+          "lineColor": "#c8d2e0"
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/map": {
+          "visible": true,
+          "frameLocked": true,
+          "pointSize": 1.5,
+          "colorField": "z",
+          "colorMode": "flat",
+          "flatColor": "#b6c2d1ff"
+        },
+        "/front_lidar": {
+          "visible": false,
+          "pointSize": 1.5,
+          "colorMode": "colormap",
+          "colorField": "z",
+          "decayTime": 0
+        },
+        "/laser_scan": {
+          "visible": true,
+          "pointSize": 3,
+          "colorField": "intensity",
+          "colorMode": "flat",
+          "flatColor": "#2588ffff"
+        },
+        "/studio_script/traj_localization": {
+          "visible": true,
+          "type": "line",
+          "lineWidth": 0.06,
+          "gradient": [
+            "#e5484dff",
+            "#e5484dff"
+          ]
+        },
+        "/studio_script/traj_nav2": {
+          "visible": true,
+          "type": "line",
+          "lineWidth": 0.06,
+          "gradient": [
+            "#3b82f6ff",
+            "#3b82f6ff"
+          ]
+        },
+        "/studio_script/traj_mc_odom": {
+          "visible": true,
+          "type": "line",
+          "lineWidth": 0.06,
+          "gradient": [
+            "#22c55eff",
+            "#22c55eff"
+          ]
+        },
+        "/localization/scan_match_pose": {
+          "visible": true,
+          "type": "arrow",
+          "arrowScale": [
+            0.8,
+            0.12,
+            0.12
+          ],
+          "color": "#eab308ff",
+          "showCovariance": false
+        },
+        "/plan": {
+          "visible": true,
+          "type": "line",
+          "lineWidth": 0.09,
+          "gradient": [
+            "#8a94a6ff",
+            "#8a94a6ff"
+          ]
+        },
+        "/transformed_global_plan": {
+          "visible": true,
+          "type": "line",
+          "lineWidth": 0.07,
+          "gradient": [
+            "#b8c0ccff",
+            "#b8c0ccff"
+          ]
+        }
+      },
+      "layers": {},
+      "publish": {
+        "type": "point"
+      }
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {
+    "traj_localization": {
+      "name": "traj_localization",
+      "sourceCode": "// Lichtblick's 3D panel cannot render nav_msgs/Odometry: there is no ODOMETRY\n// entry in ThreeDeeRender/ros.ts and no renderable handles it, so an odometry\n// topic configured under \"topics\" is silently ignored. Converting to\n// nav_msgs/Path here is what puts the trajectory on screen -- the 3D panel does\n// render Path (PoseArrays.ts, default display type \"line\").\n//\n// Use Message<\"schema/name\"> from \"./types\", NOT the Messages.* namespace from\n// the ros lib: ast.ts resolves a return type declared in generatedTypes.ts back\n// to the property-signature key, which is how the output topic gets the real\n// datatype \"nav_msgs/msg/Path\". Keep the ROS 2 \"msg\" segment -- this bag records\n// nav_msgs/msg/Path, not nav_msgs/Path.\n//\n// Getting either wrong fails silently: the script is dropped from the\n// registration list, /studio_script/* never appears in the 3D panel's topic\n// list, and the diagnostic goes to the User Scripts panel -- which an embedded\n// single-3D-panel layout does not contain.\nimport { Input, Message } from \"./types\";\n\nexport const inputs = [\"/odom/localization_odom\"];\nexport const output = \"/studio_script/traj_localization\";\n\n// The trail is kept in module scope: the script is invoked once per message and\n// only the return value reaches the panel, so accumulation has to live out here.\n// Typed off the Path schema itself so this depends on one schema name, not on\n// geometry_msgs/msg/PoseStamped also being registered by the data source.\nconst poses: Message<\"nav_msgs/msg/Path\">[\"poses\"] = [];\nconst MAX_POSES = 3000;\n\nexport default function script(event: Input<\"/odom/localization_odom\">): Message<\"nav_msgs/msg/Path\"> {\n  poses.push({ header: event.message.header, pose: event.message.pose.pose });\n  if (poses.length > MAX_POSES) {\n    poses.shift();\n  }\n  return { header: event.message.header, poses };\n}\n"
+    },
+    "traj_nav2": {
+      "name": "traj_nav2",
+      "sourceCode": "// Lichtblick's 3D panel cannot render nav_msgs/Odometry: there is no ODOMETRY\n// entry in ThreeDeeRender/ros.ts and no renderable handles it, so an odometry\n// topic configured under \"topics\" is silently ignored. Converting to\n// nav_msgs/Path here is what puts the trajectory on screen -- the 3D panel does\n// render Path (PoseArrays.ts, default display type \"line\").\n//\n// Use Message<\"schema/name\"> from \"./types\", NOT the Messages.* namespace from\n// the ros lib: ast.ts resolves a return type declared in generatedTypes.ts back\n// to the property-signature key, which is how the output topic gets the real\n// datatype \"nav_msgs/msg/Path\". Keep the ROS 2 \"msg\" segment -- this bag records\n// nav_msgs/msg/Path, not nav_msgs/Path.\n//\n// Getting either wrong fails silently: the script is dropped from the\n// registration list, /studio_script/* never appears in the 3D panel's topic\n// list, and the diagnostic goes to the User Scripts panel -- which an embedded\n// single-3D-panel layout does not contain.\nimport { Input, Message } from \"./types\";\n\nexport const inputs = [\"/odom/nav2\"];\nexport const output = \"/studio_script/traj_nav2\";\n\n// The trail is kept in module scope: the script is invoked once per message and\n// only the return value reaches the panel, so accumulation has to live out here.\n// Typed off the Path schema itself so this depends on one schema name, not on\n// geometry_msgs/msg/PoseStamped also being registered by the data source.\nconst poses: Message<\"nav_msgs/msg/Path\">[\"poses\"] = [];\nconst MAX_POSES = 3000;\n\nexport default function script(event: Input<\"/odom/nav2\">): Message<\"nav_msgs/msg/Path\"> {\n  poses.push({ header: event.message.header, pose: event.message.pose.pose });\n  if (poses.length > MAX_POSES) {\n    poses.shift();\n  }\n  return { header: event.message.header, poses };\n}\n"
+    },
+    "traj_mc_odom": {
+      "name": "traj_mc_odom",
+      "sourceCode": "// Lichtblick's 3D panel cannot render nav_msgs/Odometry: there is no ODOMETRY\n// entry in ThreeDeeRender/ros.ts and no renderable handles it, so an odometry\n// topic configured under \"topics\" is silently ignored. Converting to\n// nav_msgs/Path here is what puts the trajectory on screen -- the 3D panel does\n// render Path (PoseArrays.ts, default display type \"line\").\n//\n// Use Message<\"schema/name\"> from \"./types\", NOT the Messages.* namespace from\n// the ros lib: ast.ts resolves a return type declared in generatedTypes.ts back\n// to the property-signature key, which is how the output topic gets the real\n// datatype \"nav_msgs/msg/Path\". Keep the ROS 2 \"msg\" segment -- this bag records\n// nav_msgs/msg/Path, not nav_msgs/Path.\n//\n// Getting either wrong fails silently: the script is dropped from the\n// registration list, /studio_script/* never appears in the 3D panel's topic\n// list, and the diagnostic goes to the User Scripts panel -- which an embedded\n// single-3D-panel layout does not contain.\nimport { Input, Message } from \"./types\";\n\nexport const inputs = [\"/odom/mc_odom\"];\nexport const output = \"/studio_script/traj_mc_odom\";\n\n// The trail is kept in module scope: the script is invoked once per message and\n// only the return value reaches the panel, so accumulation has to live out here.\n// Typed off the Path schema itself so this depends on one schema name, not on\n// geometry_msgs/msg/PoseStamped also being registered by the data source.\nconst poses: Message<\"nav_msgs/msg/Path\">[\"poses\"] = [];\nconst MAX_POSES = 1500;\n\nexport default function script(event: Input<\"/odom/mc_odom\">): Message<\"nav_msgs/msg/Path\"> {\n  poses.push({ header: event.message.header, pose: event.message.pose.pose });\n  if (poses.length > MAX_POSES) {\n    poses.shift();\n  }\n  return { header: event.message.header, poses };\n}\n"
+    }
+  },
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": "3D!scene"
+}
