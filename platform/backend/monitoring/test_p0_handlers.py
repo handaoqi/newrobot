@@ -503,8 +503,10 @@ class MessageHandlerTests(TestCase):
             )
 
             self.assertIs(result["automatic_docking"], False)
-            self.assertFalse(result["registered"])
-            self.assertFalse(InspectionEvent.objects.filter(event_id=event_id).exists())
+            self.assertTrue(result["registered"])
+            event = InspectionEvent.objects.get(event_id=event_id)
+            self.assertEqual(event.title, "低电量停车告警")
+            self.assertEqual(event.object_class, "low_battery")
 
         self.assertEqual(TaskExecution.objects.count(), execution_count)
         self.assertEqual(RemoteCommand.objects.count(), remote_command_count)

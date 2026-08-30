@@ -31,6 +31,22 @@ def is_bicycle_alert(payload: dict) -> bool:
     return is_bicycle_detection(detection)
 
 
+def is_low_battery_alert(payload: dict) -> bool:
+    event_type = str(payload.get("event_type") or "").strip().lower()
+    source_code = str((payload.get("source") or {}).get("code") or "").strip().upper()
+    object_class = str((payload.get("detection") or {}).get("class") or "").strip().lower()
+    return (
+        event_type in {"low_battery_alert", "low_battery_return_charge"}
+        or source_code in {"LOW_BATTERY_ALERT", "LOW_BATTERY_RETURN_CHARGE"}
+        or object_class == "low_battery"
+    )
+
+
+def should_register_edge_alert(payload: dict) -> bool:
+    """Register business bicycle events and the operator-facing battery safety alert."""
+    return is_bicycle_alert(payload) or is_low_battery_alert(payload)
+
+
 def _decimal(value):
     return Decimal(str(value)) if value is not None else None
 
@@ -39,7 +55,7 @@ class AlertService:
     @staticmethod
     @transaction.atomic
     def ingest_edge_alert(robot: Robot, payload: dict) -> tuple[InspectionEvent | None, bool]:
-        if not is_bicycle_alert(payload):
+        if not should_register_edge_alert(payload):
             return None, False
         existing = InspectionEvent.objects.filter(event_id=payload["event_id"]).first()
         if existing:

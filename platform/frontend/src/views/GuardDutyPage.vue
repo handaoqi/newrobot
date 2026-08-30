@@ -42,6 +42,13 @@ import {
   clearGuardDutyLoopExecution,
   guardDutyLoopCleanupExecutionId,
 } from '../utils/guardDutyLoopStop'
+import { resolveBatteryPercent } from '../utils/battery'
+import {
+  isLowBatteryBlocked,
+  isLowBatteryStopAlert,
+  isLowBatteryTaskError,
+  lowBatteryGuardMessage,
+} from '../utils/guardDutyLowBattery'
 import { activateRouteMap } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
 import {
@@ -125,6 +132,8 @@ const presetTask = computed(() => {
 const latestAlert = computed(() => latestRobot.value?.recent_events?.[0] || overview.value?.live_event || null)
 const alerts = computed(() => latestRobot.value?.recent_events || [])
 const pendingEventCount = computed(() => Number(overview.value?.summary?.pending_event_count || 0))
+const batteryPercent = computed(() => resolveBatteryPercent(null, latestRobot.value))
+const lowBatteryBlocked = computed(() => isLowBatteryBlocked(batteryPercent.value))
 const actions = computed(() => executionActions(execution.value?.state))
 const isRunning = computed(() => isExecutionActive(execution.value?.state))
 const routeWaypoints = computed(() => execution.value?.route_snapshot?.waypoints || routeData.value?.waypoints || [])
@@ -428,17 +437,44 @@ function eventImage(event) {
   return event?.annotated_snapshot_url || event?.snapshot_url || ''
 }
 
+function stopForLowBattery({ notify = true } = {}) {
+  loopActive.value = false
+  loopState.value = 'stopped'
+  loopStoppedAt.value = Date.now()
+  loopRestUntil.value = 0
+  loopCurrentExecutionId.value = ''
+  loopMessage.value = lowBatteryGuardMessage(batteryPercent.value)
+  persistLoopState()
+  releaseLoopOwnership()
+  if (notify) showToast(loopMessage.value, { variant: 'alert', duration: 8000 })
+}
+
+function reconcileLowBatteryState() {
+  const recentLowBattery = (latestRobot.value?.recent_events || []).find(isLowBatteryStopAlert)
+  const detectedAt = new Date(recentLowBattery?.detected_at || '').getTime()
+  const happenedDuringLoop = loopActive.value
+    && Number.isFinite(detectedAt)
+    && detectedAt >= loopStartedAt.value
+  if (lowBatteryBlocked.value || happenedDuringLoop) stopForLowBattery({ notify: false })
+}
+
 function addRealtimeEvent(event) {
   if (!event?.id) return
   const robot = latestRobot.value
   if (!robot || (event.robot_code && event.robot_code !== robot.code)) return
+  const isLowBattery = isLowBatteryStopAlert(event)
+  if (isLowBattery) stopForLowBattery({ notify: false })
   const current = robot.recent_events || []
   if (current.some((item) => item.id === event.id)) return
   robot.recent_events = [event, ...current].slice(0, 5)
   if (event.status === 'pending' && overview.value?.summary) {
     overview.value.summary.pending_event_count = pendingEventCount.value + 1
   }
-  showToast('收到新的现场报警', { variant: 'alert', duration: 5200 })
+  showToast(isLowBattery ? loopMessage.value : '收到新的现场报警', {
+    variant: 'alert',
+    duration: isLowBattery ? 8000 : 5200,
+  })
+  if (isLowBattery) void refreshExecution()
 }
 
 function openPendingEvents() {
@@ -480,6 +516,7 @@ async function load() {
     selectedTaskId.value = String(availableTasks[0]?.id || '')
   }
   restoreLoopState(robotId)
+  reconcileLowBatteryState()
   await restoreExecution(taskResult, robotId)
   await refreshExecutionVisual()
 }
@@ -540,6 +577,7 @@ async function refreshRobot() {
   if (!latestRobot.value?.id) return
   try {
     selectedRobot.value = await fetchRobotDetail(latestRobot.value.id)
+    reconcileLowBatteryState()
   } catch {}
 }
 
@@ -858,7 +896,8 @@ async function launchTask({ fromLoop = false } = {}) {
     await refreshExecutionVisual()
     return execution.value
   } catch (error) {
-    showToast(error.message || '任务启动失败', { variant: 'alert' })
+    if (isLowBatteryTaskError(error)) stopForLowBattery()
+    else showToast(error.message || '任务启动失败', { variant: 'alert' })
     return null
   } finally {
     busy.value = false
@@ -889,6 +928,10 @@ function scheduleNextLoopRound(message = '') {
 async function runLoopCycle() {
   nowMs.value = Date.now()
   if (!loopActive.value || loopCycleBusy) return
+  if (lowBatteryBlocked.value) {
+    stopForLowBattery()
+    return
+  }
   if (!ensureLoopOwnership()) return
   loopCycleBusy = true
   try {
@@ -1226,7 +1269,7 @@ watch(playUrlKey, () => {
               </small>
             </div>
             <div class="guard-task-actions">
-              <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
+              <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning || lowBatteryBlocked" @click="startTask">
                 {{ busy ? '处理中...' : '开始巡检' }}
               </button>
               <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
@@ -1277,7 +1320,7 @@ watch(playUrlKey, () => {
               <button
                 class="guard-loop-toggle"
                 :class="{ 'is-active': loopActive }"
-                :disabled="busy || localizationBusy || (!loopActive && (!presetTask || isRunning || !navigationReady()))"
+                :disabled="busy || localizationBusy || (!loopActive && (!presetTask || isRunning || lowBatteryBlocked || !navigationReady()))"
                 @click="toggleLoop"
               >
                 {{ loopActive ? '停止循环' : '循环执行' }}

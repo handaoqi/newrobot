@@ -342,9 +342,10 @@ def _dispatch(
             "low_battery_alert",
             "low_battery_return_charge",
         } or source_code in {"LOW_BATTERY_ALERT", "LOW_BATTERY_RETURN_CHARGE"}:
-            # System safety handling stays active even though non-bicycle
-            # alerts no longer create business event-center records.
-            _queue_low_battery_alert_speech(robot, payload)
+            # Low battery is both an operator-facing safety event and an
+            # alert-only stop: it must never dispatch docking or switch maps.
+            if created:
+                _queue_low_battery_alert_speech(robot, payload)
             return {
                 "created": created,
                 "registered": event is not None,
