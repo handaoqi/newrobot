@@ -138,12 +138,12 @@ class MappingAdapter:
         "save_progress.json",
     )
     SAVE_OUTPUT_TIMEOUT_SECONDS = 7200
-    SLAM_PROCESS_PATTERNS = (
-        "robot_slam.*mapping",
-        "/robot_slam/mapping",
-        "lib/robot_slam/mapping",
-        "ros2 launch robot_slam",
-        "slam.launch.py",
+    SLAM_MAPPING_EXECUTABLE_RE = re.compile(
+        r"^\S*/robot_slam/lib/robot_slam/mapping(?:\s|$)"
+    )
+    SLAM_LAUNCH_PROCESS_RE = re.compile(
+        r"^(?:\S*/python(?:3(?:\.\d+)?)?\s+)?"
+        r"(?:\S*/)?ros2\s+launch\s+robot_slam(?:\s|$)"
     )
     LIO_ODOMETRY_PROCESS_MARKERS = (
         "lio_odometry.launch",
@@ -643,11 +643,6 @@ class MappingAdapter:
         if should_stop:
             self._cleanup()
             result.update(self.status())
-            # The command result is the durable terminal snapshot consumed by
-            # the platform.  status() intentionally returns idle after cleanup,
-            # but a successful save must retain the explicit workflow terminal
-            # state so stale progress cannot put the UI back into "saving".
-            result["state"] = "exited"
         # Start the post-save static self-check only after the map is durable and
         # the mapping session has been torn down.  It never publishes motion.
         self._start_post_save_validation(
@@ -655,6 +650,11 @@ class MappingAdapter:
             str(command.get("mapping_type") or self._mapping_type or "indoor"),
         )
         result.update(self.status())
+        if should_stop:
+            # The command result is the durable terminal snapshot consumed by
+            # the platform.  Both cleanup and queued post-save validation merge
+            # live status into the result, so write the terminal state last.
+            result["state"] = "exited"
         return result
 
     def _read_post_save_validation(self) -> dict:
@@ -2542,11 +2542,19 @@ class MappingAdapter:
                 continue
             if pid == current_pid:
                 continue
-            if self._is_lio_odometry_process(args):
-                continue
-            if any(re.search(pattern, args) for pattern in self.SLAM_PROCESS_PATTERNS):
+            if self._is_slam_mapping_process(args):
                 pids.append(pid)
         return pids
+
+    @classmethod
+    def _is_slam_mapping_process(cls, args: str) -> bool:
+        """Match the process itself, never a shell merely mentioning it."""
+        if cls._is_lio_odometry_process(args):
+            return False
+        return bool(
+            cls.SLAM_MAPPING_EXECUTABLE_RE.search(args)
+            or cls.SLAM_LAUNCH_PROCESS_RE.search(args)
+        )
 
     @staticmethod
     def _is_lio_odometry_process(args: str) -> bool:

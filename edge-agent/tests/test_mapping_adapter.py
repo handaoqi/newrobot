@@ -1113,6 +1113,49 @@ def test_lio_odometry_is_never_matched_when_ps_output_is_narrow(tmp_path, monkey
     assert "-ww" in seen_argv["argv"]
 
 
+def test_slam_process_scan_ignores_shell_that_only_mentions_mapping(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    shell_args = (
+        "/bin/bash -c python3 -m roamerx_edge.mapping_cli status; "
+        "pgrep -af '/robot_slam/lib/robot_slam/mapping'; "
+        "rg 'ros2 launch robot_slam'"
+    )
+
+    monkeypatch.setattr(
+        mapping_adapter_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"  57607 {shell_args}\n",
+        ),
+    )
+
+    assert adapter._find_slam_process_pids() == []
+
+
+def test_slam_process_scan_matches_mapping_binary_and_ros_launch(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    mapping_args = (
+        "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/mapping "
+        "--ros-args -r __node:=mapping"
+    )
+    launch_args = (
+        "/usr/bin/python3 /opt/ros/humble/bin/ros2 launch robot_slam "
+        "unified_mapping.launch.py"
+    )
+
+    monkeypatch.setattr(
+        mapping_adapter_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"  57608 {mapping_args}\n  57609 {launch_args}\n",
+        ),
+    )
+
+    assert adapter._find_slam_process_pids() == [57608, 57609]
+
+
 def _ready_to_save_adapter(tmp_path, monkeypatch):
     """An adapter parked one step before the export, with a healthy save_progress."""
     session = tmp_path / "20260828_120000_001"
