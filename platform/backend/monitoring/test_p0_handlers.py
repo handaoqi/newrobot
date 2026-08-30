@@ -395,7 +395,26 @@ class MessageHandlerTests(TestCase):
         handle_mqtt_message("robots/rx-001/telemetry/trajectory", duplicate)
         self.assertEqual(TrajectoryPoint.objects.count(), 2)
 
-    def test_alert_event_id_is_idempotent(self):
+    def test_bicycle_alert_event_id_is_idempotent(self):
+        event_id = str(uuid.uuid4())
+        payload = {
+            "event_id": event_id,
+            "event_type": "vehicle_illegal_parking",
+            "severity": "medium",
+            "occurred_at": timezone.now().isoformat(),
+            "task_execution_id": str(self.execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "pose": {"frame_id": "map", "x": 1.0, "y": 2.0, "yaw": 0.0},
+            "source": {"component": "bike_bot", "code": "BICYCLE_ALERT"},
+            "detection": {"label": "自行车违停", "class": "bicycle", "confidence": 0.9},
+            "attributes": {},
+        }
+        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
+        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
+        self.assertEqual(InspectionEvent.objects.filter(event_id=event_id).count(), 1)
+
+    def test_non_bicycle_edge_alert_is_not_registered_in_event_center(self):
         event_id = str(uuid.uuid4())
         payload = {
             "event_id": event_id,
@@ -407,11 +426,19 @@ class MessageHandlerTests(TestCase):
             "map_version": "v1",
             "pose": {"frame_id": "map", "x": 1.0, "y": 2.0, "yaw": 0.0},
             "source": {"component": "localization", "code": "LOCALIZATION_LOST"},
+            "detection": {"label": "定位丢失", "class": "localization_lost", "confidence": 1},
             "attributes": {},
         }
-        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
-        handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
-        self.assertEqual(InspectionEvent.objects.filter(event_id=event_id).count(), 1)
+
+        result = handle_mqtt_message(
+            "robots/rx-001/events/alert",
+            self.envelope("alert.event", payload),
+        )
+
+        self.assertFalse(result["created"])
+        self.assertFalse(result["registered"])
+        self.assertEqual(result["event_id"], event_id)
+        self.assertFalse(InspectionEvent.objects.filter(event_id=event_id).exists())
 
     @patch(
         "monitoring.message_handlers.tts_service.synthesize_speech",
@@ -476,6 +503,8 @@ class MessageHandlerTests(TestCase):
             )
 
             self.assertIs(result["automatic_docking"], False)
+            self.assertFalse(result["registered"])
+            self.assertFalse(InspectionEvent.objects.filter(event_id=event_id).exists())
 
         self.assertEqual(TaskExecution.objects.count(), execution_count)
         self.assertEqual(RemoteCommand.objects.count(), remote_command_count)
@@ -509,8 +538,7 @@ class MessageHandlerTests(TestCase):
         }
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
-        event = InspectionEvent.objects.get(event_id=event_id)
-        self.assertEqual(event.title, "建图定位已发散")
+        self.assertFalse(InspectionEvent.objects.filter(event_id=event_id).exists())
         commands = RobotCommand.objects.filter(payload__source="mapping_divergence_speech")
         self.assertEqual(commands.count(), 1)
         self.assertEqual(commands.get().payload["mapping_session_id"], "session-1")

@@ -8,6 +8,29 @@ from django.utils import timezone
 from ..models import InspectionEvent, MediaAsset, Robot, TaskExecution, TrajectoryPoint
 
 
+def is_bicycle_detection(detection: dict) -> bool:
+    """Keep the business event center scoped to bicycle alerts."""
+    values = {
+        str(detection.get(field) or "").strip().lower()
+        for field in ("object_class", "class", "type", "event_type", "label")
+    }
+    if values & {
+        "bicycle",
+        "bike",
+        "自行车",
+        "vehicle_illegal_parking",
+        "自行车违停",
+    }:
+        return True
+    return any("自行车" in value or "bicycle" in value for value in values)
+
+
+def is_bicycle_alert(payload: dict) -> bool:
+    detection = dict(payload.get("detection") or {})
+    detection.setdefault("event_type", payload.get("event_type"))
+    return is_bicycle_detection(detection)
+
+
 def _decimal(value):
     return Decimal(str(value)) if value is not None else None
 
@@ -15,7 +38,9 @@ def _decimal(value):
 class AlertService:
     @staticmethod
     @transaction.atomic
-    def ingest_edge_alert(robot: Robot, payload: dict) -> tuple[InspectionEvent, bool]:
+    def ingest_edge_alert(robot: Robot, payload: dict) -> tuple[InspectionEvent | None, bool]:
+        if not is_bicycle_alert(payload):
+            return None, False
         existing = InspectionEvent.objects.filter(event_id=payload["event_id"]).first()
         if existing:
             return existing, False

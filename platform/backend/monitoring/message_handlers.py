@@ -328,30 +328,34 @@ def _dispatch(
         return _handle_trajectory(envelope, robot, publish_response)
     if message_type == "alert.event":
         event, created = AlertService.ingest_edge_alert(robot, payload)
-        if created:
+        if created and event is not None:
             realtime_publisher.publish_alert(
                 {
                     "event": EventSerializer(event).data,
                     "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
                 }
             )
-            source_code = str((payload.get("source") or {}).get("code") or "")
-            if payload.get("event_type") == "slam_diverged" or source_code == "SLAM_DIVERGED":
-                _queue_mapping_divergence_speech(robot, payload)
-            if payload.get("event_type") in {
-                "low_battery_alert",
-                "low_battery_return_charge",
-            } or source_code in {"LOW_BATTERY_ALERT", "LOW_BATTERY_RETURN_CHARGE"}:
-                # Legacy Edge versions still publish `low_battery_return_charge`.
-                # Treat both formats as alert-only so no docking task or map
-                # activation command can be created from a battery warning.
-                _queue_low_battery_alert_speech(robot, payload)
-                return {
-                    "created": created,
-                    "event_id": str(event.event_id),
-                    "automatic_docking": False,
-                }
-        return {"created": created, "event_id": str(event.event_id)}
+        source_code = str((payload.get("source") or {}).get("code") or "")
+        if payload.get("event_type") == "slam_diverged" or source_code == "SLAM_DIVERGED":
+            _queue_mapping_divergence_speech(robot, payload)
+        if payload.get("event_type") in {
+            "low_battery_alert",
+            "low_battery_return_charge",
+        } or source_code in {"LOW_BATTERY_ALERT", "LOW_BATTERY_RETURN_CHARGE"}:
+            # System safety handling stays active even though non-bicycle
+            # alerts no longer create business event-center records.
+            _queue_low_battery_alert_speech(robot, payload)
+            return {
+                "created": created,
+                "registered": event is not None,
+                "event_id": str(event.event_id) if event else str(payload["event_id"]),
+                "automatic_docking": False,
+            }
+        return {
+            "created": created,
+            "registered": event is not None,
+            "event_id": str(event.event_id) if event else str(payload["event_id"]),
+        }
     if message_type == "sync.request":
         return _handle_sync(envelope, robot, publish_response)
     return {"ignored": True}

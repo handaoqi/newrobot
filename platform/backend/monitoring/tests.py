@@ -234,6 +234,43 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(RobotCommand.objects.filter(payload__source="vision_bicycle_auto").count(), 1)
         synthesize_speech.assert_called_once()
 
+    def test_telemetry_ingest_does_not_register_non_bicycle_detection(self):
+        self.authenticate()
+        robot = Robot.objects.first()
+        before_events = InspectionEvent.objects.count()
+        before_alerts = robot.today_alerts
+
+        response = self.client.post(
+            "/api/telemetry/ingest/",
+            {
+                "sequence_id": "test-non-bicycle-0001",
+                "robot_code": robot.code,
+                "robot_name": robot.name,
+                "reported_at": "2026-05-02T14:36:18+08:00",
+                "position": {"name": "太阳宫公园南入口"},
+                "motion": {"speed": 0, "heading": 0},
+                "power": {"battery_level": 78, "charging": False},
+                "network": {"signal_strength": 92, "network_type": "5G"},
+                "runtime": {"mode": "auto", "status": "online"},
+                "detections": [
+                    {
+                        "type": "fire_detected",
+                        "label": "烟火识别",
+                        "object_class": "fire",
+                        "confidence": 0.96,
+                        "risk_level": "high",
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(InspectionEvent.objects.count(), before_events)
+        self.assertEqual(response.data["audio_commands_queued"], [])
+        robot.refresh_from_db()
+        self.assertEqual(robot.today_alerts, before_alerts)
+
     def test_event_list_pagination_and_status_filter(self):
         self.authenticate()
         robot = Robot.objects.first()

@@ -58,7 +58,7 @@ from .models import (
 from .permissions import IsAudioDeviceCredential, IsAuthenticatedOrDeviceCredential
 from .map_loop_review import LoopReviewError, audit_map_package, normalize_thresholds
 from .realtime import event_broker, sse_stream
-from .services.alert_service import AlertService
+from .services.alert_service import AlertService, is_bicycle_detection
 from .services.command_service import CommandService
 from .services.docking_service import DockingDispatchError, dispatch_docking_task
 from .services.schedule_service import ScheduleService
@@ -123,17 +123,6 @@ def build_public_media_url(request, saved_path: str) -> str:
     media_path = f"{media_url.rstrip('/')}/{saved_path}"
     public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
     return f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
-
-
-def is_bicycle_detection(detection: dict) -> bool:
-    values = {
-        str(detection.get("object_class") or "").strip().lower(),
-        str(detection.get("type") or "").strip().lower(),
-        str(detection.get("label") or "").strip().lower(),
-    }
-    if values & {"bicycle", "bike", "自行车", "vehicle_illegal_parking", "自行车违停"}:
-        return True
-    return any("自行车" in value or "bicycle" in value for value in values)
 
 
 def queue_bicycle_departure_speech(request, robot: Robot, detection: dict, event: InspectionEvent):
@@ -1881,7 +1870,7 @@ class TelemetryIngestView(APIView):
         robot.camera_id = camera_id
         robot.stream_id = stream_id
         robot.play_urls = video.get("play_urls") or robot.play_urls
-        # The business event center is intentionally limited to bicycle alerts.
+        # Telemetry, like Edge alerts, registers only bicycle business events.
         bicycle_detections = [d for d in payload.get("detections", []) if is_bicycle_detection(d)]
         robot.today_alerts += len(bicycle_detections)
         robot.save()
