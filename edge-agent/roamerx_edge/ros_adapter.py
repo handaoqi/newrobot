@@ -1245,10 +1245,15 @@ class RosAdapter(Node):
                 math.pi,
             )
         ]
-        candidates.extend(
-            {"x": x + dx, "y": y + dy, "z": z, "yaw": normalize(yaw)}
-            for dx, dy in ((0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3))
-        )
+        # Expand the position search in bounded rings.  The first ring keeps
+        # the correction local; the outer rings recover a robot that stopped
+        # near, but not exactly on, the waypoint without allowing an unbounded
+        # pose jump.
+        for radius in (0.3, 0.6, 1.0):
+            candidates.extend(
+                {"x": x + dx * radius, "y": y + dy * radius, "z": z, "yaw": normalize(yaw)}
+                for dx, dy in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+            )
         return candidates
 
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool:
