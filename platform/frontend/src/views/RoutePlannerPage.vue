@@ -108,6 +108,7 @@ const waypointYawDrafts = ref([])
 const waypointYawErrors = ref([])
 const waypointYawConfirmed = ref([])
 const singleGoalIndex = ref(null)
+const selectedSingleGoalIndex = ref(0)
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   taskMapExecution.value,
   taskMapTrajectory.value,
@@ -2303,7 +2304,6 @@ async function handleDeleteRoute(route) {
                         {{ isWaypointExpanded(index) ? '收起' : '展开' }}
                       </button>
                       <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
-                      <button type="button" class="btn btn-sm" :disabled="!!navCommandBusy || !selectedMap" @click="executeSingleGoal(index)">{{ singleGoalIndex === index ? '下发中…' : '单点导航' }}</button>
                       <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
                     </div>
                     <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
@@ -2498,6 +2498,15 @@ async function handleDeleteRoute(route) {
             <p v-if="localizationSampleStale()" class="form-error">定位数据未持续更新，请检查导航/定位栈是否启动。</p>
             <p v-if="navError" class="form-error">{{ navError }}</p>
             <div class="nav-actions">
+              <label class="single-goal-selector">
+                <span>目标途经点</span>
+                <select v-model.number="selectedSingleGoalIndex" :disabled="!!navCommandBusy || waypoints.length === 0">
+                  <option v-for="(point, index) in waypoints" :key="index" :value="index">{{ waypointNames[index] || `点${index + 1}` }}（{{ waypointDisplayText(point) }}）</option>
+                </select>
+              </label>
+              <button class="btn btn-sm btn-primary" :disabled="!!navCommandBusy || !selectedMap || !selectedRobot || !waypoints.length || navStatus?.connection_status !== 'online'" @click="executeSingleGoal(selectedSingleGoalIndex)">
+                {{ navCommandBusy === 'single-goal' ? '单点导航下发中...' : '执行单点导航' }}
+              </button>
               <button class="btn btn-sm" :disabled="!!navCommandBusy" @click="refreshNavigationStatus">刷新状态</button>
               <button
                 class="btn btn-sm btn-primary"
