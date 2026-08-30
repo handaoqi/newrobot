@@ -64,10 +64,11 @@ COMMAND_TYPES = (
 
 
 class ProtocolError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
 
 def now_iso() -> str:

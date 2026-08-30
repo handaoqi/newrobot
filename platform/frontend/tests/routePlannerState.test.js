@@ -6,6 +6,7 @@ import {
   clampMapZoom,
   headingBetweenMapPoints,
   headingDegreesToRadians,
+  initialPoseCommandOutcome,
   normalizeHeadingDegrees,
   normalizeRoutePlannerTelemetry,
   normalizeRtkQuality,
@@ -78,6 +79,51 @@ test('two map points produce the same yaw convention used by initial pose', () =
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 2, y: 1 }), 0)
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1, y: 2 }), Number((Math.PI / 2).toFixed(5)))
   assert.equal(headingBetweenMapPoints({ x: 1, y: 1 }, { x: 1.01, y: 1.01 }), null)
+})
+
+test('initial pose command prefers the robot-confirmed localized pose', () => {
+  const outcome = initialPoseCommandOutcome({
+    result_payload: {
+      localized_pose: { x: 1.25, y: 2.5, z: 0.1, yaw: 0.45 },
+      best_ndt_committed: true,
+      best_ndt_candidate: {
+        matched_pose: { x: 1.2, y: 2.4, yaw: 0.4 },
+        matching_error: 0.12,
+        inlier_fraction: 0.82,
+      },
+    },
+  }, { x: 1, y: 2, yaw: 0.3 })
+
+  assert.deepEqual(outcome.pose, { x: 1.25, y: 2.5, z: 0.1, yaw: 0.45 })
+  assert.equal(outcome.bestNdtCommitted, true)
+  assert.equal(outcome.matchingError, 0.12)
+  assert.equal(outcome.inlierFraction, 0.82)
+})
+
+test('failed handoff still exposes the committed best NDT pose', () => {
+  const outcome = initialPoseCommandOutcome({
+    result_payload: {
+      best_ndt_committed: true,
+      handoff_pending: true,
+      best_ndt_candidate: {
+        matched_pose: { x: 3.1, y: -0.2, yaw: -0.5 },
+      },
+    },
+  }, { x: 3, y: 0, yaw: 0 })
+
+  assert.deepEqual(outcome.pose, { x: 3.1, y: -0.2, yaw: -0.5 })
+  assert.equal(outcome.handoffPending, true)
+})
+
+test('incomplete robot poses never turn null coordinates into a false map origin', () => {
+  const outcome = initialPoseCommandOutcome({
+    result_payload: {
+      localized_pose: { x: null, y: null, yaw: null },
+    },
+  }, { x: 4, y: 5, yaw: 0.6 })
+
+  assert.deepEqual(outcome.pose, { x: 4, y: 5, yaw: 0.6 })
+  assert.equal(outcome.localizedPose, null)
 })
 
 test('RTK quality aliases normalize to one route-planner enum', () => {

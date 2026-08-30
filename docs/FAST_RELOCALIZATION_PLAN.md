@@ -1,5 +1,18 @@
 # 快速重定位方案（Scan-Context 位置识别接入定位）
 
+实现进展（2026-08-30）：Edge Agent 的有界候选搜索现在会原子写入
+`relocalization_search_state.json`，记录搜索来源、种子、候选总数、每个候选的
+位姿/拒绝原因以及最终状态（running/committing_best/accepted/failed/superseded/
+handoff_failed）。该文件仅用于诊断和断电后
+恢复现场，不改变默认定位策略，也不发送运动指令。
+
+同日补充修复：人工 `nav.initial_pose` 和自动重定位已使用定位操作代次互斥；新人工
+请求会使旧搜索立即失效。Edge 订阅 `/localization/scan_match_pose`，把每个候选的绝对
+NDT 位姿与 score/inlier 关联起来；三帧验证通过后提交最优位姿并停止换候选，只等待
+FAST-LIO 接管。初始化匹配增加 1.50 m / 30° 种子偏差门，避免错误局部极值成为可信
+位姿。定位节点改为双线程执行器，FAST-LIO 接收使用独立回调组，避免 NDT/VGICP
+重计算阻塞造成 0.30 s freshness 假超时。
+
 状态：**已落码编译，默认关闭，未重启生效**。离线留一法评估（§6.1）已跑完并给出结论，回放（§6.3）与实机（§6.4）尚未进行——两者都需要另行征得拉起回放栈 / 重启定位栈的同意。`config.yaml` 的 `relocalization.use_scan_context` 默认 `false`，因此**在显式打开之前，现网行为逐字节不变**。
 
 本文档从 [定位丢失恢复与自愈方案](LOCALIZATION_SELF_HEALING_PLAN.md) 中拆出，只处理"丢失之后怎么快速找回来"，不重复自愈分级和告警链路。建图侧 Scan-Context 的产生过程见 [SLAM 采集与世界位姿计划](SLAM_DATA_CAPTURE_AND_WORLD_POSE_PLAN.md)，本方案是它的**运行时消费方**。
@@ -117,7 +130,9 @@ raw_points_ptr_ (0.15 m 体素降采样 + 4 cm 外参平移，仍等价于雷达
 | ring key 粗筛 | 95 × 20 | 可忽略 |
 | 移位搜索 | 15 候选 × 60 移位 × 1200 元素 ≈ 1.1×10⁶ 次绝对差 | ~1–3 ms |
 
-`localization_nodelet.cpp:3644` 是 `rclcpp::spin(node)`——**单线程执行器**，回调超 80 ms 已有告警。3 ms 完全在预算内。
+定位节点现使用双线程执行器，FAST-LIO 接收位于独立 callback group；NDT/VGICP 与
+LIO 接收不会再互相阻塞。Scan-Context 查询本身仍应保持约 3 ms 的预算，避免挤占
+点云处理链路。
 
 对比：现有 `performGlobalLocalization` 要对 12 MB 全局地图跑两遍 30 迭代 ICP，那才是真正阻塞回调的部分。**本方案不新增任何重量级在线计算，反而把昂贵的 ICP 从"唯一手段"降级为"验证手段"。**
 

@@ -94,6 +94,38 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(self.command.status, "succeeded")
         self.assertEqual(self.execution.state, "completed")
 
+    def test_sync_reconciles_edge_terminal_state_and_releases_robot(self):
+        result = handle_mqtt_message(
+            "robots/rx-001/sync/state",
+            self.envelope(
+                "sync.request",
+                {
+                    "current_task_execution_id": str(self.execution.id),
+                    "local_task_state": "failed",
+                    "local_task_state_version": 4,
+                    "last_processed_command_id": str(self.command.id),
+                    "last_trajectory_seq": -1,
+                    "outbox_pending": 3056,
+                },
+            ),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, "failed")
+        self.assertEqual(self.execution.state_version, 4)
+        self.assertEqual(self.execution.failure_code, "EDGE_SYNC_TERMINAL")
+        self.assertEqual(result["action"], "report_only")
+        self.assertIs(result["terminal_reconciled"], True)
+        self.assertFalse(
+            TaskExecution.objects.filter(
+                robot=self.robot,
+                state__in=TaskExecution.ACTIVE_STATES,
+            ).exists()
+        )
+        event = TaskExecutionEvent.objects.get(event_type="task.sync_terminal_reconciled")
+        self.assertEqual(event.payload["previous_cloud_state"], "dispatching")
+        self.assertEqual(event.payload["outbox_pending"], 3056)
+
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(
             self.execution,

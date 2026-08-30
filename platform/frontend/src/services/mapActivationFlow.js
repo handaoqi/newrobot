@@ -40,13 +40,17 @@ export async function waitForRobotCommand(robotId, command, {
     throw new Error('等待机器狗确认命令超时')
   }
   if (latest.status !== 'succeeded') {
-    throw new Error(
+    const error = new Error(
       latest.error_message
       || latest.ack_reason_message
       || latest.error_code
       || latest.ack_reason_code
       || `机器狗命令执行失败：${latest.status}`,
     )
+    // Preserve the terminal payload for callers that need to display a
+    // committed NDT candidate even when the final LIO handoff failed.
+    error.command = latest
+    throw error
   }
   onProgress(latest)
   return latest

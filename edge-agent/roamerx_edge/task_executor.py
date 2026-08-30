@@ -436,7 +436,7 @@ class TaskExecutor:
     def current_localization_waypoint(self) -> dict | None:
         """Return the pending waypoint as a localization seed, if a task exists."""
         with self._lock:
-            if not self.context:
+            if not self.context or self.context.state in self.TERMINAL_STATES:
                 return None
             points = self.context.route_snapshot.get("waypoints") or []
             index = int(self.context.current_waypoint_index)
@@ -780,6 +780,23 @@ class TaskExecutor:
         relocalize = getattr(self.navigation, "active_relocalize", None)
         seen = set()
         if callable(relocalize):
+            trusted_pose_getter = getattr(self.navigation, "latest_trusted_pose", None)
+            trusted_pose = trusted_pose_getter() if callable(trusted_pose_getter) else None
+            if not trusted_pose:
+                map_info = dict(self.context.route_snapshot.get("map") or {})
+                trusted_pose = self.store.load_last_trusted_pose(
+                    str(map_info.get("map_id") or ""),
+                    str(map_info.get("map_version") or ""),
+                )
+            if trusted_pose:
+                trusted_seed = dict(trusted_pose)
+                trusted_seed.update({"max_attempts": 12, "source": "startup_trusted"})
+                try:
+                    LOGGER.info("startup localization using last trusted pose")
+                    relocalize(trusted_seed)
+                    return
+                except Exception as exc:
+                    LOGGER.warning("startup trusted-pose localization failed: %s", exc)
             for candidate_index in candidate_indexes:
                 if candidate_index < 0 or candidate_index >= len(points):
                     continue

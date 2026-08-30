@@ -132,6 +132,9 @@ MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "roamerx-platform-worker")
 MQTT_KEEPALIVE_SECONDS = int(os.getenv("MQTT_KEEPALIVE_SECONDS", "20"))
 DEVICE_OFFLINE_TIMEOUT_SECONDS = int(os.getenv("DEVICE_OFFLINE_TIMEOUT_SECONDS", "30"))
 COMMAND_ACK_TIMEOUT_SECONDS = int(os.getenv("COMMAND_ACK_TIMEOUT_SECONDS", "5"))
+# task.start remains valid for the whole patrol, but delivery acknowledgement
+# must arrive promptly or the active execution blocks every later loop round.
+TASK_START_ACK_TIMEOUT_SECONDS = int(os.getenv("TASK_START_ACK_TIMEOUT_SECONDS", "60"))
 COMMAND_RESULT_TIMEOUT_SECONDS = int(os.getenv("COMMAND_RESULT_TIMEOUT_SECONDS", "1800"))
 COMMAND_START_EXPIRY_SECONDS = int(os.getenv("COMMAND_START_EXPIRY_SECONDS", "30"))
 COMMAND_CONTROL_EXPIRY_SECONDS = int(os.getenv("COMMAND_CONTROL_EXPIRY_SECONDS", "15"))

@@ -40,7 +40,10 @@ LOGGER = logging.getLogger(__name__)
 class EdgeAgentApplication:
     def __init__(self, config: EdgeConfig, navigation=None, config_path: str = "config.yaml") -> None:
         self.config = config
-        self.store = LocalStore(config.storage.sqlite_path)
+        self.store = LocalStore(
+            config.storage.sqlite_path,
+            trajectory_outbox_limit=config.storage.trajectory_outbox_limit,
+        )
         self.stop_event = threading.Event()
         self.safety_state = RuntimeSafetyState(
             control_mode="autonomous",
@@ -807,11 +810,9 @@ class EdgeAgentApplication:
                 LOGGER.exception("auto relocalize could not zero cmd_vel")
 
     def _localization_recovery_seed(self) -> dict | None:
-        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
-        waypoint = waypoint_getter() if callable(waypoint_getter) else None
-        if waypoint and waypoint.get("waypoint_index") is not None and waypoint.get("x") is not None and waypoint.get("y") is not None:
-            LOGGER.info("localization seed: current waypoint index=%s round=%s", waypoint.get("waypoint_index"), waypoint.get("round_number"))
-            return {"x": float(waypoint["x"]), "y": float(waypoint["y"]), "z": float(waypoint.get("z", 0.0) or 0.0), "yaw": float(waypoint.get("yaw", 0.0) or 0.0), "source": "current_waypoint"}
+        # A recently verified pose is a substantially safer first recovery seed
+        # than the pending waypoint. Route yaw is often unset (0) and a loop
+        # round can start at the route end, far from the robot's true heading.
         pose = self.navigation.latest_trusted_pose()
         if not pose:
             pose = self.store.load_last_trusted_pose(
@@ -822,6 +823,11 @@ class EdgeAgentApplication:
             seed = dict(pose)
             seed.setdefault("source", "last_trusted")
             return seed
+        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
+        waypoint = waypoint_getter() if callable(waypoint_getter) else None
+        if waypoint and waypoint.get("waypoint_index") is not None and waypoint.get("x") is not None and waypoint.get("y") is not None:
+            LOGGER.info("localization seed fallback: current waypoint index=%s round=%s", waypoint.get("waypoint_index"), waypoint.get("round_number"))
+            return {"x": float(waypoint["x"]), "y": float(waypoint["y"]), "z": float(waypoint.get("z", 0.0) or 0.0), "yaw": float(waypoint.get("yaw", 0.0) or 0.0), "source": "current_waypoint"}
         latest_getter = getattr(self.navigation, "latest_pose", None)
         latest = latest_getter() if callable(latest_getter) else None
         if latest is None:
@@ -865,9 +871,20 @@ class EdgeAgentApplication:
             while first_cycle or self.task_executor.is_paused_for_localization():
                 first_cycle = False
                 cycle += 1
+                primary_seed = self._localization_recovery_seed()
                 waypoint_seeds = self._localization_waypoint_seeds()
-                fallback_seed = None if waypoint_seeds else self._localization_recovery_seed()
-                seeds = waypoint_seeds or ([fallback_seed] if fallback_seed else [])
+                seeds = []
+                seen_seeds = set()
+                for seed in ([primary_seed] if primary_seed else []) + waypoint_seeds:
+                    key = (
+                        round(float(seed["x"]), 3),
+                        round(float(seed["y"]), 3),
+                        round(float(seed.get("yaw", 0.0)), 3),
+                    )
+                    if key in seen_seeds:
+                        continue
+                    seen_seeds.add(key)
+                    seeds.append(seed)
                 if not seeds:
                     LOGGER.error(
                         "localization recovery has no trusted pose; retrying in %.1fs",
@@ -890,6 +907,22 @@ class EdgeAgentApplication:
                             LOGGER.info("active relocalize accepted on cycle %d waypoint=%s", cycle, seed.get("waypoint_index"))
                             return
                         except Exception as exc:
+                            error_code = getattr(exc, "code", "")
+                            if error_code == "RELOCALIZATION_SUPERSEDED":
+                                LOGGER.info(
+                                    "automatic relocalization was superseded by a newer localization request"
+                                )
+                                return
+                            if error_code == "RELOCALIZATION_HANDOFF_FAILED":
+                                # NDT has already produced and committed a
+                                # verified map pose. Trying another waypoint
+                                # here would overwrite that optimum while LIO
+                                # is still taking ownership.
+                                LOGGER.error(
+                                    "best NDT pose committed but LIO handoff failed; "
+                                    "keeping the robot stopped at the committed pose"
+                                )
+                                return
                             LOGGER.warning("active relocalize cycle %d waypoint=%s failed: %s", cycle, seed.get("waypoint_index"), exc)
                     if cycle == 1:
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)

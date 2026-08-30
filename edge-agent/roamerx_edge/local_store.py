@@ -8,8 +8,9 @@ from typing import Any
 
 
 class LocalStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, trajectory_outbox_limit: int = 720) -> None:
         self.path = path
+        self.trajectory_outbox_limit = max(1, int(trajectory_outbox_limit))
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(path, check_same_thread=False)
@@ -67,6 +68,22 @@ class LocalStore:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN record_rosbag INTEGER NOT NULL DEFAULT 0"
                 )
+            self._prune_trajectory_outbox_locked()
+
+    def _prune_trajectory_outbox_locked(self) -> None:
+        self._connection.execute(
+            """
+            DELETE FROM outbox
+            WHERE message_type = 'trajectory.batch'
+              AND id NOT IN (
+                  SELECT id FROM outbox
+                  WHERE message_type = 'trajectory.batch'
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (self.trajectory_outbox_limit,),
+        )
 
     def get_processed_command(self, command_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(
@@ -94,8 +111,14 @@ class LocalStore:
     def save_command_result(self, command_id: str, result: dict) -> None:
         with self._lock, self._connection:
             self._connection.execute(
-                "UPDATE processed_commands SET result_json=?, updated_at=CURRENT_TIMESTAMP WHERE command_id=?",
-                (json.dumps(result, ensure_ascii=False), command_id),
+                """
+                INSERT INTO processed_commands(command_id, ack_json, result_json)
+                VALUES (?, 'null', ?)
+                ON CONFLICT(command_id) DO UPDATE SET
+                    result_json=excluded.result_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (command_id, json.dumps(result, ensure_ascii=False)),
             )
 
     def save_task_context(self, context: dict) -> None:
@@ -162,9 +185,18 @@ class LocalStore:
                 """,
                 (topic, qos, int(retain), payload["message_type"], dedupe_key, json.dumps(payload, ensure_ascii=False)),
             )
+            if payload["message_type"] == "trajectory.batch":
+                self._prune_trajectory_outbox_locked()
 
     def list_pending_outbox(self, limit: int = 100) -> list[dict]:
-        rows = self._connection.execute("SELECT * FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM outbox
+            ORDER BY CASE WHEN message_type = 'trajectory.batch' THEN 1 ELSE 0 END, id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
         return [
             {
                 "id": row["id"],

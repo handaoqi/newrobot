@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.db import OperationalError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 import uuid
@@ -21,6 +21,7 @@ from .services.command_service import CommandService
 from .services.docking_service import dispatch_docking_task
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
+from .management.commands.run_device_worker import Command as DeviceWorkerCommand
 
 
 class TaskExecutionTests(TestCase):
@@ -124,6 +125,22 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(command.events.get().event_type, "created")
         execution.refresh_from_db()
         self.assertEqual(execution.state, "dispatching")
+
+    @override_settings(TASK_START_ACK_TIMEOUT_SECONDS=60)
+    def test_unacknowledged_task_start_times_out_before_task_duration(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        command = CommandService.create(execution, "task.start", self.user)
+        RemoteCommand.objects.filter(pk=command.pk).update(
+            status="published",
+            issued_at=timezone.now() - timezone.timedelta(seconds=61),
+        )
+
+        DeviceWorkerCommand._expire_commands()
+
+        command.refresh_from_db()
+        execution.refresh_from_db()
+        self.assertEqual(command.status, "timed_out")
+        self.assertEqual(execution.state, "timed_out")
 
     def test_low_battery_docking_episode_creates_exactly_one_return_task(self):
         self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]

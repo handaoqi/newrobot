@@ -67,6 +67,7 @@ obstacle_speech:
 
 storage:
   sqlite_path: "/var/lib/roamerx-edge/edge.db"
+  trajectory_outbox_limit: 720
 
 media:
   upload_url: "https://center.example.com/api/device/media/upload/"

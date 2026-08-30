@@ -461,6 +461,10 @@ public:
       0.01, declare_parameter<double>("init_match_stable_xy_m", 0.10)));
     init_match_stable_yaw_rad_ = static_cast<float>(std::max(
       0.1, declare_parameter<double>("init_match_stable_yaw_deg", 2.0)) * M_PI / 180.0);
+    init_match_max_seed_xy_m_ = static_cast<float>(std::max(
+      0.10, declare_parameter<double>("init_match_max_seed_xy_m", 1.50)));
+    init_match_max_seed_yaw_rad_ = static_cast<float>(std::max(
+      1.0, declare_parameter<double>("init_match_max_seed_yaw_deg", 30.0)) * M_PI / 180.0);
     
     // Global localization parameters
     declare_parameter<bool>("use_global_localization_init", true);
@@ -658,9 +662,18 @@ public:
         get_logger(), "Controller odometry disabled for localization and Nav2 pose chains");
     }
     if (enable_lio_primary_) {
+      // NDT/VGICP can occupy the point-cloud callback for longer than the
+      // 300 ms LIO freshness gate during recovery. Keep LIO reception in a
+      // separate callback group so a heavy registration cannot make a healthy
+      // 10 Hz odometry stream look stale.
+      lio_callback_group_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+      rclcpp::SubscriptionOptions lio_options;
+      lio_options.callback_group = lio_callback_group_;
       lio_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         lio_odom_topic_, rclcpp::SensorDataQoS(),
-        std::bind(&HdlLocalizationNode::lio_odom_callback, this, std::placeholders::_1));
+        std::bind(&HdlLocalizationNode::lio_odom_callback, this, std::placeholders::_1),
+        lio_options);
       RCLCPP_INFO(
         get_logger(),
         "FAST-LIO-only continuous source enabled: topic=%s max_age=%.2fs drift_xy=%.2fm "
@@ -837,12 +850,15 @@ private:
   float init_match_min_inlier_fraction_ = 0.50f;
   float init_match_stable_xy_m_ = 0.10f;
   float init_match_stable_yaw_rad_ = 2.0f * M_PI / 180.0f;
+  float init_match_max_seed_xy_m_ = 1.50f;
+  float init_match_max_seed_yaw_rad_ = 30.0f * M_PI / 180.0f;
   bool has_previous_init_match_pose_ = false;
   Eigen::Vector2f previous_init_match_xy_ = Eigen::Vector2f::Zero();
   float previous_init_match_yaw_ = 0.0f;
   float initialization_seed_yaw_ = 0.0f;
   float initialization_match_yaw_ = 0.0f;
   float initialization_yaw_correction_rad_ = 0.0f;
+  float initialization_position_correction_m_ = 0.0f;
   bool initialization_verified_ = false;
   std::string initialization_state_ = "uninitialized";
 
@@ -899,6 +915,7 @@ private:
     initialization_seed_yaw_ = yawFromRotation(last_init_quat_.toRotationMatrix());
     initialization_match_yaw_ = initialization_seed_yaw_;
     initialization_yaw_correction_rad_ = 0.0f;
+    initialization_position_correction_m_ = 0.0f;
   }
 
   /**
@@ -2398,6 +2415,11 @@ private:
         << ",\"seed_yaw_deg\":" << initialization_seed_yaw_ * 180.0 / M_PI
         << ",\"matched_yaw_deg\":" << initialization_match_yaw_ * 180.0 / M_PI
         << ",\"yaw_correction_deg\":" << initialization_yaw_correction_rad_ * 180.0 / M_PI
+        << ",\"position_correction_m\":" << initialization_position_correction_m_
+        << ",\"within_seed_gate\":"
+        << ((initialization_position_correction_m_ <= init_match_max_seed_xy_m_ &&
+             std::fabs(initialization_yaw_correction_rad_) <= init_match_max_seed_yaw_rad_)
+          ? "true" : "false")
         << "}"
         << ",\"global_relocalization\":{\"mode\":\"" << scan_context_effective_runtime_mode_
         << "\",\"state\":\"" << global_relocalization_state_
@@ -3196,6 +3218,11 @@ private:
       initialization_match_yaw_ = yawFromRotation(init_result.transform_.block<3, 3>(0, 0));
       initialization_yaw_correction_rad_ = yawDifference(
         initialization_match_yaw_, initialization_seed_yaw_);
+      initialization_position_correction_m_ =
+        (init_match_xy - last_init_pos_.head<2>()).norm();
+      const bool seed_correction_ok =
+        initialization_position_correction_m_ <= init_match_max_seed_xy_m_ &&
+        std::fabs(initialization_yaw_correction_rad_) <= init_match_max_seed_yaw_rad_;
       const bool pose_stable = !has_previous_init_match_pose_ ||
         ((init_match_xy - previous_init_match_xy_).norm() <= init_match_stable_xy_m_ &&
          std::fabs(yawDifference(initialization_match_yaw_, previous_init_match_yaw_)) <=
@@ -3203,7 +3230,8 @@ private:
       const bool global_seed_ready = !global_search_required_ || global_candidate_applied_;
       const bool quality_ok = init_result.is_converged_ && init_result.transform_.allFinite() &&
         init_result.fitness_score_ < init_match_score_threshold_ &&
-        last_ndt_inlier_fraction_ >= init_match_min_inlier_fraction_ && global_seed_ready;
+        last_ndt_inlier_fraction_ >= init_match_min_inlier_fraction_ && global_seed_ready &&
+        seed_correction_ok;
       if (quality_ok && pose_stable) {
         init_match_count_++;
         initialization_state_ = "validating";
@@ -3230,9 +3258,13 @@ private:
         init_match_count_ = quality_ok ? 1 : 0;
         initialization_state_ = global_seed_ready ? "validating" : "global_search_required";
         RCLCPP_INFO(get_logger(),
-          "Init match rejected: quality=%s stable=%s global_seed_ready=%s score=%.3f inlier=%.3f",
+          "Init match rejected: quality=%s stable=%s global_seed_ready=%s seed_gate=%s "
+          "correction_xy=%.2f/%.2fm correction_yaw=%.1f/%.1fdeg score=%.3f inlier=%.3f",
           quality_ok ? "true" : "false", pose_stable ? "true" : "false",
-          global_seed_ready ? "true" : "false", init_result.fitness_score_,
+          global_seed_ready ? "true" : "false", seed_correction_ok ? "true" : "false",
+          initialization_position_correction_m_, init_match_max_seed_xy_m_,
+          initialization_yaw_correction_rad_ * 180.0 / M_PI,
+          init_match_max_seed_yaw_rad_ * 180.0 / M_PI, init_result.fitness_score_,
           last_ndt_inlier_fraction_);
       }
       if (quality_ok) {
@@ -3630,6 +3662,16 @@ private:
         pose_changed = true;
         RCLCPP_INFO(get_logger(), "Pose change detected - Position: %.3f m, Orientation: %.3f", pos_change, quat_change);
       }
+    }
+    if (!pose_changed && localization_state_ != 3) {
+      // An operator may deliberately retry the same map pose after a failed
+      // LIO handoff. Treat it as a new acquisition while localization is not
+      // normal; silently ignoring it leaves Edge waiting on stale state.
+      pose_changed = true;
+      RCLCPP_INFO(
+        get_logger(),
+        "Initial pose unchanged but localization state=%d; restarting verification",
+        localization_state_);
     }
     
     if (pose_changed) {
@@ -5229,6 +5271,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               lidar_odom_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            robot_odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            lio_odom_sub_;
+  rclcpp::CallbackGroup::SharedPtr                                    lio_callback_group_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         aligned_pub;
   rclcpp::Publisher<localization::msg::ScanMatchingStatus>::SharedPtr status_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr scan_match_pose_pub_;
@@ -5602,7 +5645,9 @@ int main(int argc, char** argv) {
   omp_set_num_threads(6);
   rclcpp::init(argc, argv);
   auto node = std::make_shared<localization::HdlLocalizationNode>(rclcpp::NodeOptions());
-  rclcpp::spin(node);
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

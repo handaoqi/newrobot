@@ -39,6 +39,10 @@ import {
   renewGuardDutyLoopLease,
 } from '../utils/guardDutyLoopLease'
 import {
+  clearGuardDutyLoopExecution,
+  guardDutyLoopCleanupExecutionId,
+} from '../utils/guardDutyLoopStop'
+import {
   activeGuardDutyTarget,
   guardDutyExecutionWaypointPlan,
   guardDutyRouteState,
@@ -770,16 +774,40 @@ function finishLoop(message, { notify = true } = {}) {
   if (notify) showToast(message)
 }
 
-function stopLoop({ notify = true } = {}) {
-  if (!loopActive.value) return
+async function stopLoop({ notify = true, clearExecution = true } = {}) {
+  if (!loopActive.value) return null
+  const executionId = guardDutyLoopCleanupExecutionId(loopCurrentExecutionId.value, execution.value)
+  const shouldClearExecution = clearExecution && Boolean(executionId)
   loopActive.value = false
   loopState.value = 'stopped'
   loopStoppedAt.value = Date.now()
   loopRestUntil.value = 0
-  loopMessage.value = isRunning.value ? '循环已停止，当前轮次继续执行' : '循环已停止'
+  loopMessage.value = shouldClearExecution ? '正在停止循环并清理当前任务' : '循环已停止'
   persistLoopState()
-  releaseLoopOwnership()
-  if (notify) showToast(loopMessage.value)
+  if (!shouldClearExecution) {
+    releaseLoopOwnership()
+    if (notify) showToast(loopMessage.value)
+    return null
+  }
+
+  busy.value = true
+  try {
+    execution.value = await clearGuardDutyLoopExecution(sendTaskExecutionAction, executionId)
+    loopCurrentExecutionId.value = ''
+    loopMessage.value = '循环和当前任务已停止，任务状态已清理'
+    persistLoopState()
+    startExecutionPolling()
+    if (notify) showToast(loopMessage.value, { variant: 'alert' })
+    return execution.value
+  } catch (error) {
+    loopMessage.value = `循环已停止，但任务状态清理失败：${error.message || '请点击强制退出重试'}`
+    persistLoopState()
+    if (notify) showToast(loopMessage.value, { variant: 'alert' })
+    return null
+  } finally {
+    busy.value = false
+    releaseLoopOwnership()
+  }
 }
 
 async function launchTask({ fromLoop = false } = {}) {
@@ -902,7 +930,7 @@ async function runLoopCycle() {
 async function toggleLoop() {
   if (loopActive.value) {
     if (!loopLeaseOwned && !acquireLoopOwnership({ notify: true })) return
-    stopLoop()
+    await stopLoop()
     return
   }
   if (!presetTask.value || isRunning.value || busy.value || localizationBusy.value) return
@@ -953,7 +981,7 @@ async function controlTask() {
 async function forceExitTask() {
   if (!execution.value?.id || busy.value) return
   if (!window.confirm('强制退出会停止当前导航，并清理该机器人的全部未结束任务。确认继续？')) return
-  stopLoop({ notify: false })
+  await stopLoop({ notify: false, clearExecution: false })
   busy.value = true
   try {
     execution.value = await sendTaskExecutionAction(execution.value.id, 'force-exit')

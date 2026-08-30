@@ -2,7 +2,10 @@ import math
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from roamerx_edge.config import SafetyConfig
+from roamerx_edge.protocol import ProtocolError
 from roamerx_edge.ros_adapter import RosAdapter, follow_path_patrol_params
 
 
@@ -73,6 +76,144 @@ def test_relocalization_candidates_cover_full_yaw_and_nearby_positions():
     positions = {(candidate["x"], candidate["y"]) for candidate in candidates[8:]}
     for radius in (0.3, 0.6, 1.0):
         assert {(4.0 + radius, 5.0), (4.0 - radius, 5.0), (4.0, 5.0 + radius), (4.0, 5.0 - radius)} <= positions
+
+
+def test_new_localization_operation_supersedes_previous_search():
+    adapter = object.__new__(RosAdapter)
+    adapter._localization_operation_lock = threading.Lock()
+    adapter._localization_operation_generation = 0
+
+    old_generation = adapter._start_localization_operation("automatic")
+    new_generation = adapter._start_localization_operation("operator")
+
+    with pytest.raises(ProtocolError) as exc:
+        adapter._assert_localization_operation(old_generation)
+    assert exc.value.code == "RELOCALIZATION_SUPERSEDED"
+    adapter._assert_localization_operation(new_generation)
+
+
+def test_best_ndt_candidate_uses_verified_streak_and_seed_gate():
+    adapter = object.__new__(RosAdapter)
+    adapter._scan_match_condition = threading.Condition()
+    adapter._scan_match_records = {
+        (1, 0): {
+            "sequence": 1,
+            "has_converged": True,
+            "matching_error": 0.05,
+            "inlier_fraction": 0.90,
+            "matched_pose": {"x": 4.0, "y": 0.0, "z": 0.0, "yaw": 1.2},
+        },
+        (2, 0): {
+            "sequence": 2,
+            "has_converged": True,
+            "matching_error": 0.20,
+            "inlier_fraction": 0.70,
+            "matched_pose": {"x": 0.20, "y": 0.0, "z": 0.0, "yaw": 0.10},
+        },
+        (3, 0): {
+            "sequence": 3,
+            "has_converged": True,
+            "matching_error": 0.18,
+            "inlier_fraction": 0.72,
+            "matched_pose": {"x": 0.21, "y": 0.0, "z": 0.0, "yaw": 0.11},
+        },
+        (4, 0): {
+            "sequence": 4,
+            "has_converged": True,
+            "matching_error": 0.19,
+            "inlier_fraction": 0.71,
+            "matched_pose": {"x": 0.19, "y": 0.0, "z": 0.0, "yaw": 0.09},
+        },
+    }
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.5)
+    adapter.telemetry = FakeTelemetry({
+        "initialization": {
+            "verified": True,
+            "stable_frames": 3,
+            "required_stable_frames": 3,
+        }
+    })
+
+    result = adapter._best_ndt_candidate(0, {"x": 0.0, "y": 0.0, "yaw": 0.0})
+
+    assert result["matched_pose"]["x"] == 0.21
+    assert result["matching_error"] == 0.18
+    assert result["eligible"] is True
+
+
+def test_active_relocalize_commits_verified_ndt_instead_of_advancing_candidate():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 7
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    localized = SimpleNamespace(x=0.2, y=0.1, z=0.0, yaw=0.3)
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: localized)
+    calls = []
+    candidate = {
+        "eligible": True,
+        "verified": True,
+        "matched_pose": {"x": 0.2, "y": 0.1, "z": 0.0, "yaw": 0.3},
+        "matching_error": 0.12,
+        "inlier_fraction": 0.8,
+    }
+
+    def set_once(pose, generation):
+        calls.append((dict(pose), generation))
+        if len(calls) == 1:
+            raise ProtocolError(
+                "INITIAL_POSE_NOT_ACCEPTED",
+                "handoff pending",
+                details={"best_ndt_candidate": candidate},
+            )
+        return {
+            "localized_pose": {"x": 0.2, "y": 0.1, "yaw": 0.3},
+            "localization_status": "normal",
+        }
+
+    adapter._set_initial_pose_once = set_once
+
+    result = adapter.active_relocalize({"x": 0.0, "y": 0.0, "yaw": 0.0, "max_attempts": 12})
+
+    assert len(calls) == 2
+    assert calls[1][0]["x"] == 0.2
+    assert calls[1][0]["yaw"] == 0.3
+    assert result["best_ndt_committed"] is True
+
+
+def test_operator_initial_pose_commits_verified_ndt_match():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 9
+    calls = []
+    candidate = {
+        "eligible": True,
+        "verified": True,
+        "matched_pose": {"x": 1.2, "y": 2.1, "z": 0.0, "yaw": 0.4},
+        "matching_error": 0.10,
+        "inlier_fraction": 0.85,
+    }
+
+    def set_once(pose, generation):
+        calls.append((dict(pose), generation))
+        if len(calls) == 1:
+            raise ProtocolError(
+                "INITIAL_POSE_NOT_ACCEPTED",
+                "lio handoff pending",
+                details={"best_ndt_candidate": candidate},
+            )
+        return {
+            "localized_pose": {"x": 1.2, "y": 2.1, "yaw": 0.4},
+            "localization_status": "normal",
+        }
+
+    adapter._set_initial_pose_once = set_once
+
+    result = adapter.set_initial_pose({"x": 1.0, "y": 2.0, "yaw": 0.3})
+
+    assert len(calls) == 2
+    assert calls[1][0]["x"] == 1.2
+    assert calls[1][0]["y"] == 2.1
+    assert result["best_ndt_committed"] is True
 
 
 def test_ndt_score_over_threshold_triggers_recovery_after_hysteresis():

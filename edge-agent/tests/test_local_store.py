@@ -32,6 +32,18 @@ def test_trajectory_sequence_persists(tmp_path):
     store.close()
 
 
+def test_command_result_is_persisted_even_when_ack_was_not_saved(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    result = {"message_type": "command.result", "payload": {"status": "failed"}}
+
+    store.save_command_result("cmd-before-ack", result)
+
+    saved = store.get_processed_command("cmd-before-ack")
+    assert saved["ack"] is None
+    assert saved["result"] == result
+    store.close()
+
+
 def test_last_trusted_pose_is_scoped_by_map(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     pose = {"x": 12.5, "y": -3.0, "yaw": 0.7, "source": "test"}
@@ -40,3 +52,39 @@ def test_last_trusted_pose_is_scoped_by_map(tmp_path):
     assert store.load_last_trusted_pose("92", "v1") == pose
     assert store.load_last_trusted_pose("92", "v2") is None
     store.close()
+
+
+def test_outbox_prioritizes_control_events_ahead_of_trajectory(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    for index in range(3):
+        store.enqueue_outbox(
+            "trajectory",
+            {"message_type": "trajectory.batch", "payload": {"batch_id": f"batch-{index}"}},
+            dedupe_key=f"batch-{index}",
+        )
+    store.enqueue_outbox("task", {"message_type": "task.failed", "payload": {}})
+
+    pending = store.list_pending_outbox(limit=1)
+
+    assert pending[0]["payload"]["message_type"] == "task.failed"
+    store.close()
+
+
+def test_trajectory_outbox_is_bounded_and_pruned_again_on_restart(tmp_path):
+    path = tmp_path / "edge.db"
+    store = LocalStore(str(path), trajectory_outbox_limit=4)
+    for index in range(6):
+        store.enqueue_outbox(
+            "trajectory",
+            {"message_type": "trajectory.batch", "payload": {"batch_id": f"batch-{index}"}},
+            dedupe_key=f"batch-{index}",
+        )
+    assert store.outbox_count() == 4
+    store.close()
+
+    restarted = LocalStore(str(path), trajectory_outbox_limit=2)
+    pending = restarted.list_pending_outbox()
+
+    assert restarted.outbox_count() == 2
+    assert [row["dedupe_key"] for row in pending] == ["batch-4", "batch-5"]
+    restarted.close()

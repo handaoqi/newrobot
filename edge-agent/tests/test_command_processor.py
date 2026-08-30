@@ -226,6 +226,48 @@ def test_task_start_waits_then_accepts_fresh_normal_localization(tmp_path, monke
     store.close()
 
 
+def test_task_start_persists_ack_before_smart_initialization(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    command_id = raw["payload"]["command_id"]
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    ack_seen_during_initialization = []
+
+    def initialize():
+        saved = store.get_processed_command(command_id)
+        ack_seen_during_initialization.append(saved["ack"]["payload"]["ack"])
+
+    executor.initialize_before_navigation = initialize
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=time.monotonic() - 10.0,
+        nav_ready=True,
+        control_mode="autonomous",
+        current_map_id="site-a-main",
+        current_map_version="v1",
+    )
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+    )
+
+    ack, _ = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert ack_seen_during_initialization == ["accepted"]
+    store.close()
+
+
 def test_task_start_repairs_nav_stack_only_when_not_ready(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -490,6 +532,7 @@ def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
     )
     _, result = processor.handle_command(raw)
     assert navigation.initial_pose["x"] == 1.0
+    assert navigation.initial_pose["require_absolute"] is True
     assert result["payload"]["status"] == "succeeded"
     assert results[0]["payload"]["result"]["topic"] == "/initialpose"
     store.close()

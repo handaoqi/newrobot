@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -132,6 +133,16 @@ class RosAdapter(Node):
         self._localization_sample_condition = threading.Condition()
         self._localization_sample_sequence = 0
         self._localization_status_samples = deque(maxlen=100)
+        # A localization operation owns a monotonically increasing generation.
+        # Starting an operator request invalidates an older automatic search so
+        # the old worker can no longer overwrite the newly selected pose while
+        # it is being verified.
+        self._localization_operation_lock = threading.Lock()
+        self._localization_operation_generation = 0
+        self._scan_match_condition = threading.Condition()
+        self._scan_match_sequence = 0
+        self._scan_match_records: dict[tuple[int, int], dict] = {}
+        self._scan_match_record_order = deque(maxlen=200)
         self._localization_lost_count = 0
         self._localization_failure_notified = False
         self._lio_motion_anomaly_notified = False
@@ -161,6 +172,14 @@ class RosAdapter(Node):
         self._rtk_origin_cache = RtkOriginPayloadCache(
             stale_after_seconds=(mapping_config.heading_max_age_seconds if mapping_config else 1.5)
         )
+        # Durable diagnostics for relocalization searches.  This is deliberately
+        # outside the ROS graph so a node restart does not erase the candidate
+        # state needed to explain a failed cold start.
+        self._relocalization_state_file = None
+        if mapping_config and mapping_config.map_dir:
+            self._relocalization_state_file = os.path.join(
+                os.path.expanduser(mapping_config.map_dir), "relocalization_search_state.json"
+            )
         self.create_subscription(
             Localization,
             ros_config.localization_topic,
@@ -178,6 +197,12 @@ class RosAdapter(Node):
         self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
+        self.create_subscription(
+            PoseStamped,
+            "/localization/scan_match_pose",
+            self._on_scan_match_pose,
+            qos_profile_sensor_data,
+        )
         self._subscribe_imu_cross_check()
         if mapping_config is not None:
             self.create_subscription(
@@ -290,6 +315,58 @@ class RosAdapter(Node):
             },
             "frame_id": str(getattr(header, "frame_id", "") or ""),
         }
+
+    @staticmethod
+    def _stamp_key(header) -> tuple[int, int]:
+        stamp = getattr(header, "stamp", None)
+        return (
+            int(getattr(stamp, "sec", 0)),
+            int(getattr(stamp, "nanosec", 0)),
+        )
+
+    def _scan_match_record(self, key: tuple[int, int]) -> dict:
+        record = self._scan_match_records.get(key)
+        if record is None:
+            if len(self._scan_match_record_order) == self._scan_match_record_order.maxlen:
+                oldest = self._scan_match_record_order.popleft()
+                self._scan_match_records.pop(oldest, None)
+            record = {"stamp": {"sec": key[0], "nanosec": key[1]}}
+            self._scan_match_records[key] = record
+            self._scan_match_record_order.append(key)
+        return record
+
+    def _on_scan_match_pose(self, msg) -> None:
+        orientation = msg.pose.orientation
+        yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
+        with self._scan_match_condition:
+            record = self._scan_match_record(self._stamp_key(getattr(msg, "header", None)))
+            record["matched_pose"] = {
+                "x": float(msg.pose.position.x),
+                "y": float(msg.pose.position.y),
+                "z": float(msg.pose.position.z),
+                "yaw": float(yaw),
+                "frame_id": str(msg.header.frame_id or "map"),
+            }
+            self._scan_match_condition.notify_all()
+
+    def _start_localization_operation(self, source: str) -> int:
+        with self._localization_operation_lock:
+            self._localization_operation_generation += 1
+            generation = self._localization_operation_generation
+        LOGGER.info("localization operation %d started by %s", generation, source)
+        return generation
+
+    def _assert_localization_operation(self, generation: int) -> None:
+        with self._localization_operation_lock:
+            current = self._localization_operation_generation
+        if generation != current:
+            raise ProtocolError(
+                "RELOCALIZATION_SUPERSEDED",
+                f"localization operation {generation} was superseded by {current}",
+            )
 
     def _on_origin_fix(self, msg) -> None:
         self._rtk_origin_cache.update(
@@ -512,6 +589,18 @@ class RosAdapter(Node):
             float(getattr(msg, "inlier_fraction", 0.0)),
         )
         self.telemetry.on_scan_matching_status(msg)
+        scan_condition = getattr(self, "_scan_match_condition", None)
+        if scan_condition is not None:
+            with scan_condition:
+                self._scan_match_sequence += 1
+                record = self._scan_match_record(self._stamp_key(getattr(msg, "header", None)))
+                record.update({
+                    "sequence": self._scan_match_sequence,
+                    "has_converged": bool(getattr(msg, "has_converged", False)),
+                    "matching_error": float(getattr(msg, "matching_error", float("inf"))),
+                    "inlier_fraction": float(getattr(msg, "inlier_fraction", 0.0)),
+                })
+                scan_condition.notify_all()
         # Outdoor RTK-primary navigation still publishes NDT as a shadow health
         # check. Open sky often has an empty/poor scan match even when GPS pose
         # is centimetre-grade. That must not pause the task as localization loss.
@@ -967,7 +1056,128 @@ class RosAdapter(Node):
             )
         return {**result, "confirmed": True, "motion_state": self._robot_motion_state}
 
+    def _scan_match_sequence_snapshot(self) -> int:
+        with self._scan_match_condition:
+            return self._scan_match_sequence
+
+    def _best_ndt_candidate(self, after_sequence: int, submitted_pose: dict) -> dict | None:
+        with self._scan_match_condition:
+            records = [
+                {
+                    **record,
+                    "matched_pose": dict(record.get("matched_pose") or {}),
+                }
+                for record in self._scan_match_records.values()
+                if int(record.get("sequence", 0)) > after_sequence
+            ]
+        usable = [
+            record for record in records
+            if record.get("has_converged") is True
+            and math.isfinite(float(record.get("matching_error", float("inf"))))
+            and float(record.get("matching_error", float("inf"))) < self.safety_config.ndt_failure_score
+            and float(record.get("inlier_fraction", 0.0)) >= 0.50
+            and record.get("matched_pose")
+        ]
+        if not usable:
+            return None
+        decision = self.telemetry.localization_decision()
+        initialization = dict(decision.get("initialization") or {})
+        verified = bool(initialization.get("verified"))
+        stable_frames = int(initialization.get("stable_frames") or 0)
+        required_frames = max(1, int(initialization.get("required_stable_frames") or 3))
+        # When C++ has verified a stable streak, choose the strongest result
+        # from that streak rather than an earlier isolated low score that may
+        # belong to a different local minimum.
+        ranked_pool = sorted(usable, key=lambda item: int(item.get("sequence", 0)))
+        if verified or stable_frames >= required_frames:
+            ranked_pool = ranked_pool[-required_frames:]
+        best = min(
+            ranked_pool,
+            key=lambda item: (
+                float(item.get("matching_error", float("inf"))),
+                -float(item.get("inlier_fraction", 0.0)),
+            ),
+        )
+        matched_pose = dict(best["matched_pose"])
+        position_correction_m = math.hypot(
+            float(matched_pose["x"]) - float(submitted_pose["x"]),
+            float(matched_pose["y"]) - float(submitted_pose["y"]),
+        )
+        yaw_correction_rad = math.atan2(
+            math.sin(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
+            math.cos(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
+        )
+        within_seed_gate = position_correction_m <= 1.50 and abs(yaw_correction_rad) <= math.radians(30.0)
+        return {
+            "matched_pose": matched_pose,
+            "matching_error": float(best["matching_error"]),
+            "inlier_fraction": float(best["inlier_fraction"]),
+            "healthy_samples": len(usable),
+            "stable_frames": stable_frames,
+            "required_stable_frames": required_frames,
+            "verified": verified,
+            "position_correction_m": position_correction_m,
+            "yaw_correction_deg": math.degrees(yaw_correction_rad),
+            "within_seed_gate": within_seed_gate,
+            "eligible": within_seed_gate and (verified or stable_frames >= required_frames),
+        }
+
+    @staticmethod
+    def _candidate_rank(candidate: dict | None) -> tuple:
+        if not candidate:
+            return (1, 1, float("inf"), 0.0)
+        return (
+            0 if candidate.get("eligible") else 1,
+            0 if candidate.get("verified") else 1,
+            float(candidate.get("matching_error", float("inf"))),
+            -float(candidate.get("inlier_fraction", 0.0)),
+        )
+
     def set_initial_pose(self, pose: dict) -> dict:
+        generation = self._start_localization_operation("operator_initial_pose")
+        try:
+            return self._set_initial_pose_once(pose, generation)
+        except ProtocolError as exc:
+            if exc.code != "INITIAL_POSE_NOT_ACCEPTED":
+                raise
+            candidate = dict((exc.details or {}).get("best_ndt_candidate") or {})
+            if not candidate.get("eligible"):
+                raise
+            best_pose = dict(candidate["matched_pose"])
+            LOGGER.warning(
+                "initial pose NDT verified but handoff was not accepted; committing best match "
+                "x=%.3f y=%.3f yaw=%.3f score=%.3f inlier=%.3f",
+                best_pose["x"], best_pose["y"], best_pose["yaw"],
+                candidate["matching_error"], candidate["inlier_fraction"],
+            )
+            try:
+                result = self._set_initial_pose_once({
+                    **pose,
+                    **best_pose,
+                    "frame_id": "map",
+                    "wait_seconds": max(12.0, float(pose.get("wait_seconds", 8.0))),
+                    "require_absolute": True,
+                }, generation)
+                result["best_ndt_candidate"] = candidate
+                result["best_ndt_committed"] = True
+                return result
+            except ProtocolError as handoff_exc:
+                if handoff_exc.code == "RELOCALIZATION_SUPERSEDED":
+                    raise
+                details = dict(handoff_exc.details or {})
+                details.update({
+                    "best_ndt_candidate": candidate,
+                    "best_ndt_committed": True,
+                    "handoff_pending": True,
+                })
+                raise ProtocolError(
+                    "RELOCALIZATION_HANDOFF_FAILED",
+                    "best NDT pose was committed but FAST-LIO did not become stable",
+                    details=details,
+                ) from handoff_exc
+
+    def _set_initial_pose_once(self, pose: dict, generation: int) -> dict:
+        self._assert_localization_operation(generation)
         yaw = float(pose.get("yaw", 0.0))
         x = float(pose["x"])
         y = float(pose["y"])
@@ -987,14 +1197,18 @@ class RosAdapter(Node):
         msg.pose.covariance[35] = float(pose.get("covariance_yaw", 0.0685))
         subscriber_deadline = time.monotonic() + float(pose.get("subscriber_wait_seconds", 15.0))
         while self._initial_pose_pub.get_subscription_count() == 0 and time.monotonic() < subscriber_deadline:
+            self._assert_localization_operation(generation)
             time.sleep(0.2)
         if self._initial_pose_pub.get_subscription_count() == 0:
             raise ProtocolError("LOCALIZATION_UNAVAILABLE", "/initialpose has no localization subscriber")
-        for _ in range(5):
-            self._initial_pose_pub.publish(msg)
-            time.sleep(0.2)
         with self._localization_sample_condition:
             sample_sequence = self._localization_sample_sequence
+        scan_match_sequence = self._scan_match_sequence_snapshot()
+        # The publisher is reliable and a live subscriber was confirmed above.
+        # Publishing once also lets the localization node deliberately re-run
+        # an unchanged pose while lost without five duplicate resets.
+        self._assert_localization_operation(generation)
+        self._initial_pose_pub.publish(msg)
         wait_seconds = float(pose.get("wait_seconds", 8.0))
         required_normal_samples = int(pose.get("required_normal_samples", 0))
         require_absolute = bool(pose.get("require_absolute", False))
@@ -1002,6 +1216,7 @@ class RosAdapter(Node):
             deadline = time.monotonic() + wait_seconds
             latest = self.telemetry.latest_pose()
             while time.monotonic() < deadline:
+                self._assert_localization_operation(generation)
                 latest = self.telemetry.latest_pose()
                 if (
                     latest
@@ -1020,12 +1235,14 @@ class RosAdapter(Node):
                 after_sequence=sample_sequence,
                 required_samples=required_normal_samples,
                 timeout_seconds=wait_seconds,
+                generation=generation,
             )
             accepted = latest is not None
         else:
             deadline = time.monotonic() + wait_seconds
             latest = self.telemetry.latest_pose()
             while time.monotonic() < deadline:
+                self._assert_localization_operation(generation)
                 latest = self.telemetry.latest_pose()
                 stable_for = time.monotonic() - self.safety_state.localization_normal_since_monotonic
                 if (
@@ -1043,9 +1260,17 @@ class RosAdapter(Node):
             )
         if not accepted:
             status = latest.localization_status if latest else "unknown"
+            best_candidate = self._best_ndt_candidate(scan_match_sequence, {
+                "x": x, "y": y, "z": z, "yaw": yaw,
+            })
             raise ProtocolError(
                 "INITIAL_POSE_NOT_ACCEPTED",
                 f"localization_status={status}, wait_seconds={wait_seconds:.1f}",
+                details={
+                    "submitted_pose": {"x": x, "y": y, "z": z, "yaw": yaw},
+                    "best_ndt_candidate": best_candidate,
+                    "localization_status": status,
+                },
             )
         return {
             "frame_id": frame_id,
@@ -1054,6 +1279,9 @@ class RosAdapter(Node):
             "yaw": yaw,
             "topic": "/initialpose",
             "localization_status": latest.localization_status,
+            "best_ndt_candidate": self._best_ndt_candidate(scan_match_sequence, {
+                "x": x, "y": y, "z": z, "yaw": yaw,
+            }),
             "localized_pose": {
                 "x": latest.x,
                 "y": latest.y,
@@ -1064,6 +1292,7 @@ class RosAdapter(Node):
 
     def set_initial_pose_from_rtk(self, wait_seconds: float = 30.0) -> dict:
         """Ask localization to convert a fresh fixed RTK pose into map coordinates."""
+        generation = self._start_localization_operation("operator_rtk_initial_pose")
         if not self._rtk_initial_pose_client.wait_for_service(timeout_sec=3.0):
             raise ProtocolError(
                 "RTK_INITIAL_POSE_UNAVAILABLE",
@@ -1077,6 +1306,7 @@ class RosAdapter(Node):
         if not completed.wait(timeout=5.0) or not future.done():
             raise ProtocolError("RTK_INITIAL_POSE_TIMEOUT", "RTK initial pose service timed out")
         response = future.result()
+        self._assert_localization_operation(generation)
         if response is None or not response.success:
             raise ProtocolError(
                 "RTK_POSE_UNAVAILABLE",
@@ -1086,6 +1316,7 @@ class RosAdapter(Node):
             after_sequence=sample_sequence,
             required_samples=3,
             timeout_seconds=wait_seconds,
+            generation=generation,
         )
         if latest is None:
             raise ProtocolError(
@@ -1107,6 +1338,7 @@ class RosAdapter(Node):
 
     def global_relocalize(self, wait_seconds: float = 90.0) -> dict:
         """Run map-wide position and 360-degree yaw search without a guessed pose."""
+        generation = self._start_localization_operation("global_relocalize")
         if not self._global_relocalize_client.wait_for_service(timeout_sec=3.0):
             raise ProtocolError(
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
@@ -1122,6 +1354,7 @@ class RosAdapter(Node):
                 "GLOBAL_RELOCALIZATION_TIMEOUT", "global relocalization service timed out"
             )
         response = future.result()
+        self._assert_localization_operation(generation)
         if response is None or not response.success:
             raise ProtocolError(
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
@@ -1131,6 +1364,7 @@ class RosAdapter(Node):
             after_sequence=sample_sequence,
             required_samples=3,
             timeout_seconds=wait_seconds,
+            generation=generation,
         )
         if latest is None:
             raise ProtocolError(
@@ -1157,10 +1391,13 @@ class RosAdapter(Node):
         after_sequence: int,
         required_samples: int,
         timeout_seconds: float,
+        generation: int | None = None,
     ):
         deadline = time.monotonic() + timeout_seconds
         with self._localization_sample_condition:
             while True:
+                if generation is not None:
+                    self._assert_localization_operation(generation)
                 if self._fresh_normal_streak(
                     self._localization_status_samples,
                     after_sequence,
@@ -1182,6 +1419,9 @@ class RosAdapter(Node):
 
     def active_relocalize(self, seed: dict) -> dict:
         """Try bounded stationary pose candidates without commanding motion."""
+        generation = self._start_localization_operation(
+            str(seed.get("source") or "active_relocalize")
+        )
         base_x = float(seed["x"])
         base_y = float(seed["y"])
         base_z = float(seed.get("z", 0.0))
@@ -1189,9 +1429,16 @@ class RosAdapter(Node):
         max_attempts = max(1, min(12, int(seed.get("max_attempts", 12))))
         candidates = self._relocalization_candidates(base_x, base_y, base_z, base_yaw)
         attempts = []
+        best_candidate = None
+        self._persist_relocalization_state({
+            "state": "running", "source": seed.get("source", "operator_seed"),
+            "seed": {k: seed.get(k) for k in ("x", "y", "z", "yaw", "waypoint_index")},
+            "candidate_count": min(max_attempts, len(candidates)), "attempts": [],
+            "updated_at": time.time(),
+        })
         for index, candidate in enumerate(candidates[:max_attempts], start=1):
             try:
-                result = self.set_initial_pose({
+                result = self._set_initial_pose_once({
                     **candidate,
                     "frame_id": "map",
                     "wait_seconds": 10.0,
@@ -1200,32 +1447,161 @@ class RosAdapter(Node):
                     "covariance_x": 1.0,
                     "covariance_y": 1.0,
                     "covariance_yaw": 0.274,
-                })
+                }, generation)
                 latest = self.telemetry.latest_pose()
                 if self._trusted_pose_cb and latest:
                     self._trusted_pose_cb(latest)
                     self._last_trusted_pose_report_monotonic = time.monotonic()
-                return {
+                payload = {
                     "mode": "stationary_bounded_search",
                     "source": seed.get("source", "operator_seed"),
                     "attempts": attempts + [{"index": index, **candidate, "accepted": True}],
                     "localized_pose": result["localized_pose"],
                     "localization_status": result["localization_status"],
+                    "best_ndt_candidate": result.get("best_ndt_candidate"),
                     "motion_commanded": False,
                 }
+                self._persist_relocalization_state({**payload, "state": "accepted", "updated_at": time.time()})
+                return payload
             except ProtocolError as exc:
-                attempts.append({
+                if exc.code == "RELOCALIZATION_SUPERSEDED":
+                    self._persist_relocalization_state({
+                        "state": "superseded",
+                        "source": seed.get("source", "operator_seed"),
+                        "attempts": attempts,
+                        "updated_at": time.time(),
+                    })
+                    raise
+                ndt_candidate = dict((exc.details or {}).get("best_ndt_candidate") or {})
+                if self._candidate_rank(ndt_candidate) < self._candidate_rank(best_candidate):
+                    best_candidate = ndt_candidate
+                attempt = {
                     "index": index,
                     **candidate,
                     "accepted": False,
                     "error_code": exc.code,
+                    "ndt_candidate": ndt_candidate or None,
+                }
+                attempts.append(attempt)
+                self._persist_relocalization_state({
+                    "state": "running", "source": seed.get("source", "operator_seed"),
+                    "candidate_count": min(max_attempts, len(candidates)), "attempts": attempts,
+                    "best_ndt_candidate": best_candidate,
+                    "updated_at": time.time(),
                 })
+                # Once NDT has passed its three-frame verification, changing to
+                # another seed destroys the best pose and restarts acquisition.
+                # Commit that exact match and wait only for the LIO handoff.
+                if ndt_candidate.get("eligible"):
+                    return self._commit_best_relocalization_candidate(
+                        generation, seed, ndt_candidate, attempts
+                    )
         latest = self.telemetry.latest_pose()
+        self._persist_relocalization_state({
+            "state": "failed", "source": seed.get("source", "operator_seed"),
+            "candidate_count": min(max_attempts, len(candidates)), "attempts": attempts,
+            "best_ndt_candidate": best_candidate,
+            "localization_status": latest.localization_status if latest else None,
+            "updated_at": time.time(),
+        })
         raise ProtocolError(
             "ACTIVE_RELOCALIZATION_FAILED",
             f"stationary search exhausted {len(attempts)} candidates; "
             f"localization_status={latest.localization_status if latest else 'unknown'}",
+            details={
+                "mode": "stationary_bounded_search",
+                "source": seed.get("source", "operator_seed"),
+                "attempts": attempts,
+                "best_ndt_candidate": best_candidate,
+                "candidate_count": min(max_attempts, len(candidates)),
+                "localization_status": latest.localization_status if latest else None,
+                "motion_commanded": False,
+            },
         )
+
+    def _commit_best_relocalization_candidate(
+        self,
+        generation: int,
+        seed: dict,
+        candidate: dict,
+        attempts: list[dict],
+    ) -> dict:
+        best_pose = dict(candidate["matched_pose"])
+        state = {
+            "state": "committing_best",
+            "source": seed.get("source", "operator_seed"),
+            "attempts": attempts,
+            "best_ndt_candidate": candidate,
+            "updated_at": time.time(),
+        }
+        self._persist_relocalization_state(state)
+        try:
+            result = self._set_initial_pose_once({
+                **best_pose,
+                "frame_id": "map",
+                "wait_seconds": 20.0,
+                "require_absolute": True,
+                "covariance_x": 0.25,
+                "covariance_y": 0.25,
+                "covariance_yaw": 0.0685,
+            }, generation)
+        except ProtocolError as exc:
+            if exc.code == "RELOCALIZATION_SUPERSEDED":
+                raise
+            details = {
+                "mode": "stationary_bounded_search",
+                "source": seed.get("source", "operator_seed"),
+                "attempts": attempts,
+                "best_ndt_candidate": candidate,
+                "best_ndt_committed": True,
+                "handoff_pending": True,
+                "motion_commanded": False,
+            }
+            self._persist_relocalization_state({
+                **details,
+                "state": "handoff_failed",
+                "updated_at": time.time(),
+            })
+            raise ProtocolError(
+                "RELOCALIZATION_HANDOFF_FAILED",
+                "best NDT pose was committed but FAST-LIO did not become stable",
+                details=details,
+            ) from exc
+        payload = {
+            "mode": "stationary_bounded_search",
+            "source": seed.get("source", "operator_seed"),
+            "attempts": attempts,
+            "best_ndt_candidate": candidate,
+            "best_ndt_committed": True,
+            "localized_pose": result["localized_pose"],
+            "localization_status": result["localization_status"],
+            "motion_commanded": False,
+        }
+        latest = self.telemetry.latest_pose()
+        if self._trusted_pose_cb and latest:
+            self._trusted_pose_cb(latest)
+            self._last_trusted_pose_report_monotonic = time.monotonic()
+        self._persist_relocalization_state({
+            **payload, "state": "accepted", "updated_at": time.time(),
+        })
+        return payload
+
+    def _persist_relocalization_state(self, payload: dict) -> None:
+        path = self._relocalization_state_file
+        if not path:
+            return
+        try:
+            parent = os.path.dirname(path)
+            os.makedirs(parent, exist_ok=True)
+            temporary = f"{path}.tmp"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            LOGGER.warning("unable to persist relocalization search state: %s", exc)
 
     @staticmethod
     def _relocalization_candidates(x: float, y: float, z: float, yaw: float) -> list[dict]:

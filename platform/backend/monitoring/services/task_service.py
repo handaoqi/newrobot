@@ -29,6 +29,13 @@ ALLOWED_TRANSITIONS = {
     "interrupted": {"paused", "running", "pausing", "resuming", "cancelling", "cancelled", "failed"},
 }
 
+# A reconnecting Edge can be the only side that observed the terminal result.
+# Allow that authoritative terminal state to close any cloud-side active state
+# instead of leaving the robot blocked behind a stale ROBOT_BUSY execution.
+TERMINAL_RECONCILIATION_STATES = {"completed", "failed", "cancelled", "timed_out", "rejected"}
+for _active_state in TaskExecution.ACTIVE_STATES:
+    ALLOWED_TRANSITIONS[_active_state].update(TERMINAL_RECONCILIATION_STATES)
+
 
 def assert_transition_allowed(current: str, target: str) -> None:
     if target not in ALLOWED_TRANSITIONS.get(current, set()):

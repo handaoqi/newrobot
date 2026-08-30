@@ -35,6 +35,7 @@ import {
   clampMapZoom,
   headingBetweenMapPoints,
   headingDegreesToRadians,
+  initialPoseCommandOutcome,
   normalizeHeadingDegrees,
   normalizeRoutePlannerTelemetry,
   paginateKeyframes,
@@ -50,7 +51,7 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
-import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
+import { activateAndRelocalizeMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
@@ -1280,6 +1281,27 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function applyInitialPoseOutcome(command, submittedPose = manualInitialPose.value) {
+  const outcome = initialPoseCommandOutcome(command, submittedPose)
+  if (outcome.pose) {
+    manualInitialPose.value = {
+      ...(manualInitialPose.value || {}),
+      ...outcome.pose,
+    }
+    initialPoseHeadingTarget.value = null
+  }
+  return outcome
+}
+
+function initialPoseOutcomeMessage(prefix, outcome) {
+  if (!outcome?.pose) return prefix
+  const pose = outcome.pose
+  const score = outcome.matchingError === null ? '' : ` · NDT ${outcome.matchingError.toFixed(3)}`
+  const inlier = outcome.inlierFraction === null ? '' : ` · 内点 ${(outcome.inlierFraction * 100).toFixed(1)}%`
+  const committed = outcome.bestNdtCommitted ? ' · 已提交最优候选' : ''
+  return `${prefix}：x ${pose.x.toFixed(3)} / y ${pose.y.toFixed(3)} / yaw ${pose.yaw.toFixed(3)}${score}${inlier}${committed}`
+}
+
 async function initializeLocalization() {
   const robotId = selectedRobot.value?.id || selectedMap.value?.robot
   if (!robotId) {
@@ -1302,11 +1324,16 @@ async function initializeLocalization() {
       localizationInitMessage.value = '当前地图定位已经过连续帧验证，无需覆盖初始位姿'
       return
     }
-    await sendRobotNavigationCommand(robotId, 'restart', {
+    const restartCommand = await sendRobotNavigationCommand(robotId, 'restart', {
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
     })
-    await sleep(2500)
+    await waitForRobotCommand(robotId, restartCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => {
+        localizationInitMessage.value = `正在重启导航/定位栈 · ${latest.status || 'created'}`
+      },
+    })
     await refreshNavigationStatus()
     localizationInitState.value = 'sending_pose'
     const rtk = normalizeRoutePlannerTelemetry(navStatus.value?.status).rtk
@@ -1314,20 +1341,27 @@ async function initializeLocalization() {
     localizationInitMessage.value = useFixedRtk
       ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
       : 'RTK Fix 不可用，正在搜索全图位置与 360° 航向'
-    await sendRobotNavigationCommand(robotId, useFixedRtk ? 'initial-pose' : 'relocalize', {
+    const localizationCommand = await sendRobotNavigationCommand(robotId, useFixedRtk ? 'initial-pose' : 'relocalize', {
       seed_source: useFixedRtk ? 'rtk' : 'global',
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
       wait_seconds: 90,
     })
+    const completedLocalization = await waitForRobotCommand(robotId, localizationCommand, {
+      timeoutMs: 210_000,
+      onProgress: latest => {
+        localizationInitMessage.value = `${useFixedRtk ? 'RTK初始化' : '全局定位搜索'} · ${latest.status || 'created'}`
+      },
+    })
+    const outcome = applyInitialPoseOutcome(completedLocalization)
     localizationInitState.value = 'waiting_convergence'
-    localizationInitMessage.value = '等待定位收敛和 NDT 质量更新'
+    localizationInitMessage.value = initialPoseOutcomeMessage('命令已完成，等待定位状态同步', outcome)
     for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
       await refreshNavigationStatus()
       if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
         localizationInitState.value = 'done'
-        localizationInitMessage.value = '定位初始化完成'
+        localizationInitMessage.value = initialPoseOutcomeMessage('定位初始化完成', outcome)
         return
       }
     }
@@ -1336,7 +1370,10 @@ async function initializeLocalization() {
     navError.value = localizationInitMessage.value
   } catch (error) {
     localizationInitState.value = 'failed'
-    localizationInitMessage.value = error.message || '定位初始化失败'
+    const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
+    localizationInitMessage.value = outcome?.bestNdtCommitted
+      ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
+      : (error.message || '定位初始化失败')
     navError.value = localizationInitMessage.value
   } finally {
     navCommandBusy.value = ''
@@ -1364,20 +1401,30 @@ async function activeRelocalize() {
       payload.y = Number(manualInitialPose.value.y)
       payload.yaw = Number(manualInitialPose.value.yaw || 0)
     }
-    await sendRobotNavigationCommand(robotId, 'relocalize', payload)
+    const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload)
+    const completed = await waitForRobotCommand(robotId, command, {
+      timeoutMs: 210_000,
+      onProgress: latest => {
+        localizationInitMessage.value = `正在静止搜索定位候选 · ${latest.status || 'created'}`
+      },
+    })
+    const outcome = applyInitialPoseOutcome(completed, manualInitialPose.value)
     for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
       await refreshNavigationStatus()
       if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
         localizationInitState.value = 'done'
-        localizationInitMessage.value = '主动重定位完成'
+        localizationInitMessage.value = initialPoseOutcomeMessage('主动重定位完成', outcome)
         return
       }
     }
     throw new Error('主动重定位未在限定时间内收敛')
   } catch (error) {
     localizationInitState.value = 'failed'
-    localizationInitMessage.value = error.message || '主动重定位失败'
+    const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
+    localizationInitMessage.value = outcome?.bestNdtCommitted
+      ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
+      : (error.message || '主动重定位失败')
     navError.value = localizationInitMessage.value
   } finally {
     navCommandBusy.value = ''
@@ -1484,20 +1531,39 @@ async function publishInitialPose(confirmRequired = true, manageBusy = true) {
   }
   if (confirmRequired && !confirm(`确认把初始定位设置为 ${waypointDisplayText(manualInitialPose.value)} / yaw ${Number(manualInitialPose.value.yaw || 0).toFixed(2)}？`)) return
   if (manageBusy) navCommandBusy.value = 'initial-pose'
+  const submittedPose = {
+    x: Number(manualInitialPose.value.x),
+    y: Number(manualInitialPose.value.y),
+    yaw: Number(manualInitialPose.value.yaw || 0),
+  }
   navError.value = ''
+  localizationInitState.value = 'sending_pose'
+  localizationInitMessage.value = '正在下发初始种子并等待NDT最优位姿'
   try {
-    await sendRobotNavigationCommand(robotId, 'initial-pose', {
+    const command = await sendRobotNavigationCommand(robotId, 'initial-pose', {
       frame_id: 'map',
-      x: Number(manualInitialPose.value.x),
-      y: Number(manualInitialPose.value.y),
-      yaw: Number(manualInitialPose.value.yaw || 0),
+      ...submittedPose,
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
     })
+    const completed = await waitForRobotCommand(robotId, command, {
+      timeoutMs: 120_000,
+      onProgress: latest => {
+        localizationInitMessage.value = `NDT初始定位 · ${latest.status || 'created'}`
+      },
+    })
+    const outcome = applyInitialPoseOutcome(completed, submittedPose)
     initialPoseMode.value = false
+    localizationInitState.value = 'done'
+    localizationInitMessage.value = initialPoseOutcomeMessage('初始定位已确认', outcome)
     await refreshNavigationStatus()
   } catch (error) {
-    navError.value = error.message || '初始定位下发失败'
+    const outcome = error?.command ? applyInitialPoseOutcome(error.command, submittedPose) : null
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = outcome?.bestNdtCommitted
+      ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
+      : (error.message || '初始定位下发失败')
+    navError.value = localizationInitMessage.value
   } finally {
     if (manageBusy && navCommandBusy.value === 'initial-pose') navCommandBusy.value = ''
   }
@@ -2557,7 +2623,9 @@ async function handleDeleteRoute(route) {
                 <button class="btn btn-sm" @click="resetInitialPosePosition">重选位置</button>
                 <span>{{ Math.round(Number(manualInitialPose.yaw || 0) * 180 / Math.PI) }}°</span>
               </div>
-              <button class="btn btn-sm btn-primary" :disabled="!manualInitialPose || !!navCommandBusy" @click="sendInitialPose">下发初始定位</button>
+              <button class="btn btn-sm btn-primary" :disabled="!manualInitialPose || !!navCommandBusy" @click="sendInitialPose">
+                {{ navCommandBusy === 'initial-pose' ? 'NDT定位中...' : '下发初始定位' }}
+              </button>
             </div>
             <small v-if="navStatus?.command" class="command-note">
               最近命令 {{ navStatus.command.command_type }} · {{ navStatus.command.status }}

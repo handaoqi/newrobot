@@ -60,10 +60,11 @@ class CommandProcessor:
         command_id = envelope.payload["command_id"]
         duplicate = self.store.get_processed_command(command_id)
         if duplicate:
-            self.publish_ack(command_id, duplicate["ack"])
+            if duplicate["ack"]:
+                self.publish_ack(command_id, duplicate["ack"])
             if duplicate["result"]:
                 self.publish_result(command_id, duplicate["result"])
-            return duplicate["ack"], duplicate["result"]
+            return duplicate["ack"] or {}, duplicate["result"]
 
         started_at = now_iso()
         ack = None
@@ -91,8 +92,6 @@ class CommandProcessor:
                 # completed task's stale version, causing progress events to be
                 # discarded by the center as out-of-order.
                 self.task_executor.prepare_task_start(envelope)
-                if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
-                    self.task_executor.initialize_before_navigation()
             ack = build_ack(
                 envelope,
                 accepted=True,
@@ -102,6 +101,11 @@ class CommandProcessor:
             self.publish_ack(command_id, ack)
             result = None if prepared_task_start else self._execute(envelope, started_at)
             if prepared_task_start:
+                # Initialization can actively relocalize and may take up to 90s.
+                # Persist and publish the acceptance first so an Edge restart in
+                # that window cannot leave the center stuck in `dispatching`.
+                if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
+                    self.task_executor.initialize_before_navigation()
                 self.task_executor.launch_prepared_task()
             if result:
                 self.store.save_command_result(command_id, result)
@@ -132,7 +136,7 @@ class CommandProcessor:
             result = build_result(
                 envelope,
                 status="failed",
-                result={},
+                result=exc.details if isinstance(exc.details, dict) else {},
                 started_at=started_at,
                 error_code=exc.code,
                 error_message=exc.message,
@@ -142,6 +146,11 @@ class CommandProcessor:
             return ack, result
         except Exception as exc:
             LOGGER.exception("unexpected error executing command %s", command_id)
+            if prepared_task_start and ack is not None:
+                try:
+                    self.task_executor.force_exit(envelope.payload["task_execution_id"])
+                except Exception:
+                    LOGGER.exception("failed to clear task after unexpected launch error")
             result = build_result(
                 envelope,
                 status="failed",
@@ -289,6 +298,10 @@ class CommandProcessor:
                 else:
                     pose = self._resolve_localization_seed(command)
                     pose.setdefault("wait_seconds", 30.0)
+                    # Initialization is complete only after the verified NDT
+                    # match has handed ownership to an absolute pose source.
+                    # A transient status=3 frame must not acknowledge the UI.
+                    pose.setdefault("require_absolute", True)
                     result_payload = self.localization_adapter.set_initial_pose(pose)
             else:
                 if str(command.get("seed_source") or "last_trusted") == "global":

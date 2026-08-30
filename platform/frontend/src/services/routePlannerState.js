@@ -130,6 +130,55 @@ export function resolveMapClickAction(mode, initialPoseMode = false) {
   return mode === 'inspect' ? 'inspect' : 'waypoint'
 }
 
+function finitePose(value) {
+  if (!value || typeof value !== 'object') return null
+  const numeric = field => field === null || field === undefined || field === ''
+    ? Number.NaN
+    : Number(field)
+  const x = numeric(value.x)
+  const y = numeric(value.y)
+  const yaw = numeric(value.yaw)
+  if (![x, y, yaw].every(Number.isFinite)) return null
+  const z = numeric(value.z)
+  return {
+    x,
+    y,
+    yaw,
+    ...(Number.isFinite(z) ? { z } : {}),
+  }
+}
+
+/** Extract the pose actually accepted/committed by NDT from a command result. */
+export function initialPoseCommandOutcome(command, submittedPose = null) {
+  const result = command?.result_payload && typeof command.result_payload === 'object'
+    ? command.result_payload
+    : {}
+  const candidate = result.best_ndt_candidate && typeof result.best_ndt_candidate === 'object'
+    ? result.best_ndt_candidate
+    : null
+  const localizedPose = finitePose(result.localized_pose)
+  const matchedPose = finitePose(candidate?.matched_pose)
+  return {
+    pose: localizedPose || matchedPose || finitePose(submittedPose),
+    localizedPose,
+    matchedPose,
+    bestNdtCommitted: result.best_ndt_committed === true,
+    handoffPending: result.handoff_pending === true,
+    matchingError: candidate?.matching_error !== null
+      && candidate?.matching_error !== undefined
+      && candidate?.matching_error !== ''
+      && Number.isFinite(Number(candidate.matching_error))
+      ? Number(candidate.matching_error)
+      : null,
+    inlierFraction: candidate?.inlier_fraction !== null
+      && candidate?.inlier_fraction !== undefined
+      && candidate?.inlier_fraction !== ''
+      && Number.isFinite(Number(candidate.inlier_fraction))
+      ? Number(candidate.inlier_fraction)
+      : null,
+  }
+}
+
 export function appendConfirmedInspectionPoint(points, draft, id) {
   const source = Array.isArray(points) ? points : []
   if (!draft?.point || id === null || id === undefined || id === '') return source

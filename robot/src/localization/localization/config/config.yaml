@@ -270,6 +270,11 @@ localization:
     init_match_min_inlier_fraction: 0.50
     init_match_stable_xy_m: 0.10
     init_match_stable_yaw_deg: 2.0
+    # Reject a locally stable but geometrically implausible basin. Active
+    # relocalization already searches explicit yaw/position candidates, so a
+    # valid candidate should only need a bounded correction from its seed.
+    init_match_max_seed_xy_m: 1.50
+    init_match_max_seed_yaw_deg: 30.0
 
     # Global localization parameters
     use_global_localization_init: true

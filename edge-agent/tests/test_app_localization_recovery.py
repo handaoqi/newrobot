@@ -69,6 +69,54 @@ class StuckTaskExecutor:
         return True
 
 
+def test_recovery_seed_prefers_trusted_pose_over_pending_waypoint():
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = SimpleNamespace(
+        latest_trusted_pose=lambda: {"x": 9.43, "y": -0.52, "yaw": -2.36}
+    )
+    application.store = SimpleNamespace(load_last_trusted_pose=lambda *_args: None)
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1")
+    )
+    application.task_executor = SimpleNamespace(
+        current_localization_waypoint=lambda: {
+            "x": 9.308,
+            "y": -0.489,
+            "yaw": 0.0,
+            "waypoint_index": 0,
+            "round_number": 10,
+        }
+    )
+
+    seed = application._localization_recovery_seed()
+
+    assert seed == {"x": 9.43, "y": -0.52, "yaw": -2.36, "source": "last_trusted"}
+
+
+def test_recovery_attempts_trusted_pose_before_waypoint_candidates(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = FakeNavigation()
+    application.task_executor = SimpleNamespace(
+        context=SimpleNamespace(route_snapshot={"waypoints": [{"x": 9.308, "y": -0.489, "yaw": 0.0}]}),
+        current_localization_waypoint=lambda: {
+            "x": 9.308,
+            "y": -0.489,
+            "yaw": 0.0,
+            "waypoint_index": 0,
+            "round_number": 10,
+        },
+        is_paused_for_localization=lambda: True,
+        has_active_task=lambda: True,
+    )
+    application.navigation_stack_adapter = SimpleNamespace(restarts=0)
+    _wire_recovery_collaborators(application)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+
+    application._recover_task_localization()
+
+    assert application.navigation.seeds[0]["source"] == "last_trusted"
+
+
 def _wire_recovery_collaborators(application, *, max_cycles=0):
     """Attach the collaborators `_recover_task_localization` reaches for."""
     application.config = SimpleNamespace(

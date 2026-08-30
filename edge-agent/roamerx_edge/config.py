@@ -114,6 +114,10 @@ class WaypointSpeechConfig:
 @dataclass
 class StorageConfig:
     sqlite_path: str = "data/edge.db"
+    # At the default five-second flush interval this retains roughly one hour
+    # of offline trajectory while preventing stale batches from growing
+    # without bound or blocking control events behind them.
+    trajectory_outbox_limit: int = 720
 
 
 @dataclass

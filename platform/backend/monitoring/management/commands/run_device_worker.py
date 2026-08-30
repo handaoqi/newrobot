@@ -51,6 +51,15 @@ class Command(BaseCommand):
     @staticmethod
     def _expire_commands():
         now = timezone.now()
+        task_start_ack_cutoff = now - timezone.timedelta(
+            seconds=getattr(settings, "TASK_START_ACK_TIMEOUT_SECONDS", 60)
+        )
+        for command in RemoteCommand.objects.filter(
+            command_type="task.start",
+            status__in=["created", "published"],
+            issued_at__lt=task_start_ack_cutoff,
+        ):
+            CommandService.mark_timeout(command)
         for command in RemoteCommand.objects.filter(
             status__in=["created", "published", "accepted", "executing"],
             expires_at__lt=now,

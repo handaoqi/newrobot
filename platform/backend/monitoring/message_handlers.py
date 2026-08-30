@@ -712,9 +712,39 @@ def _handle_sync(
             "last_accepted_trajectory_seq": -1,
         }
     else:
+        local_state = str(payload.get("local_task_state") or "")
+        reconciled = False
+        if (
+            execution.state in TaskExecution.ACTIVE_STATES
+            and local_state in {"completed", "failed", "cancelled", "timed_out", "rejected"}
+        ):
+            try:
+                local_version = int(payload.get("local_task_state_version") or 0)
+            except (TypeError, ValueError):
+                local_version = 0
+            execution = TaskExecutionService.transition(
+                execution,
+                local_state,
+                event_type="task.sync_terminal_reconciled",
+                state_version=max(execution.state_version + 1, local_version),
+                reason_code="" if local_state == "completed" else "EDGE_SYNC_TERMINAL",
+                reason_message="" if local_state == "completed" else f"Edge 重连时上报终态 {local_state}",
+                payload={
+                    "source": "edge_sync",
+                    "previous_cloud_state": execution.state,
+                    "local_task_state": local_state,
+                    "local_task_state_version": local_version,
+                    "outbox_pending": payload.get("outbox_pending"),
+                },
+            )
+            realtime_publisher.publish_task_event(
+                str(execution.id),
+                TaskExecutionSerializer(execution).data,
+            )
+            reconciled = True
         last_point = execution.trajectory_points.order_by("-seq").first()
-        action = "continue"
-        if execution.state != payload.get("local_task_state"):
+        action = "report_only" if reconciled else "continue"
+        if not reconciled and execution.state != local_state:
             action = "hold"
             if execution.state in {"cancelling", "cancelled"}:
                 action = "cancel"
@@ -724,6 +754,7 @@ def _handle_sync(
             "expected_state_version": execution.state_version,
             "action": action,
             "last_accepted_trajectory_seq": last_point.seq if last_point else -1,
+            "terminal_reconciled": reconciled,
         }
     if publish_response:
         publish_response(
