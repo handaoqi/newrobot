@@ -26,13 +26,13 @@ function milestone(eventType, waypointIndex, waypointId, stateVersion) {
 
 test('a newly started task keeps every waypoint blue until a target is dispatched', () => {
   assert.deepEqual(guardDutyWaypointStates(waypoints, []), ['idle', 'idle'])
-  assert.equal(guardDutyRouteState([]), 'idle')
+  assert.equal(guardDutyRouteState('running'), 'idle')
 })
 
 test('target dispatch changes only that waypoint to yellow', () => {
   const events = [milestone('task.target_dispatched', 0, 'wp-1', 1)]
   assert.deepEqual(guardDutyWaypointStates(waypoints, events), ['target', 'idle'])
-  assert.equal(guardDutyRouteState(events), 'target')
+  assert.equal(guardDutyRouteState('running'), 'idle')
 })
 
 test('target arrival changes the waypoint from yellow to green', () => {
@@ -42,8 +42,20 @@ test('target arrival changes the waypoint from yellow to green', () => {
   ]
   const states = guardDutyWaypointStates(waypoints, events)
   assert.deepEqual(states, ['reached', 'idle'])
-  assert.equal(guardDutyRouteState(events), 'reached')
+  assert.equal(guardDutyRouteState('running'), 'idle')
   assert.equal(activeGuardDutyTarget(events, waypoints, states), null)
+})
+
+test('round and route summary turns green only when the execution completes', () => {
+  assert.equal(guardDutyRouteState('created'), 'idle')
+  assert.equal(guardDutyRouteState('dispatching'), 'idle')
+  assert.equal(guardDutyRouteState('running'), 'idle')
+  assert.equal(guardDutyRouteState('paused'), 'idle')
+  assert.equal(guardDutyRouteState('failed'), 'idle')
+  assert.equal(guardDutyRouteState('cancelled'), 'idle')
+  assert.equal(guardDutyRouteState('timed_out'), 'idle')
+  assert.equal(guardDutyRouteState('completed'), 'reached')
+  assert.equal(guardDutyRouteState('running'), 'idle')
 })
 
 test('execution waypoint index distinguishes repeated waypoint ids', () => {

@@ -31,11 +31,10 @@ export function guardDutyWaypointStates(waypoints = [], milestones = []) {
   return states
 }
 
-export function guardDutyRouteState(milestones = []) {
-  const latest = milestones[milestones.length - 1]
-  if (latest?.event_type === 'task.target_dispatched') return GUARD_WAYPOINT_STATE.target
-  if (latest?.event_type === 'task.waypoint_reached') return GUARD_WAYPOINT_STATE.reached
-  return GUARD_WAYPOINT_STATE.idle
+export function guardDutyRouteState(executionState = '') {
+  return executionState === 'completed'
+    ? GUARD_WAYPOINT_STATE.reached
+    : GUARD_WAYPOINT_STATE.idle
 }
 
 export function activeGuardDutyTarget(milestones = [], waypoints = [], states = []) {

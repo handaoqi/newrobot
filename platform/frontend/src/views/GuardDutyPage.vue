@@ -136,7 +136,7 @@ const waypointStates = computed(() => guardDutyWaypointStates(
   displayRouteWaypoints.value,
   waypointMilestones.value,
 ))
-const routeStatusClass = computed(() => `is-${guardDutyRouteState(waypointMilestones.value)}`)
+const routeStatusClass = computed(() => `is-${guardDutyRouteState(execution.value?.state)}`)
 const activeTargetMilestone = computed(() => activeGuardDutyTarget(
   waypointMilestones.value,
   displayRouteWaypoints.value,
@@ -1469,7 +1469,6 @@ watch(playUrlKey, () => {
 .guard-route-log { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #dde5e9; }
 .guard-route-summary { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; }
 .guard-route-summary > div { display: grid; gap: 2px; min-width: 0; padding: 8px 10px; color: #fff; background: var(--guard-waypoint-idle); transition: background-color .2s ease; }
-.guard-route-summary.is-target > div { background: var(--guard-waypoint-target); }
 .guard-route-summary.is-reached > div { background: var(--guard-waypoint-reached); }
 .guard-route-summary span, .guard-current-target > span { color: #71818c; font-size: 10px; }
 .guard-route-summary > div > span { color: rgba(255, 255, 255, .82); }
