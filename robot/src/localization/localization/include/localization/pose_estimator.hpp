@@ -43,6 +43,7 @@ public:
     bool  is_converged_ = false;   ///< Indicates whether the matching operation converged.
     float fitness_score_ = std::numeric_limits<float>::infinity();  ///< Accepted (or best rejected) fitness.
     float ndt_score_ = std::numeric_limits<float>::infinity();
+    float ndt_inlier_fraction_ = std::numeric_limits<float>::quiet_NaN();
     float refine_score_ = std::numeric_limits<float>::infinity();
     Eigen::Matrix4f transform_ = Eigen::Matrix4f::Identity();
     std::string method_ = "none";
@@ -232,6 +233,7 @@ private:
   float max_fitness_score_ = 0.50f;
   float coarse_max_fitness_score_ = 2.00f;
   ScanMatchRefinePolicy refine_policy_;
+  int consecutive_zero_ndt_inliers_ = 0;
 
   pcl::PointCloud<PointT>::Ptr cropLocalMap(const Eigen::Vector3f& center) const;
 

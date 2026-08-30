@@ -7,10 +7,22 @@ namespace {
 
 TEST(ScanMatchPolicy, StableHighQualityNdtSkipsRefinement) {
   ScanMatchRefinePolicy policy;
-  EXPECT_FALSE(shouldRunRefinement(true, true, 0.14f, policy));
-  EXPECT_TRUE(shouldRunRefinement(false, true, 0.14f, policy));
-  EXPECT_TRUE(shouldRunRefinement(true, true, 0.16f, policy));
-  EXPECT_TRUE(shouldRunRefinement(true, false, 0.10f, policy));
+  EXPECT_FALSE(shouldRunRefinement(true, true, 0.14f, 0, policy));
+  EXPECT_TRUE(shouldRunRefinement(false, true, 0.14f, 0, policy));
+  EXPECT_TRUE(shouldRunRefinement(true, true, 0.16f, 0, policy));
+  EXPECT_TRUE(shouldRunRefinement(true, false, 0.10f, 0, policy));
+}
+
+TEST(ScanMatchPolicy, ConsecutiveZeroInliersSkipRefinement) {
+  ScanMatchRefinePolicy policy;
+  policy.zero_inlier_skip_count = 2;
+
+  EXPECT_TRUE(shouldRunRefinement(false, false, 1.0f, 1, policy));
+  EXPECT_FALSE(shouldRunRefinement(false, false, 1.0f, 2, policy));
+  EXPECT_FALSE(shouldRunRefinement(false, true, 0.20f, 3, policy));
+
+  policy.zero_inlier_skip_count = 0;
+  EXPECT_TRUE(shouldRunRefinement(false, false, 1.0f, 20, policy));
 }
 
 TEST(ScanMatchPolicy, RefinementMustImproveAndRemainConsistent) {

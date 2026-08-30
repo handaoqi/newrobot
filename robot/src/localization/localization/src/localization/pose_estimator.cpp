@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 #include <localization/pose_system.hpp>
 #include <localization/odom_system.hpp>
 #include <kkl/alg/unscented_kalman_filter.hpp>
@@ -258,6 +259,7 @@ void PoseEstimator::configure_scan_matching(
 void PoseEstimator::configure_refine_policy(const ScanMatchRefinePolicy& policy) {
   refine_policy_.skip_ndt_score = std::clamp(
     policy.skip_ndt_score, 0.001f, max_fitness_score_);
+  refine_policy_.zero_inlier_skip_count = std::max(0, policy.zero_inlier_skip_count);
   refine_policy_.min_improvement_ratio = std::clamp(
     policy.min_improvement_ratio, 0.0f, 0.90f);
   refine_policy_.max_translation_disagreement_m = std::max(
@@ -336,6 +338,34 @@ AlignAttempt runAlign(
   }
   return attempt;
 }
+
+float inlierFraction(
+    const pcl::Registration<pcl::PointXYZI, pcl::PointXYZI>::Ptr& registration,
+    const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& aligned,
+    float max_correspondence_distance) {
+  if (!aligned || aligned->empty()) {
+    return 0.0f;
+  }
+  const auto target_tree = registration ? registration->getSearchMethodTarget() : nullptr;
+  if (!target_tree) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  const float max_squared_distance =
+    max_correspondence_distance * max_correspondence_distance;
+  std::size_t inliers = 0;
+  std::vector<int> indices;
+  std::vector<float> squared_distances;
+  for (const auto& point : aligned->points) {
+    indices.clear();
+    squared_distances.clear();
+    if (target_tree->nearestKSearch(point, 1, indices, squared_distances) > 0 &&
+        !squared_distances.empty() && squared_distances.front() < max_squared_distance) {
+      ++inliers;
+    }
+  }
+  return static_cast<float>(inliers) / static_cast<float>(aligned->size());
+}
 }  // namespace
 
 /**
@@ -380,6 +410,18 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     std::chrono::steady_clock::now() - ndt_start).count();
 
   match_result_.ndt_score_ = static_cast<float>(ndt.fitness);
+  constexpr float kInlierMaxCorrespondenceDistanceM = 0.5f;
+  match_result_.ndt_inlier_fraction_ = inlierFraction(
+    registration, ndt.aligned, kInlierMaxCorrespondenceDistanceM);
+  const bool fast_reject_zero_inliers = refine_policy_.zero_inlier_skip_count > 0 &&
+    consecutive_zero_ndt_inliers_ >= refine_policy_.zero_inlier_skip_count;
+  if (fast_reject_zero_inliers) {
+    static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(
+      logger_, steady_clock, 2000,
+      "Skipping VGICP refine: the previous %d scan matches reported zero inliers",
+      consecutive_zero_ndt_inliers_);
+  }
   match_result_.refine_score_ = std::numeric_limits<float>::infinity();
   match_result_.transform_ = ndt.transform;
   match_result_.fitness_score_ = static_cast<float>(ndt.fitness);
@@ -388,7 +430,7 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   AlignAttempt refine;
   const bool run_refine = refine_registration_ && shouldRunRefinement(
     allow_high_quality_refine_skip, ndt.acceptable,
-    static_cast<float>(ndt.fitness), refine_policy_);
+    static_cast<float>(ndt.fitness), consecutive_zero_ndt_inliers_, refine_policy_);
   if (run_refine) {
     const Eigen::Matrix4f refine_guess = ndt.usable_as_seed ? ndt.transform : init_guess;
     const auto local_map_start = std::chrono::steady_clock::now();
@@ -441,7 +483,17 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     match_result_.method_ = ndt.usable_as_seed ? "ndt_vgicp" : "vgicp";
   } else if (ndt.acceptable) {
     chosen = ndt;
-    match_result_.method_ = run_refine ? "ndt" : "ndt_high_quality";
+    match_result_.method_ = run_refine ? "ndt" :
+      (fast_reject_zero_inliers ? "ndt_zero_inlier_skip" : "ndt_high_quality");
+  }
+
+  const float chosen_inlier_fraction = chosen.acceptable
+    ? inlierFraction(registration, chosen.aligned, kInlierMaxCorrespondenceDistanceM)
+    : 0.0f;
+  if (std::isfinite(chosen_inlier_fraction) && chosen_inlier_fraction <= 0.0f) {
+    ++consecutive_zero_ndt_inliers_;
+  } else {
+    consecutive_zero_ndt_inliers_ = 0;
   }
 
   match_result_.is_converged_ = chosen.acceptable;
@@ -454,7 +506,8 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     match_result_.transform_ = refine.transform;
     match_result_.method_ = "vgicp_rejected";
   } else {
-    match_result_.method_ = "ndt_rejected";
+    match_result_.method_ = fast_reject_zero_inliers
+      ? "ndt_zero_inlier_rejected" : "ndt_rejected";
   }
 
   if (!chosen.acceptable) {

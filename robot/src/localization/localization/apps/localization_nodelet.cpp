@@ -199,6 +199,8 @@ public:
     scan_matching_refine_policy_.skip_ndt_score = static_cast<float>(std::clamp(
       declare_parameter<double>("scan_matching.refine_skip_ndt_score", 0.15),
       0.001, static_cast<double>(ndt_max_fitness_score_)));
+    scan_matching_refine_policy_.zero_inlier_skip_count = static_cast<int>(std::max<int64_t>(
+      0, declare_parameter<int>("scan_matching.refine_zero_inlier_skip_count", 2)));
     scan_matching_refine_policy_.min_improvement_ratio = static_cast<float>(std::clamp(
       declare_parameter<double>("scan_matching.refine_min_improvement_ratio", 0.05),
       0.0, 0.90));
@@ -966,11 +968,12 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "Indoor scan matching: NDT coarse + local FastVGICP refine "
-      "(res=%.2fm corr=%.2fm iter=%d threads=%d stable_skip<=%.3f improve>=%.0f%%)",
+      "(res=%.2fm corr=%.2fm iter=%d threads=%d stable_skip<=%.3f zero_inlier_skip=%d improve>=%.0f%%)",
       scan_matching_vgicp_resolution_,
       scan_matching_max_correspondence_distance_,
       scan_matching_max_iterations_,
       scan_matching_num_threads_, scan_matching_refine_policy_.skip_ndt_score,
+      scan_matching_refine_policy_.zero_inlier_skip_count,
       scan_matching_refine_policy_.min_improvement_ratio * 100.0f);
     return vgicp;
   }

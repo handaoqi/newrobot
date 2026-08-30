@@ -8,6 +8,7 @@ namespace localization {
 
 struct ScanMatchRefinePolicy {
   float skip_ndt_score = 0.15f;
+  int zero_inlier_skip_count = 2;
   float min_improvement_ratio = 0.05f;
   float max_translation_disagreement_m = 0.30f;
   float max_rotation_disagreement_rad = 0.0872665f;
@@ -17,7 +18,12 @@ inline bool shouldRunRefinement(
     bool allow_high_quality_skip,
     bool ndt_acceptable,
     float ndt_fitness,
+    int consecutive_zero_inlier_count,
     const ScanMatchRefinePolicy& policy) {
+  if (policy.zero_inlier_skip_count > 0 &&
+      consecutive_zero_inlier_count >= policy.zero_inlier_skip_count) {
+    return false;
+  }
   return !(allow_high_quality_skip && ndt_acceptable &&
     std::isfinite(ndt_fitness) && ndt_fitness <= policy.skip_ndt_score);
 }

@@ -220,6 +220,10 @@ localization:
       # 0.30 removes the rejected VGICP pass while retaining a margin to the
       # normal 0.50 acceptance ceiling.
       refine_skip_ndt_score: 0.30
+      # A wrong relocalization seed often has no geometric overlap at all.
+      # After two consecutive scan-match results report zero inliers for the
+      # same candidate, reject subsequent matches without another VGICP pass.
+      refine_zero_inlier_skip_count: 2
       refine_min_improvement_ratio: 0.05
       refine_max_translation_disagreement_m: 0.30
       refine_max_rotation_disagreement_deg: 5.0
