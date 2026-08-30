@@ -40,6 +40,9 @@ class CommandService:
             allow_docking=bool((command_options.get("docking") or {}).get("enabled")),
         )
         if command_type == "task.start":
+            record_rosbag = command_options.get("record_rosbag")
+            if record_rosbag is None:
+                record_rosbag = execution.task.record_rosbag
             command_payload = {
                 "task_id": str(execution.task_id),
                 "task_name": execution.task.name,
@@ -50,7 +53,7 @@ class CommandService:
                     "max_duration_seconds": getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800),
                     "continue_on_disconnect": True,
                 },
-                "record_rosbag": bool(command_options.get("record_rosbag", False)),
+                "record_rosbag": bool(record_rosbag),
                 "loop_execution": bool(command_options.get("loop_execution", False)),
                 "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
                 "round_number": execution.round_number,

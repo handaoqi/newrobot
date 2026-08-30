@@ -363,24 +363,29 @@ export async function createPatrolTask(payload) {
   return request('/patrol-tasks/', { method: 'POST', body: JSON.stringify(payload) })
 }
 
+export async function updatePatrolTask(taskId, payload) {
+  return request(`/patrol-tasks/${taskId}/`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
 export async function deletePatrolTask(taskId, { force = false } = {}) {
   return request(`/patrol-tasks/${taskId}/${force ? '?force=true' : ''}`, { method: 'DELETE' })
 }
 
 export async function executePatrolTask(taskId, {
-  recordRosbag = false,
+  recordRosbag = null,
   loopExecution = false,
   loopSessionId = null,
   roundNumber = 1,
 } = {}) {
+  const payload = {
+    loop_execution: loopExecution,
+    loop_session_id: loopSessionId,
+    round_number: roundNumber,
+  }
+  if (typeof recordRosbag === 'boolean') payload.record_rosbag = recordRosbag
   return request(`/patrol-tasks/${taskId}/execute/`, {
     method: 'POST',
-    body: JSON.stringify({
-      record_rosbag: recordRosbag,
-      loop_execution: loopExecution,
-      loop_session_id: loopSessionId,
-      round_number: roundNumber,
-    }),
+    body: JSON.stringify(payload),
   })
 }
 

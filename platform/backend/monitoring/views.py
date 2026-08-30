@@ -3470,8 +3470,8 @@ class PatrolRouteExecuteView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, pk):
-        record_rosbag = request.data.get("record_rosbag", False)
-        if not isinstance(record_rosbag, bool):
+        record_rosbag = request.data.get("record_rosbag")
+        if record_rosbag is not None and not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             loop_execution, loop_session_id, round_number = parse_loop_execution_context(request.data)
@@ -3826,8 +3826,8 @@ class PatrolTaskExecuteView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, task_id):
-        record_rosbag = request.data.get("record_rosbag", False)
-        if not isinstance(record_rosbag, bool):
+        record_rosbag = request.data.get("record_rosbag")
+        if record_rosbag is not None and not isinstance(record_rosbag, bool):
             return Response({"detail": "record_rosbag 必须是布尔值"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             loop_execution, loop_session_id, round_number = parse_loop_execution_context(request.data)

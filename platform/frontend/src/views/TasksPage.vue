@@ -9,6 +9,7 @@ import {
   fetchPatrolTasks,
   fetchRobots,
   fetchRouteSummaries,
+  updatePatrolTask,
 } from '../services/api'
 
 const router = useRouter()
@@ -16,8 +17,8 @@ const tasks = ref([])
 const robots = ref([])
 const routes = ref([])
 const error = ref('')
-const recordNavigationBag = ref(false)
-const form = ref({ name: '', robot: '', route: '', description: '', enabled: true })
+const savingRecordTaskId = ref(null)
+const form = ref({ name: '', robot: '', route: '', description: '', enabled: true, record_rosbag: false })
 
 const routeOptions = computed(() => {
   if (!form.value.robot) return routes.value
@@ -82,7 +83,7 @@ async function createTask() {
   error.value = ''
   try {
     await createPatrolTask(form.value)
-    form.value = { name: '', robot: '', route: '', description: '', enabled: true }
+    form.value = { name: '', robot: '', route: '', description: '', enabled: true, record_rosbag: false }
     await load()
   } catch (exc) {
     error.value = exc.message
@@ -92,10 +93,28 @@ async function createTask() {
 async function execute(task) {
   error.value = ''
   try {
-    const execution = await executePatrolTask(task.id, { recordRosbag: recordNavigationBag.value })
+    const execution = await executePatrolTask(task.id)
     router.push(`/dashboard/task-executions/${execution.id}`)
   } catch (exc) {
     error.value = exc.message
+  }
+}
+
+async function setTaskRecording(task, event) {
+  const enabled = event.target.checked
+  const previous = Boolean(task.record_rosbag)
+  savingRecordTaskId.value = task.id
+  error.value = ''
+  task.record_rosbag = enabled
+  try {
+    const updated = await updatePatrolTask(task.id, { record_rosbag: enabled })
+    Object.assign(task, updated)
+  } catch (exc) {
+    task.record_rosbag = previous
+    event.target.checked = previous
+    error.value = exc.message
+  } finally {
+    savingRecordTaskId.value = null
   }
 }
 
@@ -157,19 +176,19 @@ onMounted(load)
           <option v-for="route in routeOptions" :key="route.id" :value="route.id">{{ route.name }} / {{ route.map_name }}</option>
         </select>
         <input v-model="form.description" placeholder="任务说明" />
+        <label class="diagnostic-record-toggle form-record-toggle">
+          <input v-model="form.record_rosbag" type="checkbox" />
+          <span>
+            <strong>录制导航诊断包</strong>
+            <small>持久保存；手动、日历调度和循环执行都生效。</small>
+          </span>
+        </label>
       </div>
       <p v-if="error" class="form-error">{{ error }}</p>
       <button class="primary-btn" :disabled="!form.name || !form.robot || !form.route" @click="createTask">保存模板</button>
     </section>
 
     <section class="panel detail-panel">
-      <label class="diagnostic-record-toggle">
-        <input v-model="recordNavigationBag" type="checkbox" />
-        <span>
-          <strong>录制导航诊断包</strong>
-          <small>仅影响“立即执行”；任务结束后自动保存到机器狗。</small>
-        </span>
-      </label>
       <div class="task-list">
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div>
@@ -178,6 +197,15 @@ onMounted(load)
             <small>任务模板 · {{ task.enabled ? '可用于日历自动调度' : '已停用，不参与自动调度' }}</small>
           </div>
           <div class="table-side action-row">
+            <label class="task-record-toggle">
+              <input
+                :checked="task.record_rosbag"
+                :disabled="savingRecordTaskId === task.id"
+                type="checkbox"
+                @change="setTaskRecording(task, $event)"
+              />
+              <span>{{ savingRecordTaskId === task.id ? '保存中…' : '录制导航包' }}</span>
+            </label>
             <span class="panel-badge">{{ task.latest_execution?.state || '未执行' }}</span>
             <button v-if="task.latest_execution" class="ghost-btn" @click="router.push(`/dashboard/task-executions/${task.latest_execution.id}`)">详情</button>
             <button class="primary-btn" :disabled="!task.enabled" @click="execute(task)">立即执行</button>
@@ -195,13 +223,16 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 14px;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--table-bg);
   cursor: pointer;
   user-select: none;
+}
+
+.form-record-toggle {
+  grid-column: 1 / -1;
 }
 
 .diagnostic-record-toggle input {
@@ -217,5 +248,19 @@ onMounted(load)
 
 .diagnostic-record-toggle small {
   color: var(--muted);
+}
+
+.task-record-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.task-record-toggle input {
+  width: 16px;
+  height: 16px;
 }
 </style>

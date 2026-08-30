@@ -4,9 +4,20 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 import uuid
 
-from .models import MapData, PatrolRoute, PatrolTask, RemoteCommand, Robot, SpeechCategory, SpeechTemplate, TaskExecution
+from .models import (
+    MapData,
+    PatrolRoute,
+    PatrolSchedule,
+    PatrolTask,
+    RemoteCommand,
+    Robot,
+    SpeechCategory,
+    SpeechTemplate,
+    TaskExecution,
+)
 from .services.command_service import CommandService
 from .services.docking_service import dispatch_docking_task
+from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
 
 
@@ -153,6 +164,65 @@ class TaskExecutionTests(TestCase):
         )
         self.assertEqual(response.status_code, 201)
         self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_task_execute_uses_persisted_navigation_rosbag_setting(self):
+        self.task.record_rosbag = True
+        self.task.save(update_fields=["record_rosbag", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", {}, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_task_execute_can_override_persisted_navigation_rosbag_setting(self):
+        self.task.record_rosbag = True
+        self.task.save(update_fields=["record_rosbag", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": False},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], False)
+
+    def test_task_api_persists_navigation_rosbag_setting(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.put(
+            f"/api/patrol-tasks/{self.task.id}/",
+            {"record_rosbag": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.task.refresh_from_db()
+        self.assertIs(self.task.record_rosbag, True)
+        self.assertIs(response.data["record_rosbag"], True)
+
+    def test_scheduled_task_uses_persisted_navigation_rosbag_setting(self):
+        self.task.record_rosbag = True
+        self.task.save(update_fields=["record_rosbag", "updated_at"])
+        schedule = PatrolSchedule.objects.create(
+            name="daily patrol",
+            robot=self.robot,
+            task_template=self.task,
+            route=self.route,
+            map_data=self.map,
+            schedule_type="daily",
+            time_of_day=timezone.localtime().time().replace(second=0, microsecond=0),
+        )
+
+        run = ScheduleService.trigger_now(schedule, operator=self.user)
+
+        self.assertEqual(run.status, "dispatched")
+        self.assertIs(run.remote_command.payload["record_rosbag"], True)
 
     def test_task_execute_marks_loop_execution(self):
         client = APIClient()

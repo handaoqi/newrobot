@@ -147,6 +147,7 @@ class PatrolTask(BaseTimestampModel):
         blank=True,
     )
     enabled = models.BooleanField(default=True)
+    record_rosbag = models.BooleanField(default=False)
     description = models.TextField(blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

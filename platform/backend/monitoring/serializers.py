@@ -312,6 +312,7 @@ class PatrolTaskSerializer(serializers.ModelSerializer):
             "route_name_display",
             "map_id",
             "enabled",
+            "record_rosbag",
             "description",
             "latest_execution",
             "created_at",
@@ -338,7 +339,16 @@ class PatrolTaskCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PatrolTask
-        fields = ["name", "robot", "route", "enabled", "description", "scheduled_start", "scheduled_end"]
+        fields = [
+            "name",
+            "robot",
+            "route",
+            "enabled",
+            "record_rosbag",
+            "description",
+            "scheduled_start",
+            "scheduled_end",
+        ]
 
     def validate(self, attrs):
         robot = attrs.get("robot", getattr(self.instance, "robot", None))
