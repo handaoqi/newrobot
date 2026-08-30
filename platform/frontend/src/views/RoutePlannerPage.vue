@@ -2499,13 +2499,13 @@ async function handleDeleteRoute(route) {
             <p v-if="navError" class="form-error">{{ navError }}</p>
             <div class="nav-actions">
               <label class="single-goal-selector">
-                <span>目标途经点</span>
+                <span>目标航点</span>
                 <select v-model.number="selectedSingleGoalIndex" :disabled="!!navCommandBusy || waypoints.length === 0">
                   <option v-for="(point, index) in waypoints" :key="index" :value="index">{{ waypointNames[index] || `点${index + 1}` }}（{{ waypointDisplayText(point) }}）</option>
                 </select>
               </label>
               <button class="btn btn-sm btn-primary" :disabled="!!navCommandBusy || !selectedMap || !selectedRobot || !waypoints.length || navStatus?.connection_status !== 'online'" @click="executeSingleGoal(selectedSingleGoalIndex)">
-                {{ navCommandBusy === 'single-goal' ? '单点导航下发中...' : '执行单点导航' }}
+                {{ navCommandBusy === 'single-goal' ? '单点导航下发中...' : '单点导航' }}
               </button>
               <button class="btn btn-sm" :disabled="!!navCommandBusy" @click="refreshNavigationStatus">刷新状态</button>
               <button

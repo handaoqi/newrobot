@@ -35,6 +35,14 @@ class ProtocolContractTests(SimpleTestCase):
         envelope = parse_message(payload)
         self.assertEqual(envelope.message_type, "nav.recover")
 
+    def test_accepts_nav_single_goal_command(self):
+        payload = json.loads(self.fixture_path.read_text())
+        payload["message_type"] = "nav.single_goal"
+        payload["payload"].pop("task_execution_id", None)
+        payload["payload"]["command"] = {"x": 1.25, "y": -0.5, "yaw": 0.75}
+        envelope = parse_message(payload)
+        self.assertEqual(envelope.message_type, "nav.single_goal")
+
     def test_accepts_mapping_origin_workflow_commands(self):
         for command_type in (
             "mapping.origin_start", "mapping.origin_cancel", "mapping.slam_start", "mapping.begin",

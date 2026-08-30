@@ -32,6 +32,7 @@ COMMAND_TYPES = {
     "nav.recover",
     "nav.stop",
     "nav.initial_pose",
+    "nav.single_goal",
     "nav.relocalize",
     "map.activate",
     "map.optimize",

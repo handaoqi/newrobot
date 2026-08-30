@@ -910,6 +910,7 @@ class RemoteCommand(BaseTimestampModel):
         ("nav.recover", "恢复导航栈"),
         ("nav.stop", "停止导航栈"),
         ("nav.initial_pose", "设置初始定位"),
+        ("nav.single_goal", "单点导航"),
         ("nav.relocalize", "主动重定位"),
         ("map.activate", "切换活动地图"),
         ("map.optimize", "离线回环优化"),
