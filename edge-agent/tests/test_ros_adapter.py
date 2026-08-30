@@ -70,12 +70,9 @@ def test_relocalization_candidates_cover_full_yaw_and_nearby_positions():
     }
     assert len(center_yaws) == 8
     assert round(math.pi, 6) in {round(abs(yaw), 6) for yaw in center_yaws}
-    assert {(candidate["x"], candidate["y"]) for candidate in candidates[8:]} == {
-        (5.0, 5.0),
-        (3.0, 5.0),
-        (4.0, 6.0),
-        (4.0, 4.0),
-    }
+    positions = {(candidate["x"], candidate["y"]) for candidate in candidates[8:]}
+    for radius in (0.3, 0.6, 1.0):
+        assert {(4.0 + radius, 5.0), (4.0 - radius, 5.0), (4.0, 5.0 + radius), (4.0, 5.0 - radius)} <= positions
 
 
 def test_ndt_score_over_threshold_triggers_recovery_after_hysteresis():
