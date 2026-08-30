@@ -152,8 +152,9 @@ localization:
       initialization_ndt_stride: 2
       stationary_ndt_stride: 5
       moving_ndt_stride: 5
-      # Stride and monotonic time must both be due. At the current 10 Hz input,
-      # stride=5 is about 2 Hz; this keeps the ceiling if LiDAR rate increases.
+      # The stride bootstraps the first match. Afterwards monotonic time owns
+      # the cadence, so the first cloud after each deadline runs immediately;
+      # the rate limit still keeps the ceiling if LiDAR frequency increases.
       stable_ndt_max_rate_hz: 2.0
       recovery_ndt_max_rate_hz: 5.0
       # Do not abandon a healthy NDT source on a single noisy moving scan.

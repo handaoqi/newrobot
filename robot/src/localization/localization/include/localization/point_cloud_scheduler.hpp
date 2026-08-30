@@ -77,10 +77,19 @@ inline PointCloudWorkDecision decidePointCloudWork(
     ? (input.lio_stable ? config.stable_max_rate_hz : config.recovery_max_rate_hz)
     : 0.0;
   decision.rate_due = rateLimitDue(input.now_ns, input.last_ndt_start_ns, max_rate_hz);
+  // Use the frame stride only to bootstrap the first match (or when no valid
+  // monotonic rate can be configured).  Once a match has started, the wall
+  // clock owns the cadence and the first cloud after the deadline runs NDT.
+  // Requiring stride_due and rate_due on the same cloud makes small 10 Hz
+  // LiDAR timing jitter miss a 500 ms deadline and wait another five frames,
+  // reducing a configured 2 Hz cadence to roughly 1.3 Hz in practice.
+  const bool clock_cadence_active = input.lio_primary_enabled && max_rate_hz > 0.0 &&
+    input.last_ndt_start_ns > 0 && input.now_ns > 0;
+  const bool cadence_due = clock_cadence_active ? decision.rate_due : decision.stride_due;
   const bool stable_correction_suppressed = input.lio_primary_enabled && input.lio_stable &&
     input.correction_suppressed;
   decision.run_ndt = !input.lidar_matching_paused && !input.rtk_primary &&
-    !stable_correction_suppressed && decision.stride_due && decision.rate_due;
+    !stable_correction_suppressed && cadence_due;
   decision.needs_heavy_cloud = !input.lidar_matching_paused &&
     (decision.run_ndt || input.global_relocalization_requested ||
       input.lidar_odometry_required);
@@ -88,10 +97,10 @@ inline PointCloudWorkDecision decidePointCloudWork(
     decision.reason = "rtk_primary_paused";
   } else if (stable_correction_suppressed) {
     decision.reason = "correction_suppressed";
-  } else if (!decision.stride_due) {
-    decision.reason = "stride_skip";
-  } else if (!decision.rate_due) {
+  } else if (clock_cadence_active && !decision.rate_due) {
     decision.reason = "rate_limited";
+  } else if (!cadence_due) {
+    decision.reason = "stride_skip";
   } else if (decision.run_ndt) {
     decision.reason = input.lio_stable ? "stable_match" : "recovery_match";
   } else if (decision.needs_heavy_cloud) {
