@@ -17,6 +17,7 @@ const videoRef = ref(null)
 const streamUnavailable = ref(false)
 const streamLoading = ref(false)
 const liveAudioEnabled = ref(false)
+const liveAudioChanging = ref(false)
 const streamAudioDetected = ref(false)
 const audioDetectionSuppressed = ref(false)
 const browserAudioMuted = ref(true)
@@ -36,6 +37,7 @@ let applyingBrowserAudio = false
 let setupVersion = 0
 let mediaModulesPromise = null
 let playerSetupTimer = null
+let audioReconnectTimer = null
 
 function loadMediaModules() {
   if (!mediaModulesPromise) {
@@ -85,18 +87,49 @@ function handleBrowserAudioChange(event) {
   browserAudioVolume.value = element.volume
 }
 
+function setBrowserAudioMuted(muted) {
+  browserAudioMuted.value = Boolean(muted)
+  applyBrowserAudio(videoRef.value, { muted: browserAudioMuted.value })
+}
+
 function detectStreamAudio(event) {
   const element = event.currentTarget
   const hasAudioTrack = Boolean(element.audioTracks?.length)
   const hasDecodedAudio = Number(element.webkitAudioDecodedByteCount || 0) > 0
-  if (hasAudioTrack || hasDecodedAudio) streamAudioDetected.value = true
+  if (hasAudioTrack || hasDecodedAudio) {
+    streamAudioDetected.value = true
+    if (liveAudioEnabled.value) applyBrowserAudio(element, { muted: false })
+  }
+}
+
+function clearAudioReconnectTimer() {
+  if (!audioReconnectTimer) return
+  window.clearTimeout(audioReconnectTimer)
+  audioReconnectTimer = null
+}
+
+function reconnectAfterAudioCaptureChange() {
+  clearAudioReconnectTimer()
+  audioReconnectTimer = window.setTimeout(() => {
+    audioReconnectTimer = null
+    if (!liveAudioEnabled.value || playbackMode.value !== 'live') return
+    streamUnavailable.value = false
+    schedulePlayerSetup()
+  }, 1500)
 }
 
 async function setLiveAudio(enabled) {
+  if (liveAudioChanging.value) return
   if (!props.robotId) {
     notify('当前没有可控制的机器人音频采集', 'alert')
     return
   }
+  const previousMuted = browserAudioMuted.value
+  liveAudioChanging.value = true
+  // The click itself is a browser user gesture. Apply the desired mute state
+  // immediately so Chrome/Safari allow audio once the restarted stream track
+  // arrives; waiting for the device command would lose that gesture.
+  setBrowserAudioMuted(!enabled)
   try {
     const command = await setRobotStreamAudioCapture(props.robotId, enabled)
     if (enabled && command?.id) {
@@ -110,10 +143,15 @@ async function setLiveAudio(enabled) {
     }
     liveAudioEnabled.value = enabled
     audioDetectionSuppressed.value = !enabled
-    if (!enabled) streamAudioDetected.value = false
+    streamAudioDetected.value = false
+    if (enabled) reconnectAfterAudioCaptureChange()
+    else clearAudioReconnectTimer()
     notify(enabled ? '已请求开启 NX 现场音频采集' : '已请求关闭 NX 现场音频采集')
   } catch (error) {
+    setBrowserAudioMuted(previousMuted)
     notify(error.message || 'NX 现场音频采集控制失败', 'alert')
+  } finally {
+    liveAudioChanging.value = false
   }
 }
 
@@ -459,13 +497,19 @@ watch(() => props.available, (available) => {
 })
 
 watch(() => props.robotId, () => {
+  clearAudioReconnectTimer()
   liveAudioEnabled.value = false
+  liveAudioChanging.value = false
   streamAudioDetected.value = false
   audioDetectionSuppressed.value = false
+  setBrowserAudioMuted(true)
 })
 
 onMounted(() => { void setupPlayer() })
-onBeforeUnmount(destroyPlayers)
+onBeforeUnmount(() => {
+  clearAudioReconnectTimer()
+  destroyPlayers()
+})
 
 defineExpose({ returnToLive })
 </script>
@@ -507,9 +551,10 @@ defineExpose({ returnToLive })
       type="button"
       class="live-video-player__listen-toggle"
       :class="{ active: audioToggleActive }"
+      :disabled="liveAudioChanging"
       @click="setLiveAudio(!audioToggleActive)"
     >
-      {{ audioToggleActive ? '关闭现场收音' : '开启现场收音' }}
+      {{ liveAudioChanging ? '正在切换现场收音' : (audioToggleActive ? '关闭现场收音' : '开启现场收音') }}
     </button>
 
     <div v-if="hasStream && !loading && !streamLoading" class="live-video-player__playback-controls" aria-label="视频播放控制">
@@ -529,6 +574,7 @@ defineExpose({ returnToLive })
 .live-video-player__empty { display: grid; place-content: center; gap: 8px; color: #d7e0e6; text-align: center; background: #152633; }
 .live-video-player__listen-toggle { position: absolute; z-index: 12; top: 18px; right: 18px; min-height: 42px; padding: 0 16px; border: 1px solid rgba(255, 255, 255, .4); color: #fff; background: rgba(10, 29, 41, .82); font: inherit; font-weight: 800; cursor: pointer; }
 .live-video-player__listen-toggle.active { border-color: #52d99c; background: rgba(16, 110, 73, .9); }
+.live-video-player__listen-toggle:disabled { cursor: wait; opacity: .72; }
 .live-video-player__playback-controls { position: absolute; z-index: 12; top: 18px; left: 50%; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 9px; color: #fff; background: rgba(10, 29, 41, .82); transform: translateX(-50%); }
 .live-video-player__playback-controls button { min-height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, .36); color: #fff; background: rgba(27, 62, 81, .9); font: inherit; font-size: 12px; font-weight: 800; cursor: pointer; }
 .live-video-player__playback-controls button:hover { background: rgba(42, 99, 128, .96); }
