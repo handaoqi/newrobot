@@ -776,14 +776,24 @@ class TaskExecutor:
             return
         points = self.context.route_snapshot.get("waypoints") or []
         index = min(max(0, self.context.current_waypoint_index), max(0, len(points) - 1))
-        waypoint = dict(points[index]) if points else None
+        candidate_indexes = [index, index - 1, index + 1, 0, len(points) - 1]
         relocalize = getattr(self.navigation, "active_relocalize", None)
-        if waypoint and callable(relocalize):
-            try:
-                relocalize({"x": float(waypoint["x"]), "y": float(waypoint["y"]), "yaw": float(waypoint.get("yaw", 0.0)), "max_attempts": 12, "source": "startup_waypoint"})
-                return
-            except Exception as exc:
-                LOGGER.warning("startup waypoint localization failed: %s", exc)
+        seen = set()
+        if callable(relocalize):
+            for candidate_index in candidate_indexes:
+                if candidate_index < 0 or candidate_index >= len(points):
+                    continue
+                waypoint = dict(points[candidate_index])
+                key = (round(float(waypoint["x"]), 3), round(float(waypoint["y"]), 3))
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    LOGGER.info("startup localization waypoint candidate index=%d", candidate_index)
+                    relocalize({"x": float(waypoint["x"]), "y": float(waypoint["y"]), "yaw": float(waypoint.get("yaw", 0.0)), "max_attempts": 12, "source": "startup_waypoint", "waypoint_index": candidate_index})
+                    return
+                except Exception as exc:
+                    LOGGER.warning("startup waypoint %d localization failed: %s", candidate_index, exc)
         global_relocalize = getattr(self.navigation, "global_relocalize", None)
         if callable(global_relocalize):
             try:
