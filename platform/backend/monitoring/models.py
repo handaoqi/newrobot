@@ -896,6 +896,7 @@ class RemoteCommand(BaseTimestampModel):
         ("task.start", "启动任务"),
         ("task.pause", "暂停任务"),
         ("task.resume", "继续任务"),
+        ("task.resume_forward", "恢复前向"),
         ("task.cancel", "终止任务"),
         ("task.force_exit", "强制退出并清理任务"),
         ("mapping.start", "开始建图"),

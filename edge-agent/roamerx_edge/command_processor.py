@@ -334,6 +334,8 @@ class CommandProcessor:
             self.safety.validate_resume(self.task_executor.context.state)
             resume_index = int(envelope.payload["command"].get("resume_from_waypoint_index", -1))
             result_payload = self.task_executor.resume_task(execution_id, resume_index)
+        elif envelope.message_type == "task.resume_forward":
+            result_payload = self.task_executor.resume_forward(execution_id)
         else:
             self.safety.validate_cancel(self.task_executor.context.state)
             result_payload = self.task_executor.cancel_task(execution_id)

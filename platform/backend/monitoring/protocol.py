@@ -15,6 +15,7 @@ COMMAND_TYPES = {
     "task.start",
     "task.pause",
     "task.resume",
+    "task.resume_forward",
     "task.cancel",
     "task.force_exit",
     "mapping.start",

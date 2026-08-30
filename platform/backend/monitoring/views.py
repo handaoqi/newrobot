@@ -4057,6 +4057,10 @@ class TaskExecutionResumeView(TaskExecutionCommandView):
     command_type = "task.resume"
 
 
+class TaskExecutionResumeForwardView(TaskExecutionCommandView):
+    command_type = "task.resume_forward"
+
+
 class TaskExecutionCancelView(TaskExecutionCommandView):
     command_type = "task.cancel"
 

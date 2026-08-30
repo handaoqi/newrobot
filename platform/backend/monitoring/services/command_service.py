@@ -17,6 +17,7 @@ class CommandService:
         "task.start": "dispatching",
         "task.pause": "pausing",
         "task.resume": "resuming",
+        "task.resume_forward": "resuming",
         "task.cancel": "cancelling",
         "task.force_exit": "cancelling",
     }
@@ -64,6 +65,9 @@ class CommandService:
             expiry_seconds = getattr(settings, "TASK_MAX_DURATION_SECONDS", 1800)
         elif command_type == "task.resume":
             command_payload = {"resume_from_waypoint_index": execution.current_waypoint_index or 0}
+            expiry_seconds = getattr(settings, "COMMAND_CONTROL_EXPIRY_SECONDS", 15)
+        elif command_type == "task.resume_forward":
+            command_payload = {"reason": "operator_resume_forward", "resume_forward": True}
             expiry_seconds = getattr(settings, "COMMAND_CONTROL_EXPIRY_SECONDS", 15)
         else:
             command_payload = {"reason": "operator_request"}

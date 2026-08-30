@@ -50,6 +50,11 @@ const progress = computed(() => {
 })
 const isActive = computed(() => ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted'].includes(execution.value?.state))
 const rosbagStatus = computed(() => resolveTaskRosbagStatus(execution.value))
+const obstacleManualIntervention = computed(() =>
+  (execution.value?.events || []).some(event =>
+    event.event_type === 'task.obstacle_blocked_manual' && event.payload?.requires_manual_intervention
+  )
+)
 
 function fullUrl(relativeUrl) {
   if (!relativeUrl) return ''
@@ -515,6 +520,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="action-row">
           <button class="primary-btn" :disabled="!actions.control.enabled" @click="controlTask">{{ actions.control.label }}</button>
+          <button v-if="obstacleManualIntervention" class="primary-btn" @click="act('resume-forward')">恢复前向</button>
           <button class="danger-btn" :disabled="!actions.forceExit" @click="act('force-exit')">强制退出</button>
         </div>
         <p v-if="error" class="form-error">{{ error }}</p>

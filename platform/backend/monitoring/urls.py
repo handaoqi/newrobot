@@ -99,6 +99,7 @@ from .views import (
     TaskExecutionDetailView,
     TaskExecutionPauseView,
     TaskExecutionResumeView,
+    TaskExecutionResumeForwardView,
     TaskExecutionTrajectoryView,
     ScheduleRunListView,
 )
@@ -200,6 +201,7 @@ urlpatterns = [
     path("task-executions/<uuid:execution_id>/", TaskExecutionDetailView.as_view()),
     path("task-executions/<uuid:execution_id>/pause/", TaskExecutionPauseView.as_view()),
     path("task-executions/<uuid:execution_id>/resume/", TaskExecutionResumeView.as_view()),
+    path("task-executions/<uuid:execution_id>/resume-forward/", TaskExecutionResumeForwardView.as_view()),
     path("task-executions/<uuid:execution_id>/cancel/", TaskExecutionCancelView.as_view()),
     path("task-executions/<uuid:execution_id>/force-exit/", TaskExecutionForceExitView.as_view()),
     path("task-executions/<uuid:execution_id>/trajectory/", TaskExecutionTrajectoryView.as_view()),

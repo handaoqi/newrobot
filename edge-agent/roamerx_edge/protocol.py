@@ -8,7 +8,7 @@ from typing import Any
 
 
 PROTOCOL_VERSION = "1.0"
-TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.cancel", "task.force_exit"}
+TASK_COMMAND_TYPES = {"task.start", "task.pause", "task.resume", "task.resume_forward", "task.cancel", "task.force_exit"}
 MAPPING_COMMAND_TYPES = {
     "mapping.start", "mapping.save", "mapping.cancel", "mapping.status",
     "mapping.origin_start", "mapping.origin_cancel", "mapping.origin_extract_global", "mapping.slam_start", "mapping.begin",

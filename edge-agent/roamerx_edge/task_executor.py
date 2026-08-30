@@ -364,6 +364,15 @@ class TaskExecutor:
         if self._recovery_attempts >= 3:
             self._leave_route_announced = True
             self._emit_obstacle_speech("leave_route", self._recovery_attempts, observation)
+            self.event_callback(
+                "task.obstacle_blocked_manual",
+                {"task_execution_id": self.context.task_execution_id,
+                 "round_number": self.context.round_number,
+                 "waypoint_index": self.context.current_waypoint_index,
+                 "obstacle_episode_id": self._obstacle_episode_id,
+                 "requires_manual_intervention": True,
+                 "reported_at": now_iso()}, "",
+            )
 
     def _perform_obstacle_reverse(self) -> None:
         """Safely back away a short distance before retrying the current goal."""
@@ -1166,6 +1175,21 @@ class TaskExecutor:
                 "robot_stopped": True,
             }
 
+    def resume_forward(self, execution_id: str) -> dict:
+        """Operator acknowledgement to retry a task held by an obstacle."""
+        with self._lock:
+            self._assert_execution(execution_id)
+            if self.context.state != "running":
+                raise ProtocolError("INVALID_TASK_STATE", "task is not running")
+            self._leave_route_announced = False
+            self._recovery_attempts = 0
+            self._last_obstacle_seen_at = None
+            self._obstacle_progress_anchor = None
+            self._obstacle_progress_anchor_at = None
+            self._send_from(self.context.current_waypoint_index)
+            return {"final_task_state": "running", "resumed_forward": True,
+                    "waypoint_index": self.context.current_waypoint_index}
+
     def resume_task(self, execution_id: str, resume_index: int) -> dict:
         with self._lock:
             self._paused_for_localization = False
@@ -1939,12 +1963,25 @@ class TaskExecutor:
             if not self.context or self.context.state != "running":
                 return
             if self._leave_route_announced:
-                # After three failed reverse attempts, remain stopped and wait
-                # for operator intervention instead of repeatedly re-dispatching
-                # the same blocked goal.
+                # Keep the safety stop, but allow an automatic retry after a
+                # short cooling window once the obstacle has actually cleared.
+                # Do not blindly re-dispatch into the same obstacle.
                 self.navigation.stop_motion()
-                LOGGER.error("obstacle recovery exhausted; task remains stopped after dissuasion")
-                return
+                observation = self.navigation.obstacle_monitor_snapshot()
+                distance = observation.get("front_obstacle_distance_m")
+                clear = distance is None or float(distance) > self.obstacle_speech.obstacle_max_distance_m
+                if not clear:
+                    LOGGER.warning("obstacle recovery still blocked; retrying safety check in 5s")
+                    self._blocked_retry_timer = threading.Timer(5.0, self._retry_blocked_navigation)
+                    self._blocked_retry_timer.daemon = True
+                    self._blocked_retry_timer.start()
+                    return
+                LOGGER.info("obstacle cleared after cooling; resetting recovery episode and retrying waypoint")
+                self._recovery_attempts = 0
+                self._leave_route_announced = False
+                self._last_obstacle_seen_at = None
+                self._obstacle_progress_anchor = None
+                self._obstacle_progress_anchor_at = None
             self._send_from(self.context.current_waypoint_index)
 
     def _hold_final_pose(self) -> bool:
