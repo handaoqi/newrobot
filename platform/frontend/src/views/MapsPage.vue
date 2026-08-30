@@ -483,6 +483,11 @@ const mappingState = computed(() => (
 ))
 const mappingCommandInFlight = computed(() => ['created', 'published', 'accepted', 'executing'].includes(commandStatus.value))
 const saveProgress = computed(() => mappingStatus.value?.result?.save_progress || {})
+const postSaveValidation = computed(() => mappingStatus.value?.result?.post_save_validation || {})
+const indoorValidation = computed(() => postSaveValidation.value.indoor || { required: 10, success: 0, attempts: 0 })
+const outdoorValidation = computed(() => postSaveValidation.value.outdoor || { required: 5, success: 0, attempts: 0 })
+const validationPercent = bucket => Math.min(100, Number(bucket?.success || 0) / Math.max(1, Number(bucket?.required || 1)) * 100)
+const validationStateLabel = computed(() => ({ queued: '排队中', running: '自检中', passed: '本轮通过', failed: '本轮失败', unavailable: '待接入验证器', idle: '未开始' }[postSaveValidation.value.state] || postSaveValidation.value.state || '未开始'))
 // Runtime result is intentionally independent from the selected map. It is
 // published only after the package has been uploaded, and is cleared by the
 // next successful startup/check command.
@@ -2262,6 +2267,17 @@ async function saveCleaner() {
               <span>建图耗时<strong>{{ formatDuration(mappingMetrics.mapping_duration_seconds) }}</strong></span>
               <span>诊断数据<strong>{{ formatBytes(mappingMetrics.diagnostic_data_size_bytes) }}</strong></span>
             </div>
+          </div>
+          <div class="post-save-validation-panel">
+            <div class="map-artifact-head">
+              <strong>保存后静止定位自检</strong>
+              <span>{{ validationStateLabel }}</span>
+            </div>
+            <div class="validation-counters">
+              <div><span>室内累计</span><strong>{{ indoorValidation.success }}/{{ indoorValidation.required }}</strong><progress :value="validationPercent(indoorValidation)" max="100"></progress><small>尝试 {{ indoorValidation.attempts || 0 }} 次</small></div>
+              <div><span>室外累计</span><strong>{{ outdoorValidation.success }}/{{ outdoorValidation.required }}</strong><progress :value="validationPercent(outdoorValidation)" max="100"></progress><small>尝试 {{ outdoorValidation.attempts || 0 }} 次</small></div>
+            </div>
+            <div v-if="postSaveValidation.detail" class="mapping-progress-error">{{ postSaveValidation.detail }}</div>
           </div>
           <div class="state-steps">
             <div

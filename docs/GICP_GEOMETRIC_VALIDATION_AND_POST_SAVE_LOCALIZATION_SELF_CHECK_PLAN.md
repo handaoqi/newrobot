@@ -274,10 +274,11 @@ relocalization/
    - 室外最大对应距离 1.5 m。
 
 7. FastGICP 执行异常或不收敛时，允许普通 ICP 运行一次诊断回退。
-8. 输出统一为从查询关键帧到匹配关键帧的相对位姿：
+8. 采用列向量约定，输出把查询/源点变换到匹配/目标坐标系的相对位姿：
 
 ```text
-T_query_match = T_world_query⁻¹ × T_world_match
+T_target_source = T_world_target⁻¹ × T_world_source
+T_world_source = T_world_target × T_target_source
 ```
 
 ### 3.2 几何质量门
@@ -733,3 +734,109 @@ Edge 端：
 - 当前活动地图、导航任务和 FAST-LIO ESKF 状态不由本计划自动迁移或重写。
 - 普通 ICP 不能仅凭 `hasConverged()` 和单一 fitness 获得回环接受资格，必须经过相同的内点、重叠率、一致性和退化门。
 - 正式启用 Tier 1 只提高可恢复范围，不保证所有环境下 100% 自动重定位；拒绝不确定候选优先于错误定位。
+
+## 九、2026-08-30 执行记录与下一步
+
+### 9.1 已落码能力
+
+本轮完成了 P1/P4 的第一段可运行实现，但没有开启生产位姿接管：
+
+- 新增 ROS 无关的 C++ `RelocalizationGeometryVerifier`，真实调用现有 FastGICP，并使用普通 ICP 做独立结果交叉检查。
+- 几何结果包含：GICP/ICP 收敛、RMSE、源/目标内点、双向重叠率、相对初值的平移/旋转/垂直变化、Hessian 正定性与条件数、GICP/ICP 位姿差和耗时。
+- 按统一拒绝码执行安全门：`insufficient_points`、`no_convergence`、`rmse_too_high`、`insufficient_inliers`、`low_overlap`、`pose_inconsistent`、`vertical_inconsistent`、`degenerate_hessian`、`icp_disagreement`。
+- `ScanContextDatabase` 新增关键帧索引解析和按需 PCD 加载。运行时只保存路径与原始 LiDAR 位姿，不把全部关键帧点云常驻内存。
+- 新增 `localization_relocalization_geometry_check` 离线工具，把 Scan Context Top-K 召回、真实几何接受、正确接受和错误位置接受分别计数。
+- 定位后台重定位线程新增 `relocalization.scan_context_runtime_mode`：
+  - `disabled`：不加载、不执行；
+  - `shadow`：检索和真实 GICP/ICP 只记日志，不写正式位姿；
+  - `active`：只有几何门通过后，才把精化种子交给原有全图 ICP。
+- 旧参数 `relocalization.use_scan_context=true` 仅作为兼容别名映射到 `active`；默认配置明确保持 `disabled`。
+- 新增 5 个几何质量门和 2 个 Scan Context 余弦距离单元测试；定位包最新完整测试结果为 `129 tests, 0 errors, 0 failures, 8 skipped`。
+
+主要实现文件：
+
+- `robot/src/localization/localization/include/localization/relocalization_geometry.hpp`
+- `robot/src/localization/localization/src/localization/relocalization_geometry.cpp`
+- `robot/src/localization/localization/tools/relocalization_geometry_check.cpp`
+- `robot/src/localization/localization/test/relocalization_geometry_policy_test.cpp`
+- `robot/src/localization/localization/include/localization/scan_context_db.hpp`
+- `robot/src/localization/localization/src/localization/scan_context_db.cpp`
+- `robot/src/localization/localization/apps/localization_nodelet.cpp`
+
+### 9.2 当前活动地图离线结果
+
+验证地图：`20260828_205712_005`，共 76 个关键帧。为避免时间相邻帧造成虚高，评估排除索引前后 20 帧；39/76 个查询在剩余底库中确有 2 m 内空间近邻，属于可答查询。
+
+默认室内门限（0.20 m voxel、1.0 m 对应距离、30 次迭代、RMSE 0.25 m、双向重叠率 45%、最少 500 内点）的结果：
+
+| 指标 | 结果 |
+|---|---:|
+| Scan Context Top-5 召回 | 92.3%（36/39） |
+| 首个几何通过候选覆盖 | 69.2%（27/39） |
+| 正确位置接受 | 69.2%（27/39） |
+| 错误位置接受 | 0 |
+| 无候选通过 | 12/39 |
+| 候选验证耗时中位数 / p90 | 131.88 / 419.84 ms |
+| 接受后位置误差中位数 / p90 | 0.01 / 0.01 m |
+| 接受后 yaw 误差中位数 / p90 | 0.02° / 0.04° |
+
+正确候选与错误候选的指标已经呈现明显分离：
+
+| 候选类型 | RMSE 中位数 / p90 | 双向重叠率 p10 / 中位数 | ICP 平移差中位数 / p90 |
+|---|---:|---:|---:|
+| 正确 | 0.22 / 0.30 m | 0.83 / 0.99 | 0.06 / 0.17 m |
+| 错误 | 0.51 / 0.57 m | 0.00 / 0.00 | 1.11 / 1.61 m |
+
+门限曲线结果：
+
+- RMSE 放宽到 0.30 m：正确查询覆盖 74.4%，错误位置接受仍为 0。
+- RMSE 放宽到 0.40 m：正确查询覆盖仍为 74.4%，错误位置接受仍为 0；新增候选主要被 ICP 不一致门拒绝。
+- 最大迭代从 30 增到 60：覆盖没有提高，耗时 p90 增至约 653 ms，因此不采用。
+- 正确候选的拒绝组成（RMSE 0.40 m、30 次）：`no_convergence=5`、`rmse_too_high=6`、`icp_disagreement=5`。
+- 把 Top-K 直接增至 10 时召回反而降到 87.2%。原因是当前 ring-key 预筛候选数随 Top-K 改变，候选集合不具备单调性；不能用盲目增大 K 解决覆盖。
+
+候选检索与子图追加实验：
+
+- 已将 ring-key 预筛候选池与返回 Top-K 解耦；固定候选池为 30 后，Top-1/Top-5/Top-10 召回依次为 82.1%/97.4%/100%，恢复单调性。
+- 新增标准 Scan Context 列余弦距离。固定候选池为 15/30/全部时 Top-5 均为 97.4%，优于原绝对高度距离的 92.3%/82.1%/82.1%。余弦排序已达到当前单图 95% 召回门槛，但仍需多地图复核。
+- 余弦距离的描述子值仍不能作为硬阈值：正确候选距离 p90 约 0.07，错误 Top-1 距离中位数约 0.06，分布继续重叠。
+- 单纯用绝对高度距离为余弦候选估 yaw 会出现对称混淆，yaw p90 达到 57.2°，因此该混合单 yaw 方案不采用。
+- 目标侧前后 3 帧子图把默认几何覆盖从 69.2% 提到 74.4%，错误位置接受仍为 0；候选耗时中位数/p90 约 108.66/329.40 ms。
+- 查询和目标两侧都使用前后 3 帧子图时覆盖仍为 74.4%，但耗时 p90 增至约 1.08 s，不适合运行时路径。
+- 对余弦候选在首次失败后追加 ±6° 假设没有提高 74.4% 查询覆盖，反而出现 1 个错误候选通过几何门，耗时 p90 约 915 ms。该实验不满足“错误候选接受数为 0”，运行时必须保持 `yaw_neighbors=0`。
+
+### 9.3 当前上线判断
+
+当前实现证明了“错误候选可被真实三维几何拒绝”，但尚未达到正式接管条件：
+
+- Top-5 召回 92.3%，低于计划要求的 95%；
+- 默认几何覆盖 69.2%，低于真回环召回 95% 门槛；
+- 当前评估仍是单关键帧对单关键帧，尚未实现计划中的前后各 3 帧局部子图和实时多帧积累；
+- 只验证了当前一张地图，未完成跨地图、独立 rosbag 和实机绑架/冷启动回归；
+- 保存协调器尚未接入 v2 验证摘要、raw 回滚、静止定位必检和验证后原子激活。
+
+因此 `scan_context_runtime_mode` 必须继续保持 `disabled`。现在不能宣称 Tier 2 问题已经解决，也不能宣称系统已能在所有可答场景自动找到关键帧对应位置。已经具备安全影子运行和后续接管所需的核心几何门，但正式能力仍以 P5 验收为准。
+
+### 9.4 后续推进顺序
+
+1. 用历史地图与独立 rosbag 复核“固定 30 个预筛候选 + 列余弦距离”，确认 Top-5 提升不是当前地图过拟合，再决定运行时排序默认值。
+2. 目标侧保留前后各 3 帧子图作为 P1/P4 候选；运行时增加有上限的多帧点云积累前，先解决子图重复加载和 p90 计算开销。
+3. 用相同工具回归历史地图与独立 rosbag，门限只从正确/错误标注集校准，要求错误位置接受为 0。
+4. 在 `shadow` 模式下做静止实机 A/B；确认不增加点云回调重任务次数，不产生 `/cmd_vel`，不修改正式定位估计器。
+5. 将验证器接入地图保存流程，生成 `loop_closures.csv` v2 和 `localization_validation.json` v2，再实现 raw 回滚与验证后原子激活。
+6. 只有 P4 门槛全部满足后才切本机地图为 `active`，并继续经过现有全图 ICP、NDT/FastVGICP 连续初始化门；失败时保留 Tier 2 安全兜底。
+
+### 9.5 本轮运行安全记录
+
+- 所有几何回归均为离线只读地图检查，没有发布 `/initialpose`、导航目标或 `/cmd_vel`。
+- 现场 ROS launch 组在 11:50:10 收到统一 `SIGINT/SIGTERM` 后按节点顺序退出；定位日志没有崩溃栈、GICP 异常或 OOM，属于受控整组终止，不是本轮代码失败。
+- 本轮没有自动重启导航栈。后续静止实机影子测试需先由任务上下文明确允许启动传感器/定位，并继续禁止运动输出。
+- 12:00 后导航/定位栈由本轮命令之外的流程重新启动；只读核验显示节点实际参数为 `scan_context_runtime_mode=disabled`、`use_scan_context=false`，定位状态为 3、报告速度约 0.0018 m/s，6 秒观察窗口内 `/cmd_vel` 没有消息。本轮未发送服务请求、初始位姿或控制命令。
+- 新启动实例仍可见稳定阶段重帧 p90 约 165～188 ms，主要耗时为现有 VGICP 约 142～164 ms；Scan Context 几何路径处于 disabled 且 `global=0.0 ms`，因此该残余回调耗时不是本轮几何验证引入，需继续按点云回调性能计划单独处理。
+## 10. 地图管理页与保存后静止自检实现（2026-08-30）
+
+- 保存成功并完成会话清理后，`MappingAdapter` 自动创建异步静止自检任务，不发布 `/cmd_vel`。
+- 自检结果持久化到 `post_save_validation.json`，按 `indoor`/`outdoor` 分桶累计成功次数，目标分别为 10 次和 5 次，并保留最近 20 次历史。
+- 真实 ROS 验证器通过 `ROAMERX_POST_SAVE_VALIDATION_CMD` 接入，命令可使用 `{map_dir}` 与 `{mapping_type}` 占位符；未配置时状态为“待接入验证器”，不会虚增成功计数。
+- 地图管理页新增“保存后静止定位自检”卡片，显示当前状态、室内/室外成功数、尝试数、进度条和失败/未接入原因。
+- 当前完成的是状态持久化、自动触发和页面展示；室内 10 次/室外 5 次的真实通过条件仍需接入 ROS 静止验证器后才会累计。

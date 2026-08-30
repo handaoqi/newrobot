@@ -167,6 +167,8 @@ class MappingAdapter:
         self._state_lock = threading.RLock()
         self._origin_file = Path(config.origin_file).expanduser() if config.origin_file else self.map_dir / "gnss_origin.yaml"
         self._global_enu_file = self._origin_file.parent / "global_enu.yaml"
+        self._post_save_validation_file = self.map_dir / "post_save_validation.json"
+        self._post_save_validation_lock = threading.RLock()
         self._origin_state_file = (
             Path(config.origin_state_file).expanduser()
             if config.origin_state_file
@@ -646,7 +648,51 @@ class MappingAdapter:
             # but a successful save must retain the explicit workflow terminal
             # state so stale progress cannot put the UI back into "saving".
             result["state"] = "exited"
+        # Start the post-save static self-check only after the map is durable and
+        # the mapping session has been torn down.  It never publishes motion.
+        self._start_post_save_validation(
+            str(result.get("latest_session_dir") or result.get("active_map_dir") or work_dir),
+            str(command.get("mapping_type") or self._mapping_type or "indoor"),
+        )
+        result.update(self.status())
         return result
+
+    def _read_post_save_validation(self) -> dict:
+        value = self._read_json(self._post_save_validation_file)
+        return value if isinstance(value, dict) else {
+            "indoor": {"required": 10, "success": 0, "attempts": 0, "history": []},
+            "outdoor": {"required": 5, "success": 0, "attempts": 0, "history": []},
+            "state": "idle",
+        }
+
+    def _start_post_save_validation(self, map_dir: str, mapping_type: str) -> None:
+        kind = "outdoor" if str(mapping_type).lower() == "outdoor" else "indoor"
+        with self._post_save_validation_lock:
+            payload = self._read_post_save_validation()
+            payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
+            payload.update({"state": "queued", "mapping_type": kind, "map_dir": map_dir, "updated_at": now_iso()})
+            _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        threading.Thread(target=self._run_post_save_validation, args=(map_dir, kind), daemon=True).start()
+
+    def _run_post_save_validation(self, map_dir: str, kind: str) -> None:
+        command = os.environ.get("ROAMERX_POST_SAVE_VALIDATION_CMD", "").strip()
+        result_state, detail = ("unavailable", "未配置真实静止定位验证命令")
+        if command:
+            try:
+                completed = subprocess.run(command.format(map_dir=map_dir, mapping_type=kind), shell=True, capture_output=True, text=True, timeout=45)
+                result_state = "passed" if completed.returncode == 0 else "failed"
+                detail = (completed.stdout or completed.stderr or "").strip()[-1000:]
+            except Exception as exc:
+                result_state, detail = "failed", str(exc)
+        with self._post_save_validation_lock:
+            payload = self._read_post_save_validation()
+            bucket = payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
+            bucket["attempts"] = int(bucket.get("attempts", 0)) + 1
+            if result_state == "passed": bucket["success"] = int(bucket.get("success", 0)) + 1
+            bucket.setdefault("history", []).append({"at": now_iso(), "map_dir": map_dir, "state": result_state, "detail": detail})
+            bucket["history"] = bucket["history"][-20:]
+            payload.update({"state": result_state, "detail": detail, "updated_at": now_iso()})
+            _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:
         self._set_state("recovering")
@@ -761,6 +807,7 @@ class MappingAdapter:
         readiness = self._mapping_readiness(progress, process_alive)
         files = self._file_snapshot(latest_session_dir or self.map_dir)
         optimization = self._read_optimization_status(latest_session_dir)
+        post_save_validation = self._read_post_save_validation()
         rosbag = self._rosbag_status()
         global_enu = self._read_global_enu()
         if not self.session:
@@ -807,6 +854,7 @@ class MappingAdapter:
                 "ready_for_save": readiness["ready_for_save"],
                 "files": files,
                 "optimization": optimization,
+                "post_save_validation": post_save_validation,
                 "rosbag": rosbag,
                 "origin": origin,
                 "global_enu": global_enu,
@@ -865,6 +913,7 @@ class MappingAdapter:
             "ready_for_save": readiness["ready_for_save"],
             "files": files,
             "optimization": optimization,
+            "post_save_validation": post_save_validation,
             "rosbag": rosbag,
             "origin": origin,
             "global_enu": global_enu,
