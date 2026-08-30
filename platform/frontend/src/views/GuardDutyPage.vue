@@ -251,9 +251,9 @@ function formatTime(value) {
 function formatExecutionTime(value) {
   if (!value) return '未执行'
   const date = new Date(value)
-  return Number.isNaN(date.getTime())
-    ? value
-    : date.toLocaleString('zh-CN', { hour12: false })
+  if (Number.isNaN(date.getTime())) return value
+  const pad = number => String(number).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())}`
 }
 
 function executionStateLabel(state) {
@@ -1122,7 +1122,9 @@ watch(playUrlKey, () => {
             <div class="guard-task-state">
               <span>执行状态</span>
               <strong>{{ taskStateText }}</strong>
-              <small>执行时间：{{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}</small>
+              <small :title="formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at)">
+                {{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}
+              </small>
             </div>
             <div class="guard-task-actions">
               <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
