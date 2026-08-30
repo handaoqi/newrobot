@@ -2562,8 +2562,8 @@ async function handleDeleteRoute(route) {
             <small v-if="navStatus?.command" class="command-note">
               最近命令 {{ navStatus.command.command_type }} · {{ navStatus.command.status }}
             </small>
-            <small v-if="lastExecution" class="command-note">
-              最近执行 {{ lastExecution.id }} · {{ lastExecution.state }} · {{ formatExecutionCreatedAt(lastExecution.created_at) }}
+                  <small v-if="lastExecution" class="command-note">
+                最近执行 {{ lastExecution.id }} · 第 {{ lastExecution.round_number || 1 }} 轮 · {{ lastExecution.state }} · {{ formatExecutionCreatedAt(lastExecution.created_at) }}
             </small>
             <small v-if="localizationInitMessage" class="command-note">
               定位初始化 {{ localizationInitState }} · {{ localizationInitMessage }}

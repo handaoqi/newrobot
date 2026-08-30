@@ -169,6 +169,7 @@ class TaskContext:
     current_segment_index: int = 0
     record_rosbag: bool = False
     docking: dict | None = None
+    round_number: int = 1
 
 
 class TaskExecutor:
@@ -386,6 +387,7 @@ class TaskExecutor:
             "task.obstacle_speech",
             {
                 "task_execution_id": self.context.task_execution_id,
+                "round_number": self.context.round_number,
                 "obstacle_episode_id": self._obstacle_episode_id,
                 "speech_stage": stage,
                 "template_name": titles[stage],
@@ -589,6 +591,7 @@ class TaskExecutor:
                 start_command_id=envelope.payload["command_id"],
                 record_rosbag=bool(command.get("record_rosbag", False)),
                 docking=docking,
+                round_number=max(1, int(command.get("round_number", 1))),
             )
             self._last_target_index = initial_waypoint_index - 1
             self._last_reached_index = initial_waypoint_index - 1
@@ -1326,6 +1329,7 @@ class TaskExecutor:
             }
         return {
             "task_execution_id": self.context.task_execution_id,
+            "round_number": self.context.round_number,
             "state": "running",
             "state_version": self.context.state_version,
             "current_waypoint_index": waypoint_index,

@@ -726,7 +726,7 @@ export async function executeRoute(routeId, {
   loopSessionId = null,
   roundNumber = 1,
 } = {}) {
-  return request(`/routes/${routeId}/execute/`, {
+  const result = await request(`/routes/${routeId}/execute/`, {
     method: 'POST',
     body: JSON.stringify({
       record_rosbag: recordRosbag,
@@ -735,6 +735,8 @@ export async function executeRoute(routeId, {
       round_number: roundNumber,
     }),
   })
+  listCache.invalidate('routes-summary')
+  return result
 }
 
 export async function navigateSingleGoal(robotId, payload) {

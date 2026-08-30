@@ -173,8 +173,9 @@ class TaskExecutionService:
         round_number: int = 1,
     ) -> TaskExecution:
         robot = Robot.objects.select_for_update().get(pk=task.robot_id)
-        if TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).exists():
-            raise TaskStateError("ROBOT_BUSY")
+        active = TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).order_by("-created_at").first()
+        if active:
+            raise TaskStateError(f"ROBOT_BUSY: 执行 {active.id} 仍处于 {active.state}（第 {active.round_number} 轮）")
         if not task.enabled:
             raise TaskStateError("TASK_DISABLED")
         route = task.route
