@@ -427,6 +427,15 @@ class CommandProcessor:
                 if localization_bootstrap is not None:
                     result_payload = dict(result_payload or {})
                     result_payload["localization_bootstrap"] = localization_bootstrap
+                progressive_initialization = (
+                    envelope.message_type == "nav.relocalize"
+                    and str(command.get("seed_source") or "") == "progressive"
+                )
+                should_start_navigation = localization_bootstrap is not None or bool(
+                    command.get("start_navigation", progressive_initialization)
+                )
+                if should_start_navigation:
+                    result_payload = dict(result_payload or {})
                     result_payload["navigation_start"] = self._start_navigation_after_localization()
             finally:
                 try:
@@ -483,9 +492,18 @@ class CommandProcessor:
         map_version = str(command.get("map_version") or self.safety.state.current_map_version or "")
         seed_source = str(command.get("seed_source") or "last_trusted")
         if seed_source == "mapping_start":
-            seed = self.map_activation_adapter.mapping_start_pose() if self.map_activation_adapter else {}
+            resolved = self.map_activation_adapter.mapping_start_pose() if self.map_activation_adapter else {}
         else:
-            seed = self.store.load_last_trusted_pose(map_id, map_version) or {}
+            resolved = self.store.load_last_trusted_pose(map_id, map_version) or {}
+        # Preserve operator search controls while taking x/y/yaw from the
+        # map-scoped trusted seed.  Previously wait_seconds/max_attempts were
+        # silently lost here, forcing every stored-pose search back to its
+        # internal defaults.
+        seed = {**resolved, **{
+            key: command[key]
+            for key in ("wait_seconds", "max_attempts", "candidate_wait_seconds", "source")
+            if command.get(key) is not None
+        }}
         if not all(seed.get(field) is not None for field in ("x", "y", "yaw")):
             raise ProtocolError(
                 "RELOCALIZATION_SEED_UNAVAILABLE",

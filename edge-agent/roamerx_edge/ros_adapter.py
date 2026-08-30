@@ -1437,7 +1437,7 @@ class RosAdapter(Node):
             )
         return {
             "mode": "global_position_yaw_search",
-            "source": "scan_context_fastvgicp",
+            "source": "scan_context_fastgicp_icp",
             "stage": "keyframe_global_match",
             "service": "/localization/global_relocalize",
             "message": response.message,
@@ -1463,18 +1463,20 @@ class RosAdapter(Node):
         Every local seed must produce fresh, consecutive absolute-localization
         evidence.  A verified NDT correction is committed immediately because
         changing seeds after that point would discard the strongest result.
-        Scan Context keyframe retrieval plus FastVGICP/global matching remains
-        the final fallback when all explicit map seeds fail.
+        Scan Context keyframe retrieval, FastGICP/ICP geometry verification,
+        and full-map ICP remain the final fallback when explicit seeds fail.
         """
         generation = self._start_localization_operation("progressive_operator_initialization")
         deadline = time.monotonic() + max(30.0, float(wait_seconds))
         stages = []
+        strategy = ["mapping_origin_bounded", "route_waypoints", "keyframe_global_match"]
+        origin_seed = None
         seeds = []
         if origin and all(origin.get(field) is not None for field in ("x", "y", "yaw")):
-            seeds.append(("mapping_origin", None, dict(origin)))
+            origin_seed = dict(origin)
         else:
             stages.append({
-                "stage": "mapping_origin",
+                "stage": "mapping_origin_bounded",
                 "status": "unavailable",
                 "error_code": (origin or {}).get("unavailable_error_code", "MAPPING_START_POSE_MISSING"),
                 "error_message": (origin or {}).get(
@@ -1488,21 +1490,86 @@ class RosAdapter(Node):
                 continue
             seeds.append(("route_waypoint", index, dict(raw)))
 
-        # Reserve enough time for the heavyweight keyframe/global stage while
-        # still giving every explicit route seed a fresh-frame verification.
-        local_budget = max(0.0, float(wait_seconds) - 60.0)
-        per_seed_wait = min(8.0, max(3.0, local_budget / max(1, len(seeds))))
         self._persist_relocalization_state({
             "state": "running",
             "mode": "progressive_stationary_search",
-            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
-            "candidate_count": len(seeds),
+            "strategy": strategy,
+            "candidate_count": len(seeds) + (20 if origin_seed else 0),
             "stages": stages,
             "updated_at": time.time(),
         })
 
+        # The mapping origin receives the complete stationary bounded search:
+        # exact pose, eight yaw hypotheses, then 0.3/0.6/1.0 m XY rings.  Keep
+        # route waypoints exact to avoid multiplying a large route by twenty,
+        # and reserve sixty seconds for map-wide keyframe recovery.
+        if origin_seed is not None:
+            origin_budget = min(
+                120.0,
+                max(20.0, deadline - time.monotonic() - 60.0 - 3.0 * len(seeds)),
+            )
+            try:
+                result = self._active_relocalize_once({
+                    **origin_seed,
+                    "source": "mapping_origin",
+                    "max_attempts": 20,
+                    "wait_seconds": origin_budget,
+                    "candidate_wait_seconds": 5.0,
+                }, generation, persist_state=False)
+                accepted = {
+                    "stage": "mapping_origin_bounded",
+                    "status": "accepted",
+                    "attempts": result.get("attempts", []),
+                    "best_ndt_candidate": result.get("best_ndt_candidate"),
+                }
+                stages.append(accepted)
+                payload = {
+                    **result,
+                    "mode": "progressive_stationary_search",
+                    "strategy": strategy,
+                    "selected_stage": "mapping_origin_bounded",
+                    "selected_waypoint_index": None,
+                    "stages": stages,
+                }
+                self._persist_relocalization_state({
+                    **payload, "state": "accepted", "updated_at": time.time()
+                })
+                return payload
+            except ProtocolError as exc:
+                if exc.code == "RELOCALIZATION_SUPERSEDED":
+                    raise
+                details = dict(exc.details or {})
+                stages.append({
+                    "stage": "mapping_origin_bounded",
+                    "status": "rejected",
+                    "error_code": exc.code,
+                    "attempts": details.get("attempts", []),
+                    "best_ndt_candidate": details.get("best_ndt_candidate"),
+                    "timed_out": details.get("timed_out", False),
+                })
+                self._persist_relocalization_state({
+                    "state": "running",
+                    "mode": "progressive_stationary_search",
+                    "strategy": strategy,
+                    "stages": stages,
+                    "updated_at": time.time(),
+                })
+
+        # Reserve enough time for the heavyweight keyframe/global stage while
+        # still giving every explicit route seed fresh-frame verification.
+        local_budget = max(0.0, deadline - time.monotonic() - 60.0)
+        per_seed_wait = min(8.0, max(3.0, local_budget / max(1, len(seeds))))
         for stage_name, waypoint_index, seed in seeds:
             self._assert_localization_operation(generation)
+            remaining_local = deadline - time.monotonic() - 60.0
+            if remaining_local < 1.0:
+                stages.append({
+                    "stage": stage_name,
+                    "waypoint_index": waypoint_index,
+                    "status": "skipped",
+                    "error_code": "LOCAL_SEARCH_BUDGET_EXHAUSTED",
+                })
+                continue
             attempt = {
                 "stage": stage_name,
                 "waypoint_index": waypoint_index,
@@ -1514,7 +1581,7 @@ class RosAdapter(Node):
                 result = self._set_initial_pose_once({
                     **seed,
                     "frame_id": "map",
-                    "wait_seconds": min(per_seed_wait, max(1.0, deadline - time.monotonic())),
+                    "wait_seconds": min(per_seed_wait, remaining_local),
                     "required_normal_samples": 3,
                     "require_absolute": True,
                     "covariance_x": 1.0,
@@ -1533,7 +1600,7 @@ class RosAdapter(Node):
                 stages.append(accepted)
                 payload = {
                     "mode": "progressive_stationary_search",
-                    "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                    "strategy": strategy,
                     "selected_stage": stage_name,
                     "selected_waypoint_index": waypoint_index,
                     "stages": stages,
@@ -1559,7 +1626,7 @@ class RosAdapter(Node):
                 self._persist_relocalization_state({
                     "state": "running",
                     "mode": "progressive_stationary_search",
-                    "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                    "strategy": strategy,
                     "stages": stages,
                     "updated_at": time.time(),
                 })
@@ -1572,7 +1639,7 @@ class RosAdapter(Node):
                     )
                     committed.update({
                         "mode": "progressive_stationary_search",
-                        "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                        "strategy": strategy,
                         "selected_stage": stage_name,
                         "selected_waypoint_index": waypoint_index,
                         "stages": stages,
@@ -1583,7 +1650,7 @@ class RosAdapter(Node):
         self._persist_relocalization_state({
             "state": "global_searching",
             "mode": "progressive_stationary_search",
-            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+            "strategy": strategy,
             "stages": stages,
             "updated_at": time.time(),
         })
@@ -1595,7 +1662,7 @@ class RosAdapter(Node):
             stages[-1].update({"status": "failed", "error_code": exc.code})
             details = {
                 "mode": "progressive_stationary_search",
-                "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                "strategy": strategy,
                 "stages": stages,
                 "motion_commanded": False,
             }
@@ -1611,7 +1678,7 @@ class RosAdapter(Node):
         payload = {
             **global_result,
             "mode": "progressive_stationary_search",
-            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+            "strategy": strategy,
             "selected_stage": "keyframe_global_match",
             "stages": stages,
         }
@@ -1660,26 +1727,48 @@ class RosAdapter(Node):
             if automatic
             else self._start_localization_operation(source)
         )
+        return self._active_relocalize_once(seed, generation)
+
+    def _active_relocalize_once(
+        self,
+        seed: dict,
+        generation: int,
+        *,
+        persist_state: bool = True,
+    ) -> dict:
+        """Run bounded pose candidates under an existing operation generation."""
         base_x = float(seed["x"])
         base_y = float(seed["y"])
         base_z = float(seed.get("z", 0.0))
         base_yaw = float(seed["yaw"])
-        max_attempts = max(1, min(12, int(seed.get("max_attempts", 12))))
         candidates = self._relocalization_candidates(base_x, base_y, base_z, base_yaw)
+        max_attempts = max(
+            1,
+            min(len(candidates), int(seed.get("max_attempts", len(candidates)))),
+        )
+        candidate_wait_seconds = max(
+            1.0,
+            min(10.0, float(seed.get("candidate_wait_seconds", 8.0))),
+        )
+        deadline = time.monotonic() + max(1.0, float(seed.get("wait_seconds", 180.0)))
         attempts = []
         best_candidate = None
-        self._persist_relocalization_state({
-            "state": "running", "source": seed.get("source", "operator_seed"),
-            "seed": {k: seed.get(k) for k in ("x", "y", "z", "yaw", "waypoint_index")},
-            "candidate_count": min(max_attempts, len(candidates)), "attempts": [],
-            "updated_at": time.time(),
-        })
+        if persist_state:
+            self._persist_relocalization_state({
+                "state": "running", "source": seed.get("source", "operator_seed"),
+                "seed": {k: seed.get(k) for k in ("x", "y", "z", "yaw", "waypoint_index")},
+                "candidate_count": max_attempts, "attempts": [],
+                "updated_at": time.time(),
+            })
         for index, candidate in enumerate(candidates[:max_attempts], start=1):
+            remaining = deadline - time.monotonic()
+            if remaining < 1.0:
+                break
             try:
                 result = self._set_initial_pose_once({
                     **candidate,
                     "frame_id": "map",
-                    "wait_seconds": 10.0,
+                    "wait_seconds": min(candidate_wait_seconds, remaining),
                     "required_normal_samples": 3,
                     "require_absolute": True,
                     "covariance_x": 1.0,
@@ -1699,16 +1788,20 @@ class RosAdapter(Node):
                     "best_ndt_candidate": result.get("best_ndt_candidate"),
                     "motion_commanded": False,
                 }
-                self._persist_relocalization_state({**payload, "state": "accepted", "updated_at": time.time()})
+                if persist_state:
+                    self._persist_relocalization_state({
+                        **payload, "state": "accepted", "updated_at": time.time()
+                    })
                 return payload
             except ProtocolError as exc:
                 if exc.code == "RELOCALIZATION_SUPERSEDED":
-                    self._persist_relocalization_state({
-                        "state": "superseded",
-                        "source": seed.get("source", "operator_seed"),
-                        "attempts": attempts,
-                        "updated_at": time.time(),
-                    })
+                    if persist_state:
+                        self._persist_relocalization_state({
+                            "state": "superseded",
+                            "source": seed.get("source", "operator_seed"),
+                            "attempts": attempts,
+                            "updated_at": time.time(),
+                        })
                     raise
                 ndt_candidate = dict((exc.details or {}).get("best_ndt_candidate") or {})
                 if self._candidate_rank(ndt_candidate) < self._candidate_rank(best_candidate):
@@ -1721,12 +1814,13 @@ class RosAdapter(Node):
                     "ndt_candidate": ndt_candidate or None,
                 }
                 attempts.append(attempt)
-                self._persist_relocalization_state({
-                    "state": "running", "source": seed.get("source", "operator_seed"),
-                    "candidate_count": min(max_attempts, len(candidates)), "attempts": attempts,
-                    "best_ndt_candidate": best_candidate,
-                    "updated_at": time.time(),
-                })
+                if persist_state:
+                    self._persist_relocalization_state({
+                        "state": "running", "source": seed.get("source", "operator_seed"),
+                        "candidate_count": max_attempts, "attempts": attempts,
+                        "best_ndt_candidate": best_candidate,
+                        "updated_at": time.time(),
+                    })
                 # Once NDT has passed its three-frame verification, changing to
                 # another seed destroys the best pose and restarts acquisition.
                 # Commit that exact match and wait only for the LIO handoff.
@@ -1735,13 +1829,14 @@ class RosAdapter(Node):
                         generation, seed, ndt_candidate, attempts
                     )
         latest = self.telemetry.latest_pose()
-        self._persist_relocalization_state({
-            "state": "failed", "source": seed.get("source", "operator_seed"),
-            "candidate_count": min(max_attempts, len(candidates)), "attempts": attempts,
-            "best_ndt_candidate": best_candidate,
-            "localization_status": latest.localization_status if latest else None,
-            "updated_at": time.time(),
-        })
+        if persist_state:
+            self._persist_relocalization_state({
+                "state": "failed", "source": seed.get("source", "operator_seed"),
+                "candidate_count": max_attempts, "attempts": attempts,
+                "best_ndt_candidate": best_candidate,
+                "localization_status": latest.localization_status if latest else None,
+                "updated_at": time.time(),
+            })
         raise ProtocolError(
             "ACTIVE_RELOCALIZATION_FAILED",
             f"stationary search exhausted {len(attempts)} candidates; "
@@ -1751,7 +1846,8 @@ class RosAdapter(Node):
                 "source": seed.get("source", "operator_seed"),
                 "attempts": attempts,
                 "best_ndt_candidate": best_candidate,
-                "candidate_count": min(max_attempts, len(candidates)),
+                "candidate_count": max_attempts,
+                "timed_out": len(attempts) < max_attempts,
                 "localization_status": latest.localization_status if latest else None,
                 "motion_commanded": False,
             },

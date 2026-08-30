@@ -32,3 +32,34 @@ export function buildProgressiveLocalizationPayload({ mapId, mapVersion, waypoin
 export function progressiveLocalizationTimeoutMs(payload) {
   return (Number(payload?.wait_seconds || 180) + 240) * 1000
 }
+
+export async function initializeProgressiveLocalization({
+  mapId,
+  robotId,
+  mapVersion,
+  waypoints = [],
+  onProgress = () => {},
+  dependencies = {},
+}) {
+  const activateMap = dependencies.activateRouteMap
+  const sendCommand = dependencies.sendRobotNavigationCommand
+  const waitCommand = dependencies.waitForRobotCommand
+  if (![activateMap, sendCommand, waitCommand].every(item => typeof item === 'function')) {
+    throw new Error('渐进定位编排缺少地图激活、命令下发或命令等待实现')
+  }
+
+  const activation = await activateMap({
+    mapId,
+    robotId,
+    mapVersion,
+    onProgress,
+  })
+  const payload = buildProgressiveLocalizationPayload({ mapId, mapVersion, waypoints })
+  onProgress('地图已下发，正在依次尝试建图原点、静态航向、1米范围、路线航点和全局匹配')
+  const createdCommand = await sendCommand(robotId, 'relocalize', payload)
+  const command = await waitCommand(robotId, createdCommand, {
+    timeoutMs: progressiveLocalizationTimeoutMs(payload),
+    onProgress: latest => onProgress(`渐进定位 · ${latest.status || 'created'}`),
+  })
+  return { activation, payload, command }
+}

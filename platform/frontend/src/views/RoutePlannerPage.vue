@@ -53,10 +53,7 @@ import {
 } from '../services/taskMapState'
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
-import {
-  buildProgressiveLocalizationPayload,
-  progressiveLocalizationTimeoutMs,
-} from '../services/progressiveLocalization'
+import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
 const maps = ref([])
@@ -1351,30 +1348,23 @@ async function initializeLocalization() {
   localizationInitMessage.value = '正在下发当前地图，并准备从原点重新初始化定位'
   navError.value = ''
   try {
-    const activation = await activateRouteMap({
+    const initialization = await initializeProgressiveLocalization({
       mapId: selectedMap.value?.id,
       robotId,
-      mapVersion: selectedMapVersion(),
-      onProgress: message => { localizationInitMessage.value = message },
-    })
-    navStatus.value = activation.navigationStatus
-    localizationInitState.value = 'sending_pose'
-    localizationInitMessage.value = '正在依次尝试建图原点、路线航点、关键帧与全局匹配'
-    const localizationPayload = buildProgressiveLocalizationPayload({
-      mapId: selectedMap.value?.id,
       mapVersion: selectedMapVersion(),
       waypoints: waypoints.value.map(point => {
         const normalized = normalizeStoredWaypoint(point)
         return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
       }),
-    })
-    const localizationCommand = await sendRobotNavigationCommand(robotId, 'relocalize', localizationPayload)
-    const completedLocalization = await waitForRobotCommand(robotId, localizationCommand, {
-      timeoutMs: progressiveLocalizationTimeoutMs(localizationPayload),
-      onProgress: latest => {
-        localizationInitMessage.value = `渐进定位：原点 → 航点 → 关键帧/全局匹配 · ${latest.status || 'created'}`
+      onProgress: message => { localizationInitMessage.value = message },
+      dependencies: {
+        activateRouteMap,
+        sendRobotNavigationCommand,
+        waitForRobotCommand,
       },
     })
+    navStatus.value = initialization.activation.navigationStatus
+    const completedLocalization = initialization.command
     const outcome = applyInitialPoseOutcome(completedLocalization)
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = initialPoseOutcomeMessage('命令已完成，等待定位状态同步', outcome)

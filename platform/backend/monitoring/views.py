@@ -3170,7 +3170,8 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
         seed_source = str(request.data.get("seed_source") or "last_trusted").strip()
         if seed_source not in {"last_trusted", "mapping_start", "global", "progressive"}:
             raise ValueError("主动重定位方式必须是渐进初始化、可信位姿、建图起点或全局搜索")
-        wait_seconds = float(request.data.get("wait_seconds") or 90.0)
+        default_wait_seconds = 90.0 if seed_source == "global" else 180.0
+        wait_seconds = float(request.data.get("wait_seconds") or default_wait_seconds)
         if not math.isfinite(wait_seconds) or wait_seconds <= 0:
             raise ValueError("主动重定位等待时间必须是正数")
         if seed_source == "progressive":

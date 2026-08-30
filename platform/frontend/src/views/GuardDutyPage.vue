@@ -49,12 +49,9 @@ import {
   isLowBatteryTaskError,
   lowBatteryGuardMessage,
 } from '../utils/guardDutyLowBattery'
-import { activateRouteMap } from '../services/mapActivationFlow'
+import { activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
-import {
-  buildProgressiveLocalizationPayload,
-  progressiveLocalizationTimeoutMs,
-} from '../services/progressiveLocalization'
+import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
 import {
   activeGuardDutyTarget,
   guardDutyExecutionWaypointPlan,
@@ -656,24 +653,22 @@ async function initializeLocalization() {
     const mapId = presetTask.value?.map_id || routeData.value?.map_data
     if (!mapId) throw new Error('没有可初始化的地图，请先为值守任务配置路线地图')
     const mapVersion = expectedLegacyMapVersion(mapId)
-    const activation = await activateRouteMap({
+    const initialization = await initializeProgressiveLocalization({
       mapId,
       robotId: robot.id,
       mapVersion,
-      onProgress: message => { localizationInitMessage.value = message },
-    })
-    navigationStatus.value = activation.navigationStatus
-    localizationInitMessage.value = '路线地图已下发，正在从原点重新初始化定位'
-
-    const localizationPayload = buildProgressiveLocalizationPayload({
-      mapId,
-      mapVersion,
       waypoints: routeData.value?.waypoints || [],
+      onProgress: message => { localizationInitMessage.value = message },
+      dependencies: {
+        activateRouteMap,
+        sendRobotNavigationCommand,
+        waitForRobotCommand,
+      },
     })
-    const command = await sendRobotNavigationCommand(robot.id, 'relocalize', localizationPayload)
+    navigationStatus.value = initialization.activation.navigationStatus
+    const command = initialization.command
 
-    const maxAttempts = Math.ceil(progressiveLocalizationTimeoutMs(localizationPayload) / 3000)
-    for (let attempt = 0; attempt < maxAttempts && runId === localizationRunId; attempt += 1) {
+    for (let attempt = 0; attempt < 25 && runId === localizationRunId; attempt += 1) {
       await sleep(3000)
       const latest = await refreshLocalizationStatus({ sync: false })
       if (!latest) continue
@@ -683,7 +678,7 @@ async function initializeLocalization() {
         throw new Error(latestCommand.error_message || latestCommand.error_code || '渐进定位初始化失败')
       }
       if (isCurrentCommand && latestCommand.status === 'succeeded') {
-        localizationInitMessage.value = '原点、航点、关键帧/全局匹配已完成，正在等待定位收敛'
+        localizationInitMessage.value = '原点航向/1米范围、航点及全局匹配已完成，正在等待定位收敛'
         if (navigationReadyForMap(latest, mapId, mapVersion)) {
           localizationInitState.value = 'success'
           localizationInitMessage.value = '已重新初始化到最优定位点，导航栈已就绪'

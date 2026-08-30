@@ -224,7 +224,39 @@ def test_active_relocalize_commits_verified_ndt_instead_of_advancing_candidate()
     assert result["best_ndt_committed"] is True
 
 
-def test_progressive_relocalize_tries_origin_then_each_waypoint_in_order():
+def test_active_relocalize_executes_the_one_meter_candidates():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 12
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    calls = []
+
+    def reject(pose, generation):
+        calls.append((dict(pose), generation))
+        raise ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no match", details={})
+
+    adapter._set_initial_pose_once = reject
+
+    with pytest.raises(ProtocolError) as exc:
+        adapter.active_relocalize({
+            "x": 4.0,
+            "y": 5.0,
+            "yaw": 0.0,
+            "wait_seconds": 180.0,
+            "candidate_wait_seconds": 1.0,
+        })
+
+    assert exc.value.code == "ACTIVE_RELOCALIZATION_FAILED"
+    assert len(calls) == 20
+    attempted_positions = {(call[0]["x"], call[0]["y"]) for call in calls}
+    assert {(5.0, 5.0), (3.0, 5.0), (4.0, 6.0), (4.0, 4.0)} <= attempted_positions
+    assert exc.value.details["candidate_count"] == 20
+    assert exc.value.details["timed_out"] is False
+
+
+def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 13
     adapter._assert_localization_operation = lambda _generation: None
@@ -236,7 +268,9 @@ def test_progressive_relocalize_tries_origin_then_each_waypoint_in_order():
 
     def set_once(pose, generation):
         calls.append((dict(pose), generation))
-        if len(calls) < 3:
+        # All twenty origin candidates and the first route point fail.  The
+        # second route point then supplies the accepted exact seed.
+        if len(calls) <= 21:
             raise ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no match", details={})
         return {
             "localized_pose": {"x": pose["x"], "y": pose["y"], "yaw": pose["yaw"]},
@@ -255,8 +289,11 @@ def test_progressive_relocalize_tries_origin_then_each_waypoint_in_order():
         wait_seconds=120.0,
     )
 
-    assert [(call[0]["x"], call[0]["y"]) for call in calls] == [
-        (0.0, 0.0), (1.0, 2.0), (3.0, 4.0),
+    assert len(calls) == 22
+    origin_positions = {(call[0]["x"], call[0]["y"]) for call in calls[:20]}
+    assert {(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)} <= origin_positions
+    assert [(call[0]["x"], call[0]["y"]) for call in calls[-2:]] == [
+        (1.0, 2.0), (3.0, 4.0),
     ]
     assert result["selected_stage"] == "route_waypoint"
     assert result["selected_waypoint_index"] == 1

@@ -736,6 +736,44 @@ def test_active_relocalization_uses_map_scoped_trusted_pose(tmp_path):
     store.close()
 
 
+def test_trusted_pose_relocalization_preserves_operator_search_controls(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    store.save_last_trusted_pose("92", "v1", {"x": 8.0, "y": 9.0, "yaw": -0.4})
+    navigation = FakeNavigation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(
+            SafetyConfig(), RuntimeSafetyState(current_map_id="92", current_map_version="v1")
+        ),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    seed = processor._resolve_localization_seed({
+        "seed_source": "last_trusted",
+        "wait_seconds": 17.0,
+        "max_attempts": 4,
+        "candidate_wait_seconds": 3.0,
+        "source": "operator_retry",
+    })
+
+    assert seed == {
+        "x": 8.0,
+        "y": 9.0,
+        "yaw": -0.4,
+        "wait_seconds": 17.0,
+        "max_attempts": 4,
+        "candidate_wait_seconds": 3.0,
+        "source": "operator_retry",
+    }
+    store.close()
+
+
 def test_active_relocalization_global_does_not_require_seed(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.relocalize"
@@ -777,6 +815,7 @@ def test_progressive_relocalization_starts_at_mapping_origin_then_receives_waypo
     }
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()
+    stack = FakeNavigationStack()
     processor = CommandProcessor(
         robot_id="rx-001",
         store=store,
@@ -788,6 +827,7 @@ def test_progressive_relocalization_starts_at_mapping_origin_then_receives_waypo
         publish_result=lambda *args: None,
         localization_adapter=navigation,
         map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=stack,
     )
 
     _, result = processor.handle_command(raw)
@@ -798,6 +838,8 @@ def test_progressive_relocalization_starts_at_mapping_origin_then_receives_waypo
     assert request["waypoints"][1]["x"] == 3.0
     assert request["wait_seconds"] == 150.0
     assert result["payload"]["result"]["selected_stage"] == "mapping_origin"
+    assert result["payload"]["result"]["navigation_start"]["action"] == "start"
+    assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
     store.close()
 
 

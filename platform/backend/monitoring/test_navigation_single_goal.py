@@ -72,3 +72,14 @@ class NavigationSingleGoalTests(TestCase):
             {"x": 1.0, "y": 2.0, "yaw": 0.1},
             {"x": 3.0, "y": 4.0, "yaw": -0.2},
         ])
+
+    def test_trusted_pose_relocalization_reserves_time_for_all_bounded_candidates(self):
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/navigation/relocalize/",
+            {"seed_source": "last_trusted", "map_id": "7", "map_version": "v3"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        command = RemoteCommand.objects.get(pk=response.data["id"])
+        self.assertEqual(command.payload["wait_seconds"], 180.0)
