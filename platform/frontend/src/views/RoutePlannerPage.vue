@@ -1236,7 +1236,6 @@ async function refreshNavigationStatus({ signal } = {}) {
     }
     await refreshTaskMapExecution()
     recordPoseSample()
-    navError.value = ''
     refreshImageGeometry()
   } catch (error) {
     if (error?.name === 'AbortError') return
