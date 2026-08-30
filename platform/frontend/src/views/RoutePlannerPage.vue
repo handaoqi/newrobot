@@ -58,6 +58,8 @@ import {
   shouldInitializeFromRtk,
 } from '../services/progressiveLocalization'
 import { preferredExecutedItem } from '../utils/executionSelection'
+import { resolveBatteryPercent } from '../utils/battery'
+import { isLowBatteryBlocked, lowBatteryGuardMessage } from '../utils/guardDutyLowBattery'
 
 const maps = ref([])
 const mapSets = ref([])
@@ -1483,6 +1485,11 @@ async function activeRelocalize() {
 async function handleExecuteRoute() {
   if (!selectedRoute.value?.id) {
     navError.value = '请先保存并选择一条路线'
+    return
+  }
+  const batteryPercent = resolveBatteryPercent(null, selectedRobot.value)
+  if (isLowBatteryBlocked(batteryPercent)) {
+    navError.value = lowBatteryGuardMessage(batteryPercent)
     return
   }
   if (!confirm(`确定执行路线 "${selectedRoute.value.name}" 吗？请确认现场路径安全。`)) return

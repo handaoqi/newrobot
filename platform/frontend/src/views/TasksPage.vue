@@ -12,6 +12,8 @@ import {
   updatePatrolTask,
 } from '../services/api'
 import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
+import { resolveBatteryPercent } from '../utils/battery'
+import { isLowBatteryBlocked, lowBatteryGuardMessage } from '../utils/guardDutyLowBattery'
 
 const router = useRouter()
 const tasks = ref([])
@@ -96,6 +98,12 @@ async function createTask() {
 async function execute(task) {
   error.value = ''
   executingTaskId.value = task.id
+  const batteryPercent = resolveBatteryPercent(null, robots.value.find(robot => String(robot.id) === String(task.robot)))
+  if (isLowBatteryBlocked(batteryPercent)) {
+    error.value = lowBatteryGuardMessage(batteryPercent)
+    executingTaskId.value = null
+    return
+  }
   executionProgress.value = '正在检查机器狗地图'
   try {
     await activateAndRelocalizeMap({

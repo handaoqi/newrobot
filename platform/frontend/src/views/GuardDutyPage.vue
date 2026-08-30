@@ -866,6 +866,10 @@ async function stopLoop({ notify = true, clearExecution = true } = {}) {
 
 async function launchTask({ fromLoop = false } = {}) {
   if (!presetTask.value || busy.value || isRunning.value || (!fromLoop && loopActive.value)) return null
+  if (lowBatteryBlocked.value) {
+    showToast(lowBatteryGuardMessage(batteryPercent.value), { variant: 'alert' })
+    return null
+  }
   if (fromLoop && !navigationReady()) {
     showToast('定位或导航栈未就绪，本轮稍后重试', { variant: 'alert' })
     return null
@@ -993,6 +997,10 @@ async function toggleLoop() {
     return
   }
   if (!presetTask.value || isRunning.value || busy.value || localizationBusy.value) return
+  if (lowBatteryBlocked.value) {
+    showToast(lowBatteryGuardMessage(batteryPercent.value), { variant: 'alert' })
+    return
+  }
   if (!navigationReady()) {
     showToast('请先完成地图定位初始化', { variant: 'alert' })
     return
@@ -1278,7 +1286,7 @@ watch(playUrlKey, () => {
               </small>
             </div>
             <div class="guard-task-actions">
-              <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning || lowBatteryBlocked" @click="startTask">
+              <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
                 {{ busy ? '处理中...' : '开始巡检' }}
               </button>
               <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
@@ -1329,7 +1337,7 @@ watch(playUrlKey, () => {
               <button
                 class="guard-loop-toggle"
                 :class="{ 'is-active': loopActive }"
-                :disabled="busy || localizationBusy || (!loopActive && (!presetTask || isRunning || lowBatteryBlocked || !navigationReady()))"
+                :disabled="busy || localizationBusy || (!loopActive && (!presetTask || isRunning || !navigationReady()))"
                 @click="toggleLoop"
               >
                 {{ loopActive ? '停止循环' : '循环执行' }}
