@@ -1247,7 +1247,7 @@ class RosAdapter(Node):
         ]
         candidates.extend(
             {"x": x + dx, "y": y + dy, "z": z, "yaw": normalize(yaw)}
-            for dx, dy in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+            for dx, dy in ((0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3))
         )
         return candidates
 
