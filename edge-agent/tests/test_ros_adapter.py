@@ -550,6 +550,46 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
 
     with_obstacles = follow_path_patrol_params(final_approach=False, local_obstacles=True)
     assert with_obstacles["FollowPath.CostCritic.enabled"] is True
+    assert with_obstacles["FollowPath.CostCritic.cost_weight"] == 18.0
+
+    outdoor_with_obstacles = follow_path_patrol_params(
+        final_approach=False,
+        local_obstacles=True,
+        outdoor=True,
+    )
+    assert outdoor_with_obstacles["FollowPath.CostCritic.enabled"] is True
+    assert outdoor_with_obstacles["FollowPath.CostCritic.cost_weight"] == 8.0
+
+
+def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(monkeypatch):
+    adapter = object.__new__(RosAdapter)
+    adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
+    monkeypatch.setattr(
+        "roamerx_edge.ros_adapter.Bool",
+        lambda: SimpleNamespace(data=False),
+    )
+    adapter._rtk_is_navigation_pose_source = lambda: False
+    calls = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: calls.append(
+        (node, dict(values))
+    )
+
+    adapter.set_waypoint_profile(
+        avoid_obstacles=True,
+        require_yaw=False,
+        outdoor=True,
+    )
+
+    assert calls[0][0] == "/controller_server"
+    assert calls[0][1]["FollowPath.CostCritic.enabled"] is True
+    assert calls[0][1]["FollowPath.CostCritic.cost_weight"] == 8.0
+    assert (
+        "/local_costmap/local_costmap",
+        {"obstacle_layer.enabled": True},
+    ) in calls
+    assert ("/collision_monitor", {"PolygonStop.enabled": True}) in calls
+    assert ("/collision_monitor", {"PolygonSlow.enabled": True}) in calls
+    assert all(node != "/global_costmap/global_costmap" for node, _ in calls)
 
 
 def test_final_approach_follow_path_is_applied_before_costmap_timeout(monkeypatch):

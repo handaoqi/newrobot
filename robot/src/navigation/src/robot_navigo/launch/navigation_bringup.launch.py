@@ -277,6 +277,10 @@ def generate_launch_description():
             'self_x_max': 0.46,
             'self_y_min': -0.19,
             'self_y_max': 0.10,
+            # pointcloud_to_laserscan preserves the completed frame's start
+            # stamp. Costmaps consume the frame after acquisition, so shift it
+            # by scan_time to avoid painting obstacles with a stale base pose.
+            'stamp_at_scan_end': True,
             'performance_log_interval_seconds': 10.0,
         }],
         remappings=[

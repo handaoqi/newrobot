@@ -24,6 +24,7 @@ def follow_path_patrol_params(
     final_approach: bool,
     local_obstacles: bool,
     require_yaw: bool = False,
+    outdoor: bool = False,
 ) -> dict[str, bool | float]:
     """MPPI settings for a patrol goal.
 
@@ -48,6 +49,10 @@ def follow_path_patrol_params(
         "FollowPath.GoalAngleCritic.enabled": bool(final_approach and require_yaw),
         "FollowPath.PreferForwardCritic.enabled": not final_approach,
         "FollowPath.CostCritic.enabled": bool(local_obstacles),
+        # Outdoor scans contain more grass and long-range noise. Keep collision
+        # rejection active, but use a lower gradient weight so MPPI makes one
+        # deliberate detour instead of weaving along the RTK reference line.
+        "FollowPath.CostCritic.cost_weight": 8.0 if outdoor else 18.0,
         "FollowPath.PathAlignCritic.enabled": bool(final_approach and not require_yaw),
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
         "FollowPath.PathAlignCritic.use_path_orientations": False,
@@ -2030,16 +2035,18 @@ class RosAdapter(Node):
         require_yaw: bool,
         final_approach: bool = False,
         live: bool = False,
+        outdoor: bool | None = None,
     ) -> None:
         yaw_message = Bool()
         yaw_message.data = bool(require_yaw)
         self._goal_yaw_required_pub.publish(yaw_message)
-        outdoor = self._rtk_is_navigation_pose_source()
-        # Temporary smoothness test: keep lidar local avoidance off even
-        # when a waypoint asks for obstacles. Edge startup was turning it
-        # back on before RTK was classified as the pose source.
-        local_obstacles = False
-        global_obstacles = bool(avoid_obstacles) and not outdoor
+        use_outdoor_profile = (
+            self._rtk_is_navigation_pose_source() if outdoor is None else bool(outdoor)
+        )
+        # Both indoor and outdoor navigation use the rolling local costmap for
+        # live lidar detours. The outdoor profile lowers CostCritic's gradient
+        # weight, while its collision cost and CollisionMonitor remain active.
+        local_obstacles = bool(avoid_obstacles)
         # Last-point approach must be slow enough that the DiffDrive turning
         # radius (v / wz_max) fits inside the 0.35 m goal window. At 0.5 m/s
         # that radius is 1.0 m, so the dog orbits the final point instead of
@@ -2052,6 +2059,7 @@ class RosAdapter(Node):
             final_approach=final_approach,
             local_obstacles=local_obstacles,
             require_yaw=require_yaw,
+            outdoor=use_outdoor_profile,
         )
         follow_applied = False
         try:
@@ -2067,7 +2075,6 @@ class RosAdapter(Node):
         if not live:
             for node_name, parameter_name, value in (
                 ("/local_costmap/local_costmap", "obstacle_layer.enabled", local_obstacles),
-                ("/global_costmap/global_costmap", "obstacle_layer.enabled", global_obstacles),
                 ("/collision_monitor", "PolygonStop.enabled", local_obstacles),
                 ("/collision_monitor", "PolygonSlow.enabled", local_obstacles),
             ):
@@ -2079,19 +2086,15 @@ class RosAdapter(Node):
                         attempts=1,
                     )
                 except ProtocolError:
-                    if node_name == "/global_costmap/global_costmap":
-                        LOGGER.info(
-                            "global costmap has no obstacle_layer; lidar avoidance stays on the local costmap"
-                        )
-                    else:
-                        LOGGER.warning(
-                            "unable to set %s on %s; keeping the FollowPath profile",
-                            parameter_name,
-                            node_name,
-                        )
+                    LOGGER.warning(
+                        "unable to set %s on %s; keeping the FollowPath profile",
+                        parameter_name,
+                        node_name,
+                    )
                     continue
         LOGGER.info(
-            "waypoint profile final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s",
+            "waypoint profile outdoor=%s final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s cost_weight=%s",
+            use_outdoor_profile,
             final_approach,
             live,
             follow_applied,
@@ -2100,6 +2103,7 @@ class RosAdapter(Node):
             params["FollowPath.wz_max"],
             params["FollowPath.PathAlignCritic.enabled"],
             params["FollowPath.CostCritic.enabled"],
+            params["FollowPath.CostCritic.cost_weight"],
         )
 
     def apply_outdoor_gps_profile(self, *, outdoor: bool | None = None) -> None:

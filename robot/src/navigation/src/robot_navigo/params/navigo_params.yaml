@@ -124,9 +124,9 @@ local_costmap:
         inflation_radius: 0.50
       obstacle_layer:
         plugin: "navigo_costmap_2d::ObstacleLayer"
-        # Temporary outdoor test: lidar local avoidance off so TF-stale
-        # costmap painting cannot weave the robot off the GPS line.
-        enabled: False
+        # Keep the global RTK line as the route reference while this rolling
+        # lidar layer lets MPPI make short local detours around live obstacles.
+        enabled: True
         footprint_clearing_enabled: true
         observation_persistence: 0.3
         observation_sources: scan

@@ -12,6 +12,16 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 
 
+def scan_end_stamp(
+    seconds: int, nanoseconds: int, scan_time_seconds: float
+) -> tuple[int, int]:
+    """Return a normalized timestamp at the end of a completed scan frame."""
+    offset_nanoseconds = max(0, round(float(scan_time_seconds) * 1_000_000_000))
+    total_nanoseconds = int(seconds) * 1_000_000_000 + int(nanoseconds)
+    total_nanoseconds += offset_nanoseconds
+    return divmod(total_nanoseconds, 1_000_000_000)
+
+
 class SelfFilterScan(Node):
     """Remove only the calibrated chassis/foreleg reflection rectangle."""
 
@@ -21,11 +31,15 @@ class SelfFilterScan(Node):
         self.declare_parameter("self_x_max", 0.46)
         self.declare_parameter("self_y_min", -0.19)
         self.declare_parameter("self_y_max", 0.10)
+        self.declare_parameter("stamp_at_scan_end", True)
         self.declare_parameter("performance_log_interval_seconds", 10.0)
         self._x_min = float(self.get_parameter("self_x_min").value)
         self._x_max = float(self.get_parameter("self_x_max").value)
         self._y_min = float(self.get_parameter("self_y_min").value)
         self._y_max = float(self.get_parameter("self_y_max").value)
+        self._stamp_at_scan_end = bool(
+            self.get_parameter("stamp_at_scan_end").value
+        )
         self._performance_log_interval = max(
             1.0, float(self.get_parameter("performance_log_interval_seconds").value)
         )
@@ -45,7 +59,8 @@ class SelfFilterScan(Node):
         self._warned_frame = False
         self.get_logger().info(
             f"self filter active: {self._x_min:.2f}<=x<={self._x_max:.2f}, "
-            f"{self._y_min:.2f}<=y<={self._y_max:.2f} in base_link"
+            f"{self._y_min:.2f}<=y<={self._y_max:.2f} in base_link, "
+            f"stamp_at_scan_end={self._stamp_at_scan_end}"
         )
 
     def _on_scan(self, scan: LaserScan) -> None:
@@ -73,7 +88,16 @@ class SelfFilterScan(Node):
             ]
 
         filtered = LaserScan()
-        filtered.header = scan.header
+        filtered.header.frame_id = scan.header.frame_id
+        filtered.header.stamp = scan.header.stamp
+        if self._stamp_at_scan_end and scan.scan_time > 0.0:
+            seconds, nanoseconds = scan_end_stamp(
+                scan.header.stamp.sec,
+                scan.header.stamp.nanosec,
+                scan.scan_time,
+            )
+            filtered.header.stamp.sec = seconds
+            filtered.header.stamp.nanosec = nanoseconds
         filtered.angle_min = scan.angle_min
         filtered.angle_max = scan.angle_max
         filtered.angle_increment = scan.angle_increment

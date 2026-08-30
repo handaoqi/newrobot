@@ -33,6 +33,7 @@ class FakeNavigation:
         self.goal_precisions = []
         self.docking_profiles = []
         self.live_profiles = []
+        self.outdoor_profiles = []
         self.localization_state = {"active_source": "ndt_imu", "absolute_stable": True}
 
     def prepare_for_navigation(self, timeout_seconds=12):
@@ -71,9 +72,18 @@ class FakeNavigation:
     def set_localization_policy(self, source, phase):
         self.localization_policies.append((source, phase))
 
-    def set_waypoint_profile(self, *, avoid_obstacles, require_yaw, final_approach=False, live=False):
+    def set_waypoint_profile(
+        self,
+        *,
+        avoid_obstacles,
+        require_yaw,
+        final_approach=False,
+        live=False,
+        outdoor=None,
+    ):
         self.waypoint_profiles.append((avoid_obstacles, require_yaw, final_approach))
         self.live_profiles.append(live)
+        self.outdoor_profiles.append(outdoor)
 
     def set_docking_profile(self, *, final_approach):
         self.docking_profiles.append(final_approach)
@@ -681,6 +691,30 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-3"]
     assert nav.waypoint_profiles[-1] == (True, False, True)
+    store.close()
+
+
+def test_outdoor_rtk_route_selects_outdoor_detour_profile(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {
+            "coordinate_mode": "rtk_fixed",
+            "scene_scope": "outdoor",
+        }
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert nav.outdoor_profiles[0] is True
+    assert nav.waypoint_profiles[0][0] is True
     store.close()
 
 

@@ -156,6 +156,15 @@ class NavigationAdapter(Protocol):
     def localization_decision(self) -> dict: ...
     def localization_diagnostics(self) -> dict: ...
     def set_goal_precision(self, *, enabled: bool) -> None: ...
+    def set_waypoint_profile(
+        self,
+        *,
+        avoid_obstacles: bool,
+        require_yaw: bool,
+        final_approach: bool = False,
+        live: bool = False,
+        outdoor: bool | None = None,
+    ) -> None: ...
 
 
 @dataclass
@@ -1566,7 +1575,12 @@ class TaskExecutor:
         }
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if callable(setter):
-            setter(avoid_obstacles=False, require_yaw=True, final_approach=True)
+            setter(
+                avoid_obstacles=bool(current.get("avoidance_to_next", True)),
+                require_yaw=True,
+                final_approach=True,
+                outdoor=self._outdoor_navigation_profile(),
+            )
         self._departure_heading_index = reached_index
         self._goal_offset, self._dispatched_count = reached_index, 1
         accepted = self.navigation.send_waypoints([goal], self.on_feedback, self.on_navigation_result)
@@ -1807,28 +1821,18 @@ class TaskExecutor:
         if force_final is not None:
             final_approach = bool(force_final) or precision_goal
         self._segment_avoidance_enabled = avoid_obstacles
+        outdoor_profile = self._outdoor_navigation_profile()
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if callable(setter):
             setter(
                 avoid_obstacles=avoid_obstacles,
                 require_yaw=require_yaw,
                 final_approach=final_approach,
+                outdoor=outdoor_profile,
             )
         outdoor_setter = getattr(self.navigation, "apply_outdoor_gps_profile", None)
         if callable(outdoor_setter):
-            map_info = self.context.route_snapshot.get("map") or {}
-            scene_scope = str(
-                self.context.route_snapshot.get("scene_scope")
-                or map_info.get("scene_scope")
-                or ""
-            ).lower()
-            coordinate_mode = str(map_info.get("coordinate_mode") or "").lower()
-            outdoor_setter(
-                outdoor=(
-                    coordinate_mode == "rtk_fixed"
-                    and scene_scope in {"outdoor", "transition"}
-                )
-            )
+            outdoor_setter(outdoor=outdoor_profile)
         if self._is_docking_task():
             precision_setter = getattr(self.navigation, "set_goal_precision", None)
             if callable(precision_setter):
@@ -1836,6 +1840,21 @@ class TaskExecutor:
             self._apply_docking_profile(waypoint_index)
         if not avoid_obstacles:
             self._stop_obstacle_monitor()
+
+    def _outdoor_navigation_profile(self) -> bool:
+        if not self.context:
+            return False
+        map_info = self.context.route_snapshot.get("map") or {}
+        scene_scope = str(
+            self.context.route_snapshot.get("scene_scope")
+            or map_info.get("scene_scope")
+            or ""
+        ).lower()
+        coordinate_mode = str(map_info.get("coordinate_mode") or "").lower()
+        return coordinate_mode == "rtk_fixed" and scene_scope in {
+            "outdoor",
+            "transition",
+        }
 
     def _apply_patrol_final_approach(self) -> None:
         """Slow the live FollowPath goal; do not touch costmaps or docking precision."""
@@ -1846,6 +1865,7 @@ class TaskExecutor:
             "avoid_obstacles": self._segment_avoidance_enabled,
             "require_yaw": False,
             "final_approach": True,
+            "outdoor": self._outdoor_navigation_profile(),
         }
         try:
             setter(**kwargs, live=True)
@@ -1862,7 +1882,12 @@ class TaskExecutor:
         try:
             setter = getattr(self.navigation, "set_waypoint_profile", None)
             if callable(setter):
-                setter(avoid_obstacles=True, require_yaw=False, final_approach=False)
+                setter(
+                    avoid_obstacles=True,
+                    require_yaw=False,
+                    final_approach=False,
+                    outdoor=self._outdoor_navigation_profile(),
+                )
             if self._is_docking_task():
                 precision_setter = getattr(self.navigation, "set_goal_precision", None)
                 if callable(precision_setter):
