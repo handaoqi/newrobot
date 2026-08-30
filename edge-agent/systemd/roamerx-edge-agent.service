@@ -19,6 +19,9 @@ Environment=EDGE_CONFIG=/home/dogrobot/runtime/nx-edge/conf/edge-agent.yaml
 ExecStart=/home/dogrobot/edge-agent/start_edge.sh
 Restart=always
 RestartSec=5
+# Keep a bounded core for post-mortem analysis of child ROS containers.
+LimitCORE=infinity
+Environment=ROAMERX_CORE_DIR=/tmp/roamerx-core
 # Sensors, localization and Nav2 are independently managed long-running
 # processes. Restarting the MQTT Edge process must not terminate them.
 KillMode=process

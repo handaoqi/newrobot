@@ -15,10 +15,18 @@ MC_CONTROLLER_TYPE="${MC_CONTROLLER_TYPE:-RL_TRACK_VELOCITY}"
 COMMUNICATION_TYPE="${COMMUNICATION_TYPE:-UDP}"
 USE_OFFICIAL_UKF="${USE_OFFICIAL_UKF:-false}"
 LOCALIZATION_WAIT_SECONDS="${LOCALIZATION_WAIT_SECONDS:-60}"
+LOCALIZATION_START_WAIT_SECONDS="${LOCALIZATION_START_WAIT_SECONDS:-30}"
+MAP_LOAD_TIMEOUT_SECONDS="${MAP_LOAD_TIMEOUT_SECONDS:-25}"
 REQUIRE_RTK="${REQUIRE_RTK:-0}"
 RTK_WAIT_SECONDS="${RTK_WAIT_SECONDS:-45}"
 
 mkdir -p "${LOG_DIR}"
+# Child Nav2 components inherit this limit.  The systemd unit also sets
+# LimitCORE=infinity; keep the explicit shell setting for manual launches.
+ulimit -c unlimited 2>/dev/null || true
+CORE_DIR="${ROAMERX_CORE_DIR:-/tmp/roamerx-core}"
+mkdir -p "${CORE_DIR}"
+chmod 700 "${CORE_DIR}" 2>/dev/null || true
 
 # The filtered PCD is used to generate the navigation occupancy map, but may
 # remove sparse structural features that NDT needs.  Prefer the raw mapping PCD
@@ -148,16 +156,18 @@ stop_localization() {
   kill_pattern "__node:=lio_odometry"
 }
 
-wait_for_node() {
-  local node="$1"
-  local timeout_s="$2"
-  for _ in $(seq 1 "${timeout_s}"); do
-    if ros2 node list 2>/dev/null | grep -qx "${node}"; then
+wait_for_localization_process() {
+  local deadline=$((SECONDS + LOCALIZATION_START_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    # Check the real executable instead of ros2cli's cached graph. A stale
+    # /localization graph entry can outlive its process and race map loading.
+    if is_localization_node_alive; then
+      echo "Localization process is running."
       return 0
     fi
     sleep 1
   done
-  echo "ERROR: timed out waiting for node ${node}" >&2
+  echo "ERROR: localization process did not start within ${LOCALIZATION_START_WAIT_SECONDS}s." >&2
   return 1
 }
 
@@ -186,19 +196,21 @@ ensure_rtk() {
 
 load_pcd_map() {
   echo "Loading localization PCD map: ${PCD_MAP}"
-  timeout 25 ros2 service call /load_map_service robots_dog_msgs/srv/LoadMap \
-    "{pcd_path: '${PCD_MAP}'}" | tee "${LOG_DIR}/load_map.last.log"
+  "${SCRIPT_DIR}/load_localization_map.py" \
+    "${PCD_MAP}" --timeout "${MAP_LOAD_TIMEOUT_SECONDS}" 2>&1 \
+    | tee "${LOG_DIR}/load_map.last.log"
 }
 
 wait_for_localization() {
   echo "Waiting for localization status=3..."
-  for _ in $(seq 1 "${LOCALIZATION_WAIT_SECONDS}"); do
+  local deadline=$((SECONDS + LOCALIZATION_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
     if ! is_localization_running; then
       echo "ERROR: localization process exited before reporting status=3." >&2
       return 1
     fi
     local status
-    status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+    status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 1 2>/dev/null || true)"
     if [ "${status}" = "3" ]; then
       echo "Localization OK."
       return 0
@@ -215,6 +227,12 @@ localization_is_valid() {
   [ "${status}" = "3" ]
 }
 
+localization_has_fresh_lio() {
+  # A FAST-LIO process may remain alive after entering SAFE_HOLD. Require a
+  # real odometry sample; a publisher entry in the ROS graph is insufficient.
+  timeout 3 ros2 topic echo /odom/lio_odom --once >/dev/null 2>&1
+}
+
 restart_localization_only() {
   # Used by the edge task-recovery path. Nav2 remains alive but has no active
   # goal (the task executor cancelled it before invoking this action). Do not
@@ -228,7 +246,7 @@ restart_localization_only() {
   echo "Restarting localization only..."
   setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
     >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
-  if ! wait_for_node "/localization" 15; then
+  if ! wait_for_localization_process; then
     echo "ERROR: localization node did not start." >&2
     return 1
   fi
@@ -236,12 +254,23 @@ restart_localization_only() {
   echo "Localization restarted; waiting for trusted-pose recovery."
 }
 
+recover_invalid_localization() {
+  if localization_has_fresh_lio; then
+    echo "FAST-LIO is publishing; reloading the active PCD map."
+    load_pcd_map
+  else
+    echo "FAST-LIO has no fresh odometry; restarting localization and LIO."
+    restart_localization_only
+  fi
+  wait_for_localization
+}
+
 ensure_localization_odom() {
   if ! is_localization_running; then
     echo "Starting localization odometry for mapping preparation..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
       >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
-    if ! wait_for_node "/localization" 15; then
+    if ! wait_for_localization_process; then
       echo "ERROR: localization node did not start for mapping preparation." >&2
       return 1
     fi
@@ -270,8 +299,8 @@ start_stack() {
       echo "Use '$0 restart' to stop and start again."
       return 0
     fi
-    echo "Nav2 is running but localization is not status=3; waiting for initialization."
-    if wait_for_localization; then
+    echo "Nav2 is running but localization is not status=3; starting localization recovery."
+    if recover_invalid_localization; then
       return 0
     fi
     echo "ERROR: localization is running but not valid. Initialize or relocalize first." >&2
@@ -296,7 +325,10 @@ start_stack() {
     echo "Starting localization..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
       >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
-    sleep 3
+    if ! wait_for_localization_process; then
+      echo "ERROR: localization node did not start." >&2
+      return 1
+    fi
     localization_started=true
   fi
 
@@ -309,8 +341,8 @@ start_stack() {
   elif localization_is_valid; then
     echo "Localization is already valid; preserving its current map and pose."
   else
-    echo "Localization is running but not yet status=3; waiting for initialization."
-    if ! wait_for_localization; then
+    echo "Localization is running but not yet status=3; starting localization recovery."
+    if ! recover_invalid_localization; then
       echo "ERROR: localization is running but not valid. Initialize or relocalize first; refusing to reset its pose." >&2
       return 1
     fi
