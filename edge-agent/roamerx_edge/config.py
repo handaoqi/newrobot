@@ -100,6 +100,8 @@ class ObstacleSpeechConfig:
     collision_limit_ratio: float = 0.6
     minimum_blocked_task_seconds: float = 300.0
     navigation_retry_seconds: float = 5.0
+    reverse_speed_mps: float = 0.12
+    reverse_duration_seconds: float = 1.5
 
 
 @dataclass

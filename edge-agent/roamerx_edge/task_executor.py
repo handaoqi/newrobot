@@ -345,9 +345,36 @@ class TaskExecutor:
         self._recovery_attempts += 1
         self._obstacle_progress_anchor_at = now
         self._emit_obstacle_speech("recovery_attempt", self._recovery_attempts, observation)
+        if self._recovery_attempts <= 3:
+            self._perform_obstacle_reverse()
         if self._recovery_attempts >= 3:
             self._leave_route_announced = True
             self._emit_obstacle_speech("leave_route", self._recovery_attempts, observation)
+
+    def _perform_obstacle_reverse(self) -> None:
+        """Safely back away a short distance before retrying the current goal."""
+        cancel = getattr(self.navigation, "cancel_navigation", None)
+        velocity = getattr(self.navigation, "teleop_velocity", None)
+        stop = getattr(self.navigation, "stop_motion", None)
+        if not callable(velocity):
+            LOGGER.warning("obstacle recovery requested but teleop reverse is unavailable")
+            return
+        if callable(cancel):
+            cancel(timeout_seconds=2.0)
+        speed = -abs(float(getattr(self.obstacle_speech, "reverse_speed_mps", 0.12)))
+        duration = max(0.2, min(float(getattr(self.obstacle_speech, "reverse_duration_seconds", 1.5)), 3.0))
+        LOGGER.warning("obstacle recovery reverse start speed=%.2f duration=%.2fs", speed, duration)
+        deadline = time.monotonic() + duration
+        try:
+            while time.monotonic() < deadline:
+                velocity(vx=speed, vy=0.0, yaw_rate=0.0)
+                time.sleep(0.1)
+        finally:
+            if callable(stop):
+                stop()
+            else:
+                velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+            LOGGER.warning("obstacle recovery reverse finished")
 
     def _emit_obstacle_speech(self, stage: str, attempt: int, observation: dict) -> None:
         titles = {
@@ -1691,6 +1718,13 @@ class TaskExecutor:
     def _retry_blocked_navigation(self) -> None:
         with self._lock:
             if not self.context or self.context.state != "running":
+                return
+            if self._leave_route_announced:
+                # After three failed reverse attempts, remain stopped and wait
+                # for operator intervention instead of repeatedly re-dispatching
+                # the same blocked goal.
+                self.navigation.stop_motion()
+                LOGGER.error("obstacle recovery exhausted; task remains stopped after dissuasion")
                 return
             self._send_from(self.context.current_waypoint_index)
 
