@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only post-save localization check; never publishes motion commands."""
+"""Motion-free post-save localization check; never publishes velocity commands."""
 import argparse
 import json
 import math
@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from robots_dog_msgs.msg import Localization
 from localization.msg import ScanMatchingStatus
 
@@ -32,7 +32,11 @@ def read_saved_terminal_pose(map_dir: str) -> dict | None:
     if not trajectory.is_file():
         return None
     latest = None
-    for line in trajectory.read_text(encoding="utf-8", errors="replace").splitlines():
+    try:
+        lines = trajectory.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
         fields = line.split()
         if len(fields) < 3 or line.lstrip().startswith("#"):
             continue
@@ -60,7 +64,8 @@ def read_map_context(map_dir: str) -> dict:
 
 
 def output_result(*, state: str, reason_code: str, message: str, args, latest: dict,
-                  normal_samples: int, expected_pose: dict | None) -> int:
+                  normal_samples: int, expected_pose: dict | None,
+                  diagnostics: dict) -> int:
     loc = latest.get("loc")
     match = latest.get("match")
     pose_message = latest.get("pose")
@@ -105,6 +110,10 @@ def output_result(*, state: str, reason_code: str, message: str, args, latest: d
             "max_matching_error": args.max_matching_error,
             "min_inlier_fraction": args.min_inlier_fraction,
             "max_static_speed_mps": args.max_static_speed,
+            "max_pose_step_m": args.max_pose_step,
+            "max_yaw_step_deg": args.max_yaw_step_deg,
+            "required_normal_samples": args.min_normal,
+            "required_pose_samples": args.min_pose_samples,
         },
         "localization": {
             "status": int(loc.status) if loc is not None else None,
@@ -117,6 +126,7 @@ def output_result(*, state: str, reason_code: str, message: str, args, latest: d
             "matching_error": float(getattr(match, "matching_error", math.inf)) if match is not None else None,
             "inlier_fraction": float(getattr(match, "inlier_fraction", 0.0)) if match is not None else None,
         },
+        "diagnostics": diagnostics,
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0 if state == "passed" else 1
@@ -129,24 +139,102 @@ def main() -> int:
     parser.add_argument("--mapping-type", choices=("indoor", "outdoor"), default="indoor")
     parser.add_argument("--map-dir", default="")
     parser.add_argument("--max-position-error", type=float, default=0.50)
-    parser.add_argument("--max-yaw-error-deg", type=float, default=15.0)
+    parser.add_argument("--max-yaw-error-deg", type=float, default=10.0)
     parser.add_argument("--max-matching-error", type=float, default=0.50)
     parser.add_argument("--min-inlier-fraction", type=float, default=0.05)
     parser.add_argument("--max-static-speed", type=float, default=0.15)
+    parser.add_argument("--min-pose-samples", type=int, default=3)
+    parser.add_argument("--max-pose-step", type=float, default=0.15)
+    parser.add_argument("--max-yaw-step-deg", type=float, default=3.0)
+    parser.add_argument("--initial-pose-subscriber-timeout", type=float, default=10.0)
     args = parser.parse_args()
     rclpy.init(args=None)
     node = rclpy.create_node("post_save_static_localization_check")
-    latest = {"loc": None, "match": None, "pose": None}
+    latest = {
+        "loc": None,
+        "match": None,
+        "pose": None,
+        "loc_sequence": 0,
+        "match_sequence": 0,
+        "pose_sequence": 0,
+    }
     expected_pose = read_saved_terminal_pose(args.map_dir)
-    node.create_subscription(Localization, "/localization_info", lambda m: latest.__setitem__("loc", m), 10)
+
+    def update_latest(key: str, message) -> None:
+        latest[key] = message
+        latest[f"{key}_sequence"] += 1
+
+    node.create_subscription(Localization, "/localization_info", lambda m: update_latest("loc", m), 10)
     # The deployed localization configuration publishes ScanMatchingStatus on
     # /status (the pose topic is /localization/scan_match_pose).
-    node.create_subscription(ScanMatchingStatus, "/status", lambda m: latest.__setitem__("match", m), 10)
-    node.create_subscription(PoseStamped, "/localization/scan_match_pose", lambda m: latest.__setitem__("pose", m), 10)
+    node.create_subscription(ScanMatchingStatus, "/status", lambda m: update_latest("match", m), 10)
+    node.create_subscription(PoseStamped, "/localization/scan_match_pose", lambda m: update_latest("pose", m), 10)
+    initial_pose_pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
     normal = 0
-    last_localization_message = None
+    last_loc_sequence = 0
+    last_match_sequence = 0
+    last_pose_sequence = 0
+    loc_samples = 0
+    match_samples = 0
+    pose_samples = 0
+    last_pose = None
+    max_pose_step_m = 0.0
+    max_yaw_step_deg = 0.0
+    seed_published = False
+    seed_source = "rtk_map_initialization" if args.mapping_type == "outdoor" else "saved_terminal_pose"
     deadline = time.monotonic() + max(1.0, args.timeout)
     try:
+        if expected_pose is None:
+            return output_result(
+                state="failed", reason_code="SAVED_TERMINAL_POSE_MISSING",
+                message="地图缺少保存终点，无法核对定位位置", args=args,
+                latest=latest, normal_samples=normal, expected_pose=expected_pose,
+                diagnostics={"seed_source": seed_source, "seed_published": False},
+            )
+        map_context = read_map_context(args.map_dir)
+        if args.mapping_type == "outdoor" and map_context.get("coordinate_mode") != "global_enu":
+            return output_result(
+                state="failed", reason_code="OUTDOOR_MAP_CONTEXT_INVALID",
+                message="室外地图缺少已锁定的全局 ENU 坐标上下文", args=args,
+                latest=latest, normal_samples=normal, expected_pose=expected_pose,
+                diagnostics={"seed_source": seed_source, "seed_published": False},
+            )
+
+        # Indoor validation deliberately seeds the new localization process at
+        # the saved terminal pose. Outdoor maps are seeded by LoadMapCallBack's
+        # GNSS/ENU initialization and must not be allowed to bypass that path.
+        if args.mapping_type == "indoor":
+            subscriber_deadline = min(
+                deadline,
+                time.monotonic() + max(0.1, args.initial_pose_subscriber_timeout),
+            )
+            while initial_pose_pub.get_subscription_count() == 0 and time.monotonic() < subscriber_deadline:
+                rclpy.spin_once(node, timeout_sec=0.1)
+            if initial_pose_pub.get_subscription_count() == 0:
+                return output_result(
+                    state="failed", reason_code="INITIAL_POSE_SUBSCRIBER_MISSING",
+                    message="本次地图定位栈未就绪：/initialpose 无订阅者", args=args,
+                    latest=latest, normal_samples=normal, expected_pose=expected_pose,
+                    diagnostics={"seed_source": seed_source, "seed_published": False},
+                )
+            seed = PoseWithCovarianceStamped()
+            seed.header.frame_id = "map"
+            seed.pose.pose.position.x = expected_pose["x"]
+            seed.pose.pose.position.y = expected_pose["y"]
+            seed.pose.pose.orientation.z = math.sin(expected_pose["yaw_rad"] / 2.0)
+            seed.pose.pose.orientation.w = math.cos(expected_pose["yaw_rad"] / 2.0)
+            seed.pose.covariance[0] = 0.25
+            seed.pose.covariance[7] = 0.25
+            seed.pose.covariance[35] = 0.0685
+            initial_pose_pub.publish(seed)
+            seed_published = True
+
+        # Ignore everything received before the candidate-map seed boundary.
+        last_loc_sequence = latest["loc_sequence"]
+        last_match_sequence = latest["match_sequence"]
+        last_pose_sequence = latest["pose_sequence"]
+        latest.update({"loc": None, "match": None, "pose": None})
+
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.2)
             loc, match = latest["loc"], latest["match"]
@@ -154,12 +242,31 @@ def main() -> int:
             # both indoor and ENU-aligned outdoor maps. Outdoor identity comes
             # from map_manifest.json; coord_type must not make outdoor checks
             # fail before the message implementation exposes geodetic fields.
-            if loc is not None and loc is not last_localization_message:
-                last_localization_message = loc
+            if latest["loc_sequence"] > last_loc_sequence and loc is not None:
+                last_loc_sequence = latest["loc_sequence"]
+                loc_samples += 1
                 if int(loc.status) == 3 and float(getattr(loc, "speed", 0.0)) <= args.max_static_speed:
                     normal += 1
                 else:
                     normal = 0
+            if latest["match_sequence"] > last_match_sequence and match is not None:
+                match_samples += latest["match_sequence"] - last_match_sequence
+                last_match_sequence = latest["match_sequence"]
+            if latest["pose_sequence"] > last_pose_sequence and latest["pose"] is not None:
+                pose_samples += latest["pose_sequence"] - last_pose_sequence
+                last_pose_sequence = latest["pose_sequence"]
+                current_pose = latest["pose"]
+                if last_pose is not None:
+                    pose_step = math.hypot(
+                        float(current_pose.pose.position.x) - float(last_pose.pose.position.x),
+                        float(current_pose.pose.position.y) - float(last_pose.pose.position.y),
+                    )
+                    yaw_step = abs(math.degrees(normalize_angle(
+                        quaternion_yaw(current_pose) - quaternion_yaw(last_pose),
+                    )))
+                    max_pose_step_m = max(max_pose_step_m, pose_step)
+                    max_yaw_step_deg = max(max_yaw_step_deg, yaw_step)
+                last_pose = current_pose
             match_ok = bool(
                 match is not None
                 and getattr(match, "has_converged", False)
@@ -167,24 +274,58 @@ def main() -> int:
                 and float(getattr(match, "inlier_fraction", 0.0)) >= args.min_inlier_fraction
             )
             pose_message = latest["pose"]
-            if normal >= args.min_normal and match_ok and pose_message is not None and expected_pose is not None:
+            if (
+                normal >= args.min_normal
+                and match_samples > 0
+                and match_ok
+                and pose_message is not None
+                and pose_samples >= args.min_pose_samples
+            ):
                 yaw_rad = quaternion_yaw(pose_message)
                 position_error = math.hypot(
                     float(pose_message.pose.position.x) - expected_pose["x"],
                     float(pose_message.pose.position.y) - expected_pose["y"],
                 )
                 yaw_error = abs(math.degrees(normalize_angle(yaw_rad - expected_pose["yaw_rad"])))
-                if position_error <= args.max_position_error and yaw_error <= args.max_yaw_error_deg:
+                pose_stable = (
+                    max_pose_step_m <= args.max_pose_step
+                    and max_yaw_step_deg <= args.max_yaw_step_deg
+                )
+                if (
+                    position_error <= args.max_position_error
+                    and yaw_error <= args.max_yaw_error_deg
+                    and pose_stable
+                ):
                     return output_result(
                         state="passed", reason_code="LOCALIZATION_ACCURATE",
                         message="静止定位准确", args=args, latest=latest,
                         normal_samples=normal, expected_pose=expected_pose,
+                        diagnostics={
+                            "seed_source": seed_source,
+                            "seed_published": seed_published,
+                            "fresh_localization_samples": loc_samples,
+                            "fresh_scan_match_samples": match_samples,
+                            "fresh_pose_samples": pose_samples,
+                            "max_pose_step_m": max_pose_step_m,
+                            "max_yaw_step_deg": max_yaw_step_deg,
+                        },
                     )
-        if expected_pose is None:
-            reason_code, message = "SAVED_TERMINAL_POSE_MISSING", "地图缺少保存终点，无法核对定位位置"
-        elif latest["pose"] is None:
+        diagnostics = {
+            "seed_source": seed_source,
+            "seed_published": seed_published,
+            "fresh_localization_samples": loc_samples,
+            "fresh_scan_match_samples": match_samples,
+            "fresh_pose_samples": pose_samples,
+            "max_pose_step_m": max_pose_step_m,
+            "max_yaw_step_deg": max_yaw_step_deg,
+        }
+        if latest["pose"] is None:
             reason_code, message = "LOCALIZATION_POSE_MISSING", "未收到本次地图的定位姿态"
-        elif latest["loc"] is None or normal < args.min_normal:
+        elif latest["loc"] is None:
+            reason_code, message = "LOCALIZATION_STATUS_MISSING", "未收到本次地图的新定位状态"
+        elif float(getattr(latest["loc"], "speed", 0.0)) > args.max_static_speed:
+            reason_code, message = "ROBOT_NOT_STATIONARY", "机器人速度未达到静止门槛"
+        elif int(getattr(latest["loc"], "status", 0)) != 3 or normal < args.min_normal:
             reason_code, message = "LOCALIZATION_NOT_NORMAL", "定位状态未达到静止且正常"
         elif latest["match"] is None or not bool(getattr(latest["match"], "has_converged", False)):
             reason_code, message = "SCAN_MATCH_NOT_CONVERGED", "点云匹配未收敛"
@@ -193,12 +334,15 @@ def main() -> int:
             or float(getattr(latest["match"], "inlier_fraction", 0.0)) < args.min_inlier_fraction
         ):
             reason_code, message = "SCAN_MATCH_QUALITY_LOW", "点云匹配质量未达到阈值"
+        elif max_pose_step_m > args.max_pose_step or max_yaw_step_deg > args.max_yaw_step_deg:
+            reason_code, message = "LOCALIZATION_POSE_UNSTABLE", "静止定位相邻输出跳变超过阈值"
         else:
             reason_code, message = "LOCALIZATION_POSITION_MISMATCH", "定位位置或航向偏差超过阈值"
         return output_result(
             state="failed", reason_code=reason_code, message=message,
             args=args, latest=latest, normal_samples=normal,
             expected_pose=expected_pose,
+            diagnostics=diagnostics,
         )
     finally:
         node.destroy_node()

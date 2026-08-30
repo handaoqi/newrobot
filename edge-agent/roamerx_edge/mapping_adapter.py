@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -662,7 +663,8 @@ class MappingAdapter:
             self._cleanup()
             result.update(self.status())
         # Start the post-save static self-check only after the map is durable and
-        # the mapping session has been torn down.  It never publishes motion.
+        # the mapping session has been torn down. It may seed localization but
+        # never starts Nav2 or publishes a velocity command.
         self._start_post_save_validation(
             str(work_dir),
             str(command.get("mapping_type") or saved_mapping_type or "indoor"),
@@ -685,6 +687,7 @@ class MappingAdapter:
 
     def _start_post_save_validation(self, map_dir: str, mapping_type: str) -> None:
         kind = "outdoor" if str(mapping_type).lower() == "outdoor" else "indoor"
+        validation_id = str(uuid.uuid4())
         with self._post_save_validation_lock:
             payload = self._read_post_save_validation()
             payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
@@ -692,30 +695,61 @@ class MappingAdapter:
                 "state": "queued",
                 "mapping_type": kind,
                 "map_dir": map_dir,
+                "validation_id": validation_id,
                 "detail": "",
                 "result": {},
                 "updated_at": now_iso(),
             })
             _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        threading.Thread(target=self._run_post_save_validation, args=(map_dir, kind), daemon=True).start()
+        threading.Thread(
+            target=self._run_post_save_validation,
+            args=(map_dir, kind, validation_id),
+            daemon=True,
+        ).start()
 
-    def _run_post_save_validation(self, map_dir: str, kind: str) -> None:
+    def _run_post_save_validation(
+        self,
+        map_dir: str,
+        kind: str,
+        validation_id: str = "",
+    ) -> None:
         with self._post_save_validation_lock:
             payload = self._read_post_save_validation()
+            if validation_id and payload.get("validation_id") != validation_id:
+                return
             payload.update({"state": "running", "mapping_type": kind, "map_dir": map_dir, "updated_at": now_iso()})
             _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         command = os.environ.get("ROAMERX_POST_SAVE_VALIDATION_CMD", "").strip()
+        checker_argv = None
         if not command:
             checker = Path(__file__).resolve().parents[2] / "robot" / "script" / "robot" / "post_save_static_localization_check.py"
-            command = f"python3 {checker} --mapping-type {{mapping_type}} --map-dir {{map_dir}}"
+            checker_argv = [
+                "python3",
+                str(checker),
+                "--mapping-type",
+                kind,
+                "--map-dir",
+                map_dir,
+            ]
         result_state, detail = ("unavailable", "未配置真实静止定位验证命令")
         structured_result = {}
-        if command:
+        candidate_localization_started = False
+        navigation_script = None
+        prepare_environment = None
+        if command or checker_argv:
             try:
                 navigation_script = Path(self.config.navigation_script).expanduser()
                 if not navigation_script.is_file():
                     raise RuntimeError(f"navigation script not found: {navigation_script}")
                 map_path = Path(map_dir).expanduser().resolve()
+                missing_files = [
+                    name for name in ("map.pcd", "map.yaml", "map.txt", "map_manifest.json")
+                    if not (map_path / name).is_file()
+                ]
+                if missing_files:
+                    raise RuntimeError(
+                        f"saved map is incomplete for localization check: {', '.join(missing_files)}"
+                    )
                 prepare_environment = os.environ.copy()
                 prepare_environment.update({
                     "PCD_MAP": str(map_path / "map.pcd"),
@@ -732,22 +766,57 @@ class MappingAdapter:
                     raise RuntimeError(
                         (prepared.stderr or prepared.stdout or "本次地图定位栈启动失败").strip()[-1000:]
                     )
-                completed = subprocess.run(command.format(map_dir=map_dir, mapping_type=kind), shell=True, capture_output=True, text=True, timeout=45)
+                candidate_localization_started = True
+                completed = subprocess.run(
+                    checker_argv or command.format(
+                        map_dir=shlex.quote(str(map_path)),
+                        mapping_type=shlex.quote(kind),
+                    ),
+                    shell=checker_argv is None,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
                 combined_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
                 structured_result = _parse_post_save_localization_check(combined_output)
-                result_state = "passed" if completed.returncode == 0 else "failed"
                 if structured_result:
                     declared_state = str(structured_result.get("state") or "")
-                    result_state = (
-                        "passed"
-                        if completed.returncode == 0
+                    declared_map_dir = str(structured_result.get("map_dir") or "")
+                    declared_map_matches = bool(declared_map_dir) and (
+                        Path(declared_map_dir).expanduser().resolve() == map_path
+                    )
+                    declared_type_matches = structured_result.get("mapping_type") == kind
+                    passed = bool(
+                        completed.returncode == 0
                         and declared_state == "passed"
                         and structured_result.get("accurate") is True
-                        else "failed"
+                        and declared_map_matches
+                        and declared_type_matches
                     )
+                    result_state = "passed" if passed else "failed"
+                    if not declared_map_matches or not declared_type_matches:
+                        structured_result = {
+                            **structured_result,
+                            "state": "failed",
+                            "accurate": False,
+                            "reason_code": "LOCALIZATION_CHECK_IDENTITY_MISMATCH",
+                            "message": "自检输出的地图目录或建图类型与本次保存不一致",
+                        }
                     detail = str(structured_result.get("message") or "")
                 else:
-                    detail = combined_output.strip()[-1000:]
+                    result_state = "failed"
+                    detail = "静止定位验证器未输出结构化结果"
+                    structured_result = {
+                        "schema": "roamerx.post-save-localization-check.v1",
+                        "state": "failed",
+                        "accurate": False,
+                        "reason_code": "LOCALIZATION_CHECK_OUTPUT_INVALID",
+                        "message": detail,
+                        "mapping_type": kind,
+                        "map_dir": str(map_path),
+                        "frame_id": "map",
+                        "raw_output": combined_output.strip()[-1000:],
+                    }
             except Exception as exc:
                 result_state, detail = "failed", str(exc)
                 structured_result = {
@@ -760,24 +829,50 @@ class MappingAdapter:
                     "map_dir": map_dir,
                     "frame_id": "map",
                 }
+        if result_state != "passed" and candidate_localization_started and navigation_script:
+            try:
+                stopped = subprocess.run(
+                    [str(navigation_script), "stop-localization"],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    env=prepare_environment,
+                )
+                stop_error = (
+                    (stopped.stderr or stopped.stdout or "候选定位栈停止失败").strip()[-500:]
+                    if stopped.returncode != 0
+                    else ""
+                )
+            except Exception as exc:
+                stop_error = f"候选定位栈停止失败: {exc}"
+            if stop_error:
+                detail = f"{detail}；{stop_error}" if detail else stop_error
+                structured_result["cleanup_error"] = stop_error
         with self._post_save_validation_lock:
             payload = self._read_post_save_validation()
             bucket = payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
             bucket["attempts"] = int(bucket.get("attempts", 0)) + 1
             if result_state == "passed": bucket["success"] = int(bucket.get("success", 0)) + 1
-            history_entry = {"at": now_iso(), "map_dir": map_dir, "state": result_state, "detail": detail}
+            history_entry = {
+                "at": now_iso(),
+                "map_dir": map_dir,
+                "state": result_state,
+                "detail": detail,
+                "validation_id": validation_id,
+            }
             if structured_result:
                 history_entry["result"] = structured_result
             bucket.setdefault("history", []).append(history_entry)
             bucket["history"] = bucket["history"][-20:]
-            payload.update({
-                "state": result_state,
-                "detail": detail,
-                "result": structured_result,
-                "mapping_type": kind,
-                "map_dir": map_dir,
-                "updated_at": now_iso(),
-            })
+            if not validation_id or payload.get("validation_id") == validation_id:
+                payload.update({
+                    "state": result_state,
+                    "detail": detail,
+                    "result": structured_result,
+                    "mapping_type": kind,
+                    "map_dir": map_dir,
+                    "updated_at": now_iso(),
+                })
             _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:

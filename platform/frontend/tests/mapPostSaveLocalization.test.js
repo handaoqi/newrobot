@@ -15,10 +15,16 @@ test('map page shows this save localization outcome and map pose', () => {
   assert.match(source, /航向偏差/)
   assert.match(source, /NDT 匹配误差/)
   assert.match(source, /内点率/)
+  assert.match(source, /最大位置跳变/)
+  assert.match(source, /最大航向跳变/)
+  assert.match(source, /判定代码/)
+  assert.match(source, /候选地图/)
 })
 
-test('map page reports queued check as loading the exact saved map without motion', () => {
+test('map page reports queued check as loading the exact saved map without navigation motion', () => {
   assert.match(source, /正在加载本次地图并定位/)
-  assert.match(source, /不会下发运动指令/)
+  assert.match(source, /不会启动导航或下发速度指令/)
   assert.match(source, /postSaveValidationResult\.value\.accurate === true/)
+  assert.match(source, /保存终点初始位姿已发布/)
+  assert.match(source, /候选地图 RTK\/ENU 初始化/)
 })

@@ -85,6 +85,8 @@ def test_post_save_validation_loads_exact_saved_map_and_persists_pose(tmp_path, 
     navigation_script.write_text("#!/bin/sh\n")
     saved_map = tmp_path / "20260830_120000_001"
     saved_map.mkdir()
+    for name in ("map.pcd", "map.yaml", "map.txt", "map_manifest.json"):
+        (saved_map / name).write_text("test")
     adapter = make_adapter(tmp_path, navigation_script=str(navigation_script))
     calls = []
     checker_payload = {
@@ -101,7 +103,7 @@ def test_post_save_validation_loads_exact_saved_map_and_persists_pose(tmp_path, 
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        if isinstance(command, list):
+        if isinstance(command, list) and command[-1] == "restart-localization":
             return SimpleNamespace(returncode=0, stdout="ready", stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps(checker_payload), stderr="")
 
@@ -112,12 +114,56 @@ def test_post_save_validation_loads_exact_saved_map_and_persists_pose(tmp_path, 
     assert calls[0][0] == [str(navigation_script), "restart-localization"]
     assert calls[0][1]["env"]["PCD_MAP"] == str(saved_map / "map.pcd")
     assert calls[0][1]["env"]["MAP_YAML"] == str(saved_map / "map.yaml")
+    assert calls[1][0][0] == "python3"
+    assert calls[1][0][-4:] == ["--mapping-type", "outdoor", "--map-dir", str(saved_map)]
+    assert calls[1][1]["shell"] is False
     persisted = json.loads(adapter._post_save_validation_file.read_text())
     assert persisted["state"] == "passed"
     assert persisted["mapping_type"] == "outdoor"
     assert persisted["result"]["pose"]["x"] == 4.25
     assert persisted["outdoor"]["attempts"] == 1
     assert persisted["outdoor"]["success"] == 1
+
+
+def test_post_save_validation_rejects_unstructured_or_wrong_map_output(tmp_path, monkeypatch):
+    navigation_script = tmp_path / "start_navigation_real.sh"
+    navigation_script.write_text("#!/bin/sh\n")
+    saved_map = tmp_path / "20260830_120000_002"
+    saved_map.mkdir()
+    for name in ("map.pcd", "map.yaml", "map.txt", "map_manifest.json"):
+        (saved_map / name).write_text("test")
+    adapter = make_adapter(tmp_path, navigation_script=str(navigation_script))
+    checker_results = iter([
+        SimpleNamespace(returncode=0, stdout="PASS", stderr=""),
+        SimpleNamespace(returncode=0, stdout=json.dumps({
+            "schema": "roamerx.post-save-localization-check.v1",
+            "state": "passed",
+            "accurate": True,
+            "mapping_type": "indoor",
+            "map_dir": str(tmp_path / "different-map"),
+            "message": "静止定位准确",
+        }), stderr=""),
+    ])
+
+    def fake_run(command, **_kwargs):
+        if isinstance(command, list) and command[-1] in {"restart-localization", "stop-localization"}:
+            return SimpleNamespace(returncode=0, stdout="ready", stderr="")
+        return next(checker_results)
+
+    monkeypatch.setattr(mapping_adapter_module.subprocess, "run", fake_run)
+
+    adapter._run_post_save_validation(str(saved_map), "indoor")
+    first = json.loads(adapter._post_save_validation_file.read_text())
+    assert first["state"] == "failed"
+    assert first["result"]["reason_code"] == "LOCALIZATION_CHECK_OUTPUT_INVALID"
+    assert first["indoor"]["success"] == 0
+
+    adapter._run_post_save_validation(str(saved_map), "indoor")
+    second = json.loads(adapter._post_save_validation_file.read_text())
+    assert second["state"] == "failed"
+    assert second["result"]["reason_code"] == "LOCALIZATION_CHECK_IDENTITY_MISMATCH"
+    assert second["indoor"]["attempts"] == 2
+    assert second["indoor"]["success"] == 0
 
 
 def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch):

@@ -520,6 +520,20 @@ const formatValidationPose = pose => {
 }
 const validationPoseLabel = computed(() => formatValidationPose(postSaveValidationResult.value.pose))
 const validationSavedPoseLabel = computed(() => formatValidationPose(postSaveValidationResult.value.saved_terminal_pose))
+const validationDiagnostics = computed(() => postSaveValidationResult.value.diagnostics || {})
+const validationSeedLabel = computed(() => {
+  const source = validationDiagnostics.value.seed_source
+  if (source === 'saved_terminal_pose') {
+    return validationDiagnostics.value.seed_published ? '保存终点初始位姿已发布' : '保存终点初始位姿未发布'
+  }
+  if (source === 'rtk_map_initialization') return '候选地图 RTK/ENU 初始化'
+  return '初始化来源未知'
+})
+const validationSampleLabel = computed(() => (
+  `定位 ${Number(validationDiagnostics.value.fresh_localization_samples || 0)} 帧`
+  + ` · 匹配 ${Number(validationDiagnostics.value.fresh_scan_match_samples || 0)} 帧`
+  + ` · 姿态 ${Number(validationDiagnostics.value.fresh_pose_samples || 0)} 帧`
+))
 const formatValidationMetric = (value, digits, suffix) => {
   const number = finiteValidationNumber(value)
   return number === null ? '无数据' : `${number.toFixed(digits)}${suffix}`
@@ -2352,12 +2366,17 @@ async function saveCleaner() {
                 <span>航向偏差<strong>{{ formatValidationMetric(postSaveValidationResult.yaw_error_deg, 1, '°') }}</strong></span>
                 <span>NDT 匹配误差<strong>{{ formatValidationMetric(postSaveValidationResult.quality?.matching_error, 3, '') }}</strong></span>
                 <span>内点率<strong>{{ formatValidationMetric(Number(postSaveValidationResult.quality?.inlier_fraction) * 100, 1, '%') }}</strong></span>
+                <span>最大位置跳变<strong>{{ formatValidationMetric(validationDiagnostics.max_pose_step_m, 3, ' m') }}</strong></span>
+                <span>最大航向跳变<strong>{{ formatValidationMetric(validationDiagnostics.max_yaw_step_deg, 1, '°') }}</strong></span>
               </div>
+              <small>{{ validationSeedLabel }} · {{ validationSampleLabel }}</small>
+              <small v-if="postSaveValidationResult.reason_code">判定代码 {{ postSaveValidationResult.reason_code }}</small>
+              <small v-if="postSaveValidationResult.map_dir" :title="postSaveValidationResult.map_dir">候选地图 {{ postSaveValidationResult.map_dir }}</small>
               <small v-if="validationResultTime">检测时间 {{ validationResultTime }}</small>
               <small v-if="postSaveValidationResult.message">{{ postSaveValidationResult.message }}</small>
             </div>
             <div v-else-if="['queued', 'running'].includes(postSaveValidation.state)" class="validation-waiting">
-              正在启动只读定位、加载本次保存地图并核对保存结束位置；不会下发运动指令。
+              正在启动候选地图定位、加载本次保存地图并核对保存结束位置；不会启动导航或下发速度指令。
             </div>
             <div class="validation-counters">
               <div><span>室内累计</span><strong>{{ indoorValidation.success }}/{{ indoorValidation.required }}</strong><progress :value="validationPercent(indoorValidation)" max="100"></progress><small>尝试 {{ indoorValidation.attempts || 0 }} 次</small></div>

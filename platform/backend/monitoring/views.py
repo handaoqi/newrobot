@@ -2741,7 +2741,7 @@ class RobotMappingStatusView(APIView):
                 )
                 mapping_result["save_progress"] = completed_progress
             # The save command finishes as soon as the durable map package is
-            # uploaded, while the read-only localization check completes in a
+            # uploaded, while the motion-free localization check completes in a
             # background Edge thread. Merge only the live result for the same
             # saved map so the UI can leave "queued/running" without allowing
             # a later mapping run to overwrite this command's result.
