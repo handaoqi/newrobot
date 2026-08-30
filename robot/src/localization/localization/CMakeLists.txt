@@ -86,6 +86,7 @@ add_executable(${PROJECT_NAME}_node
   src/localization/static_imu_init.cpp
   src/localization/global_localization.cpp
   src/localization/scan_context_db.cpp
+  src/localization/relocalization_geometry.cpp
 )
 ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
@@ -118,6 +119,23 @@ add_executable(${PROJECT_NAME}_scan_context_check
   tools/scan_context_check.cpp
   src/localization/scan_context_db.cpp
 )
+
+# Shadow/offline Tier-1 validation: Scan Context proposals must survive real 3D
+# FastGICP, bidirectional overlap, Hessian and an independent ICP cross-check.
+add_executable(${PROJECT_NAME}_relocalization_geometry_check
+  tools/relocalization_geometry_check.cpp
+  src/localization/scan_context_db.cpp
+  src/localization/relocalization_geometry.cpp
+)
+ament_target_dependencies(${PROJECT_NAME}_relocalization_geometry_check
+  pcl_ros
+  pcl_conversions
+  fast_gicp
+)
+target_include_directories(${PROJECT_NAME}_relocalization_geometry_check PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
 ament_target_dependencies(${PROJECT_NAME}_scan_context_check
   pcl_ros
   pcl_conversions
@@ -138,6 +156,7 @@ install(
   TARGETS
     ${PROJECT_NAME}_node
     ${PROJECT_NAME}_scan_context_check
+    ${PROJECT_NAME}_relocalization_geometry_check
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -154,5 +173,45 @@ install(
         DESTINATION .
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(point_cloud_scheduler_test
+    test/point_cloud_scheduler_test.cpp
+  )
+  target_include_directories(point_cloud_scheduler_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_add_gtest(scan_match_policy_test
+    test/scan_match_policy_test.cpp
+  )
+  target_include_directories(scan_match_policy_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_add_gtest(global_relocalization_policy_test
+    test/global_relocalization_policy_test.cpp
+  )
+  target_include_directories(global_relocalization_policy_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_add_gtest(correction_policy_test
+    test/correction_policy_test.cpp
+  )
+  target_include_directories(correction_policy_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_add_gtest(relocalization_geometry_policy_test
+    test/relocalization_geometry_policy_test.cpp
+    src/localization/relocalization_geometry.cpp
+  )
+  ament_target_dependencies(relocalization_geometry_policy_test
+    pcl_ros
+    pcl_conversions
+    fast_gicp
+  )
+  target_include_directories(relocalization_geometry_policy_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+endif()
 
 ament_package()

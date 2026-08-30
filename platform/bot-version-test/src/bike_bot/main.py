@@ -14,6 +14,7 @@ from .audio_commands import AudioCommandClient
 from .config import AppConfig
 from .control import CommandServer
 from .detector import YoloDetector
+from .rate_control import InferenceRateLimiter, selected_inference_rate_hz
 from .logging_utils import rotating_file_handler
 from .runtime import RuntimeState
 from .sdk import RobotSdkClient
@@ -56,6 +57,7 @@ class DetectionPerfWindow:
         self.parse_seconds = 0.0
         self.max_session_run_seconds = 0.0
         self.providers = ""
+        self.target_inference_rate_hz = 0.0
 
     def record(
         self,
@@ -74,6 +76,7 @@ class DetectionPerfWindow:
         session_run_seconds: float = 0.0,
         parse_seconds: float = 0.0,
         providers: str = "",
+        target_inference_rate_hz: float = 0.0,
     ) -> None:
         self.frames += 1
         self.events += event_count
@@ -98,6 +101,7 @@ class DetectionPerfWindow:
         self.max_session_run_seconds = max(self.max_session_run_seconds, session_run_seconds)
         if providers:
             self.providers = providers
+        self.target_inference_rate_hz = target_inference_rate_hz
 
     def should_log(self, now: float) -> bool:
         return now - self.started_at >= PERF_LOG_INTERVAL_SECONDS
@@ -111,7 +115,8 @@ class DetectionPerfWindow:
         LOGGER.info(
             "edge_perf detection_window frames=%d target_frames=%d max_target_count=%d events=%d "
             "dropped_frames=%d elapsed_s=%.1f effective_fps=%.2f "
-            "source_fps=%.2f lag_risk=%s avg_wait_latest_ms=%.1f avg_input_age_ms=%.1f "
+            "source_fps=%.2f target_inference_fps=%.2f lag_risk=%s "
+            "avg_wait_latest_ms=%.1f avg_input_age_ms=%.1f "
             "avg_detect_ms=%.1f avg_preview_ms=%.1f "
             "avg_snapshot_ms=%.1f avg_telemetry_ms=%.1f avg_loop_ms=%.1f max_read_ms=%.1f "
             "max_detect_ms=%.1f max_telemetry_ms=%.1f max_loop_ms=%.1f "
@@ -125,6 +130,7 @@ class DetectionPerfWindow:
             elapsed,
             effective_fps,
             self.source_fps,
+            self.target_inference_rate_hz,
             lag_risk,
             _milliseconds(self.read_seconds / frames),
             _milliseconds(self.input_age_seconds / frames),
@@ -183,6 +189,7 @@ class LatestFrameCapture:
         self._frame_id = 0
         self._frame_read_at = 0.0
         self._source_fps = 0.0
+        self._sample_rate_hz = max(0.0, detector.config.detection.inference_rate_hz)
         self._exception: BaseException | None = None
 
     def start(self) -> None:
@@ -193,6 +200,10 @@ class LatestFrameCapture:
         with self._condition:
             self._condition.notify_all()
         self._thread.join(timeout=2)
+
+    def set_sample_rate_hz(self, rate_hz: float) -> None:
+        with self._condition:
+            self._sample_rate_hz = max(0.0, float(rate_hz))
 
     def wait_for_latest(self, last_frame_id: int, timeout_seconds: float = 1.0) -> LatestFrameSample | None:
         started_at = time.perf_counter()
@@ -228,6 +239,8 @@ class LatestFrameCapture:
     def _run(self) -> None:
         capture = None
         reader_started_at = time.perf_counter()
+        source_frame_id = 0
+        grabbed_frames = 0
         reader_frames = 0
         reader_failures = 0
         reader_read_seconds = 0.0
@@ -273,13 +286,15 @@ class LatestFrameCapture:
                         self.detector.config.video.rtsp_transport,
                     )
                     reader_started_at = time.perf_counter()
+                    next_sample_at = 0.0
+                    grabbed_frames = 0
                     reader_frames = 0
                     reader_failures = 0
                     reader_read_seconds = 0.0
                     reader_max_read_seconds = 0.0
 
                 read_started_at = time.perf_counter()
-                ok, frame = capture.read()
+                ok = capture.grab()
                 read_seconds = time.perf_counter() - read_started_at
                 if not ok:
                     reader_failures += 1
@@ -295,11 +310,30 @@ class LatestFrameCapture:
                     continue
 
                 read_at = time.perf_counter()
-                reader_frames += 1
+                source_frame_id += 1
+                grabbed_frames += 1
                 reader_read_seconds += read_seconds
                 reader_max_read_seconds = max(reader_max_read_seconds, read_seconds)
                 with self._condition:
-                    self._frame_id += 1
+                    sample_rate_hz = self._sample_rate_hz
+                if sample_rate_hz > 0.0 and read_at < next_sample_at:
+                    continue
+                retrieve_started_at = time.perf_counter()
+                ok, frame = capture.retrieve()
+                retrieve_seconds = time.perf_counter() - retrieve_started_at
+                if not ok:
+                    reader_failures += 1
+                    LOGGER.warning("edge_perf retrieve_failed source=%s", self.detector.config.video.source)
+                    capture.release()
+                    capture = None
+                    self.stop_event.wait(self.detector.config.video.reconnect_interval_seconds)
+                    continue
+                reader_frames += 1
+                reader_read_seconds += retrieve_seconds
+                reader_max_read_seconds = max(reader_max_read_seconds, read_seconds + retrieve_seconds)
+                next_sample_at = read_at + (1.0 / sample_rate_hz if sample_rate_hz > 0.0 else 0.0)
+                with self._condition:
+                    self._frame_id = source_frame_id
                     self._frame = frame
                     self._frame_read_at = read_at
                     self._condition.notify_all()
@@ -308,18 +342,23 @@ class LatestFrameCapture:
                 if now - reader_started_at >= PERF_LOG_INTERVAL_SECONDS:
                     elapsed = max(now - reader_started_at, 1e-6)
                     LOGGER.info(
-                        "edge_perf latest_frame_reader_window captured_frames=%d elapsed_s=%.1f "
-                        "capture_effective_fps=%.2f avg_capture_read_ms=%.1f max_capture_read_ms=%.1f "
+                        "edge_perf latest_frame_reader_window grabbed_frames=%d sampled_frames=%d "
+                        "elapsed_s=%.1f source_effective_fps=%.2f sampled_fps=%.2f "
+                        "target_sample_fps=%.2f avg_capture_ms=%.1f max_capture_ms=%.1f "
                         "read_failures=%d latest_frame_id=%d",
+                        grabbed_frames,
                         reader_frames,
                         elapsed,
+                        grabbed_frames / elapsed,
                         reader_frames / elapsed,
-                        _milliseconds(reader_read_seconds / max(reader_frames, 1)),
+                        sample_rate_hz,
+                        _milliseconds(reader_read_seconds / max(grabbed_frames, 1)),
                         _milliseconds(reader_max_read_seconds),
                         reader_failures,
                         self._frame_id,
                     )
                     reader_started_at = now
+                    grabbed_frames = 0
                     reader_frames = 0
                     reader_failures = 0
                     reader_read_seconds = 0.0
@@ -360,6 +399,30 @@ def status_worker(stop_event: threading.Event, client: TelemetryClient, interval
         stop_event.wait(interval_seconds)
 
 
+def person_detection_mode_worker(
+    stop_event: threading.Event,
+    client: TelemetryClient,
+    state: dict[str, bool],
+    state_lock: threading.Lock,
+) -> None:
+    """Poll follow mode independently so network latency cannot stall inference."""
+    while not stop_event.is_set():
+        try:
+            requested = client.fetch_person_detection_enabled()
+            if requested is not None:
+                with state_lock:
+                    changed = requested != state["enabled"]
+                    state["enabled"] = requested
+                if changed:
+                    LOGGER.info(
+                        "person detection inference %s",
+                        "enabled" if requested else "disabled",
+                    )
+        except Exception:
+            LOGGER.exception("person detection mode poll failed")
+        stop_event.wait(1.0)
+
+
 def detection_worker(
     stop_event: threading.Event,
     detector: YoloDetector,
@@ -374,10 +437,30 @@ def detection_worker(
     last_frame_id = 0
     frame_number = 0
     perf_window = DetectionPerfWindow(0.0)
-    person_detection_enabled = False
-    next_person_mode_poll_at = 0.0
+    person_mode_state = {"enabled": False}
+    person_mode_lock = threading.Lock()
+    person_mode_thread = threading.Thread(
+        target=person_detection_mode_worker,
+        args=(stop_event, client, person_mode_state, person_mode_lock),
+        daemon=False,
+        name="person-detection-mode",
+    )
+    person_mode_thread.start()
+    inference_limiter = InferenceRateLimiter()
     try:
         while not stop_event.is_set():
+            with person_mode_lock:
+                person_detection_enabled = person_mode_state["enabled"]
+            target_inference_rate_hz = selected_inference_rate_hz(
+                detector.config.detection.inference_rate_hz,
+                detector.config.detection.person_follow_inference_rate_hz,
+                person_detection_enabled,
+            )
+            latest_capture.set_sample_rate_hz(target_inference_rate_hz)
+            delay_seconds = inference_limiter.delay_seconds(time.perf_counter())
+            if delay_seconds > 0.0:
+                stop_event.wait(delay_seconds)
+                continue
             sample = latest_capture.wait_for_latest(last_frame_id)
             if sample is None:
                 continue
@@ -389,6 +472,7 @@ def detection_worker(
                 cv2.namedWindow(detector.config.display.window_name, cv2.WINDOW_NORMAL)
 
             loop_started_at = time.perf_counter()
+            inference_limiter.mark_started(loop_started_at, target_inference_rate_hz)
             frame = sample.frame
             client.update_frame_size(frame.shape[1], frame.shape[0])
             frame_number += 1
@@ -399,13 +483,6 @@ def detection_worker(
 
             detect_started_at = time.perf_counter()
             result = detector.detect(frame)
-            now = time.monotonic()
-            if now >= next_person_mode_poll_at:
-                requested = client.fetch_person_detection_enabled()
-                if requested is not None and requested != person_detection_enabled:
-                    person_detection_enabled = requested
-                    LOGGER.info("person detection inference %s", "enabled" if requested else "disabled")
-                next_person_mode_poll_at = now + 1.0
             live_tracks = [
                 track
                 for track in (result.tracked_objects or [])
@@ -455,6 +532,7 @@ def detection_worker(
                     session_run_seconds=detector.last_timing.session_run_seconds,
                     parse_seconds=detector.last_timing.parse_seconds,
                     providers=detector.last_timing.providers,
+                    target_inference_rate_hz=target_inference_rate_hz,
                 )
                 if perf_window.should_log(time.perf_counter()):
                     perf_window.log_and_reset(time.perf_counter())
@@ -512,6 +590,7 @@ def detection_worker(
                 session_run_seconds=detector.last_timing.session_run_seconds,
                 parse_seconds=detector.last_timing.parse_seconds,
                 providers=detector.last_timing.providers,
+                target_inference_rate_hz=target_inference_rate_hz,
             )
             if perf_window.should_log(time.perf_counter()):
                 perf_window.log_and_reset(time.perf_counter())
@@ -520,6 +599,7 @@ def detection_worker(
         error_queue.put(exc)
     finally:
         latest_capture.close()
+        person_mode_thread.join(timeout=max(1.0, client.config.telemetry.timeout_seconds + 1.0))
         if detector.config.display.enable:
             cv2.destroyAllWindows()
 

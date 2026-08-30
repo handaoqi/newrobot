@@ -277,6 +277,7 @@ def generate_launch_description():
             'self_x_max': 0.46,
             'self_y_min': -0.19,
             'self_y_max': 0.10,
+            'performance_log_interval_seconds': 10.0,
         }],
         remappings=[
             ('scan_in', '/laser_scan_raw'),

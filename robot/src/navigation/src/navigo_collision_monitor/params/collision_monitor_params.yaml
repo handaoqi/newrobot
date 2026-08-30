@@ -46,6 +46,8 @@ collision_monitor:
       type: "scan"
       topic: "/scan"
       enabled: True
+      cache_by_stamp: True
+      performance_log_interval_seconds: 10.0
     pointcloud:
       type: "pointcloud"
       topic: "/intel_realsense_r200_depth/points"

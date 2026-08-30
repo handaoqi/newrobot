@@ -422,3 +422,5 @@ collision_monitor:
       type: "scan"
       topic: "/laser_scan"
       enabled: true
+      cache_by_stamp: true
+      performance_log_interval_seconds: 10.0

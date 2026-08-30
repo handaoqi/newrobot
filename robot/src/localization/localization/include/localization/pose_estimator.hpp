@@ -12,6 +12,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/registration/registration.h>
 #include <Eigen/Geometry>
+#include <localization/scan_match_policy.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -45,6 +46,13 @@ public:
     float refine_score_ = std::numeric_limits<float>::infinity();
     Eigen::Matrix4f transform_ = Eigen::Matrix4f::Identity();
     std::string method_ = "none";
+  };
+
+  struct MatchTiming {
+    double ndt_ms = 0.0;
+    double local_map_ms = 0.0;
+    double refine_ms = 0.0;
+    double total_ms = 0.0;
   };
 
   /// Default process noise for the gyro bias states (rad/s)^2 per second.
@@ -122,6 +130,8 @@ public:
     float max_fitness_score,
     float coarse_max_fitness_score);
 
+  void configure_refine_policy(const ScanMatchRefinePolicy& policy);
+
   /**
    * @brief correct
    * @param cloud   input cloud
@@ -130,7 +140,8 @@ public:
   pcl::PointCloud<PointT>::Ptr correct(
     const rclcpp::Time& stamp,
     const pcl::PointCloud<PointT>::ConstPtr& cloud,
-    bool apply_observation = true);
+    bool apply_observation = true,
+    bool allow_high_quality_refine_skip = false);
 
   void correct_absolute_pose(
     const Eigen::Vector3f& position,
@@ -167,6 +178,7 @@ public:
   const boost::optional<Eigen::Matrix4f>& lidar_odometry_prediction_error() const;
 
   MatchResult GetMatchState() const; 
+  MatchTiming GetMatchTiming() const;
   Eigen::VectorXf GetCurrentUkfState(); 
 
   void apply_position_correction(const Eigen::Vector3f& correction);
@@ -196,6 +208,7 @@ private:
 
   Eigen::MatrixXf process_noise;
   MatchResult     match_result_;
+  MatchTiming     match_timing_;
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, PoseSystem>> ukf;
   std::unique_ptr<kkl::alg::UnscentedKalmanFilterX<float, OdomSystem>> odom_ukf;
   bool odom_orientation_initialized_ = false;
@@ -218,6 +231,7 @@ private:
   int min_local_map_points_ = 400;
   float max_fitness_score_ = 0.50f;
   float coarse_max_fitness_score_ = 2.00f;
+  ScanMatchRefinePolicy refine_policy_;
 
   pcl::PointCloud<PointT>::Ptr cropLocalMap(const Eigen::Vector3f& center) const;
 

@@ -2,6 +2,7 @@
 
 #include <pcl/filters/voxel_grid.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -254,6 +255,17 @@ void PoseEstimator::configure_scan_matching(
   coarse_max_fitness_score_ = std::max(max_fitness_score_, coarse_max_fitness_score);
 }
 
+void PoseEstimator::configure_refine_policy(const ScanMatchRefinePolicy& policy) {
+  refine_policy_.skip_ndt_score = std::clamp(
+    policy.skip_ndt_score, 0.001f, max_fitness_score_);
+  refine_policy_.min_improvement_ratio = std::clamp(
+    policy.min_improvement_ratio, 0.0f, 0.90f);
+  refine_policy_.max_translation_disagreement_m = std::max(
+    0.05f, policy.max_translation_disagreement_m);
+  refine_policy_.max_rotation_disagreement_rad = std::max(
+    0.01f, policy.max_rotation_disagreement_rad);
+}
+
 pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::cropLocalMap(
     const Eigen::Vector3f& center) const {
   pcl::PointCloud<PointT>::Ptr local(new pcl::PointCloud<PointT>());
@@ -334,7 +346,10 @@ AlignAttempt runAlign(
 pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     const rclcpp::Time& stamp,
     const pcl::PointCloud<PointT>::ConstPtr& cloud,
-    bool apply_observation) {
+    bool apply_observation,
+    bool allow_high_quality_refine_skip) {
+  const auto match_start = std::chrono::steady_clock::now();
+  match_timing_ = MatchTiming{};
   Eigen::Matrix4f imu_guess = matrix();
   Eigen::Matrix4f init_guess = imu_guess;
   Eigen::Matrix4f odom_guess = imu_guess;
@@ -357,9 +372,12 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   constexpr float kMaxInitCorrectionM = 5.0f;
   constexpr float kMaxRefineCorrectionM = 1.5f;
 
+  const auto ndt_start = std::chrono::steady_clock::now();
   AlignAttempt ndt = runAlign(
     registration, cloud, init_guess,
     coarse_max_fitness_score_, max_fitness_score_, kMaxInitCorrectionM);
+  match_timing_.ndt_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - ndt_start).count();
 
   match_result_.ndt_score_ = static_cast<float>(ndt.fitness);
   match_result_.refine_score_ = std::numeric_limits<float>::infinity();
@@ -368,14 +386,23 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   match_result_.method_ = "ndt";
 
   AlignAttempt refine;
-  if (refine_registration_) {
+  const bool run_refine = refine_registration_ && shouldRunRefinement(
+    allow_high_quality_refine_skip, ndt.acceptable,
+    static_cast<float>(ndt.fitness), refine_policy_);
+  if (run_refine) {
     const Eigen::Matrix4f refine_guess = ndt.usable_as_seed ? ndt.transform : init_guess;
+    const auto local_map_start = std::chrono::steady_clock::now();
     auto local_map = cropLocalMap(refine_guess.block<3, 1>(0, 3));
+    match_timing_.local_map_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - local_map_start).count();
     if (static_cast<int>(local_map->size()) >= min_local_map_points_) {
       refine_registration_->setInputTarget(local_map);
+      const auto refine_start = std::chrono::steady_clock::now();
       refine = runAlign(
         refine_registration_, cloud, refine_guess,
         coarse_max_fitness_score_, max_fitness_score_, kMaxRefineCorrectionM);
+      match_timing_.refine_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - refine_start).count();
       const Eigen::Matrix4f from_init = init_guess.inverse() * refine.transform;
       const float from_init_m = from_init.block<3, 1>(0, 3).norm();
       const bool bounded_from_init = refine.transform.allFinite() &&
@@ -388,18 +415,33 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
       RCLCPP_WARN_THROTTLE(
         logger_, steady_clock, 2000,
         "Skipping VGICP refine: local map has %zu points (need %d) around [%.2f, %.2f, %.2f]",
-        local_map->size(), min_local_map_points_,
+        local_map ? local_map->size() : 0, min_local_map_points_,
         refine_guess(0, 3), refine_guess(1, 3), refine_guess(2, 3));
     }
   }
 
   AlignAttempt chosen;
-  if (refine.acceptable) {
+  float refine_disagreement_m = std::numeric_limits<float>::infinity();
+  float refine_disagreement_rad = std::numeric_limits<float>::infinity();
+  if (ndt.transform.allFinite() && refine.transform.allFinite()) {
+    const Eigen::Matrix4f disagreement = ndt.transform.inverse() * refine.transform;
+    refine_disagreement_m = disagreement.block<3, 1>(0, 3).norm();
+    Eigen::Quaternionf disagreement_rotation(disagreement.block<3, 3>(0, 0));
+    if (disagreement_rotation.coeffs().allFinite() && disagreement_rotation.norm() > 1e-6f) {
+      disagreement_rotation.normalize();
+      refine_disagreement_rad = Eigen::Quaternionf::Identity().angularDistance(
+        disagreement_rotation);
+    }
+  }
+  if (shouldChooseRefinement(
+        ndt.acceptable, static_cast<float>(ndt.fitness),
+        refine.acceptable, static_cast<float>(refine.fitness),
+        refine_disagreement_m, refine_disagreement_rad, refine_policy_)) {
     chosen = refine;
     match_result_.method_ = ndt.usable_as_seed ? "ndt_vgicp" : "vgicp";
   } else if (ndt.acceptable) {
     chosen = ndt;
-    match_result_.method_ = "ndt";
+    match_result_.method_ = run_refine ? "ndt" : "ndt_high_quality";
   }
 
   match_result_.is_converged_ = chosen.acceptable;
@@ -416,6 +458,8 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   }
 
   if (!chosen.acceptable) {
+    match_timing_.total_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - match_start).count();
     RCLCPP_WARN(logger_,
                 "Rejecting scan match: ndt(conv=%d score=%.3f corr=%.2fm) "
                 "vgicp(conv=%d score=%.3f corr=%.2fm)",
@@ -446,6 +490,8 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   last_observation = trans;
 
   if (!apply_observation) {
+    match_timing_.total_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - match_start).count();
     return aligned;
   }
 
@@ -483,6 +529,9 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     odom_ukf->correct(observation);
     odom_pred_error = odom_guess.inverse() * trans;
   }
+
+  match_timing_.total_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - match_start).count();
 
   return aligned;
 }
@@ -544,6 +593,10 @@ const boost::optional<Eigen::Matrix4f>& PoseEstimator::lidar_odometry_prediction
 
 PoseEstimator::MatchResult PoseEstimator::GetMatchState() const {
     return match_result_;
+}
+
+PoseEstimator::MatchTiming PoseEstimator::GetMatchTiming() const {
+    return match_timing_;
 }
 
 Eigen::VectorXf PoseEstimator::GetCurrentUkfState() {

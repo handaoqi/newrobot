@@ -11,6 +11,16 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
+#include <array>
+#include <chrono>
+#include <functional>
+#include <vector>
+#include <utility>
+#include <numeric>
+#include <condition_variable>
+#include <cstdint>
+#include <optional>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_ros/transforms.hpp>
@@ -45,6 +55,11 @@
 #include <localization/mode_state.h>
 #include <localization/global_localization.hpp>
 #include <localization/scan_context_db.hpp>
+#include <localization/relocalization_geometry.hpp>
+#include <localization/point_cloud_scheduler.hpp>
+#include <localization/correction_cooldown_gate.hpp>
+#include <localization/correction_policy.hpp>
+#include <localization/global_relocalization_policy.hpp>
 
 #include <localization/msg/scan_matching_status.hpp>
 #include <robots_dog_msgs/srv/load_map.hpp>
@@ -55,6 +70,78 @@
 using namespace std;
 
 namespace localization {
+
+namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+std::int64_t steadyNowNanoseconds() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    SteadyClock::now().time_since_epoch()).count();
+}
+
+enum PointCloudPerfStage : std::size_t {
+  kLockWait = 0,
+  kRosConversion,
+  kPreprocess,
+  kVoxelTransform,
+  kGlobalRelocalization,
+  kLidarOdometry,
+  kLioObservation,
+  kNdt,
+  kLocalMap,
+  kVgicp,
+  kOutput,
+  kTotal,
+  kPointCloudPerfStageCount
+};
+
+struct PointCloudPerfSample {
+  std::array<double, kPointCloudPerfStageCount> stage_ms{};
+  double cloud_age_ms = 0.0;
+  std::string phase = "stationary";
+  bool heavy = false;
+  bool run_ndt = false;
+  bool stale = false;
+};
+
+struct PointCloudPerfWindow {
+  std::vector<PointCloudPerfSample> samples;
+  std::uint64_t heavy_count = 0;
+  std::uint64_t light_count = 0;
+  std::uint64_t stale_count = 0;
+};
+
+template<typename Callable>
+class ScopeExit {
+public:
+  explicit ScopeExit(Callable&& callable) : callable_(std::forward<Callable>(callable)) {}
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+  ~ScopeExit() { callable_(); }
+
+private:
+  Callable callable_;
+};
+
+template<typename Callable>
+ScopeExit<Callable> makeScopeExit(Callable&& callable) {
+  return ScopeExit<Callable>(std::forward<Callable>(callable));
+}
+
+double quantile(std::vector<double> values, double fraction) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  std::sort(values.begin(), values.end());
+  const double position = std::clamp(fraction, 0.0, 1.0) * (values.size() - 1);
+  const auto lower = static_cast<std::size_t>(std::floor(position));
+  const auto upper = static_cast<std::size_t>(std::ceil(position));
+  const double weight = position - static_cast<double>(lower);
+  return values[lower] * (1.0 - weight) + values[upper] * weight;
+}
+
+}  // namespace
 
 class HdlLocalizationNode : public rclcpp::Node {
 public:
@@ -96,6 +183,18 @@ public:
     scan_matching_coarse_max_fitness_score_ = static_cast<float>(std::max(
       static_cast<double>(ndt_max_fitness_score_),
       declare_parameter<double>("scan_matching.coarse_max_fitness_score", 2.00)));
+    scan_matching_refine_policy_.skip_ndt_score = static_cast<float>(std::clamp(
+      declare_parameter<double>("scan_matching.refine_skip_ndt_score", 0.15),
+      0.001, static_cast<double>(ndt_max_fitness_score_)));
+    scan_matching_refine_policy_.min_improvement_ratio = static_cast<float>(std::clamp(
+      declare_parameter<double>("scan_matching.refine_min_improvement_ratio", 0.05),
+      0.0, 0.90));
+    scan_matching_refine_policy_.max_translation_disagreement_m = static_cast<float>(std::max(
+      0.05, declare_parameter<double>(
+        "scan_matching.refine_max_translation_disagreement_m", 0.30)));
+    scan_matching_refine_policy_.max_rotation_disagreement_rad = static_cast<float>(std::max(
+      0.01, declare_parameter<double>(
+        "scan_matching.refine_max_rotation_disagreement_deg", 5.0) * M_PI / 180.0));
     scan_preprocess_min_range_m_ = std::max(
       0.0, declare_parameter<double>("scan_preprocessing.min_range", 0.50));
     scan_preprocess_max_range_m_ = std::max(
@@ -154,6 +253,8 @@ public:
       0.01, declare_parameter<double>("lio_primary.drift_yaw_deg", 5.0) * M_PI / 180.0));
     lio_drift_hysteresis_frames_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("lio_primary.drift_hysteresis_frames", 3)));
+    lio_stable_confirmation_frames_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("lio_primary.stable_confirmation_frames", 3)));
     lio_stable_xy_tolerance_m_ = static_cast<float>(std::max(
       0.01, declare_parameter<double>("lio_primary.stable_xy_tolerance_m", 0.10)));
     lio_stable_yaw_tolerance_rad_ = static_cast<float>(std::max(
@@ -204,6 +305,12 @@ public:
     lio_correction_completion_rotation_rad_ = static_cast<float>(std::max(
       0.001, declare_parameter<double>("lio_primary.correction_smoothing.completion_rotation_deg", 0.25)
         * M_PI / 180.0));
+    lio_correction_min_interval_s_ = std::max(
+      0.0, declare_parameter<double>("lio_primary.correction_gate.min_interval_seconds", 3.0));
+    lio_correction_post_suppression_s_ = std::max(
+      0.0, declare_parameter<double>("lio_primary.correction_gate.post_suppression_seconds", 3.0));
+    lio_correction_cooldown_gate_.configure(
+      lio_correction_min_interval_s_, lio_correction_post_suppression_s_);
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -281,6 +388,22 @@ public:
       1, declare_parameter<int>("source_arbiter.absolute_recovery_samples", 3)));
     moving_ndt_stride_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("source_arbiter.moving_ndt_stride", 5)));
+    stationary_ndt_stride_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("source_arbiter.stationary_ndt_stride", 5)));
+    initialization_ndt_stride_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("source_arbiter.initialization_ndt_stride", 2)));
+    stable_ndt_max_rate_hz_ = std::max(
+      0.0, declare_parameter<double>("source_arbiter.stable_ndt_max_rate_hz", 2.0));
+    recovery_ndt_max_rate_hz_ = std::max(
+      0.0, declare_parameter<double>("source_arbiter.recovery_ndt_max_rate_hz", 5.0));
+    point_cloud_max_age_s_ = std::max(
+      0.0, declare_parameter<double>("point_cloud_processing.max_age_seconds", 0.20));
+    point_cloud_latest_only_ = declare_parameter<bool>(
+      "point_cloud_processing.latest_only", true);
+    point_cloud_perf_log_interval_s_ = std::max(
+      1.0, declare_parameter<double>("point_cloud_processing.performance_log_interval_seconds", 10.0));
+    point_cloud_slow_callback_ms_ = std::max(
+      1.0, declare_parameter<double>("point_cloud_processing.slow_callback_ms", 80.0));
     ndt_failure_hysteresis_frames_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("source_arbiter.ndt_failure_hysteresis_frames", 3)));
     prefer_fixed_rtk_ = declare_parameter<bool>("source_arbiter.prefer_fixed_rtk", true);
@@ -333,11 +456,31 @@ public:
     get_parameter("runtime_relocalization_retry_seconds", runtime_relocalization_retry_seconds_);
     runtime_relocalization_retry_seconds_ =
       std::max(1.0, runtime_relocalization_retry_seconds_);
+    initial_pose_relocalization_settle_s_ = std::max(
+      0.0, declare_parameter<double>("relocalization.initial_pose_settle_seconds", 0.75));
+    map_relocalization_settle_s_ = std::max(
+      0.0, declare_parameter<double>("relocalization.map_settle_seconds", 2.0));
 
-    // Scan context relocalization. Default off: this package carries no unit tests, so
-    // the new retrieval path only turns on where replay or an on-robot run has backed it.
+    // Scan Context relocalization has an explicit rollout state. The legacy boolean is
+    // retained as a compatibility alias for active, but a non-disabled mode wins.
     declare_parameter<bool>("relocalization.use_scan_context", false);
     get_parameter("relocalization.use_scan_context", use_scan_context_);
+    scan_context_runtime_mode_ = declare_parameter<std::string>(
+      "relocalization.scan_context_runtime_mode", "disabled");
+    if (scan_context_runtime_mode_ != "disabled" &&
+        scan_context_runtime_mode_ != "shadow" &&
+        scan_context_runtime_mode_ != "active") {
+      RCLCPP_WARN(get_logger(),
+        "Unknown relocalization.scan_context_runtime_mode=%s; forcing disabled",
+        scan_context_runtime_mode_.c_str());
+      scan_context_runtime_mode_ = "disabled";
+    }
+    if (scan_context_runtime_mode_ == "disabled" && use_scan_context_) {
+      scan_context_runtime_mode_ = "active";
+      RCLCPP_WARN(get_logger(),
+        "relocalization.use_scan_context is deprecated; treating true as runtime_mode=active");
+    }
+    use_scan_context_ = scan_context_runtime_mode_ != "disabled";
     declare_parameter<int>("relocalization.top_k", 5);
     get_parameter("relocalization.top_k", scan_context_top_k_);
     scan_context_top_k_ = std::max(1, scan_context_top_k_);
@@ -350,6 +493,24 @@ public:
     // ICP verification as the only gate, which is the one that actually discriminates.
     declare_parameter<double>("relocalization.max_descriptor_distance", 0.0);
     get_parameter("relocalization.max_descriptor_distance", scan_context_max_distance_);
+    relocalization_geometry_config_.voxel_size_m = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("relocalization.geometry.voxel_size_m", 0.20)));
+    relocalization_geometry_config_.max_correspondence_distance_m = static_cast<float>(
+      std::max(0.10, declare_parameter<double>(
+        "relocalization.geometry.max_correspondence_distance_m", 1.0)));
+    relocalization_geometry_config_.max_iterations = static_cast<int>(std::max<std::int64_t>(
+      1, declare_parameter<int>("relocalization.geometry.max_iterations", 30)));
+    relocalization_geometry_config_.num_threads = static_cast<int>(std::max<std::int64_t>(
+      1, declare_parameter<int>("relocalization.geometry.num_threads", 2)));
+    relocalization_geometry_config_.min_points = static_cast<int>(std::max<std::int64_t>(
+      1, declare_parameter<int>("relocalization.geometry.min_points", 200)));
+    relocalization_geometry_config_.min_inliers = static_cast<int>(std::max<std::int64_t>(
+      1, declare_parameter<int>("relocalization.geometry.min_inliers", 500)));
+    relocalization_geometry_config_.min_bidirectional_overlap = std::clamp(
+      declare_parameter<double>("relocalization.geometry.min_bidirectional_overlap", 0.45),
+      0.0, 1.0);
+    relocalization_geometry_config_.max_rmse_m = std::max(
+      0.01, declare_parameter<double>("relocalization.geometry.max_rmse_m", 0.25));
 
     static_imu_init_.SetParam(imu_init_time_, imu_init_queue_size_, imu_init_max_gyro_var_, imu_init_max_acce_var_);
     
@@ -439,7 +600,12 @@ public:
         rclcpp::SensorDataQoS(),
         std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1));
     }
-    points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
+    rclcpp::QoS point_cloud_qos = point_cloud_latest_only_
+      ? rclcpp::QoS(rclcpp::SensorDataQoS().keep_last(1))
+      : rclcpp::QoS(5);
+    points_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic, point_cloud_qos,
+      std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
     // Subscribe to controller odometry only when it is explicitly needed for
     // NDT prediction or this node owns the map->odom TF.  In the real
     // navigation configuration both are disabled: Mid360 point matching and
@@ -566,9 +732,40 @@ public:
     
     RCLCPP_INFO(get_logger(), "Sensor data validity tracking initialized with buffer size: %d, min valid count: %d", 
                 buffer_size_, min_valid_count_);
+    global_relocalization_worker_ = std::thread(
+      &HdlLocalizationNode::globalRelocalizationWorkerLoop, this);
+  }
+
+  ~HdlLocalizationNode() override {
+    {
+      std::lock_guard<std::mutex> lock(global_relocalization_job_mutex_);
+      global_relocalization_worker_stop_ = true;
+      pending_global_relocalization_job_.reset();
+    }
+    global_relocalization_job_cv_.notify_all();
+    if (global_relocalization_worker_.joinable()) {
+      global_relocalization_worker_.join();
+    }
   }
 
 private:
+  struct GlobalRelocalizationJob {
+    std::uint64_t generation = 0;
+    pcl::PointCloud<PointT>::Ptr cloud;
+    pcl::PointCloud<PointT>::ConstPtr map;
+    Eigen::Matrix4d fallback_seed = Eigen::Matrix4d::Identity();
+    bool use_scan_context = false;
+    bool apply_scan_context = false;
+  };
+
+  struct GlobalRelocalizationResult {
+    std::uint64_t generation = 0;
+    bool success = false;
+    Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+    double elapsed_ms = 0.0;
+    std::string source = "none";
+  };
+
   localization::StaticIMUInit static_imu_init_;
   float imu_init_time_ = 3.0f;
   int imu_init_queue_size_ = 300;
@@ -584,6 +781,9 @@ private:
   float init_match_score_threshold_ = 0.2f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
+  // A decimated initialization must never count the same previous NDT result
+  // more than once on intervening lightweight callbacks.
+  bool init_match_result_pending_ = false;
 
   /**
    * @brief Build a PoseEstimator seeded with the calibrated gyro bias.
@@ -598,6 +798,7 @@ private:
    */
   std::unique_ptr<localization::PoseEstimator> createPoseEstimator(
     const Eigen::Vector3f& pos, const Eigen::Quaternionf& quat) {
+    init_match_result_pending_ = false;
     const bool calibrated = static_imu_init_.InitSuccess();
     const Eigen::Vector3d bias_gyro =
       calibrated ? static_imu_init_.GetInitBg() : Eigen::Vector3d::Zero();
@@ -624,6 +825,7 @@ private:
       scan_matching_min_local_map_points_,
       ndt_max_fitness_score_,
       scan_matching_coarse_max_fitness_score_);
+    estimator->configure_refine_policy(scan_matching_refine_policy_);
     return estimator;
   }
 
@@ -693,11 +895,13 @@ private:
     vgicp->setMaxCorrespondenceDistance(scan_matching_max_correspondence_distance_);
     RCLCPP_INFO(
       get_logger(),
-      "Indoor scan matching: NDT coarse + local FastVGICP refine (res=%.2fm corr=%.2fm iter=%d threads=%d)",
+      "Indoor scan matching: NDT coarse + local FastVGICP refine "
+      "(res=%.2fm corr=%.2fm iter=%d threads=%d stable_skip<=%.3f improve>=%.0f%%)",
       scan_matching_vgicp_resolution_,
       scan_matching_max_correspondence_distance_,
       scan_matching_max_iterations_,
-      scan_matching_num_threads_);
+      scan_matching_num_threads_, scan_matching_refine_policy_.skip_ndt_score,
+      scan_matching_refine_policy_.min_improvement_ratio * 100.0f);
     return vgicp;
   }
 
@@ -875,8 +1079,10 @@ private:
   void resetLioAnchor() {
     lio_anchor_valid_ = false;
     lio_has_previous_pose_ = false;
+    lio_stable_frame_count_ = 0;
     lio_corrected_this_frame_ = false;
     pending_lio_correction_.reset();
+    lio_correction_cooldown_gate_.reset();
     ndt_drift_gate_.reset();
     rtk_drift_gate_.reset();
   }
@@ -962,12 +1168,32 @@ private:
     return noise;
   }
 
+  CorrectionNoise rtkCorrectionNoise(const RtkObservation& observation) const {
+    CorrectionNoise noise;
+    noise.horizontal_variance = static_cast<float>(std::max(
+      observation.horizontal_std_m * observation.horizontal_std_m,
+      static_cast<double>(lio_correct_xy_variance_)));
+    noise.vertical_variance = gnss_use_elevation_
+      ? noise.horizontal_variance : lio_z_variance_;
+    noise.orientation_variance = observation.heading_usable
+      ? static_cast<float>(std::max(
+          observation.heading_std_rad * observation.heading_std_rad,
+          static_cast<double>(lio_correct_orientation_variance_)))
+      : lio_orientation_variance_;
+    noise.quality_penalty = static_cast<float>(std::clamp(
+      observation.horizontal_std_m / std::max(gnss_max_horizontal_std_, 1.0e-3),
+      0.0, 1.0));
+    return noise;
+  }
+
   bool scheduleLioAnchorCorrection(
       const Eigen::Isometry3f& target_map_T_base,
       const CorrectionNoise& noise,
       const char* source,
       const rclcpp::Time& stamp) {
+    const std::int64_t steady_now_ns = steadyNowNanoseconds();
     if (!lio_anchor_valid_ || pending_lio_correction_.active ||
+        !lio_correction_cooldown_gate_.canStart(steady_now_ns) ||
         !target_map_T_base.matrix().allFinite()) {
       return false;
     }
@@ -1002,6 +1228,9 @@ private:
     last_correction_orientation_variance_ = noise.orientation_variance;
     last_correction_quality_penalty_ = noise.quality_penalty;
     last_correction_progress_ = 0.0f;
+    lio_correction_cooldown_gate_.markStarted(steady_now_ns);
+    last_correction_started_steady_ns_ = steady_now_ns;
+    last_correction_source_ = source;
     return true;
   }
 
@@ -1069,6 +1298,8 @@ private:
       RCLCPP_INFO(get_logger(),
         "%s global correction smoothing completed", pending_lio_correction_.source.c_str());
       pending_lio_correction_.active = false;
+      last_correction_completed_steady_ns_ = steadyNowNanoseconds();
+      lio_correction_cooldown_gate_.markCompleted(last_correction_completed_steady_ns_);
     }
     // The current frame contains part of the queued global correction even if
     // this step completed it. Its dynamic covariance must still be applied.
@@ -1343,18 +1574,8 @@ private:
       last_rtk_heading_fused_stamp_ns_ = observation.heading_stamp_ns;
       rtk_heading_fused_this_frame_ = true;
     }
-    const float horizontal_variance = static_cast<float>(std::max(
-      observation.horizontal_std_m * observation.horizontal_std_m,
-      static_cast<double>(lio_correct_xy_variance_)));
-    const float vertical_variance = gnss_use_elevation_
-      ? horizontal_variance : lio_z_variance_;
-    CorrectionNoise noise;
-    noise.horizontal_variance = horizontal_variance;
-    noise.vertical_variance = vertical_variance;
+    CorrectionNoise noise = rtkCorrectionNoise(observation);
     noise.orientation_variance = orientation_variance;
-    noise.quality_penalty = static_cast<float>(std::clamp(
-      observation.horizontal_std_m / std::max(gnss_max_horizontal_std_, 1.0e-3),
-      0.0, 1.0));
     Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
     target_map_T_base.translation() = rtk_position;
     target_map_T_base.linear() = orientation.normalized().toRotationMatrix();
@@ -1378,12 +1599,187 @@ private:
     return true;
   }
 
+  CorrectionCandidateSummary ndtCorrectionCandidate(
+      const PoseEstimator::MatchResult& match,
+      bool quality_ok,
+      const rclcpp::Time& stamp) const {
+    CorrectionCandidateSummary candidate;
+    candidate.eligible = quality_ok && pose_estimator && match.transform_.allFinite();
+    candidate.stamp_ns = stamp.nanoseconds();
+    if (!candidate.eligible) {
+      return candidate;
+    }
+    const Eigen::Vector3f position = match.transform_.block<3, 1>(0, 3);
+    Eigen::Quaternionf orientation(match.transform_.block<3, 3>(0, 0));
+    orientation.normalize();
+    const CorrectionNoise noise = scanMatchCorrectionNoise(match);
+    candidate.x = position.x();
+    candidate.y = position.y();
+    candidate.yaw = std::atan2(
+      orientation.toRotationMatrix()(1, 0), orientation.toRotationMatrix()(0, 0));
+    candidate.yaw_valid = true;
+    candidate.horizontal_variance = noise.horizontal_variance;
+    candidate.orientation_variance = noise.orientation_variance;
+    candidate.residual_xy =
+      (position.head<2>() - pose_estimator->pos().head<2>()).norm();
+    candidate.residual_yaw = pose_estimator->quat().angularDistance(orientation);
+    return candidate;
+  }
+
+  CorrectionCandidateSummary rtkCorrectionCandidate(
+      const RtkObservation& observation) const {
+    CorrectionCandidateSummary candidate;
+    candidate.eligible = pose_estimator && observation.usable &&
+      observation.quality == "fixed" && observation.position.allFinite();
+    candidate.stamp_ns = observation.stamp_ns;
+    if (!candidate.eligible) {
+      return candidate;
+    }
+    const CorrectionNoise noise = rtkCorrectionNoise(observation);
+    candidate.x = observation.position.x();
+    candidate.y = observation.position.y();
+    candidate.yaw = std::atan2(
+      observation.orientation.toRotationMatrix()(1, 0),
+      observation.orientation.toRotationMatrix()(0, 0));
+    candidate.yaw_valid = observation.heading_usable;
+    candidate.horizontal_variance = noise.horizontal_variance;
+    candidate.orientation_variance = noise.orientation_variance;
+    candidate.residual_xy =
+      (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm();
+    candidate.residual_yaw = observation.heading_usable
+      ? pose_estimator->quat().angularDistance(observation.orientation) : 0.0;
+    return candidate;
+  }
+
+  void evaluateAuxiliaryCorrections(
+      const PoseEstimator::MatchResult* match,
+      bool ndt_quality_ok,
+      const RtkObservation& observation,
+      const rclcpp::Time& stamp) {
+    const bool ndt_fresh = last_ndt_healthy_ && last_ndt_update_time_.nanoseconds() > 0 &&
+      std::fabs((stamp - last_ndt_update_time_).seconds()) <= 1.0;
+    const bool rtk_ready = observation.usable && observation.quality == "fixed";
+    policy_source_ready_ = preferred_correction_mode_ == CorrectionPolicyMode::ndt
+      ? ndt_fresh
+      : preferred_correction_mode_ == CorrectionPolicyMode::rtk
+        ? rtk_ready
+        : (ndt_fresh || rtk_ready);
+
+    if (!lio_anchor_valid_ || pending_lio_correction_.active) {
+      last_correction_candidate_source_ = "none";
+      last_correction_selection_reason_ = pending_lio_correction_.active
+        ? "correction_already_active" : "lio_anchor_unavailable";
+      return;
+    }
+
+    // UKF mode samples both auxiliary sources on the same NDT scheduling
+    // cycle. This gives both sources the same three-frame evidence cadence and
+    // prevents a faster RTK topic from winning solely because of its rate.
+    if (preferred_correction_mode_ == CorrectionPolicyMode::ukf && !match) {
+      return;
+    }
+
+    CorrectionCandidateSummary ndt;
+    if (match && correctionPolicyAllowsNdt(preferred_correction_mode_)) {
+      ndt = ndtCorrectionCandidate(*match, ndt_quality_ok, stamp);
+    }
+    CorrectionCandidateSummary rtk;
+    if (correctionPolicyAllowsRtk(preferred_correction_mode_)) {
+      rtk = rtkCorrectionCandidate(observation);
+    }
+
+    if (preferred_correction_mode_ == CorrectionPolicyMode::ukf &&
+        ndt.eligible && rtk.eligible) {
+      const auto conflict_check = selectCorrectionSource(
+        preferred_correction_mode_, ndt, rtk,
+        lio_drift_xy_m_, lio_drift_yaw_rad_,
+        lio_drift_xy_m_, lio_drift_yaw_rad_);
+      if (conflict_check.source == CorrectionSource::conflict) {
+        ndt_drift_gate_.resetConsecutive();
+        rtk_drift_gate_.resetConsecutive();
+        ndt_drift_gate_.last_decision = "ukf_source_conflict";
+        rtk_drift_gate_.last_decision = "ukf_source_conflict";
+        policy_source_ready_ = false;
+        last_correction_candidate_source_ = "conflict";
+        last_correction_selection_reason_ = conflict_check.reason;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "UKF auxiliary conflict: NDT/VGICP and RTK differ by more than %.2fm or %.1fdeg",
+          lio_drift_xy_m_, lio_drift_yaw_rad_ * 180.0 / M_PI);
+        return;
+      }
+    }
+
+    const bool ndt_drifted = ndt.eligible &&
+      (ndt.residual_xy >= lio_drift_xy_m_ || ndt.residual_yaw >= lio_drift_yaw_rad_);
+    const bool rtk_drifted = rtk.eligible &&
+      (rtk.residual_xy >= lio_drift_xy_m_ ||
+       (rtk.yaw_valid && rtk.residual_yaw >= lio_drift_yaw_rad_));
+
+    // Low-drift observations still pass through the existing gate so a prior
+    // one-shot correction can re-arm only after returning to the safe band.
+    if (ndt.eligible && !ndt_drifted) {
+      maybeCorrectLioDrift(*match, stamp);
+    }
+    if (rtk.eligible && !rtk_drifted) {
+      maybeCorrectRtkDrift(observation);
+    }
+
+    ndt.eligible = ndt_drifted;
+    rtk.eligible = rtk_drifted;
+    const CorrectionSelection selection = selectCorrectionSource(
+      preferred_correction_mode_, ndt, rtk,
+      lio_drift_xy_m_, lio_drift_yaw_rad_,
+      lio_drift_xy_m_, lio_drift_yaw_rad_);
+    last_correction_candidate_source_ = correctionSourceName(selection.source);
+    last_correction_selection_reason_ = selection.reason;
+
+    bool corrected = false;
+    if (selection.source == CorrectionSource::ndt && match) {
+      rtk_drift_gate_.resetConsecutive();
+      corrected = maybeCorrectLioDrift(*match, stamp);
+    } else if (selection.source == CorrectionSource::rtk) {
+      ndt_drift_gate_.resetConsecutive();
+      corrected = maybeCorrectRtkDrift(observation);
+    } else {
+      if (match && !ndt_quality_ok) {
+        ndt_drift_gate_.resetConsecutive();
+        ndt_drift_gate_.last_decision = "quality_rejected";
+      }
+      if (!rtk_ready) {
+        rtk_drift_gate_.resetConsecutive();
+        rtk_drift_gate_.last_decision = "quality_rejected";
+      }
+    }
+    if (corrected) {
+      // One accepted auxiliary correction closes the epoch for both sources.
+      // Each source must independently return to the re-arm band before a new
+      // NDT/RTK correction can be considered.
+      ndt_drift_gate_.correction_latched = true;
+      rtk_drift_gate_.correction_latched = true;
+      ndt_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.resetConsecutive();
+    }
+  }
+
   void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
-    const std::string command = msg->data;
-    if (command.find("rtk") != std::string::npos) {
-      preferred_source_ = "rtk";
-    } else if (command.find("ndt") != std::string::npos) {
-      preferred_source_ = "ndt";
+    const std::string command = msg ? msg->data : "";
+    const auto separator = command.find(':');
+    const std::string requested_mode = separator == std::string::npos
+      ? command : command.substr(separator + 1);
+    const CorrectionPolicyMode next_mode = parseCorrectionPolicyMode(requested_mode);
+    if (next_mode != preferred_correction_mode_) {
+      preferred_correction_mode_ = next_mode;
+      preferred_source_ = correctionPolicyModeName(next_mode);
+      // A waypoint policy change starts a new correction epoch. Do not carry
+      // the previous source's one-shot latch into a different requested
+      // source, but still require three fresh stable observations.
+      ndt_drift_gate_.reset();
+      rtk_drift_gate_.reset();
+      last_correction_candidate_source_ = "none";
+      last_correction_selection_reason_ = "policy_changed";
+      RCLCPP_INFO(get_logger(), "Localization correction policy changed to %s",
+        preferred_source_.c_str());
     }
     motion_phase_ = command.find("moving") != std::string::npos ? "moving" : "stationary";
     if (motion_phase_ == "stationary") {
@@ -1779,6 +2175,15 @@ private:
     out << std::fixed << std::setprecision(3)
         << "{\"active_source\":\"" << active_source_
         << "\",\"preferred_source\":\"" << preferred_source_
+        << "\",\"correction_policy\":\"" << preferred_source_
+        << "\",\"allowed_correction_sources\":\""
+        << (preferred_correction_mode_ == CorrectionPolicyMode::ndt
+          ? "ndt_vgicp"
+          : preferred_correction_mode_ == CorrectionPolicyMode::rtk
+            ? "rtk" : "ndt_vgicp,rtk")
+        << "\",\"policy_source_ready\":" << (policy_source_ready_ ? "true" : "false")
+        << ",\"correction_candidate_source\":\"" << last_correction_candidate_source_
+        << "\",\"correction_selection_reason\":\"" << last_correction_selection_reason_
         << "\",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
         << ",\"rtk_good_for_navigation\":" << (rtkGoodForNavigation(rtk) ? "true" : "false")
         << ",\"phase\":\"" << motion_phase_
@@ -1789,8 +2194,15 @@ private:
         << ",\"lio_healthy\":" << (lioOdomFresh(stamp) ? "true" : "false")
         << ",\"lio_anchored\":" << (lio_anchor_valid_ ? "true" : "false")
         << ",\"lio_corrected\":" << (lio_corrected_this_frame_ ? "true" : "false")
+        << ",\"lio_stable_frames\":" << lio_stable_frame_count_
+        << ",\"lio_schedule_stable\":"
+        << (lio_stable_frame_count_ >= lio_stable_confirmation_frames_ ? "true" : "false")
         << ",\"correction_smoothing_active\":" << (pending_lio_correction_.active ? "true" : "false")
         << ",\"correction_source\":\"" << pending_lio_correction_.source << "\""
+        << ",\"last_correction_source\":\"" << last_correction_source_ << "\""
+        << ",\"correction_cooldown_remaining_s\":"
+        << lio_correction_cooldown_gate_.remainingSeconds(steadyNowNanoseconds())
+        << ",\"ndt_schedule_reason\":\"" << last_point_cloud_schedule_reason_ << "\""
         << ",\"correction_progress\":" << last_correction_progress_
         << ",\"correction_xy_variance\":" << last_correction_xy_variance_
         << ",\"correction_z_variance\":" << last_correction_z_variance_
@@ -2050,6 +2462,7 @@ private:
     if (!seedPositionFromGnss(get_clock()->now(), reason, true, true)) {
       return false;
     }
+    advanceGlobalRelocalizationGeneration(reason);
     pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
     has_trusted_ndt_pose_ = false;
     resetLioAnchor();
@@ -2086,8 +2499,8 @@ private:
    * It mirrors the runtime self-healing path (see the NDT-failure branch in
    * points_callback): re-seed from the last trusted pose, drop out of the
    * converged state so the gate below is reachable, and open gl_once_gate_.
-   * The expensive ICP itself still runs inside points_callback, so this
-   * callback returns immediately instead of blocking the service thread.
+   * The expensive ICP runs on the background relocalization worker, so this
+   * callback only advances the recovery generation and arms the next cloud.
    */
   void reinitialize_global_localization_callback(
     const std::shared_ptr<std_srvs::srv::Empty::Request>,
@@ -2105,6 +2518,7 @@ private:
     last_init_quat_.normalize();
     has_set_init_pose_ = true;
     last_pose_source_ = "service_relocalization";
+    advanceGlobalRelocalizationGeneration("service relocalization");
     is_init_success_ = false;
     init_match_count_ = 0;
     localization_state_ = 1;
@@ -2257,10 +2671,122 @@ private:
     ++latest_robot_odom_sequence_;
   }
 
+  void recordPointCloudPerformance(const PointCloudPerfSample& sample) {
+    const std::size_t phase_index = sample.phase == "initialization" ? 0
+      : sample.phase == "relocalization" ? 1
+      : sample.phase == "moving" ? 2 : 3;
+    auto& window = point_cloud_perf_windows_[phase_index];
+    window.samples.push_back(sample);
+    window.heavy_count += sample.heavy ? 1 : 0;
+    window.light_count += sample.heavy ? 0 : 1;
+    window.stale_count += sample.stale ? 1 : 0;
+
+    last_timeout_ = static_cast<int>(std::lround(sample.stage_ms[kTotal]));
+    if (sample.stage_ms[kTotal] > point_cloud_slow_callback_ms_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Slow point cloud callback: total=%.1fms age=%.1fms phase=%s heavy=%s "
+        "lock=%.1f convert=%.1f preprocess=%.1f voxel_tf=%.1f global=%.1f "
+        "lidar_odom=%.1f lio=%.1f ndt=%.1f local_map=%.1f vgicp=%.1f output=%.1f",
+        sample.stage_ms[kTotal], sample.cloud_age_ms, sample.phase.c_str(),
+        sample.heavy ? "yes" : "no", sample.stage_ms[kLockWait],
+        sample.stage_ms[kRosConversion], sample.stage_ms[kPreprocess],
+        sample.stage_ms[kVoxelTransform], sample.stage_ms[kGlobalRelocalization],
+        sample.stage_ms[kLidarOdometry], sample.stage_ms[kLioObservation],
+        sample.stage_ms[kNdt], sample.stage_ms[kLocalMap], sample.stage_ms[kVgicp],
+        sample.stage_ms[kOutput]);
+    }
+
+    const auto now = SteadyClock::now();
+    if (last_point_cloud_perf_log_ == SteadyClock::time_point{}) {
+      last_point_cloud_perf_log_ = now;
+      return;
+    }
+    if (std::chrono::duration<double>(now - last_point_cloud_perf_log_).count() <
+        point_cloud_perf_log_interval_s_) {
+      return;
+    }
+
+    static constexpr std::array<const char*, 4> phase_names{
+      "initialization", "relocalization", "moving", "stationary"};
+    for (std::size_t index = 0; index < point_cloud_perf_windows_.size(); ++index) {
+      auto& phase_window = point_cloud_perf_windows_[index];
+      if (phase_window.samples.empty()) {
+        continue;
+      }
+      auto stage_values = [&phase_window](PointCloudPerfStage stage) {
+        std::vector<double> values;
+        values.reserve(phase_window.samples.size());
+        for (const auto& entry : phase_window.samples) {
+          values.push_back(entry.stage_ms[stage]);
+        }
+        return values;
+      };
+      std::vector<double> ages;
+      ages.reserve(phase_window.samples.size());
+      for (const auto& entry : phase_window.samples) {
+        ages.push_back(entry.cloud_age_ms);
+      }
+      const auto total = stage_values(kTotal);
+      const auto conversion = stage_values(kRosConversion);
+      const auto preprocess = stage_values(kPreprocess);
+      const auto voxel_tf = stage_values(kVoxelTransform);
+      const auto ndt = stage_values(kNdt);
+      const auto local_map = stage_values(kLocalMap);
+      const auto vgicp = stage_values(kVgicp);
+      const auto output = stage_values(kOutput);
+      RCLCPP_INFO(
+        get_logger(),
+        "Point cloud perf phase=%s n=%zu heavy=%llu light=%llu stale=%llu "
+        "total[mean/p50/p90/p99/max]=[%.1f/%.1f/%.1f/%.1f/%.1f]ms age_p99=%.1fms "
+        "p90[convert/preprocess/voxel_tf/ndt/local_map/vgicp/output]="
+        "[%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f]ms",
+        phase_names[index], phase_window.samples.size(),
+        static_cast<unsigned long long>(phase_window.heavy_count),
+        static_cast<unsigned long long>(phase_window.light_count),
+        static_cast<unsigned long long>(phase_window.stale_count),
+        std::accumulate(total.begin(), total.end(), 0.0) / total.size(),
+        quantile(total, 0.50), quantile(total, 0.90), quantile(total, 0.99),
+        *std::max_element(total.begin(), total.end()), quantile(ages, 0.99),
+        quantile(conversion, 0.90), quantile(preprocess, 0.90),
+        quantile(voxel_tf, 0.90), quantile(ndt, 0.90), quantile(local_map, 0.90),
+        quantile(vgicp, 0.90), quantile(output, 0.90));
+      phase_window = PointCloudPerfWindow{};
+    }
+    last_point_cloud_perf_log_ = now;
+  }
+
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
-    auto start = std::chrono::high_resolution_clock::now();
+    const auto callback_start = SteadyClock::now();
+    PointCloudPerfSample perf;
+    auto perf_scope = makeScopeExit([this, &perf, callback_start]() {
+      perf.stage_ms[kTotal] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - callback_start).count();
+      recordPointCloudPerformance(perf);
+    });
+    const auto lock_start = SteadyClock::now();
+    std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
+    perf.stage_ms[kLockWait] = std::chrono::duration<double, std::milli>(
+      SteadyClock::now() - lock_start).count();
+    applyPendingGlobalRelocalizationResult();
+    perf.phase = !is_init_success_ ? (gl_once_gate_ ? "relocalization" : "initialization")
+      : motion_phase_;
+    const rclcpp::Time cloud_stamp(points_msg->header.stamp, get_clock()->get_clock_type());
+    perf.cloud_age_ms = std::max(0.0, (get_clock()->now() - cloud_stamp).seconds() * 1000.0);
+    // Receipt health and processing freshness are separate. A stale queued
+    // frame still proves the sensor stream is alive; it simply has no value
+    // for a real-time localization correction.
     updateLidarStatus(true);
-    std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex); 
+    if (isPointCloudStale(
+          get_clock()->now().nanoseconds(), cloud_stamp.nanoseconds(),
+          point_cloud_max_age_s_, is_init_success_)) {
+      perf.stale = true;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Dropping stale localization cloud: age=%.1fms limit=%.1fms",
+        perf.cloud_age_ms, point_cloud_max_age_s_ * 1000.0);
+      return;
+    }
     rtk_heading_fused_this_frame_ = false;
     rtk_position_fused_this_frame_ = false;
     if (use_imu && !static_imu_init_.InitSuccess()) {
@@ -2309,19 +2835,65 @@ private:
     const builtin_interfaces::msg::Time stamp = skip_lidar_matching
       ? static_cast<builtin_interfaces::msg::Time>(get_clock()->now())
       : points_msg->header.stamp;
-    pcl::PointCloud<PointT>::Ptr pcl_cloud(new pcl::PointCloud<PointT>());
-    if (!skip_lidar_matching) {
+    ++ndt_frame_counter_;
+    const bool lio_fresh_for_schedule = enable_lio_primary_ && is_init_success_ &&
+      lioOdomFresh(rclcpp::Time(stamp));
+    const bool lidar_odometry_required = enable_lidar_odometry_prediction_ &&
+      !(lio_fresh_for_schedule && !rtk_auto_primary_latched_);
+    PointCloudScheduleConfig schedule_config;
+    schedule_config.initialization_stride = initialization_ndt_stride_;
+    schedule_config.stationary_stride = stationary_ndt_stride_;
+    schedule_config.moving_stride = moving_ndt_stride_;
+    schedule_config.stable_max_rate_hz = stable_ndt_max_rate_hz_;
+    schedule_config.recovery_max_rate_hz = recovery_ndt_max_rate_hz_;
+    PointCloudScheduleInput schedule_input;
+    schedule_input.initialized = is_init_success_;
+    schedule_input.lidar_matching_paused = skip_lidar_matching;
+    schedule_input.rtk_primary = skip_lidar_matching;
+    const std::int64_t schedule_now_ns = steadyNowNanoseconds();
+    schedule_input.global_relocalization_requested =
+      use_global_localization_init_ && gl_once_gate_ && global_localization_ptr_ &&
+      !is_init_success_ && globalRelocalizationRequestReady(
+        schedule_now_ns, global_relocalization_earliest_start_ns_);
+    schedule_input.lidar_odometry_required = lidar_odometry_required;
+    schedule_input.lio_primary_enabled = enable_lio_primary_;
+    schedule_input.lio_stable = lio_fresh_for_schedule &&
+      lio_stable_frame_count_ >= lio_stable_confirmation_frames_;
+    schedule_input.correction_suppressed = pending_lio_correction_.active ||
+      !lio_correction_cooldown_gate_.canStart(steadyNowNanoseconds());
+    schedule_input.motion_phase = motion_phase_;
+    schedule_input.frame_index = ndt_frame_counter_;
+    schedule_input.now_ns = schedule_now_ns;
+    schedule_input.last_ndt_start_ns = last_ndt_match_start_steady_ns_;
+    const PointCloudWorkDecision work_decision =
+      decidePointCloudWork(schedule_config, schedule_input);
+    last_point_cloud_schedule_reason_ = work_decision.reason;
+    if (work_decision.run_ndt) {
+      last_ndt_match_start_steady_ns_ = schedule_input.now_ns;
+    }
+    perf.heavy = work_decision.needs_heavy_cloud;
+    perf.run_ndt = work_decision.run_ndt;
+
+    raw_points_ptr_->clear();
+    if (work_decision.needs_heavy_cloud) {
+      auto stage_start = SteadyClock::now();
       raw_points_ptr_->clear();
       pcl::fromROSMsg(*points_msg, *raw_points_ptr_);
+      perf.stage_ms[kRosConversion] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - stage_start).count();
       if (raw_points_ptr_->empty()) {
         RCLCPP_ERROR(get_logger(), "cloud is empty!!");
         return;
       }
+      stage_start = SteadyClock::now();
       auto preprocessed = preprocessScanForMapMatching(raw_points_ptr_);
+      perf.stage_ms[kPreprocess] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - stage_start).count();
+      stage_start = SteadyClock::now();
       auto filtered = downsample(preprocessed);
       TransformPoints(filtered, raw_points_ptr_);
-    } else {
-      raw_points_ptr_->clear();
+      perf.stage_ms[kVoxelTransform] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - stage_start).count();
     }
 
     try {
@@ -2362,40 +2934,26 @@ private:
           elapsed);
       }
     }
-    if (use_global_localization_init_ && gl_once_gate_ && global_localization_ptr_ && !is_init_success_) {
-      // Consume the one-shot gate before doing the expensive synchronous ICP.
-      // A failed attempt must not be retried for every incoming lidar frame.
+    if (schedule_input.global_relocalization_requested && work_decision.needs_heavy_cloud) {
+      // Consume the one-shot gate before publishing to the capacity-one worker
+      // mailbox. A failed attempt must not be retried for every lidar frame.
       gl_once_gate_ = false;
       last_global_localization_attempt_ = std::chrono::steady_clock::now();
       seedPositionFromGnss(rclcpp::Time(points_msg->header.stamp), "global relocalization");
-      RCLCPP_INFO(get_logger(), "Attempting global localization for better initial pose...");
-      bool relocalized = false;
-      if (use_scan_context_ && !scan_context_db_.empty()) {
-        relocalized = tryScanContextRelocalization(raw_points_ptr_);
-      }
-      if (relocalized || performGlobalLocalization(raw_points_ptr_)) {
-        RCLCPP_INFO(get_logger(), "Global localization successful! Using new initial pose.");
-        pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
-        has_trusted_ndt_pose_ = false;
-        resetLioAnchor();
-        is_init_success_ = false;
-        init_match_count_ = 0;
-        localization_state_ = 1;
-        RCLCPP_INFO(get_logger(), "Pose estimator recreated with global localization result");
-      } else {
-        RCLCPP_WARN(
-          get_logger(),
-          "Global localization failed once; keeping the last trusted pose and waiting for operator initialization.");
-        if (runtime_relocalization_attempted_ && has_valid_pose_history_) {
-          pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
-          is_extrapolating_ = true;
-        }
-      }
+      const auto global_start = SteadyClock::now();
+      scheduleGlobalRelocalization(raw_points_ptr_);
+      perf.stage_ms[kGlobalRelocalization] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - global_start).count();
+      RCLCPP_INFO(
+        get_logger(), "Queued background global localization generation=%llu",
+        static_cast<unsigned long long>(global_relocalization_generation_));
     }
     
     bool initialized_this_frame = false;
     if (!is_init_success_) {
       localization_state_ = 1;
+      if (init_match_result_pending_) {
+        init_match_result_pending_ = false;
       PoseEstimator::MatchResult init_result = pose_estimator->GetMatchState();
       RCLCPP_INFO(get_logger(), "init_result.is_converged_ : %d", init_result.is_converged_);
       RCLCPP_INFO(get_logger(), "init_result.fitness_score_ : %f", init_result.fitness_score_);
@@ -2405,6 +2963,7 @@ private:
         RCLCPP_INFO(get_logger(), "Init match count: %d/%d (score: %.6f)", init_match_count_, init_match_count_threshold_, init_result.fitness_score_);
         // Check if we have enough consecutive successful matches
         if (init_match_count_ >= init_match_count_threshold_) {
+          advanceGlobalRelocalizationGeneration("local initialization success");
           is_init_success_ = true;
           initialized_this_frame = true;
           localization_state_ = 2;
@@ -2416,9 +2975,9 @@ private:
         RCLCPP_INFO(get_logger(), "Init match criteria not met, resetting counter");
       }
       RCLCPP_INFO(get_logger(), "Wait Init Pose!!! Current count: %d/%d", init_match_count_, init_match_count_threshold_);
+      }
     }
 
-    pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());  
     // Do not integrate IMU translation while scan matching is lost or the
     // initial pose is still being verified. Discard samples from that period
     // so a later recovery cannot replay a stale backlog into the UKF.
@@ -2457,11 +3016,12 @@ private:
       imu_data.clear();
     }
 
-    if (!skip_lidar_matching && enable_lidar_odometry_prediction_ && pose_estimator &&
-        !(enable_lio_primary_ && is_init_success_ && lioOdomFresh(rclcpp::Time(stamp)) &&
-          !rtk_auto_primary_latched_)) {
+    if (!skip_lidar_matching && lidar_odometry_required && pose_estimator) {
+      const auto lidar_odom_start = SteadyClock::now();
       pose_estimator->enable_lidar_odometry_prediction();
       updateLidarOdometryPrediction(raw_points_ptr_, rclcpp::Time(stamp));
+      perf.stage_ms[kLidarOdometry] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - lidar_odom_start).count();
     }
 
     // Use adjacent received odometry poses directly. The device header carries
@@ -2534,21 +3094,40 @@ private:
       lioOdomFresh(rclcpp::Time(stamp));
     bool lio_observation_applied = false;
     if (lio_primary) {
+      const auto lio_start = SteadyClock::now();
       lio_observation_applied = applyLioPrimaryObservation(rclcpp::Time(stamp));
+      if (lio_observation_applied) {
+        lio_stable_frame_count_ = std::min(
+          lio_stable_frame_count_ + 1, lio_stable_confirmation_frames_);
+      } else {
+        lio_stable_frame_count_ = 0;
+      }
+      perf.stage_ms[kLioObservation] = std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - lio_start).count();
+    } else if (enable_lio_primary_ && is_init_success_) {
+      lio_stable_frame_count_ = 0;
     }
     // Obstacle extraction remains on the independent 10 Hz laser scan chain.
     // Scan matching is reduced to 2 Hz while moving and restored to every
     // LiDAR frame while stationary or during initialization.
-    ++ndt_frame_counter_;
-    const bool run_ndt = !skip_lidar_matching && !rtk_primary &&
-      (motion_phase_ != "moving" || !is_init_success_ ||
-      (ndt_frame_counter_ % static_cast<uint64_t>(moving_ndt_stride_) == 0));
+    const bool run_ndt = work_decision.run_ndt && !rtk_primary;
+    perf.run_ndt = run_ndt;
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+    std::optional<PoseEstimator::MatchResult> current_match_result;
+    bool current_ndt_sample_healthy = false;
     if (run_ndt) {
       aligned = pose_estimator->correct(
         stamp, raw_points_ptr_,
         is_init_success_ && !enable_lio_primary_ &&
-          !rtk_primary && !bridge_active_ && !lio_observation_applied);
+          !rtk_primary && !bridge_active_ && !lio_observation_applied,
+        enable_lio_primary_ && schedule_input.lio_stable);
+      const PoseEstimator::MatchTiming match_timing = pose_estimator->GetMatchTiming();
+      perf.stage_ms[kNdt] = match_timing.ndt_ms;
+      perf.stage_ms[kLocalMap] = match_timing.local_map_ms;
+      perf.stage_ms[kVgicp] = match_timing.refine_ms;
+      if (!is_init_success_) {
+        init_match_result_pending_ = true;
+      }
       publish_scan_matching_status(points_msg->header, aligned);
       const PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
       last_ndt_score_ = match_result.fitness_score_;
@@ -2558,6 +3137,8 @@ private:
       // can be discarded solely because the fallback yaw covariance is high.
       const bool ndt_sample_healthy = match_result.is_converged_ &&
         match_result.fitness_score_ < ndt_max_fitness_score_ && last_ndt_status_healthy_;
+      current_match_result = match_result;
+      current_ndt_sample_healthy = ndt_sample_healthy;
       if (ndt_sample_healthy) {
         ndt_unhealthy_frame_count_ = 0;
         last_ndt_healthy_ = true;
@@ -2568,15 +3149,20 @@ private:
         }
       }
       last_ndt_update_time_ = rclcpp::Time(stamp);
-      if (lio_observation_applied && ndt_sample_healthy) {
-        maybeCorrectLioDrift(match_result, rclcpp::Time(stamp));
-      } else if (lio_observation_applied) {
-        ndt_drift_gate_.resetConsecutive();
-      }
-    } else if ((rclcpp::Time(stamp) - last_ndt_update_time_).seconds() > 1.0) {
+    } else if (work_decision.reason != "correction_suppressed" &&
+        (rclcpp::Time(stamp) - last_ndt_update_time_).seconds() > 1.0) {
       last_ndt_healthy_ = false;
       ndt_unhealthy_frame_count_ = ndt_failure_hysteresis_frames_;
       ndt_drift_gate_.resetConsecutive();
+    }
+    if (lio_observation_applied) {
+      evaluateAuxiliaryCorrections(
+        current_match_result ? &*current_match_result : nullptr,
+        current_ndt_sample_healthy,
+        rtk_observation,
+        rclcpp::Time(stamp));
+    } else if (enable_lio_primary_ && is_init_success_) {
+      policy_source_ready_ = false;
     }
     bool absolute_pose_valid = false;
     bool bridge_pose_valid = false;
@@ -2597,7 +3183,6 @@ private:
       absolute_pose_valid = true;
       active_source_ = "lio_imu";
       absolute_observation_updated = true;
-      maybeCorrectRtkDrift(rtk_observation);
     } else if (enable_lio_primary_ && is_init_success_) {
       // A stale FAST-LIO stream is a localization outage, not permission for
       // NDT or RTK to become a second continuous odometry source. Keep scan
@@ -2677,6 +3262,7 @@ private:
           is_init_success_ && has_valid_pose_history_ &&
           !runtime_relocalization_attempted_ &&
           consecutive_match_failures_ >= runtime_relocalization_failure_threshold_) {
+        advanceGlobalRelocalizationGeneration("runtime localization loss");
         last_init_pos_ = last_pose_.block<3, 1>(0, 3);
         last_init_quat_ = Eigen::Quaternionf(last_pose_.block<3, 3>(0, 0));
         last_init_quat_.normalize();
@@ -2703,17 +3289,12 @@ private:
       RCLCPP_INFO(get_logger(), "Continuous Localization may not good!!!");
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    last_timeout_ = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    if (last_timeout_ > 80) {
-      RCLCPP_INFO(get_logger(), "!!!point cloud callback time cost > 80ms, = %d ms\n", last_timeout_);
-    }
-
+    const auto output_start = SteadyClock::now();
     if (run_ndt && aligned_pub->get_subscription_count()) {
-      aligned->header.frame_id = "map";
-      aligned->header.stamp = cloud->header.stamp;
       sensor_msgs::msg::PointCloud2 aligned_msg;
       pcl::toROSMsg(*aligned, aligned_msg);
+      aligned_msg.header = points_msg->header;
+      aligned_msg.header.frame_id = "map";
       aligned_pub->publish(aligned_msg);
     }
     // Update pose history for extrapolation
@@ -2735,6 +3316,8 @@ private:
         ? pose_estimator->matrix()
         : (has_valid_pose_history_ ? last_pose_ : pose_estimator->matrix()));
     syncLidarOdometryImuAnchor();
+    perf.stage_ms[kOutput] = std::chrono::duration<double, std::milli>(
+      SteadyClock::now() - output_start).count();
     } catch (const std::exception& e) {
       RCLCPP_ERROR(get_logger(), "Localization points_callback aborted: %s", e.what());
     } catch (...) {
@@ -2768,6 +3351,8 @@ private:
     }
     
     if (pose_changed) {
+      advanceGlobalRelocalizationGeneration(
+        "initial pose update", initial_pose_relocalization_settle_s_);
       last_init_pos_ = new_pos;
       last_init_quat_ = new_quat;
       has_set_init_pose_ = true;
@@ -3150,116 +3735,262 @@ private:
     publish_odometry(stamp, default_pose);
   }
 
-  /**
-   * @brief Seed global localization from scan context place recognition.
-   *
-   * The stock path seeds ICP from the last trusted pose and searches no yaw at all, so a
-   * robot that has drifted far enough in heading can never recover: every retry re-seeds
-   * from a pose that is a little more wrong than the last. Retrieval answers the question
-   * directly instead, proposing a map keyframe and a heading from the descriptor.
-   *
-   * Only scan_context_max_seeds_ candidates are verified per firing, so the per-frame ICP
-   * cost matches the stock path - which matters because points_callback runs on a single
-   * threaded executor and already warns past 80 ms. The existing
-   * runtime_relocalization_retry_seconds_ rearm walks the cursor down the rest of the list.
-   *
-   * @return true when a candidate passed verification and last_init_pos_ / last_init_quat_
-   *         now hold the recovered pose.
-   */
-  bool tryScanContextRelocalization(const pcl::PointCloud<PointT>::Ptr& current_cloud) {
-    if (!current_cloud || current_cloud->empty()) {
+  bool runGlobalLocalizationIcp(
+    const GlobalRelocalizationJob& job,
+    const Eigen::Matrix4d& seed,
+    Eigen::Matrix4d& final_pose) {
+    if (!global_localization_ptr_ || !job.map || job.map->empty() ||
+        !job.cloud || job.cloud->empty()) {
       return false;
     }
-    const auto candidates = scan_context_db_.query(
-      *current_cloud, scan_context_top_k_, scan_context_max_distance_);
-    if (candidates.empty()) {
-      RCLCPP_WARN(get_logger(), "Scan context returned no candidate; falling back to the last trusted pose");
-      return false;
+    try {
+      return global_localization_ptr_->performGlobalLocalization(
+        job.map, job.cloud, seed, final_pose);
+    } catch (const std::exception& error) {
+      RCLCPP_ERROR(get_logger(), "Global localization worker exception: %s", error.what());
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "Global localization worker aborted with unknown exception");
     }
-    if (scan_context_cursor_ >= candidates.size()) {
-      scan_context_cursor_ = 0;
-    }
-    const int attempts = std::min<int>(scan_context_max_seeds_, candidates.size());
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-      const auto candidate = candidates[scan_context_cursor_];
-      scan_context_cursor_ = (scan_context_cursor_ + 1) % candidates.size();
-      RCLCPP_INFO(
-        get_logger(),
-        "Scan context candidate %d/%zu: keyframe %d, distance %.3f, yaw %+.1f deg, seed [%.2f, %.2f, %.2f]",
-        attempt + 1, candidates.size(), candidate.keyframe_index, candidate.distance,
-        candidate.yaw_offset_rad * 180.0 / M_PI,
-        candidate.seed_pose(0, 3), candidate.seed_pose(1, 3), candidate.seed_pose(2, 3));
-      if (performGlobalLocalization(current_cloud, &candidate.seed_pose)) {
-        RCLCPP_INFO(get_logger(), "Scan context seed verified against the map");
-        return true;
-      }
-    }
-    RCLCPP_WARN(
-      get_logger(),
-      "No scan context seed verified this round; next attempt resumes at candidate %zu",
-      scan_context_cursor_ + 1);
     return false;
   }
 
-  /**
-   * @brief perform global localization
-   * @param current_cloud current point cloud
-   * @param seed_override optional map-frame seed, e.g. from scan context retrieval;
-   *        nullptr keeps the historical last-trusted-pose behaviour
-   * @return true if global localization is successful
-   */
-  bool performGlobalLocalization(const pcl::PointCloud<PointT>::Ptr& current_cloud,
-                                 const Eigen::Matrix4d* seed_override = nullptr) {
-    if (!global_localization_ptr_ || !global_map_points_ptr_) {
-      RCLCPP_WARN(get_logger(), "Global localization not available");
-      return false;
-    }
-    global_localization_in_progress_ = true;
-    global_localization_start_time_ = get_clock()->now();  
-    RCLCPP_INFO(get_logger(), "Starting global localization..."); 
-    try {
-      Eigen::Matrix4d initial_trans = Eigen::Matrix4d::Identity();
-      if (seed_override != nullptr) {
-        // Scan context already answered where and at what heading, so the last trusted
-        // pose - the one that has just been shown wrong - must not override it.
-        initial_trans = *seed_override;
-      } else {
-        Eigen::Vector3f init_pos;
-        Eigen::Quaternionf init_quat;
-        if (!getCurrentInitPose(init_pos, init_quat)) {
-          RCLCPP_WARN(get_logger(), "Failed to get initial pose for global localization");
-          global_localization_in_progress_ = false;
-          return false;
+  GlobalRelocalizationResult executeGlobalRelocalizationJob(
+    const GlobalRelocalizationJob& job) {
+    const auto started = SteadyClock::now();
+    GlobalRelocalizationResult result;
+    result.generation = job.generation;
+    RCLCPP_INFO(
+      get_logger(), "Starting background global localization generation=%llu",
+      static_cast<unsigned long long>(job.generation));
+
+    if (job.use_scan_context) {
+      std::vector<ScanContextCandidate> candidates;
+      {
+        std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+        if (!scan_context_db_.empty()) {
+          candidates = scan_context_db_.query(
+            *job.cloud, scan_context_top_k_, scan_context_max_distance_);
         }
-        initial_trans.block<3, 1>(0, 3) = init_pos.cast<double>();
-        initial_trans.block<3, 3>(0, 0) = init_quat.toRotationMatrix().cast<double>();
       }
-      
-      Eigen::Matrix4d final_pose;
-      bool localization_success = global_localization_ptr_->performGlobalLocalization(
-        global_map_points_ptr_, current_cloud, initial_trans, final_pose);
-      
-      if (localization_success) {
-        Eigen::Vector3f new_pos = final_pose.block<3, 1>(0, 3).cast<float>();
-        Eigen::Quaternionf new_quat(final_pose.block<3, 3>(0, 0).cast<float>());
-        if (pose_estimator) {
-          last_init_pos_ = new_pos;
-          last_init_quat_ = new_quat;
-          has_set_init_pose_ = true;
-          last_pose_source_ = "global_localization";
-          RCLCPP_INFO(get_logger(), "Global localization successful! New pose: pos[%.3f, %.3f, %.3f], quat[%.3f, %.3f, %.3f, %.3f]",
-                      new_pos.x(), new_pos.y(), new_pos.z(), new_quat.w(), new_quat.x(), new_quat.y(), new_quat.z());
-          global_localization_in_progress_ = false;
-          return true;
-        }
+      if (candidates.empty()) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Scan context returned no candidate; falling back to the last trusted pose");
       } else {
-        RCLCPP_WARN(get_logger(), "Global localization failed");
+        std::size_t cursor = 0;
+        {
+          std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+          if (scan_context_cursor_ >= candidates.size()) {
+            scan_context_cursor_ = 0;
+          }
+          cursor = scan_context_cursor_;
+        }
+        const int attempts = std::min<int>(scan_context_max_seeds_, candidates.size());
+        RelocalizationGeometryVerifier geometry_verifier(relocalization_geometry_config_);
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+          const auto candidate = candidates[cursor];
+          cursor = (cursor + 1) % candidates.size();
+          RCLCPP_INFO(
+            get_logger(),
+            "Scan context candidate %d/%zu: keyframe %d, distance %.3f, yaw %+.1f deg, "
+            "seed [%.2f, %.2f, %.2f]",
+            attempt + 1, candidates.size(), candidate.keyframe_index, candidate.distance,
+            candidate.yaw_offset_rad * 180.0 / M_PI,
+            candidate.seed_pose(0, 3), candidate.seed_pose(1, 3), candidate.seed_pose(2, 3));
+          pcl::PointCloud<PointT> candidate_scan;
+          Eigen::Matrix4d candidate_map_pose = Eigen::Matrix4d::Identity();
+          bool candidate_loaded = false;
+          std::string load_error;
+          {
+            std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+            std::size_t candidate_slot = 0;
+            if (scan_context_db_.findKeyframeSlot(candidate.keyframe_index, candidate_slot)) {
+              candidate_map_pose = scan_context_db_.keyframePose(candidate_slot);
+              candidate_loaded = scan_context_db_.loadKeyframeScan(
+                candidate_slot, candidate_scan, &load_error);
+            } else {
+              load_error = "candidate keyframe index is absent from the database";
+            }
+          }
+          if (!candidate_loaded) {
+            RCLCPP_WARN(get_logger(),
+              "Scan context geometry candidate %d could not load: %s",
+              candidate.keyframe_index, load_error.c_str());
+            continue;
+          }
+
+          const Eigen::Matrix4f initial_source_to_target =
+            (candidate_map_pose.inverse() * candidate.seed_pose).cast<float>();
+          const auto geometry = geometry_verifier.verify(
+            *job.cloud, candidate_scan, initial_source_to_target);
+          RCLCPP_INFO(get_logger(),
+            "Scan context geometry keyframe=%d accepted=%s reason=%s "
+            "rmse=%.3fm inliers=%d overlap=%.3f hessian=%.1f "
+            "icp_delta=%.3fm/%.2fdeg elapsed=%.1fms mode=%s",
+            candidate.keyframe_index, geometry.accepted ? "true" : "false",
+            geometry.rejection_reason.empty() ? "none" : geometry.rejection_reason.c_str(),
+            geometry.rmse_m, geometry.inlier_count, geometry.bidirectional_overlap,
+            geometry.hessian_condition, geometry.icp_translation_disagreement_m,
+            geometry.icp_rotation_disagreement_rad * 180.0 / M_PI,
+            geometry.elapsed_ms, scan_context_runtime_mode_.c_str());
+          if (!geometry.accepted || !job.apply_scan_context) {
+            continue;
+          }
+
+          const Eigen::Matrix4d verified_seed = candidate_map_pose *
+            geometry.source_to_target.cast<double>();
+          if (runGlobalLocalizationIcp(job, verified_seed, result.pose)) {
+            result.success = true;
+            result.source = "scan_context_gicp_verified";
+            break;
+          }
+        }
+        {
+          std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+          scan_context_cursor_ = cursor;
+        }
       }
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(get_logger(), "Global localization exception: %s", e.what());
     }
-    global_localization_in_progress_ = false;
-    return false;
+
+    if (!result.success &&
+        runGlobalLocalizationIcp(job, job.fallback_seed, result.pose)) {
+      result.success = true;
+      result.source = "last_trusted_pose";
+    }
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(
+      SteadyClock::now() - started).count();
+    return result;
+  }
+
+  void globalRelocalizationWorkerLoop() {
+    while (true) {
+      GlobalRelocalizationJob job;
+      {
+        std::unique_lock<std::mutex> lock(global_relocalization_job_mutex_);
+        global_relocalization_job_cv_.wait(lock, [this]() {
+          return global_relocalization_worker_stop_ || pending_global_relocalization_job_.has_value();
+        });
+        if (global_relocalization_worker_stop_) {
+          return;
+        }
+        job = std::move(*pending_global_relocalization_job_);
+        pending_global_relocalization_job_.reset();
+      }
+
+      auto result = executeGlobalRelocalizationJob(job);
+      RCLCPP_INFO(
+        get_logger(),
+        "Background global localization finished generation=%llu success=%s source=%s elapsed=%.1fms",
+        static_cast<unsigned long long>(result.generation),
+        result.success ? "true" : "false", result.source.c_str(), result.elapsed_ms);
+      {
+        std::lock_guard<std::mutex> lock(global_relocalization_result_mutex_);
+        pending_global_relocalization_result_ = std::move(result);
+      }
+      {
+        std::lock_guard<std::mutex> lock(global_relocalization_job_mutex_);
+        if (!pending_global_relocalization_job_) {
+          global_localization_in_progress_.store(false);
+        }
+      }
+    }
+  }
+
+  void scheduleGlobalRelocalization(const pcl::PointCloud<PointT>::Ptr& current_cloud) {
+    GlobalRelocalizationJob job;
+    job.generation = global_relocalization_generation_;
+    job.cloud.reset(new pcl::PointCloud<PointT>(*current_cloud));
+    job.map = global_map_points_ptr_;
+    job.fallback_seed.block<3, 1>(0, 3) = last_init_pos_.cast<double>();
+    job.fallback_seed.block<3, 3>(0, 0) = last_init_quat_.toRotationMatrix().cast<double>();
+    job.use_scan_context = use_scan_context_;
+    job.apply_scan_context = scan_context_runtime_mode_ == "active";
+    {
+      std::lock_guard<std::mutex> lock(global_relocalization_job_mutex_);
+      // Capacity-one mailbox: a newer request replaces a queued request. The
+      // active job may finish, but its generation is checked before write-back.
+      pending_global_relocalization_job_ = std::move(job);
+      global_localization_in_progress_.store(true);
+      global_localization_start_time_ = get_clock()->now();
+    }
+    global_relocalization_job_cv_.notify_one();
+  }
+
+  void advanceGlobalRelocalizationGeneration(
+    const char* reason, double settle_seconds = 0.0) {
+    ++global_relocalization_generation_;
+    global_relocalization_earliest_start_ns_ = steadyNowNanoseconds() +
+      static_cast<std::int64_t>(std::max(0.0, settle_seconds) * 1e9);
+    {
+      std::lock_guard<std::mutex> lock(global_relocalization_job_mutex_);
+      if (pending_global_relocalization_job_ &&
+          pending_global_relocalization_job_->generation != global_relocalization_generation_) {
+        pending_global_relocalization_job_.reset();
+      }
+    }
+    {
+      std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+      scan_context_cursor_ = 0;
+    }
+    RCLCPP_INFO(
+      get_logger(), "Global localization generation advanced to %llu (%s, settle=%.2fs)",
+      static_cast<unsigned long long>(global_relocalization_generation_), reason,
+      std::max(0.0, settle_seconds));
+  }
+
+  void applyPendingGlobalRelocalizationResult() {
+    std::optional<GlobalRelocalizationResult> result;
+    {
+      std::lock_guard<std::mutex> lock(global_relocalization_result_mutex_);
+      result.swap(pending_global_relocalization_result_);
+    }
+    if (!result) {
+      return;
+    }
+    const auto disposition = decideGlobalRelocalizationResult(
+      global_relocalization_generation_, result->generation, result->success,
+      result->elapsed_ms, global_localization_timeout_);
+    if (disposition == GlobalRelocalizationResultDisposition::kDiscardStale) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Discarding stale global localization result generation=%llu current=%llu",
+        static_cast<unsigned long long>(result->generation),
+        static_cast<unsigned long long>(global_relocalization_generation_));
+      return;
+    }
+    if (disposition == GlobalRelocalizationResultDisposition::kDiscardTimedOut) {
+      RCLCPP_WARN(
+        get_logger(), "Discarding timed-out global localization result elapsed=%.1fms limit=%.1fms",
+        result->elapsed_ms, global_localization_timeout_ * 1000.0f);
+      return;
+    }
+    if (disposition == GlobalRelocalizationResultDisposition::kApplyFailure) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Background global localization failed once; keeping the last trusted pose");
+      if (runtime_relocalization_attempted_ && has_valid_pose_history_) {
+        pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
+        is_extrapolating_ = true;
+      }
+      return;
+    }
+
+    last_init_pos_ = result->pose.block<3, 1>(0, 3).cast<float>();
+    last_init_quat_ = Eigen::Quaternionf(result->pose.block<3, 3>(0, 0).cast<float>());
+    last_init_quat_.normalize();
+    has_set_init_pose_ = true;
+    last_pose_source_ = "global_localization_" + result->source;
+    pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
+    has_trusted_ndt_pose_ = false;
+    resetLioAnchor();
+    is_init_success_ = false;
+    init_match_count_ = 0;
+    localization_state_ = 1;
+    RCLCPP_INFO(
+      get_logger(),
+      "Applied background global localization generation=%llu source=%s pose=[%.3f, %.3f, %.3f]",
+      static_cast<unsigned long long>(result->generation), result->source.c_str(),
+      last_init_pos_.x(), last_init_pos_.y(), last_init_pos_.z());
   }
   
   /**
@@ -3964,22 +4695,35 @@ private:
      * simply keeps the stock last-trusted-pose seed.
      */
     void loadScanContextForMap(const std::string& map_path) {
-        scan_context_db_.clear();
-        scan_context_cursor_ = 0;
         if (!use_scan_context_) {
+            std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+            scan_context_db_.clear();
+            scan_context_cursor_ = 0;
             return;
         }
         const std::string map_dir = std::filesystem::path(map_path).parent_path().string();
+        ScanContextDatabase loaded_database;
         std::string error;
-        if (!scan_context_db_.load(map_dir, &error)) {
+        if (!loaded_database.load(map_dir, &error)) {
+            {
+                std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+                scan_context_db_.clear();
+                scan_context_cursor_ = 0;
+            }
             RCLCPP_WARN(get_logger(), "Scan context relocalization unavailable for %s: %s",
                         map_dir.c_str(), error.c_str());
             return;
         }
+        const std::size_t loaded_size = loaded_database.size();
+        const std::string seed_source = loaded_database.seed_pose_source();
+        {
+            std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
+            scan_context_db_ = std::move(loaded_database);
+            scan_context_cursor_ = 0;
+        }
         RCLCPP_INFO(get_logger(),
                     "Scan context database loaded: %zu keyframes from %s (seed poses: %s)",
-                    scan_context_db_.size(), map_dir.c_str(),
-                    scan_context_db_.seed_pose_source().c_str());
+                    loaded_size, map_dir.c_str(), seed_source.c_str());
     }
 
     void LoadMapCallBack(robots_dog_msgs::srv::LoadMap::Request::SharedPtr request, 
@@ -3991,26 +4735,28 @@ private:
             RCLCPP_ERROR(get_logger(), "Map file does not exist: %s", map_path.c_str());
             response->success = false;
             response->message = "Map file does not exist.";
+            update_map_flag_.store(false);
             return;
         }
-        global_map_points_ptr_->clear();
-        pcl::io::loadPCDFile(map_path, *global_map_points_ptr_);
-        RCLCPP_INFO(get_logger(), "Global map points size==: %zu", global_map_points_ptr_->points.size());
-        if (!global_map_points_ptr_->empty()) {
+        pcl::PointCloud<PointT>::Ptr loaded_map(new pcl::PointCloud<PointT>());
+        pcl::io::loadPCDFile(map_path, *loaded_map);
+        RCLCPP_INFO(get_logger(), "Global map points size==: %zu", loaded_map->points.size());
+        if (!loaded_map->empty()) {
             pcl::VoxelGrid<pcl::PointXYZI> voxel;
-            voxel.setInputCloud(global_map_points_ptr_);
+            voxel.setInputCloud(loaded_map);
             voxel.setLeafSize(globalmap_voxel_size_, globalmap_voxel_size_, globalmap_voxel_size_);
-            voxel.filter(*global_map_points_ptr_);
-            if (global_map_points_ptr_->points.size() < 1000) {
-                RCLCPP_ERROR(get_logger(), "Global map points size is too small: %zu", global_map_points_ptr_->points.size());
+            voxel.filter(*loaded_map);
+            if (loaded_map->points.size() < 1000) {
+                RCLCPP_ERROR(get_logger(), "Global map points size is too small: %zu", loaded_map->points.size());
                 response->success = false;
                 response->message = "Global map points size is too small.";
+                update_map_flag_.store(false);
                 return;
             } else {
                 if (global_map_pub_->get_subscription_count()) {
                     pcl::PointCloud<pcl::PointXYZI>::Ptr global_map_downsampled(new pcl::PointCloud<pcl::PointXYZI>);
                     pcl::VoxelGrid<pcl::PointXYZI> publish_voxel;
-                    publish_voxel.setInputCloud(global_map_points_ptr_);
+                    publish_voxel.setInputCloud(loaded_map);
                     publish_voxel.setLeafSize(0.5f, 0.5f, 0.5f); // Only for publishing
                     publish_voxel.filter(*global_map_downsampled);
                     sensor_msgs::msg::PointCloud2 global_map_msg;
@@ -4023,6 +4769,10 @@ private:
                 response->success = true;
                 response->message = "Map update successfully.";
                 RCLCPP_INFO(get_logger(), "Global map updated!!!!!!");
+                // Publish the new immutable snapshot atomically at the callback
+                // boundary. A running background ICP retains the old shared_ptr
+                // and its generation prevents that old result from being applied.
+                global_map_points_ptr_ = loaded_map;
                 registration->setInputTarget(global_map_points_ptr_);;
                 if (use_gnss_fusion_) {
                     loadGnssOriginForMap(map_path);
@@ -4043,11 +4793,11 @@ private:
     }
 
     void Reset() {
+        advanceGlobalRelocalizationGeneration("map reset", map_relocalization_settle_s_);
         is_init_success_ = false;
         localization_state_ = 0; 
         init_match_count_ = 0;
         gl_once_gate_ = true;
-        scan_context_cursor_ = 0;
         consecutive_match_failures_ = 0;
         runtime_relocalization_attempted_ = false;
         gnss_recovery_seed_pending_ = false;
@@ -4180,6 +4930,10 @@ private:
   bool rtk_auto_primary_latched_ = false;
   bool lidar_matching_paused_for_rtk_ = false;
   std::string preferred_source_ = "ndt";
+  CorrectionPolicyMode preferred_correction_mode_ = CorrectionPolicyMode::ndt;
+  bool policy_source_ready_ = false;
+  std::string last_correction_candidate_source_ = "none";
+  std::string last_correction_selection_reason_ = "idle";
   std::string active_source_ = "unavailable";
   std::string motion_phase_ = "stationary";
   bool bridge_active_ = false;
@@ -4194,6 +4948,10 @@ private:
   double bridge_max_odom_yaw_rate_rps_ = 2.0;
   int absolute_recovery_samples_ = 3;
   int moving_ndt_stride_ = 5;
+  int stationary_ndt_stride_ = 5;
+  int initialization_ndt_stride_ = 2;
+  double stable_ndt_max_rate_hz_ = 2.0;
+  double recovery_ndt_max_rate_hz_ = 5.0;
   int ndt_failure_hysteresis_frames_ = 3;
   int ndt_unhealthy_frame_count_ = 0;
   uint64_t ndt_frame_counter_ = 0;
@@ -4202,6 +4960,8 @@ private:
   double last_ndt_score_ = std::numeric_limits<double>::infinity();
   float last_ndt_inlier_fraction_ = 0.0f;
   rclcpp::Time last_ndt_update_time_{0, 0, RCL_ROS_TIME};
+  std::int64_t last_ndt_match_start_steady_ns_ = 0;
+  std::string last_point_cloud_schedule_reason_ = "idle";
   Eigen::Vector3f last_rtk_map_position_ = Eigen::Vector3f::Zero();
   double last_rtk_map_yaw_ = 0.0;
   int absolute_stable_count_ = 0;
@@ -4221,6 +4981,8 @@ private:
   std::shared_ptr<GlobalLocalization> global_localization_ptr_;
   ScanContextDatabase scan_context_db_;
   bool use_scan_context_ = false;
+  std::string scan_context_runtime_mode_ = "disabled";
+  RelocalizationGeometryConfig relocalization_geometry_config_;
   int scan_context_top_k_ = 5;
   int scan_context_max_seeds_ = 1;
   double scan_context_max_distance_ = 0.0;
@@ -4247,11 +5009,23 @@ private:
   float init_quat_change_threshold_ = 0.01f;      
   float global_localization_timeout_ = 10.0f;     
   // Global localization state
-  bool global_localization_in_progress_ = false;
+  std::atomic<bool> global_localization_in_progress_{false};
   rclcpp::Time global_localization_start_time_;
+  std::uint64_t global_relocalization_generation_ = 1;
+  std::mutex global_relocalization_job_mutex_;
+  std::condition_variable global_relocalization_job_cv_;
+  std::optional<GlobalRelocalizationJob> pending_global_relocalization_job_;
+  bool global_relocalization_worker_stop_ = false;
+  std::thread global_relocalization_worker_;
+  std::mutex global_relocalization_result_mutex_;
+  std::optional<GlobalRelocalizationResult> pending_global_relocalization_result_;
+  std::mutex global_relocalization_resource_mutex_;
   bool gl_once_gate_ = true;
   int runtime_relocalization_failure_threshold_ = 10;
   double runtime_relocalization_retry_seconds_ = 5.0;
+  double initial_pose_relocalization_settle_s_ = 0.75;
+  double map_relocalization_settle_s_ = 2.0;
+  std::int64_t global_relocalization_earliest_start_ns_ = 0;
   std::chrono::steady_clock::time_point last_global_localization_attempt_{};
   int consecutive_match_failures_ = 0;
   bool runtime_relocalization_attempted_ = false;
@@ -4319,6 +5093,7 @@ private:
   float lio_drift_xy_m_ = 0.30f;
   float lio_drift_yaw_rad_ = 5.0f * static_cast<float>(M_PI) / 180.0f;
   int lio_drift_hysteresis_frames_ = 3;
+  int lio_stable_confirmation_frames_ = 3;
   float lio_stable_xy_tolerance_m_ = 0.10f;
   float lio_stable_yaw_tolerance_rad_ = 2.0f * static_cast<float>(M_PI) / 180.0f;
   float lio_rearm_xy_m_ = 0.20f;
@@ -4339,6 +5114,13 @@ private:
   float lio_correction_rotation_rate_radps_ = 8.0f * static_cast<float>(M_PI) / 180.0f;
   float lio_correction_completion_translation_m_ = 0.01f;
   float lio_correction_completion_rotation_rad_ = 0.25f * static_cast<float>(M_PI) / 180.0f;
+  double lio_correction_min_interval_s_ = 3.0;
+  double lio_correction_post_suppression_s_ = 3.0;
+  int lio_stable_frame_count_ = 0;
+  CorrectionCooldownGate lio_correction_cooldown_gate_;
+  std::int64_t last_correction_started_steady_ns_ = 0;
+  std::int64_t last_correction_completed_steady_ns_ = 0;
+  std::string last_correction_source_ = "none";
   mutable std::mutex lio_odom_mutex_;
   nav_msgs::msg::Odometry latest_lio_odom_;
   rclcpp::Time latest_lio_odom_stamp_{0, 0, RCL_ROS_TIME};
@@ -4370,6 +5152,7 @@ private:
   int scan_matching_max_iterations_ = 20;
   int scan_matching_num_threads_ = 2;
   float scan_matching_coarse_max_fitness_score_ = 2.00f;
+  ScanMatchRefinePolicy scan_matching_refine_policy_;
   double scan_preprocess_min_range_m_ = 0.50;
   double scan_preprocess_max_range_m_ = 10.0;
   double scan_preprocess_fov_degree_ = 240.0;
@@ -4395,6 +5178,13 @@ private:
   uint64_t consumed_robot_odom_sequence_ = 0;
   bool odom_prediction_initialized_ = false;
   int imu_data_filter_num_ = 5;  // Number of IMU data points to filter.
+
+  double point_cloud_max_age_s_ = 0.20;
+  bool point_cloud_latest_only_ = true;
+  double point_cloud_perf_log_interval_s_ = 10.0;
+  double point_cloud_slow_callback_ms_ = 80.0;
+  std::array<PointCloudPerfWindow, 4> point_cloud_perf_windows_;
+  SteadyClock::time_point last_point_cloud_perf_log_{};
 
   bool is_init_success_ = false;
   // Tracks a verified NDT anchor for the current initialization cycle. Generic

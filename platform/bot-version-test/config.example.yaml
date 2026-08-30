@@ -55,6 +55,8 @@ detection:
   event_classes: [bicycle]
   person_detection_enabled: true
   person_report_interval_seconds: 0.4
+  inference_rate_hz: 2.0
+  person_follow_inference_rate_hz: 5.0
 
 telemetry:
   endpoint: https://platform.example/api/telemetry/ingest/

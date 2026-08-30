@@ -122,6 +122,20 @@ public:
     return descriptors_[slot];
   }
 
+  /// Resolve a keyframes.csv index to the compact database slot used by the accessors.
+  bool findKeyframeSlot(int keyframe_index, std::size_t& slot) const;
+
+  /**
+   * @brief Load one stored world-frame keyframe and return it in its raw lidar frame.
+   *
+   * Geometry verification calls this only for Scan Context Top-K candidates. Keeping
+   * paths and poses, instead of every cloud, bounds long-running localization memory.
+   */
+  bool loadKeyframeScan(
+    std::size_t slot,
+    pcl::PointCloud<pcl::PointXYZI>& scan,
+    std::string* error = nullptr) const;
+
 private:
   struct KeyframeRow;
 
@@ -133,6 +147,8 @@ private:
   std::string seed_pose_source_ = "raw";
   std::vector<int> keyframe_indices_;
   std::vector<Eigen::Matrix4d> poses_;
+  std::vector<std::string> keyframe_cloud_paths_;
+  std::vector<Eigen::Matrix4d> raw_lidar_poses_;
   /// Flattened rings*sectors descriptor per keyframe.
   std::vector<std::vector<float>> descriptors_;
   std::vector<std::vector<float>> ring_keys_;

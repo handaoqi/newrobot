@@ -17,8 +17,8 @@ namespace localization {
             void init(const Eigen::Matrix4d& initial_pose);
         
             bool performGlobalLocalization(
-                const pcl::PointCloud<pcl::PointXYZI>::Ptr& global_map,
-                const pcl::PointCloud<pcl::PointXYZI>::Ptr& current_cloud,
+                const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& global_map,
+                const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& current_cloud,
                 const Eigen::Matrix4d& initial_trans,  
                 Eigen::Matrix4d& final_pose
             );

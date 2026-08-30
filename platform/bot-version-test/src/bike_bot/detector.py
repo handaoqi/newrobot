@@ -306,6 +306,9 @@ class YoloDetector:
             session_options.intra_op_num_threads = 2
             session_options.inter_op_num_threads = 1
             session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # At 2/5 Hz inference, ORT worker spinning wastes CPU between runs.
+            session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
             providers = self._onnxruntime_providers(ort)
             try:
                 session = ort.InferenceSession(

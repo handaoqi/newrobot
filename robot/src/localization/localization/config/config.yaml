@@ -2,6 +2,13 @@ localization:
   ros__parameters:
     # basic parameters
     points_topic: "/front_lidar"      # 真机: firefly 转发来的 livox 点云
+    # Localization alone keeps one latest sensor frame. Other /front_lidar
+    # consumers remain at their own rates; stable stale frames are discarded.
+    point_cloud_processing:
+      latest_only: true
+      max_age_seconds: 0.20
+      performance_log_interval_seconds: 10.0
+      slow_callback_ms: 80.0
     imu_topic: "/front_lidar/imu"     # 真机: 雷达内置 IMU
     gnss_topic: "/fix"
     localization_odom_frame_id: "base_link"
@@ -41,6 +48,7 @@ localization:
       drift_xy_m: 0.30
       drift_yaw_deg: 5.0
       drift_hysteresis_frames: 3
+      stable_confirmation_frames: 3
       stable_xy_tolerance_m: 0.10
       stable_yaw_tolerance_deg: 2.0
       rearm_xy_m: 0.20
@@ -69,6 +77,10 @@ localization:
         rotation_rate_degps: 8.0
         completion_translation_m: 0.01
         completion_rotation_deg: 0.25
+      correction_gate:
+        # Shared by NDT/VGICP and RTK so auxiliary sources cannot ping-pong.
+        min_interval_seconds: 3.0
+        post_suppression_seconds: 3.0
     # navigation_bringup's odom_to_tf_broadcaster is the sole owner of
     # map->odom and odom->base_link.  It converts /odom/localization_odom to
     # /odom/nav2, so do not also publish a controller-odometry TF chain here.
@@ -131,8 +143,15 @@ localization:
       prefer_fixed_rtk: true
       rtk_primary_promote_samples: 2
       rtk_primary_demote_samples: 3
-      # LiDAR is approximately 10 Hz: every fifth moving frame gives 2 Hz NDT.
+      # LiDAR is approximately 10 Hz. FAST-LIO remains the continuous source;
+      # scan matching is the 2 Hz absolute correction/health observation.
+      initialization_ndt_stride: 2
+      stationary_ndt_stride: 5
       moving_ndt_stride: 5
+      # Stride and monotonic time must both be due. At the current 10 Hz input,
+      # stride=5 is about 2 Hz; this keeps the ceiling if LiDAR rate increases.
+      stable_ndt_max_rate_hz: 2.0
+      recovery_ndt_max_rate_hz: 5.0
       # Do not abandon a healthy NDT source on a single noisy moving scan.
       ndt_failure_hysteresis_frames: 3
       bridge_max_distance_m: 10.0
@@ -188,6 +207,17 @@ localization:
       # NDT may seed VGICP even when its own fitness is worse than the final
       # gate. VGICP (or NDT if refine fails) must still beat ndt_max_fitness_score.
       coarse_max_fitness_score: 2.00
+      # After FAST-LIO is stable, a high-quality NDT result is already a valid
+      # absolute correction and avoids the expensive VGICP tail. Initialization
+      # and recovery always retain VGICP. When both converge, VGICP must improve
+      # the score by 5% and remain geometrically consistent with NDT.
+      # Static A/B at the current map pose measured healthy NDT at 0.247-0.267;
+      # 0.30 removes the rejected VGICP pass while retaining a margin to the
+      # normal 0.50 acceptance ceiling.
+      refine_skip_ndt_score: 0.30
+      refine_min_improvement_ratio: 0.05
+      refine_max_translation_disagreement_m: 0.30
+      refine_max_rotation_disagreement_deg: 5.0
 
     # Keep localization scans identical to the scans that built the map.
     # Formal indoor mapping uses 0.5-10 m, front 240 degrees and the
@@ -234,6 +264,9 @@ localization:
     init_pose_change_threshold: 0.01      
     init_quat_change_threshold: 0.01      
     global_localization_timeout: 10.0
+    # Coalesce the edge agent's trusted-pose recovery burst before starting ICP.
+    # Map loading waits longer so a persisted /initialpose can supersede the
+    # configured seed without launching an obsolete background job first.
     # After one second of continuous NDT failure at 10 Hz, try one bounded
     # global ICP from the last pose that passed scan-matching validation.
     runtime_relocalization_failure_threshold: 10
@@ -244,8 +277,13 @@ localization:
     # 原点开机。地图会话里的 keyframes/ 本来就够重建 Scan Context 描述子，扇区维即偏航，
     # 循环移位搜索天然给出 360° 假设。
     relocalization:
-      # 默认关闭。本包没有单元测试，只能靠回放和实机验证，验证通过前不改变现网行为。
+      initial_pose_settle_seconds: 0.75
+      map_settle_seconds: 2.0
+      # 兼容旧配置；新部署使用 scan_context_runtime_mode。true 等价于 active。
       use_scan_context: false
+      # disabled: 不加载/运行；shadow: 后台运行检索和真实 GICP/ICP 但不写入位姿；
+      # active: 几何门通过后才允许把候选送入全图 ICP。当前地图回归尚未达到 95%，保持关闭。
+      scan_context_runtime_mode: disabled
       top_k: 5
       # 每次闸门触发只验 1 个种子，单帧 ICP 次数与开启前完全一致；失败后由上面的
       # runtime_relocalization_retry_seconds 重挂，游标顺延到下一个候选。
@@ -253,3 +291,12 @@ localization:
       # 103 张实测地图的留一法结果：正确检索的描述子距离 p90 为 0.33，错误检索的中位数
       # 是 0.26，两者重叠，卡阈值只会误杀正确候选。0 表示不卡，由 ICP 验证做唯一门限。
       max_descriptor_distance: 0.0
+      geometry:
+        voxel_size_m: 0.20
+        max_correspondence_distance_m: 1.0
+        max_iterations: 30
+        num_threads: 2
+        min_points: 200
+        min_inliers: 500
+        min_bidirectional_overlap: 0.45
+        max_rmse_m: 0.25

@@ -119,6 +119,8 @@ void ScanContextDatabase::clear() {
   seed_pose_source_ = "raw";
   keyframe_indices_.clear();
   poses_.clear();
+  keyframe_cloud_paths_.clear();
+  raw_lidar_poses_.clear();
   descriptors_.clear();
   ring_keys_.clear();
 }
@@ -282,6 +284,8 @@ bool ScanContextDatabase::load(const std::string& map_dir, std::string* error) {
   ring_keys_.reserve(rows.size());
   poses_.reserve(rows.size());
   keyframe_indices_.reserve(rows.size());
+  keyframe_cloud_paths_.reserve(rows.size());
+  raw_lidar_poses_.reserve(rows.size());
 
   pcl::PointCloud<pcl::PointXYZI> world_cloud;
   pcl::PointCloud<pcl::PointXYZI> lidar_cloud;
@@ -289,7 +293,8 @@ bool ScanContextDatabase::load(const std::string& map_dir, std::string* error) {
     char name[64];
     std::snprintf(name, sizeof(name), "/keyframes/scan_%05d.pcd", row.index);
     world_cloud.clear();
-    if (pcl::io::loadPCDFile(map_dir + name, world_cloud) < 0 || world_cloud.empty()) {
+    const std::string cloud_path = map_dir + name;
+    if (pcl::io::loadPCDFile(cloud_path, world_cloud) < 0 || world_cloud.empty()) {
       continue;
     }
 
@@ -324,12 +329,73 @@ bool ScanContextDatabase::load(const std::string& map_dir, std::string* error) {
     pose.block<3, 1>(0, 3) = row.world_translation;
     poses_.push_back(pose);
     keyframe_indices_.push_back(row.index);
+    keyframe_cloud_paths_.push_back(cloud_path);
+
+    Eigen::Matrix4d raw_lidar_pose = Eigen::Matrix4d::Identity();
+    raw_lidar_pose.block<3, 3>(0, 0) = row.lidar_rotation.toRotationMatrix();
+    raw_lidar_pose.block<3, 1>(0, 3) = row.lidar_translation;
+    raw_lidar_poses_.push_back(raw_lidar_pose);
   }
 
   if (descriptors_.empty()) {
     return fail("no keyframe cloud under keyframes/ could be read");
   }
   source_dir_ = map_dir;
+  return true;
+}
+
+bool ScanContextDatabase::findKeyframeSlot(int keyframe_index, std::size_t& slot) const {
+  const auto found = std::find(
+    keyframe_indices_.begin(), keyframe_indices_.end(), keyframe_index);
+  if (found == keyframe_indices_.end()) {
+    return false;
+  }
+  slot = static_cast<std::size_t>(std::distance(keyframe_indices_.begin(), found));
+  return true;
+}
+
+bool ScanContextDatabase::loadKeyframeScan(
+    std::size_t slot,
+    pcl::PointCloud<pcl::PointXYZI>& scan,
+    std::string* error) const {
+  scan.clear();
+  const auto fail = [&error](const std::string& reason) {
+    if (error != nullptr) {
+      *error = reason;
+    }
+    return false;
+  };
+  if (slot >= keyframe_cloud_paths_.size() || slot >= raw_lidar_poses_.size()) {
+    return fail("keyframe slot is out of range");
+  }
+
+  pcl::PointCloud<pcl::PointXYZI> world_cloud;
+  if (pcl::io::loadPCDFile(keyframe_cloud_paths_[slot], world_cloud) < 0 ||
+      world_cloud.empty()) {
+    return fail("keyframe PCD is missing or empty: " + keyframe_cloud_paths_[slot]);
+  }
+
+  const Eigen::Matrix4d world_to_lidar = raw_lidar_poses_[slot].inverse();
+  scan.reserve(world_cloud.size());
+  for (const auto& point : world_cloud) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+      continue;
+    }
+    const Eigen::Vector4d local = world_to_lidar *
+      Eigen::Vector4d(point.x, point.y, point.z, 1.0);
+    pcl::PointXYZI transformed;
+    transformed.x = static_cast<float>(local.x());
+    transformed.y = static_cast<float>(local.y());
+    transformed.z = static_cast<float>(local.z());
+    transformed.intensity = point.intensity;
+    scan.push_back(transformed);
+  }
+  if (scan.empty()) {
+    return fail("keyframe PCD has no finite points: " + keyframe_cloud_paths_[slot]);
+  }
+  scan.width = static_cast<std::uint32_t>(scan.size());
+  scan.height = 1;
+  scan.is_dense = true;
   return true;
 }
 

@@ -1,0 +1,63 @@
+#include <gtest/gtest.h>
+
+#include <localization/correction_policy.hpp>
+
+namespace localization {
+namespace {
+
+CorrectionCandidateSummary candidate(double x, double variance, std::int64_t stamp) {
+  CorrectionCandidateSummary value;
+  value.eligible = true;
+  value.x = x;
+  value.horizontal_variance = variance;
+  value.orientation_variance = variance;
+  value.stamp_ns = stamp;
+  return value;
+}
+
+TEST(CorrectionPolicy, ParsesAndRoutesEveryWaypointMode) {
+  EXPECT_EQ(parseCorrectionPolicyMode("NDT"), CorrectionPolicyMode::ndt);
+  EXPECT_EQ(parseCorrectionPolicyMode("rtk"), CorrectionPolicyMode::rtk);
+  EXPECT_EQ(parseCorrectionPolicyMode("ukf"), CorrectionPolicyMode::ukf);
+  EXPECT_TRUE(correctionPolicyAllowsNdt(CorrectionPolicyMode::ndt));
+  EXPECT_FALSE(correctionPolicyAllowsRtk(CorrectionPolicyMode::ndt));
+  EXPECT_FALSE(correctionPolicyAllowsNdt(CorrectionPolicyMode::rtk));
+  EXPECT_TRUE(correctionPolicyAllowsRtk(CorrectionPolicyMode::rtk));
+  EXPECT_TRUE(correctionPolicyAllowsNdt(CorrectionPolicyMode::ukf));
+  EXPECT_TRUE(correctionPolicyAllowsRtk(CorrectionPolicyMode::ukf));
+}
+
+TEST(CorrectionPolicy, StrictModesNeverUseTheOtherSource) {
+  const auto ndt = candidate(0.0, 0.02, 10);
+  const auto rtk = candidate(0.0, 0.01, 20);
+  EXPECT_EQ(selectCorrectionSource(
+    CorrectionPolicyMode::ndt, ndt, rtk, 0.3, 0.1, 0.3, 0.1).source,
+    CorrectionSource::ndt);
+  EXPECT_EQ(selectCorrectionSource(
+    CorrectionPolicyMode::rtk, ndt, rtk, 0.3, 0.1, 0.3, 0.1).source,
+    CorrectionSource::rtk);
+}
+
+TEST(CorrectionPolicy, UkfSelectsLowerVarianceAndUsesFreshnessAsTieBreaker) {
+  auto ndt = candidate(0.0, 0.02, 10);
+  auto rtk = candidate(0.1, 0.01, 20);
+  EXPECT_EQ(selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1).source,
+    CorrectionSource::rtk);
+  ndt.horizontal_variance = 0.01;
+  EXPECT_EQ(selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1).source,
+    CorrectionSource::rtk);
+}
+
+TEST(CorrectionPolicy, UkfRejectsConflictingSources) {
+  const auto ndt = candidate(0.0, 0.01, 10);
+  const auto rtk = candidate(0.31, 0.01, 20);
+  const auto selection = selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1);
+  EXPECT_EQ(selection.source, CorrectionSource::conflict);
+  EXPECT_EQ(selection.reason, "ukf_source_conflict");
+}
+
+}  // namespace
+}  // namespace localization

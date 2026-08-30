@@ -90,6 +90,8 @@ class DetectionConfig:
     person_detection_enabled: bool = False
     person_report_interval_seconds: float = 0.4
     person_track_hold_seconds: float = 0.75
+    inference_rate_hz: float = 2.0
+    person_follow_inference_rate_hz: float = 5.0
 
 
 @dataclass

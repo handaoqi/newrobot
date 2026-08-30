@@ -15,7 +15,10 @@
 #ifndef NAVIGO_COLLISION_MONITOR__SCAN_HPP_
 #define NAVIGO_COLLISION_MONITOR__SCAN_HPP_
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -89,6 +92,21 @@ protected:
 
   /// @brief Latest data obtained from laser scanner
   sensor_msgs::msg::LaserScan::ConstSharedPtr data_;
+  mutable std::mutex data_mutex_;
+  mutable std::mutex cache_mutex_;
+  bool cache_by_stamp_{true};
+  double performance_log_interval_seconds_{10.0};
+  mutable int32_t cached_stamp_sec_{0};
+  mutable uint32_t cached_stamp_nanosec_{0};
+  mutable std::string cached_frame_id_;
+  mutable bool cache_valid_{false};
+  mutable std::vector<Point> cached_points_;
+  mutable std::uint64_t received_scans_{0};
+  mutable std::uint64_t converted_scans_{0};
+  mutable std::uint64_t cache_hits_{0};
+  mutable std::uint64_t output_points_{0};
+  mutable double conversion_milliseconds_{0.0};
+  mutable std::chrono::steady_clock::time_point last_performance_log_{};
 };  // class Scan
 
 }  // namespace navigo_collision_monitor
