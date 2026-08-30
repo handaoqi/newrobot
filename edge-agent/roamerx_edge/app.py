@@ -819,7 +819,9 @@ class EdgeAgentApplication:
                 str(self.config.robot.current_map_version or ""),
             )
         if pose:
-            return dict(pose)
+            seed = dict(pose)
+            seed.setdefault("source", "last_trusted")
+            return seed
         latest_getter = getattr(self.navigation, "latest_pose", None)
         latest = latest_getter() if callable(latest_getter) else None
         if latest is None:
