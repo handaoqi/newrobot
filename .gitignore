@@ -61,3 +61,8 @@ known_hosts*
 *.mcap
 *.log
 *.pid
+
+# One-off browser probes and quarantined ROS build trees are local diagnostics,
+# not reproducible project sources.
+/platform/frontend/*.tmp.mjs
+/runtime/roamerx-build-quarantine-*/
