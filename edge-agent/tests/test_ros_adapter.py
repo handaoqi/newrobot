@@ -111,6 +111,23 @@ def test_only_absolute_ndt_or_rtk_decision_is_trusted():
     assert adapter._absolute_localization_stable() is True
     adapter.telemetry.decision = {"active_source": "lio_imu", "absolute_stable": True}
     assert adapter._absolute_localization_stable() is True
+    adapter.telemetry.decision = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "policy_source_ready": False,
+    }
+    assert adapter._absolute_localization_stable() is False
+
+
+def test_localization_policy_preserves_ukf_mode():
+    published = []
+    adapter = object.__new__(RosAdapter)
+    adapter._localization_policy_pub = SimpleNamespace(publish=published.append)
+
+    result = adapter.set_localization_policy("UKF", "moving")
+
+    assert result == {"topic": "/localization/policy", "source": "ukf", "phase": "moving"}
+    assert published[0].data == "moving:ukf"
 
 
 def test_rtk_primary_ignores_ndt_degradation():
@@ -159,6 +176,30 @@ def test_lio_primary_ndt_degradation_triggers_recovery():
     assert triggered.wait(1.0)
     assert reasons == ["ndt_degraded"]
     assert adapter._localization_recovery_armed is True
+
+
+def test_lio_primary_fixed_rtk_policy_ignores_unused_ndt_degradation():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "lio_imu",
+        "correction_policy": "rtk",
+        "policy_source_ready": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+    })
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.5, ndt_failure_samples=1)
+    adapter._ndt_failure_count = 0
+    adapter._ndt_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    adapter._localization_failure_cb = lambda reason: triggered.set()
+
+    adapter._on_scan_matching_status(
+        SimpleNamespace(has_converged=False, matching_error=1.2, inlier_fraction=0.0)
+    )
+
+    assert not triggered.wait(0.05)
+    assert adapter._ndt_failure_count == 0
 
 
 def test_patrol_cruise_profile_does_not_hug_path_orientations():

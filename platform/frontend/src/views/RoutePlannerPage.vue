@@ -1653,6 +1653,7 @@ function localizationDecisionBasis(quality = localizationQuality()) {
   const source = decision.active_source || ''
   if (!source) return '定位决策数据未上报。'
   const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
+  const correctionPolicy = String(decision.correction_policy || preferred).toUpperCase()
   const rtkUsable = decision.rtk_usable === true
   const rtkQuality = rtkQualityLabel(rawRtk.quality || decision.rtk_quality)
   const decisionQuality = rtkQualityLabel(decision.rtk_quality)
@@ -1676,11 +1677,14 @@ function localizationDecisionBasis(quality = localizationQuality()) {
     const stable = decision.absolute_stable === true
       ? `定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
       : `等待定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
-    let correction = ndtHealthy ? 'NDT健康待命' : 'NDT当前不可用于修正'
+    const policyReady = decision.policy_source_ready
+    let correction = `${correctionPolicy}校正源${policyReady === false ? '未就绪' : '已就绪'}`
     if (decision.correction_smoothing_active === true) {
       correction = `正在平滑应用${decision.correction_source || '外部'}修正`
+    } else if (decision.correction_candidate_source && decision.correction_candidate_source !== 'none') {
+      correction = `${correctionPolicy}已选择${String(decision.correction_candidate_source).toUpperCase()}校正候选`
     } else if (decision.ndt_drift_decision === 'suppressed_low_drift') {
-      correction = '当前漂移较小，无需NDT修正'
+      correction = '当前漂移较小，无需校正'
     }
     return `LIO + IMU主定位，${lioHealth}，${anchor}，${stable}；${ndtDetail}，${correction}；${rtkDetail}。`
   }
@@ -1780,6 +1784,9 @@ function localizationDebugRows() {
     ['定位状态码', localizationStatusCodeLabel(status.localization_source_status)],
     ['当前定位源', localizationSourceLabel(decision.active_source)],
     ['定位决策依据', localizationDecisionBasis(quality)],
+    ['航点定位校正方式', String(decision.correction_policy || decision.preferred_source || 'ndt').toUpperCase()],
+    ['校正源就绪', decision.policy_source_ready === true ? '是' : '否'],
+    ['本次校正候选', String(decision.correction_candidate_source || 'none').toUpperCase()],
     ['NDT · 质量', ndtQualityLabel(quality)],
     ['NDT · 分数', qualityFresh ? formatNumber(quality.matching_error, 3) : (quality ? `已过期 ${formatNumber(quality.matching_error, 3)}` : '—')],
     ['NDT · 收敛', qualityFresh ? ndtConvergedText(quality) : (quality ? '已过期' : '—')],
@@ -2233,11 +2240,11 @@ async function handleDeleteRoute(route) {
                         <span>到下个点避障</span>
                       </label>
                       <label>
-                        <span>定位方式</span>
+                        <span>定位校正方式</span>
                         <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
-                          <option value="ndt">NDT（室内/特征区）</option>
-                          <option value="ukf">UKF（复杂过道融合）</option>
-                          <option value="rtk" :disabled="mapIsLocalOnly">RTK（室外开阔区）</option>
+                          <option value="ndt">NDT / FastVGICP 校正</option>
+                          <option value="ukf">UKF（NDT / RTK 动态择优校正）</option>
+                          <option value="rtk" :disabled="mapIsLocalOnly">RTK（固定解校正）</option>
                         </select>
                       </label>
                       <label>

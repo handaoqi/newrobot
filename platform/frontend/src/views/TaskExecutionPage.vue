@@ -374,6 +374,7 @@ function localizationDecisionBasis(quality = {}) {
   const decision = quality.decision || {}
   const source = decision.active_source || ''
   const preferred = String(decision.preferred_source || 'ndt').toLowerCase()
+  const correctionPolicy = String(decision.correction_policy || preferred).toUpperCase()
   const rtkUsable = decision.rtk_usable === true
   const rtkQuality = decision.rtk_quality || '无数据'
   const decisionScore = Number(decision.ndt_score)
@@ -395,11 +396,14 @@ function localizationDecisionBasis(quality = {}) {
     const stable = decision.absolute_stable === true
       ? `定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
       : `等待定位稳定（${Number(decision.absolute_stable_samples || 0)}帧）`
-    let correction = ndtHealthy ? 'NDT健康待命' : 'NDT当前不可用于修正'
+    const policyReady = decision.policy_source_ready
+    let correction = `${correctionPolicy}校正源${policyReady === false ? '未就绪' : '已就绪'}`
     if (decision.correction_smoothing_active === true) {
       correction = `正在平滑应用${decision.correction_source || '外部'}修正`
+    } else if (decision.correction_candidate_source && decision.correction_candidate_source !== 'none') {
+      correction = `${correctionPolicy}已选择${String(decision.correction_candidate_source).toUpperCase()}校正候选`
     } else if (decision.ndt_drift_decision === 'suppressed_low_drift') {
-      correction = '当前漂移较小，无需NDT修正'
+      correction = '当前漂移较小，无需校正'
     }
     return `LIO + IMU主定位，${lioHealth}，${anchor}，${stable}；${ndtDetail}，${correction}；${rtkDetail}。`
   }
@@ -449,7 +453,9 @@ function localizationDebugItems() {
     ['当前定位决策', localizationSourceLabel(decision.active_source), localizationDecisionTone(decision)],
     ['当前决策依据', localizationDecisionBasis(quality), localizationDecisionTone(decision)],
     ['绝对定位确认', decision.absolute_stable ? `稳定（${Number(decision.absolute_stable_samples || 0)}帧）` : `等待（${Number(decision.absolute_stable_samples || 0)}帧）`, decision.absolute_stable ? 'ok' : 'warn'],
-    ['途经点优先方式', String(decision.preferred_source || 'ndt').toUpperCase(), 'idle'],
+    ['航点定位校正方式', String(decision.correction_policy || decision.preferred_source || 'ndt').toUpperCase(), 'idle'],
+    ['校正源就绪', decision.policy_source_ready === true ? '是' : '否', decision.policy_source_ready === true ? 'ok' : 'warn'],
+    ['本次校正候选', String(decision.correction_candidate_source || 'none').toUpperCase(), 'idle'],
     ['RTK质量', decision.rtk_quality || '—', decision.rtk_usable ? 'ok' : 'warn'],
     ['RTK地图坐标', Number.isFinite(Number(decision.rtk_x)) ? `${Number(decision.rtk_x).toFixed(2)}, ${Number(decision.rtk_y).toFixed(2)}` : '—', decision.rtk_usable ? 'ok' : 'warn'],
     ['RTK航向', Number.isFinite(Number(decision.rtk_yaw)) ? `${(Number(decision.rtk_yaw) * 180 / Math.PI).toFixed(1)}°` : '—', decision.rtk_usable ? 'ok' : 'warn'],

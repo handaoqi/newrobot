@@ -33,6 +33,7 @@ class FakeNavigation:
         self.goal_precisions = []
         self.docking_profiles = []
         self.live_profiles = []
+        self.localization_state = {"active_source": "ndt_imu", "absolute_stable": True}
 
     def prepare_for_navigation(self, timeout_seconds=12):
         self.stand_requests += 1
@@ -81,7 +82,7 @@ class FakeNavigation:
         self.goal_precisions.append(enabled)
 
     def localization_decision(self):
-        return {"active_source": "ndt_imu", "absolute_stable": True}
+        return dict(self.localization_state)
 
 
 class FakeBlockedNavigation(FakeNavigation):
@@ -208,6 +209,65 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     assert events[0][1]["initial_waypoint_index"] == 1
     assert events[1][0] == "task.progress"
     assert events[1][1]["completed_waypoints"] == 1
+    store.close()
+
+
+def test_navigation_feedback_switches_each_waypoint_correction_policy(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    waypoints[0]["localization_mode"] = "ndt"
+    waypoints[1]["localization_mode"] = "rtk"
+    waypoints[2]["localization_mode"] = "ukf"
+    envelope.payload["command"]["map"].update({
+        "coordinate_mode": "rtk_fixed",
+        "scene_scope": "transition",
+        "localization_mode": "rtk_ndt",
+        "origin_status": "fixed",
+    })
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "transition"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+    assert ids(nav.sent[-1]) == ["wp-1"]
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert ids(nav.sent[-1]) == ["wp-3"]
+
+    assert nav.localization_policies == [
+        ("ndt", "moving"),
+        ("ndt", "stationary"),
+        ("rtk", "moving"),
+        ("rtk", "stationary"),
+        ("ukf", "moving"),
+    ]
+    store.close()
+
+
+def test_waypoint_arrival_requires_requested_correction_source_ready(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "policy_source_ready": False,
+    }
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
+    nav.localization_state["policy_source_ready"] = True
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
     store.close()
 
 

@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .local_store import LocalStore
-from .map_coordinate import MapConstraintError, constraints_from_manifest, validate_route_against_map
+from .map_coordinate import (
+    MapConstraintError,
+    constraints_from_manifest,
+    validate_route_against_map,
+    waypoint_localization_mode,
+)
 from .map_package_finalize import load_map_manifest
 from .protocol import MessageEnvelope, ProtocolError, now_iso
 
@@ -217,6 +222,7 @@ class TaskExecutor:
         self._patrol_final_approach_applied = False
         self._last_target_index = -1
         self._last_reached_index = -1
+        self._last_localization_policy: tuple[str, str] | None = None
         self._speech_waiting_index: int | None = None
         self._speech_wait_finished = False
         self._speech_wait_thread: threading.Thread | None = None
@@ -535,6 +541,7 @@ class TaskExecutor:
             )
             self._last_target_index = initial_waypoint_index - 1
             self._last_reached_index = initial_waypoint_index - 1
+            self._last_localization_policy = None
             self._speech_waiting_index = None
             self._speech_wait_finished = False
             self._persist()
@@ -710,6 +717,7 @@ class TaskExecutor:
         if self._segments:
             end = min(self._segments[self.context.current_segment_index].end_index, total)
         start_wp = waypoints[start_index]
+        start_correction_mode = waypoint_localization_mode(start_wp.get("localization_mode"))
         if (
             bool(start_wp.get("require_yaw", False))
             or float(start_wp.get("dwell_seconds") or 0) > 0
@@ -717,6 +725,13 @@ class TaskExecutor:
         ):
             return start_index + 1
         for index in range(start_index + 1, end):
+            # A correction mode belongs to the target waypoint. End the Nav2
+            # goal before a mode boundary so the current waypoint can be
+            # confirmed with its requested source before dispatching the next.
+            if waypoint_localization_mode(
+                waypoints[index].get("localization_mode")
+            ) != start_correction_mode:
+                return index
             if index == end - 1:
                 break
             waypoint = waypoints[index]
@@ -906,8 +921,15 @@ class TaskExecutor:
 
     def _set_localization_policy(self, waypoint: dict, phase: str) -> None:
         setter = getattr(self.navigation, "set_localization_policy", None)
-        if callable(setter):
-            setter(waypoint.get("localization_mode", "ndt"), phase)
+        if not callable(setter):
+            return
+        mode = waypoint_localization_mode(waypoint.get("localization_mode"))
+        phase = "moving" if str(phase).lower() == "moving" else "stationary"
+        policy = (mode, phase)
+        if policy == self._last_localization_policy:
+            return
+        setter(mode, phase)
+        self._last_localization_policy = policy
 
     def _absolute_localization_ready(self, timeout_seconds: float = 5.0) -> bool:
         getter = getattr(self.navigation, "localization_decision", None)
@@ -917,7 +939,12 @@ class TaskExecutor:
         while time.monotonic() <= deadline:
             decision = getter() or {}
             source = str(decision.get("active_source") or "")
-            if source in {"ndt_imu", "rtk_imu", "lio_imu"} and bool(decision.get("absolute_stable")):
+            policy_source_ready = decision.get("policy_source_ready")
+            if (
+                source in {"ndt_imu", "rtk_imu", "lio_imu"}
+                and bool(decision.get("absolute_stable"))
+                and (policy_source_ready is None or policy_source_ready is True)
+            ):
                 return True
             time.sleep(0.1)
         return False
@@ -1079,6 +1106,7 @@ class TaskExecutor:
         completed_waypoints: int | None = None,
     ) -> None:
         apply_final = False
+        policy_waypoint = None
         progress_updates: list[dict] = []
         with self._lock:
             if not self.context or self.context.state != "running":
@@ -1087,6 +1115,8 @@ class TaskExecutor:
             total = len(self.context.route_snapshot["waypoints"])
             if current_waypoint_index < 0 or current_waypoint_index >= total:
                 return
+            if milestone != "waypoint_reached":
+                policy_waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index]
             if (
                 not self._is_docking_task()
                 and current_waypoint_index == total - 1
@@ -1164,6 +1194,8 @@ class TaskExecutor:
                             distance_remaining_m,
                         )
                     )
+        if policy_waypoint is not None:
+            self._set_localization_policy(policy_waypoint, "moving")
         if apply_final:
             try:
                 self._apply_patrol_final_approach()
@@ -1263,7 +1295,7 @@ class TaskExecutor:
                     self._emit(
                         "task.paused",
                         code="ABSOLUTE_LOCALIZATION_REQUIRED",
-                        message="waypoint reached by dead reckoning; waiting for NDT or RTK confirmation",
+                        message="waypoint reached by FAST-LIO; waiting for the requested correction source",
                     )
                     return
 

@@ -341,7 +341,8 @@ class RosAdapter(Node):
         )
 
     def set_localization_policy(self, source: str, phase: str) -> dict:
-        source = "rtk" if str(source).lower() == "rtk" else "ndt"
+        normalized_source = str(source).strip().lower()
+        source = normalized_source if normalized_source in {"ndt", "rtk", "ukf"} else "ndt"
         phase = "moving" if str(phase).lower() == "moving" else "stationary"
         msg = String()
         msg.data = f"{phase}:{source}"
@@ -497,6 +498,21 @@ class RosAdapter(Node):
             self._ndt_failure_count = 0
             self._ndt_failure_notified = False
             return
+        decision = self.telemetry.localization_decision()
+        correction_policy = str(decision.get("correction_policy") or "ndt").lower()
+        if (
+            decision.get("active_source") == "lio_imu"
+            and correction_policy in {"rtk", "ukf"}
+            and decision.get("policy_source_ready") is True
+            and decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+        ):
+            # FAST-LIO remains the continuous pose source. In RTK mode, or in
+            # UKF mode when fixed RTK is available, NDT is only an unused
+            # auxiliary candidate and its degradation must not pause motion.
+            self._ndt_failure_count = 0
+            self._ndt_failure_notified = False
+            return
         score = float(getattr(msg, "matching_error", float("inf")))
         healthy = bool(getattr(msg, "has_converged", False)) and math.isfinite(score) and (
             score < self.safety_config.ndt_failure_score
@@ -533,9 +549,11 @@ class RosAdapter(Node):
 
     def _absolute_localization_stable(self) -> bool:
         decision = self.telemetry.localization_decision()
+        policy_source_ready = decision.get("policy_source_ready")
         return bool(
             decision.get("active_source") in {"ndt_imu", "rtk_imu", "lio_imu"}
             and decision.get("absolute_stable")
+            and (policy_source_ready is None or policy_source_ready is True)
         )
 
     def _on_cmd_vel_raw(self, msg) -> None:
