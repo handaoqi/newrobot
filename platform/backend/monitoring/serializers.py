@@ -980,6 +980,13 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             for field in ("avoidance_to_next", "require_yaw"):
                 if field in point and not isinstance(point[field], bool):
                     raise serializers.ValidationError(f"途经点 {index + 1} 的 {field} 必须是布尔值")
+            if "dwell_seconds" in point:
+                try:
+                    dwell_seconds = float(point["dwell_seconds"] or 0)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError(f"途经点 {index + 1} 的停留秒数必须是数字")
+                if not 0 <= dwell_seconds <= 3600:
+                    raise serializers.ValidationError(f"途经点 {index + 1} 的停留秒数必须在 0 到 3600 之间")
         invalid_modes = [
             point.get("localization_mode")
             for point in value

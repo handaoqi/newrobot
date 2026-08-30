@@ -4727,7 +4727,20 @@ private:
     std::vector<float> k_sq_dists;
     auto target_tree = registration->getSearchMethodTarget();
     if (!target_tree) {
-      status.inlier_fraction = match.is_converged_ ? 1.0f : 0.0f;
+      // A converged optimizer result without a target search tree has no
+      // geometric inlier evidence.  Treat it as invalid instead of promoting
+      // it to 100% inliers, otherwise a stale/empty map could authorize an
+      // NDT drift correction.
+      status.inlier_fraction = 0.0f;
+      last_ndt_status_healthy_ = false;
+      last_ndt_inlier_fraction_ = 0.0f;
+      status.has_converged = false;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000.0,
+        "Scan match rejected: target search tree unavailable, score=%.3f",
+        status.matching_error);
+      status_pub->publish(status);
+      return;
     } else {
     for (int i = 0; i < aligned->size(); i++) {
       const auto& pt = aligned->at(i);

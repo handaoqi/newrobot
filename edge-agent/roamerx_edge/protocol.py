@@ -173,6 +173,10 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("avoidance_to_next", "require_yaw"):
                 if field in waypoint and not isinstance(waypoint[field], bool):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
+            if "dwell_seconds" in waypoint:
+                dwell_seconds = waypoint["dwell_seconds"]
+                if isinstance(dwell_seconds, bool) or not isinstance(dwell_seconds, (int, float)) or not 0 <= dwell_seconds <= 3600:
+                    raise ProtocolError("INVALID_MESSAGE", "waypoint dwell_seconds must be between 0 and 3600")
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")

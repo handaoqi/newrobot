@@ -46,7 +46,12 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             name = raw.get("name") or (names[index] if index < len(names) else f"航点 {index + 1}")
             waypoint_id = str(raw.get("waypoint_id") or f"wp-{index + 1}")
             map_point_number = int(raw.get("map_point_number") or index + 1)
-            dwell_seconds = int(raw.get("dwell_seconds", 0))
+            try:
+                dwell_seconds = float(raw.get("dwell_seconds", 0) or 0)
+            except (TypeError, ValueError) as exc:
+                raise TaskStateError(f"route waypoint {index} dwell_seconds must be numeric") from exc
+            if not 0.0 <= dwell_seconds <= 3600.0:
+                raise TaskStateError(f"route waypoint {index} dwell_seconds must be between 0 and 3600")
             actions = list(raw.get("actions") or [])
             speech_template_id = raw.get("speech_template_id")
             speech_template_name = str(raw.get("speech_template_name") or "")
@@ -78,7 +83,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "x": float(x),
                 "y": float(y),
                 "yaw": float(yaw),
-                "dwell_seconds": dwell_seconds,
+            "dwell_seconds": round(dwell_seconds, 1),
                 "actions": actions,
                 "localization_mode": localization_mode if localization_mode in {"ndt", "rtk", "ukf"} else "ndt",
                 "avoidance_to_next": avoidance_to_next,

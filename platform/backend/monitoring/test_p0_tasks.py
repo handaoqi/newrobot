@@ -95,6 +95,17 @@ class TaskExecutionTests(TestCase):
         self.assertIs(waypoint["require_yaw"], True)
         self.assertIs(waypoint["avoidance_to_next"], False)
 
+    def test_route_snapshot_preserves_fractional_dwell_seconds(self):
+        self.route.waypoints = [{
+            "x": 1,
+            "y": 2,
+            "yaw": 0,
+            "dwell_seconds": 1.5,
+        }]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.assertEqual(execution.route_snapshot["waypoints"][0]["dwell_seconds"], 1.5)
+
     def test_one_active_execution_per_robot(self):
         TaskExecutionService.create_execution(self.task, self.user)
         with self.assertRaises(TaskStateError):
