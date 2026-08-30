@@ -11,6 +11,16 @@ MIN_FREE_GB="${MIN_FREE_GB:-10}"
 # "mapping stops working".
 PRUNE_TOOL="${PRUNE_TOOL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prune_runtime_storage.py}"
 PRUNE_ENABLED="${PRUNE_ENABLED:-1}"
+BAG_KEEP_RECENT="${BAG_KEEP_RECENT:-10}"
+BAG_MAX_AGE_DAYS="${BAG_MAX_AGE_DAYS:-30}"
+BAG_MAX_TOTAL_GIB="${BAG_MAX_TOTAL_GIB:-20}"
+PRUNE_AFTER_STOP="${PRUNE_AFTER_STOP:-0}"
+MAX_SESSION_GIB="${MAX_SESSION_GIB:-0}"
+RESOURCE_METRICS_ENABLED="${RESOURCE_METRICS_ENABLED:-0}"
+RESOURCE_INTERVAL_SECONDS="${RESOURCE_INTERVAL_SECONDS:-1}"
+TEGRASTATS_BIN="${TEGRASTATS_BIN:-/usr/bin/tegrastats}"
+PIDSTAT_BIN="${PIDSTAT_BIN:-/usr/bin/pidstat}"
+RESOURCE_SUMMARY_TOOL="${RESOURCE_SUMMARY_TOOL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/summarize_navigation_resources.py}"
 # mcap writes a far smaller bag than sqlite3. At the configured Zstd/Slow it
 # also costs more CPU: ~41% of a core against sqlite3's measured 20.0%, for
 # ~2.2 vs 5.38 MB/s (8.0 vs 19.4 GB/hour). That trade is deliberate. Recording
@@ -27,6 +37,9 @@ PRUNE_TRIGGER_GB="${PRUNE_TRIGGER_GB:-$((MIN_FREE_GB * 2))}"
 PID_FILE="${STATE_DIR}/recorder.pid"
 SESSION_FILE="${STATE_DIR}/session.env"
 LOG_FILE="${STATE_DIR}/recorder.log"
+TEGRASTATS_PID_FILE="${STATE_DIR}/tegrastats.pid"
+PIDSTAT_PID_FILE="${STATE_DIR}/pidstat.pid"
+QUOTA_PID_FILE="${STATE_DIR}/quota-monitor.pid"
 # Kept beside the bags rather than in STATE_DIR: the state dir is under /tmp and
 # is per-uid, and the Edge Agent has to be able to find this report to report
 # deletions upstream. The leading dot keeps it out of the session scan.
@@ -49,6 +62,7 @@ is_running() {
 
 load_session() {
   BAG_DIR=""
+  METRICS_DIR=""
   STARTED_AT_UNIX="0"
   STOPPED_AT_UNIX="0"
   if [ -f "${SESSION_FILE}" ]; then
@@ -73,7 +87,12 @@ print_status() {
     [ "${end_time}" -gt 0 ] 2>/dev/null || end_time="$(date +%s)"
     duration=$(( end_time - STARTED_AT_UNIX ))
   fi
-  python3 - "${running}" "${pid}" "${BAG_DIR}" "${STARTED_AT_UNIX:-0}" "${duration}" "${size:-0}" "${LOG_FILE}" <<'PY'
+  local metrics_running=false
+  if { [ -f "${TEGRASTATS_PID_FILE}" ] && kill -0 "$(cat "${TEGRASTATS_PID_FILE}")" 2>/dev/null; } ||
+     { [ -f "${PIDSTAT_PID_FILE}" ] && kill -0 "$(cat "${PIDSTAT_PID_FILE}")" 2>/dev/null; }; then
+    metrics_running=true
+  fi
+  python3 - "${running}" "${pid}" "${BAG_DIR}" "${STARTED_AT_UNIX:-0}" "${duration}" "${size:-0}" "${LOG_FILE}" "${METRICS_DIR}" "${metrics_running}" <<'PY'
 import json
 import sys
 
@@ -85,6 +104,8 @@ print(json.dumps({
     "duration_seconds": max(0, int(sys.argv[5])),
     "size_bytes": int(sys.argv[6]),
     "log_path": sys.argv[7],
+    "metrics_dir": sys.argv[8] or None,
+    "metrics_running": sys.argv[9] == "true",
 }, ensure_ascii=False))
 PY
 }
@@ -99,7 +120,12 @@ run_prune() {
     echo "ERROR: retention tool not found: ${PRUNE_TOOL}" >&2
     return 1
   fi
-  local -a args=("${PRUNE_TOOL}" --bag-root "${BAG_ROOT}")
+  local -a args=(
+    "${PRUNE_TOOL}" --bag-root "${BAG_ROOT}"
+    --bag-keep-recent "${BAG_KEEP_RECENT}"
+    --bag-max-age-days "${BAG_MAX_AGE_DAYS}"
+    --bag-max-total-gib "${BAG_MAX_TOTAL_GIB}"
+  )
   local in_flight
   # The bag being written right now is the one deletion would hurt most, and
   # it is too new to be referenced by any map manifest yet.
@@ -108,6 +134,138 @@ run_prune() {
   [ "${mode}" = "apply" ] && args+=(--apply)
   args+=("$@")
   python3 "${args[@]}"
+}
+
+stop_pid_file() {
+  local pid_file="$1" signal="${2:-INT}" pid
+  [ -f "${pid_file}" ] || return 0
+  pid="$(cat "${pid_file}")"
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -"${signal}" "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${pid_file}"
+}
+
+start_resource_metrics() {
+  [ "${RESOURCE_METRICS_ENABLED}" = "1" ] || return 0
+  METRICS_DIR="${BAG_DIR}/system_metrics"
+  mkdir -p "${METRICS_DIR}"
+  local tegra_available=false pidstat_available=false
+  if [ -x "${TEGRASTATS_BIN}" ]; then
+    tegra_available=true
+    setsid "${TEGRASTATS_BIN}" --interval "$((RESOURCE_INTERVAL_SECONDS * 1000))" \
+      >"${METRICS_DIR}/tegrastats.log" 2>"${METRICS_DIR}/tegrastats.stderr.log" < /dev/null &
+    printf '%s\n' "$!" >"${TEGRASTATS_PID_FILE}"
+  else
+    echo "WARNING: tegrastats unavailable: ${TEGRASTATS_BIN}" >&2
+  fi
+  if [ -x "${PIDSTAT_BIN}" ]; then
+    pidstat_available=true
+    setsid stdbuf -oL "${PIDSTAT_BIN}" -h -u -r -d -p ALL "${RESOURCE_INTERVAL_SECONDS}" \
+      >"${METRICS_DIR}/pidstat.log" 2>"${METRICS_DIR}/pidstat.stderr.log" < /dev/null &
+    printf '%s\n' "$!" >"${PIDSTAT_PID_FILE}"
+  else
+    echo "WARNING: pidstat unavailable; install the sysstat package" >&2
+  fi
+  python3 - "${METRICS_DIR}/sampler.json" "${tegra_available}" "${pidstat_available}" \
+    "${RESOURCE_INTERVAL_SECONDS}" "${MAX_SESSION_GIB}" <<'PY'
+import json
+import sys
+import time
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "schema": "roamerx.navigation-resource-sampler.v1",
+        "started_at_unix": round(time.time(), 3),
+        "sample_interval_seconds": int(sys.argv[4]),
+        "tegrastats_available": sys.argv[2] == "true",
+        "pidstat_available": sys.argv[3] == "true",
+        "max_session_gib": float(sys.argv[5]),
+    }, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PY
+}
+
+start_quota_monitor() {
+  [ "${MAX_SESSION_GIB}" != "0" ] || return 0
+  local recorder_pid="$1" limit_bytes
+  mkdir -p "${METRICS_DIR}"
+  limit_bytes="$(python3 - "${MAX_SESSION_GIB}" <<'PY'
+import sys
+print(int(float(sys.argv[1]) * 1024 ** 3))
+PY
+)"
+  python3 - "${recorder_pid}" "${BAG_DIR}" "${limit_bytes}" "${METRICS_DIR}/recording_quota.json" <<'PY' \
+    >"${METRICS_DIR}/quota-monitor.log" 2>&1 &
+import json
+import os
+import signal
+import sys
+import time
+
+pid = int(sys.argv[1])
+bag_dir = sys.argv[2]
+limit = int(sys.argv[3])
+report = sys.argv[4]
+
+def size_bytes():
+    total = 0
+    for root, _dirs, files in os.walk(bag_dir):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+while True:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    used = size_bytes()
+    if used >= limit:
+        payload = {
+            "schema": "roamerx.navigation-recording-quota.v1",
+            "exceeded": True,
+            "limit_bytes": limit,
+            "observed_bytes": used,
+            "stopped_at_unix": round(time.time(), 3),
+        }
+        temporary = report + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary, report)
+        try:
+            os.killpg(pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        break
+    time.sleep(5)
+PY
+  printf '%s\n' "$!" >"${QUOTA_PID_FILE}"
+}
+
+stop_resource_metrics() {
+  stop_pid_file "${TEGRASTATS_PID_FILE}"
+  stop_pid_file "${PIDSTAT_PID_FILE}"
+  if [ -n "${METRICS_DIR:-}" ] && [ -d "${METRICS_DIR}" ] && [ -f "${RESOURCE_SUMMARY_TOOL}" ]; then
+    if ! python3 "${RESOURCE_SUMMARY_TOOL}" \
+      --tegrastats "${METRICS_DIR}/tegrastats.log" \
+      --pidstat "${METRICS_DIR}/pidstat.log" \
+      --output "${METRICS_DIR}/resource_summary.json"; then
+      echo "WARNING: failed to summarize task resource metrics" >&2
+    fi
+  fi
 }
 
 reclaim_space_if_needed() {
@@ -168,6 +326,8 @@ start_recording() {
   [ -n "${label}" ] || label="mapping"
   stamp="$(date +%Y%m%d_%H%M%S)"
   bag_dir="${BAG_ROOT}/${stamp}_${label}"
+  BAG_DIR="${bag_dir}"
+  METRICS_DIR="${bag_dir}/system_metrics"
 
   set +u
   source /opt/ros/humble/setup.bash
@@ -252,6 +412,7 @@ start_recording() {
   printf '%s\n' "${pid}" >"${PID_FILE}"
   {
     printf 'BAG_DIR=%q\n' "${bag_dir}"
+    printf 'METRICS_DIR=%q\n' "${bag_dir}/system_metrics"
     printf 'STARTED_AT_UNIX=%q\n' "$(date +%s)"
     printf 'STOPPED_AT_UNIX=0\n'
   } >"${SESSION_FILE}"
@@ -261,6 +422,8 @@ start_recording() {
     tail -n 40 "${LOG_FILE}" >&2 || true
     exit 1
   fi
+  start_resource_metrics
+  start_quota_monitor "${pid}"
   print_status
 }
 
@@ -285,13 +448,21 @@ stop_recording() {
       kill -TERM -- "-${pid}" 2>/dev/null || true
     fi
   fi
+  stop_pid_file "${QUOTA_PID_FILE}" TERM
+  stop_resource_metrics
   rm -f "${PID_FILE}"
   if [ "${STARTED_AT_UNIX:-0}" -gt 0 ] 2>/dev/null; then
     {
       printf 'BAG_DIR=%q\n' "${BAG_DIR}"
+      printf 'METRICS_DIR=%q\n' "${METRICS_DIR:-${BAG_DIR}/system_metrics}"
       printf 'STARTED_AT_UNIX=%q\n' "${STARTED_AT_UNIX}"
       printf 'STOPPED_AT_UNIX=%q\n' "$(date +%s)"
     } >"${SESSION_FILE}"
+  fi
+  if [ "${PRUNE_AFTER_STOP}" = "1" ]; then
+    if ! run_prune apply --skip-maps >"${RETENTION_REPORT}" 2>>"${LOG_FILE}"; then
+      echo "WARNING: post-recording retention failed; see ${LOG_FILE}" >&2
+    fi
   fi
   print_status
 }

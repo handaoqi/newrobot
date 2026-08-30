@@ -136,6 +136,9 @@ def test_rtk_raw_details_and_cross_sensor_time_diagnostics(monkeypatch):
             name,
             topic=f"/{name}",
             measurement_stamp=stamp,
+            measurement_header_stamp=99.800 if name == "lidar" else None,
+            measurement_time_basis="scan_end" if name == "lidar" else "header",
+            scan_duration_ms=100.0 if name == "lidar" else None,
             measurement_time_valid=True,
             measurement_time_offset_ms=0.0,
         )
@@ -165,4 +168,7 @@ def test_rtk_raw_details_and_cross_sensor_time_diagnostics(monkeypatch):
     assert raw_rtk["heading"]["heading_deg"] == 90.0
     assert diagnostics["lidar_to_rtk_delta_ms"] == 20.0
     assert diagnostics["lidar_to_odom_delta_ms"] == 10.0
+    assert diagnostics["lidar"]["measurement_header_stamp"] == 99.800
+    assert diagnostics["lidar"]["measurement_time_basis"] == "scan_end"
+    assert diagnostics["lidar"]["scan_duration_ms"] == 100.0
     assert diagnostics["all_time_valid"] is True

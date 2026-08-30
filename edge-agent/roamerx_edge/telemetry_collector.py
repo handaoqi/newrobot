@@ -153,6 +153,9 @@ class TelemetryCollector:
             values[name] = {
                 "topic": details.get("topic"),
                 "measurement_stamp": stamp,
+                "measurement_header_stamp": details.get("measurement_header_stamp"),
+                "measurement_time_basis": details.get("measurement_time_basis"),
+                "scan_duration_ms": details.get("scan_duration_ms"),
                 "received_at": received,
                 "sample_age_seconds": round(age, 3) if age is not None else None,
                 "measurement_time_offset_ms": details.get("measurement_time_offset_ms"),

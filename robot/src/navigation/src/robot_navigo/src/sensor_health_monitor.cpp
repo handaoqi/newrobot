@@ -16,6 +16,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "robots_dog_msgs/msg/uni_rtk_pvh.hpp"
+#include "pointcloud_timestamp.hpp"
 
 using namespace std::chrono_literals;
 
@@ -26,7 +27,9 @@ class SensorHealthMonitor : public rclcpp::Node {
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
         "/laser_scan", qos, [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) { mark(scan_, msg->header.stamp); });
     lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "/front_lidar", qos, [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { mark(lidar_, msg->header.stamp); });
+        "/front_lidar", qos, [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+          mark(lidar_, msg->header.stamp, robot_navigo::PointCloudEndOffsetNs(*msg).value_or(0));
+        });
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         "/front_lidar/imu", qos, [this](const sensor_msgs::msg::Imu::SharedPtr msg) { mark(imu_, msg->header.stamp); });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -70,19 +73,26 @@ class SensorHealthMonitor : public rclcpp::Node {
   struct Counter {
     std::atomic<uint64_t> count{0};
     std::atomic<int64_t> last_ns{0};
+    std::atomic<int64_t> measurement_header_stamp_ns{0};
     std::atomic<int64_t> measurement_stamp_ns{0};
+    std::atomic<int64_t> measurement_duration_ns{0};
   };
 
   static int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
   }
 
-  static void mark(Counter &counter, const builtin_interfaces::msg::Time &stamp) {
+  static void mark(
+      Counter &counter, const builtin_interfaces::msg::Time &stamp,
+      int64_t measurement_duration_ns = 0) {
     counter.count.fetch_add(1, std::memory_order_relaxed);
     counter.last_ns.store(now_ns(), std::memory_order_relaxed);
-    counter.measurement_stamp_ns.store(
-        static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec,
-        std::memory_order_relaxed);
+    const int64_t header_stamp_ns =
+        static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
+    const int64_t bounded_duration_ns = std::max<int64_t>(0, measurement_duration_ns);
+    counter.measurement_header_stamp_ns.store(header_stamp_ns, std::memory_order_relaxed);
+    counter.measurement_stamp_ns.store(header_stamp_ns + bounded_duration_ns, std::memory_order_relaxed);
+    counter.measurement_duration_ns.store(bounded_duration_ns, std::memory_order_relaxed);
   }
 
   static std::string timestamp_health(Counter &counter) {
@@ -93,9 +103,21 @@ class SensorHealthMonitor : public rclcpp::Node {
     const int64_t system_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const double offset_ms = (system_ns - stamp_ns) / 1e6;
+    const int64_t duration_ns = counter.measurement_duration_ns.load(std::memory_order_relaxed);
+    const int64_t header_stamp_ns =
+        counter.measurement_header_stamp_ns.load(std::memory_order_relaxed);
     std::ostringstream out;
     out << ",\"measurement_stamp\":" << std::fixed << std::setprecision(6)
         << static_cast<double>(stamp_ns) / 1e9
+        << ",\"measurement_time_basis\":\""
+        << (duration_ns > 0 ? "scan_end" : "header") << "\"";
+    if (duration_ns > 0) {
+      out << ",\"measurement_header_stamp\":" << std::fixed << std::setprecision(6)
+          << static_cast<double>(header_stamp_ns) / 1e9
+          << ",\"scan_duration_ms\":" << std::fixed << std::setprecision(3)
+          << static_cast<double>(duration_ns) / 1e6;
+    }
+    out
         << ",\"measurement_time_valid\":"
         << (std::fabs(offset_ms) <= 100.0 ? "true" : "false")
         << ",\"measurement_time_offset_ms\":" << std::fixed << std::setprecision(3)

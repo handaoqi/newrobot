@@ -3,6 +3,15 @@ set -euo pipefail
 
 export BAG_ROOT="${BAG_ROOT:-/home/dogrobot/runtime/nx-edge/data/rosbags/navigation}"
 export STATE_DIR="${STATE_DIR:-/tmp/roamerx_navigation_rosbag}"
+# Navigation diagnostics are incident data, not a long-term archive. Keep the
+# latest task by default, cap both the retained root and an individual task at
+# 10 GiB, and collect task-scoped system/process metrics alongside the MCAP.
+export BAG_KEEP_RECENT="${BAG_KEEP_RECENT:-1}"
+export BAG_MAX_AGE_DAYS="${BAG_MAX_AGE_DAYS:-0}"
+export BAG_MAX_TOTAL_GIB="${BAG_MAX_TOTAL_GIB:-10}"
+export MAX_SESSION_GIB="${MAX_SESSION_GIB:-10}"
+export PRUNE_AFTER_STOP="${PRUNE_AFTER_STOP:-1}"
+export RESOURCE_METRICS_ENABLED="${RESOURCE_METRICS_ENABLED:-1}"
 # /odom/nav2 is not a relay of /odom/localization_odom: tf_publisher flattens
 # roll/pitch (yawOnly) before republishing, and navigo_params.yaml points both
 # planner_server and controller_server at it. It is the pose Nav2 actually

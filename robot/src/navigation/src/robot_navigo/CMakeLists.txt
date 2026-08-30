@@ -335,6 +335,16 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/src
       /usr/local/include/zsibot/include
   )
+  ament_add_gtest(test_pointcloud_timestamp
+    test/test_pointcloud_timestamp.cpp
+  )
+  ament_target_dependencies(test_pointcloud_timestamp
+    sensor_msgs
+  )
+  target_include_directories(test_pointcloud_timestamp
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
 endif()
 
 ament_package()
