@@ -233,7 +233,7 @@ namespace navigo_waypoint_follower
             }
             else if (current_goal_status_ == ActionStatus::SUCCEEDED)
             {
-                RCLCPP_INFO(get_logger(), "Succeeded processing waypoint %i, processing waypoint task execution", goal_index);
+                RCLCPP_INFO(get_logger(), "WAYPOINT_DEBUG success begin index=%i total=%zu", goal_index, goal->poses.size());
                 bool is_task_executed = waypoint_task_executor_->processAtWaypoint(goal->poses[goal_index], goal_index);
                 RCLCPP_INFO(get_logger(), "Task execution at waypoint %i %s", goal_index, is_task_executed ? "succeeded" : "failed!");
                 // if task execution was failed and stop_on_failure_ is on , terminate action
@@ -266,9 +266,10 @@ namespace navigo_waypoint_follower
                 new_goal = true;
                 if (goal_index >= goal->poses.size())
                 {
-                    RCLCPP_INFO(get_logger(), "Completed all %zu waypoints requested.", goal->poses.size());
+                    RCLCPP_INFO(get_logger(), "WAYPOINT_DEBUG complete begin total=%zu", goal->poses.size());
                     result->missed_waypoints = failed_ids_;
                     action_server_->succeeded_current(result);
+                    RCLCPP_INFO(get_logger(), "WAYPOINT_DEBUG complete end total=%zu", goal->poses.size());
                     failed_ids_.clear();
                     return;
                 }

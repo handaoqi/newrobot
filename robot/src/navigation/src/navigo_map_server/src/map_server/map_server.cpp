@@ -154,7 +154,7 @@ namespace navigo_map_server
 
     navigo_util::CallbackReturn MapServer::on_cleanup(const rclcpp_lifecycle::State& /*state*/)
     {
-        RCLCPP_INFO(get_logger(), "Cleaning up");
+        RCLCPP_INFO(get_logger(), "MAP_DEBUG cleanup begin map=%s available=%d size=%ux%u", yaml_file_.c_str(), map_available_, msg_.info.width, msg_.info.height);
 
         occ_pub_.reset();
         occ_service_.reset();
@@ -162,12 +162,14 @@ namespace navigo_map_server
         map_available_ = false;
         msg_           = nav_msgs::msg::OccupancyGrid();
 
+        RCLCPP_INFO(get_logger(), "MAP_DEBUG cleanup end");
+
         return navigo_util::CallbackReturn::SUCCESS;
     }
 
     navigo_util::CallbackReturn MapServer::on_shutdown(const rclcpp_lifecycle::State& /*state*/)
     {
-        RCLCPP_INFO(get_logger(), "Shutting down");
+        RCLCPP_INFO(get_logger(), "MAP_DEBUG shutdown begin map=%s available=%d", yaml_file_.c_str(), map_available_);
         return navigo_util::CallbackReturn::SUCCESS;
     }
 
@@ -205,6 +207,7 @@ namespace navigo_map_server
 
     bool MapServer::loadMapResponseFromYaml(const std::string& yaml_file, std::shared_ptr<nav2_msgs::srv::LoadMap::Response> response)
     {
+        RCLCPP_INFO(get_logger(), "MAP_DEBUG load begin yaml=%s", yaml_file.c_str());
         if (yaml_file == yaml_file_ && map_available_)
         {
             RCLCPP_INFO(get_logger(), "The map %s has already been loaded", yaml_file_.c_str());
@@ -213,6 +216,7 @@ namespace navigo_map_server
 
             response->map    = msg_;
             response->result = nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS;
+            RCLCPP_INFO(get_logger(), "MAP_DEBUG load end reused yaml=%s", yaml_file.c_str());
             return true;
         }
 
@@ -238,6 +242,7 @@ namespace navigo_map_server
 
         yaml_file_ = yaml_file;
 
+        RCLCPP_INFO(get_logger(), "MAP_DEBUG load end yaml=%s result=%d size=%ux%u", yaml_file.c_str(), response->result, msg_.info.width, msg_.info.height);
         return true;
     }
 
