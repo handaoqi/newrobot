@@ -42,6 +42,8 @@ import {
   clearGuardDutyLoopExecution,
   guardDutyLoopCleanupExecutionId,
 } from '../utils/guardDutyLoopStop'
+import { activateRouteMap } from '../services/mapActivationFlow'
+import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
 import {
   activeGuardDutyTarget,
   guardDutyExecutionWaypointPlan,
@@ -231,11 +233,8 @@ function createLoopSessionId() {
 }
 
 function navigationReady(payload = navigationStatus.value) {
-  const status = payload?.status || {}
-  const mapId = status.map_id || payload?.current_map_id
-  const localizationStatus = status.localization_status || payload?.localization_status
-  const navReady = status.nav_ready ?? payload?.nav_ready
-  return Boolean(mapId) && payload?.connection_status === 'online' && localizationStatus === 'normal' && Boolean(navReady)
+  const mapId = presetTask.value?.map_id || routeData.value?.map_data
+  return Boolean(mapId) && navigationReadyForMap(payload, mapId, expectedLegacyMapVersion(mapId))
 }
 
 function syncLocalizationState(payload = navigationStatus.value) {
@@ -523,6 +522,8 @@ async function changeSelectedTask() {
   trajectoryExecutionId.value = ''
   routeData.value = null
   mapData.value = null
+  localizationInitState.value = 'uninitialized'
+  localizationInitMessage.value = '所选任务地图尚未初始化'
   try {
     if (task.latest_execution?.id) {
       execution.value = await fetchTaskExecution(task.latest_execution.id)
@@ -608,13 +609,19 @@ async function initializeLocalization() {
   const runId = ++localizationRunId
   localizationBusy.value = true
   localizationInitState.value = 'initializing'
-  localizationInitMessage.value = '正在重启导航/定位栈'
+  localizationInitMessage.value = '正在下发所选任务的路线地图'
   try {
-    const current = navigationStatus.value || await refreshLocalizationStatus({ sync: false })
-    const status = current?.status || {}
-    const mapId = presetTask.value?.map_id || status.map_id || current?.current_map_id
-    const mapVersion = status.map_version || current?.current_map_version || ''
+    const mapId = presetTask.value?.map_id || routeData.value?.map_data
     if (!mapId) throw new Error('没有可初始化的地图，请先为值守任务配置路线地图')
+    const mapVersion = expectedLegacyMapVersion(mapId)
+    const activation = await activateRouteMap({
+      mapId,
+      robotId: robot.id,
+      mapVersion,
+      onProgress: message => { localizationInitMessage.value = message },
+    })
+    navigationStatus.value = activation.navigationStatus
+    localizationInitMessage.value = '路线地图已下发，正在重启导航/定位栈'
 
     const command = await sendRobotNavigationCommand(robot.id, 'restart', {
       map_id: mapId,
@@ -632,7 +639,7 @@ async function initializeLocalization() {
       }
       if (isCurrentCommand && latestCommand.status === 'succeeded') {
         localizationInitMessage.value = '导航栈已重启，正在等待定位收敛'
-        if (navigationReady(latest)) {
+        if (navigationReadyForMap(latest, mapId, mapVersion)) {
           localizationInitState.value = 'success'
           localizationInitMessage.value = '当前地图定位正常，导航栈已就绪'
           showToast('定位初始化成功')

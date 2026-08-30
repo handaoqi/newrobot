@@ -52,7 +52,7 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
-import { activateAndRelocalizeMap, waitForRobotCommand } from '../services/mapActivationFlow'
+import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
@@ -894,20 +894,41 @@ async function handleSaveRoute() {
     scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
   }
 
+  let savedRoute
   try {
-    if (selectedRoute.value?.id) {
-      await updateRoute(selectedRoute.value.id, payload)
-    } else {
-      await createRoute(payload)
-    }
+    savedRoute = selectedRoute.value?.id
+      ? await updateRoute(selectedRoute.value.id, payload)
+      : await createRoute(payload)
     await loadData()
-    selectedRoute.value = null
-    routeForm.value.name = ''
-    routeForm.value.description = ''
-    alert('保存成功')
+    const savedSummary = routes.value.find(route => String(route.id) === String(savedRoute.id))
+    await handleLoadRoute(savedSummary || savedRoute)
   } catch (error) {
     console.error('保存失败:', error)
     alert('保存失败')
+    return
+  }
+
+  navCommandBusy.value = 'map-activate'
+  navError.value = ''
+  localizationInitState.value = 'idle'
+  localizationInitMessage.value = '路线已保存，正在下发路线地图'
+  try {
+    const result = await activateRouteMap({
+      mapId: savedRoute.map_data,
+      robotId: savedRoute.robot,
+      onProgress: message => { localizationInitMessage.value = message },
+    })
+    navStatus.value = result.navigationStatus
+    localizationInitMessage.value = '路线已保存并选中，地图下发完成；定位尚未初始化'
+    alert('路线保存成功，已选中并下发路线地图')
+  } catch (error) {
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = `路线已保存，但地图下发失败：${error.message || '未知错误'}`
+    navError.value = localizationInitMessage.value
+    alert(localizationInitMessage.value)
+  } finally {
+    navCommandBusy.value = ''
+    await refreshNavigationStatus()
   }
 }
 
@@ -1244,12 +1265,19 @@ async function sendNavigationCommand(action) {
     navError.value = '未选择机器人'
     return
   }
+  if (navCommandBusy.value) return
   navCommandBusy.value = action
   navError.value = ''
   try {
-    await sendRobotNavigationCommand(robotId, action, {
+    const command = await sendRobotNavigationCommand(robotId, action, {
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
+    })
+    await waitForRobotCommand(robotId, command, {
+      timeoutMs: ['start', 'restart', 'recover'].includes(action) ? 240_000 : 90_000,
+      onProgress: latest => {
+        localizationInitMessage.value = `导航${action} · ${latest.status || 'created'}`
+      },
     })
     await refreshNavigationStatus()
   } catch (error) {
@@ -1316,7 +1344,7 @@ async function initializeLocalization() {
 
   navCommandBusy.value = 'localization-init'
   localizationInitState.value = 'restarting'
-  localizationInitMessage.value = '正在重启导航/定位栈'
+  localizationInitMessage.value = '正在检查地图、定位与导航栈状态'
   navError.value = ''
   try {
     const currentDecision = localizationQuality()?.decision || {}

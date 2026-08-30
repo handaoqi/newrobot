@@ -8,6 +8,7 @@ import {
   expectedLegacyMapVersion,
   navigationMapIdentity,
   navigationReadyForMap,
+  shouldFallbackToGlobalRelocalization,
 } from './mapActivationState.js'
 
 const TERMINAL_COMMAND_STATES = new Set([
@@ -21,6 +22,20 @@ const TERMINAL_COMMAND_STATES = new Set([
 
 function sleep(milliseconds) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds))
+}
+
+function localizationNormal(payload = {}) {
+  const status = payload.status || {}
+  return (status.localization_status || payload.localization_status) === 'normal'
+}
+
+function navigationStackReady(payload = {}) {
+  const status = payload.status || {}
+  return Boolean(status.nav_ready ?? payload.nav_ready)
+}
+
+function activeTaskExecutionId(payload = {}) {
+  return payload?.status?.task_execution_id || null
 }
 
 export async function waitForRobotCommand(robotId, command, {
@@ -62,6 +77,93 @@ export async function activateAndRelocalizeMap({
   mapVersion = expectedLegacyMapVersion(mapId),
   onProgress = () => {},
 }) {
+  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress })
+  let navigationStatus = activation.navigationStatus
+
+  if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
+    onProgress('目标地图已应用，定位与导航已就绪')
+    return activation
+  }
+  if (activeTaskExecutionId(navigationStatus)) {
+    throw new Error('机器人正在执行任务，路线已保存，但不能切换地图、重定位或重启导航栈')
+  }
+
+  if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {
+    onProgress('定位已就绪，正在启动导航栈')
+    const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+    })
+    await waitForRobotCommand(robotId, startCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
+    })
+    navigationStatus = await fetchRobotNavigationStatus(robotId)
+    if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
+      onProgress('地图、定位与导航均已就绪')
+      return { ...activation, navigationStatus }
+    }
+  }
+
+  onProgress('地图已应用，正在准备定位栈并使用最近可信位置重定位')
+  try {
+    const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+      seed_source: 'last_trusted',
+    })
+    await waitForRobotCommand(robotId, relocalizeCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`可信位置重定位：${latest.status || 'created'}`),
+    })
+  } catch (error) {
+    const errorCode = error?.command?.error_code || error?.command?.ack_reason_code || ''
+    if (!shouldFallbackToGlobalRelocalization(errorCode)) throw error
+    onProgress('无可用可信位姿，正在搜索全图位置与 360° 航向')
+    const globalCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+      seed_source: 'global',
+      wait_seconds: 90,
+    })
+    await waitForRobotCommand(robotId, globalCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`全局重定位：${latest.status || 'created'}`),
+    })
+  }
+
+  navigationStatus = await fetchRobotNavigationStatus(robotId)
+  if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {
+    onProgress('定位已恢复，正在启动导航栈')
+    const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
+      map_id: String(mapId),
+      map_version: mapVersion,
+    })
+    await waitForRobotCommand(robotId, startCommand, {
+      timeoutMs: 180_000,
+      onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
+    })
+  }
+
+  const deadline = Date.now() + 60_000
+  while (Date.now() < deadline) {
+    navigationStatus = await fetchRobotNavigationStatus(robotId)
+    if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
+      onProgress('地图、定位与导航均已就绪')
+      return { ...activation, navigationStatus }
+    }
+    onProgress('重定位命令已完成，正在等待定位稳定')
+    await sleep(2_000)
+  }
+  throw new Error('地图已下发，但定位未在限定时间内恢复 normal；请到路径规划页面手动设置初始定位')
+}
+
+export async function activateRouteMap({
+  mapId,
+  robotId,
+  mapVersion = expectedLegacyMapVersion(mapId),
+  onProgress = () => {},
+}) {
   if (!mapId) throw new Error('路线未绑定地图')
   if (!robotId) throw new Error('路线未绑定机器狗')
 
@@ -69,14 +171,12 @@ export async function activateAndRelocalizeMap({
   if (navigationStatus.connection_status !== 'online') {
     throw new Error('机器狗 Edge Agent 当前离线，无法下发地图')
   }
-  if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
-    onProgress('目标地图已应用，定位与导航已就绪')
-    return { changed: false, navigationStatus }
-  }
-
   const currentMap = navigationMapIdentity(navigationStatus)
   const mapMatches = currentMap.mapId === String(mapId) && currentMap.mapVersion === String(mapVersion)
   if (!mapMatches) {
+    if (activeTaskExecutionId(navigationStatus)) {
+      throw new Error('机器人正在执行任务，不能切换到新路线地图')
+    }
     onProgress('正在下发地图到机器狗')
     const activation = await setActiveMap(mapId)
     if (activation.robot && String(activation.robot) !== String(robotId)) {
@@ -91,46 +191,6 @@ export async function activateAndRelocalizeMap({
   }
 
   navigationStatus = await fetchRobotNavigationStatus(robotId)
-
-  if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
-    onProgress('地图、定位与导航均已就绪')
-    return { changed: !mapMatches, navigationStatus }
-  }
-
-  onProgress('地图已应用，正在准备定位栈并使用最近可信位置重定位')
-  try {
-    const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-      seed_source: 'last_trusted',
-    })
-    await waitForRobotCommand(robotId, relocalizeCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => onProgress(`可信位置重定位：${latest.status || 'created'}`),
-    })
-  } catch {
-    onProgress('无可用可信位姿，正在搜索全图位置与 360° 航向')
-    const globalCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-      seed_source: 'global',
-      wait_seconds: 90,
-    })
-    await waitForRobotCommand(robotId, globalCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => onProgress(`全局重定位：${latest.status || 'created'}`),
-    })
-  }
-
-  const deadline = Date.now() + 60_000
-  while (Date.now() < deadline) {
-    navigationStatus = await fetchRobotNavigationStatus(robotId)
-    if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
-      onProgress('地图、定位与导航均已就绪')
-      return { changed: !mapMatches, navigationStatus }
-    }
-    onProgress('重定位命令已完成，正在等待定位稳定')
-    await sleep(2_000)
-  }
-  throw new Error('地图已下发，但定位未在限定时间内恢复 normal；请到路径规划页面手动设置初始定位')
+  onProgress(mapMatches ? '目标地图已在机器狗上' : '路线地图下发完成')
+  return { changed: !mapMatches, navigationStatus }
 }

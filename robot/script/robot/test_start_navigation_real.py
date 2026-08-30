@@ -42,3 +42,11 @@ def test_localization_wait_uses_an_absolute_deadline():
 
     assert "deadline=$((SECONDS + LOCALIZATION_WAIT_SECONDS))" in body
     assert "--timeout 1" in body
+
+
+def test_navigation_stack_does_not_start_a_permanent_diagnostics_bag():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert source.count("ros2 bag record") == 1
+    assert "start_navigation_diagnostics" not in source
+    assert 'kill_pattern "ros2 bag record.*roamerx_nav_logs/diagnostics"' in source

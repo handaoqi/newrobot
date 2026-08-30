@@ -1211,7 +1211,13 @@ class TaskExecutor:
                 self._persist()
                 self.store.clear_task_context(context.task_execution_id, "cancelled")
                 self.context = None
-            return {"final_task_state": "cancelled", "state_version": context.state_version if context else 0, "robot_stopped": self.navigation.is_robot_stopped(), "cleared": True}
+            return {
+                "final_task_state": "cancelled",
+                "state_version": context.state_version if context else 0,
+                "robot_stopped": self.navigation.is_robot_stopped(),
+                "cleared": True,
+                "rosbag": self._rosbag_state if context and context.record_rosbag else None,
+            }
 
     def cancel_task(self, execution_id: str) -> dict:
         with self._lock:
@@ -1230,6 +1236,7 @@ class TaskExecutor:
                     "robot_stopped": True,
                     "already_terminal": True,
                     "cancel_performed": False,
+                    "rosbag": self._rosbag_state if self.context.record_rosbag else None,
                 }
             if self.context.state not in {"running", "paused", "pausing", "resuming", "interrupted"}:
                 raise ProtocolError("INVALID_TASK_STATE", f"cannot cancel from {self.context.state}")
@@ -1255,6 +1262,7 @@ class TaskExecutor:
                 "robot_stopped": True,
                 "already_terminal": False,
                 "cancel_performed": True,
+                "rosbag": self._rosbag_state if self.context.record_rosbag else None,
             }
 
     def on_feedback(
@@ -1966,6 +1974,17 @@ class TaskExecutor:
             return
         label = f"task_{self.context.task_execution_id[:8]}"
         try:
+            try:
+                status = self.rosbag_recorder.status()
+            except Exception:
+                LOGGER.warning("could not inspect navigation rosbag before task start", exc_info=True)
+                status = {}
+            if status.get("running"):
+                LOGGER.warning(
+                    "stopping stale navigation rosbag before starting task %s",
+                    self.context.task_execution_id,
+                )
+                self.rosbag_recorder.stop()
             self._rosbag_state = self.rosbag_recorder.start(label)
         except Exception as exc:
             LOGGER.exception("failed to start navigation rosbag")

@@ -17,6 +17,7 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
+import { resolveTaskRosbagStatus } from '../services/taskRosbagState'
 
 const route = useRoute()
 const execution = ref(null)
@@ -48,14 +49,7 @@ const progress = computed(() => {
   return Math.round(execution.value.completed_waypoints / execution.value.total_waypoints * 100)
 })
 const isActive = computed(() => ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted'].includes(execution.value?.state))
-const rosbagStatus = computed(() => {
-  const events = [...(execution.value?.events || [])].reverse()
-  for (const event of events) {
-    const status = event?.payload?.rosbag
-    if (status && typeof status === 'object') return status
-  }
-  return null
-})
+const rosbagStatus = computed(() => resolveTaskRosbagStatus(execution.value))
 
 function fullUrl(relativeUrl) {
   if (!relativeUrl) return ''

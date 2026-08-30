@@ -50,6 +50,10 @@ class CommandProcessor:
         self.publish_ack = publish_ack
         self.publish_result = publish_result
         self._navigation_command_lock = threading.Lock()
+        # Pose commands bypass the navigation-stack lock so they can seed a
+        # nav.start that is waiting for localization. They still need their
+        # own lock: two operator requests must never supersede one another.
+        self._localization_command_lock = threading.Lock()
         self.skill_executor = TeleopSkillExecutor(localization_adapter) if localization_adapter else None
 
     def handle_command(self, raw) -> tuple[dict, dict | None]:
@@ -361,32 +365,58 @@ class CommandProcessor:
             # creates a deadlock where localization can never be initialized.
             if not self.localization_adapter:
                 raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
-            localization_bootstrap = self._ensure_initial_pose_subscriber()
-            if envelope.message_type == "nav.initial_pose":
-                if str(command.get("seed_source") or "") == "rtk":
-                    result_payload = self.localization_adapter.set_initial_pose_from_rtk(
-                        wait_seconds=float(command.get("wait_seconds", 30.0)),
-                    )
+            if not self._localization_command_lock.acquire(blocking=True, timeout=1.0):
+                raise ProtocolError(
+                    "LOCALIZATION_COMMAND_BUSY",
+                    "another operator localization command is still running",
+                )
+            begin_operator = getattr(
+                self.localization_adapter,
+                "begin_operator_localization",
+                None,
+            )
+            end_operator = getattr(
+                self.localization_adapter,
+                "end_operator_localization",
+                None,
+            )
+            operator_scope_started = False
+            try:
+                if callable(begin_operator):
+                    begin_operator()
+                    operator_scope_started = True
+                localization_bootstrap = self._ensure_initial_pose_subscriber()
+                if envelope.message_type == "nav.initial_pose":
+                    if str(command.get("seed_source") or "") == "rtk":
+                        result_payload = self.localization_adapter.set_initial_pose_from_rtk(
+                            wait_seconds=float(command.get("wait_seconds", 30.0)),
+                        )
+                    else:
+                        pose = self._resolve_localization_seed(command)
+                        pose.setdefault("wait_seconds", 30.0)
+                        # Initialization is complete only after the verified NDT
+                        # match has handed ownership to an absolute pose source.
+                        # A transient status=3 frame must not acknowledge the UI.
+                        pose.setdefault("require_absolute", True)
+                        result_payload = self.localization_adapter.set_initial_pose(pose)
                 else:
-                    pose = self._resolve_localization_seed(command)
-                    pose.setdefault("wait_seconds", 30.0)
-                    # Initialization is complete only after the verified NDT
-                    # match has handed ownership to an absolute pose source.
-                    # A transient status=3 frame must not acknowledge the UI.
-                    pose.setdefault("require_absolute", True)
-                    result_payload = self.localization_adapter.set_initial_pose(pose)
-            else:
-                if str(command.get("seed_source") or "last_trusted") == "global":
-                    result_payload = self.localization_adapter.global_relocalize(
-                        wait_seconds=float(command.get("wait_seconds", 90.0)),
-                    )
-                else:
-                    seed = self._resolve_localization_seed(command)
-                    result_payload = self.localization_adapter.active_relocalize(seed)
-            if localization_bootstrap is not None:
-                result_payload = dict(result_payload or {})
-                result_payload["localization_bootstrap"] = localization_bootstrap
-                result_payload["navigation_start"] = self._start_navigation_after_localization()
+                    if str(command.get("seed_source") or "last_trusted") == "global":
+                        result_payload = self.localization_adapter.global_relocalize(
+                            wait_seconds=float(command.get("wait_seconds", 90.0)),
+                        )
+                    else:
+                        seed = self._resolve_localization_seed(command)
+                        result_payload = self.localization_adapter.active_relocalize(seed)
+                if localization_bootstrap is not None:
+                    result_payload = dict(result_payload or {})
+                    result_payload["localization_bootstrap"] = localization_bootstrap
+                    result_payload["navigation_start"] = self._start_navigation_after_localization()
+            finally:
+                try:
+                    if operator_scope_started and callable(end_operator):
+                        end_operator()
+                finally:
+                    self._localization_command_lock.release()
         else:
             wait_seconds = 90.0 if envelope.message_type in {
                 "nav.start", "nav.restart", "nav.recover",
@@ -690,6 +720,12 @@ class CommandProcessor:
             raise ProtocolError("MAP_ACTIVATION_UNAVAILABLE", "map activation adapter is not configured")
         command = envelope.payload.get("command") or {}
         if envelope.message_type == "map.activate":
+            context = self.task_executor.context
+            if context and context.state not in self.task_executor.TERMINAL_STATES:
+                raise ProtocolError(
+                    "ROBOT_BUSY",
+                    "机器人正在执行任务，不能切换活动地图",
+                )
             result_payload = self.map_activation_adapter.activate(command)
             if not self.navigation_stack_adapter:
                 raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")

@@ -5,6 +5,8 @@ import {
   expectedLegacyMapVersion,
   navigationMapIdentity,
   navigationReadyForMap,
+  navigationStatusFresh,
+  shouldFallbackToGlobalRelocalization,
 } from '../src/services/mapActivationState.js'
 
 test('legacy map versions use the platform map id', () => {
@@ -25,9 +27,11 @@ test('navigation map identity prefers the latest telemetry current_map', () => {
 })
 
 test('map readiness requires exact id/version, online connection, normal localization and Nav2', () => {
+  const sampledAt = new Date().toISOString()
   const ready = {
     connection_status: 'online',
     status: {
+      sampled_at: sampledAt,
       map_id: '9',
       map_version: 'legacy-mapdata-9',
       localization_status: 'normal',
@@ -38,4 +42,24 @@ test('map readiness requires exact id/version, online connection, normal localiz
   assert.equal(navigationReadyForMap({ ...ready, connection_status: 'offline' }, 9), false)
   assert.equal(navigationReadyForMap({ ...ready, status: { ...ready.status, map_version: 'v1' } }, 9), false)
   assert.equal(navigationReadyForMap({ ...ready, status: { ...ready.status, localization_status: 'initializing' } }, 9), false)
+})
+
+test('navigation readiness rejects stale or explicitly expired localization samples', () => {
+  const nowMs = Date.parse('2026-08-30T12:00:00.000Z')
+  assert.equal(navigationStatusFresh({ status: { sampled_at: '2026-08-30T11:59:55.000Z' } }, { nowMs }), true)
+  assert.equal(navigationStatusFresh({ status: { sampled_at: '2026-08-30T11:59:49.000Z' } }, { nowMs }), false)
+  assert.equal(navigationStatusFresh({
+    status: {
+      sampled_at: '2026-08-30T11:59:59.000Z',
+      localization_quality: { localization_fresh: false },
+    },
+  }, { nowMs }), false)
+})
+
+test('global search fallback is limited to an unavailable or exhausted trusted seed', () => {
+  assert.equal(shouldFallbackToGlobalRelocalization('RELOCALIZATION_SEED_UNAVAILABLE'), true)
+  assert.equal(shouldFallbackToGlobalRelocalization('ACTIVE_RELOCALIZATION_FAILED'), true)
+  assert.equal(shouldFallbackToGlobalRelocalization('RELOCALIZATION_SUPERSEDED'), false)
+  assert.equal(shouldFallbackToGlobalRelocalization('LOCALIZATION_COMMAND_BUSY'), false)
+  assert.equal(shouldFallbackToGlobalRelocalization('NAV_COMMAND_FAILED'), false)
 })

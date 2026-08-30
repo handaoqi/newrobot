@@ -19,6 +19,13 @@ class FakeNavigation:
         self.pose = SimpleNamespace(x=3.0, y=4.0)
         self.rtk_initial_pose_requests = 0
         self.global_relocalize_requests = []
+        self.operator_localization_events = []
+
+    def begin_operator_localization(self):
+        self.operator_localization_events.append("begin")
+
+    def end_operator_localization(self):
+        self.operator_localization_events.append("end")
 
     def send_waypoints(self, waypoints, feedback_cb, result_cb):
         self.result_cb = result_cb
@@ -535,6 +542,7 @@ def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
     assert navigation.initial_pose["require_absolute"] is True
     assert result["payload"]["status"] == "succeeded"
     assert results[0]["payload"]["result"]["topic"] == "/initialpose"
+    assert navigation.operator_localization_events == ["begin", "end"]
     store.close()
 
 
@@ -622,6 +630,38 @@ def test_nav_initial_pose_bypasses_stack_management_lock(tmp_path):
 
     assert result["payload"]["status"] == "succeeded"
     assert navigation.initial_pose["x"] == 1.0
+    store.close()
+
+
+def test_second_operator_localization_command_is_rejected_without_superseding_first(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.initial_pose"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    processor._localization_command_lock.acquire()
+    try:
+        _, result = processor.handle_command(raw)
+    finally:
+        processor._localization_command_lock.release()
+
+    assert result["payload"]["status"] == "failed"
+    assert result["payload"]["error_code"] == "LOCALIZATION_COMMAND_BUSY"
+    assert navigation.initial_pose is None
+    assert navigation.operator_localization_events == []
     store.close()
 
 
@@ -1016,6 +1056,38 @@ def test_map_activation_reloads_both_map_consumers_and_requires_reseed(tmp_path)
     assert stack.reload_calls == [("/maps/selected/map.pcd", "/maps/selected/map.yaml")]
     assert result["payload"]["result"]["localization_reset_required"] is True
     assert state.localization_status == "initializing"
+    store.close()
+
+
+def test_map_activation_is_rejected_while_a_task_is_active(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "map.activate"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"map_id": "95", "map_version": "selected-map"}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(state="running", state_version=0)
+    activation = FakeMapActivation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        map_activation_adapter=activation,
+        navigation_stack_adapter=FakeNavigationStack(),
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "failed"
+    assert result["payload"]["error_code"] == "ROBOT_BUSY"
     store.close()
 
 

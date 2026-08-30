@@ -92,6 +92,49 @@ def test_new_localization_operation_supersedes_previous_search():
     adapter._assert_localization_operation(new_generation)
 
 
+def test_automatic_recovery_cannot_supersede_operator_localization():
+    adapter = object.__new__(RosAdapter)
+    adapter._localization_operation_lock = threading.Lock()
+    adapter._localization_operation_generation = 0
+    adapter._operator_localization_depth = 0
+
+    adapter.begin_operator_localization()
+    operator_generation = adapter._start_localization_operation("global_relocalize")
+    with pytest.raises(ProtocolError) as exc:
+        adapter._start_localization_operation("last_trusted", automatic=True)
+
+    assert exc.value.code == "RELOCALIZATION_SUPERSEDED"
+    adapter._assert_localization_operation(operator_generation)
+    adapter.end_operator_localization()
+    assert adapter.operator_localization_active() is False
+    assert adapter._start_localization_operation("last_trusted", automatic=True) > operator_generation
+
+
+def test_operator_localization_transition_does_not_start_auto_recovery():
+    adapter = object.__new__(RosAdapter)
+    adapter._localization_operation_lock = threading.Lock()
+    adapter._localization_operation_generation = 0
+    adapter._operator_localization_depth = 0
+    adapter._localization_sample_condition = threading.Condition()
+    adapter._localization_sample_sequence = 0
+    adapter._localization_status_samples = []
+    adapter._localization_lost_count = 0
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    adapter._latest_speed = 0.0
+    adapter.safety_config = SimpleNamespace(localization_loss_samples=1)
+    adapter.telemetry = SimpleNamespace(on_localization=lambda _msg: None)
+    failures = []
+    adapter._localization_failure_cb = failures.append
+
+    adapter.begin_operator_localization()
+    adapter._on_localization(SimpleNamespace(status=1, speed=0.0))
+    adapter.end_operator_localization()
+
+    assert failures == []
+    assert adapter._localization_failure_notified is False
+
+
 def test_best_ndt_candidate_uses_verified_streak_and_seed_gate():
     adapter = object.__new__(RosAdapter)
     adapter._scan_match_condition = threading.Condition()

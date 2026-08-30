@@ -756,6 +756,15 @@ class EdgeAgentApplication:
         Indoor LIO can keep status=3 with a false map lock, so NDT degradation is
         treated as loss as well.
         """
+        # Initial-pose and global-search commands intentionally pass through
+        # non-normal states. Their own timeout/verification owns failure
+        # reporting; treating that transition as a new loss starts an
+        # automatic search that can supersede the operator command.
+        if self._operator_localization_active():
+            LOGGER.info(
+                "localization transition ignored by auto recovery while an operator request is active"
+            )
+            return
         # Alert before the early returns below: localization degrading is worth
         # reporting even when no task is running and there is nothing to pause.
         if not self._localization_alert_notified:
@@ -808,6 +817,10 @@ class EdgeAgentApplication:
                 stop()
             except Exception:
                 LOGGER.exception("auto relocalize could not zero cmd_vel")
+
+    def _operator_localization_active(self) -> bool:
+        active = getattr(self.navigation, "operator_localization_active", None)
+        return bool(callable(active) and active())
 
     def _localization_recovery_seed(self) -> dict | None:
         # A recently verified pose is a substantially safer first recovery seed
@@ -863,6 +876,9 @@ class EdgeAgentApplication:
 
     def _recover_task_localization(self, reason: str = "localization_lost") -> None:
         try:
+            if self._operator_localization_active():
+                LOGGER.info("automatic relocalization skipped while an operator request is active")
+                return
             cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
             max_cycles = max(0, int(self.config.safety.localization_recovery_max_cycles))
             cycle = 0
@@ -898,12 +914,21 @@ class EdgeAgentApplication:
                         return
                     relocalize = getattr(self.navigation, "active_relocalize", None)
                     for seed in seeds:
+                        if self._operator_localization_active():
+                            LOGGER.info(
+                                "automatic relocalization stopped before it could preempt an operator request"
+                            )
+                            return
                         LOGGER.warning("localization lost; try waypoint seed index=%s x=%.3f y=%.3f yaw=%.3f", seed.get("waypoint_index"), seed["x"], seed["y"], seed["yaw"])
                         try:
                             self._hold_motion_for_relocalize()
                             if not callable(relocalize):
                                 raise RuntimeError("active_relocalize is unavailable")
-                            relocalize({**seed, "max_attempts": 12})
+                            relocalize({
+                                **seed,
+                                "max_attempts": 12,
+                                "_automatic_recovery": True,
+                            })
                             LOGGER.info("active relocalize accepted on cycle %d waypoint=%s", cycle, seed.get("waypoint_index"))
                             return
                         except Exception as exc:
@@ -927,8 +952,13 @@ class EdgeAgentApplication:
                     if cycle == 1:
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)
                         if callable(global_relocalize):
+                            if self._operator_localization_active():
+                                LOGGER.info(
+                                    "automatic global relocalization skipped for an operator request"
+                                )
+                                return
                             try:
-                                global_relocalize(wait_seconds=90.0)
+                                global_relocalize(wait_seconds=90.0, automatic=True)
                                 LOGGER.info("global relocalize accepted after waypoint seed failure")
                                 return
                             except Exception as exc:

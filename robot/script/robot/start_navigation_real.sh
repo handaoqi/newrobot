@@ -126,18 +126,6 @@ stop_navigation() {
   echo "Navigation stopped. Localization is still running."
 }
 
-start_navigation_diagnostics() {
-  local diagnostics_dir="${LOG_DIR}/diagnostics"
-  local session_dir="${diagnostics_dir}/$(date +%Y%m%d_%H%M%S)"
-  mkdir -p "${session_dir}"
-  # Record the controller output before and after collision monitoring along
-  # with both protection polygons. This makes a future blocked-path event
-  # replayable without recording the high-bandwidth camera or point cloud.
-  setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 bag record --storage sqlite3 --max-bag-size 104857600 --max-cache-size 10485760 -o '${session_dir}/nav_diagnostics' /cmd_vel_raw /cmd_vel /polygon_stop /polygon_slowdown" \
-    >"${session_dir}/recorder.log" 2>&1 < /dev/null &
-  echo "Navigation diagnostics recording: ${session_dir}/nav_diagnostics"
-}
-
 stop_stack() {
   stop_navigation
   stop_localization
@@ -356,7 +344,6 @@ start_stack() {
     echo "Starting Nav2/Navigo..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' use_official_ukf:='${USE_OFFICIAL_UKF}' map:='${MAP_YAML}'" \
       >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
-    start_navigation_diagnostics
   fi
 
   echo

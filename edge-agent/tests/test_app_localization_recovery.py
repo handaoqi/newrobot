@@ -115,6 +115,7 @@ def test_recovery_attempts_trusted_pose_before_waypoint_candidates(monkeypatch):
     application._recover_task_localization()
 
     assert application.navigation.seeds[0]["source"] == "last_trusted"
+    assert application.navigation.seeds[0]["_automatic_recovery"] is True
 
 
 def _wire_recovery_collaborators(application, *, max_cycles=0):
@@ -227,6 +228,22 @@ def test_localization_loss_starts_auto_relocalize_without_active_task(monkeypatc
     assert alerts[0][0][1] == "high"
     assert alerts[0][1]["attributes"]["localization_quality"] == "bad"
     assert alerts[0][1]["component"] == "localization"
+
+
+def test_operator_localization_suppresses_auto_recovery_worker(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.task_executor = IdleTaskExecutor()
+    application.navigation = SimpleNamespace(operator_localization_active=lambda: True)
+    application._localization_alert_notified = False
+
+    def unexpected_thread(**_kwargs):
+        raise AssertionError("operator localization must not start automatic recovery")
+
+    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+
+    application._handle_task_localization_loss()
+
+    assert application.task_executor.loss_notifications == 0
 
 
 def test_mapping_session_skips_auto_relocalize(monkeypatch):

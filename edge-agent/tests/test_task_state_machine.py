@@ -110,9 +110,11 @@ class FakeRosbagRecorder:
     def __init__(self):
         self.started = []
         self.stopped = 0
+        self.running = False
 
     def start(self, label):
         self.started.append(label)
+        self.running = True
         return {
             "running": True,
             "bag_dir": f"/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/{label}",
@@ -122,11 +124,18 @@ class FakeRosbagRecorder:
 
     def stop(self):
         self.stopped += 1
+        self.running = False
         return {
             "running": False,
             "bag_dir": "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/test",
             "duration_seconds": 12,
             "size_bytes": 1024,
+        }
+
+    def status(self):
+        return {
+            "running": self.running,
+            "bag_dir": "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/stale" if self.running else None,
         }
 
 
@@ -839,6 +848,82 @@ def test_navigation_rosbag_follows_task_lifecycle(tmp_path):
 
     assert recorder.stopped == 1
     assert results[0][2]["rosbag"]["size_bytes"] == 1024
+    store.close()
+
+
+def test_navigation_rosbag_force_exit_returns_stopped_status(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    recorder = FakeRosbagRecorder()
+    envelope = command("task.start")
+    envelope.payload["command"]["record_rosbag"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        rosbag_recorder=recorder,
+    )
+
+    executor.start_task(envelope)
+    result = executor.force_exit(executor.context.task_execution_id)
+
+    assert recorder.stopped == 1
+    assert result["final_task_state"] == "cancelled"
+    assert result["rosbag"]["running"] is False
+    assert result["rosbag"]["size_bytes"] == 1024
+    store.close()
+
+
+def test_navigation_rosbag_starts_a_fresh_recording_for_next_execution(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    recorder = FakeRosbagRecorder()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        rosbag_recorder=recorder,
+    )
+
+    first = command("task.start")
+    first.payload["command"]["record_rosbag"] = True
+    executor.start_task(first)
+    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    second = command("task.start")
+    second.payload["task_execution_id"] = "55555555-5555-4555-8555-555555555555"
+    second.payload["command_id"] = "66666666-6666-4666-8666-666666666666"
+    second.payload["command"]["record_rosbag"] = True
+    executor.start_task(second)
+
+    assert recorder.stopped == 1
+    assert recorder.started == ["task_44444444", "task_55555555"]
+    store.close()
+
+
+def test_navigation_rosbag_replaces_a_stale_recorder_before_task_start(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    recorder = FakeRosbagRecorder()
+    recorder.running = True
+    envelope = command("task.start")
+    envelope.payload["command"]["record_rosbag"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        rosbag_recorder=recorder,
+    )
+
+    executor.start_task(envelope)
+
+    assert recorder.stopped == 1
+    assert recorder.started == ["task_44444444"]
+    assert recorder.running is True
     store.close()
 
 

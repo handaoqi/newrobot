@@ -139,6 +139,7 @@ class RosAdapter(Node):
         # it is being verified.
         self._localization_operation_lock = threading.Lock()
         self._localization_operation_generation = 0
+        self._operator_localization_depth = 0
         self._scan_match_condition = threading.Condition()
         self._scan_match_sequence = 0
         self._scan_match_records: dict[tuple[int, int], dict] = {}
@@ -352,8 +353,35 @@ class RosAdapter(Node):
             }
             self._scan_match_condition.notify_all()
 
-    def _start_localization_operation(self, source: str) -> int:
+    def begin_operator_localization(self) -> None:
+        """Prevent automatic recovery from preempting an operator pose request."""
         with self._localization_operation_lock:
+            self._operator_localization_depth += 1
+
+    def end_operator_localization(self) -> None:
+        with self._localization_operation_lock:
+            self._operator_localization_depth = max(
+                0,
+                self._operator_localization_depth - 1,
+            )
+            if self._operator_localization_depth == 0:
+                # If the operator attempt ended without reaching normal, the
+                # next non-normal sample may hand control back to automatic
+                # recovery instead of leaving its previous notification latch
+                # stuck forever.
+                self._localization_failure_notified = False
+
+    def operator_localization_active(self) -> bool:
+        with self._localization_operation_lock:
+            return self._operator_localization_depth > 0
+
+    def _start_localization_operation(self, source: str, *, automatic: bool = False) -> int:
+        with self._localization_operation_lock:
+            if automatic and self._operator_localization_depth > 0:
+                raise ProtocolError(
+                    "RELOCALIZATION_SUPERSEDED",
+                    "automatic localization recovery was suppressed by an operator request",
+                )
             self._localization_operation_generation += 1
             generation = self._localization_operation_generation
         LOGGER.info("localization operation %d started by %s", generation, source)
@@ -526,6 +554,7 @@ class RosAdapter(Node):
             self._localization_lost_count >= max(1, self.safety_config.localization_loss_samples)
             and not self._localization_failure_notified
             and self._localization_failure_cb
+            and not self.operator_localization_active()
         ):
             self._localization_failure_notified = True
             self._localization_recovery_armed = True
@@ -1355,9 +1384,13 @@ class RosAdapter(Node):
             },
         }
 
-    def global_relocalize(self, wait_seconds: float = 90.0) -> dict:
+    def global_relocalize(self, wait_seconds: float = 90.0, *, automatic: bool = False) -> dict:
         """Run map-wide position and 360-degree yaw search without a guessed pose."""
-        generation = self._start_localization_operation("global_relocalize")
+        generation = (
+            self._start_localization_operation("global_relocalize", automatic=True)
+            if automatic
+            else self._start_localization_operation("global_relocalize")
+        )
         if not self._global_relocalize_client.wait_for_service(timeout_sec=3.0):
             raise ProtocolError(
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
@@ -1438,8 +1471,12 @@ class RosAdapter(Node):
 
     def active_relocalize(self, seed: dict) -> dict:
         """Try bounded stationary pose candidates without commanding motion."""
-        generation = self._start_localization_operation(
-            str(seed.get("source") or "active_relocalize")
+        automatic = bool(seed.get("_automatic_recovery"))
+        source = str(seed.get("source") or "active_relocalize")
+        generation = (
+            self._start_localization_operation(source, automatic=True)
+            if automatic
+            else self._start_localization_operation(source)
         )
         base_x = float(seed["x"])
         base_y = float(seed["y"])
