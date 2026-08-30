@@ -2740,6 +2740,26 @@ class RobotMappingStatusView(APIView):
                     error="",
                 )
                 mapping_result["save_progress"] = completed_progress
+            # The save command finishes as soon as the durable map package is
+            # uploaded, while the read-only localization check completes in a
+            # background Edge thread. Merge only the live result for the same
+            # saved map so the UI can leave "queued/running" without allowing
+            # a later mapping run to overwrite this command's result.
+            command_validation = mapping_result.get("post_save_validation") or {}
+            live_validation = live_mapping.get("post_save_validation") or {}
+            command_validation_map = str(
+                command_validation.get("map_dir")
+                or mapping_result.get("latest_session_dir")
+                or mapping_result.get("active_map_dir")
+                or ""
+            )
+            live_validation_map = str(live_validation.get("map_dir") or "")
+            if (
+                live_sample_is_current
+                and command_validation_map
+                and live_validation_map == command_validation_map
+            ):
+                mapping_result["post_save_validation"] = live_validation
             mapping_state = "exited"
         elif (
             live_mapping

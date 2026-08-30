@@ -487,7 +487,64 @@ const postSaveValidation = computed(() => mappingStatus.value?.result?.post_save
 const indoorValidation = computed(() => postSaveValidation.value.indoor || { required: 10, success: 0, attempts: 0 })
 const outdoorValidation = computed(() => postSaveValidation.value.outdoor || { required: 5, success: 0, attempts: 0 })
 const validationPercent = bucket => Math.min(100, Number(bucket?.success || 0) / Math.max(1, Number(bucket?.required || 1)) * 100)
-const validationStateLabel = computed(() => ({ queued: '排队中', running: '自检中', passed: '本轮通过', failed: '本轮失败', unavailable: '待接入验证器', idle: '未开始' }[postSaveValidation.value.state] || postSaveValidation.value.state || '未开始'))
+const postSaveValidationResult = computed(() => postSaveValidation.value.result || {})
+const validationStateLabel = computed(() => {
+  if (postSaveValidation.value.state === 'passed') {
+    return postSaveValidationResult.value.accurate === true ? '本次定位准确' : '本轮通过'
+  }
+  return ({ queued: '排队中', running: '正在加载本次地图并定位', failed: '本次定位不通过', unavailable: '待接入验证器', idle: '未开始' }[postSaveValidation.value.state] || postSaveValidation.value.state || '未开始')
+})
+const validationMappingTypeLabel = computed(() => (
+  (postSaveValidationResult.value.mapping_type || postSaveValidation.value.mapping_type) === 'outdoor'
+    ? '室外'
+    : '室内'
+))
+const validationCoordinateLabel = computed(() => {
+  const mode = postSaveValidationResult.value.coordinate_mode
+  if (mode === 'global_enu') return '全局 ENU / map'
+  if (mode === 'local_only') return '本地 map'
+  return 'map'
+})
+const finiteValidationNumber = value => {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+const formatValidationPose = pose => {
+  const x = finiteValidationNumber(pose?.x)
+  const y = finiteValidationNumber(pose?.y)
+  const z = finiteValidationNumber(pose?.z)
+  const yaw = finiteValidationNumber(pose?.yaw_deg)
+  if (x === null || y === null || yaw === null) return '未取得定位坐标'
+  return `X ${x.toFixed(2)} m · Y ${y.toFixed(2)} m${z === null ? '' : ` · Z ${z.toFixed(2)} m`} · 航向 ${yaw.toFixed(1)}°`
+}
+const validationPoseLabel = computed(() => formatValidationPose(postSaveValidationResult.value.pose))
+const validationSavedPoseLabel = computed(() => formatValidationPose(postSaveValidationResult.value.saved_terminal_pose))
+const formatValidationMetric = (value, digits, suffix) => {
+  const number = finiteValidationNumber(value)
+  return number === null ? '无数据' : `${number.toFixed(digits)}${suffix}`
+}
+const validationResultTime = computed(() => {
+  const value = postSaveValidationResult.value.sampled_at || postSaveValidation.value.updated_at
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+})
+let lastValidationNotice = ''
+watch(
+  () => `${postSaveValidation.value.map_dir || ''}:${postSaveValidation.value.state || ''}:${postSaveValidation.value.updated_at || ''}`,
+  (signature) => {
+    const state = postSaveValidation.value.state
+    if (!['passed', 'failed'].includes(state) || signature === lastValidationNotice) return
+    lastValidationNotice = signature
+    const result = postSaveValidationResult.value
+    setMappingStepFeedback(
+      '保存后静止定位自检',
+      state === 'passed' && result.accurate === true,
+      `${result.message || validationStateLabel.value}；${formatValidationPose(result.pose)}`,
+    )
+  },
+)
 // Runtime result is intentionally independent from the selected map. It is
 // published only after the package has been uploaded, and is cleared by the
 // next successful startup/check command.
@@ -2273,11 +2330,40 @@ async function saveCleaner() {
               <strong>保存后静止定位自检</strong>
               <span>{{ validationStateLabel }}</span>
             </div>
+            <div
+              v-if="Object.keys(postSaveValidationResult).length"
+              class="validation-current-result"
+              :class="postSaveValidation.state === 'passed' && postSaveValidationResult.accurate ? 'is-accurate' : 'is-inaccurate'"
+            >
+              <div class="validation-result-title">
+                <strong>本次{{ validationMappingTypeLabel }}定位</strong>
+                <span>{{ validationStateLabel }}</span>
+              </div>
+              <div class="validation-position">
+                <span>{{ validationCoordinateLabel }} 定位位置</span>
+                <strong>{{ validationPoseLabel }}</strong>
+              </div>
+              <div v-if="postSaveValidationResult.saved_terminal_pose" class="validation-position validation-reference">
+                <span>保存结束参考位置</span>
+                <strong>{{ validationSavedPoseLabel }}</strong>
+              </div>
+              <div class="validation-quality-grid">
+                <span>位置偏差<strong>{{ formatValidationMetric(postSaveValidationResult.position_error_m, 2, ' m') }}</strong></span>
+                <span>航向偏差<strong>{{ formatValidationMetric(postSaveValidationResult.yaw_error_deg, 1, '°') }}</strong></span>
+                <span>NDT 匹配误差<strong>{{ formatValidationMetric(postSaveValidationResult.quality?.matching_error, 3, '') }}</strong></span>
+                <span>内点率<strong>{{ formatValidationMetric(Number(postSaveValidationResult.quality?.inlier_fraction) * 100, 1, '%') }}</strong></span>
+              </div>
+              <small v-if="validationResultTime">检测时间 {{ validationResultTime }}</small>
+              <small v-if="postSaveValidationResult.message">{{ postSaveValidationResult.message }}</small>
+            </div>
+            <div v-else-if="['queued', 'running'].includes(postSaveValidation.state)" class="validation-waiting">
+              正在启动只读定位、加载本次保存地图并核对保存结束位置；不会下发运动指令。
+            </div>
             <div class="validation-counters">
               <div><span>室内累计</span><strong>{{ indoorValidation.success }}/{{ indoorValidation.required }}</strong><progress :value="validationPercent(indoorValidation)" max="100"></progress><small>尝试 {{ indoorValidation.attempts || 0 }} 次</small></div>
               <div><span>室外累计</span><strong>{{ outdoorValidation.success }}/{{ outdoorValidation.required }}</strong><progress :value="validationPercent(outdoorValidation)" max="100"></progress><small>尝试 {{ outdoorValidation.attempts || 0 }} 次</small></div>
             </div>
-            <div v-if="postSaveValidation.detail" class="mapping-progress-error">{{ postSaveValidation.detail }}</div>
+            <div v-if="postSaveValidation.detail && postSaveValidation.state !== 'passed'" class="mapping-progress-error">{{ postSaveValidation.detail }}</div>
           </div>
           <div class="state-steps">
             <div
@@ -2811,6 +2897,23 @@ async function saveCleaner() {
 .mapping-metrics-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.45rem 0.8rem; }
 .mapping-metrics-grid span { display: flex; justify-content: space-between; gap: 0.6rem; color: #667085; }
 .mapping-metrics-grid strong { color: #1f2937; white-space: nowrap; }
+.post-save-validation-panel { display: grid; gap: 0.6rem; margin-top: 0.7rem; padding: 0.7rem 0.75rem; border: 1px solid #d0d5dd; border-radius: 6px; background: #fff; font-size: 0.78rem; }
+.validation-current-result { display: grid; gap: 0.5rem; padding: 0.65rem; border: 1px solid #f0a69a; border-radius: 6px; background: #fff4f2; }
+.validation-current-result.is-accurate { border-color: #8bd3a8; background: #f0fdf4; }
+.validation-result-title, .validation-position, .validation-quality-grid span { display: flex; justify-content: space-between; gap: 0.75rem; }
+.validation-result-title span { color: #b42318; font-weight: 650; }
+.validation-current-result.is-accurate .validation-result-title span { color: #067647; }
+.validation-position { align-items: baseline; color: #667085; }
+.validation-position strong { color: #101828; text-align: right; font: 650 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.validation-reference { padding-top: 0.35rem; border-top: 1px dashed #d0d5dd; }
+.validation-quality-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.35rem 0.8rem; }
+.validation-quality-grid span { color: #667085; }
+.validation-quality-grid strong { color: #344054; }
+.validation-current-result small, .validation-waiting { color: #667085; }
+.validation-counters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
+.validation-counters > div { display: grid; grid-template-columns: 1fr auto; gap: 0.25rem 0.5rem; align-items: center; }
+.validation-counters progress { grid-column: 1 / -1; width: 100%; }
+.validation-counters small { grid-column: 1 / -1; color: #667085; }
 .optimization-panel { display: grid; gap: 0.45rem; padding: 0.65rem 0.75rem; border: 1px solid #93c5fd; border-radius: 6px; background: #eff6ff; font-size: 0.78rem; }
 .optimization-runtime { margin-top: 0.7rem; }
 .optimization-line { overflow: hidden; color: #174ea6; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }

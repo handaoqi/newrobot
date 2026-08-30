@@ -13,7 +13,12 @@ import yaml
 
 import roamerx_edge.mapping_adapter as mapping_adapter_module
 from roamerx_edge.config import MappingConfig
-from roamerx_edge.mapping_adapter import MappingAdapter, MappingSession, _parse_scan_context_check
+from roamerx_edge.mapping_adapter import (
+    MappingAdapter,
+    MappingSession,
+    _parse_post_save_localization_check,
+    _parse_scan_context_check,
+)
 from roamerx_edge.protocol import ProtocolError
 
 
@@ -56,6 +61,63 @@ def test_scan_context_validation_output_is_structured_for_manual_threshold_revie
         "descriptor_hit_p90": 0.07,
         "descriptor_miss_median": 0.10,
     }
+
+
+def test_post_save_localization_output_parser_ignores_ros_logs():
+    result = _parse_post_save_localization_check(
+        "[INFO] localization ready\n"
+        + json.dumps({
+            "schema": "roamerx.post-save-localization-check.v1",
+            "state": "passed",
+            "accurate": True,
+            "pose": {"x": 1.2, "y": -0.5, "yaw_deg": 91.0},
+        })
+        + "\n"
+    )
+
+    assert result["state"] == "passed"
+    assert result["accurate"] is True
+    assert result["pose"]["x"] == 1.2
+
+
+def test_post_save_validation_loads_exact_saved_map_and_persists_pose(tmp_path, monkeypatch):
+    navigation_script = tmp_path / "start_navigation_real.sh"
+    navigation_script.write_text("#!/bin/sh\n")
+    saved_map = tmp_path / "20260830_120000_001"
+    saved_map.mkdir()
+    adapter = make_adapter(tmp_path, navigation_script=str(navigation_script))
+    calls = []
+    checker_payload = {
+        "schema": "roamerx.post-save-localization-check.v1",
+        "state": "passed",
+        "accurate": True,
+        "mapping_type": "outdoor",
+        "map_dir": str(saved_map),
+        "frame_id": "map",
+        "pose": {"x": 4.25, "y": -1.5, "yaw_deg": 87.0},
+        "position_error_m": 0.08,
+        "yaw_error_deg": 1.2,
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if isinstance(command, list):
+            return SimpleNamespace(returncode=0, stdout="ready", stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(checker_payload), stderr="")
+
+    monkeypatch.setattr(mapping_adapter_module.subprocess, "run", fake_run)
+
+    adapter._run_post_save_validation(str(saved_map), "outdoor")
+
+    assert calls[0][0] == [str(navigation_script), "restart-localization"]
+    assert calls[0][1]["env"]["PCD_MAP"] == str(saved_map / "map.pcd")
+    assert calls[0][1]["env"]["MAP_YAML"] == str(saved_map / "map.yaml")
+    persisted = json.loads(adapter._post_save_validation_file.read_text())
+    assert persisted["state"] == "passed"
+    assert persisted["mapping_type"] == "outdoor"
+    assert persisted["result"]["pose"]["x"] == 4.25
+    assert persisted["outdoor"]["attempts"] == 1
+    assert persisted["outdoor"]["success"] == 1
 
 
 def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch):
@@ -1251,6 +1313,24 @@ def test_save_defaults_to_stopping_slam(tmp_path, monkeypatch):
     # via _cleanup(). The repeat is a harmless no-op, so only "it stopped" matters.
     assert stopped
     assert result["state"] == "exited"
+
+
+def test_outdoor_save_keeps_mapping_type_for_post_save_validation(tmp_path, monkeypatch):
+    adapter, session_dir, _stopped = _ready_to_save_adapter(tmp_path, monkeypatch)
+    adapter._mapping_type = "outdoor"
+    adapter.session.mapping_type = "outdoor"
+    validation_calls = []
+    monkeypatch.setattr(adapter, "_finalize_session_package", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        adapter,
+        "_start_post_save_validation",
+        lambda map_dir, mapping_type: validation_calls.append((map_dir, mapping_type)),
+    )
+
+    result = adapter._save_active_mapping({"upload": False, "package": False})
+
+    assert result["state"] == "exited"
+    assert validation_calls == [(str(session_dir), "outdoor")]
 
 
 def test_save_keeps_slam_when_the_save_service_itself_fails(tmp_path, monkeypatch):

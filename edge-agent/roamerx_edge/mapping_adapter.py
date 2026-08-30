@@ -52,6 +52,19 @@ def _parse_scan_context_check(output: str) -> dict:
         "descriptor_miss_median": float(values["miss_distance"]),
     }
 
+
+def _parse_post_save_localization_check(output: str) -> dict:
+    """Return the last structured checker record while tolerating ROS log lines."""
+    for line in reversed((output or "").splitlines()):
+        try:
+            payload = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("schema") == "roamerx.post-save-localization-check.v1":
+            return payload
+    return {}
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write then replace using a unique tmp name so concurrent persist cannot steal the file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -566,6 +579,11 @@ class MappingAdapter:
             raise ProtocolError("MAP_OFFLINE_OPTIMIZATION_FAILED", str(exc)) from exc
 
     def _save_active_mapping(self, command: dict) -> dict:
+        saved_mapping_type = (
+            self.session.mapping_type
+            if self.session and self.session.mapping_type in {"indoor", "outdoor"}
+            else self._mapping_type
+        )
         progress_dir = self._find_latest_progress_dir()
         progress = self._read_save_progress(progress_dir)
         readiness = self._mapping_readiness(progress, self._any_slam_process_alive)
@@ -646,8 +664,8 @@ class MappingAdapter:
         # Start the post-save static self-check only after the map is durable and
         # the mapping session has been torn down.  It never publishes motion.
         self._start_post_save_validation(
-            str(result.get("latest_session_dir") or result.get("active_map_dir") or work_dir),
-            str(command.get("mapping_type") or self._mapping_type or "indoor"),
+            str(work_dir),
+            str(command.get("mapping_type") or saved_mapping_type or "indoor"),
         )
         result.update(self.status())
         if should_stop:
@@ -670,31 +688,96 @@ class MappingAdapter:
         with self._post_save_validation_lock:
             payload = self._read_post_save_validation()
             payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
-            payload.update({"state": "queued", "mapping_type": kind, "map_dir": map_dir, "updated_at": now_iso()})
+            payload.update({
+                "state": "queued",
+                "mapping_type": kind,
+                "map_dir": map_dir,
+                "detail": "",
+                "result": {},
+                "updated_at": now_iso(),
+            })
             _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         threading.Thread(target=self._run_post_save_validation, args=(map_dir, kind), daemon=True).start()
 
     def _run_post_save_validation(self, map_dir: str, kind: str) -> None:
+        with self._post_save_validation_lock:
+            payload = self._read_post_save_validation()
+            payload.update({"state": "running", "mapping_type": kind, "map_dir": map_dir, "updated_at": now_iso()})
+            _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         command = os.environ.get("ROAMERX_POST_SAVE_VALIDATION_CMD", "").strip()
         if not command:
             checker = Path(__file__).resolve().parents[2] / "robot" / "script" / "robot" / "post_save_static_localization_check.py"
-            command = f"python3 {checker} --mapping-type {{mapping_type}}"
+            command = f"python3 {checker} --mapping-type {{mapping_type}} --map-dir {{map_dir}}"
         result_state, detail = ("unavailable", "未配置真实静止定位验证命令")
+        structured_result = {}
         if command:
             try:
+                navigation_script = Path(self.config.navigation_script).expanduser()
+                if not navigation_script.is_file():
+                    raise RuntimeError(f"navigation script not found: {navigation_script}")
+                map_path = Path(map_dir).expanduser().resolve()
+                prepare_environment = os.environ.copy()
+                prepare_environment.update({
+                    "PCD_MAP": str(map_path / "map.pcd"),
+                    "MAP_YAML": str(map_path / "map.yaml"),
+                })
+                prepared = subprocess.run(
+                    [str(navigation_script), "restart-localization"],
+                    capture_output=True,
+                    text=True,
+                    timeout=max(90, self.config.command_timeout_seconds),
+                    env=prepare_environment,
+                )
+                if prepared.returncode != 0:
+                    raise RuntimeError(
+                        (prepared.stderr or prepared.stdout or "本次地图定位栈启动失败").strip()[-1000:]
+                    )
                 completed = subprocess.run(command.format(map_dir=map_dir, mapping_type=kind), shell=True, capture_output=True, text=True, timeout=45)
+                combined_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+                structured_result = _parse_post_save_localization_check(combined_output)
                 result_state = "passed" if completed.returncode == 0 else "failed"
-                detail = (completed.stdout or completed.stderr or "").strip()[-1000:]
+                if structured_result:
+                    declared_state = str(structured_result.get("state") or "")
+                    result_state = (
+                        "passed"
+                        if completed.returncode == 0
+                        and declared_state == "passed"
+                        and structured_result.get("accurate") is True
+                        else "failed"
+                    )
+                    detail = str(structured_result.get("message") or "")
+                else:
+                    detail = combined_output.strip()[-1000:]
             except Exception as exc:
                 result_state, detail = "failed", str(exc)
+                structured_result = {
+                    "schema": "roamerx.post-save-localization-check.v1",
+                    "state": "failed",
+                    "accurate": False,
+                    "reason_code": "LOCALIZATION_CHECK_START_FAILED",
+                    "message": detail,
+                    "mapping_type": kind,
+                    "map_dir": map_dir,
+                    "frame_id": "map",
+                }
         with self._post_save_validation_lock:
             payload = self._read_post_save_validation()
             bucket = payload.setdefault(kind, {"required": 5 if kind == "outdoor" else 10, "success": 0, "attempts": 0, "history": []})
             bucket["attempts"] = int(bucket.get("attempts", 0)) + 1
             if result_state == "passed": bucket["success"] = int(bucket.get("success", 0)) + 1
-            bucket.setdefault("history", []).append({"at": now_iso(), "map_dir": map_dir, "state": result_state, "detail": detail})
+            history_entry = {"at": now_iso(), "map_dir": map_dir, "state": result_state, "detail": detail}
+            if structured_result:
+                history_entry["result"] = structured_result
+            bucket.setdefault("history", []).append(history_entry)
             bucket["history"] = bucket["history"][-20:]
-            payload.update({"state": result_state, "detail": detail, "updated_at": now_iso()})
+            payload.update({
+                "state": result_state,
+                "detail": detail,
+                "result": structured_result,
+                "mapping_type": kind,
+                "map_dir": map_dir,
+                "updated_at": now_iso(),
+            })
             _atomic_write_text(self._post_save_validation_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def _rescue_diverged_mapping(self, command: dict, source_dir: Path) -> dict:

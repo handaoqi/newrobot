@@ -99,6 +99,10 @@ class MappingWorkflowApiTests(TestCase):
                 "state": "saving",
                 "upload_result": {"id": uploaded.id},
                 "mapping_metrics": {"keyframe_count": 178},
+                "post_save_validation": {
+                    "state": "queued",
+                    "map_dir": "/maps/20260830_120000_001",
+                },
                 "save_progress": {
                     "stage": "writing_pcd",
                     "progress_percent": 65,
@@ -113,6 +117,16 @@ class MappingWorkflowApiTests(TestCase):
                 "mapping": {
                     "state": "saving",
                     "process_alive": False,
+                    "post_save_validation": {
+                        "state": "passed",
+                        "map_dir": "/maps/20260830_120000_001",
+                        "result": {
+                            "schema": "roamerx.post-save-localization-check.v1",
+                            "state": "passed",
+                            "accurate": True,
+                            "pose": {"x": 1.25, "y": -2.5, "yaw_deg": 92.0},
+                        },
+                    },
                     "save_progress": {
                         "stage": "writing_pcd",
                         "progress_percent": 65,
@@ -131,3 +145,42 @@ class MappingWorkflowApiTests(TestCase):
         self.assertEqual(response.data["result"]["state"], "exited")
         self.assertEqual(response.data["result"]["save_progress"]["stage"], "completed")
         self.assertEqual(response.data["result"]["save_progress"]["progress_percent"], 100.0)
+        self.assertEqual(response.data["result"]["post_save_validation"]["state"], "passed")
+        self.assertTrue(response.data["result"]["post_save_validation"]["result"]["accurate"])
+        self.assertEqual(response.data["result"]["post_save_validation"]["result"]["pose"]["x"], 1.25)
+
+    def test_successful_save_does_not_merge_validation_from_another_map(self):
+        uploaded = MapData.objects.create(name="本次地图", robot=self.robot, active=True)
+        now = timezone.now()
+        RemoteCommand.objects.create(
+            robot=self.robot,
+            command_type="mapping.save",
+            status="succeeded",
+            issued_at=now - timedelta(minutes=1),
+            expires_at=now + timedelta(hours=1),
+            finished_at=now,
+            result_payload={
+                "state": "exited",
+                "upload_result": {"id": uploaded.id},
+                "post_save_validation": {"state": "queued", "map_dir": "/maps/current"},
+            },
+        )
+        RobotStatusLatest.objects.create(
+            robot=self.robot,
+            sampled_at=now,
+            raw_payload={
+                "mapping": {
+                    "state": "idle",
+                    "post_save_validation": {
+                        "state": "passed",
+                        "map_dir": "/maps/different",
+                        "result": {"accurate": True},
+                    },
+                }
+            },
+        )
+
+        response = self.client.get(f"/api/robots/{self.robot.id}/mapping/status/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["result"]["post_save_validation"]["state"], "queued")
