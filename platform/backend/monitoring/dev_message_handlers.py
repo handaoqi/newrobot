@@ -39,6 +39,10 @@ LOGGER = logging.getLogger(__name__)
 # Keep the original wake phrase available as well so existing commands remain
 # compatible.
 VOICE_WAKE_ALIASES = ("小太阳", "小太陽", "有太阳", "太阳", "太陽")
+# Place names spoken by patrol announcements must never arm the development
+# wake window.  In particular, the exact site name "太阳宫" starts with the
+# short alias "太阳" and was previously interpreted as a wake-only utterance.
+VOICE_WAKE_FALSE_POSITIVES = frozenset(("太阳宫",))
 VOICE_WAKE_PINYIN = ("xiao", "tai", "yang")
 VOICE_WAKE_SHORT_PINYIN = ("tai", "yang")
 _PINYIN_INITIALS = (
@@ -166,6 +170,12 @@ def _is_double_wake_phrase(transcript: str) -> bool:
     return any(compact.startswith(alias + alias) for alias in VOICE_WAKE_ALIASES)
 
 
+def _is_false_wake_phrase(transcript: str) -> bool:
+    """Reject exact known non-command phrases before fuzzy wake matching."""
+    compact = re.sub(r"[\s，。,.!！?？：:；;、]", "", transcript)
+    return compact in VOICE_WAKE_FALSE_POSITIVES
+
+
 def _looks_like_short_wake_attempt(transcript: str) -> bool:
     """Identify a garbled, short retry while the wake window is already open.
 
@@ -241,6 +251,13 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
     if not transcript:
         _record_voice_recognition(robot, payload, transcript, "no_speech")
         return {"status": "no_speech", "transcript": transcript}
+    if _is_false_wake_phrase(transcript):
+        # A false positive must also close a previously armed window; otherwise
+        # the following unrelated utterance could still become a Codex task.
+        _VOICE_WAKE_UNTIL.pop(robot.code, None)
+        _VOICE_WAKE_COUNT.pop(robot.code, None)
+        _record_voice_recognition(robot, payload, transcript, "ignored")
+        return {"status": "ignored", "transcript": transcript}
     now = timezone.now()
     if _is_double_wake_phrase(transcript):
         _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)

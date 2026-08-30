@@ -303,6 +303,29 @@ class RemoteDevelopmentMqttTests(TestCase):
             self.assertEqual(result["status"], "ignored")
         self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
 
+    def test_taiyanggong_does_not_arm_or_create_a_codex_task(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+        _VOICE_WAKE_UNTIL[self.robot.code] = timezone.now() + timezone.timedelta(seconds=8)
+
+        result = handle_dev_mqtt_message(
+            self.topic("voice/audio"),
+            {"asr_engine": "nx-sensevoice", "transcript": "太阳宫。"},
+        )
+        follow_up = handle_dev_mqtt_message(
+            self.topic("voice/audio"),
+            {"asr_engine": "nx-sensevoice", "transcript": "检查导航"},
+        )
+
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(follow_up["status"], "ignored")
+        self.assertNotIn(self.robot.code, _VOICE_WAKE_UNTIL)
+        self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
+        self.assertEqual(
+            list(VoiceRecognitionEvent.objects.values_list("outcome", flat=True)),
+            ["ignored", "ignored"],
+        )
+
     def test_wake_word_arms_and_acknowledges_without_creating_task(self):
         published = []
         with patch("monitoring.dev_message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/wake.mp3", False)):

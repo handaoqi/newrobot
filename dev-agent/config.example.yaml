@@ -1,5 +1,5 @@
 codex:
-  binary: /home/dogrobot/.nvm/versions/node/v22.22.3/bin/codex
+  binary: /home/dogrobot/.local/bin/codex
   # The Agent gets its own mutable cache. Auth, sessions and skills below are
   # linked from shared_home so the main conversation still resumes normally.
   home: /home/dogrobot/.codex-dev-agent
