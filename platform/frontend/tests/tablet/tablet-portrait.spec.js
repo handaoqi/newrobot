@@ -94,22 +94,26 @@ for (const pageCase of pages) {
     expect(report.smallTouchTargets, JSON.stringify(report, null, 2)).toEqual([])
 
     if (pageCase.authenticated) {
-      const shell = page.locator('.dashboard-shell')
       const menuButton = page.locator('.tablet-menu-button')
-      await expect(shell).toHaveClass(/drawer-navigation/)
-      await expect(menuButton).toBeVisible()
-      await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
-      await expect(menuButton).toHaveCSS('border-radius', '50%')
-      await expect(menuButton).toHaveJSProperty('offsetWidth', 56)
-      await expect(menuButton).toHaveJSProperty('offsetHeight', 56)
-      await menuButton.click()
-      await expect(menuButton).toHaveAttribute('aria-expanded', 'true')
-      await expect(menuButton).toHaveAttribute('aria-label', '关闭导航菜单')
-      await expect(page.locator('#dashboard-navigation')).toHaveClass(/tablet-open/)
-      await page.keyboard.press('Escape')
-      await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
-      await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
-      await expect(menuButton).toBeFocused()
+      const viewport = page.viewportSize()
+      if (viewport.height >= viewport.width) {
+        await expect(menuButton).toBeVisible()
+        await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
+        await expect(menuButton).toHaveCSS('border-radius', '50%')
+        await expect(menuButton).toHaveJSProperty('offsetWidth', 56)
+        await expect(menuButton).toHaveJSProperty('offsetHeight', 56)
+        await menuButton.click()
+        await expect(menuButton).toHaveAttribute('aria-expanded', 'true')
+        await expect(menuButton).toHaveAttribute('aria-label', '关闭导航菜单')
+        await expect(page.locator('#dashboard-navigation')).toHaveClass(/tablet-open/)
+        await page.keyboard.press('Escape')
+        await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
+        await expect(menuButton).toHaveAttribute('aria-label', '打开导航菜单')
+        await expect(menuButton).toBeFocused()
+      } else {
+        await expect(menuButton).toBeHidden()
+        await expect(page.locator('#dashboard-navigation')).toBeVisible()
+      }
     }
 
     if (pageCase.name === 'overview') {
@@ -148,12 +152,12 @@ for (const pageCase of pages) {
 }
 
 for (const routeCase of shellRoutes) {
-  test(`${routeCase.name} keeps the mobile drawer within the 2000x1200 viewport`, async ({ page }, testInfo) => {
+  test(`${routeCase.name} keeps the left desktop menu within the 2000x1200 landscape viewport`, async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The full route shell matrix runs at the target landscape tablet size')
     await installTabletMocks(page, { authenticated: true })
     await page.goto(routeCase.path)
-    await expect(page.locator('.dashboard-shell')).toHaveClass(/drawer-navigation/)
-    await expect(page.locator('.tablet-app-bar')).toBeVisible()
+    await expect(page.locator('.tablet-app-bar')).toBeHidden()
+    await expect(page.locator('#dashboard-navigation')).toBeVisible()
     await page.waitForTimeout(700)
     await page.emulateMedia({ reducedMotion: 'reduce', colorScheme: 'light' })
     await page.addStyleTag({ content: '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }' })
@@ -168,21 +172,16 @@ for (const routeCase of shellRoutes) {
     expect(report.horizontalOffenders, JSON.stringify(report, null, 2)).toEqual([])
     expect(report.smallTouchTargets, JSON.stringify(report, null, 2)).toEqual([])
 
-    const menuButton = page.locator('.tablet-menu-button')
-    await menuButton.click()
-    await expect(page.locator('#dashboard-navigation')).toHaveClass(/tablet-open/)
     await expect(page.locator('.menu-list')).toHaveCSS('display', 'grid')
     const taskMenu = page.getByRole('button', { name: '巡检任务' })
     const taskLink = page.getByRole('link', { name: '任务列表', exact: true })
     if (!(await taskLink.isVisible())) await taskMenu.click()
     await expect(taskLink).toBeVisible()
-    await page.keyboard.press('Escape')
-    await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
     await page.goto('about:blank')
   })
 }
 
-test('narrow desktop keeps the permanent vertical sidebar', async ({ browser }, testInfo) => {
+test('portrait orientation uses the right-side floating menu even with a desktop user agent', async ({ browser }, testInfo) => {
   test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The device-mode regression runs once in Chromium')
   const context = await browser.newContext({
     baseURL: 'http://127.0.0.1:4173',
@@ -199,9 +198,16 @@ test('narrow desktop keeps the permanent vertical sidebar', async ({ browser }, 
     const page = await context.newPage()
     await installTabletMocks(page, { authenticated: true })
     await page.goto('/dashboard/overview')
-    await expect(page.locator('.dashboard-shell')).toHaveClass(/desktop-navigation/)
-    await expect(page.locator('.tablet-app-bar')).toBeHidden()
-    await expect(page.locator('#dashboard-navigation')).toBeVisible()
+    const menuButton = page.locator('.tablet-menu-button')
+    await expect(menuButton).toBeVisible()
+    await menuButton.click()
+    const sidebar = page.locator('#dashboard-navigation')
+    await expect(sidebar).toHaveClass(/tablet-open/)
+    await expect.poll(async () => {
+      const sidebarBox = await sidebar.boundingBox()
+      const viewportWidth = await page.evaluate(() => window.innerWidth)
+      return sidebarBox ? Math.abs((sidebarBox.x + sidebarBox.width) - viewportWidth) : Number.POSITIVE_INFINITY
+    }).toBeLessThanOrEqual(1)
     await expect(page.locator('.menu-list')).toHaveCSS('display', 'grid')
     await expect(page.locator('.menu-list')).toHaveJSProperty('scrollWidth', await page.locator('.menu-list').evaluate(element => element.clientWidth))
     const report = await collectLayoutReport(page)
@@ -212,7 +218,7 @@ test('narrow desktop keeps the permanent vertical sidebar', async ({ browser }, 
   }
 })
 
-test('mobile landscape uses the right-side floating drawer', async ({ browser }, testInfo) => {
+test('landscape orientation uses the permanent left desktop menu even on mobile', async ({ browser }, testInfo) => {
   test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The device-mode regression runs once in Chromium')
   const context = await browser.newContext({
     baseURL: 'http://127.0.0.1:4173',
@@ -229,7 +235,36 @@ test('mobile landscape uses the right-side floating drawer', async ({ browser },
     const page = await context.newPage()
     await installTabletMocks(page, { authenticated: true })
     await page.goto('/dashboard/overview')
-    await expect(page.locator('.dashboard-shell')).toHaveClass(/drawer-navigation/)
+    const menuButton = page.locator('.tablet-menu-button')
+    await expect(menuButton).toBeHidden()
+    const sidebar = page.locator('#dashboard-navigation')
+    await expect(sidebar).toBeVisible()
+    await expect.poll(async () => {
+      const sidebarBox = await sidebar.boundingBox()
+      return sidebarBox ? Math.abs(sidebarBox.x) : Number.POSITIVE_INFINITY
+    }).toBeLessThanOrEqual(1)
+  } finally {
+    await context.close()
+  }
+})
+
+test('a square viewport follows the portrait right-side floating menu rule', async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The orientation boundary regression runs once in Chromium')
+  const context = await browser.newContext({
+    baseURL: 'http://127.0.0.1:4173',
+    colorScheme: 'light',
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
+    hasTouch: true,
+    isMobile: true,
+    userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    viewport: { width: 900, height: 900 },
+    screen: { width: 900, height: 900 },
+  })
+  try {
+    const page = await context.newPage()
+    await installTabletMocks(page, { authenticated: true })
+    await page.goto('/dashboard/overview')
     const menuButton = page.locator('.tablet-menu-button')
     await expect(menuButton).toBeVisible()
     await menuButton.click()
@@ -240,8 +275,6 @@ test('mobile landscape uses the right-side floating drawer', async ({ browser },
       const viewportWidth = await page.evaluate(() => window.innerWidth)
       return sidebarBox ? Math.abs((sidebarBox.x + sidebarBox.width) - viewportWidth) : Number.POSITIVE_INFINITY
     }).toBeLessThanOrEqual(1)
-    await page.keyboard.press('Escape')
-    await expect(menuButton).toHaveAttribute('aria-expanded', 'false')
   } finally {
     await context.close()
   }

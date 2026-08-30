@@ -13,23 +13,12 @@ const expandedMenus = ref({})
 const tabletMenuOpen = ref(false)
 const tabletMenuButton = ref(null)
 const tabletSidebar = ref(null)
-const mobileDevice = ref(detectMobileDevice())
 const mappingAlert = ref(null)
 const robots = ref([])
 let mappingPollTimer = null
 let mappingAlertEventSource = null
 let lastMappingAlertKey = ''
 let mappingStatusRefreshing = false
-
-function detectMobileDevice() {
-  if (typeof navigator === 'undefined') return false
-  if (navigator.userAgentData?.mobile === true) return true
-  const userAgent = String(navigator.userAgent || '')
-  const iPadOS = navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1
-  return iPadOS || /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent)
-}
-
-const drawerNavigation = computed(() => mobileDevice.value)
 
 const menuItems = [
   { label: '保安值守', path: '/dashboard/guard-duty' },
@@ -76,7 +65,6 @@ function expandActiveMenu() {
 }
 
 async function openTabletMenu() {
-  if (!drawerNavigation.value) return
   expandActiveMenu()
   tabletMenuOpen.value = true
   document.body.classList.add('tablet-menu-locked')
@@ -100,6 +88,10 @@ function handleTabletMenuKeydown(event) {
   if (event.key === 'Escape' && tabletMenuOpen.value) {
     closeTabletMenu({ returnFocus: true })
   }
+}
+
+function handleOrientationChange() {
+  closeTabletMenu()
 }
 
 function isMenuActive(item) {
@@ -215,6 +207,7 @@ function setupMappingAlertStream() {
 onMounted(() => {
   expandActiveMenu()
   document.addEventListener('keydown', handleTabletMenuKeydown)
+  window.addEventListener('orientationchange', handleOrientationChange)
   refreshMappingAlerts()
   mappingPollTimer = window.setInterval(refreshMappingAlerts, 2000)
   setupMappingAlertStream()
@@ -222,6 +215,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', handleTabletMenuKeydown)
+  window.removeEventListener('orientationchange', handleOrientationChange)
   document.body.classList.remove('tablet-menu-locked')
   if (mappingPollTimer) window.clearInterval(mappingPollTimer)
   mappingAlertEventSource?.close()
@@ -235,16 +229,10 @@ watch(() => route.path, () => {
   refreshMappingAlerts()
 })
 
-watch(drawerNavigation, (enabled) => {
-  if (!enabled) closeTabletMenu()
-})
 </script>
 
 <template>
-  <div
-    class="dashboard-shell"
-    :class="drawerNavigation ? 'drawer-navigation' : 'desktop-navigation'"
-  >
+  <div class="dashboard-shell orientation-navigation">
     <header class="tablet-app-bar">
       <button
         ref="tabletMenuButton"
@@ -265,7 +253,7 @@ watch(drawerNavigation, (enabled) => {
     </header>
 
     <button
-      v-if="drawerNavigation && tabletMenuOpen"
+      v-if="tabletMenuOpen"
       class="tablet-menu-backdrop"
       type="button"
       aria-label="关闭导航菜单"
@@ -276,7 +264,7 @@ watch(drawerNavigation, (enabled) => {
       id="dashboard-navigation"
       ref="tabletSidebar"
       class="sidebar"
-      :class="{ 'tablet-open': drawerNavigation && tabletMenuOpen }"
+      :class="{ 'tablet-open': tabletMenuOpen }"
       aria-label="平台导航"
     >
       <div class="brand-block">
@@ -433,16 +421,16 @@ watch(drawerNavigation, (enabled) => {
   background: #7a4e00;
 }
 
-@media (min-width: 0px) {
+@media (orientation: portrait) {
   :global(body.tablet-menu-locked) {
     overflow: hidden;
   }
 
-  .dashboard-shell.drawer-navigation {
+  .dashboard-shell.orientation-navigation {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .drawer-navigation .tablet-app-bar {
+  .orientation-navigation .tablet-app-bar {
     position: sticky;
     z-index: 1100;
     top: 0;
@@ -458,7 +446,7 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: blur(22px);
   }
 
-  .drawer-navigation .tablet-menu-button {
+  .orientation-navigation .tablet-menu-button {
     display: grid;
     place-content: center;
     gap: 5px;
@@ -472,16 +460,16 @@ watch(drawerNavigation, (enabled) => {
     transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
   }
 
-  .drawer-navigation .tablet-menu-button:hover {
+  .orientation-navigation .tablet-menu-button:hover {
     border-color: var(--cyan);
     background: var(--menu-active-bg);
   }
 
-  .drawer-navigation .tablet-menu-button[aria-expanded="true"] {
+  .orientation-navigation .tablet-menu-button[aria-expanded="true"] {
     transform: rotate(90deg);
   }
 
-  .drawer-navigation .tablet-menu-button span {
+  .orientation-navigation .tablet-menu-button span {
     display: block;
     width: 21px;
     height: 2px;
@@ -490,13 +478,13 @@ watch(drawerNavigation, (enabled) => {
     transition: transform 0.2s ease, opacity 0.2s ease;
   }
 
-  .drawer-navigation .tablet-app-title {
+  .orientation-navigation .tablet-app-title {
     display: grid;
     min-width: 0;
     gap: 2px;
   }
 
-  .drawer-navigation .tablet-app-title span {
+  .orientation-navigation .tablet-app-title span {
     overflow: hidden;
     color: var(--muted);
     font-size: 12px;
@@ -504,14 +492,14 @@ watch(drawerNavigation, (enabled) => {
     white-space: nowrap;
   }
 
-  .drawer-navigation .tablet-app-title strong {
+  .orientation-navigation .tablet-app-title strong {
     overflow: hidden;
     font-size: 18px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .drawer-navigation .tablet-user {
+  .orientation-navigation .tablet-user {
     max-width: 120px;
     overflow: hidden;
     color: var(--muted);
@@ -520,7 +508,7 @@ watch(drawerNavigation, (enabled) => {
     white-space: nowrap;
   }
 
-  .drawer-navigation .tablet-menu-backdrop {
+  .orientation-navigation .tablet-menu-backdrop {
     position: fixed;
     z-index: 1150;
     inset: 0;
@@ -534,7 +522,7 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: blur(2px);
   }
 
-  .drawer-navigation .sidebar {
+  .orientation-navigation .sidebar {
     position: fixed;
     z-index: 1200;
     inset: 0 auto 0 0;
@@ -550,36 +538,36 @@ watch(drawerNavigation, (enabled) => {
     transition: transform 0.22s ease, visibility 0.22s ease;
   }
 
-  .drawer-navigation .sidebar.tablet-open {
+  .orientation-navigation .sidebar.tablet-open {
     transform: translateX(0);
     visibility: visible;
     pointer-events: auto;
   }
 
-  .drawer-navigation .sidebar .menu-list {
+  .orientation-navigation .sidebar .menu-list {
     display: grid;
     overflow: visible;
     gap: 8px;
     padding-bottom: 0;
   }
 
-  .drawer-navigation .sidebar .menu-item,
-  .drawer-navigation .sidebar .menu-group,
-  .drawer-navigation .sidebar .menu-group-header,
-  .drawer-navigation .sidebar .menu-subitem {
+  .orientation-navigation .sidebar .menu-item,
+  .orientation-navigation .sidebar .menu-group,
+  .orientation-navigation .sidebar .menu-group-header,
+  .orientation-navigation .sidebar .menu-subitem {
     width: 100%;
   }
 
-  .drawer-navigation .sidebar .menu-group {
+  .orientation-navigation .sidebar .menu-group {
     position: static;
   }
 
-  .drawer-navigation .sidebar .menu-subgroup {
+  .orientation-navigation .sidebar .menu-subgroup {
     width: 100%;
     min-width: 0;
   }
 
-  .drawer-navigation .sidebar .menu-submenu {
+  .orientation-navigation .sidebar .menu-submenu {
     position: static;
     width: 100%;
     padding: 6px 0 0 12px;
@@ -588,30 +576,30 @@ watch(drawerNavigation, (enabled) => {
     box-shadow: none;
   }
 
-  .drawer-navigation .sidebar .menu-third-level {
+  .orientation-navigation .sidebar .menu-third-level {
     padding-left: 20px;
   }
 
-  .drawer-navigation .desktop-page-heading {
+  .orientation-navigation .desktop-page-heading {
     display: none;
   }
 
-  .drawer-navigation .main-header {
+  .orientation-navigation .main-header {
     justify-content: flex-end;
     margin-bottom: 14px;
   }
 
-  .drawer-navigation .header-actions {
+  .orientation-navigation .header-actions {
     width: 100%;
   }
 
-  .drawer-navigation .mapping-live-alert {
+  .orientation-navigation .mapping-live-alert {
     align-items: flex-start;
   }
 }
 
-@media (min-width: 0px) {
-  .drawer-navigation .tablet-app-bar {
+@media (orientation: portrait) {
+  .orientation-navigation .tablet-app-bar {
     position: fixed;
     top: 12px;
     right: 12px;
@@ -626,24 +614,24 @@ watch(drawerNavigation, (enabled) => {
     backdrop-filter: none;
   }
 
-  .drawer-navigation .tablet-app-title,
-  .drawer-navigation .tablet-user {
+  .orientation-navigation .tablet-app-title,
+  .orientation-navigation .tablet-user {
     display: none;
   }
 
-  .drawer-navigation .tablet-menu-button {
+  .orientation-navigation .tablet-menu-button {
     box-shadow: 0 10px 28px rgba(25, 55, 90, 0.22);
     backdrop-filter: blur(18px);
   }
 
-  .drawer-navigation .sidebar {
+  .orientation-navigation .sidebar {
     inset: 0 0 0 auto;
     border-right: 0;
     border-left: 1px solid var(--line);
     transform: translateX(105%);
   }
 
-  .drawer-navigation .main-layout {
+  .orientation-navigation .main-layout {
     padding-top: 78px;
   }
 }
@@ -659,89 +647,90 @@ watch(drawerNavigation, (enabled) => {
   }
 }
 
-/* Device mode wins over viewport-width breakpoints. A desktop keeps the
-   permanent vertical sidebar at every width; every mobile orientation uses
-   the right-side drawer. */
-.dashboard-shell.desktop-navigation {
-  grid-template-columns: clamp(180px, 18vw, 224px) minmax(0, 1fr);
-  font-size: 14px;
-}
+/* CSS orientation is the only layout switch: portrait means height >= width;
+   landscape means width > height. */
+@media (orientation: landscape) {
+  .dashboard-shell.orientation-navigation {
+    grid-template-columns: clamp(180px, 18vw, 224px) minmax(0, 1fr);
+    font-size: 14px;
+  }
 
-.desktop-navigation .tablet-app-bar,
-.desktop-navigation .tablet-menu-backdrop {
-  display: none;
-}
+  .orientation-navigation .tablet-app-bar,
+  .orientation-navigation .tablet-menu-backdrop {
+    display: none;
+  }
 
-.desktop-navigation .sidebar {
-  position: static;
-  inset: auto;
-  width: auto;
-  max-height: none;
-  overflow: visible;
-  padding: 22px 18px;
-  border-right: 1px solid var(--line);
-  border-bottom: 0;
-  border-left: 0;
-  transform: none;
-  visibility: visible;
-  pointer-events: auto;
-  transition: none;
-}
+  .orientation-navigation .sidebar {
+    position: static;
+    inset: auto;
+    width: auto;
+    max-height: none;
+    overflow: visible;
+    padding: 22px 18px;
+    border-right: 1px solid var(--line);
+    border-bottom: 0;
+    border-left: 0;
+    transform: none;
+    visibility: visible;
+    pointer-events: auto;
+    transition: none;
+  }
 
-.desktop-navigation .sidebar .menu-list {
-  display: grid;
-  overflow: visible;
-  gap: 8px;
-  margin-top: 27px;
-  padding-bottom: 0;
-}
+  .orientation-navigation .sidebar .menu-list {
+    display: grid;
+    overflow: visible;
+    gap: 8px;
+    margin-top: 27px;
+    padding-bottom: 0;
+  }
 
-.desktop-navigation .sidebar .menu-item,
-.desktop-navigation .sidebar .menu-group,
-.desktop-navigation .sidebar .menu-group-header,
-.desktop-navigation .sidebar .menu-subitem {
-  width: 100%;
-  flex: initial;
-}
+  .orientation-navigation .sidebar .menu-item,
+  .orientation-navigation .sidebar .menu-group,
+  .orientation-navigation .sidebar .menu-group-header,
+  .orientation-navigation .sidebar .menu-subitem {
+    width: 100%;
+    flex: initial;
+  }
 
-.desktop-navigation .sidebar .menu-group,
-.desktop-navigation .sidebar .menu-subgroup {
-  position: static;
-  min-width: 0;
-}
+  .orientation-navigation .sidebar .menu-group,
+  .orientation-navigation .sidebar .menu-subgroup {
+    position: static;
+    min-width: 0;
+  }
 
-.desktop-navigation .sidebar .menu-submenu {
-  position: static;
-  z-index: auto;
-  top: auto;
-  left: auto;
-  width: 100%;
-  padding: 6px 0 0 12px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-}
+  .orientation-navigation .sidebar .menu-submenu {
+    position: static;
+    z-index: auto;
+    top: auto;
+    left: auto;
+    width: 100%;
+    padding: 6px 0 0 12px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
 
-.desktop-navigation .sidebar .menu-third-level {
-  padding-left: 20px;
-}
+  .orientation-navigation .sidebar .menu-third-level {
+    padding-left: 20px;
+  }
 
-.desktop-navigation .main-layout {
-  min-width: 0;
-  padding: 19px;
-}
+  .orientation-navigation .main-layout {
+    min-width: 0;
+    padding: 19px;
+  }
 
-.desktop-navigation .desktop-page-heading {
-  display: block;
-}
+  .orientation-navigation .desktop-page-heading {
+    display: block;
+  }
 
-.desktop-navigation .main-header {
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
+  .orientation-navigation .main-header {
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
 
-.desktop-navigation .header-actions {
-  width: auto;
+  .orientation-navigation .header-actions {
+    width: auto;
+  }
 }
 </style>
