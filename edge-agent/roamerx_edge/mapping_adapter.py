@@ -676,6 +676,9 @@ class MappingAdapter:
 
     def _run_post_save_validation(self, map_dir: str, kind: str) -> None:
         command = os.environ.get("ROAMERX_POST_SAVE_VALIDATION_CMD", "").strip()
+        if not command:
+            checker = Path(__file__).resolve().parents[2] / "robot" / "script" / "robot" / "post_save_static_localization_check.py"
+            command = f"python3 {checker} --mapping-type {{mapping_type}}"
         result_state, detail = ("unavailable", "未配置真实静止定位验证命令")
         if command:
             try:
