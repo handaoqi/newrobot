@@ -861,12 +861,17 @@ class TaskExecutor:
                 waypoints[index].get("localization_mode")
             ) != start_correction_mode:
                 return index
+            waypoint = waypoints[index]
+            # A heading-constrained waypoint must be the final pose of its
+            # own goal.  The goal-yaw profile is selected from the batch
+            # target, so keeping it behind a pass-through waypoint would make
+            # Nav2 accept the position while ignoring the requested turn.
+            if bool(waypoint.get("require_yaw", False)):
+                return index
             if index == end - 1:
                 break
-            waypoint = waypoints[index]
             if (
-                bool(waypoint.get("require_yaw", False))
-                or float(waypoint.get("dwell_seconds") or 0) > 0
+                float(waypoint.get("dwell_seconds") or 0) > 0
                 or bool(waypoint.get("speech_template_id"))
             ):
                 return index + 1

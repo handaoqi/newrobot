@@ -660,8 +660,11 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     )
 
     executor.start_task(envelope)
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2"]
-    assert nav.waypoint_profiles[0] == (False, False, False)
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert nav.waypoint_profiles[0] == (False, False, True)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    assert nav.waypoint_profiles[-1] == (False, True, True)
     nav.result("succeeded", "", {"missed_waypoints": []})
     assert ids(nav.sent[-1]) == ["wp-3"]
     assert nav.waypoint_profiles[-1] == (True, False, True)
