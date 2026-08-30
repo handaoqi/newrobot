@@ -1015,16 +1015,33 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
 
 class PatrolRouteSummarySerializer(PatrolRouteSerializer):
     waypoint_count = serializers.SerializerMethodField()
+    latest_execution = serializers.SerializerMethodField()
 
     class Meta(PatrolRouteSerializer.Meta):
         fields = [
             "id", "name", "map_data", "map_name", "map_set", "map_set_name", "robot",
             "robot_name", "robot_code", "waypoint_count", "description", "scene_scope",
-            "created_at", "updated_at",
+            "latest_execution", "created_at", "updated_at",
         ]
 
     def get_waypoint_count(self, obj):
         return len(obj.waypoints or [])
+
+    def get_latest_execution(self, obj):
+        prefetched = getattr(obj, "recent_executions", None)
+        execution = prefetched[0] if prefetched else None
+        if execution is None and prefetched is None:
+            execution = obj.executions.order_by("-created_at").first()
+        if execution is None:
+            return None
+        return {
+            "id": str(execution.id),
+            "task_id": execution.task_id,
+            "state": execution.state,
+            "created_at": execution.created_at,
+            "started_at": execution.started_at,
+            "finished_at": execution.finished_at,
+        }
 
 
 class ZoneSerializer(serializers.ModelSerializer):

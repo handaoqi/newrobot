@@ -611,20 +611,24 @@ onBeforeUnmount(() => {
 .execution-page {
   display: grid;
   grid-template-columns: 360px 1fr;
+  align-items: start;
   gap: 20px;
-  height: calc(100vh - 136px);
-  min-height: 680px;
+  min-height: calc(100vh - 136px);
 }
 
 .execution-sidebar {
   display: grid;
   gap: 16px;
   align-content: start;
-  overflow: auto;
+  overflow: visible;
 }
 
 .execution-map-panel {
+  position: sticky;
+  top: 24px;
   min-width: 0;
+  height: calc(100vh - 136px);
+  min-height: 680px;
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 12px;
@@ -1028,6 +1032,12 @@ onBeforeUnmount(() => {
 
   .execution-map-layer {
     min-width: 680px;
+  }
+
+  .execution-map-panel {
+    position: static;
+    height: auto;
+    min-height: 680px;
   }
 }
 

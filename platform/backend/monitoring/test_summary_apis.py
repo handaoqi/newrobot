@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import MapData, MapSet, MapSetMember, PatrolRoute, PatrolTask, Robot, Track
+from .models import MapData, MapSet, MapSetMember, PatrolRoute, PatrolTask, Robot, TaskExecution, Track
 
 
 class SummaryListApiTests(TestCase):
@@ -26,12 +26,12 @@ class SummaryListApiTests(TestCase):
             waypoints=[{"x": index, "y": index + 1} for index in range(4)],
             waypoint_names=["one", "two", "three", "four"],
         )
-        task = PatrolTask.objects.create(
+        self.task = PatrolTask.objects.create(
             name="summary task", robot=self.robot, route=self.route, route_name=self.route.name,
             scheduled_start=timezone.now(), scheduled_end=timezone.now() + timedelta(hours=1),
         )
         self.track = Track.objects.create(
-            robot=self.robot, map_data=self.map, route=self.route, task=task,
+            robot=self.robot, map_data=self.map, route=self.route, task=self.task,
             path=[[1, 2, 3], [2, 3, 4], [3, 4, 5]], start_time=timezone.now(), duration=9,
         )
 
@@ -51,6 +51,7 @@ class SummaryListApiTests(TestCase):
 
         routes = self.client.get("/api/routes/?view=summary")
         self.assertEqual(routes.data[0]["waypoint_count"], 4)
+        self.assertIsNone(routes.data[0]["latest_execution"])
         self.assertNotIn("waypoints", routes.data[0])
 
         tracks = self.client.get("/api/tracks/?view=summary")
@@ -66,3 +67,19 @@ class SummaryListApiTests(TestCase):
         full_tracks = self.client.get("/api/tracks/")
         self.assertIn("path", full_tracks.data[0])
         self.assertIn("path", self.client.get(f"/api/tracks/{self.track.id}/").data)
+
+    def test_route_summary_includes_latest_execution_time_and_state(self):
+        execution = TaskExecution.objects.create(
+            task=self.task,
+            robot=self.robot,
+            route=self.route,
+            map_data=self.map,
+            route_snapshot={},
+            state="completed",
+        )
+
+        route = self.client.get("/api/routes/?view=summary").data[0]
+
+        self.assertEqual(route["latest_execution"]["id"], str(execution.id))
+        self.assertEqual(route["latest_execution"]["state"], "completed")
+        self.assertIsNotNone(route["latest_execution"]["created_at"])

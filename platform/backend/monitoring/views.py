@@ -3378,8 +3378,17 @@ class PatrolRouteListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        summary = request.query_params.get("view") == "summary"
         routes = PatrolRoute.objects.select_related("robot", "map_data", "map_set").all()
-        serializer_class = PatrolRouteSummarySerializer if request.query_params.get("view") == "summary" else PatrolRouteSerializer
+        if summary:
+            routes = routes.prefetch_related(
+                Prefetch(
+                    "executions",
+                    queryset=TaskExecution.objects.order_by("-created_at")[:1],
+                    to_attr="recent_executions",
+                )
+            )
+        serializer_class = PatrolRouteSummarySerializer if summary else PatrolRouteSerializer
         serializer = serializer_class(routes, many=True)
         return Response(serializer.data)
 

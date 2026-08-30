@@ -41,13 +41,13 @@ const tasks = [
   },
 ]
 
-test('guard duty keeps the first configured task first and sorts remaining history by execution time', () => {
-  assert.deepEqual(guardDutyTaskOptions(tasks, 1).map((task) => task.id), [75, 51, 62])
+test('guard duty sorts executed tasks by command creation time before tasks that never ran', () => {
+  assert.deepEqual(guardDutyTaskOptions(tasks, 1).map((task) => task.id), [51, 62, 75])
 })
 
-test('an old rejected execution never replaces a first task that has not run', () => {
+test('the most recently executed task is selected when no task is active', () => {
   const options = guardDutyTaskOptions(tasks, 1)
-  assert.equal(initialGuardDutyExecution(options), null)
+  assert.equal(initialGuardDutyExecution(options)?.id, 'completed-execution')
 })
 
 test('an active execution takes precedence so operators retain its controls', () => {
@@ -69,5 +69,17 @@ test('disabled and other-robot tasks are omitted from the selector', () => {
     { id: 80, robot: 1, enabled: false, scheduled_start: '2026-08-26T00:00:00Z' },
     { id: 81, robot: 2, enabled: true, scheduled_start: '2026-08-27T00:00:00Z' },
   ]
-  assert.deepEqual(guardDutyTaskOptions(extraTasks, 1).map((task) => task.id), [75, 51, 62])
+  assert.deepEqual(guardDutyTaskOptions(extraTasks, 1).map((task) => task.id), [51, 62, 75])
+})
+
+test('a running task remains selectable even if its template was disabled after launch', () => {
+  const runningDisabled = {
+    id: 90,
+    robot: 1,
+    enabled: false,
+    latest_execution: { id: 'active-disabled', state: 'running', created_at: '2026-08-19T12:00:00Z' },
+  }
+  const options = guardDutyTaskOptions([...tasks, runningDisabled], 1)
+  assert.equal(options[0].id, 90)
+  assert.equal(initialGuardDutyExecution(options)?.id, 'active-disabled')
 })

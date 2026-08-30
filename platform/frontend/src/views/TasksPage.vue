@@ -11,6 +11,7 @@ import {
   fetchRouteSummaries,
   updatePatrolTask,
 } from '../services/api'
+import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
 
 const router = useRouter()
 const tasks = ref([])
@@ -18,6 +19,8 @@ const robots = ref([])
 const routes = ref([])
 const error = ref('')
 const savingRecordTaskId = ref(null)
+const executingTaskId = ref(null)
+const executionProgress = ref('')
 const form = ref({ name: '', robot: '', route: '', description: '', enabled: true, record_rosbag: false })
 
 const routeOptions = computed(() => {
@@ -92,11 +95,22 @@ async function createTask() {
 
 async function execute(task) {
   error.value = ''
+  executingTaskId.value = task.id
+  executionProgress.value = '正在检查机器狗地图'
   try {
+    await activateAndRelocalizeMap({
+      mapId: task.map_id,
+      robotId: task.robot,
+      onProgress: message => { executionProgress.value = message },
+    })
+    executionProgress.value = '地图与定位已就绪，正在下发巡检任务'
     const execution = await executePatrolTask(task.id)
     router.push(`/dashboard/task-executions/${execution.id}`)
   } catch (exc) {
     error.value = exc.message
+  } finally {
+    executingTaskId.value = null
+    executionProgress.value = ''
   }
 }
 
@@ -189,6 +203,7 @@ onMounted(load)
     </section>
 
     <section class="panel detail-panel">
+      <p v-if="executionProgress" class="muted-note execution-progress">{{ executionProgress }}</p>
       <div class="task-list">
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div>
@@ -208,7 +223,9 @@ onMounted(load)
             </label>
             <span class="panel-badge">{{ task.latest_execution?.state || '未执行' }}</span>
             <button v-if="task.latest_execution" class="ghost-btn" @click="router.push(`/dashboard/task-executions/${task.latest_execution.id}`)">详情</button>
-            <button class="primary-btn" :disabled="!task.enabled" @click="execute(task)">立即执行</button>
+            <button class="primary-btn" :disabled="!task.enabled || executingTaskId !== null" @click="execute(task)">
+              {{ executingTaskId === task.id ? '准备执行中...' : '立即执行' }}
+            </button>
             <button class="ghost-btn danger-btn" @click="removeTask(task)">删除</button>
             <button class="ghost-btn danger-btn" @click="forceRemoveTask(task)">强制删除</button>
           </div>
@@ -262,5 +279,11 @@ onMounted(load)
 .task-record-toggle input {
   width: 16px;
   height: 16px;
+}
+
+.execution-progress {
+  margin: -4px 0 14px;
+  color: var(--cyan);
+  font-weight: 700;
 }
 </style>

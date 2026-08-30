@@ -49,6 +49,8 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
+import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
+import { preferredExecutedItem } from '../utils/executionSelection'
 
 const maps = ref([])
 const mapSets = ref([])
@@ -134,6 +136,7 @@ let drillAudio = null
 let drillAudioResolve = null
 let navigationStatusRefreshing = false
 let inspectionPointSequence = 0
+let initialSelectionApplied = false
 
 const routeForm = ref({
   name: '',
@@ -183,8 +186,14 @@ async function loadData() {
     if (templatesResult.status === 'fulfilled') speechTemplates.value = templatesResult.value
     else console.error('加载播报文案失败:', templatesResult.reason)
     seedRobotsFromMapsAndRoutes()
-    if (!selectedMap.value && maps.value.length) {
-      void handleMapSelect(maps.value.find(map => map.active) || maps.value[0])
+    if (!initialSelectionApplied) {
+      initialSelectionApplied = true
+      const preferredRoute = preferredExecutedItem(routes.value)
+      if (preferredRoute) {
+        await handleLoadRoute(preferredRoute)
+      } else if (maps.value.length) {
+        await handleMapSelect(maps.value.find(map => map.active) || maps.value[0])
+      }
     }
   } catch (error) {
     console.error('加载数据失败:', error)
@@ -257,6 +266,9 @@ function seedRobotsFromMapsAndRoutes() {
 async function handleMapSelect(map) {
   selectedMap.value = map
   selectedRoute.value = null
+  lastExecution.value = null
+  taskMapExecution.value = null
+  taskMapTrajectory.value = []
   resetWaypointExpansion()
   waypoints.value = []
   waypointNames.value = []
@@ -871,10 +883,16 @@ async function handleSaveRoute() {
 }
 
 async function handleLoadRoute(route) {
+  const routeSummary = route
   if (!route.waypoints) {
-    route = await fetchRouteDetail(route.id)
+    route = {
+      ...routeSummary,
+      ...await fetchRouteDetail(route.id),
+      latest_execution: routeSummary.latest_execution || null,
+    }
   }
   selectedRoute.value = route
+  lastExecution.value = route.latest_execution || null
   resetWaypointExpansion()
   let routeMap = maps.value.find(m => String(m.id) === String(route.map_data))
     || (String(selectedMap.value?.id || '') === String(route.map_data) ? selectedMap.value : null)
@@ -1350,6 +1368,45 @@ async function handleExecuteRoute() {
   } finally {
     routeExecuteBusy.value = false
   }
+}
+
+async function handleActivateSelectedMap() {
+  const robotId = selectedRobot.value?.id
+  if (!selectedMap.value?.id || !robotId || navCommandBusy.value) return
+  navCommandBusy.value = 'map-activate'
+  navError.value = ''
+  localizationInitState.value = 'waiting_convergence'
+  localizationInitMessage.value = '正在检查机器狗地图'
+  try {
+    const result = await activateAndRelocalizeMap({
+      mapId: selectedMap.value.id,
+      robotId,
+      onProgress: message => { localizationInitMessage.value = message },
+    })
+    navStatus.value = result.navigationStatus
+    localizationInitState.value = 'done'
+    localizationInitMessage.value = '地图下发完成，定位与导航已就绪'
+  } catch (error) {
+    localizationInitState.value = 'failed'
+    localizationInitMessage.value = error.message || '地图下发失败'
+    navError.value = localizationInitMessage.value
+  } finally {
+    navCommandBusy.value = ''
+    await refreshNavigationStatus()
+  }
+}
+
+function formatExecutionCreatedAt(value) {
+  if (!value) return '未执行'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function routeExecutionOptionText(route) {
+  const latest = route.latest_execution
+  return latest ? ` · ${formatExecutionCreatedAt(latest.created_at)}` : ' · 未执行'
 }
 
 function toggleInitialPoseMode() {
@@ -2339,9 +2396,12 @@ async function handleDeleteRoute(route) {
               <select class="route-selector" :value="selectedRoute?.id || ''" @change="handleRouteSelect($event.target.value)">
                 <option value="">请选择已保存路线</option>
                 <option v-for="route in routes" :key="route.id" :value="route.id">
-                  {{ route.name }}（{{ route.waypoint_count }} 个途经点）
+                  {{ route.name }}（{{ route.waypoint_count }} 个途经点）{{ routeExecutionOptionText(route) }}
                 </option>
               </select>
+              <small v-if="selectedRoute" class="route-last-execution">
+                上次执行：{{ formatExecutionCreatedAt(selectedRoute.latest_execution?.created_at) }}
+              </small>
               <button type="button" class="route-list-toggle" @click="toggleRouteList">
                 {{ routeListOpen ? '收起路线列表' : '展开路线列表' }}
               </button>
@@ -2383,6 +2443,11 @@ async function handleDeleteRoute(route) {
             <p v-if="navError" class="form-error">{{ navError }}</p>
             <div class="nav-actions">
               <button class="btn btn-sm" :disabled="!!navCommandBusy" @click="refreshNavigationStatus">刷新状态</button>
+              <button
+                class="btn btn-sm btn-primary"
+                :disabled="!!navCommandBusy || !selectedMap || !selectedRobot || navStatus?.connection_status !== 'online'"
+                @click="handleActivateSelectedMap"
+              >{{ navCommandBusy === 'map-activate' ? '下发并定位中...' : '下发地图' }}</button>
               <button class="btn btn-sm btn-primary" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="sendNavigationCommand('start')">启动导航栈</button>
               <button class="btn btn-sm" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="sendNavigationCommand('restart')">重启</button>
               <button class="btn btn-sm" :disabled="!!navCommandBusy || navStatus?.connection_status !== 'online'" @click="sendNavigationCommand('recover')">恢复</button>
@@ -2433,7 +2498,7 @@ async function handleDeleteRoute(route) {
               最近命令 {{ navStatus.command.command_type }} · {{ navStatus.command.status }}
             </small>
             <small v-if="lastExecution" class="command-note">
-              最近执行 {{ lastExecution.id }} · {{ lastExecution.state }}
+              最近执行 {{ lastExecution.id }} · {{ lastExecution.state }} · {{ formatExecutionCreatedAt(lastExecution.created_at) }}
             </small>
             <small v-if="localizationInitMessage" class="command-note">
               定位初始化 {{ localizationInitState }} · {{ localizationInitMessage }}
@@ -3507,6 +3572,13 @@ async function handleDeleteRoute(route) {
   color: var(--text);
   background: var(--input-bg);
   font: inherit;
+}
+
+.route-last-execution {
+  display: block;
+  margin-top: 0.45rem;
+  color: var(--muted);
+  font-size: 0.72rem;
 }
 
 .route-list-toggle {

@@ -248,6 +248,14 @@ function formatTime(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+function formatExecutionTime(value) {
+  if (!value) return '未执行'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString('zh-CN', { hour12: false })
+}
+
 function executionStateLabel(state) {
   return ({
     created: '准备中',
@@ -1114,6 +1122,7 @@ watch(playUrlKey, () => {
             <div class="guard-task-state">
               <span>执行状态</span>
               <strong>{{ taskStateText }}</strong>
+              <small>执行时间：{{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}</small>
             </div>
             <div class="guard-task-actions">
               <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
@@ -1349,6 +1358,7 @@ watch(playUrlKey, () => {
 .guard-task-bar > div { display: grid; gap: 5px; min-width: 0; }
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guard-task-state small { overflow: hidden; color: #70808c; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; }
 .guard-task-actions > button { width: 100%; min-width: 0; padding-inline: 10px; font-size: 11px; white-space: nowrap; }
 .guard-task-selector { display: grid; gap: 5px; min-width: 0; }
