@@ -288,6 +288,7 @@ class EdgeAgentApplication:
                     "nav.stop",
                     "nav.initial_pose",
                     "nav.relocalize",
+                    "nav.single_goal",
                     "sensor.restart",
                     "charge.start",
                     "charge.stop",

@@ -737,6 +737,12 @@ export async function executeRoute(routeId, {
   })
 }
 
+export async function navigateSingleGoal(robotId, payload) {
+  return request(`/robots/${robotId}/navigation/single-goal/`, {
+    method: 'POST', body: JSON.stringify(payload),
+  })
+}
+
 export async function fetchZones() {
   return request('/zones/')
 }

@@ -15,7 +15,7 @@ MAPPING_COMMAND_TYPES = {
 }
 NAV_COMMAND_TYPES = {
     "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",
-    "nav.initial_pose", "nav.relocalize",
+    "nav.initial_pose", "nav.relocalize", "nav.single_goal",
 }
 MAP_COMMAND_TYPES = {"map.activate", "map.optimize"}
 SENSOR_COMMAND_TYPES = {"sensor.restart"}
@@ -208,6 +208,12 @@ def validate_command(envelope: MessageEnvelope) -> None:
             value = command.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"nav.initial_pose {field} must be numeric")
+    if envelope.message_type == "nav.single_goal":
+        command = payload["command"]
+        for field in ("x", "y", "yaw"):
+            value = command.get(field)
+            if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ProtocolError("INVALID_MESSAGE", f"nav.single_goal {field} must be numeric")
     if envelope.message_type == "nav.relocalize":
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]

@@ -3105,6 +3105,28 @@ class RobotNavigationInitialPoseView(APIView):
         return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
 
+class RobotNavigationSingleGoalView(APIView):
+    """通过 Nav2 直接执行一个地图坐标目标，不创建巡逻任务。"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        if robot.effective_connection_status() != "online":
+            return Response({"detail": "机器狗 Edge Agent 当前离线，无法执行单点导航。"}, status=status.HTTP_409_CONFLICT)
+        try:
+            coords = {field: float(request.data[field]) for field in ("x", "y", "yaw")}
+        except (TypeError, ValueError, KeyError):
+            return Response({"detail": "单点导航需要数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
+        command = CommandService.create_robot_command(
+            robot=robot, command_type="nav.single_goal",
+            payload={"reason": "route_planner_single_goal", "frame_id": request.data.get("frame_id") or "map",
+                     "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
+                     "map_version": request.data.get("map_version") or robot.current_map_version or "",
+                     "require_yaw": bool(request.data.get("require_yaw", True)), **coords},
+            operator=request.user if request.user.is_authenticated else None, expiry_seconds=180)
+        return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
+
+
 class RobotNavigationStartView(RobotNavigationCommandView):
     command_type = "nav.start"
 

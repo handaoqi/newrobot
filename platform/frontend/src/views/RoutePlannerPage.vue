@@ -19,6 +19,7 @@ import {
   updateRoute,
   deleteRoute,
   executeRoute,
+  navigateSingleGoal,
   sendRobotNavigationCommand,
   restartRobotSensor,
   synthesizeSpeech,
@@ -106,6 +107,7 @@ const mapImageNaturalWidth = ref(0)
 const waypointYawDrafts = ref([])
 const waypointYawErrors = ref([])
 const waypointYawConfirmed = ref([])
+const singleGoalIndex = ref(null)
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   taskMapExecution.value,
   taskMapTrajectory.value,
@@ -519,6 +521,20 @@ function confirmWaypointYaw(index) {
 
 function waypointYawDegrees(point) {
   return normalizeHeadingDegrees(Number(point?.yaw || 0) * 180 / Math.PI) ?? 0
+}
+
+async function executeSingleGoal(index) {
+  const robotId = selectedRobot.value?.id || selectedMap.value?.robot
+  const point = waypoints.value[index]
+  if (!robotId || !selectedMap.value?.id || !point || navCommandBusy.value) return
+  if (!waypointYawConfirmed.value[index]) { navError.value = '请先确认该途经点方向角'; return }
+  if (!confirm(`确认通过云平台导航到${waypointNames.value[index] || `点${index + 1}`}？`)) return
+  navCommandBusy.value = 'single-goal'; singleGoalIndex.value = index; navError.value = ''
+  try {
+    await navigateSingleGoal(robotId, { frame_id: 'map', x: Number(point.x), y: Number(point.y), yaw: Number(point.yaw || 0), require_yaw: Boolean(point.require_yaw), map_id: selectedMap.value.id, map_version: selectedMapVersion() })
+    navError.value = `已下发单点导航：${waypointNames.value[index] || `点${index + 1}`}`
+  } catch (error) { navError.value = error.message || '单点导航下发失败' }
+  finally { navCommandBusy.value = ''; singleGoalIndex.value = null; await refreshNavigationStatus() }
 }
 
 function setWaypointBoolean(index, field, value) {
@@ -2287,6 +2303,7 @@ async function handleDeleteRoute(route) {
                         {{ isWaypointExpanded(index) ? '收起' : '展开' }}
                       </button>
                       <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                      <button type="button" class="btn btn-sm" :disabled="!!navCommandBusy || !selectedMap" @click="executeSingleGoal(index)">{{ singleGoalIndex === index ? '下发中…' : '单点导航' }}</button>
                       <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
                     </div>
                     <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">

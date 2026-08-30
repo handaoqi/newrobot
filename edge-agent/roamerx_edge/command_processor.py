@@ -260,7 +260,16 @@ class CommandProcessor:
 
     def _execute_navigation(self, envelope: MessageEnvelope, started_at: str) -> dict:
         command = envelope.payload.get("command") or {}
-        if envelope.message_type == "nav.status":
+        if envelope.message_type == "nav.single_goal":
+            navigation = getattr(self.task_executor, "navigation", None)
+            if navigation is None:
+                raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation adapter is not configured")
+            goal = {"x": float(command["x"]), "y": float(command["y"]), "yaw": float(command["yaw"]), "require_yaw": bool(command.get("require_yaw", True))}
+            accepted = navigation.send_waypoints([goal], lambda *_: None, lambda *_: None)
+            if not accepted:
+                raise ProtocolError("NAV_GOAL_REJECTED", "Nav2 rejected the single-point goal")
+            result_payload = {"accepted": True, "goal": goal}
+        elif envelope.message_type == "nav.status":
             if not self.navigation_stack_adapter:
                 raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
             result_payload = self.navigation_stack_adapter.status()
