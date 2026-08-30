@@ -320,6 +320,19 @@ NX 为 Ubuntu 22.04 + ROS 2 Humble + Jetson/厂商驱动环境。完整传感器
 
 ### 6.2 ROS 与构建依赖
 
+先执行仓库内的 NX 系统依赖初始化任务。该任务可重复执行；它会安装 `sysstat`（提供任务诊断使用的 `pidstat`）并校验命令可用性。`tegrastats` 由批准的 NVIDIA JetPack/L4T 基础镜像提供，初始化任务会检查它，但不会用通用 apt 包替换 NVIDIA 版本：
+
+```bash
+cd /home/dogrobot
+deploy/nx-edge/deploy.sh --init-system-deps
+```
+
+首次安装 systemd 服务时，`--install-service` 会自动包含上述系统依赖初始化任务，无需重复传参：
+
+```bash
+deploy/nx-edge/deploy.sh --install-service
+```
+
 先按 ROS 2 官方 Ubuntu 22.04/Humble 流程安装 `ros-humble-desktop`，随后在 NX 安装仓库定义的导航依赖：
 
 ```bash
@@ -365,7 +378,7 @@ source install/setup.bash
 
 ```bash
 cd /home/dogrobot
-deploy/robot/deploy.sh --host robot@<NX_IP> --build
+deploy/nx-edge/deploy.sh --host robot@<NX_IP> --init-system-deps --build
 ```
 
 源码和构建产物统一位于 `/home/dogrobot`。地图、rosbag、Edge 配置与数据、模型和厂商 SDK 位于 `/home/dogrobot/runtime/nx-edge`；真实配置和 `data/` 被 Git 忽略。`/home/robot` 下的对应路径仅为兼容链接，发布或拉取代码时不得覆盖 runtime 数据。

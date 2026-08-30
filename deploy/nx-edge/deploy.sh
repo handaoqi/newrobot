@@ -9,21 +9,25 @@ EDGE_RUNTIME_DIR="${ROAMERX_EDGE_RUNTIME_DIR:-/home/dogrobot/runtime/nx-edge}"
 TARGET_REPO_ROOT="$(dirname "$ROBOT_PROJECT_DIR")"
 BUILD=false
 INSTALL_SERVICE=false
+INIT_SYSTEM_DEPS=false
 DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--build] [--install-service] [--dry-run]
+Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--init-system-deps] [--build] [--install-service] [--dry-run]
 
 Runtime configuration, state, maps, build outputs and logs are preserved.
+--init-system-deps installs and verifies required NX runtime packages.
+--install-service includes --init-system-deps automatically.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) ROBOT_HOST="${2:?missing host}"; shift ;;
+    --init-system-deps) INIT_SYSTEM_DEPS=true ;;
     --build) BUILD=true ;;
-    --install-service) INSTALL_SERVICE=true ;;
+    --install-service) INSTALL_SERVICE=true; INIT_SYSTEM_DEPS=true ;;
     --dry-run) DRY_RUN=true ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -46,11 +50,17 @@ target_path() {
 }
 
 if "$DRY_RUN"; then
-  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge=$EDGE_SOURCE_DIR runtime=$EDGE_RUNTIME_DIR build=$BUILD install_service=$INSTALL_SERVICE"
+  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge=$EDGE_SOURCE_DIR runtime=$EDGE_RUNTIME_DIR init_system_deps=$INIT_SYSTEM_DEPS build=$BUILD install_service=$INSTALL_SERVICE"
   exit 0
 fi
 
 remote_exec "mkdir -p '$ROBOT_PROJECT_DIR' '$EDGE_SOURCE_DIR' '$EDGE_RUNTIME_DIR/data/edge-agent' '$EDGE_RUNTIME_DIR/conf'"
+
+if "$INIT_SYSTEM_DEPS"; then
+  rsync -a "$REPO_ROOT/deploy/nx-edge/init-system-deps.sh" "$(target_path /tmp/roamerx-init-nx-system-deps.sh)"
+  remote_exec "chmod 0755 /tmp/roamerx-init-nx-system-deps.sh && /tmp/roamerx-init-nx-system-deps.sh"
+fi
+
 if [[ -n "$ROBOT_HOST" || "$(readlink -f "$REPO_ROOT/robot")" != "$(readlink -f "$ROBOT_PROJECT_DIR")" ]]; then
   rsync -a --exclude='build/' --exclude='install/' --exclude='log/' \
     "$REPO_ROOT/robot/" "$(target_path "$ROBOT_PROJECT_DIR/")"
