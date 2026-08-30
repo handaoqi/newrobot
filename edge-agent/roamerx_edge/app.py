@@ -829,6 +829,7 @@ class EdgeAgentApplication:
             "y": float(latest.y),
             "z": float(getattr(latest, "z", 0.0) or 0.0),
             "yaw": float(latest.yaw),
+            "source": "last_trusted",
         }
 
     def _localization_waypoint_seeds(self) -> list[dict]:
