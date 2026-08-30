@@ -7,6 +7,7 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   initialPoseCommandOutcome,
+  localizationReadyForReuse,
   normalizeHeadingDegrees,
   normalizeRoutePlannerTelemetry,
   normalizeRtkQuality,
@@ -48,6 +49,21 @@ test('map click mode has one explicit action and initial pose takes precedence',
   assert.equal(resolveMapClickAction('waypoint'), 'waypoint')
   assert.equal(resolveMapClickAction('inspect'), 'inspect')
   assert.equal(resolveMapClickAction('waypoint', true), 'initial_pose')
+})
+
+test('retained normal localization is not reused when the stack or samples are stale', () => {
+  const healthy = {
+    mapMatches: true,
+    navReady: true,
+    localizationStatus: 'normal',
+    initializationVerified: true,
+    localizationSampleStale: false,
+    localizationQualityStale: false,
+  }
+  assert.equal(localizationReadyForReuse(healthy), true)
+  assert.equal(localizationReadyForReuse({ ...healthy, navReady: false }), false)
+  assert.equal(localizationReadyForReuse({ ...healthy, localizationSampleStale: true }), false)
+  assert.equal(localizationReadyForReuse({ ...healthy, localizationQualityStale: true }), false)
 })
 
 test('confirmed inspection points append independently and can be removed with contiguous display order', () => {

@@ -48,6 +48,12 @@ class TelemetryService:
         map_set = payload.get("map_set") or {}
         localization_quality = dict(localization.get("quality") or {})
         localization_quality["decision"] = dict(localization.get("decision") or {})
+        if localization.get("sampled_at") is not None:
+            localization_quality["localization_sampled_at"] = localization["sampled_at"]
+        if "fresh" in localization:
+            localization_quality["localization_fresh"] = bool(localization["fresh"])
+        if localization.get("sample_age_seconds") is not None:
+            localization_quality["localization_sample_age_seconds"] = localization["sample_age_seconds"]
         if map_set:
             localization_quality["map_set"] = map_set
         execution = None

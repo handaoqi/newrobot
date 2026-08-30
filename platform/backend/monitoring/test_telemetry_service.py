@@ -54,6 +54,9 @@ class TelemetryServiceTests(TestCase):
                 "sampled_at": timezone.now().isoformat(),
                 "state_version": 1,
                 "localization": {
+                    "sampled_at": "2026-08-30T12:00:00+00:00",
+                    "fresh": True,
+                    "sample_age_seconds": 0.2,
                     "status": "normal",
                     "quality": {"matching_error": 0.12},
                     "decision": {
@@ -77,6 +80,8 @@ class TelemetryServiceTests(TestCase):
 
         self.assertEqual(latest.localization_quality["decision"]["active_source"], "rtk_imu")
         self.assertEqual(latest.localization_quality["decision"]["rtk_x"], 12.3)
+        self.assertEqual(latest.localization_quality["localization_sampled_at"], "2026-08-30T12:00:00+00:00")
+        self.assertTrue(latest.localization_quality["localization_fresh"])
 
         serialized_quality = RobotStatusSerializer(latest).data["localization_quality"]
         self.assertEqual(serialized_quality["matching_error"], 0.12)

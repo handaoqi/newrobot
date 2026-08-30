@@ -19,6 +19,8 @@ LOCALIZATION_STATUS = {
     4: "lost",
 }
 
+LOCALIZATION_SAMPLE_STALE_SECONDS = 10.0
+
 RTK_QUALITY_ALIASES = {
     "fixed": "fixed",
     "rtk_fixed": "fixed",
@@ -66,6 +68,7 @@ class TelemetryCollector:
         self.safety_state = safety_state
         self._lock = threading.Lock()
         self._pose: PoseSnapshot | None = None
+        self._pose_sampled_monotonic = 0.0
         self._localization_quality: LocalizationQualitySnapshot | None = None
         self._localization_decision: dict = {}
         # Progress of an in-flight localization recovery. Empty when not recovering.
@@ -229,6 +232,7 @@ class TelemetryCollector:
 
     def on_localization(self, msg) -> None:
         status = LOCALIZATION_STATUS.get(int(msg.status), "unknown")
+        sampled_monotonic = time.monotonic()
         with self._lock:
             previous_status = self.safety_state.localization_status
             self._pose = PoseSnapshot(
@@ -242,11 +246,12 @@ class TelemetryCollector:
                 source_status=int(msg.status),
                 coord_type=int(msg.coord_type),
             )
+            self._pose_sampled_monotonic = sampled_monotonic
             self._state_version += 1
             self.safety_state.localization_status = status
             if status == "normal":
                 if previous_status != "normal":
-                    self.safety_state.localization_normal_since_monotonic = time.monotonic()
+                    self.safety_state.localization_normal_since_monotonic = sampled_monotonic
             else:
                 self.safety_state.localization_normal_since_monotonic = 0.0
 
@@ -399,6 +404,21 @@ class TelemetryCollector:
             pose = self._pose
             quality = self._localization_quality
             now_monotonic = time.monotonic()
+            localization_age = (
+                max(0.0, now_monotonic - self._pose_sampled_monotonic)
+                if pose and self._pose_sampled_monotonic
+                else None
+            )
+            localization_fresh = bool(
+                localization_age is not None
+                and localization_age <= LOCALIZATION_SAMPLE_STALE_SECONDS
+            )
+            if not localization_fresh and self.safety_state.localization_status != "unknown":
+                # The heartbeat itself can remain fresh after localization was
+                # stopped. Never admit a task using that retained normal pose.
+                self.safety_state.localization_status = "unknown"
+                self.safety_state.localization_normal_since_monotonic = 0.0
+                self._state_version += 1
             power_fresh = bool(
                 self.power_available
                 and now_monotonic - self._power_sampled_monotonic <= self._system_probe_stale_seconds
@@ -428,8 +448,11 @@ class TelemetryCollector:
                     "speed_mps": pose.speed_mps if pose else None,
                 },
                 "localization": {
-                    "status": pose.localization_status if pose else "unknown",
-                    "source_status": pose.source_status if pose else None,
+                    "sampled_at": pose.sampled_at if pose else None,
+                    "fresh": localization_fresh,
+                    "sample_age_seconds": round(localization_age, 3) if localization_age is not None else None,
+                    "status": pose.localization_status if pose and localization_fresh else "unknown",
+                    "source_status": pose.source_status if pose and localization_fresh else None,
                     "coord_type": pose.coord_type if pose else None,
                     "quality": {
                         "sampled_at": quality.sampled_at,

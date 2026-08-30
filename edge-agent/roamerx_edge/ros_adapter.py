@@ -1176,6 +1176,26 @@ class RosAdapter(Node):
                     details=details,
                 ) from handoff_exc
 
+    def initial_pose_subscriber_ready(self) -> bool:
+        """Return whether the localization node can currently receive a seed."""
+        return self._initial_pose_pub.get_subscription_count() > 0
+
+    def wait_for_initial_pose_subscriber(
+        self,
+        timeout_seconds: float = 0.0,
+        generation: int | None = None,
+    ) -> bool:
+        """Wait for the real /initialpose consumer, not a stale ROS graph node."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            if generation is not None:
+                self._assert_localization_operation(generation)
+            if self.initial_pose_subscriber_ready():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
     def _set_initial_pose_once(self, pose: dict, generation: int) -> dict:
         self._assert_localization_operation(generation)
         yaw = float(pose.get("yaw", 0.0))
@@ -1195,11 +1215,10 @@ class RosAdapter(Node):
         msg.pose.covariance[0] = float(pose.get("covariance_x", 0.25))
         msg.pose.covariance[7] = float(pose.get("covariance_y", 0.25))
         msg.pose.covariance[35] = float(pose.get("covariance_yaw", 0.0685))
-        subscriber_deadline = time.monotonic() + float(pose.get("subscriber_wait_seconds", 15.0))
-        while self._initial_pose_pub.get_subscription_count() == 0 and time.monotonic() < subscriber_deadline:
-            self._assert_localization_operation(generation)
-            time.sleep(0.2)
-        if self._initial_pose_pub.get_subscription_count() == 0:
+        if not self.wait_for_initial_pose_subscriber(
+            timeout_seconds=float(pose.get("subscriber_wait_seconds", 15.0)),
+            generation=generation,
+        ):
             raise ProtocolError("LOCALIZATION_UNAVAILABLE", "/initialpose has no localization subscriber")
         with self._localization_sample_condition:
             sample_sequence = self._localization_sample_sequence

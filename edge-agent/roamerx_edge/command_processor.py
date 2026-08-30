@@ -184,6 +184,77 @@ class CommandProcessor:
             raise ProtocolError("NAV_STACK_NOT_READY", message)
         self.safety.state.nav_ready = True
 
+    def _wait_for_initial_pose_subscriber(self, timeout_seconds: float) -> bool:
+        """Probe the concrete localization seed receiver when the adapter supports it."""
+        wait_for_subscriber = getattr(
+            self.localization_adapter,
+            "wait_for_initial_pose_subscriber",
+            None,
+        )
+        # Test adapters and older optional integrations do not expose the ROS
+        # publisher. Their own pose call remains the authoritative check.
+        if not callable(wait_for_subscriber):
+            return True
+        return bool(wait_for_subscriber(timeout_seconds=timeout_seconds))
+
+    def _ensure_initial_pose_subscriber(self) -> dict | None:
+        """Start localization without waiting for the pose it is about to receive.
+
+        ``nav.start`` intentionally waits for localization status=3 before it
+        starts Nav2. Therefore it cannot be used to prepare a cold
+        ``nav.initial_pose`` command: status=3 itself depends on that seed.
+        ``restart_localization`` stops after the node and map service are ready,
+        which breaks that dependency cycle.
+        """
+        if self._wait_for_initial_pose_subscriber(1.0):
+            return None
+        if not self.navigation_stack_adapter:
+            raise ProtocolError(
+                "LOCALIZATION_UNAVAILABLE",
+                "/initialpose has no localization subscriber and the localization stack cannot be started",
+            )
+
+        acquired = self._navigation_command_lock.acquire(blocking=False)
+        if not acquired:
+            # A concurrent nav.start/restart owns the stack lock. It may still
+            # be bringing up localization, so let it create the subscriber
+            # while this pose command remains free to seed it.
+            if self._wait_for_initial_pose_subscriber(45.0):
+                return None
+            raise ProtocolError(
+                "LOCALIZATION_UNAVAILABLE",
+                "/initialpose subscriber did not appear while the navigation stack was starting",
+            )
+        try:
+            if self._wait_for_initial_pose_subscriber(0.0):
+                return None
+            bootstrap = self.navigation_stack_adapter.restart_localization()
+        finally:
+            self._navigation_command_lock.release()
+
+        if not self._wait_for_initial_pose_subscriber(30.0):
+            raise ProtocolError(
+                "LOCALIZATION_UNAVAILABLE",
+                "localization was started but /initialpose still has no subscriber",
+                details={"localization_bootstrap": bootstrap},
+            )
+        return bootstrap
+
+    def _start_navigation_after_localization(self) -> dict:
+        if not self.navigation_stack_adapter:
+            raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
+        if not self._navigation_command_lock.acquire(blocking=True, timeout=45.0):
+            raise ProtocolError("NAV_COMMAND_BUSY", "another navigation command is still running")
+        try:
+            result = self.navigation_stack_adapter.start({"reason": "initial_pose_bootstrap"})
+            self._await_navigation_stack_ready(
+                timeout_seconds=45.0,
+                message="Nav2 did not become ready after localization initialization",
+            )
+            return result
+        finally:
+            self._navigation_command_lock.release()
+
     def _release_manual_control_for_task(self) -> None:
         """Clear manual input before a navigation task takes control."""
         if self.person_follow_controller:
@@ -290,6 +361,7 @@ class CommandProcessor:
             # creates a deadlock where localization can never be initialized.
             if not self.localization_adapter:
                 raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
+            localization_bootstrap = self._ensure_initial_pose_subscriber()
             if envelope.message_type == "nav.initial_pose":
                 if str(command.get("seed_source") or "") == "rtk":
                     result_payload = self.localization_adapter.set_initial_pose_from_rtk(
@@ -311,6 +383,10 @@ class CommandProcessor:
                 else:
                     seed = self._resolve_localization_seed(command)
                     result_payload = self.localization_adapter.active_relocalize(seed)
+            if localization_bootstrap is not None:
+                result_payload = dict(result_payload or {})
+                result_payload["localization_bootstrap"] = localization_bootstrap
+                result_payload["navigation_start"] = self._start_navigation_after_localization()
         else:
             wait_seconds = 90.0 if envelope.message_type in {
                 "nav.start", "nav.restart", "nav.recover",

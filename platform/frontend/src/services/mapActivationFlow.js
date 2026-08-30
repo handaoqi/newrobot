@@ -91,26 +91,13 @@ export async function activateAndRelocalizeMap({
   }
 
   navigationStatus = await fetchRobotNavigationStatus(robotId)
-  const liveStatus = navigationStatus.status || {}
-  if (!(liveStatus.nav_ready ?? navigationStatus.nav_ready)) {
-    onProgress('地图已应用，正在启动导航栈')
-    const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-    })
-    await waitForRobotCommand(robotId, startCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => onProgress(`启动导航栈：${latest.status || 'created'}`),
-    })
-    navigationStatus = await fetchRobotNavigationStatus(robotId)
-  }
 
   if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
     onProgress('地图、定位与导航均已就绪')
     return { changed: !mapMatches, navigationStatus }
   }
 
-  onProgress('地图已应用，正在使用最近可信位置重定位')
+  onProgress('地图已应用，正在准备定位栈并使用最近可信位置重定位')
   try {
     const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
       map_id: String(mapId),

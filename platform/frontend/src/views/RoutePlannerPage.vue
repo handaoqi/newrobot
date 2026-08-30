@@ -36,6 +36,7 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   initialPoseCommandOutcome,
+  localizationReadyForReuse,
   normalizeHeadingDegrees,
   normalizeRoutePlannerTelemetry,
   paginateKeyframes,
@@ -1319,28 +1320,25 @@ async function initializeLocalization() {
   navError.value = ''
   try {
     const currentDecision = localizationQuality()?.decision || {}
-    if (robotMapMatches() && localizationLabel() === 'normal' && currentDecision.initialization?.verified === true) {
+    const currentStatus = navStatus.value?.status || {}
+    if (localizationReadyForReuse({
+      mapMatches: robotMapMatches(),
+      navReady: (currentStatus.nav_ready ?? navStatus.value?.nav_ready) === true,
+      localizationStatus: localizationLabel(),
+      initializationVerified: currentDecision.initialization?.verified === true,
+      localizationSampleStale: localizationSampleStale(),
+      localizationQualityStale: localizationQualityStale(),
+    })) {
       localizationInitState.value = 'done'
       localizationInitMessage.value = '当前地图定位已经过连续帧验证，无需覆盖初始位姿'
       return
     }
-    const restartCommand = await sendRobotNavigationCommand(robotId, 'restart', {
-      map_id: selectedMap.value?.id,
-      map_version: selectedMapVersion(),
-    })
-    await waitForRobotCommand(robotId, restartCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => {
-        localizationInitMessage.value = `正在重启导航/定位栈 · ${latest.status || 'created'}`
-      },
-    })
-    await refreshNavigationStatus()
     localizationInitState.value = 'sending_pose'
     const rtk = normalizeRoutePlannerTelemetry(navStatus.value?.status).rtk
     const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
     localizationInitMessage.value = useFixedRtk
-      ? '检测到可融合 RTK Fix，正在下发 RTK XY 和航向'
-      : 'RTK Fix 不可用，正在搜索全图位置与 360° 航向'
+      ? '正在准备定位栈，并下发 RTK XY 和航向'
+      : '正在准备定位栈，并搜索全图位置与 360° 航向'
     const localizationCommand = await sendRobotNavigationCommand(robotId, useFixedRtk ? 'initial-pose' : 'relocalize', {
       seed_source: useFixedRtk ? 'rtk' : 'global',
       map_id: selectedMap.value?.id,
@@ -1666,7 +1664,14 @@ function sampleIsStale(value, thresholdMs = 10000) {
 }
 
 function localizationSampleStale() {
-  return sampleIsStale(navStatus.value?.status?.sampled_at)
+  const status = navStatus.value?.status || {}
+  const quality = status.localization_quality || {}
+  if (quality.localization_fresh === false) return true
+  return sampleIsStale(
+    quality.localization_sampled_at
+    || quality.sampled_at
+    || status.sampled_at,
+  )
 }
 
 function localizationQualityStale(quality = localizationQuality()) {

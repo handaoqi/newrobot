@@ -27,10 +27,12 @@ def test_status_timestamp_advances_without_new_localization(monkeypatch):
     assert first["sampled_at"] == "status-time-1"
     assert second["sampled_at"] == "status-time-2"
     assert first["state_version"] == second["state_version"] == 1
+    assert first["localization"]["sampled_at"] == "pose-time"
+    assert first["localization"]["fresh"] is True
 
 
 def test_localization_normal_timer_resets_on_every_non_normal_state(monkeypatch):
-    monotonic_values = iter((10.0, 20.0))
+    monotonic_values = iter((10.0, 11.0, 12.0, 20.0))
     monkeypatch.setattr(
         "roamerx_edge.telemetry_collector.time.monotonic",
         lambda: next(monotonic_values),
@@ -58,6 +60,39 @@ def test_localization_normal_timer_resets_on_every_non_normal_state(monkeypatch)
     assert state.localization_normal_since_monotonic == 0.0
     collector.on_localization(message(3))
     assert state.localization_normal_since_monotonic == 20.0
+
+
+def test_stale_localization_sample_cannot_remain_normal(monkeypatch):
+    monotonic = {"value": 100.0}
+    monkeypatch.setattr(
+        "roamerx_edge.telemetry_collector.time.monotonic",
+        lambda: monotonic["value"],
+    )
+    state = RuntimeSafetyState(nav_ready=False)
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        state,
+    )
+    collector.on_localization(SimpleNamespace(
+        status=3,
+        pos=SimpleNamespace(x=1.0, y=2.0, z=0.0),
+        rpy=SimpleNamespace(z=0.5),
+        speed=0.0,
+        coord_type=0,
+    ))
+
+    fresh = collector.build_status_snapshot()
+    assert fresh["localization"]["status"] == "normal"
+    assert fresh["localization"]["fresh"] is True
+
+    monotonic["value"] = 111.0
+    stale = collector.build_status_snapshot()
+    assert stale["localization"]["status"] == "unknown"
+    assert stale["localization"]["source_status"] is None
+    assert stale["localization"]["fresh"] is False
+    assert stale["localization"]["sample_age_seconds"] == 11.0
+    assert state.localization_status == "unknown"
+    assert state.localization_normal_since_monotonic == 0.0
 
 
 def test_power_and_network_are_only_reported_while_fresh(monkeypatch):

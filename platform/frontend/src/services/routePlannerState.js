@@ -130,6 +130,23 @@ export function resolveMapClickAction(mode, initialPoseMode = false) {
   return mode === 'inspect' ? 'inspect' : 'waypoint'
 }
 
+/** A retained `normal` label is reusable only while the live stack and samples agree. */
+export function localizationReadyForReuse({
+  mapMatches,
+  navReady,
+  localizationStatus,
+  initializationVerified,
+  localizationSampleStale,
+  localizationQualityStale,
+} = {}) {
+  return mapMatches === true
+    && navReady === true
+    && localizationStatus === 'normal'
+    && initializationVerified === true
+    && localizationSampleStale === false
+    && localizationQualityStale === false
+}
+
 function finitePose(value) {
   if (!value || typeof value !== 'object') return null
   const numeric = field => field === null || field === undefined || field === ''

@@ -538,6 +538,63 @@ def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
     store.close()
 
 
+def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.initial_pose"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"x": 1.0, "y": 2.0, "yaw": 0.5}
+
+    class ColdNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.subscriber_ready = False
+            self.subscriber_waits = []
+
+        def wait_for_initial_pose_subscriber(self, timeout_seconds=0.0):
+            self.subscriber_waits.append(timeout_seconds)
+            return self.subscriber_ready
+
+    class ColdStack(FakeNavigationStack):
+        def __init__(self, navigation):
+            super().__init__()
+            self.navigation = navigation
+            self.restart_localization_calls = 0
+
+        def restart_localization(self):
+            self.restart_localization_calls += 1
+            self.navigation.subscriber_ready = True
+            return {"action": "restart-localization", "returncode": 0}
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = ColdNavigation()
+    stack = ColdStack(navigation)
+    state = RuntimeSafetyState(localization_status="unknown", nav_ready=False)
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        navigation_stack_adapter=stack,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    payload = result["payload"]["result"]
+    assert result["payload"]["status"] == "succeeded"
+    assert stack.restart_localization_calls == 1
+    assert navigation.initial_pose["x"] == 1.0
+    assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
+    assert payload["localization_bootstrap"]["action"] == "restart-localization"
+    assert payload["navigation_start"]["action"] == "start"
+    assert state.nav_ready is True
+    store.close()
+
+
 def test_nav_initial_pose_bypasses_stack_management_lock(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.initial_pose"
