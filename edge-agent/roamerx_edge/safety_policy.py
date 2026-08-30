@@ -121,5 +121,8 @@ class SafetyPolicy:
 
     @staticmethod
     def validate_cancel(state: str) -> None:
-        if state not in {"running", "paused", "pausing", "resuming", "interrupted"}:
+        if state not in {
+            "running", "paused", "pausing", "resuming", "interrupted",
+            "completed", "failed", "cancelled", "timed_out", "rejected",
+        }:
             raise ProtocolError("INVALID_TASK_STATE", f"cannot cancel from {state}")

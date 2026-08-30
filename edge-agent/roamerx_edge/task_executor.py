@@ -1073,6 +1073,20 @@ class TaskExecutor:
         with self._lock:
             self._assert_execution(execution_id)
             self._stop_obstacle_monitor()
+            if self.context.state in self.TERMINAL_STATES:
+                # A task can finish between the low-battery active-state check
+                # and this locked cancellation. Preserve its real terminal
+                # outcome and avoid waiting on a Nav2 goal that no longer
+                # exists. Repeated calls intentionally return the same result.
+                self._stop_task_rosbag()
+                self.navigation.stop_motion()
+                return {
+                    "final_task_state": self.context.state,
+                    "state_version": self.context.state_version,
+                    "robot_stopped": True,
+                    "already_terminal": True,
+                    "cancel_performed": False,
+                }
             if self.context.state not in {"running", "paused", "pausing", "resuming", "interrupted"}:
                 raise ProtocolError("INVALID_TASK_STATE", f"cannot cancel from {self.context.state}")
             previous_state = self.context.state
@@ -1095,6 +1109,8 @@ class TaskExecutor:
                 "final_task_state": "cancelled",
                 "state_version": self.context.state_version,
                 "robot_stopped": True,
+                "already_terminal": False,
+                "cancel_performed": True,
             }
 
     def on_feedback(

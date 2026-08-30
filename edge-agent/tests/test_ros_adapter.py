@@ -17,11 +17,38 @@ class FakeTelemetry:
     def localization_decision(self):
         return dict(self.decision)
 
+    def on_localization_decision(self, decision):
+        self.decision = dict(decision)
+
 
 def test_fresh_normal_streak_ignores_samples_before_candidate():
     samples = [(10, 3), (11, 3), (12, 3)]
 
     assert RosAdapter._fresh_normal_streak(samples, after_sequence=12) == 0
+
+
+def test_lio_motion_anomaly_bypasses_localization_loss_debounce():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry()
+    adapter._lio_motion_anomaly_notified = False
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    reasons = []
+
+    def on_failure(reason):
+        reasons.append(reason)
+        triggered.set()
+
+    adapter._localization_failure_cb = on_failure
+    message = SimpleNamespace(data='{"lio_motion_anomaly":true,"lio_motion_anomaly_reason":"yaw_rate_exceeded"}')
+
+    adapter._on_localization_decision(message)
+    adapter._on_localization_decision(message)
+
+    assert triggered.wait(1.0)
+    assert reasons == ["lio_motion_anomaly"]
+    assert adapter._localization_recovery_armed is True
 
 
 def test_fresh_normal_streak_requires_consecutive_successes():

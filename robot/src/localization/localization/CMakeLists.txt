@@ -182,6 +182,13 @@ if(BUILD_TESTING)
   target_include_directories(point_cloud_scheduler_test PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+
+  ament_add_gtest(lio_motion_guard_test
+    test/lio_motion_guard_test.cpp
+  )
+  target_include_directories(lio_motion_guard_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
   ament_add_gtest(scan_match_policy_test
     test/scan_match_policy_test.cpp
   )

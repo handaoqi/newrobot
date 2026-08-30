@@ -259,6 +259,61 @@ def test_task_start_repairs_nav_stack_only_when_not_ready(tmp_path):
     store.close()
 
 
+def test_cross_map_docking_switches_map_before_final_validation(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    command = raw["payload"]["command"]
+    command["map"] = {"map_id": "charge-map", "map_version": "dock-v1"}
+    command["docking"] = {"enabled": True, "final_waypoint_index": 2}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=time.monotonic() - 10.0,
+        nav_ready=True,
+        control_mode="autonomous",
+        current_map_id="patrol-map",
+        current_map_version="patrol-v1",
+    )
+    order = []
+
+    class DockMapActivation(FakeMapActivation):
+        def activate(self, map_payload):
+            order.append("activate")
+            state.current_map_id = map_payload["map_id"]
+            state.current_map_version = map_payload["map_version"]
+            return super().activate(map_payload)
+
+    class DockNavigationStack(FakeNavigationStack):
+        def switch_map(self):
+            order.append("switch")
+            return {"action": "switch_map", "returncode": 0}
+
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        map_activation_adapter=DockMapActivation(),
+        navigation_stack_adapter=DockNavigationStack(),
+    )
+
+    ack, _ = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert order == ["activate", "switch"]
+    assert state.current_map_id == "charge-map"
+    assert executor.context.docking["enabled"] is True
+    store.close()
+
+
 def test_duplicate_command_is_not_executed_twice(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     store = LocalStore(str(tmp_path / "edge.db"))

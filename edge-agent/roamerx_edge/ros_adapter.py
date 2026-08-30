@@ -134,6 +134,7 @@ class RosAdapter(Node):
         self._localization_status_samples = deque(maxlen=100)
         self._localization_lost_count = 0
         self._localization_failure_notified = False
+        self._lio_motion_anomaly_notified = False
         self._ndt_failure_count = 0
         self._ndt_failure_notified = False
         self._localization_recovery_pending = False
@@ -254,8 +255,27 @@ class RosAdapter(Node):
         except (TypeError, ValueError, json.JSONDecodeError):
             LOGGER.warning("invalid /localization/decision payload")
             return
-        if isinstance(payload, dict):
-            self.telemetry.on_localization_decision(payload)
+        if not isinstance(payload, dict):
+            return
+        self.telemetry.on_localization_decision(payload)
+        anomaly = bool(payload.get("lio_motion_anomaly"))
+        if not anomaly:
+            self._lio_motion_anomaly_notified = False
+            return
+        if (
+            self._lio_motion_anomaly_notified
+            or not self._localization_failure_cb
+        ):
+            return
+        self._lio_motion_anomaly_notified = True
+        self._localization_failure_notified = True
+        self._localization_recovery_armed = True
+        threading.Thread(
+            target=self._localization_failure_cb,
+            args=("lio_motion_anomaly",),
+            daemon=True,
+            name="lio-motion-anomaly-handler",
+        ).start()
 
     @staticmethod
     def _header_payload(header) -> dict:

@@ -134,9 +134,11 @@ class EdgeAgentApplication:
             config.charge_control,
             self.power_mode_controller,
             self.store,
+            power_refresh=self._refresh_charge_power,
         )
         self.charge_control_adapter.set_low_battery_handler(self._handle_low_battery_charge)
         self._docking_undock_pending = False
+        self.charge_control_adapter.set_charge_started_handler(self._handle_charge_started)
         self.charge_control_adapter.set_full_charge_handler(self._finish_docking_undock)
         self.task_executor.docking_arrived_handler = self._start_docking_charge
         self.audio_control_adapter = AudioControlAdapter(config.audio_control)
@@ -216,20 +218,28 @@ class EdgeAgentApplication:
         if callable(passive):
             passive("passive", {"passive"}, {"passive_failed"}, timeout_seconds=5.0)
         self._docking_undock_pending = True
-        retries = max(1, int(docking.get("charge_retries", 3)))
-        last_result = {}
-        for attempt in range(retries):
-            last_result = self.charge_control_adapter.start()
-            if last_result.get("dock_ready") or last_result.get("charge_stage") not in {"waiting_for_dock", "idle"}:
-                self.task_executor.report_docking_charge("task.docking_charge_started", message="充电条件通过，已发起充电", extra={"charge_stage": last_result.get("charge_stage"), "dock": last_result})
-                LOGGER.info("docking charge accepted on attempt %d", attempt + 1)
-                return
-            time.sleep(2)
-        self._docking_undock_pending = False
-        self.task_executor.report_docking_charge("task.docking_charge_failed", message="充电条件未满足", extra={"dock": last_result})
-        raise ProtocolError(
-            "DOCK_CONTACT_NOT_READY",
-            "充电桩蓝牙、极片或正负极未满足，已重试 3 次: " + str(last_result.get("missing") or "unknown"),
+        result = self.charge_control_adapter.start()
+        if result.get("dock_ready"):
+            return
+        # Reaching the dock and starting its controller is a successful
+        # hand-off. Contact can settle after Nav2 has completed; the pending
+        # monitor owns that wait and starts charging on the first valid sample.
+        self.task_executor.report_docking_charge(
+            "task.docking_contact_waiting",
+            message="充电服务已启动，等待蓝牙与极片接触",
+            extra={"dock": result},
+        )
+
+    def _refresh_charge_power(self) -> dict:
+        power = self.system_telemetry.poll_power()
+        self.power_mode_controller.refresh_service_status(power)
+        return power
+
+    def _handle_charge_started(self, result: dict) -> None:
+        self.task_executor.report_docking_charge(
+            "task.docking_charge_started",
+            message="极片接触已确认，已自动开始充电",
+            extra={"charge_stage": result.get("charge_stage"), "dock": result},
         )
 
     def _finish_docking_undock(self) -> None:
@@ -550,7 +560,11 @@ class EdgeAgentApplication:
             and (context.docking or {}).get("enabled")
         )
         action = "docking_already_active" if docking_active else "return_charge_requested"
-        if self.task_executor.has_active_task() and not docking_active:
+        # Always pass a retained non-docking context through the idempotent
+        # cancel path. It may have become terminal after the snapshot above;
+        # cancel_task then performs only the local zero-velocity safety action
+        # and returns immediately without waiting for Nav2.
+        if context and not docking_active:
             try:
                 self.task_executor.cancel_task(execution_id)
                 LOGGER.warning("low battery cancelled active navigation before automatic return")

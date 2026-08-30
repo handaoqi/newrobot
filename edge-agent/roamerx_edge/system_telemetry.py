@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,10 +53,11 @@ class SystemTelemetryProbe:
         self.runner = runner
         self._last_legacy_status: dict[str, int | bool | None] = {}
         self._last_legacy_status_at = 0.0
+        self._power_poll_lock = threading.Lock()
 
     def poll(self) -> None:
         try:
-            self._poll_power()
+            self.poll_power()
         except Exception:
             LOGGER.warning("failed to read battery telemetry", exc_info=True)
         try:
@@ -70,6 +72,12 @@ class SystemTelemetryProbe:
             self._poll_storage()
         except Exception:
             LOGGER.warning("failed to read storage telemetry", exc_info=True)
+
+    def poll_power(self) -> dict:
+        """Refresh only BMS/dock telemetry and return the new snapshot."""
+        with self._power_poll_lock:
+            self._poll_power()
+            return self.telemetry.latest_power() or {}
 
     def _poll_storage(self) -> None:
         """Report free space, plus whatever retention last deleted.

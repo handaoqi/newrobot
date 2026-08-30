@@ -243,6 +243,39 @@ def test_recovered_callback_rearms_alerting_and_clears_recovery_state():
     assert resumed == [True]
 
 
+def test_low_battery_terminal_context_uses_idempotent_cancel_without_force_exit():
+    application = object.__new__(EdgeAgentApplication)
+    context = SimpleNamespace(task_execution_id="task-1", state="failed", docking={})
+    calls = []
+    application.task_executor = SimpleNamespace(
+        context=context,
+        has_active_task=lambda: False,
+        cancel_task=lambda execution_id: calls.append(("cancel", execution_id)) or {
+            "final_task_state": "failed",
+            "already_terminal": True,
+        },
+        force_exit=lambda _execution_id: calls.append(("force", _execution_id)),
+    )
+    application.navigation = SimpleNamespace(latest_pose=lambda: None)
+    application.safety_state = SimpleNamespace(
+        current_map_id="map-1", current_map_version="v1"
+    )
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(agent_version="test"),
+        charge_control=SimpleNamespace(
+            low_battery_start_percent=20,
+            low_battery_rearm_percent=25,
+        ),
+    )
+    alerts = []
+    application.mqtt = SimpleNamespace(publish_alert=alerts.append)
+
+    application._handle_low_battery_charge("episode-1", 19)
+
+    assert calls == [("cancel", "task-1")]
+    assert alerts[0]["attributes"]["action"] == "return_charge_requested"
+
+
 def test_mapping_divergence_alert_emits_once(monkeypatch):
     application = object.__new__(EdgeAgentApplication)
     application._mapping_divergence_notified = False

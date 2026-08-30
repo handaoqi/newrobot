@@ -60,6 +60,7 @@
 #include <localization/correction_cooldown_gate.hpp>
 #include <localization/correction_policy.hpp>
 #include <localization/global_relocalization_policy.hpp>
+#include <localization/lio_motion_guard.hpp>
 
 #include <localization/msg/scan_matching_status.hpp>
 #include <robots_dog_msgs/srv/load_map.hpp>
@@ -241,6 +242,12 @@ public:
     lio_max_age_s_ = std::max(0.05, declare_parameter<double>("lio_primary.max_age", 0.30));
     lio_max_step_m_ = static_cast<float>(std::max(
       0.10, declare_parameter<double>("lio_primary.max_step_m", 1.50)));
+    lio_max_yaw_step_rad_ = static_cast<float>(std::max(
+      1.0, declare_parameter<double>("lio_primary.max_yaw_step_deg", 12.0))
+      * M_PI / 180.0);
+    lio_max_yaw_rate_radps_ = static_cast<float>(std::max(
+      1.0, declare_parameter<double>("lio_primary.max_yaw_rate_degps", 60.0))
+      * M_PI / 180.0);
     lio_xy_variance_ = static_cast<float>(std::max(
       1e-4, declare_parameter<double>("lio_primary.xy_variance", 0.0025)));
     lio_z_variance_ = static_cast<float>(std::max(
@@ -629,10 +636,13 @@ public:
       RCLCPP_INFO(
         get_logger(),
         "FAST-LIO-only continuous source enabled: topic=%s max_age=%.2fs drift_xy=%.2fm "
-        "drift_yaw=%.1fdeg hysteresis=%d absolute_cap=%.2fm smoothing=[%.2fm/s, %.1fdeg/s] "
+        "drift_yaw=%.1fdeg motion_guard=[%.1fdeg/frame, %.1fdeg/s] hysteresis=%d "
+        "absolute_cap=%.2fm smoothing=[%.2fm/s, %.1fdeg/s] "
         "dynamic_covariance=%s (NDT/RTK intermittent corrections)",
         lio_odom_topic_.c_str(), lio_max_age_s_, lio_drift_xy_m_,
-        lio_drift_yaw_rad_ * 180.0 / M_PI, lio_drift_hysteresis_frames_,
+        lio_drift_yaw_rad_ * 180.0 / M_PI,
+        lio_max_yaw_step_rad_ * 180.0 / M_PI,
+        lio_max_yaw_rate_radps_ * 180.0 / M_PI, lio_drift_hysteresis_frames_,
         lio_max_correction_jump_m_, lio_correction_translation_rate_mps_,
         lio_correction_rotation_rate_radps_ * 180.0 / M_PI,
         lio_dynamic_covariance_enable_ ? "true" : "false");
@@ -1091,12 +1101,16 @@ private:
       Eigen::Isometry3f& pose,
       float* horizontal_variance = nullptr,
       float* vertical_variance = nullptr,
-      float* orientation_variance = nullptr) const {
+      float* orientation_variance = nullptr,
+      rclcpp::Time* odom_stamp = nullptr) const {
     std::lock_guard<std::mutex> lock(lio_odom_mutex_);
     if (!has_lio_odom_) {
       return false;
     }
     pose = poseFromOdometry(latest_lio_odom_);
+    if (odom_stamp) {
+      *odom_stamp = latest_lio_odom_stamp_;
+    }
     if (horizontal_variance) {
       const double candidate = std::max(
         latest_lio_odom_.pose.covariance[0], latest_lio_odom_.pose.covariance[7]);
@@ -1121,14 +1135,49 @@ private:
 
   void reanchorLioToUkf() {
     Eigen::Isometry3f T_lio = Eigen::Isometry3f::Identity();
-    if (!pose_estimator || !currentLioPose(T_lio)) {
+    rclcpp::Time odom_stamp{0, 0, RCL_ROS_TIME};
+    if (!pose_estimator ||
+        !currentLioPose(T_lio, nullptr, nullptr, nullptr, &odom_stamp)) {
       resetLioAnchor();
       return;
     }
     lio_map_T_lio_ = Eigen::Isometry3f(pose_estimator->matrix()) * T_lio.inverse();
     previous_lio_pose_ = T_lio;
+    previous_lio_pose_stamp_ = odom_stamp;
     lio_anchor_valid_ = lio_map_T_lio_.matrix().allFinite();
     lio_has_previous_pose_ = lio_anchor_valid_;
+  }
+
+  void latchLioMotionAnomaly(const LioMotionGuardResult& result) {
+    if (lio_motion_anomaly_active_) {
+      return;
+    }
+    lio_motion_anomaly_active_ = true;
+    lio_motion_anomaly_reason_ = result.reason;
+    lio_motion_anomaly_yaw_step_rad_ = result.yaw_step_rad;
+    lio_motion_anomaly_yaw_rate_radps_ = result.yaw_rate_radps;
+    localization_state_ = 4;
+    active_source_ = "unavailable";
+    resetLioAnchor();
+    RCLCPP_ERROR(
+      get_logger(),
+      "FAST-LIO motion anomaly latched: reason=%s yaw_step=%.1fdeg yaw_rate=%.1fdeg/s; holding last trusted pose",
+      lio_motion_anomaly_reason_.c_str(),
+      lio_motion_anomaly_yaw_step_rad_ * 180.0 / M_PI,
+      lio_motion_anomaly_yaw_rate_radps_ * 180.0 / M_PI);
+    PublishLidarLocalizationInfo();
+  }
+
+  void clearLioMotionAnomaly(const char* source) {
+    if (!lio_motion_anomaly_active_) {
+      return;
+    }
+    RCLCPP_INFO(get_logger(), "FAST-LIO motion anomaly cleared after %s", source);
+    lio_motion_anomaly_active_ = false;
+    lio_motion_anomaly_reason_ = "none";
+    lio_motion_anomaly_yaw_step_rad_ = 0.0;
+    lio_motion_anomaly_yaw_rate_radps_ = 0.0;
+    resetLioAnchor();
   }
 
   CorrectionNoise scanMatchCorrectionNoise(
@@ -1315,9 +1364,14 @@ private:
     float horizontal_variance = lio_xy_variance_;
     float vertical_variance = lio_z_variance_;
     float orientation_variance = lio_orientation_variance_;
+    rclcpp::Time lio_odom_stamp{0, 0, RCL_ROS_TIME};
     if (!currentLioPose(
-          T_lio, &horizontal_variance, &vertical_variance, &orientation_variance) ||
+          T_lio, &horizontal_variance, &vertical_variance, &orientation_variance,
+          &lio_odom_stamp) ||
         !lioOdomFresh(stamp)) {
+      return false;
+    }
+    if (lio_motion_anomaly_active_) {
       return false;
     }
     if (lio_has_previous_pose_) {
@@ -1327,6 +1381,17 @@ private:
           "Rejecting FAST-LIO2 step of %.2fm; waiting to re-anchor on the next healthy scan",
           delta.translation().norm());
         resetLioAnchor();
+        return false;
+      }
+      const double current_yaw = std::atan2(T_lio.rotation()(1, 0), T_lio.rotation()(0, 0));
+      const double previous_yaw = std::atan2(
+        previous_lio_pose_.rotation()(1, 0), previous_lio_pose_.rotation()(0, 0));
+      const auto motion = evaluateLioMotion(
+        {previous_yaw, previous_lio_pose_stamp_.nanoseconds()},
+        {current_yaw, lio_odom_stamp.nanoseconds()},
+        lio_max_yaw_step_rad_, lio_max_yaw_rate_radps_);
+      if (motion.anomaly) {
+        latchLioMotionAnomaly(motion);
         return false;
       }
     }
@@ -1359,6 +1424,7 @@ private:
       T_map.translation(), orientation,
       horizontal_variance, vertical_variance, orientation_variance);
     previous_lio_pose_ = T_lio;
+    previous_lio_pose_stamp_ = lio_odom_stamp;
     lio_has_previous_pose_ = true;
     last_lio_observation_stamp_ = stamp;
     return true;
@@ -2018,6 +2084,7 @@ private:
       horizontal_variance, vertical_variance, heading_variance);
     last_rtk_primary_applied_stamp_ns_ = observation.stamp_ns;
     is_init_success_ = true;
+    clearLioMotionAnomaly("verified RTK relocalization");
     init_match_count_ = 0;
     last_rtk_map_position_ = position;
     last_rtk_map_yaw_ = rtk_yaw;
@@ -2191,8 +2258,15 @@ private:
         << ",\"ndt_score\":" << last_ndt_score_
         << ",\"lio_primary\":" << (enable_lio_primary_ ? "true" : "false")
         << ",\"single_continuous_source_enforced\":" << (enable_lio_primary_ ? "true" : "false")
-        << ",\"lio_healthy\":" << (lioOdomFresh(stamp) ? "true" : "false")
+        << ",\"lio_healthy\":"
+        << (lioOdomFresh(stamp) && !lio_motion_anomaly_active_ ? "true" : "false")
         << ",\"lio_anchored\":" << (lio_anchor_valid_ ? "true" : "false")
+        << ",\"lio_motion_anomaly\":" << (lio_motion_anomaly_active_ ? "true" : "false")
+        << ",\"lio_motion_anomaly_reason\":\"" << lio_motion_anomaly_reason_ << "\""
+        << ",\"lio_yaw_step_deg\":" << lio_motion_anomaly_yaw_step_rad_ * 180.0 / M_PI
+        << ",\"lio_yaw_rate_degps\":" << lio_motion_anomaly_yaw_rate_radps_ * 180.0 / M_PI
+        << ",\"lio_max_yaw_step_deg\":" << lio_max_yaw_step_rad_ * 180.0 / M_PI
+        << ",\"lio_max_yaw_rate_degps\":" << lio_max_yaw_rate_radps_ * 180.0 / M_PI
         << ",\"lio_corrected\":" << (lio_corrected_this_frame_ ? "true" : "false")
         << ",\"lio_stable_frames\":" << lio_stable_frame_count_
         << ",\"lio_schedule_stable\":"
@@ -2965,6 +3039,7 @@ private:
         if (init_match_count_ >= init_match_count_threshold_) {
           advanceGlobalRelocalizationGeneration("local initialization success");
           is_init_success_ = true;
+          clearLioMotionAnomaly("verified NDT relocalization");
           initialized_this_frame = true;
           localization_state_ = 2;
           RCLCPP_INFO(get_logger(), "Init Pose Successful!!!");
@@ -3091,6 +3166,7 @@ private:
     }
     const bool lio_primary = enable_lio_primary_ && is_init_success_ &&
       has_trusted_ndt_pose_ && !rtk_primary && !bridge_active_ &&
+      !lio_motion_anomaly_active_ &&
       lioOdomFresh(rclcpp::Time(stamp));
     bool lio_observation_applied = false;
     if (lio_primary) {
@@ -3187,7 +3263,9 @@ private:
       // A stale FAST-LIO stream is a localization outage, not permission for
       // NDT or RTK to become a second continuous odometry source. Keep scan
       // matching alive for diagnostics/relocalization, but do not drive UKF.
-      if (startBridge(rclcpp::Time(stamp))) {
+      if (lio_motion_anomaly_active_) {
+        active_source_ = "unavailable";
+      } else if (startBridge(rclcpp::Time(stamp))) {
         bridge_pose_valid = !has_odom_delta || applyBridgeDelta(
           odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp));
       } else {
@@ -5087,6 +5165,8 @@ private:
   std::string lio_odom_topic_ = "/odom/lio_odom";
   double lio_max_age_s_ = 0.30;
   float lio_max_step_m_ = 1.50f;
+  float lio_max_yaw_step_rad_ = 12.0f * static_cast<float>(M_PI) / 180.0f;
+  float lio_max_yaw_rate_radps_ = 60.0f * static_cast<float>(M_PI) / 180.0f;
   float lio_xy_variance_ = 0.0025f;
   float lio_z_variance_ = 0.010f;
   float lio_orientation_variance_ = 0.0004f;
@@ -5138,6 +5218,11 @@ private:
   AuxiliaryDriftGate rtk_drift_gate_;
   Eigen::Isometry3f lio_map_T_lio_ = Eigen::Isometry3f::Identity();
   Eigen::Isometry3f previous_lio_pose_ = Eigen::Isometry3f::Identity();
+  rclcpp::Time previous_lio_pose_stamp_{0, 0, RCL_ROS_TIME};
+  bool lio_motion_anomaly_active_ = false;
+  std::string lio_motion_anomaly_reason_ = "none";
+  double lio_motion_anomaly_yaw_step_rad_ = 0.0;
+  double lio_motion_anomaly_yaw_rate_radps_ = 0.0;
   rclcpp::Time last_lio_observation_stamp_{0, 0, RCL_ROS_TIME};
   float lidar_odom_voxel_size_ = 0.40f;
   float lidar_odom_max_correspondence_distance_ = 1.00f;

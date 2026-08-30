@@ -189,6 +189,32 @@ def test_pause_resume_cancel(tmp_path):
     store.close()
 
 
+def test_terminal_task_cancel_is_idempotent_without_nav2_wait(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    executor.context.state = "failed"
+    executor.context.state_version += 1
+
+    first = executor.cancel_task(execution_id)
+    second = executor.cancel_task(execution_id)
+
+    assert first == second
+    assert first["final_task_state"] == "failed"
+    assert first["already_terminal"] is True
+    assert first["cancel_performed"] is False
+    assert nav.cancelled == 0
+    assert nav.stop_commands == 2
+    store.close()
+
+
 def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+from typing import Callable
 
 from .config import ChargeControlConfig
 from .power_mode_controller import PowerModeController
@@ -21,10 +22,12 @@ class ChargeControlAdapter:
         config: ChargeControlConfig,
         power_mode: PowerModeController,
         store=None,
+        power_refresh: Callable[[], dict] | None = None,
     ) -> None:
         self.config = config
         self.power_mode = power_mode
         self.store = store
+        self._power_refresh = power_refresh
         self._lock = threading.RLock()
         self._full_samples = 0
         self._completion_thread: threading.Thread | None = None
@@ -37,11 +40,14 @@ class ChargeControlAdapter:
         self._manual_disconnect_inhibit_until = 0.0
         self._low_battery_start_thread: threading.Thread | None = None
         self._charge_begin_thread: threading.Thread | None = None
+        self._dock_monitor_thread: threading.Thread | None = None
+        self._pending_charge_started_at: float | None = None
         self._state_recovery_thread: threading.Thread | None = None
         self._latest_power: dict = {}
         self._pending_charge = False
         self._low_battery_handler = None
         self._full_charge_handler = None
+        self._charge_started_handler = None
         persisted = store.get_metadata("low_battery_episode") if store else None
         self._low_battery_episode = persisted if isinstance(persisted, dict) else {}
 
@@ -52,23 +58,52 @@ class ChargeControlAdapter:
     def set_full_charge_handler(self, handler) -> None:
         self._full_charge_handler = handler
 
+    def set_charge_started_handler(self, handler) -> None:
+        self._charge_started_handler = handler
+
     def start(self) -> dict:
         with self._lock:
             self._previous_charge_state = None
             self._thermal_recovery_started_at = None
             self._pending_charge = True
+            self._pending_charge_started_at = time.monotonic()
         # The arbiter stops ARC before enabling the vendor helper. The helper
         # then provides per-pole feedback while the robot waits for contact.
         pile = self._set_legacy_pile_state("lying")
-        self._set_charge_stage("waiting_for_dock", self._dock_detail(self._latest_power))
+        diagnostics_refreshed = False
+        refresh_error = ""
+        if self._power_refresh:
+            try:
+                refreshed = self._power_refresh() or {}
+                with self._lock:
+                    self._latest_power = dict(refreshed)
+                diagnostics_refreshed = True
+            except Exception as exc:
+                refresh_error = str(exc)
+                LOGGER.warning("failed to refresh dock status after starting charge service", exc_info=True)
+        detail = (
+            self._dock_detail(self._latest_power)
+            if diagnostics_refreshed or self._latest_power.get("charger_controller_mode") == "legacy"
+            else "充电诊断状态刷新中"
+        )
+        self._set_charge_stage("waiting_for_dock", detail)
         if self._charger_ready(self._latest_power):
             return self._begin_charge()
-        return {
+        self._start_dock_monitor()
+        response = {
             "charge_stage": "waiting_for_dock",
             "charge_pile": pile,
             "dock_ready": False,
-            "missing": self._missing_dock_conditions(self._latest_power),
+            "diagnostics_refreshed": diagnostics_refreshed,
+            "pending_monitor": True,
+            "missing": (
+                self._missing_dock_conditions(self._latest_power)
+                if diagnostics_refreshed else ["充电诊断状态刷新中"]
+            ),
         }
+        if refresh_error:
+            response["diagnostics_refresh_error"] = refresh_error
+        return response
 
     def start_motion_control(self) -> dict:
         snapshot = self.power_mode.snapshot()
@@ -111,6 +146,7 @@ class ChargeControlAdapter:
             if not self._pending_charge:
                 return {"charge_stage": "idle"}
             self._pending_charge = False
+            self._pending_charge_started_at = None
         self._set_charge_stage("starting_charge", "充电桩接触已确认，正在停止运控")
         mode = self.power_mode.enter_cooling()
         motion = self.stop_motion_control()
@@ -122,11 +158,27 @@ class ChargeControlAdapter:
             raise
         self.power_mode.set_auto_charge_enabled(True)
         self._set_charge_stage("waiting_current", "等待 BMS 上报充电电流")
-        return {"power_mode": mode, "motion": motion, "charge": charge, "auto_restore_on_full": True}
+        result = {
+            "charge_stage": "waiting_current",
+            "dock_ready": True,
+            "diagnostics_refreshed": True,
+            "pending_monitor": False,
+            "power_mode": mode,
+            "motion": motion,
+            "charge": charge,
+            "auto_restore_on_full": True,
+        }
+        if self._charge_started_handler:
+            try:
+                self._charge_started_handler(dict(result))
+            except Exception:
+                LOGGER.exception("charge-started callback failed")
+        return result
 
     def stop(self, *, manual: bool = True) -> dict:
         with self._lock:
             self._pending_charge = False
+            self._pending_charge_started_at = None
             if manual:
                 self._low_battery_samples = 0
                 self._manual_disconnect_inhibit_until = (
@@ -453,6 +505,42 @@ class ChargeControlAdapter:
                 name="verified-dock-charge-start",
             )
             self._charge_begin_thread.start()
+
+    def _start_dock_monitor(self) -> None:
+        if not self._power_refresh:
+            return
+        with self._lock:
+            if self._dock_monitor_thread and self._dock_monitor_thread.is_alive():
+                return
+            self._dock_monitor_thread = threading.Thread(
+                target=self._monitor_pending_dock,
+                daemon=True,
+                name="pending-dock-status-monitor",
+            )
+            self._dock_monitor_thread.start()
+
+    def _monitor_pending_dock(self) -> None:
+        interval = max(0.1, float(self.config.dock_status_poll_interval_seconds))
+        timeout = max(interval, float(self.config.dock_contact_wait_timeout_seconds))
+        while True:
+            with self._lock:
+                if not self._pending_charge:
+                    return
+                started_at = self._pending_charge_started_at or time.monotonic()
+                elapsed = time.monotonic() - started_at
+                if elapsed >= timeout:
+                    self._pending_charge = False
+                    self._pending_charge_started_at = None
+                    self._set_charge_stage("error", "等待充电极片接触超时")
+                    LOGGER.error("dock contact was not confirmed within %.1f seconds", timeout)
+                    return
+            time.sleep(interval)
+            try:
+                power = self._power_refresh() or {}
+            except Exception:
+                LOGGER.warning("pending dock status refresh failed", exc_info=True)
+                continue
+            self.observe_power(power)
 
     def _set_charge_stage(self, stage: str, detail: str = "") -> None:
         setter = getattr(self.power_mode, "set_charge_stage", None)

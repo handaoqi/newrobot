@@ -77,11 +77,15 @@ class CommandProcessor:
             if prepared_task_start:
                 self._release_manual_control_for_task()
                 self._ensure_navigation_stack_for_task()
-                self.safety.wait_until_localization_stable()
-                self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
                 docking = ((envelope.payload.get("command") or {}).get("docking") or {})
                 if docking.get("enabled"):
+                    # A return-to-charge route may intentionally use a
+                    # dedicated map. Activate it before the final map and
+                    # localization checks; validating the old patrol map first
+                    # rejects every legitimate cross-map docking task.
                     self._prepare_docking_map(envelope.payload["command"])
+                self.safety.wait_until_localization_stable()
+                self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
                 # The acknowledgement must carry the same task version sequence
                 # as task.started/task.progress.  Previously it reused a
                 # completed task's stale version, causing progress events to be

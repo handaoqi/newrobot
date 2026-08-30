@@ -409,8 +409,105 @@ def test_charge_waits_for_dock_before_stopping_motion():
     result = adapter.start()
 
     assert result["charge_stage"] == "waiting_for_dock"
-    assert "旧版充电诊断未运行" in result["missing"]
+    assert result["missing"] == ["充电诊断状态刷新中"]
+    assert result["diagnostics_refreshed"] is False
     assert power_mode.stages[-1][0] == "waiting_for_dock"
+
+
+def test_charge_start_refreshes_legacy_status_before_reporting_missing_conditions():
+    class FakePowerMode:
+        def __init__(self):
+            self.stages = []
+
+        def snapshot(self):
+            return {"auto_charge_enabled": False, "charge_stage": "waiting_for_dock"}
+
+        def set_charge_stage(self, stage, detail=""):
+            self.stages.append((stage, detail))
+
+    refreshed = {
+        "charger_controller_mode": "legacy",
+        "bluetooth_connected": True,
+        "charge_pin": 0,
+        "negative_contact": 0,
+        "positive_contact": 0,
+    }
+    adapter = ChargeControlAdapter(
+        ChargeControlConfig(), FakePowerMode(), power_refresh=lambda: refreshed
+    )
+    adapter._set_legacy_pile_state = lambda _state: {"action": "legacy_lying"}
+
+    result = adapter.start()
+    with adapter._lock:
+        adapter._pending_charge = False
+    adapter._dock_monitor_thread.join(timeout=1)
+
+    assert result["diagnostics_refreshed"] is True
+    assert "旧版充电诊断未运行" not in result["missing"]
+    assert "充电极片未接触" in result["missing"]
+
+
+def test_pending_dock_monitor_starts_charge_once_after_contact():
+    class FakePowerMode:
+        def snapshot(self):
+            return {"auto_charge_enabled": False, "charge_stage": "waiting_for_dock"}
+
+        def set_charge_stage(self, _stage, _detail=""):
+            return None
+
+    samples = [
+        {
+            "charger_controller_mode": "legacy",
+            "bluetooth_connected": True,
+            "charge_pin": 0,
+            "negative_contact": 0,
+            "positive_contact": 0,
+        },
+        {
+            "charger_controller_mode": "legacy",
+            "bluetooth_connected": True,
+            "charge_pin": 1,
+            "negative_contact": 1,
+            "positive_contact": 1,
+        },
+    ]
+
+    def refresh():
+        return samples.pop(0) if samples else {
+            "charger_controller_mode": "legacy",
+            "bluetooth_connected": True,
+            "charge_pin": 1,
+            "negative_contact": 1,
+            "positive_contact": 1,
+        }
+
+    adapter = ChargeControlAdapter(
+        ChargeControlConfig(
+            dock_status_poll_interval_seconds=0.01,
+            dock_contact_wait_timeout_seconds=1.0,
+        ),
+        FakePowerMode(),
+        power_refresh=refresh,
+    )
+    adapter._set_legacy_pile_state = lambda _state: {"action": "legacy_lying"}
+    calls = []
+
+    def begin_once():
+        with adapter._lock:
+            if not adapter._pending_charge:
+                return {"charge_stage": "idle"}
+            adapter._pending_charge = False
+        calls.append(True)
+        return {"charge_stage": "waiting_current", "dock_ready": True}
+
+    adapter._begin_charge = begin_once
+    result = adapter.start()
+    adapter._dock_monitor_thread.join(timeout=1)
+    if adapter._charge_begin_thread:
+        adapter._charge_begin_thread.join(timeout=1)
+
+    assert result["charge_stage"] == "waiting_for_dock"
+    assert calls == [True]
 
 
 def test_charge_commands_stop_and_restore_3588_runtime_eggs():

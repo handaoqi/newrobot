@@ -42,6 +42,10 @@ localization:
       topic: "/odom/lio_odom"
       max_age: 0.30
       max_step_m: 1.50
+      # Nav2 is capped at 0.35 rad/s (~20 deg/s). These limits retain 3x
+      # dynamic margin while rejecting a one-scan heading discontinuity.
+      max_yaw_step_deg: 12.0
+      max_yaw_rate_degps: 60.0
       xy_variance: 0.0025
       z_variance: 0.010
       orientation_variance: 0.0004
