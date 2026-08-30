@@ -52,7 +52,7 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
-import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
+import { activateAndRelocalizeMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
@@ -910,20 +910,21 @@ async function handleSaveRoute() {
 
   navCommandBusy.value = 'map-activate'
   navError.value = ''
-  localizationInitState.value = 'idle'
-  localizationInitMessage.value = '路线已保存，正在下发路线地图'
+  localizationInitState.value = 'waiting_convergence'
+  localizationInitMessage.value = '路线已保存，正在准备地图、定位与导航栈'
   try {
-    const result = await activateRouteMap({
+    const result = await activateAndRelocalizeMap({
       mapId: savedRoute.map_data,
       robotId: savedRoute.robot,
       onProgress: message => { localizationInitMessage.value = message },
     })
     navStatus.value = result.navigationStatus
-    localizationInitMessage.value = '路线已保存并选中，地图下发完成；定位尚未初始化'
-    alert('路线保存成功，已选中并下发路线地图')
+    localizationInitState.value = 'done'
+    localizationInitMessage.value = '路线已保存并选中，地图、定位与导航栈均已就绪'
+    alert('路线保存成功，地图、定位与导航栈均已就绪')
   } catch (error) {
     localizationInitState.value = 'failed'
-    localizationInitMessage.value = `路线已保存，但地图下发失败：${error.message || '未知错误'}`
+    localizationInitMessage.value = `路线已保存，但导航准备失败：${error.message || '未知错误'}`
     navError.value = localizationInitMessage.value
     alert(localizationInitMessage.value)
   } finally {

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   expectedLegacyMapVersion,
@@ -62,4 +64,17 @@ test('global search fallback is limited to an unavailable or exhausted trusted s
   assert.equal(shouldFallbackToGlobalRelocalization('RELOCALIZATION_SUPERSEDED'), false)
   assert.equal(shouldFallbackToGlobalRelocalization('LOCALIZATION_COMMAND_BUSY'), false)
   assert.equal(shouldFallbackToGlobalRelocalization('NAV_COMMAND_FAILED'), false)
+})
+
+test('saving a route prepares its map, localization and navigation stack', () => {
+  const source = readFileSync(fileURLToPath(
+    new URL('../src/views/RoutePlannerPage.vue', import.meta.url),
+  ), 'utf8')
+  const saveHandler = source.match(
+    /async function handleSaveRoute\(\) \{([\s\S]*?)\n\}\n\nasync function handleLoadRoute/,
+  )?.[1] || ''
+
+  assert.match(saveHandler, /await activateAndRelocalizeMap\(/)
+  assert.doesNotMatch(saveHandler, /await activateRouteMap\(/)
+  assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
 })
