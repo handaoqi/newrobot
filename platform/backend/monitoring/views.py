@@ -907,7 +907,9 @@ class RobotListView(APIView):
 
     def get(self, request):
         ensure_demo_seed()
-        robots = Robot.objects.select_related("charging_map", "charging_route").annotate(
+        robots = Robot.objects.select_related(
+            "charging_map", "charging_route", "latest_status"
+        ).annotate(
             today_alert_count=Count(
                 "events", filter=Q(events__detected_at__date=timezone.localdate())
             )
@@ -920,7 +922,9 @@ class RobotDetailView(APIView):
 
     def get(self, request, robot_id):
         ensure_demo_seed()
-        robot = Robot.objects.select_related("charging_map", "charging_route").get(id=robot_id)
+        robot = Robot.objects.select_related(
+            "charging_map", "charging_route", "latest_status"
+        ).get(id=robot_id)
         return Response(RobotDetailSerializer(robot, context={"request": request}).data)
 
 

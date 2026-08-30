@@ -147,6 +147,7 @@ class RobotSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     mode_label = serializers.CharField(source="get_mode_display", read_only=True)
     connection_status = serializers.SerializerMethodField()
+    battery_level = serializers.SerializerMethodField()
     # 展示真实"当日"告警数（按 detected_at 当天计），而非永不清零的累计计数器字段。
     today_alerts = serializers.SerializerMethodField()
     charging_config = serializers.SerializerMethodField()
@@ -187,6 +188,20 @@ class RobotSerializer(serializers.ModelSerializer):
 
     def get_connection_status(self, obj):
         return obj.effective_connection_status()
+
+    def get_battery_level(self, obj):
+        """Prefer the latest valid BMS sample over the seeded robot profile value."""
+        try:
+            latest = obj.latest_status
+        except RobotStatusLatest.DoesNotExist:
+            latest = None
+        if (
+            latest is not None
+            and latest.power_available
+            and latest.battery_percent is not None
+        ):
+            return int(latest.battery_percent)
+        return obj.battery_level
 
     def get_today_alerts(self, obj):
         if hasattr(obj, "today_alert_count"):

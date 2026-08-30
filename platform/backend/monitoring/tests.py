@@ -5,7 +5,14 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import AlertSkillBinding, InspectionEvent, Robot, RobotCommand, SpeechTemplate
+from .models import (
+    AlertSkillBinding,
+    InspectionEvent,
+    Robot,
+    RobotCommand,
+    RobotStatusLatest,
+    SpeechTemplate,
+)
 from .views import ensure_demo_seed
 
 
@@ -104,6 +111,40 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(len(response.data), 1)
         robot_codes = {robot["code"] for robot in response.data}
         self.assertIn("ZSL-1A-07", robot_codes)
+
+    def test_robot_list_prefers_latest_realtime_battery_over_demo_seed(self):
+        robot = Robot.objects.get(code="ZSL-1A-07")
+        self.assertEqual(robot.battery_level, 78)
+        RobotStatusLatest.objects.create(
+            robot=robot,
+            state_version=1,
+            sampled_at=timezone.now(),
+            power_available=True,
+            battery_percent=14,
+        )
+
+        response = self.client.get("/api/robots/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = next(item for item in response.data if item["code"] == robot.code)
+        self.assertEqual(payload["battery_level"], 14)
+        robot.refresh_from_db()
+        self.assertEqual(robot.battery_level, 78)
+
+    def test_robot_list_falls_back_when_realtime_power_is_unavailable(self):
+        robot = Robot.objects.get(code="ZSL-1A-07")
+        RobotStatusLatest.objects.create(
+            robot=robot,
+            state_version=1,
+            sampled_at=timezone.now(),
+            power_available=False,
+            battery_percent=14,
+        )
+
+        response = self.client.get("/api/robots/")
+
+        payload = next(item for item in response.data if item["code"] == robot.code)
+        self.assertEqual(payload["battery_level"], 78)
 
     @patch("monitoring.views.tts_service.synthesize_speech", return_value=("tts-audio/bicycle-reminder.mp3", True))
     def test_telemetry_ingest(self, synthesize_speech):
