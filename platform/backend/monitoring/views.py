@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import math
+import time
 import uuid
 import zipfile
 import yaml
@@ -14,7 +15,7 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
 from django.http import FileResponse, HttpResponse, HttpResponseForbidden, StreamingHttpResponse
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, OperationalError, close_old_connections, transaction
 from django.db.models import Case, Count, IntegerField, Max, Min, Prefetch, Q, When
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
@@ -3506,6 +3507,66 @@ def parse_loop_execution_context(data) -> tuple[bool, uuid.UUID | None, int]:
     return True, loop_session_id, round_number
 
 
+def _existing_loop_execution(loop_session_id, round_number):
+    return TaskExecutionService.find_loop_execution(loop_session_id, round_number)
+
+
+def _create_and_dispatch_execution(
+    task,
+    operator,
+    *,
+    loop_session_id,
+    round_number,
+    command_options,
+):
+    """Create one task.start command, replaying the same loop round safely.
+
+    SQLite can surface a transient writer lock when task telemetry and a new
+    round arrive together. Retry only that specific error; all other database
+    failures remain visible.
+    """
+    for attempt in range(2):
+        existing = _existing_loop_execution(loop_session_id, round_number)
+        if existing is not None:
+            return existing, False
+        try:
+            with transaction.atomic():
+                execution = TaskExecutionService.create_execution(
+                    task,
+                    operator,
+                    loop_session_id=loop_session_id,
+                    round_number=round_number,
+                )
+                CommandService.create(
+                    execution,
+                    "task.start",
+                    operator,
+                    command_options=command_options,
+                )
+            return execution, True
+        except (IntegrityError, TaskStateError):
+            existing = _existing_loop_execution(loop_session_id, round_number)
+            if existing is not None:
+                return existing, False
+            raise
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= 1:
+                raise
+            close_old_connections()
+            time.sleep(0.15)
+    raise RuntimeError("unreachable task dispatch retry state")
+
+
+def _task_execution_response(execution, created):
+    response = Response(
+        TaskExecutionSerializer(execution).data,
+        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+    if not created:
+        response["X-Idempotent-Replay"] = "true"
+    return response
+
+
 class PatrolRouteExecuteView(APIView):
     """直接执行一条已保存路线。"""
     permission_classes = [permissions.AllowAny]
@@ -3525,6 +3586,9 @@ class PatrolRouteExecuteView(APIView):
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
         )
+        existing = _existing_loop_execution(loop_session_id, round_number)
+        if existing is not None:
+            return _task_execution_response(existing, False)
         CommandService.ensure_task_start_allowed(route.robot)
         now = timezone.now()
         task_name = f"路线快速执行 - {route.name}"
@@ -3554,30 +3618,28 @@ class PatrolRouteExecuteView(APIView):
             return readiness_error
 
         try:
-            # Keep the execution and task.start command atomic. Without this,
-            # a dispatch precheck failure leaves an active `created` execution
-            # and makes the next operator attempt fail as ROBOT_BUSY.
-            with transaction.atomic():
-                execution = TaskExecutionService.create_execution(
-                    task,
-                    request.user if request.user.is_authenticated else None,
-                    loop_session_id=loop_session_id,
-                    round_number=round_number,
-                )
-                CommandService.create(
-                    execution,
-                    "task.start",
-                    request.user if request.user.is_authenticated else None,
-                    command_options={
-                        "record_rosbag": record_rosbag,
-                        "loop_execution": loop_execution,
-                        "loop_total": loop_total,
-                    },
-                )
+            execution, created = _create_and_dispatch_execution(
+                task,
+                request.user if request.user.is_authenticated else None,
+                loop_session_id=loop_session_id,
+                round_number=round_number,
+                command_options={
+                    "record_rosbag": record_rosbag,
+                    "loop_execution": loop_execution,
+                    "loop_total": loop_total,
+                },
+            )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            return Response(
+                {"detail": "数据库写入繁忙，本轮尚未创建，请稍后重试", "code": "DATABASE_BUSY"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         execution.refresh_from_db()
-        return Response(TaskExecutionSerializer(execution).data, status=status.HTTP_201_CREATED)
+        return _task_execution_response(execution, created)
 
 
 class ZoneListView(APIView):
@@ -3882,33 +3944,35 @@ class PatrolTaskExecuteView(APIView):
             PatrolTask.objects.select_related("robot", "route", "route__map_data"),
             pk=task_id,
         )
+        existing = _existing_loop_execution(loop_session_id, round_number)
+        if existing is not None:
+            return _task_execution_response(existing, False)
         readiness_error = validate_task_execution_readiness(task)
         if readiness_error is not None:
             return readiness_error
         try:
             operator = request.user if request.user.is_authenticated else None
-            # See the route execution endpoint: a rejected command must roll
-            # back the just-created execution rather than orphaning it.
-            with transaction.atomic():
-                execution = TaskExecutionService.create_execution(
-                    task,
-                    operator,
-                    loop_session_id=loop_session_id,
-                    round_number=round_number,
-                )
-                CommandService.create(
-                    execution,
-                    "task.start",
-                    operator,
-                    command_options={
-                        "record_rosbag": record_rosbag,
-                        "loop_execution": loop_execution,
-                    },
-                )
+            execution, created = _create_and_dispatch_execution(
+                task,
+                operator,
+                loop_session_id=loop_session_id,
+                round_number=round_number,
+                command_options={
+                    "record_rosbag": record_rosbag,
+                    "loop_execution": loop_execution,
+                },
+            )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            return Response(
+                {"detail": "数据库写入繁忙，本轮尚未创建，请稍后重试", "code": "DATABASE_BUSY"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         execution.refresh_from_db()
-        return Response(TaskExecutionSerializer(execution).data, status=status.HTTP_201_CREATED)
+        return _task_execution_response(execution, created)
 
 
 class TaskExecutionDetailView(APIView):

@@ -164,6 +164,19 @@ def _map_local_dir(map_data: MapData) -> str:
 
 class TaskExecutionService:
     @staticmethod
+    def loop_dispatch_key(loop_session_id, round_number: int) -> str | None:
+        if not loop_session_id:
+            return None
+        return f"{loop_session_id}:{max(1, int(round_number))}"
+
+    @staticmethod
+    def find_loop_execution(loop_session_id, round_number: int) -> TaskExecution | None:
+        key = TaskExecutionService.loop_dispatch_key(loop_session_id, round_number)
+        if not key:
+            return None
+        return TaskExecution.objects.filter(loop_dispatch_key=key).first()
+
+    @staticmethod
     @transaction.atomic
     def create_execution(
         task: PatrolTask,
@@ -199,6 +212,7 @@ class TaskExecutionService:
                 route_snapshot=snapshot,
                 loop_session_id=loop_session_id,
                 round_number=max(1, int(round_number)),
+                loop_dispatch_key=TaskExecutionService.loop_dispatch_key(loop_session_id, round_number),
                 total_waypoints=len(snapshot["waypoints"]),
                 created_by=operator,
             )

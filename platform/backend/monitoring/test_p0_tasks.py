@@ -1,8 +1,10 @@
 from django.contrib.auth import get_user_model
+from django.db import OperationalError
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 import uuid
+from unittest.mock import patch
 
 from .models import (
     MapData,
@@ -266,6 +268,64 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(execution.round_number, 4)
         self.assertEqual(response.data["round_number"], 4)
         self.assertEqual(RemoteCommand.objects.get().payload["round_number"], 4)
+
+    def test_repeated_loop_round_returns_same_execution_without_second_command(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        session_id = uuid.uuid4()
+        payload = {
+            "loop_execution": True,
+            "loop_session_id": str(session_id),
+            "round_number": 4,
+        }
+
+        first = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", payload, format="json")
+        second = client.post(f"/api/patrol-tasks/{self.task.id}/execute/", payload, format="json")
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second["X-Idempotent-Replay"], "true")
+        self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(TaskExecution.objects.count(), 1)
+        self.assertEqual(RemoteCommand.objects.count(), 1)
+        self.assertEqual(
+            TaskExecution.objects.get().loop_dispatch_key,
+            f"{session_id}:4",
+        )
+
+    def test_loop_round_retries_one_transient_sqlite_writer_lock(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        session_id = uuid.uuid4()
+        original_create = TaskExecutionService.create_execution
+        attempts = 0
+
+        def create_after_transient_lock(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OperationalError("database is locked")
+            return original_create(*args, **kwargs)
+
+        with (
+            patch.object(TaskExecutionService, "create_execution", side_effect=create_after_transient_lock),
+            patch("monitoring.views.close_old_connections"),
+            patch("monitoring.views.time.sleep"),
+        ):
+            response = client.post(
+                f"/api/patrol-tasks/{self.task.id}/execute/",
+                {
+                    "loop_execution": True,
+                    "loop_session_id": str(session_id),
+                    "round_number": 5,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(TaskExecution.objects.count(), 1)
+        self.assertEqual(RemoteCommand.objects.count(), 1)
 
     def test_task_execute_rejects_invalid_loop_round(self):
         client = APIClient()

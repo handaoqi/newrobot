@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   activeGuardDutyTarget,
+  guardDutyExecutionWaypointPlan,
   guardDutyRouteState,
   guardDutyWaypointStates,
 } from '../src/utils/guardDutyWaypointState.js'
@@ -68,4 +69,55 @@ test('execution waypoint index distinguishes repeated waypoint ids', () => {
   const states = guardDutyWaypointStates(repeatedWaypoints, events)
   assert.deepEqual(states, ['reached', 'idle', 'target'])
   assert.equal(activeGuardDutyTarget(events, repeatedWaypoints, states), events[2])
+})
+
+test('reverse round marks the physical waypoint named by dispatched target instead of the template index', () => {
+  const route = [
+    { waypoint_id: 'wp-1', map_point_number: 1 },
+    { waypoint_id: 'wp-2', map_point_number: 2 },
+    { waypoint_id: 'wp-3', map_point_number: 3 },
+  ]
+  const targetThree = {
+    ...milestone('task.target_dispatched', 0, 'wp-3', 1),
+    payload: {
+      ...milestone('task.target_dispatched', 0, 'wp-3', 1).payload,
+      execution_waypoint_order: [3, 2, 1],
+      waypoint: { waypoint_id: 'wp-3', map_point_number: 3 },
+    },
+  }
+  assert.deepEqual(guardDutyWaypointStates(route, [targetThree]), ['idle', 'idle', 'target'])
+
+  const reachedThree = {
+    ...milestone('task.waypoint_reached', 0, 'wp-3', 2),
+    payload: {
+      ...milestone('task.waypoint_reached', 0, 'wp-3', 2).payload,
+      execution_waypoint_order: [3, 2, 1],
+      waypoint: { waypoint_id: 'wp-3', map_point_number: 3 },
+    },
+  }
+  const targetTwo = {
+    ...milestone('task.target_dispatched', 1, 'wp-2', 3),
+    payload: {
+      ...milestone('task.target_dispatched', 1, 'wp-2', 3).payload,
+      execution_waypoint_order: [3, 2, 1],
+      waypoint: { waypoint_id: 'wp-2', map_point_number: 2 },
+    },
+  }
+  const events = [targetThree, reachedThree, targetTwo]
+  const states = guardDutyWaypointStates(route, events)
+  assert.deepEqual(states, ['idle', 'target', 'reached'])
+  assert.equal(activeGuardDutyTarget(events, route, states), targetTwo)
+})
+
+test('round execution order maps status chips back to canonical map waypoints', () => {
+  const route = [
+    { waypoint_id: 'wp-1', map_point_number: 1 },
+    { waypoint_id: 'wp-2', map_point_number: 2 },
+    { waypoint_id: 'wp-3', map_point_number: 3 },
+  ]
+  assert.deepEqual(guardDutyExecutionWaypointPlan(route, [3, 2, 1]), [
+    { mapPointNumber: 3, waypointIndex: 2 },
+    { mapPointNumber: 2, waypointIndex: 1 },
+    { mapPointNumber: 1, waypointIndex: 0 },
+  ])
 })

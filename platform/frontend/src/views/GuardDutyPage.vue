@@ -34,7 +34,13 @@ import {
   initialGuardDutyExecution,
 } from '../utils/guardDutyTaskSelection'
 import {
+  acquireGuardDutyLoopLease,
+  releaseGuardDutyLoopLease,
+  renewGuardDutyLoopLease,
+} from '../utils/guardDutyLoopLease'
+import {
   activeGuardDutyTarget,
+  guardDutyExecutionWaypointPlan,
   guardDutyRouteState,
   guardDutyWaypointStates,
 } from '../utils/guardDutyWaypointState'
@@ -86,7 +92,11 @@ let alertEventSource = null
 let refreshTimer = null
 let executionTimer = null
 let loopTimer = null
+let loopLeaseTimer = null
 let loopCycleBusy = false
+let loopLeaseOwned = false
+const loopOwnerId = globalThis.crypto?.randomUUID?.()
+  || `guard-${Date.now()}-${Math.random().toString(16).slice(2)}`
 let localizationRunId = 0
 let liveMediaRecorder = null
 let liveRecordingStream = null
@@ -128,6 +138,10 @@ const executionWaypointOrder = computed(() => {
   return routeWaypoints.value.map((point, index) => point.map_point_number
     ?? (Number.isFinite(Number(point.sequence)) ? Number(point.sequence) + 1 : index + 1))
 })
+const executionWaypointPlan = computed(() => guardDutyExecutionWaypointPlan(
+  displayRouteWaypoints.value,
+  executionWaypointOrder.value,
+))
 const currentExecutionRound = computed(() => {
   if (!execution.value?.id) return 0
   return Math.max(1, Number(execution.value.round_number || 1))
@@ -653,6 +667,45 @@ function loopStorageKey(robotId = latestRobot.value?.id) {
   return robotId ? `guard-duty-loop:${robotId}` : ''
 }
 
+function loopLeaseStorageKey(robotId = latestRobot.value?.id) {
+  return robotId ? `guard-duty-loop-owner:${robotId}` : ''
+}
+
+function acquireLoopOwnership({ notify = false } = {}) {
+  const key = loopLeaseStorageKey()
+  if (!key) return false
+  loopLeaseOwned = acquireGuardDutyLoopLease(localStorage, key, loopOwnerId)
+  if (!loopLeaseOwned && notify) {
+    showToast('循环巡检正在另一个页面运行，请在原页面操作', { variant: 'alert' })
+  }
+  return loopLeaseOwned
+}
+
+function renewLoopOwnership() {
+  if (!loopLeaseOwned) return
+  const key = loopLeaseStorageKey()
+  loopLeaseOwned = Boolean(key) && renewGuardDutyLoopLease(localStorage, key, loopOwnerId)
+}
+
+function ensureLoopOwnership() {
+  const key = loopLeaseStorageKey()
+  if (!key) return false
+  if (loopLeaseOwned && renewGuardDutyLoopLease(localStorage, key, loopOwnerId)) return true
+  loopLeaseOwned = false
+  return acquireLoopOwnership()
+}
+
+function releaseLoopOwnership() {
+  const key = loopLeaseStorageKey()
+  if (key && loopLeaseOwned) releaseGuardDutyLoopLease(localStorage, key, loopOwnerId)
+  loopLeaseOwned = false
+}
+
+function handleLoopStorageChange(event) {
+  if (event.storageArea !== localStorage) return
+  if (event.key === loopStorageKey() && !loopLeaseOwned) restoreLoopState(latestRobot.value?.id)
+}
+
 function persistLoopState() {
   const key = loopStorageKey()
   if (!key) return
@@ -713,6 +766,7 @@ function finishLoop(message, { notify = true } = {}) {
   loopRestUntil.value = 0
   loopMessage.value = message
   persistLoopState()
+  releaseLoopOwnership()
   if (notify) showToast(message)
 }
 
@@ -724,6 +778,7 @@ function stopLoop({ notify = true } = {}) {
   loopRestUntil.value = 0
   loopMessage.value = isRunning.value ? '循环已停止，当前轮次继续执行' : '循环已停止'
   persistLoopState()
+  releaseLoopOwnership()
   if (notify) showToast(loopMessage.value)
 }
 
@@ -799,6 +854,7 @@ function scheduleNextLoopRound(message = '') {
 async function runLoopCycle() {
   nowMs.value = Date.now()
   if (!loopActive.value || loopCycleBusy) return
+  if (!ensureLoopOwnership()) return
   loopCycleBusy = true
   try {
     if (nowMs.value >= loopEndsAt.value) {
@@ -845,6 +901,7 @@ async function runLoopCycle() {
 
 async function toggleLoop() {
   if (loopActive.value) {
+    if (!loopLeaseOwned && !acquireLoopOwnership({ notify: true })) return
     stopLoop()
     return
   }
@@ -859,6 +916,7 @@ async function toggleLoop() {
     showToast('请填写正确的循环时长和休息时间', { variant: 'alert' })
     return
   }
+  if (!acquireLoopOwnership({ notify: true })) return
   const startedAt = Date.now()
   loopActive.value = true
   loopState.value = 'starting'
@@ -1039,6 +1097,9 @@ onMounted(async () => {
   if (loaded) {
     refreshTimer = window.setInterval(refreshGuardState, 5000)
     loopTimer = window.setInterval(runLoopCycle, 1000)
+    loopLeaseTimer = window.setInterval(renewLoopOwnership, 2000)
+    if (loopActive.value) acquireLoopOwnership()
+    window.addEventListener('storage', handleLoopStorageChange)
     window.addEventListener('resize', refreshImageGeometry)
   }
 })
@@ -1048,7 +1109,10 @@ onBeforeUnmount(() => {
   window.clearInterval(refreshTimer)
   window.clearInterval(executionTimer)
   window.clearInterval(loopTimer)
+  window.clearInterval(loopLeaseTimer)
+  window.removeEventListener('storage', handleLoopStorageChange)
   window.removeEventListener('resize', refreshImageGeometry)
+  releaseLoopOwnership()
   if (liveMediaRecorder && liveMediaRecorder.state !== 'inactive') {
     liveMediaRecorder.onstop = null
     liveMediaRecorder.stop()
@@ -1302,8 +1366,12 @@ watch(playUrlKey, () => {
                 <div><span>计划路线</span><strong>{{ execution?.route_name || routeData?.name || '--' }}</strong></div>
               </div>
               <div class="guard-route-order" aria-label="本轮计划航点顺序">
-                <span v-for="(number, index) in executionWaypointOrder" :key="`${number}-${index}`" :class="waypointClass(index)">{{ number }}</span>
-                <small v-if="!executionWaypointOrder.length">暂无航点</small>
+                <span
+                  v-for="(item, index) in executionWaypointPlan"
+                  :key="`${item.mapPointNumber}-${index}`"
+                  :class="waypointClass(item.waypointIndex)"
+                >{{ item.mapPointNumber }}</span>
+                <small v-if="!executionWaypointPlan.length">暂无航点</small>
               </div>
               <div v-if="activeTargetMilestone" class="guard-current-target">
                 <span>当前下发目标</span>

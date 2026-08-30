@@ -10,15 +10,17 @@ TARGET_REPO_ROOT="$(dirname "$ROBOT_PROJECT_DIR")"
 BUILD=false
 INSTALL_SERVICE=false
 INIT_SYSTEM_DEPS=false
+RESTART_EDGE=false
 DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--init-system-deps] [--build] [--install-service] [--dry-run]
+Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--init-system-deps] [--build] [--install-service] [--restart-edge] [--dry-run]
 
 Runtime configuration, state, maps, build outputs and logs are preserved.
 --init-system-deps installs and verifies required NX runtime packages.
 --install-service includes --init-system-deps automatically.
+--restart-edge restarts the Edge service only when no local task is active.
 EOF
 }
 
@@ -28,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --init-system-deps) INIT_SYSTEM_DEPS=true ;;
     --build) BUILD=true ;;
     --install-service) INSTALL_SERVICE=true; INIT_SYSTEM_DEPS=true ;;
+    --restart-edge) RESTART_EDGE=true ;;
     --dry-run) DRY_RUN=true ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -50,7 +53,7 @@ target_path() {
 }
 
 if "$DRY_RUN"; then
-  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge=$EDGE_SOURCE_DIR runtime=$EDGE_RUNTIME_DIR init_system_deps=$INIT_SYSTEM_DEPS build=$BUILD install_service=$INSTALL_SERVICE"
+  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge=$EDGE_SOURCE_DIR runtime=$EDGE_RUNTIME_DIR init_system_deps=$INIT_SYSTEM_DEPS build=$BUILD install_service=$INSTALL_SERVICE restart_edge=$RESTART_EDGE"
   exit 0
 fi
 
@@ -94,5 +97,9 @@ if "$INSTALL_SERVICE"; then
 fi
 
 remote_exec "python3 '$EDGE_SOURCE_DIR/tools/write_mapping_deployment_manifest.py' --repo '$TARGET_REPO_ROOT' --output '$EDGE_RUNTIME_DIR/conf/mapping-deployment.json'"
+
+if "$RESTART_EDGE"; then
+  remote_exec "EDGE_DB_PATH='$EDGE_RUNTIME_DIR/data/edge-agent/edge.db' bash '$EDGE_SOURCE_DIR/tools/restart-edge-agent-safely'"
+fi
 
 echo "NX code deployed to ${ROBOT_HOST:+$ROBOT_HOST:}$ROBOT_PROJECT_DIR"

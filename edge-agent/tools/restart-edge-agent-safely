@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+EDGE_DB_PATH="${EDGE_DB_PATH:-/home/dogrobot/runtime/nx-edge/data/edge-agent/edge.db}"
+SERVICE_NAME="${ROAMERX_EDGE_SERVICE_NAME:-roamerx-edge-agent.service}"
+CHECK_ONLY=false
+
+usage() {
+  cat <<'EOF'
+Usage: restart-edge-agent-safely [--db PATH] [--check-only]
+
+Refuses to restart the Edge agent while its local database contains an active
+task. --check-only performs the guard without restarting the service.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --db) EDGE_DB_PATH="${2:?missing database path}"; shift ;;
+    --check-only) CHECK_ONLY=true ;;
+    --help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ -e "$EDGE_DB_PATH" ]]; then
+  active_task="$({ python3 - "$EDGE_DB_PATH" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=1)
+try:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_context'"
+    ).fetchone()
+    if not table:
+        print("")
+    else:
+        row = connection.execute(
+            """
+            SELECT task_execution_id, state
+            FROM task_context
+            WHERE state NOT IN ('completed','failed','cancelled','timed_out','rejected')
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        print(f"{row[0]} ({row[1]})" if row else "")
+finally:
+    connection.close()
+PY
+  } 2>&1)" || {
+    echo "Refusing Edge restart: cannot verify task state in $EDGE_DB_PATH: $active_task" >&2
+    exit 74
+  }
+  if [[ -n "$active_task" ]]; then
+    echo "Refusing Edge restart: active task $active_task" >&2
+    exit 75
+  fi
+fi
+
+echo "Edge restart guard passed: no active task"
+if "$CHECK_ONLY"; then
+  exit 0
+fi
+
+sudo systemctl restart "$SERVICE_NAME"
+echo "Restarted $SERVICE_NAME"

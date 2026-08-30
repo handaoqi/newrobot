@@ -5,19 +5,56 @@ export const GUARD_WAYPOINT_STATE = Object.freeze({
 })
 
 function eventWaypointIndex(event, waypoints) {
-  const rawIndex = event?.payload?.execution_waypoint_index
+  const payload = event?.payload || {}
+  const waypointId = String(
+    payload?.waypoint?.waypoint_id
+    || payload?.current_waypoint_id
+    || '',
+  )
+  if (waypointId) {
+    const matches = waypoints
+      .map((waypoint, index) => String(waypoint?.waypoint_id || '') === waypointId ? index : -1)
+      .filter((index) => index >= 0)
+    if (matches.length === 1) return matches[0]
+  }
+
+  const mapPointNumber = payload?.waypoint?.map_point_number
+  if (mapPointNumber !== null && mapPointNumber !== undefined && mapPointNumber !== '') {
+    const matches = waypoints
+      .map((waypoint, index) => String(waypoint?.map_point_number ?? '') === String(mapPointNumber) ? index : -1)
+      .filter((index) => index >= 0)
+    if (matches.length === 1) return matches[0]
+  }
+
+  const rawIndex = payload?.execution_waypoint_index
   if (rawIndex !== null && rawIndex !== undefined && rawIndex !== '') {
     const index = Number(rawIndex)
     if (Number.isInteger(index) && index >= 0 && index < waypoints.length) return index
   }
 
-  const waypointId = String(
-    event?.payload?.waypoint?.waypoint_id
-    || event?.payload?.current_waypoint_id
-    || '',
-  )
-  if (!waypointId) return -1
-  return waypoints.findIndex((waypoint) => String(waypoint?.waypoint_id || '') === waypointId)
+  return -1
+}
+
+export function guardDutyExecutionWaypointPlan(waypoints = [], executionOrder = []) {
+  const order = Array.isArray(executionOrder) && executionOrder.length
+    ? executionOrder
+    : waypoints.map((waypoint, index) => waypoint?.map_point_number
+      ?? (Number.isFinite(Number(waypoint?.sequence)) ? Number(waypoint.sequence) + 1 : index + 1))
+  const unusedIndexes = new Set(waypoints.map((_, index) => index))
+
+  return order.map((mapPointNumber, executionIndex) => {
+    const matches = waypoints
+      .map((waypoint, index) => (
+        unusedIndexes.has(index)
+        && String(waypoint?.map_point_number ?? '') === String(mapPointNumber)
+          ? index
+          : -1
+      ))
+      .filter((index) => index >= 0)
+    const waypointIndex = matches[0] ?? (unusedIndexes.has(executionIndex) ? executionIndex : -1)
+    if (waypointIndex >= 0) unusedIndexes.delete(waypointIndex)
+    return { mapPointNumber, waypointIndex }
+  })
 }
 
 export function guardDutyWaypointStates(waypoints = [], milestones = []) {

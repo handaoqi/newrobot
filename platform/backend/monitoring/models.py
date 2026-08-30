@@ -815,6 +815,9 @@ class TaskExecution(BaseTimestampModel):
     route_snapshot = models.JSONField(default=dict)
     loop_session_id = models.UUIDField(null=True, blank=True, db_index=True)
     round_number = models.PositiveIntegerField(default=1)
+    # New loop executions receive a stable session/round key. Historical rows
+    # stay NULL so an index can be added without rewriting duplicate history.
+    loop_dispatch_key = models.CharField(max_length=80, null=True, blank=True, unique=True, editable=False)
     state = models.CharField(max_length=24, choices=STATE_CHOICES, default="created")
     state_version = models.BigIntegerField(default=0)
     current_waypoint_index = models.PositiveIntegerField(null=True, blank=True)
