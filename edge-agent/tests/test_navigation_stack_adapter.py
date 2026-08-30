@@ -86,6 +86,21 @@ def test_looks_ready_reads_tokens_after_verbose_cmd_vel_dump():
     assert adapter._looks_ready(stdout[-6000:]) is True
 
 
+def test_restart_localization_allows_process_and_map_service_startup(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    runs = []
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda action, timeout_seconds=0: runs.append((action, timeout_seconds))
+        or {"action": action, "returncode": 0},
+    )
+
+    adapter.restart_localization()
+
+    assert runs == [("restart-localization", 90)]
+
+
 def test_timeout_output_is_decoded_before_building_protocol_error(tmp_path, monkeypatch):
     script = tmp_path / "nav.sh"
     script.write_text("#!/bin/sh\n", encoding="utf-8")

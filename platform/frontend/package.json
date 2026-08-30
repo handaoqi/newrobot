@@ -14,6 +14,10 @@
     "test:foxglove": "playwright test --config playwright.foxglove.config.js"
   },
   "dependencies": {
+    "@foxglove/rosmsg": "^5.0.5",
+    "@foxglove/rosmsg2-serialization": "^3.1.2",
+    "@foxglove/ws-protocol": "^0.8.0",
+    "@mcap/core": "^2.2.1",
     "echarts": "^6.0.0",
     "hls.js": "^1.6.16",
     "mpegts.js": "^1.8.0",

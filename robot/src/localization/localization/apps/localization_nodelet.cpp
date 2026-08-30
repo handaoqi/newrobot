@@ -1597,8 +1597,14 @@ private:
       const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp) {
     lio_corrected_this_frame_ = false;
     if (!pose_estimator || pending_lio_correction_.active ||
-        !match.is_converged_ || !match.transform_.allFinite()) {
+        !match.is_converged_ || !match.transform_.allFinite() ||
+        !std::isfinite(match.fitness_score_) ||
+        match.fitness_score_ >= ndt_max_fitness_score_ ||
+        !last_ndt_status_healthy_ ||
+        !std::isfinite(last_ndt_inlier_fraction_) ||
+        last_ndt_inlier_fraction_ < 0.05f) {
       ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "quality_rejected";
       return false;
     }
     const Eigen::Vector3f ndt_position = match.transform_.block<3, 1>(0, 3);
@@ -1666,7 +1672,7 @@ private:
       }
       return false;
     }
-    const bool quality_ok = observation.usable && observation.quality == "fixed";
+    const bool quality_ok = rtkCorrectionQualityOk(observation);
     const Eigen::Vector3f ukf_position = pose_estimator->pos();
     Eigen::Vector3f rtk_position = observation.position;
     if (!gnss_use_elevation_) {
@@ -1737,7 +1743,10 @@ private:
       bool quality_ok,
       const rclcpp::Time& stamp) const {
     CorrectionCandidateSummary candidate;
-    candidate.eligible = quality_ok && pose_estimator && match.transform_.allFinite();
+    candidate.eligible = quality_ok && pose_estimator && match.is_converged_ &&
+      match.transform_.allFinite() && std::isfinite(match.fitness_score_) &&
+      match.fitness_score_ < ndt_max_fitness_score_ &&
+      std::isfinite(last_ndt_inlier_fraction_) && last_ndt_inlier_fraction_ >= 0.05f;
     candidate.stamp_ns = stamp.nanoseconds();
     if (!candidate.eligible) {
       return candidate;
@@ -1762,8 +1771,7 @@ private:
   CorrectionCandidateSummary rtkCorrectionCandidate(
       const RtkObservation& observation) const {
     CorrectionCandidateSummary candidate;
-    candidate.eligible = pose_estimator && observation.usable &&
-      observation.quality == "fixed" && observation.position.allFinite();
+    candidate.eligible = pose_estimator && rtkCorrectionQualityOk(observation);
     candidate.stamp_ns = observation.stamp_ns;
     if (!candidate.eligible) {
       return candidate;
@@ -1784,6 +1792,19 @@ private:
     return candidate;
   }
 
+  bool rtkCorrectionQualityOk(const RtkObservation& observation) const {
+    // A correction source must be independently valid at the point where it
+    // is consumed.  Do not rely only on the upstream `usable` flag: this
+    // keeps future callers from accidentally scheduling a stale or partial
+    // RTK sample while the robot is at a waypoint.
+    return observation.usable && observation.quality == "fixed" &&
+      observation.position.allFinite() &&
+      std::isfinite(observation.horizontal_std_m) &&
+      observation.horizontal_std_m <= gnss_max_horizontal_std_ &&
+      std::isfinite(observation.age_s) && observation.age_s <= gnss_max_age_ &&
+      observation.stamp_ns > 0;
+  }
+
   void evaluateAuxiliaryCorrections(
       const PoseEstimator::MatchResult* match,
       bool ndt_quality_ok,
@@ -1791,7 +1812,7 @@ private:
       const rclcpp::Time& stamp) {
     const bool ndt_fresh = last_ndt_healthy_ && last_ndt_update_time_.nanoseconds() > 0 &&
       std::fabs((stamp - last_ndt_update_time_).seconds()) <= 1.0;
-    const bool rtk_ready = observation.usable && observation.quality == "fixed";
+    const bool rtk_ready = rtkCorrectionQualityOk(observation);
     policy_source_ready_ = preferred_correction_mode_ == CorrectionPolicyMode::ndt
       ? ndt_fresh
       : preferred_correction_mode_ == CorrectionPolicyMode::rtk

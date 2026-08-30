@@ -438,7 +438,12 @@ class TaskExecutor:
                 },
             )
 
-            cancelled = self.navigation.cancel_navigation()
+            # Nav2 has already finished when the task is only waiting for the
+            # reached waypoint's speech. Cancelling in that window targets a
+            # stale goal handle and, more importantly, recovery must not
+            # dispatch the same waypoint for a second time.
+            waiting_for_speech = self._speech_waiting_index is not None
+            cancelled = waiting_for_speech or self.navigation.cancel_navigation()
             self.navigation.stop_motion()
             if not cancelled:
                 # A cancel acknowledgement can time out while Nav2 is already
@@ -481,6 +486,18 @@ class TaskExecutor:
                 code="LOCALIZATION_RECOVERED",
                 message="localization is stable; resuming from the pending waypoint",
             )
+            if self._speech_waiting_index is not None:
+                reached_index = self._speech_waiting_index
+                speech_finished = self._speech_wait_finished
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                if speech_finished:
+                    self._speech_waiting_index = None
+                    self._speech_wait_finished = False
+                    self._continue_after_waypoint(reached_index)
+                return
             self._send_from(resume_index)
 
     def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
@@ -940,10 +957,19 @@ class TaskExecutor:
             decision = getter() or {}
             source = str(decision.get("active_source") or "")
             policy_source_ready = decision.get("policy_source_ready")
+            correction_active = bool(decision.get("correction_smoothing_active", False))
+            if correction_active:
+                # Keep the controller at the safety boundary while the
+                # localization node is moving map->lio_odom.  A single stop
+                # command can be overwritten by an active Nav2 controller.
+                stop_motion = getattr(self.navigation, "stop_motion", None)
+                if callable(stop_motion):
+                    stop_motion()
             if (
                 source in {"ndt_imu", "rtk_imu", "lio_imu"}
                 and bool(decision.get("absolute_stable"))
                 and (policy_source_ready is None or policy_source_ready is True)
+                and not correction_active
             ):
                 return True
             time.sleep(0.1)
@@ -1297,8 +1323,18 @@ class TaskExecutor:
                 reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
                 reached_waypoint = self.context.route_snapshot["waypoints"][reached_index]
                 total_waypoints = len(self.context.route_snapshot["waypoints"])
-                if reached_index + 1 >= total_waypoints:
-                    self._hold_final_pose()
+                # A FollowWaypoints success only means Nav2's goal checker
+                # accepted the pose; it does not guarantee that the
+                # quadruped has finished coasting.  Confirm zero motion before
+                # switching to the stationary NDT/RTK policy, otherwise the
+                # first correction sample can be taken while the body is
+                # still moving and create an avoidable TF correction.
+                if not self._hold_final_pose():
+                    LOGGER.warning(
+                        "waypoint %d reached but zero-motion confirmation timed out; "
+                        "continuing with stationary localization policy",
+                        reached_index,
+                    )
                 self._set_localization_policy(reached_waypoint, "stationary")
                 if not self._absolute_localization_ready():
                     self.navigation.stop_motion()
@@ -1624,7 +1660,7 @@ class TaskExecutor:
                 return
             self._send_from(self.context.current_waypoint_index)
 
-    def _hold_final_pose(self) -> None:
+    def _hold_final_pose(self) -> bool:
         """Stop the dog before measuring the last waypoint.
 
         Nav2's checker does not require zero velocity, and a quadruped still
@@ -1636,7 +1672,12 @@ class TaskExecutor:
             stop_motion()
         is_stopped = getattr(self.navigation, "is_robot_stopped", None)
         if callable(is_stopped):
-            is_stopped()
+            try:
+                return bool(is_stopped())
+            except Exception:
+                LOGGER.exception("robot stop confirmation failed")
+                return False
+        return True
 
     def _final_pose_error(self) -> tuple[str, str] | None:
         if not self.context:

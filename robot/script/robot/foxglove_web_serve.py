@@ -56,8 +56,11 @@ EXPLICIT_TYPES = {
 # deliberately not here: upstream's own caddy image sets neither and works, while
 # COEP breaks any resource that lacks CORP. --cross-origin-isolated turns it on
 # for anyone who needs SharedArrayBuffer.
+# SAMEORIGIN rather than DENY: the platform embeds this host in an iframe at
+# /dashboard/replay-debug and drives it through its DOM, which only works
+# same-origin. Cross-origin framing stays blocked.
 BASE_HEADERS = {
-    "X-Frame-Options": "DENY",
+    "X-Frame-Options": "SAMEORIGIN",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "origin",
 }

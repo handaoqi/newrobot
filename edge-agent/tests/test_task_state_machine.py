@@ -294,6 +294,9 @@ def test_waypoint_arrival_requires_requested_correction_source_ready(tmp_path):
     assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
     nav.localization_state["policy_source_ready"] = True
     assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    nav.localization_state["correction_smoothing_active"] = True
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
+    assert nav.stop_commands > 0
     store.close()
 
 
@@ -544,6 +547,92 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
         time.sleep(0.01)
     executor._speech_wait_thread.join(timeout=1)
     assert ids(nav.sent[1]) == ["wp-2", "wp-3"]
+    store.close()
+
+
+def test_localization_recovery_during_final_speech_does_not_redispatch_waypoint(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    final = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
+    final["speech_template_id"] = 7
+    status_dir = tmp_path / "audio-status"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(status_dir),
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.01,
+        ),
+    )
+
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]))
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert executor._speech_waiting_index == 2
+
+    executor.on_localization_lost()
+    executor.on_localization_recovered()
+
+    assert executor.context.state == "running"
+    assert len(nav.sent) == 1
+    assert nav.cancelled == 0
+
+    waypoint_key = hashlib.sha256(b"wp-3").hexdigest()
+    status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
+    status_path.write_text(
+        json.dumps({"status": "finished", "waypoint_id": "wp-3"}),
+        encoding="utf-8",
+    )
+    executor._speech_wait_thread.join(timeout=1)
+
+    assert executor.context.state == "completed"
+    assert len(nav.sent) == 1
+    store.close()
+
+
+def test_localization_recovery_after_final_speech_finishes_completes_without_redispatch(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    final = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
+    final["speech_template_id"] = 7
+    status_dir = tmp_path / "audio-status"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(status_dir),
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.01,
+        ),
+    )
+
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]))
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    executor.on_localization_lost()
+
+    waypoint_key = hashlib.sha256(b"wp-3").hexdigest()
+    status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
+    status_path.write_text(
+        json.dumps({"status": "finished", "waypoint_id": "wp-3"}),
+        encoding="utf-8",
+    )
+    executor._speech_wait_thread.join(timeout=1)
+    assert executor.context.state == "paused"
+    assert executor._speech_wait_finished is True
+
+    executor.on_localization_recovered()
+
+    assert executor.context.state == "completed"
+    assert len(nav.sent) == 1
+    assert nav.cancelled == 0
     store.close()
 
 

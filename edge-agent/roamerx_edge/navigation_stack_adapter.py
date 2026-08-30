@@ -30,7 +30,7 @@ class NavigationStackAdapter:
 
     def restart_localization(self) -> dict:
         """Restart only localization so a paused task can reseed it safely."""
-        return self._run("restart-localization", timeout_seconds=max(self.config.command_timeout_seconds, 60))
+        return self._run("restart-localization", timeout_seconds=max(self.config.command_timeout_seconds, 90))
 
     def recover(self, command: dict | None = None) -> dict:
         status_payload = self.status()

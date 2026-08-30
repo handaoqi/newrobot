@@ -18,6 +18,7 @@ const ZoneManagerPage = () => import('../views/ZoneManagerPage.vue')
 const TrackPlaybackPage = () => import('../views/TrackPlaybackPage.vue')
 const RemoteDevelopmentPage = () => import('../views/RemoteDevelopmentPage.vue')
 const ValidationJobsPage = () => import('../views/ValidationJobsPage.vue')
+const ReplayDebugPage = () => import('../views/ReplayDebugPage.vue')
 
 const routes = [
   { path: '/', redirect: '/dashboard/overview' },
@@ -32,6 +33,7 @@ const routes = [
       { path: 'remote-control', name: 'remote-control', meta: { title: '远程控制' }, component: RemoteControlPage },
       { path: 'remote-development', name: 'remote-development', meta: { title: '远程 AI 开发' }, component: RemoteDevelopmentPage },
       { path: 'validation', name: 'validation', meta: { title: '仿真与回放检查' }, component: ValidationJobsPage },
+      { path: 'replay-debug', name: 'replay-debug', meta: { title: '回放调试台' }, component: ReplayDebugPage },
       { path: 'analytics', name: 'analytics', meta: { title: '统计分析中心' }, component: AnalyticsPage },
       { path: 'events', name: 'events', meta: { title: '事件中心' }, component: EventsPage },
       { path: 'robots', name: 'robots', meta: { title: '机器人管理' }, component: RobotsPage },
