@@ -38,11 +38,25 @@ LOGGER = logging.getLogger(__name__)
 # its syllables are recognised more reliably in the current microphone setup.
 # Keep the original wake phrase available as well so existing commands remain
 # compatible.
-VOICE_WAKE_ALIASES = ("小太阳", "小太陽", "有太阳", "太阳", "太陽")
+VOICE_WAKE_SHORT_ALIASES = ("太阳", "太陽")
+VOICE_WAKE_ALIASES = ("小太阳", "小太陽", "有太阳", *VOICE_WAKE_SHORT_ALIASES)
 # Place names spoken by patrol announcements must never arm the development
-# wake window.  In particular, the exact site name "太阳宫" starts with the
-# short alias "太阳" and was previously interpreted as a wake-only utterance.
-VOICE_WAKE_FALSE_POSITIVES = frozenset(("太阳宫",))
+# wake window.  Match these as prefixes because an announcement normally puts
+# the site name at the beginning of a much longer utterance.
+VOICE_WAKE_FALSE_POSITIVE_PREFIXES = ("太阳宫",)
+# A two-syllable wake alias has no reliable word boundary in unpunctuated
+# Chinese ASR text.  Permit it only before an explicit separator or a common
+# command lead-in; this keeps place names and nouns such as “太阳宫” and
+# “太阳能” out while retaining commands such as “太阳检查导航”.
+VOICE_COMMAND_PREFIXES = (
+    "请", "帮", "给", "把", "将",
+    "查", "看", "检查", "查看", "确认", "分析", "定位",
+    "修改", "修复", "解决", "调整", "优化", "更新", "实现",
+    "新增", "增加", "删除", "移除", "创建", "生成", "保存",
+    "提交", "推送", "部署", "执行", "运行", "测试", "验证",
+    "启动", "停止", "重启", "打开", "关闭", "取消", "继续",
+    "播放", "设置",
+)
 VOICE_WAKE_PINYIN = ("xiao", "tai", "yang")
 VOICE_WAKE_SHORT_PINYIN = ("tai", "yang")
 _PINYIN_INITIALS = (
@@ -121,12 +135,14 @@ def _syllable_similarity(expected: str, actual: str) -> float:
 
 def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
     """Return the prefix end when its first two or three syllables are a wake."""
-    exact = re.match(
-        rf"^\s*({'|'.join(re.escape(item) for item in VOICE_WAKE_ALIASES)})",
-        transcript,
-    )
-    if exact:
-        return exact.end(), exact.group(1)
+    leading_space = re.match(r"^\s*", transcript)
+    prefix_start = leading_space.end() if leading_space else 0
+    for alias in VOICE_WAKE_ALIASES:
+        if not transcript.startswith(alias, prefix_start):
+            continue
+        prefix_end = prefix_start + len(alias)
+        if alias not in VOICE_WAKE_SHORT_ALIASES or _has_short_wake_boundary(transcript, prefix_end):
+            return prefix_end, alias
 
     candidate_match = re.match(r"^(\s*)([\u4e00-\u9fff]{2,3})", transcript)
     if not candidate_match:
@@ -155,9 +171,24 @@ def _fuzzy_wake_match(transcript: str) -> tuple[int, str]:
             _syllable_similarity(expected, actual)
             for expected, actual in zip(VOICE_WAKE_SHORT_PINYIN, wake_syllables)
         )
-        if sum(scores) >= 1.5 and sum(score >= 0.95 for score in scores) >= 1:
-            return len(candidate_match.group(1)) + consumed, candidate[:consumed]
+        prefix_end = len(candidate_match.group(1)) + consumed
+        if (
+            sum(scores) >= 1.5
+            and sum(score >= 0.95 for score in scores) >= 1
+            and _has_short_wake_boundary(transcript, prefix_end)
+        ):
+            return prefix_end, candidate[:consumed]
     return 0, ""
+
+
+def _has_short_wake_boundary(transcript: str, prefix_end: int) -> bool:
+    """Require a separator, utterance end, or command lead-in after a short wake."""
+    remainder = transcript[prefix_end:]
+    if not remainder:
+        return True
+    if re.match(r"^[\s，。,.!！?？：:；;、]", remainder):
+        return True
+    return remainder.startswith(VOICE_COMMAND_PREFIXES)
 
 
 def _is_double_wake_phrase(transcript: str) -> bool:
@@ -171,9 +202,9 @@ def _is_double_wake_phrase(transcript: str) -> bool:
 
 
 def _is_false_wake_phrase(transcript: str) -> bool:
-    """Reject exact known non-command phrases before fuzzy wake matching."""
+    """Reject known non-command prefixes before fuzzy wake matching."""
     compact = re.sub(r"[\s，。,.!！?？：:；;、]", "", transcript)
-    return compact in VOICE_WAKE_FALSE_POSITIVES
+    return compact.startswith(VOICE_WAKE_FALSE_POSITIVE_PREFIXES)
 
 
 def _looks_like_short_wake_attempt(transcript: str) -> bool:
@@ -270,7 +301,7 @@ def _handle_voice_audio(robot: Robot, payload: dict, publish=None) -> dict:
     command = ""
     armed_until = _VOICE_WAKE_UNTIL.get(robot.code)
     if wake_matched:
-        command = transcript[wake_end:].strip(" ，。,.!！?？")
+        command = transcript[wake_end:].strip(" ，。,.!！?？：:；;、")
         _VOICE_WAKE_UNTIL[robot.code] = now + timezone.timedelta(seconds=VOICE_WAKE_WINDOW_SECONDS)
         if not command:
             previous = _VOICE_WAKE_COUNT.get(robot.code)

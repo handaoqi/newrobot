@@ -303,28 +303,67 @@ class RemoteDevelopmentMqttTests(TestCase):
             self.assertEqual(result["status"], "ignored")
         self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
 
-    def test_taiyanggong_does_not_arm_or_create_a_codex_task(self):
+    def test_taiyanggong_announcements_do_not_arm_or_create_a_codex_task(self):
         self.task.status = "succeeded"
         self.task.save(update_fields=["status", "updated_at"])
-        _VOICE_WAKE_UNTIL[self.robot.code] = timezone.now() + timezone.timedelta(seconds=8)
-
-        result = handle_dev_mqtt_message(
-            self.topic("voice/audio"),
-            {"asr_engine": "nx-sensevoice", "transcript": "太阳宫。"},
+        announcements = (
+            "太阳宫。",
+            "太阳宫南门入口设置蓝色健身步道起点常举办春日牡丹主题亲子游园活动",
+            "太阳宫公园是朝阳区首批试点改造的无界公园之一",
         )
+
+        for transcript in announcements:
+            with self.subTest(transcript=transcript):
+                _VOICE_WAKE_UNTIL[self.robot.code] = timezone.now() + timezone.timedelta(seconds=8)
+                result = handle_dev_mqtt_message(
+                    self.topic("voice/audio"),
+                    {"asr_engine": "nx-sensevoice", "transcript": transcript},
+                )
+                self.assertEqual(result["status"], "ignored")
+                self.assertNotIn(self.robot.code, _VOICE_WAKE_UNTIL)
+
         follow_up = handle_dev_mqtt_message(
             self.topic("voice/audio"),
             {"asr_engine": "nx-sensevoice", "transcript": "检查导航"},
         )
 
-        self.assertEqual(result["status"], "ignored")
         self.assertEqual(follow_up["status"], "ignored")
         self.assertNotIn(self.robot.code, _VOICE_WAKE_UNTIL)
         self.assertEqual(DevelopmentTask.objects.exclude(pk=self.task.pk).count(), 0)
         self.assertEqual(
             list(VoiceRecognitionEvent.objects.values_list("outcome", flat=True)),
-            ["ignored", "ignored"],
+            ["ignored", "ignored", "ignored", "ignored"],
         )
+
+    def test_short_wake_alias_requires_separator_or_command_boundary(self):
+        self.task.status = "succeeded"
+        self.task.save(update_fields=["status", "updated_at"])
+
+        accepted = (
+            ("太阳，检查导航", "检查导航"),
+            ("太阳 检查导航", "检查导航"),
+            ("太阳检查导航", "检查导航"),
+            ("太陽：重启服务", "重启服务"),
+        )
+        for transcript, command in accepted:
+            with self.subTest(transcript=transcript):
+                result = handle_dev_mqtt_message(
+                    self.topic("voice/audio"),
+                    {"asr_engine": "nx-sensevoice", "transcript": transcript},
+                )
+                self.assertEqual(result["status"], "accepted")
+                created = DevelopmentTask.objects.get(pk=result["task_id"])
+                self.assertEqual(created.prompt, command)
+                created.status = "succeeded"
+                created.save(update_fields=["status", "updated_at"])
+
+        for transcript in ("太阳能设备运行正常", "太阳花正在开放", "太阳升起了"):
+            with self.subTest(transcript=transcript):
+                result = handle_dev_mqtt_message(
+                    self.topic("voice/audio"),
+                    {"asr_engine": "nx-sensevoice", "transcript": transcript},
+                )
+                self.assertEqual(result["status"], "ignored")
 
     def test_wake_word_arms_and_acknowledges_without_creating_task(self):
         published = []
