@@ -30,8 +30,8 @@ DEFAULT_SPEECH_TEMPLATES = (
         "设备管控",
     ),
     (
-        "低电量自动回充",
-        "当前电量低于百分之二十，导航任务已停止，正在执行自动回充，请注意避让。",
+        "低电量停车告警",
+        "当前电量低于百分之二十，导航任务已停止，请及时人工处理或手动回充。",
         "设备管控",
     ),
 )
@@ -41,7 +41,7 @@ DEFAULT_ALERT_SKILLS = (
     ("obstacle_detected", "发现障碍物"),
     ("avoidance", "后退尝试避障"),
     ("dissuasion", "劝阻离开线路"),
-    ("low_battery_return_charge", "低电量自动回充"),
+    ("low_battery_return_charge", "低电量停车告警"),
 )
 
 

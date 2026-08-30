@@ -381,6 +381,84 @@ class MessageHandlerTests(TestCase):
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
         self.assertEqual(InspectionEvent.objects.filter(event_id=event_id).count(), 1)
 
+    @patch(
+        "monitoring.message_handlers.tts_service.synthesize_speech",
+        return_value=("tts-audio/low-battery-alert.mp3", True),
+    )
+    def test_low_battery_alert_never_dispatches_docking_or_map_switch(self, synthesize_speech):
+        route = self.execution.task.route
+        self.assertEqual(len(route.waypoints), 2)
+        self.execution.state = "completed"
+        self.execution.save(update_fields=["state", "updated_at"])
+        self.robot.charging_map = route.map_data
+        self.robot.charging_route = route
+        self.robot.connection_status = "online"
+        self.robot.localization_status = "normal"
+        self.robot.nav_ready = True
+        self.robot.battery_level = 19
+        self.robot.save(
+            update_fields=[
+                "charging_map",
+                "charging_route",
+                "connection_status",
+                "localization_status",
+                "nav_ready",
+                "battery_level",
+                "updated_at",
+            ]
+        )
+        execution_count = TaskExecution.objects.count()
+        remote_command_count = RemoteCommand.objects.count()
+
+        formats = (
+            ("low_battery_alert", "LOW_BATTERY_ALERT"),
+            ("low_battery_return_charge", "LOW_BATTERY_RETURN_CHARGE"),
+        )
+        for sequence, (event_type, source_code) in enumerate(formats, start=10):
+            event_id = str(uuid.uuid4())
+            payload = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "severity": "high",
+                "occurred_at": timezone.now().isoformat(),
+                "task_execution_id": str(self.execution.id),
+                "map_id": str(route.map_data_id),
+                "map_version": "v1",
+                "pose": {"frame_id": "map", "x": 1.0, "y": 2.0, "yaw": 0.0},
+                "source": {"component": "charge_control_adapter", "code": source_code},
+                "detection": {
+                    "label": "低电量停车告警",
+                    "class": "low_battery",
+                    "confidence": 1,
+                },
+                "attributes": {
+                    "low_battery_episode_id": event_id,
+                    "battery_percent": 19,
+                    "automatic_docking": False,
+                },
+            }
+
+            result = handle_mqtt_message(
+                "robots/rx-001/events/alert",
+                self.envelope("alert.event", payload, sequence=sequence),
+            )
+
+            self.assertIs(result["automatic_docking"], False)
+
+        self.assertEqual(TaskExecution.objects.count(), execution_count)
+        self.assertEqual(RemoteCommand.objects.count(), remote_command_count)
+        self.assertFalse(RemoteCommand.objects.filter(command_type="map.activate").exists())
+        self.assertFalse(
+            RemoteCommand.objects.filter(payload__docking__enabled=True).exists()
+        )
+        self.assertEqual(
+            RobotCommand.objects.filter(
+                payload__source="low_battery_alert_speech"
+            ).count(),
+            2,
+        )
+        self.assertEqual(synthesize_speech.call_count, 2)
+
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/slam-diverged.mp3", True))
     def test_slam_diverged_alert_queues_operator_speech(self, synthesize_speech):
         event_id = str(uuid.uuid4())

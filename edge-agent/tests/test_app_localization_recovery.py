@@ -270,10 +270,13 @@ def test_low_battery_terminal_context_uses_idempotent_cancel_without_force_exit(
     alerts = []
     application.mqtt = SimpleNamespace(publish_alert=alerts.append)
 
-    application._handle_low_battery_charge("episode-1", 19)
+    application._handle_low_battery_alert("episode-1", 19)
 
     assert calls == [("cancel", "task-1")]
-    assert alerts[0]["attributes"]["action"] == "return_charge_requested"
+    assert alerts[0]["event_type"] == "low_battery_alert"
+    assert alerts[0]["source"]["code"] == "LOW_BATTERY_ALERT"
+    assert alerts[0]["attributes"]["action"] == "alert_only"
+    assert alerts[0]["attributes"]["automatic_docking"] is False
 
 
 def test_mapping_divergence_alert_emits_once(monkeypatch):

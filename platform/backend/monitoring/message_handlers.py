@@ -29,7 +29,6 @@ from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
 from .services import tts_service
 from .services.alert_skill_service import resolve_alert_template
-from .services.docking_service import DockingDispatchError, dispatch_docking_task
 
 
 ResponsePublisher = Callable[[str, dict, int, bool], None]
@@ -141,19 +140,19 @@ def _queue_mapping_divergence_speech(robot: Robot, payload: dict):
     )
 
 
-def _queue_low_battery_return_speech(robot: Robot, payload: dict):
+def _queue_low_battery_alert_speech(robot: Robot, payload: dict):
     episode_id = str((payload.get("attributes") or {}).get("low_battery_episode_id") or payload.get("event_id") or "")
     duplicate_filter = {
         "robot": robot,
         "action": "play_audio",
-        "payload__source": "low_battery_return_charge_speech",
+        "payload__source": "low_battery_alert_speech",
         "payload__low_battery_episode_id": episode_id,
     }
     if RobotCommand.objects.filter(**duplicate_filter).exists():
         return None
-    template = resolve_alert_template("low_battery_return_charge", "低电量自动回充")
+    template = resolve_alert_template("low_battery_return_charge", "低电量停车告警")
     if not template:
-        LOGGER.warning("low-battery return speech skill is disabled or has no template robot=%s", robot.code)
+        LOGGER.warning("low-battery alert speech skill is disabled or has no template robot=%s", robot.code)
         return None
     try:
         saved_path, cache_hit = tts_service.synthesize_speech(template.text)
@@ -167,7 +166,7 @@ def _queue_low_battery_return_speech(robot: Robot, payload: dict):
         payload__source="patrol_waypoint_speech",
     ).update(
         status="superseded",
-        error_message="低电量回充告警已中止巡检点位播报",
+        error_message="低电量停车告警已中止巡检点位播报",
         updated_at=timezone.now(),
     )
     return RobotCommand.objects.create(
@@ -177,7 +176,7 @@ def _queue_low_battery_return_speech(robot: Robot, payload: dict):
             "audio_url": _public_media_url(saved_path),
             "audio_name": template.name,
             "text": template.text,
-            "source": "low_battery_return_charge_speech",
+            "source": "low_battery_alert_speech",
             "alert_skill": "low_battery_return_charge",
             "dual_output": True,
             "priority": "critical",
@@ -339,41 +338,18 @@ def _dispatch(
             source_code = str((payload.get("source") or {}).get("code") or "")
             if payload.get("event_type") == "slam_diverged" or source_code == "SLAM_DIVERGED":
                 _queue_mapping_divergence_speech(robot, payload)
-            if (
-                payload.get("event_type") == "low_battery_return_charge"
-                or source_code == "LOW_BATTERY_RETURN_CHARGE"
-            ):
-                _queue_low_battery_return_speech(robot, payload)
-                episode_id = str(
-                    (payload.get("attributes") or {}).get("low_battery_episode_id")
-                    or payload.get("event_id")
-                    or ""
-                )
-                try:
-                    docking = dispatch_docking_task(
-                        robot=robot,
-                        low_battery_episode_id=episode_id,
-                    )
-                    docking_result = {
-                        "status": "created" if docking.created else "already_active",
-                        "execution_id": str(docking.execution.id),
-                        "command_id": str(docking.command.id),
-                    }
-                except DockingDispatchError as exc:
-                    docking_result = {"status": "failed", "code": exc.code, "message": str(exc)}
-                    event.description = f"低电量回充任务未下发：{exc}（{exc.code}）"
-                    event.save(update_fields=["description", "updated_at"])
-                    LOGGER.warning(
-                        "low-battery docking dispatch failed robot=%s episode=%s code=%s message=%s",
-                        robot.code,
-                        episode_id,
-                        exc.code,
-                        exc,
-                    )
+            if payload.get("event_type") in {
+                "low_battery_alert",
+                "low_battery_return_charge",
+            } or source_code in {"LOW_BATTERY_ALERT", "LOW_BATTERY_RETURN_CHARGE"}:
+                # Legacy Edge versions still publish `low_battery_return_charge`.
+                # Treat both formats as alert-only so no docking task or map
+                # activation command can be created from a battery warning.
+                _queue_low_battery_alert_speech(robot, payload)
                 return {
                     "created": created,
                     "event_id": str(event.event_id),
-                    "docking": docking_result,
+                    "automatic_docking": False,
                 }
         return {"created": created, "event_id": str(event.event_id)}
     if message_type == "sync.request":

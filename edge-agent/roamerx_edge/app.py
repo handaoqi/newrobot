@@ -136,7 +136,7 @@ class EdgeAgentApplication:
             self.store,
             power_refresh=self._refresh_charge_power,
         )
-        self.charge_control_adapter.set_low_battery_handler(self._handle_low_battery_charge)
+        self.charge_control_adapter.set_low_battery_handler(self._handle_low_battery_alert)
         self._docking_undock_pending = False
         self.charge_control_adapter.set_charge_started_handler(self._handle_charge_started)
         self.charge_control_adapter.set_full_charge_handler(self._finish_docking_undock)
@@ -550,8 +550,8 @@ class EdgeAgentApplication:
             except Exception:
                 LOGGER.exception("mapping divergence local speech failed command=%s", command)
 
-    def _handle_low_battery_charge(self, episode_id: str, battery_percent: int) -> None:
-        """Stop patrol motion and ask the center for one idempotent docking task."""
+    def _handle_low_battery_alert(self, episode_id: str, battery_percent: int) -> None:
+        """Stop patrol motion and report low battery without requesting docking."""
         context = self.task_executor.context
         execution_id = context.task_execution_id if context else ""
         docking_active = bool(
@@ -559,7 +559,7 @@ class EdgeAgentApplication:
             and context
             and (context.docking or {}).get("enabled")
         )
-        action = "docking_already_active" if docking_active else "return_charge_requested"
+        action = "docking_already_active" if docking_active else "alert_only"
         # Always pass a retained non-docking context through the idempotent
         # cancel path. It may have become terminal after the snapshot above;
         # cancel_task then performs only the local zero-velocity safety action
@@ -567,14 +567,14 @@ class EdgeAgentApplication:
         if context and not docking_active:
             try:
                 self.task_executor.cancel_task(execution_id)
-                LOGGER.warning("low battery cancelled active navigation before automatic return")
+                LOGGER.warning("low battery cancelled active navigation; automatic return is disabled")
             except Exception:
                 LOGGER.exception("graceful low-battery task cancellation failed; forcing local exit")
-                action = "return_charge_requested_after_force_exit"
+                action = "alert_only_after_force_exit"
                 try:
                     self.task_executor.force_exit(execution_id)
                 except Exception:
-                    action = "navigation_stop_failed"
+                    action = "navigation_stop_failed_alert_only"
                     LOGGER.exception("failed to force low-battery task exit")
         pose = self.navigation.latest_pose()
         pose_payload = {"frame_id": "map"}
@@ -589,7 +589,7 @@ class EdgeAgentApplication:
         self.mqtt.publish_alert(
             {
                 "event_id": episode_id,
-                "event_type": "low_battery_return_charge",
+                "event_type": "low_battery_alert",
                 "severity": "high",
                 "occurred_at": now_iso(),
                 "task_execution_id": execution_id or None,
@@ -598,11 +598,11 @@ class EdgeAgentApplication:
                 "pose": pose_payload,
                 "source": {
                     "component": "charge_control_adapter",
-                    "code": "LOW_BATTERY_RETURN_CHARGE",
+                    "code": "LOW_BATTERY_ALERT",
                     "model_version": self.config.robot.agent_version,
                 },
                 "detection": {
-                    "label": "低电量自动回充",
+                    "label": "低电量停车告警",
                     "class": "low_battery",
                     "confidence": 1.0,
                 },
@@ -612,6 +612,7 @@ class EdgeAgentApplication:
                     "threshold_percent": self.config.charge_control.low_battery_start_percent,
                     "rearm_percent": self.config.charge_control.low_battery_rearm_percent,
                     "action": action,
+                    "automatic_docking": False,
                 },
             }
         )

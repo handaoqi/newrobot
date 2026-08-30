@@ -36,9 +36,9 @@ class ChargeControlAdapter:
         self._previous_charge_state: str | None = None
         self._thermal_retry_thread: threading.Thread | None = None
         self._low_battery_samples = 0
-        self._last_low_battery_start_at: float | None = None
+        self._last_low_battery_alert_at: float | None = None
         self._manual_disconnect_inhibit_until = 0.0
-        self._low_battery_start_thread: threading.Thread | None = None
+        self._low_battery_alert_thread: threading.Thread | None = None
         self._charge_begin_thread: threading.Thread | None = None
         self._dock_monitor_thread: threading.Thread | None = None
         self._pending_charge_started_at: float | None = None
@@ -309,7 +309,7 @@ class ChargeControlAdapter:
                     self._low_battery_episode = {}
                     self._persist_low_battery_episode()
                     LOGGER.info(
-                        "battery recovered to %d%%; low-battery return latch re-armed",
+                        "battery recovered to %d%%; low-battery alert latch re-armed",
                         percent,
                     )
                 return
@@ -326,18 +326,18 @@ class ChargeControlAdapter:
                 return
             self._low_battery_samples += 1
             cooldown_elapsed = (
-                self._last_low_battery_start_at is None
-                or now - self._last_low_battery_start_at >= self.config.low_battery_start_cooldown_seconds
+                self._last_low_battery_alert_at is None
+                or now - self._last_low_battery_alert_at >= self.config.low_battery_start_cooldown_seconds
             )
             start_running = bool(
-                self._low_battery_start_thread and self._low_battery_start_thread.is_alive()
+                self._low_battery_alert_thread and self._low_battery_alert_thread.is_alive()
             )
             if self._low_battery_samples < self.config.low_battery_confirmation_samples:
                 return
             if not cooldown_elapsed or start_running:
                 return
             self._low_battery_samples = 0
-            self._last_low_battery_start_at = now
+            self._last_low_battery_alert_at = now
             episode_id = str(uuid.uuid4())
             self._low_battery_episode = {
                 "active": True,
@@ -346,22 +346,22 @@ class ChargeControlAdapter:
                 "triggered_at_epoch": time.time(),
             }
             self._persist_low_battery_episode()
-            self._low_battery_start_thread = threading.Thread(
-                target=self._start_for_low_battery,
+            self._low_battery_alert_thread = threading.Thread(
+                target=self._alert_for_low_battery,
                 args=(episode_id, percent),
                 daemon=True,
-                name="low-battery-charge-start",
+                name="low-battery-alert",
             )
-            self._low_battery_start_thread.start()
+            self._low_battery_alert_thread.start()
 
     def _persist_low_battery_episode(self) -> None:
         if self.store:
             self.store.set_metadata("low_battery_episode", self._low_battery_episode)
 
-    def _start_for_low_battery(self, episode_id: str, percent: int) -> None:
+    def _alert_for_low_battery(self, episode_id: str, percent: int) -> None:
         try:
             LOGGER.warning(
-                "battery is %d%% (below %d%%); requesting one automatic return-to-charge task episode=%s",
+                "battery is %d%% (below %d%%); stopping navigation and raising an alert only episode=%s",
                 percent,
                 self.config.low_battery_start_percent,
                 episode_id,
@@ -369,7 +369,7 @@ class ChargeControlAdapter:
             if callable(self._low_battery_handler):
                 self._low_battery_handler(episode_id, percent)
         except Exception:
-            LOGGER.exception("automatic low-battery return request failed episode=%s", episode_id)
+            LOGGER.exception("low-battery alert callback failed episode=%s", episode_id)
 
     def _observe_thermal_recovery(self, power: dict) -> None:
         state = power.get("charge_state")

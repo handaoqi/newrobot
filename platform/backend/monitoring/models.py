@@ -544,7 +544,7 @@ class AlertSkillBinding(BaseTimestampModel):
         ("obstacle_detected", "发现障碍"),
         ("avoidance", "避障"),
         ("dissuasion", "劝阻"),
-        ("low_battery_return_charge", "低电量自动回充"),
+        ("low_battery_return_charge", "低电量停车告警"),
     ]
 
     skill_key = models.CharField(max_length=32, choices=SKILL_CHOICES, unique=True)

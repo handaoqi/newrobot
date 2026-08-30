@@ -259,7 +259,7 @@ def test_thermal_recovery_retries_charge_once_after_delay(monkeypatch):
     assert calls == ["retry"]
 
 
-def test_low_battery_requests_one_return_task_only_below_threshold():
+def test_low_battery_raises_one_alert_only_below_threshold():
     class FakePowerMode:
         def snapshot(self):
             return {"auto_charge_enabled": False}
@@ -340,7 +340,7 @@ def test_low_battery_episode_survives_restart_and_rearms_at_25_percent(tmp_path)
     store.close()
 
 
-def test_manual_disconnect_pauses_low_battery_auto_charge():
+def test_manual_disconnect_pauses_low_battery_alert():
     class FakePowerMode:
         def __init__(self):
             self.stage = "charging"
