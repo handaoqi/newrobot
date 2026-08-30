@@ -52,6 +52,10 @@ import {
 import { activateRouteMap } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
 import {
+  buildProgressiveLocalizationPayload,
+  progressiveLocalizationTimeoutMs,
+} from '../services/progressiveLocalization'
+import {
   activeGuardDutyTarget,
   guardDutyExecutionWaypointPlan,
   guardDutyRouteState,
@@ -659,27 +663,30 @@ async function initializeLocalization() {
       onProgress: message => { localizationInitMessage.value = message },
     })
     navigationStatus.value = activation.navigationStatus
-    localizationInitMessage.value = '路线地图已下发，正在重启导航/定位栈'
+    localizationInitMessage.value = '路线地图已下发，正在从原点重新初始化定位'
 
-    const command = await sendRobotNavigationCommand(robot.id, 'restart', {
-      map_id: mapId,
-      map_version: mapVersion,
+    const localizationPayload = buildProgressiveLocalizationPayload({
+      mapId,
+      mapVersion,
+      waypoints: routeData.value?.waypoints || [],
     })
+    const command = await sendRobotNavigationCommand(robot.id, 'relocalize', localizationPayload)
 
-    for (let attempt = 0; attempt < 25 && runId === localizationRunId; attempt += 1) {
+    const maxAttempts = Math.ceil(progressiveLocalizationTimeoutMs(localizationPayload) / 3000)
+    for (let attempt = 0; attempt < maxAttempts && runId === localizationRunId; attempt += 1) {
       await sleep(3000)
       const latest = await refreshLocalizationStatus({ sync: false })
       if (!latest) continue
       const latestCommand = latest.command
       const isCurrentCommand = String(latestCommand?.id || '') === String(command.id || '')
       if (isCurrentCommand && failedCommandStatuses.has(latestCommand.status)) {
-        throw new Error(latestCommand.error_message || latestCommand.error_code || '导航/定位栈重启失败')
+        throw new Error(latestCommand.error_message || latestCommand.error_code || '渐进定位初始化失败')
       }
       if (isCurrentCommand && latestCommand.status === 'succeeded') {
-        localizationInitMessage.value = '导航栈已重启，正在等待定位收敛'
+        localizationInitMessage.value = '原点、航点、关键帧/全局匹配已完成，正在等待定位收敛'
         if (navigationReadyForMap(latest, mapId, mapVersion)) {
           localizationInitState.value = 'success'
-          localizationInitMessage.value = '当前地图定位正常，导航栈已就绪'
+          localizationInitMessage.value = '已重新初始化到最优定位点，导航栈已就绪'
           showToast('定位初始化成功')
           return
         }

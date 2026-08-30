@@ -224,6 +224,81 @@ def test_active_relocalize_commits_verified_ndt_instead_of_advancing_candidate()
     assert result["best_ndt_committed"] is True
 
 
+def test_progressive_relocalize_tries_origin_then_each_waypoint_in_order():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 13
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    calls = []
+
+    def set_once(pose, generation):
+        calls.append((dict(pose), generation))
+        if len(calls) < 3:
+            raise ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no match", details={})
+        return {
+            "localized_pose": {"x": pose["x"], "y": pose["y"], "yaw": pose["yaw"]},
+            "localization_status": "normal",
+            "best_ndt_candidate": {"matching_error": 0.12, "inlier_fraction": 0.8},
+        }
+
+    adapter._set_initial_pose_once = set_once
+
+    result = adapter.progressive_relocalize(
+        origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        waypoints=[
+            {"x": 1.0, "y": 2.0, "yaw": 0.1},
+            {"x": 3.0, "y": 4.0, "yaw": 0.2},
+        ],
+        wait_seconds=120.0,
+    )
+
+    assert [(call[0]["x"], call[0]["y"]) for call in calls] == [
+        (0.0, 0.0), (1.0, 2.0), (3.0, 4.0),
+    ]
+    assert result["selected_stage"] == "route_waypoint"
+    assert result["selected_waypoint_index"] == 1
+    assert result["localized_pose"]["x"] == 3.0
+
+
+def test_progressive_relocalize_falls_back_to_keyframe_global_match():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 14
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    adapter._set_initial_pose_once = lambda _pose, _generation: (_ for _ in ()).throw(
+        ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no local match", details={})
+    )
+    global_calls = []
+
+    def global_once(wait_seconds, generation):
+        global_calls.append((wait_seconds, generation))
+        return {
+            "localized_pose": {"x": 8.0, "y": 9.0, "yaw": 1.0},
+            "localization_status": "normal",
+            "message": "keyframe 42 verified by FastVGICP",
+            "motion_commanded": False,
+        }
+
+    adapter._global_relocalize_once = global_once
+
+    result = adapter.progressive_relocalize(
+        origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        waypoints=[{"x": 1.0, "y": 2.0, "yaw": 0.1}],
+        wait_seconds=120.0,
+    )
+
+    assert global_calls[0][1] == 14
+    assert result["selected_stage"] == "keyframe_global_match"
+    assert result["localized_pose"]["x"] == 8.0
+    assert result["stages"][-1]["status"] == "accepted"
+
+
 def test_operator_initial_pose_commits_verified_ndt_match():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 9

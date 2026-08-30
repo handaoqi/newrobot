@@ -46,3 +46,29 @@ class NavigationSingleGoalTests(TestCase):
                 "yaw": 0.75,
             },
         )
+
+    def test_progressive_relocalization_forwards_ordered_route_waypoints(self):
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/navigation/relocalize/",
+            {
+                "seed_source": "progressive",
+                "map_id": "7",
+                "map_version": "v3",
+                "wait_seconds": 180,
+                "waypoints": [
+                    {"x": 1, "y": 2, "yaw": 0.1, "name": "ignored"},
+                    {"x": 3, "y": 4, "yaw": -0.2},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        command = RemoteCommand.objects.get(pk=response.data["id"])
+        self.assertEqual(command.command_type, "nav.relocalize")
+        self.assertEqual(command.payload["seed_source"], "progressive")
+        self.assertEqual(command.payload["wait_seconds"], 180.0)
+        self.assertEqual(command.payload["waypoints"], [
+            {"x": 1.0, "y": 2.0, "yaw": 0.1},
+            {"x": 3.0, "y": 4.0, "yaw": -0.2},
+        ])

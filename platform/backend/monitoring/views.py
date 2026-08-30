@@ -3164,19 +3164,43 @@ class RobotNavigationRecoverView(RobotNavigationCommandView):
 
 class RobotNavigationRelocalizeView(RobotNavigationCommandView):
     command_type = "nav.relocalize"
-    expiry_seconds = 180
+    expiry_seconds = 1200
 
     def build_payload(self, request, robot: Robot) -> dict:
         seed_source = str(request.data.get("seed_source") or "last_trusted").strip()
-        if seed_source not in {"last_trusted", "mapping_start", "global"}:
-            raise ValueError("主动重定位方式必须是可信位姿、建图起点或全局搜索")
+        if seed_source not in {"last_trusted", "mapping_start", "global", "progressive"}:
+            raise ValueError("主动重定位方式必须是渐进初始化、可信位姿、建图起点或全局搜索")
+        wait_seconds = float(request.data.get("wait_seconds") or 90.0)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            raise ValueError("主动重定位等待时间必须是正数")
+        if seed_source == "progressive":
+            wait_seconds = min(900.0, max(30.0, wait_seconds))
         payload = {
             "reason": "operator_active_relocalization",
             "seed_source": seed_source,
             "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
             "map_version": request.data.get("map_version") or robot.current_map_version or "",
-            "wait_seconds": float(request.data.get("wait_seconds") or 90.0),
+            "wait_seconds": wait_seconds,
         }
+        if seed_source == "progressive":
+            raw_waypoints = request.data.get("waypoints") or []
+            if not isinstance(raw_waypoints, list):
+                raise ValueError("渐进初始化的航点必须是数组")
+            if len(raw_waypoints) > 200:
+                raise ValueError("渐进初始化最多支持 200 个路线航点")
+            normalized_waypoints = []
+            for index, waypoint in enumerate(raw_waypoints):
+                if not isinstance(waypoint, dict):
+                    raise ValueError(f"第 {index + 1} 个航点格式无效")
+                try:
+                    normalized_waypoints.append({
+                        "x": float(waypoint["x"]),
+                        "y": float(waypoint["y"]),
+                        "yaw": float(waypoint.get("yaw") or 0.0),
+                    })
+                except (TypeError, ValueError, KeyError) as error:
+                    raise ValueError(f"第 {index + 1} 个航点需要数值 x、y、yaw") from error
+            payload["waypoints"] = normalized_waypoints
         supplied = [request.data.get(field) is not None for field in ("x", "y", "yaw")]
         if any(supplied):
             if not all(supplied):

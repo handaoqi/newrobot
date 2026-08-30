@@ -219,7 +219,7 @@ def validate_command(envelope: MessageEnvelope) -> None:
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]
         seed_source = str(command.get("seed_source") or "last_trusted").strip()
-        if not supplied and seed_source not in {"mapping_start", "last_trusted", "global"}:
+        if not supplied and seed_source not in {"mapping_start", "last_trusted", "global", "progressive"}:
             raise ProtocolError(
                 "INVALID_MESSAGE",
                 "nav.relocalize requires x, y and yaw or a supported seed_source",
@@ -230,6 +230,22 @@ def validate_command(envelope: MessageEnvelope) -> None:
             value = command.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"nav.relocalize {field} must be numeric")
+        if seed_source == "progressive":
+            waypoints = command.get("waypoints") or []
+            if not isinstance(waypoints, list):
+                raise ProtocolError("INVALID_MESSAGE", "nav.relocalize waypoints must be a list")
+            for index, waypoint in enumerate(waypoints):
+                if not isinstance(waypoint, dict):
+                    raise ProtocolError(
+                        "INVALID_MESSAGE", f"nav.relocalize waypoint {index} must be an object"
+                    )
+                for field in ("x", "y", "yaw"):
+                    value = waypoint.get(field)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ProtocolError(
+                            "INVALID_MESSAGE",
+                            f"nav.relocalize waypoint {index} {field} must be numeric",
+                        )
     if envelope.message_type == "map.activate":
         command = payload["command"]
         for field in ("map_id", "map_version"):

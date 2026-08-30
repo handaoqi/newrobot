@@ -19,6 +19,7 @@ class FakeNavigation:
         self.pose = SimpleNamespace(x=3.0, y=4.0)
         self.rtk_initial_pose_requests = 0
         self.global_relocalize_requests = []
+        self.progressive_relocalize_requests = []
         self.operator_localization_events = []
 
     def begin_operator_localization(self):
@@ -55,6 +56,15 @@ class FakeNavigation:
     def global_relocalize(self, wait_seconds=90.0):
         self.global_relocalize_requests.append(wait_seconds)
         return {"mode": "global_position_yaw_search", "motion_commanded": False}
+
+    def progressive_relocalize(self, *, origin, waypoints, wait_seconds=180.0):
+        request = {"origin": origin, "waypoints": waypoints, "wait_seconds": wait_seconds}
+        self.progressive_relocalize_requests.append(request)
+        return {
+            "mode": "progressive_stationary_search",
+            "selected_stage": "mapping_origin",
+            "motion_commanded": False,
+        }
 
     def teleop_action(self, action):
         self.teleop_actions.append(action)
@@ -117,6 +127,9 @@ class FakePersonFollow:
 
 
 class FakeMapActivation:
+    def mapping_start_pose(self):
+        return {"x": 0.0, "y": 0.0, "yaw": 0.0, "source": "mapping_start"}
+
     def resolve_source_dir(self, command):
         return Path("/maps/source")
 
@@ -747,6 +760,44 @@ def test_active_relocalization_global_does_not_require_seed(tmp_path):
 
     assert result["payload"]["status"] == "succeeded"
     assert navigation.global_relocalize_requests == [42.0]
+    store.close()
+
+
+def test_progressive_relocalization_starts_at_mapping_origin_then_receives_waypoints(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.relocalize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "seed_source": "progressive",
+        "waypoints": [
+            {"x": 1.0, "y": 2.0, "yaw": 0.1},
+            {"x": 3.0, "y": 4.0, "yaw": 0.2},
+        ],
+        "wait_seconds": 150.0,
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        map_activation_adapter=FakeMapActivation(),
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    request = navigation.progressive_relocalize_requests[0]
+    assert request["origin"]["source"] == "mapping_start"
+    assert request["waypoints"][1]["x"] == 3.0
+    assert request["wait_seconds"] == 150.0
+    assert result["payload"]["result"]["selected_stage"] == "mapping_origin"
     store.close()
 
 

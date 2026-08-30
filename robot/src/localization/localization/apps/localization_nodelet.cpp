@@ -2780,6 +2780,12 @@ private:
     }
 
     advanceGlobalRelocalizationGeneration("explicit global relocalization");
+    // Keep automatic recovery in the configured shadow rollout, but allow an
+    // operator's explicit initialization command to apply a candidate that
+    // passes every Scan Context + geometry gate.  The generation scope makes
+    // the permission expire as soon as another pose/relocalization operation
+    // supersedes this request.
+    explicit_global_relocalization_generation_ = global_relocalization_generation_;
     is_init_success_ = false;
     resetInitializationValidation("global_searching");
     localization_state_ = 1;
@@ -2792,7 +2798,7 @@ private:
     response->success = true;
     response->message = scan_context_effective_runtime_mode_ == "active"
       ? "Global position and 360-degree yaw search armed"
-      : "Global search armed in shadow mode; navigation remains blocked until active rollout";
+      : "Operator global search armed; only a fully geometry-verified candidate may be applied";
     RCLCPP_WARN(get_logger(),
       "Explicit global relocalization armed (mode=%s); mapping-start fallback is disabled",
       scan_context_effective_runtime_mode_.c_str());
@@ -4260,7 +4266,9 @@ private:
     job.fallback_seed.block<3, 1>(0, 3) = last_init_pos_.cast<double>();
     job.fallback_seed.block<3, 3>(0, 0) = last_init_quat_.toRotationMatrix().cast<double>();
     job.use_scan_context = scan_context_effective_runtime_mode_ != "disabled";
-    job.apply_scan_context = scan_context_effective_runtime_mode_ == "active";
+    job.apply_scan_context = scanContextApplyAllowed(
+      scan_context_effective_runtime_mode_, job.generation,
+      explicit_global_relocalization_generation_);
     job.allow_fallback = !global_search_required_;
     global_relocalization_state_ = "searching";
     {
@@ -4277,6 +4285,7 @@ private:
   void advanceGlobalRelocalizationGeneration(
     const char* reason, double settle_seconds = 0.0) {
     ++global_relocalization_generation_;
+    explicit_global_relocalization_generation_ = 0;
     global_relocalization_earliest_start_ns_ = steadyNowNanoseconds() +
       static_cast<std::int64_t>(std::max(0.0, settle_seconds) * 1e9);
     {
@@ -4311,7 +4320,10 @@ private:
     global_candidate_rmse_m_ = result->candidate_rmse_m;
     global_candidate_overlap_ = result->candidate_overlap;
     global_candidate_rejection_reason_ = result->rejection_reason;
-    if (result->candidate_accepted && scan_context_effective_runtime_mode_ == "shadow") {
+    const bool explicit_operator_result =
+      result->generation == explicit_global_relocalization_generation_;
+    if (result->candidate_accepted && scan_context_effective_runtime_mode_ == "shadow" &&
+        !explicit_operator_result) {
       global_relocalization_state_ = "shadow_candidate_verified";
       initialization_state_ = global_search_required_ ? "shadow_blocked" : initialization_state_;
     }
@@ -5435,6 +5447,9 @@ private:
   std::atomic<bool> global_localization_in_progress_{false};
   rclcpp::Time global_localization_start_time_;
   std::uint64_t global_relocalization_generation_ = 1;
+  // A nonzero matching generation grants apply permission only to a manual
+  // /localization/global_relocalize request while automatic recovery remains shadow-only.
+  std::uint64_t explicit_global_relocalization_generation_ = 0;
   std::mutex global_relocalization_job_mutex_;
   std::condition_variable global_relocalization_job_cv_;
   std::optional<GlobalRelocalizationJob> pending_global_relocalization_job_;

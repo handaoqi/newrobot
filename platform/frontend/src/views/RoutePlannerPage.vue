@@ -36,7 +36,6 @@ import {
   headingBetweenMapPoints,
   headingDegreesToRadians,
   initialPoseCommandOutcome,
-  localizationReadyForReuse,
   normalizeHeadingDegrees,
   normalizeRoutePlannerTelemetry,
   paginateKeyframes,
@@ -52,8 +51,12 @@ import {
   currentRobotMapPose,
   localizationRecoveryLabel,
 } from '../services/taskMapState'
-import { activateAndRelocalizeMap, waitForRobotCommand } from '../services/mapActivationFlow'
+import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
+import {
+  buildProgressiveLocalizationPayload,
+  progressiveLocalizationTimeoutMs,
+} from '../services/progressiveLocalization'
 import { preferredExecutedItem } from '../utils/executionSelection'
 
 const maps = ref([])
@@ -1345,39 +1348,31 @@ async function initializeLocalization() {
 
   navCommandBusy.value = 'localization-init'
   localizationInitState.value = 'restarting'
-  localizationInitMessage.value = '正在检查地图、定位与导航栈状态'
+  localizationInitMessage.value = '正在下发当前地图，并准备从原点重新初始化定位'
   navError.value = ''
   try {
-    const currentDecision = localizationQuality()?.decision || {}
-    const currentStatus = navStatus.value?.status || {}
-    if (localizationReadyForReuse({
-      mapMatches: robotMapMatches(),
-      navReady: (currentStatus.nav_ready ?? navStatus.value?.nav_ready) === true,
-      localizationStatus: localizationLabel(),
-      initializationVerified: currentDecision.initialization?.verified === true,
-      localizationSampleStale: localizationSampleStale(),
-      localizationQualityStale: localizationQualityStale(),
-    })) {
-      localizationInitState.value = 'done'
-      localizationInitMessage.value = '当前地图定位已经过连续帧验证，无需覆盖初始位姿'
-      return
-    }
-    localizationInitState.value = 'sending_pose'
-    const rtk = normalizeRoutePlannerTelemetry(navStatus.value?.status).rtk
-    const useFixedRtk = rtk?.online && rtk?.fusion_usable === true
-    localizationInitMessage.value = useFixedRtk
-      ? '正在准备定位栈，并下发 RTK XY 和航向'
-      : '正在准备定位栈，并搜索全图位置与 360° 航向'
-    const localizationCommand = await sendRobotNavigationCommand(robotId, useFixedRtk ? 'initial-pose' : 'relocalize', {
-      seed_source: useFixedRtk ? 'rtk' : 'global',
-      map_id: selectedMap.value?.id,
-      map_version: selectedMapVersion(),
-      wait_seconds: 90,
+    const activation = await activateRouteMap({
+      mapId: selectedMap.value?.id,
+      robotId,
+      mapVersion: selectedMapVersion(),
+      onProgress: message => { localizationInitMessage.value = message },
     })
+    navStatus.value = activation.navigationStatus
+    localizationInitState.value = 'sending_pose'
+    localizationInitMessage.value = '正在依次尝试建图原点、路线航点、关键帧与全局匹配'
+    const localizationPayload = buildProgressiveLocalizationPayload({
+      mapId: selectedMap.value?.id,
+      mapVersion: selectedMapVersion(),
+      waypoints: waypoints.value.map(point => {
+        const normalized = normalizeStoredWaypoint(point)
+        return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
+      }),
+    })
+    const localizationCommand = await sendRobotNavigationCommand(robotId, 'relocalize', localizationPayload)
     const completedLocalization = await waitForRobotCommand(robotId, localizationCommand, {
-      timeoutMs: 210_000,
+      timeoutMs: progressiveLocalizationTimeoutMs(localizationPayload),
       onProgress: latest => {
-        localizationInitMessage.value = `${useFixedRtk ? 'RTK初始化' : '全局定位搜索'} · ${latest.status || 'created'}`
+        localizationInitMessage.value = `渐进定位：原点 → 航点 → 关键帧/全局匹配 · ${latest.status || 'created'}`
       },
     })
     const outcome = applyInitialPoseOutcome(completedLocalization)

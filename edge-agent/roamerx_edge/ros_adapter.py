@@ -1260,7 +1260,15 @@ class RosAdapter(Node):
         wait_seconds = float(pose.get("wait_seconds", 8.0))
         required_normal_samples = int(pose.get("required_normal_samples", 0))
         require_absolute = bool(pose.get("require_absolute", False))
-        if require_absolute:
+        if require_absolute and required_normal_samples > 0:
+            latest = self._wait_for_fresh_normal_samples(
+                after_sequence=sample_sequence,
+                required_samples=required_normal_samples,
+                timeout_seconds=wait_seconds,
+                generation=generation,
+            )
+            accepted = bool(latest is not None and self._absolute_localization_stable())
+        elif require_absolute:
             deadline = time.monotonic() + wait_seconds
             latest = self.telemetry.latest_pose()
             while time.monotonic() < deadline:
@@ -1391,6 +1399,10 @@ class RosAdapter(Node):
             if automatic
             else self._start_localization_operation("global_relocalize")
         )
+        return self._global_relocalize_once(wait_seconds, generation)
+
+    def _global_relocalize_once(self, wait_seconds: float, generation: int) -> dict:
+        """Run the keyframe/global matcher inside an existing localization operation."""
         if not self._global_relocalize_client.wait_for_service(timeout_sec=3.0):
             raise ProtocolError(
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
@@ -1425,7 +1437,8 @@ class RosAdapter(Node):
             )
         return {
             "mode": "global_position_yaw_search",
-            "source": "scan_context",
+            "source": "scan_context_fastvgicp",
+            "stage": "keyframe_global_match",
             "service": "/localization/global_relocalize",
             "message": response.message,
             "localization_status": latest.localization_status,
@@ -1437,6 +1450,175 @@ class RosAdapter(Node):
             },
             "motion_commanded": False,
         }
+
+    def progressive_relocalize(
+        self,
+        *,
+        origin: dict | None,
+        waypoints: list[dict],
+        wait_seconds: float = 180.0,
+    ) -> dict:
+        """Always reinitialize through origin, route points, then global matching.
+
+        Every local seed must produce fresh, consecutive absolute-localization
+        evidence.  A verified NDT correction is committed immediately because
+        changing seeds after that point would discard the strongest result.
+        Scan Context keyframe retrieval plus FastVGICP/global matching remains
+        the final fallback when all explicit map seeds fail.
+        """
+        generation = self._start_localization_operation("progressive_operator_initialization")
+        deadline = time.monotonic() + max(30.0, float(wait_seconds))
+        stages = []
+        seeds = []
+        if origin and all(origin.get(field) is not None for field in ("x", "y", "yaw")):
+            seeds.append(("mapping_origin", None, dict(origin)))
+        else:
+            stages.append({
+                "stage": "mapping_origin",
+                "status": "unavailable",
+                "error_code": (origin or {}).get("unavailable_error_code", "MAPPING_START_POSE_MISSING"),
+                "error_message": (origin or {}).get(
+                    "unavailable_error_message", "map package has no usable mapping start pose"
+                ),
+            })
+        for index, raw in enumerate(waypoints):
+            if not isinstance(raw, dict) or not all(
+                raw.get(field) is not None for field in ("x", "y", "yaw")
+            ):
+                continue
+            seeds.append(("route_waypoint", index, dict(raw)))
+
+        # Reserve enough time for the heavyweight keyframe/global stage while
+        # still giving every explicit route seed a fresh-frame verification.
+        local_budget = max(0.0, float(wait_seconds) - 60.0)
+        per_seed_wait = min(8.0, max(3.0, local_budget / max(1, len(seeds))))
+        self._persist_relocalization_state({
+            "state": "running",
+            "mode": "progressive_stationary_search",
+            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+            "candidate_count": len(seeds),
+            "stages": stages,
+            "updated_at": time.time(),
+        })
+
+        for stage_name, waypoint_index, seed in seeds:
+            self._assert_localization_operation(generation)
+            attempt = {
+                "stage": stage_name,
+                "waypoint_index": waypoint_index,
+                "submitted_pose": {
+                    key: seed.get(key) for key in ("x", "y", "z", "yaw") if seed.get(key) is not None
+                },
+            }
+            try:
+                result = self._set_initial_pose_once({
+                    **seed,
+                    "frame_id": "map",
+                    "wait_seconds": min(per_seed_wait, max(1.0, deadline - time.monotonic())),
+                    "required_normal_samples": 3,
+                    "require_absolute": True,
+                    "covariance_x": 1.0,
+                    "covariance_y": 1.0,
+                    "covariance_yaw": 0.274,
+                }, generation)
+                latest = self.telemetry.latest_pose()
+                if self._trusted_pose_cb and latest:
+                    self._trusted_pose_cb(latest)
+                    self._last_trusted_pose_report_monotonic = time.monotonic()
+                accepted = {
+                    **attempt,
+                    "status": "accepted",
+                    "best_ndt_candidate": result.get("best_ndt_candidate"),
+                }
+                stages.append(accepted)
+                payload = {
+                    "mode": "progressive_stationary_search",
+                    "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                    "selected_stage": stage_name,
+                    "selected_waypoint_index": waypoint_index,
+                    "stages": stages,
+                    "localized_pose": result["localized_pose"],
+                    "localization_status": result["localization_status"],
+                    "best_ndt_candidate": result.get("best_ndt_candidate"),
+                    "motion_commanded": False,
+                }
+                self._persist_relocalization_state({
+                    **payload, "state": "accepted", "updated_at": time.time()
+                })
+                return payload
+            except ProtocolError as exc:
+                if exc.code == "RELOCALIZATION_SUPERSEDED":
+                    raise
+                candidate = dict((exc.details or {}).get("best_ndt_candidate") or {})
+                stages.append({
+                    **attempt,
+                    "status": "rejected",
+                    "error_code": exc.code,
+                    "best_ndt_candidate": candidate or None,
+                })
+                self._persist_relocalization_state({
+                    "state": "running",
+                    "mode": "progressive_stationary_search",
+                    "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                    "stages": stages,
+                    "updated_at": time.time(),
+                })
+                if candidate.get("eligible"):
+                    committed = self._commit_best_relocalization_candidate(
+                        generation,
+                        {"source": stage_name, "waypoint_index": waypoint_index},
+                        candidate,
+                        stages,
+                    )
+                    committed.update({
+                        "mode": "progressive_stationary_search",
+                        "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                        "selected_stage": stage_name,
+                        "selected_waypoint_index": waypoint_index,
+                        "stages": stages,
+                    })
+                    return committed
+
+        stages.append({"stage": "keyframe_global_match", "status": "searching"})
+        self._persist_relocalization_state({
+            "state": "global_searching",
+            "mode": "progressive_stationary_search",
+            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+            "stages": stages,
+            "updated_at": time.time(),
+        })
+        try:
+            global_result = self._global_relocalize_once(
+                max(30.0, deadline - time.monotonic()), generation
+            )
+        except ProtocolError as exc:
+            stages[-1].update({"status": "failed", "error_code": exc.code})
+            details = {
+                "mode": "progressive_stationary_search",
+                "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+                "stages": stages,
+                "motion_commanded": False,
+            }
+            self._persist_relocalization_state({
+                **details, "state": "failed", "updated_at": time.time()
+            })
+            raise ProtocolError(
+                "PROGRESSIVE_RELOCALIZATION_FAILED",
+                "origin, all route waypoints, and keyframe/global matching failed",
+                details=details,
+            ) from exc
+        stages[-1].update({"status": "accepted", "message": global_result.get("message")})
+        payload = {
+            **global_result,
+            "mode": "progressive_stationary_search",
+            "strategy": ["mapping_origin", "route_waypoints", "keyframe_global_match"],
+            "selected_stage": "keyframe_global_match",
+            "stages": stages,
+        }
+        self._persist_relocalization_state({
+            **payload, "state": "accepted", "updated_at": time.time()
+        })
+        return payload
 
     def _wait_for_fresh_normal_samples(
         self,
@@ -1596,6 +1778,7 @@ class RosAdapter(Node):
                 **best_pose,
                 "frame_id": "map",
                 "wait_seconds": 20.0,
+                "required_normal_samples": 3,
                 "require_absolute": True,
                 "covariance_x": 0.25,
                 "covariance_y": 0.25,

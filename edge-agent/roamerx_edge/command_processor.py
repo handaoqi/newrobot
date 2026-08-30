@@ -400,7 +400,24 @@ class CommandProcessor:
                         pose.setdefault("require_absolute", True)
                         result_payload = self.localization_adapter.set_initial_pose(pose)
                 else:
-                    if str(command.get("seed_source") or "last_trusted") == "global":
+                    seed_source = str(command.get("seed_source") or "last_trusted")
+                    if seed_source == "progressive":
+                        try:
+                            origin = (
+                                self.map_activation_adapter.mapping_start_pose()
+                                if self.map_activation_adapter else None
+                            )
+                        except ProtocolError as exc:
+                            origin = {
+                                "unavailable_error_code": exc.code,
+                                "unavailable_error_message": exc.message,
+                            }
+                        result_payload = self.localization_adapter.progressive_relocalize(
+                            origin=origin,
+                            waypoints=list(command.get("waypoints") or []),
+                            wait_seconds=float(command.get("wait_seconds", 180.0)),
+                        )
+                    elif seed_source == "global":
                         result_payload = self.localization_adapter.global_relocalize(
                             wait_seconds=float(command.get("wait_seconds", 90.0)),
                         )

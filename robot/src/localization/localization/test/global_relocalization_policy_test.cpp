@@ -35,5 +35,13 @@ TEST(GlobalRelocalizationPolicy, RequestWaitsForPoseSettleDeadline) {
   EXPECT_TRUE(globalRelocalizationRequestReady(1, 0));
 }
 
+TEST(GlobalRelocalizationPolicy, ExplicitOperatorRequestMayApplyWhileAutomaticRecoveryStaysShadow) {
+  EXPECT_TRUE(scanContextApplyAllowed("active", 7, 0));
+  EXPECT_TRUE(scanContextApplyAllowed("shadow", 7, 7));
+  EXPECT_FALSE(scanContextApplyAllowed("shadow", 8, 7));
+  EXPECT_FALSE(scanContextApplyAllowed("shadow", 7, 0));
+  EXPECT_FALSE(scanContextApplyAllowed("disabled", 7, 7));
+}
+
 }  // namespace
 }  // namespace localization
