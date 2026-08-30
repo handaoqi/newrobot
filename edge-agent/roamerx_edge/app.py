@@ -807,6 +807,11 @@ class EdgeAgentApplication:
                 LOGGER.exception("auto relocalize could not zero cmd_vel")
 
     def _localization_recovery_seed(self) -> dict | None:
+        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
+        waypoint = waypoint_getter() if callable(waypoint_getter) else None
+        if waypoint and waypoint.get("x") is not None and waypoint.get("y") is not None:
+            LOGGER.info("localization seed: current waypoint index=%s round=%s", waypoint.get("waypoint_index"), waypoint.get("round_number"))
+            return {"x": float(waypoint["x"]), "y": float(waypoint["y"]), "z": float(waypoint.get("z", 0.0) or 0.0), "yaw": float(waypoint.get("yaw", 0.0) or 0.0), "source": "current_waypoint"}
         pose = self.navigation.latest_trusted_pose()
         if not pose:
             pose = self.store.load_last_trusted_pose(
@@ -870,6 +875,15 @@ class EdgeAgentApplication:
                             cycle,
                             exc,
                         )
+                    if cycle == 1:
+                        global_relocalize = getattr(self.navigation, "global_relocalize", None)
+                        if callable(global_relocalize):
+                            try:
+                                global_relocalize(wait_seconds=90.0)
+                                LOGGER.info("global relocalize accepted after waypoint seed failure")
+                                return
+                            except Exception as exc:
+                                LOGGER.warning("global relocalize fallback failed: %s", exc)
                 if not self.task_executor.is_paused_for_localization():
                     return
                 elapsed = time.time() - started_at

@@ -433,6 +433,20 @@ class TaskExecutor:
                 and self._paused_for_localization
             )
 
+    def current_localization_waypoint(self) -> dict | None:
+        """Return the pending waypoint as a localization seed, if a task exists."""
+        with self._lock:
+            if not self.context:
+                return None
+            points = self.context.route_snapshot.get("waypoints") or []
+            index = int(self.context.current_waypoint_index)
+            if index < 0 or index >= len(points):
+                return None
+            point = dict(points[index])
+            point["waypoint_index"] = index
+            point["round_number"] = self.context.round_number
+            return point
+
     def on_localization_lost(self) -> None:
         """Pause active navigation when localization is continuously lost."""
         with self._lock:
