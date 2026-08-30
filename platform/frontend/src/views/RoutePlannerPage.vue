@@ -525,6 +525,14 @@ function setWaypointBoolean(index, field, value) {
   waypoints.value[index] = { ...waypoints.value[index], [field]: Boolean(value) }
 }
 
+function setWaypointDwell(index, value) {
+  const seconds = Math.min(3600, Math.max(0, Number(value) || 0))
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    dwell_seconds: Number(seconds.toFixed(1)),
+  }
+}
+
 async function adjustMapZoom(delta) {
   const viewport = mapViewportRef.value
   const centerX = viewport?.scrollWidth ? (viewport.scrollLeft + viewport.clientWidth / 2) / viewport.scrollWidth : 0.5
@@ -2311,6 +2319,18 @@ async function handleDeleteRoute(route) {
                       <label class="waypoint-check">
                         <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
                         <span>到点转向</span>
+                      </label>
+                      <label>
+                        <span>到点停留（秒）</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max="3600"
+                          step="0.5"
+                          inputmode="decimal"
+                          :value="point.dwell_seconds || 0"
+                          @input="setWaypointDwell(index, $event.target.value)"
+                        />
                       </label>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
