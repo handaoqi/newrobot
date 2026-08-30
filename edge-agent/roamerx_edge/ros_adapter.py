@@ -53,7 +53,14 @@ def follow_path_patrol_params(
         # rejection active, but use a lower gradient weight so MPPI makes one
         # deliberate detour instead of weaving along the RTK reference line.
         "FollowPath.CostCritic.cost_weight": 8.0 if outdoor else 18.0,
-        "FollowPath.PathAlignCritic.enabled": bool(final_approach and not require_yaw),
+        # Indoor local detours use a low-weight tangent pull to return smoothly
+        # after clearing an obstacle. Outdoor RTK keeps it off to avoid turning
+        # small GPS/polyline noise into left-right weaving.
+        "FollowPath.PathAlignCritic.enabled": bool(
+            not require_yaw
+            and (final_approach or (local_obstacles and not outdoor))
+        ),
+        "FollowPath.PathAlignCritic.cost_weight": 4.0 if local_obstacles else 12.0,
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
         "FollowPath.PathAlignCritic.use_path_orientations": False,
         "FollowPath.PathFollowCritic.enabled": True,

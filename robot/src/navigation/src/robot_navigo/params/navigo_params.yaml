@@ -243,6 +243,8 @@ controller_server:
       # being tracked, which navigation_rosbag.sh records) is published
       # regardless of this flag.
       visualize: false
+      # Publish bounded P50/P90/P99/max cycle timing for every diagnostic bag.
+      performance_log_interval_seconds: 10.0
       time_steps: 56
       model_dt: 0.05
       batch_size: 1000
@@ -300,7 +302,9 @@ controller_server:
         cost_weight: 5.0
         threshold_to_consider: 0.5
       CostCritic:
-        enabled: false
+        # Safe indoor fallback. Edge keeps this enabled for avoidance legs and
+        # lowers cost_weight to 8 for outdoor RTK without weakening collision_cost.
+        enabled: true
         cost_power: 2
         # Was 35: outdoor grass/scan noise made MPPI weave off the RTK path.
         cost_weight: 18.0
@@ -310,9 +314,11 @@ controller_server:
         near_goal_distance: 1.0
         trajectory_point_step: 2
       PathAlignCritic:
-        enabled: false
+        # Low-weight indoor return-to-path pull. Edge disables it for outdoor
+        # RTK cruise, where small GNSS/polyline variations otherwise cause weave.
+        enabled: true
         cost_power: 1
-        cost_weight: 12.0
+        cost_weight: 4.0
         max_path_occupancy_ratio: 0.20
         trajectory_point_step: 4
         threshold_to_consider: 0.5
@@ -322,13 +328,13 @@ controller_server:
         # Path yaw from hand-clicked vias weaves even when XY is almost straight.
         use_path_orientations: false
       PathFollowCritic:
-        enabled: false
+        enabled: true
         cost_power: 1
         cost_weight: 10.0 # 25
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
-        enabled: false
+        enabled: true
         cost_power: 1
         cost_weight: 2.0
         offset_from_furthest: 4

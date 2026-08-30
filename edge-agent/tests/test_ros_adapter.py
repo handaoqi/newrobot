@@ -551,6 +551,8 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     with_obstacles = follow_path_patrol_params(final_approach=False, local_obstacles=True)
     assert with_obstacles["FollowPath.CostCritic.enabled"] is True
     assert with_obstacles["FollowPath.CostCritic.cost_weight"] == 18.0
+    assert with_obstacles["FollowPath.PathAlignCritic.enabled"] is True
+    assert with_obstacles["FollowPath.PathAlignCritic.cost_weight"] == 4.0
 
     outdoor_with_obstacles = follow_path_patrol_params(
         final_approach=False,
@@ -559,6 +561,7 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     )
     assert outdoor_with_obstacles["FollowPath.CostCritic.enabled"] is True
     assert outdoor_with_obstacles["FollowPath.CostCritic.cost_weight"] == 8.0
+    assert outdoor_with_obstacles["FollowPath.PathAlignCritic.enabled"] is False
 
 
 def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(monkeypatch):

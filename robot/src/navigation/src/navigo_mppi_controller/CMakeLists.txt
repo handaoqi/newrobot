@@ -26,6 +26,7 @@ set(dependencies_pkgs
   tf2
   geometry_msgs
   visualization_msgs
+  std_msgs
   nav_msgs
   navigo_core
   navigo_costmap_2d

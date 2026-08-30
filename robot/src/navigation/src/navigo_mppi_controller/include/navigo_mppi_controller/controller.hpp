@@ -17,6 +17,8 @@
 
 #include <string>
 #include <memory>
+#include <chrono>
+#include <vector>
 
 #include "navigo_mppi_controller/tools/path_handler.hpp"
 #include "navigo_mppi_controller/optimizer.hpp"
@@ -27,6 +29,8 @@
 #include "navigo_core/controller.hpp"
 #include "navigo_core/goal_checker.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_lifecycle/lifecycle_publisher.hpp"
+#include "std_msgs/msg/string.hpp"
 
 namespace navigo_mppi_controller
 {
@@ -108,6 +112,9 @@ protected:
     */
   void visualize(nav_msgs::msg::Path transformed_plan);
 
+  /** Record and periodically publish bounded controller-cycle percentiles. */
+  void recordPerformance(double duration_ms);
+
   std::string name_;
   rclcpp_lifecycle::LifecycleNode::WeakPtr parent_;
   rclcpp::Clock::SharedPtr clock_;
@@ -121,6 +128,12 @@ protected:
   TrajectoryVisualizer trajectory_visualizer_;
 
   bool visualize_;
+
+  double performance_log_interval_seconds_{10.0};
+  std::chrono::steady_clock::time_point performance_window_started_;
+  std::vector<double> performance_samples_ms_;
+  rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>::SharedPtr
+    performance_publisher_;
 
   double reset_period_;
   // Last time computeVelocityCommands was called

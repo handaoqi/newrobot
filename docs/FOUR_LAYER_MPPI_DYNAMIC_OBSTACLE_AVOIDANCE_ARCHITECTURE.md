@@ -2,7 +2,22 @@
 
 > 文档日期：2026-08-28
 > 适用平台：RoamerX / ZSL-1A-07 / ROS 2 Humble / Nav2
-> 状态：架构设计，待分阶段实施
+> 状态：阶段 0 工具链、阶段 1 静态绕行代码已实施；受控实机场景验收待执行
+
+## 实施状态（2026-08-31）
+
+阶段 0、阶段 1 的软件内容已经落地：
+
+- `avoidance_baseline.sh` 固化直线、转弯、窄通道、纸箱、墙角和人员横穿场景，录制器本身不发布运动命令；
+- 导航诊断包覆盖 `/cmd_vel_nav -> /cmd_vel_raw -> /cmd_vel`、局部代价地图、碰撞区、传感器健康和 MPPI 性能；
+- 每个任务包关闭后自动生成 `avoidance_summary.json`，统计碰撞层干预、最小前向间距、角速度反转及 MPPI P99/最大耗时；
+- `avoidance_shadow_replay.sh` 固定使用隔离 ROS Domain，并重映射所有录制速度话题，禁止连接 SDK Bridge；
+- 室内启用局部障碍层、CostCritic、PathFollowCritic 和低权重 PathAlignCritic；室外保留 CostCritic，但关闭 PathAlignCritic 以避免 RTK 路线摆动；
+- Collision Monitor 继续作为 MPPI 后置的独立 Stop/Slow 层。
+
+代码、构建和无运动录包/回放冒烟测试通过，不代表静态纸箱、墙角、窄通道已经完成实机安全验收。实机验收必须按
+[阶段 0/1 操作手册](./AVOIDANCE_STAGE_0_1_RUNBOOK.md) 在现场确认路径安全后执行，结果以场景包中的
+`avoidance_scenario.json` 和 `avoidance_summary.json` 为准。
 
 ## 1. 文档目的
 
@@ -43,13 +58,12 @@ Nav2 Controller Server / MPPI
 
 当前主要缺口：
 
-1. `local_costmap.obstacle_layer.enabled=false`，局部代价地图没有实时障碍。
-2. MPPI 的 `CostCritic`、`PathFollowCritic`、`PathAlignCritic` 等避障相关评价器被关闭。
-3. 当前 MPPI 主要跟踪路径，动态障碍只能触发 Collision Monitor 减速或停车，不能主动绕行。
-4. 障碍物没有跨帧跟踪、速度估计和未来位置预测。
-5. Collision Monitor 主要覆盖机器狗前方，后退、侧移和旋转缺乏完整方向安全区。
-6. 遥控速度 `/teleop_cmd_vel` 直接进入 SDK Bridge，没有统一经过后置安全仲裁。
-7. 当前运动模型为 `DiffDrive`，配置的 `vy_max` 不会产生真正的全向侧移避障轨迹。
+1. 当前绕行基于二维即时/短时障碍，障碍物还没有跨帧跟踪、速度估计和未来位置预测。
+2. 尚未实现 `DynamicObstacleCritic`、`TTCCritic` 等时间对齐的动态评价器。
+3. Collision Monitor 主要覆盖机器狗前方，后退、侧移和旋转缺乏完整方向安全区。
+4. 遥控速度 `/teleop_cmd_vel` 直接进入 SDK Bridge，没有统一经过后置安全仲裁。
+5. 当前运动模型为 `DiffDrive`，配置的 `vy_max` 不会产生真正的全向侧移避障轨迹。
+6. 阶段 0/1 的受控实机验收数据尚未采集，不得把代码开关已经启用等同于效果验收通过。
 
 ## 3. 总体架构
 
@@ -459,18 +473,20 @@ robot/src/navigation/src/navigo_command_mux/
 
 ### 阶段 0：基线和回放环境
 
-- 固化当前直线、转弯、窄通道和人员横穿 rosbag；
-- 建立避障指标计算脚本；
-- 补齐 `/cmd_vel_nav -> /cmd_vel_safe` 全链路录包；
-- 建立无本体运动的离线 Shadow 回放。
+- [x] 提供直线、转弯、窄通道、纸箱、墙角和人员横穿标准录制入口与场景清单；
+- [x] 建立避障指标计算脚本；
+- [x] 补齐当前生产链 `/cmd_vel_nav -> /cmd_vel_raw -> /cmd_vel` 全链路录包；`/cmd_vel` 即当前安全输出；
+- [x] 建立隔离 Domain、速度话题强制重映射、无 SDK Bridge 的离线 Shadow 回放；
+- [ ] 在受控现场完成六类基线包采集（需要操作员确认路径与人员配合）。
 
 ### 阶段 1：恢复静态局部绕行
 
-- 按室内配置启用 `local_costmap.obstacle_layer`；
-- 启用并调低 `CostCritic` 初始权重；
-- 启用 `PathFollowCritic` 和低权重 `PathAlignCritic`；
-- 保持 Collision Monitor 作为独立停车层；
-- 验证静态纸箱、墙角和窄通道绕行。
+- [x] 按室内配置启用 `local_costmap.obstacle_layer`；
+- [x] 启用并调低 `CostCritic` 初始权重；室内 18、室外 RTK 8；
+- [x] 启用 `PathFollowCritic` 和室内低权重 `PathAlignCritic`；室外关闭 PathAlign 防摆动；
+- [x] 保持 Collision Monitor 作为独立停车层；
+- [x] 发布 MPPI 周期 P50/P90/P99/最大耗时并纳入任务诊断包；
+- [ ] 在受控现场完成静态纸箱、墙角和窄通道绕行验收。
 
 ### 阶段 2：动态目标跟踪
 
