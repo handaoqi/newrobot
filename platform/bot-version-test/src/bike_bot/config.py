@@ -81,6 +81,7 @@ class DetectionConfig:
     event_label: str
     risk_level: str = "medium"
     event_cooldown_seconds: int = 10
+    event_confirm_frames: int = 3
     min_box_area: int = 4000
     tracking_enabled: bool = True
     tracker_iou_threshold: float = 0.3
@@ -112,6 +113,7 @@ class TelemetryConfig:
 @dataclass
 class AudioPlaybackConfig:
     enabled: bool = False
+    skip_patrol_speech_sources: tuple = ()
     remote_host: str = ""
     remote_port: int = 22
     remote_user: str = ""

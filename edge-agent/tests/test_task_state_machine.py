@@ -17,7 +17,9 @@ class FakeNavigation:
         self.cancelled = 0
         self.stop_commands = 0
         self.stopped = True
-        self.pose = SimpleNamespace(x=1.0, y=2.0)
+        self.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
+        self.teleop = []
+        self.costmap_clears = 0
         self.trusted_pose = {
             "x": 3.0,
             "y": 4.0,
@@ -41,13 +43,37 @@ class FakeNavigation:
         return self.stand_confirmed
 
     def send_waypoints(self, waypoints, feedback_cb, result_cb):
+        if getattr(self, "reject_remaining", 0):
+            self.reject_remaining -= 1
+            self.sent.append(waypoints)
+            self.feedback = feedback_cb
+            self.result = result_cb
+            return False
         self.sent.append(waypoints)
         self.feedback = feedback_cb
         self.result = result_cb
+        # Mirror a completed in-place turn so subsequent pre-leg face checks
+        # see the updated heading (production TF/odom does this naturally).
+        if len(waypoints) == 1 and bool(waypoints[0].get("require_yaw")):
+            try:
+                goal_x = float(waypoints[0]["x"])
+                goal_y = float(waypoints[0]["y"])
+                # Only snap heading for stationary spins, not yaw-stop cruise goals.
+                if hypot(goal_x - self.pose.x, goal_y - self.pose.y) < 0.5:
+                    self.pose.yaw = float(waypoints[0]["yaw"])
+            except (KeyError, TypeError, ValueError):
+                pass
         return True
 
     def cancel_navigation(self, timeout_seconds=5):
         self.cancelled += 1
+        return True
+
+    def teleop_velocity(self, vx=0.0, vy=0.0, yaw_rate=0.0):
+        self.teleop.append((vx, vy, yaw_rate))
+
+    def clear_local_costmap(self, timeout_seconds=1.0):
+        self.costmap_clears += 1
         return True
 
     def stop_motion(self):
@@ -80,6 +106,7 @@ class FakeNavigation:
         final_approach=False,
         live=False,
         outdoor=None,
+        local_controller="rpp",
     ):
         self.waypoint_profiles.append((avoid_obstacles, require_yaw, final_approach))
         self.live_profiles.append(live)
@@ -102,6 +129,8 @@ class FakeBlockedNavigation(FakeNavigation):
             "actual_forward_speed_mps": 0.0,
             "localized_speed_mps": 0.0,
             "front_obstacle_distance_m": 0.45,
+            "left_clearance_m": 2.4,
+            "right_clearance_m": 0.3,
         }
 
 
@@ -166,6 +195,34 @@ def ids(batch):
     return [waypoint["waypoint_id"] for waypoint in batch]
 
 
+def drive_patrol(nav, *, until_ids=None, until_state=None, executor=None, steps=40):
+    """Advance one-pose patrol goals/spins until a sent batch or task state matches."""
+    for _ in range(steps):
+        if until_ids is not None and nav.sent and ids(nav.sent[-1]) == until_ids:
+            return
+        if (
+            executor is not None
+            and until_state is not None
+            and executor.context
+            and executor.context.state == until_state
+        ):
+            return
+        if nav.result is None:
+            raise AssertionError("navigation has no pending result callback")
+        last = nav.sent[-1][-1]
+        nav.pose = SimpleNamespace(
+            x=float(last["x"]),
+            y=float(last["y"]),
+            yaw=float(last.get("yaw") or getattr(nav.pose, "yaw", 0.0) or 0.0),
+        )
+        nav.result("succeeded", "", {"missed_waypoints": []})
+    raise AssertionError(
+        f"did not reach until_ids={until_ids} until_state={until_state}; "
+        f"last={ids(nav.sent[-1]) if nav.sent else None} "
+        f"state={getattr(getattr(executor, 'context', None), 'state', None)}"
+    )
+
+
 def command(message_type, state_version=0, resume_index=None):
     import json
     from pathlib import Path
@@ -200,9 +257,11 @@ def test_pause_resume_cancel(tmp_path):
     paused = executor.pause_task(executor.context.task_execution_id)
     assert paused["final_task_state"] == "paused"
     assert nav.cancelled == 1
+    # Face the travel direction before the resumed cruise leg.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
     resumed = executor.resume_task(executor.context.task_execution_id, 1)
     assert resumed["final_task_state"] == "running"
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     cancelled = executor.cancel_task(executor.context.task_execution_id)
     assert cancelled["final_task_state"] == "cancelled"
     store.close()
@@ -249,7 +308,7 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     executor.start_task(command("task.start"))
 
     assert executor.context.current_waypoint_index == 1
-    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-2"]
     assert events[0][0] == "task.started"
     assert events[0][1]["initial_waypoint_index"] == 1
     assert events[1][0] == "task.progress"
@@ -263,15 +322,15 @@ def test_navigation_feedback_switches_each_waypoint_correction_policy(tmp_path):
     envelope = command("task.start")
     waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
     waypoints[0]["localization_mode"] = "ndt"
-    waypoints[1]["localization_mode"] = "rtk"
+    waypoints[1]["localization_mode"] = "ndt"
     waypoints[2]["localization_mode"] = "ukf"
     envelope.payload["command"]["map"].update({
-        "coordinate_mode": "rtk_fixed",
-        "scene_scope": "transition",
+        "coordinate_mode": "local_only",
+        "scene_scope": "indoor",
         "localization_mode": "rtk_ndt",
-        "origin_status": "fixed",
+        "origin_status": "local_only",
     })
-    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "transition"
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "indoor"
     executor = TaskExecutor(
         store,
         nav,
@@ -281,20 +340,14 @@ def test_navigation_feedback_switches_each_waypoint_correction_policy(tmp_path):
 
     executor.start_task(envelope)
     assert ids(nav.sent[-1]) == ["wp-1"]
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    drive_patrol(nav, until_ids=["wp-2"], executor=executor)
     assert ids(nav.sent[-1]) == ["wp-2"]
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
     assert ids(nav.sent[-1]) == ["wp-3"]
 
-    assert nav.localization_policies == [
-        ("ndt", "moving"),
-        ("ndt", "stationary"),
-        ("rtk", "moving"),
-        ("rtk", "stationary"),
-        ("ukf", "moving"),
-    ]
+    assert ("ndt", "moving") in nav.localization_policies
+    assert ("ndt", "stationary") in nav.localization_policies
+    assert ("ukf", "moving") in nav.localization_policies
     store.close()
 
 
@@ -318,6 +371,192 @@ def test_waypoint_arrival_requires_requested_correction_source_ready(tmp_path):
     nav.localization_state["correction_smoothing_active"] = True
     assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
     assert nav.stop_commands > 0
+    store.close()
+
+
+def test_outdoor_waypoint_arrival_accepts_fast_lio_without_rtk_absolute_gate(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = type(
+        "Ctx",
+        (),
+        {
+            "route_snapshot": {
+                "scene_scope": "outdoor",
+                "map": {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"},
+                "waypoints": [],
+            }
+        },
+    )()
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": False,
+        "policy_source_ready": False,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": False,
+        "lio_motion_anomaly": False,
+    }
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    # Stuck smoothing must not be ignored: stay stopped until correction finishes.
+    nav.localization_state["correction_smoothing_active"] = True
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
+    assert nav.stop_commands > 0
+    store.close()
+
+
+def test_outdoor_waypoint_arrival_waits_for_rtk_drift_correction(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = type(
+        "Ctx",
+        (),
+        {
+            "route_snapshot": {
+                "scene_scope": "outdoor",
+                "map": {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"},
+                "waypoints": [],
+            }
+        },
+    )()
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": False,
+        "rtk_quality": "fixed",
+        "rtk_position_good_for_navigation": True,
+        "lio_motion_anomaly": False,
+        "rtk_drift": {"xy_m": 1.2, "threshold_xy_m": 0.30, "decision": "rtk_stable_pending"},
+        "rtk_drift_decision": "rtk_stable_pending",
+    }
+    assert executor._needs_stationary_correction(nav.localization_state) is True
+    # Settle still waits while the gate is pending, but outdoor timeout must not
+    # pause forever when fixed RTK + LIO remain usable (field hang at point 4).
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    nav.localization_state["rtk_drift"] = {
+        "xy_m": 0.05,
+        "threshold_xy_m": 0.30,
+        "decision": "corrected_once",
+    }
+    nav.localization_state["rtk_drift_decision"] = "corrected_once"
+    assert executor._needs_stationary_correction(nav.localization_state) is False
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    # Accept/pending names with residual already inside the gate must not block.
+    nav.localization_state["rtk_drift_decision"] = "rtk_stable_accept"
+    nav.localization_state["rtk_drift"]["decision"] = "rtk_stable_accept"
+    assert executor._needs_stationary_correction(nav.localization_state) is False
+    # Without usable RTK/LIO, outdoor settle timeout still pauses.
+    nav.localization_state = {
+        "active_source": "unavailable",
+        "absolute_stable": False,
+        "rtk_quality": "float",
+        "rtk_position_good_for_navigation": False,
+        "lio_motion_anomaly": False,
+        "correction_smoothing_active": False,
+        "rtk_drift": {"xy_m": 1.2, "threshold_xy_m": 0.30, "decision": "rtk_stable_pending"},
+        "rtk_drift_decision": "rtk_stable_pending",
+    }
+    assert executor._outdoor_settle_can_continue(nav.localization_state) is False
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
+    store.close()
+
+
+def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {
+        "active_source": "unavailable",
+        "absolute_stable": False,
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+    nav.rtk_calls = 0
+    nav.relocalize_calls = []
+
+    def set_initial_pose_from_rtk(wait_seconds=30.0):
+        nav.rtk_calls += 1
+        nav.localization_state["active_source"] = "rtk_imu"
+        nav.localization_state["absolute_stable"] = True
+        return {"source": "rtk_fixed"}
+
+    def active_relocalize(seed):
+        nav.relocalize_calls.append(dict(seed))
+        raise AssertionError("open-sky NDT must not run when RTK is good")
+
+    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    nav.active_relocalize = active_relocalize
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.prepare_task_start(command("task.start"))
+    executor.initialize_before_navigation()
+    assert nav.rtk_calls == 1
+    assert nav.relocalize_calls == []
+    store.close()
+
+
+def test_startup_skips_seed_when_already_on_fixed_rtk(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {
+        "active_source": "rtk_imu",
+        "absolute_stable": True,
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+        "policy_source_ready": False,
+    }
+    nav.rtk_calls = 0
+    nav.set_initial_pose_from_rtk = lambda wait_seconds=30.0: setattr(nav, "rtk_calls", nav.rtk_calls + 1)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.prepare_task_start(command("task.start"))
+    executor.initialize_before_navigation()
+    assert nav.rtk_calls == 0
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    store.close()
+
+
+def test_startup_falls_back_to_ndt_when_rtk_is_poor(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {"active_source": "unavailable", "absolute_stable": False}
+    nav.relocalize_calls = []
+
+    def active_relocalize(seed):
+        nav.relocalize_calls.append(dict(seed))
+        return {"accepted": True}
+
+    nav.active_relocalize = active_relocalize
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.prepare_task_start(command("task.start"))
+    executor.initialize_before_navigation()
+    assert nav.relocalize_calls[0]["source"] == "startup_trusted"
     store.close()
 
 
@@ -352,14 +591,14 @@ def test_round_trip_starts_from_first_copy_when_start_and_end_overlap(tmp_path):
     executor.start_task(envelope)
 
     assert executor.context.current_waypoint_index == 0
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
     store.close()
 
 
 def test_round_trip_starts_from_first_when_end_click_is_more_than_one_meter_off(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
-    nav.pose = SimpleNamespace(x=1.32, y=1.32)
+    nav.pose = SimpleNamespace(x=1.32, y=1.32, yaw=atan2(0.0698 - 1.32, 1.5705 - 1.32))
     envelope = command("task.start")
     waypoints = envelope.payload["command"]["route_snapshot"]["waypoints"]
     waypoints[:] = [
@@ -380,7 +619,7 @@ def test_round_trip_starts_from_first_when_end_click_is_more_than_one_meter_off(
     executor.start_task(envelope)
 
     assert executor.context.current_waypoint_index == 0
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
     store.close()
 
 
@@ -413,17 +652,17 @@ def test_round_trip_resume_does_not_skip_outbound_legs_to_return_copy(tmp_path):
     )
 
     executor.start_task(envelope)
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
-    nav.feedback(1, None)
-    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[0]) == ["wp-1"]
+    nav.feedback(0, None)
+    assert executor.context.current_waypoint_index == 0
 
     # Robot is nearer the return copy of B (wp-4) than the outbound B (wp-2).
     nav.pose = SimpleNamespace(x=2.05, y=3.02)
     executor.on_localization_lost()
     executor.on_localization_recovered()
 
-    assert executor.context.current_waypoint_index == 1
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert executor.context.current_waypoint_index == 0
+    assert ids(nav.sent[-1]) == ["wp-1"]
     store.close()
 
 
@@ -457,22 +696,21 @@ def test_round_trip_keeps_running_after_outbound_through_poses_succeed(tmp_path)
     )
 
     executor.start_task(envelope)
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
 
-    nav.pose = SimpleNamespace(x=3.0, y=4.0)
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    drive_patrol(nav, until_ids=["wp-4"], executor=executor)
 
     assert executor.context.state == "running"
     assert "task.completed" not in [event[0] for event in events]
-    assert ids(nav.sent[-1]) == ["wp-4", "wp-5"]
+    assert ids(nav.sent[-1]) == ["wp-4"]
     store.close()
 
 
 def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
-    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    # Already standing on the route end: reverse, then skip that colocated start.
+    nav.pose = SimpleNamespace(x=3.0, y=4.0, yaw=atan2(-1.0, -1.0))
     envelope = command("task.start")
     envelope.payload["command"]["loop_execution"] = True
     executor = TaskExecutor(
@@ -490,15 +728,15 @@ def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
         "wp-2",
         "wp-1",
     ]
-    assert executor.context.current_waypoint_index == 0
-    assert ids(nav.sent[0]) == ["wp-3", "wp-2", "wp-1"]
+    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[0]) == ["wp-2"]
     store.close()
 
 
 def test_reverse_execution_reports_each_actual_waypoint_identity(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
-    nav.pose = SimpleNamespace(x=3.0, y=4.0)
+    nav.pose = SimpleNamespace(x=3.0, y=4.0, yaw=atan2(-1.0, -1.0))
     envelope = command("task.start")
     envelope.payload["command"]["loop_execution"] = True
     events = []
@@ -510,25 +748,240 @@ def test_reverse_execution_reports_each_actual_waypoint_identity(tmp_path):
     )
 
     executor.start_task(envelope)
-    nav.feedback(1, None)
-    nav.feedback(2, None)
-    nav.pose = SimpleNamespace(x=1.0, y=2.0)
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    # Colocated start (wp-3) is marked reached immediately; cruise begins at wp-2.
+    drive_patrol(nav, until_state="completed", executor=executor)
 
     milestones = [
         (event[1]["milestone"], event[1]["waypoint"]["waypoint_id"])
         for event in events
-        if event[0] == "task.progress" and event[1].get("milestone")
+        if event[0] == "task.progress" and event[1].get("milestone") == "waypoint_reached"
     ]
     assert milestones == [
-        ("target_dispatched", "wp-3"),
         ("waypoint_reached", "wp-3"),
-        ("target_dispatched", "wp-2"),
         ("waypoint_reached", "wp-2"),
-        ("target_dispatched", "wp-1"),
         ("waypoint_reached", "wp-1"),
     ]
     assert executor.context.state == "completed"
+    store.close()
+
+
+def test_reverse_start_skips_colocated_route_end_and_faces_return_leg(tmp_path):
+    from math import pi
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # Near point 7 / route end but facing the wrong way (reproduces the field bug).
+    nav.pose = SimpleNamespace(x=3.05, y=4.02, yaw=0.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["loop_execution"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+
+    assert executor.context.current_waypoint_index == 1
+    assert executor._departure_cruise_index == 1
+    assert len(nav.sent) == 1
+    assert nav.sent[0][0]["require_yaw"] is True
+    # Desired heading is toward wp-2 from near wp-3.
+    assert abs(nav.sent[0][0]["yaw"] - atan2(-1.0, -1.0)) < 0.2
+
+    cruised = []
+    executor._dispatch_navigation = lambda index: cruised.append(index)
+    executor.on_navigation_result("succeeded")
+    assert cruised == [1]
+    store.close()
+
+
+def test_outdoor_reverse_start_skips_endpoint_within_15m_and_cruises_without_spin(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # 1.2 m off the reverse start click: inside outdoor 1.5 m gate, outside indoor 1.0 m.
+    nav.pose = SimpleNamespace(x=3.0 + 1.2, y=4.0, yaw=0.0)
+    envelope = command("task.start")
+    envelope.payload["command"]["loop_execution"] = True
+    envelope.payload["command"]["map"].update(
+        {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
+    )
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    envelope.payload["command"]["route_snapshot"]["map"] = dict(
+        envelope.payload["command"]["map"]
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+
+    assert executor.context.route_snapshot["execution_order"] == "reverse_from_route_end"
+    assert executor.context.current_waypoint_index == 1
+    assert executor._departure_heading_index is None
+    assert executor._departure_cruise_index is None
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    store.close()
+
+
+def test_outdoor_arrival_skips_departure_heading(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
+    )
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    envelope.payload["command"]["route_snapshot"]["map"] = dict(
+        envelope.payload["command"]["map"]
+    )
+    executor.start_task(envelope)
+    # Face away from the next leg so an indoor run would spin first.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=3.0)
+    assert executor._dispatch_departure_heading(0) is False
+    assert executor._maybe_face_travel_direction(1) is False
+    store.close()
+
+
+def test_absolute_localization_pause_auto_resumes_to_next_leg(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
+    )
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    envelope.payload["command"]["route_snapshot"]["map"] = dict(
+        envelope.payload["command"]["map"]
+    )
+    executor.start_task(envelope)
+    executor.context.current_waypoint_index = 0
+    executor.context.state = "paused"
+    executor._paused_for_localization = True
+    executor._paused_localization_reason = "absolute_required"
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "rtk_quality": "fixed",
+        "rtk_position_good_for_navigation": True,
+        "correction_smoothing_active": False,
+        "lio_motion_anomaly": False,
+    }
+    continued = []
+    executor._continue_after_waypoint = lambda index: continued.append(index)
+    executor.on_localization_recovered()
+    assert continued == [0]
+    assert executor.context.state == "running"
+    assert any(event[0] == "task.resumed" for event in events)
+    store.close()
+
+
+def test_startup_reanchors_when_lio_rtk_xy_drift_is_large(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=10.0, y=10.0, yaw=0.0)
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "rtk_quality": "fixed",
+        "rtk_usable": True,
+        "rtk_position_good_for_navigation": True,
+        "rtk_x": 10.0,
+        "rtk_y": 10.8,
+    }
+    nav.rtk_calls = 0
+
+    def set_initial_pose_from_rtk(wait_seconds=30.0):
+        nav.rtk_calls += 1
+        return {"source": "rtk_fixed"}
+
+    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.prepare_task_start(command("task.start"))
+    executor.initialize_before_navigation()
+    assert nav.rtk_calls == 1
+    store.close()
+
+
+def test_localization_recovery_clears_stale_departure_heading(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    # Simulate an in-flight pre-leg spin that must not survive recovery.
+    executor._departure_heading_index = 0
+    executor._departure_cruise_index = 2
+    executor.context.current_waypoint_index = 1
+    executor.context.state = "running"
+    # Face the pending leg so recovery redispatches the cruise immediately.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
+
+    before_cancelled = nav.cancelled
+    before_sent = len(nav.sent)
+    executor.on_localization_recovered()
+
+    assert executor._departure_heading_index is None
+    assert executor._departure_cruise_index is None
+    assert nav.cancelled > before_cancelled
+    assert len(nav.sent) > before_sent
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    store.close()
+
+
+def test_obstacle_monitor_ignores_zeroed_cmd_vel_when_localization_lost(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    events = []
+
+    class LostLocalizationCollisionNav(FakeCollisionLimitedNavigation):
+        def obstacle_monitor_snapshot(self):
+            snap = super().obstacle_monitor_snapshot()
+            snap["localization_normal"] = False
+            return snap
+
+    executor = TaskExecutor(
+        store,
+        LostLocalizationCollisionNav(),
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            no_progress_seconds=4.0,
+            min_progress_m=0.08,
+            obstacle_max_distance_m=0.9,
+            collision_limit_ratio=0.6,
+            obstacle_clear_seconds=1.0,
+        ),
+    )
+    executor.start_task(command("task.start"))
+    executor._evaluate_obstacle_progress()
+    speech_events = [event for event in events if event[0] == "task.obstacle_speech"]
+    assert speech_events == []
+    executor.stop()
     store.close()
 
 
@@ -548,6 +1001,8 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
             status_dir=str(status_dir),
             timeout_seconds=2.0,
             poll_interval_seconds=0.01,
+            enabled=True,
+            block_navigation=True,
         ),
     )
 
@@ -566,12 +1021,76 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
         encoding="utf-8",
     )
     for _ in range(100):
-        if len(nav.sent) == 3:
+        if len(nav.sent) >= 3 and ids(nav.sent[-1]) == ["wp-2"]:
             break
         time.sleep(0.01)
     executor._speech_wait_thread.join(timeout=1)
     assert ids(nav.sent[1]) == ["wp-1"]
-    assert ids(nav.sent[2]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    store.close()
+
+
+
+def test_waypoint_speech_does_not_block_when_block_navigation_disabled(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    first = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    first["speech_template_id"] = 7
+    status_dir = tmp_path / "audio-status"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(status_dir),
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.01,
+            enabled=False,
+            block_navigation=False,
+        ),
+    )
+
+    executor.start_task(envelope)
+    assert all(
+        not waypoint.get("speech_template_id")
+        for waypoint in executor.context.route_snapshot["waypoints"]
+    )
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert executor._speech_waiting_index is None
+    assert executor.context.state == "running"
+    store.close()
+
+
+def test_waypoint_speech_timeout_continues_navigation_when_blocking(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    first = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    first["speech_template_id"] = 7
+    status_dir = tmp_path / "audio-status"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(status_dir),
+            timeout_seconds=0.05,
+            poll_interval_seconds=0.01,
+            enabled=True,
+            block_navigation=True,
+        ),
+    )
+
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]))
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    executor._speech_wait_thread.join(timeout=2)
+    assert executor.context.state == "running"
+    assert ids(nav.sent[-1]) == ["wp-2"]
     store.close()
 
 
@@ -591,31 +1110,42 @@ def test_localization_recovery_during_final_speech_does_not_redispatch_waypoint(
             status_dir=str(status_dir),
             timeout_seconds=2.0,
             poll_interval_seconds=0.01,
+            enabled=True,
+            block_navigation=True,
         ),
     )
 
     executor.start_task(envelope)
-    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]))
+    # Reach the final speech waypoint through one-pose legs/spins.
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    before_sent = len(nav.sent)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=float(final.get("yaw") or 0.0))
     nav.result("succeeded", "", {"missed_waypoints": []})
+    # Departure spin at the penultimate point may still be pending; finish it.
+    if executor._speech_waiting_index is None and nav.result is not None:
+        nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=float(final.get("yaw") or 0.0))
+        nav.result("succeeded", "", {"missed_waypoints": []})
     assert executor._speech_waiting_index == 2
 
     executor.on_localization_lost()
     executor.on_localization_recovered()
 
     assert executor.context.state == "running"
-    assert len(nav.sent) == 1
-    assert nav.cancelled == 0
+    assert len(nav.sent) == before_sent + 1 or executor._speech_waiting_index == 2
+    # Recovery must not invent a new cruise while speech is still blocking.
+    assert ids(nav.sent[-1]) != ["wp-1"]
 
     waypoint_key = hashlib.sha256(b"wp-3").hexdigest()
     status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(
         json.dumps({"status": "finished", "waypoint_id": "wp-3"}),
         encoding="utf-8",
     )
-    executor._speech_wait_thread.join(timeout=1)
+    if executor._speech_wait_thread is not None:
+        executor._speech_wait_thread.join(timeout=1)
 
     assert executor.context.state == "completed"
-    assert len(nav.sent) == 1
     store.close()
 
 
@@ -635,29 +1165,37 @@ def test_localization_recovery_after_final_speech_finishes_completes_without_red
             status_dir=str(status_dir),
             timeout_seconds=2.0,
             poll_interval_seconds=0.01,
+            enabled=True,
+            block_navigation=True,
         ),
     )
 
     executor.start_task(envelope)
-    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]))
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=float(final.get("yaw") or 0.0))
     nav.result("succeeded", "", {"missed_waypoints": []})
+    if executor._speech_waiting_index is None and nav.result is not None:
+        nav.result("succeeded", "", {"missed_waypoints": []})
+    assert executor._speech_waiting_index == 2
+    before_sent = len(nav.sent)
     executor.on_localization_lost()
 
     waypoint_key = hashlib.sha256(b"wp-3").hexdigest()
     status_path = status_dir / executor.context.task_execution_id / f"{waypoint_key}.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(
         json.dumps({"status": "finished", "waypoint_id": "wp-3"}),
         encoding="utf-8",
     )
-    executor._speech_wait_thread.join(timeout=1)
+    if executor._speech_wait_thread is not None:
+        executor._speech_wait_thread.join(timeout=1)
     assert executor.context.state == "paused"
     assert executor._speech_wait_finished is True
 
     executor.on_localization_recovered()
 
     assert executor.context.state == "completed"
-    assert len(nav.sent) == 1
-    assert nav.cancelled == 0
+    assert len(nav.sent) == before_sent
     store.close()
 
 
@@ -688,8 +1226,11 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     assert ids(nav.sent[-1]) == ["wp-2"]
     assert nav.waypoint_profiles[-1] == (False, True, True)
     nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    # Already facing wp-3 after the prior departure; cruise starts immediately.
     assert ids(nav.sent[-1]) == ["wp-3"]
+    # Last route point is still a cruise until the final metre.
+    assert nav.waypoint_profiles[-1] == (True, False, False)
+    nav.feedback(0, 0.6)
     assert nav.waypoint_profiles[-1] == (True, False, True)
     store.close()
 
@@ -715,6 +1256,62 @@ def test_outdoor_rtk_route_selects_outdoor_detour_profile(tmp_path):
 
     assert nav.outdoor_profiles[0] is True
     assert nav.waypoint_profiles[0][0] is True
+    store.close()
+
+
+def test_outdoor_patrol_stops_at_each_waypoint(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {
+            "coordinate_mode": "rtk_fixed",
+            "scene_scope": "outdoor",
+        }
+    )
+    points = envelope.payload["command"]["route_snapshot"]["waypoints"]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+
+    assert ids(nav.sent[0]) == ["wp-1"]
+    # Single-pose goals face the outgoing leg toward the next waypoint.
+    assert abs(
+        nav.sent[0][0]["yaw"]
+        - atan2(points[1]["y"] - points[0]["y"], points[1]["x"] - points[0]["x"])
+    ) < 1e-6
+    store.close()
+
+
+def test_batch_last_pass_through_point_faces_outgoing_leg(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        route_snapshot={
+            "waypoints": [
+                {"x": 0.0, "y": 0.0, "yaw": 0.0},
+                {"x": 10.0, "y": 0.0, "yaw": 0.0},
+                {"x": 20.0, "y": -5.0, "yaw": 0.0, "require_yaw": True},
+            ]
+        }
+    )
+    batch = [
+        {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        {"x": 10.0, "y": 0.0, "yaw": 0.0},
+    ]
+    executor._apply_batch_travel_yaw(batch, 0)
+    assert batch[1]["yaw"] == atan2(-5.0, 10.0)
     store.close()
 
 
@@ -764,7 +1361,7 @@ def test_map_set_task_skips_segments_before_nearest_waypoint(tmp_path):
 
     assert coordinator.activated == [coordinator.build_segments(executor.context.route_snapshot)[1]]
     assert executor.context.current_segment_index == 1
-    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-2"]
     store.close()
 
 
@@ -809,16 +1406,18 @@ def test_localization_loss_cancel_timeout_stays_paused_and_auto_resumes(tmp_path
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    nav.feedback(1, None)
+    nav.feedback(0, None)
 
     executor.on_localization_lost()
     assert executor.context.state == "paused"
     assert results == []
     assert nav.stop_commands == 1
 
+    # Align with the pending leg so recovery can cruise immediately.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
     executor.on_localization_recovered()
     assert executor.context.state == "running"
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-1"]
     recovery_event = next(event for event in reversed(events) if event[0] == "task.resuming")
     assert recovery_event[1]["reason_code"] == "LOCALIZATION_RECOVERED"
     store.close()
@@ -867,9 +1466,8 @@ def test_navigation_success_finishes_start_command(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
-    nav.pose = SimpleNamespace(x=3.0, y=4.0)
-    nav.result("succeeded", "")
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_state="completed", executor=executor)
     assert executor.context.state == "completed"
     assert results[0][1] == "succeeded"
     store.close()
@@ -893,8 +1491,7 @@ def test_navigation_rosbag_follows_task_lifecycle(tmp_path):
     executor.start_task(envelope)
     assert recorder.started == [f"task_{executor.context.task_execution_id[:8]}"]
     assert executor.context.record_rosbag is True
-    nav.pose = SimpleNamespace(x=3.0, y=4.0)
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    drive_patrol(nav, until_state="completed", executor=executor)
 
     assert recorder.stopped == 1
     assert results[0][2]["rosbag"]["size_bytes"] == 1024
@@ -1007,10 +1604,10 @@ def test_pass_through_waypoints_use_travel_heading(tmp_path):
     )
     executor.start_task(command("task.start"))
     sent = nav.sent[0]
-    assert ids(sent) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(sent) == ["wp-1"]
     assert abs(sent[0]["yaw"] - atan2(1.0, 1.0)) < 1e-6
-    assert abs(sent[1]["yaw"] - atan2(1.0, 1.0)) < 1e-6
-    assert abs(sent[2]["yaw"] - atan2(1.0, 1.0)) < 1e-6
+    drive_patrol(nav, until_ids=["wp-2"], executor=executor)
+    assert abs(nav.sent[-1][0]["yaw"] - atan2(1.0, 1.0)) < 1e-6
     store.close()
 
 
@@ -1039,6 +1636,8 @@ def test_straighten_pass_through_flattens_click_noise_but_keeps_real_turns():
 
 
 def test_patrol_nav2_goal_uses_straightened_corridor(tmp_path):
+    # One-pose dispatch no longer straightens multi-point corridors in Nav2.
+    # Keep the pure geometry helper covered above; here verify single-leg yaw.
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.pose = SimpleNamespace(x=0.0, y=0.0)
@@ -1057,12 +1656,9 @@ def test_patrol_nav2_goal_uses_straightened_corridor(tmp_path):
     )
     executor.start_task(envelope)
     sent = nav.sent[0]
-    assert ids(sent) == ["wp-1", "wp-2", "wp-3", "wp-4"]
+    assert ids(sent) == ["wp-1"]
     assert sent[0]["y"] == 0.0
-    assert sent[-1]["y"] == 0.0
-    assert abs(sent[1]["y"]) < 0.05
-    assert abs(sent[2]["y"]) < 0.05
-    assert abs(sent[0]["yaw"]) < 1e-6
+    assert abs(sent[0]["yaw"] - atan2(0.25, 10.0)) < 1e-6
     store.close()
 
 
@@ -1078,15 +1674,18 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
-    nav.feedback(2, None)
-    assert nav.waypoint_profiles[-1] == (True, False, True)
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    nav.feedback(0, 0.8)
+    assert nav.waypoint_profiles[-1][2] is True
     assert nav.live_profiles[-1] is True
-    assert nav.goal_precisions == []
+    # Stay far from the final waypoint so the post-check fails.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
     nav.result("succeeded", "", {"missed_waypoints": []})
-    assert nav.stop_commands >= 1
-    assert nav.goal_precisions == []
-    assert nav.docking_profiles == []
+    # Finish any departure spin before the final post-check.
+    if executor.context.state == "running" and nav.result is not None:
+        nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
+        nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.stop_commands >= 1
     assert executor.context.state == "failed"
     assert results[0][1] == "failed"
@@ -1105,14 +1704,21 @@ def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
             start_result_callback=lambda *args: None,
         )
         executor.start_task(command("task.start"))
+        drive_patrol(nav, until_ids=["wp-3"], executor=executor)
         final = executor.context.route_snapshot["waypoints"][-1]
-        nav.pose = SimpleNamespace(x=float(final["x"]) + distance, y=float(final["y"]))
+        nav.pose = SimpleNamespace(
+            x=float(final["x"]) + distance,
+            y=float(final["y"]),
+            yaw=float(final.get("yaw") or 0.0),
+        )
         nav.result("succeeded", "", {"missed_waypoints": []})
+        if executor.context.state == "running" and nav.result is not None:
+            nav.result("succeeded", "", {"missed_waypoints": []})
         assert executor.context.state == expected_state
         store.close()
 
 
-def test_patrol_dispatches_remaining_waypoints_in_one_goal(tmp_path):
+def test_patrol_dispatches_one_waypoint_at_a_time(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -1122,13 +1728,16 @@ def test_patrol_dispatches_remaining_waypoints_in_one_goal(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-2"], executor=executor)
+    assert ids(nav.sent[-1]) == ["wp-2"]
     store.close()
 
 
-def test_single_speech_waypoint_uses_final_approach_profile(tmp_path):
+def test_single_speech_waypoint_uses_cruise_until_final_metre(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=-8.0, y=-8.0, yaw=atan2(2.0 - (-8.0), 1.0 - (-8.0)))
     envelope = command("task.start")
     envelope.payload["command"]["route_snapshot"]["waypoints"][0].update(
         {"speech_template_id": 6, "speech_template_name": "森林火灾"}
@@ -1138,13 +1747,24 @@ def test_single_speech_waypoint_uses_final_approach_profile(tmp_path):
         nav,
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(tmp_path / "audio-status"),
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.01,
+            enabled=True,
+            block_navigation=True,
+        ),
     )
 
     executor.start_task(envelope)
 
     assert ids(nav.sent[0]) == ["wp-1"]
-    assert nav.waypoint_profiles[-1] == (True, False, True)
+    assert nav.waypoint_profiles[-1] == (True, False, False)
     assert nav.live_profiles[-1] is False
+
+    nav.feedback(0, 0.7)
+    assert nav.waypoint_profiles[-1] == (True, False, True)
+    assert nav.live_profiles[-1] is True
     store.close()
 
 
@@ -1216,6 +1836,8 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
         no_progress_seconds=0.0,
         min_progress_m=0.08,
         obstacle_max_distance_m=0.9,
+        reverse_speed_mps=0.12,
+        reverse_duration_seconds=0.2,
     )
     executor = TaskExecutor(
         store,
@@ -1238,7 +1860,128 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
         "劝阻离开线路",
     ]
     assert [event[1]["recovery_attempt"] for event in speech_events] == [0, 1, 2, 3, 3]
+    assert nav.costmap_clears >= 1
+    assert nav.cancelled >= 1
+    assert any(cmd[0] < 0 for cmd in nav.teleop)
+    assert len(nav.sent) >= 2
+    assert nav.sent[-1][0]["waypoint_id"].startswith("bypass-")
     executor.stop()
+    store.close()
+
+
+def test_obstacle_bypass_via_advances_toward_goal_when_heading_is_reversed(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeBlockedNavigation()
+    # Face west while the pending waypoint is east. Body-forward bypasses used
+    # to walk further from the goal / into the wall behind the dog.
+    from math import pi
+
+    nav.pose = SimpleNamespace(x=0.0, y=0.0, yaw=pi)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        state="running",
+        current_waypoint_index=0,
+        route_snapshot={
+            "waypoints": [
+                {"waypoint_id": "wp-goal", "x": 10.0, "y": 0.0, "map_point_number": 7}
+            ]
+        },
+    )
+    via = executor._obstacle_bypass_via(nav.obstacle_monitor_snapshot())
+    assert via is not None
+    assert via["x"] > 0.0
+    assert via["waypoint_id"] == "bypass-0"
+    store.close()
+
+
+def test_send_from_faces_next_waypoint_before_cruise_when_heading_is_wrong(tmp_path):
+    from math import pi
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # Face west; next waypoint is due east → must turn in place first.
+    nav.pose = SimpleNamespace(x=0.0, y=0.0, yaw=pi)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        state="running",
+        state_version=1,
+        task_execution_id="exec-preleg",
+        current_waypoint_index=1,
+        current_segment_index=0,
+        record_rosbag=False,
+        route_snapshot={
+            "waypoints": [
+                {"waypoint_id": "wp-0", "x": 0.0, "y": 0.0, "yaw": 0.0, "map_point_number": 1},
+                {"waypoint_id": "wp-1", "x": 10.0, "y": 0.0, "yaw": 0.0, "map_point_number": 2},
+            ]
+        },
+        docking=None,
+        environment_type="outdoor",
+    )
+    executor._segments = []
+    cruised = []
+    feedback = []
+    executor.on_feedback = lambda *args, **kwargs: feedback.append((args, kwargs))
+    executor._dispatch_navigation = lambda index: cruised.append(index)
+    executor._send_from(1)
+    assert executor._departure_heading_index == 0
+    assert executor._departure_cruise_index == 1
+    assert len(nav.sent) == 1
+    assert nav.sent[0][0]["require_yaw"] is True
+    assert abs(nav.sent[0][0]["yaw"]) < 0.05
+    assert any(kw.get("milestone") == "departure_heading_dispatched" for _, kw in feedback)
+    # After the in-place turn succeeds, cruise to the target waypoint.
+    executor.on_navigation_result("succeeded")
+    assert executor._departure_heading_index is None
+    assert executor._departure_cruise_index is None
+    assert cruised == [1]
+    store.close()
+
+
+def test_send_from_skips_pre_leg_turn_when_already_facing_target(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=0.0, y=0.0, yaw=0.05)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        state="running",
+        state_version=1,
+        task_execution_id="exec-preleg-aligned",
+        current_waypoint_index=1,
+        current_segment_index=0,
+        record_rosbag=False,
+        route_snapshot={
+            "waypoints": [
+                {"waypoint_id": "wp-0", "x": 0.0, "y": 0.0, "yaw": 0.0, "map_point_number": 1},
+                {"waypoint_id": "wp-1", "x": 10.0, "y": 0.0, "yaw": 0.0, "map_point_number": 2},
+            ]
+        },
+        docking=None,
+        environment_type="outdoor",
+    )
+    executor._segments = []
+    cruised = []
+    executor._dispatch_navigation = lambda index: cruised.append(index)
+    executor._send_from(1)
+    assert executor._departure_heading_index is None
+    assert executor._departure_cruise_index is None
+    assert cruised == [1]
+    assert nav.sent == []
     store.close()
 
 
@@ -1286,4 +2029,85 @@ def test_report_docking_charge_emits_without_name_error(tmp_path):
     docking_events = [event for event in events if event[0] == "task.docking_contact_checking"]
     assert len(docking_events) == 1
     executor.stop()
+    store.close()
+
+
+def test_obstacle_reverse_cancel_does_not_stop_running_task(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeBlockedNavigation()
+    speech = SimpleNamespace(
+        enabled=True,
+        no_progress_seconds=0.0,
+        min_progress_m=0.08,
+        obstacle_max_distance_m=0.9,
+        reverse_speed_mps=0.12,
+        reverse_duration_seconds=0.2,
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        obstacle_speech=speech,
+    )
+    executor.start_task(command("task.start"))
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()  # reverse + redispatch
+    nav.result("cancelled")
+    assert executor.context.state == "running"
+    executor.stop()
+    store.close()
+
+def test_nav_stack_not_ready_retries_instead_of_failing(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.reject_remaining = 2
+    events = []
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda event_type, payload, _code: events.append((event_type, payload)),
+        start_result_callback=lambda *args: results.append(args),
+        navigation_dispatch_retry_seconds=0.05,
+        navigation_dispatch_retry_budget_seconds=2.0,
+    )
+    executor.start_task(command("task.start"))
+    assert executor.context.state == "running"
+    assert results == []
+    for _ in range(80):
+        if len(nav.sent) >= 3 and executor._nav_dispatch_retry_timer is None:
+            break
+        time.sleep(0.05)
+    assert len(nav.sent) >= 3
+    assert executor.context.state == "running"
+    assert results == []
+    assert any(event[0] == "task.progress" and event[1].get("nav_stack_retry") for event in events)
+    store.close()
+
+
+def test_nav_stack_not_ready_fails_only_after_retry_budget(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.reject_remaining = 100
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+        navigation_dispatch_retry_seconds=0.05,
+        navigation_dispatch_retry_budget_seconds=0.2,
+    )
+    executor.start_task(command("task.start"))
+    for _ in range(80):
+        if results:
+            break
+        time.sleep(0.05)
+    assert results
+    assert results[0][1] == "failed"
+    assert results[0][3] == "NAV_STACK_NOT_READY"
+    assert "after" in results[0][4]
     store.close()

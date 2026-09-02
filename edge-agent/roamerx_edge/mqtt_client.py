@@ -171,6 +171,9 @@ class EdgeMqttClient:
     def publish_result(self, command_id: str, payload: dict) -> None:
         self.publish(self._topic(f"commands/{command_id}/result"), payload, qos=1)
 
+    def publish_progress(self, command_id: str, payload: dict) -> None:
+        self.publish(self._topic(f"commands/{command_id}/progress"), payload, qos=1)
+
     def publish(self, topic: str, payload: dict, *, qos: int, retain: bool = False) -> None:
         if not self._connected.is_set():
             self.store.enqueue_outbox(

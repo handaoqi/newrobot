@@ -15,6 +15,7 @@ from .charge_control_adapter import ChargeControlAdapter
 from .command_processor import CommandProcessor
 from .config import EdgeConfig
 from .local_store import LocalStore
+from .localization_recovery import planar_distance_m, select_recovery_seed
 from .map_activation_adapter import MapActivationAdapter
 from .map_set_coordinator import MapSetCoordinator
 from .mapping_adapter import MappingAdapter
@@ -652,17 +653,32 @@ class EdgeAgentApplication:
         return self.map_activation_adapter.status()
 
     def _persist_last_trusted_pose(self, pose) -> None:
+        payload = {
+            "x": float(pose.x),
+            "y": float(pose.y),
+            "z": float(pose.z),
+            "yaw": float(pose.yaw),
+            "sampled_at": pose.sampled_at,
+            "source": "last_trusted_localization",
+        }
+        previous = self.store.load_last_trusted_pose(
+            str(self.config.robot.current_map_id or ""),
+            str(self.config.robot.current_map_version or ""),
+        )
+        max_drift = self._trusted_seed_max_drift_m()
+        if previous and previous.get("x") is not None and previous.get("y") is not None:
+            drift = planar_distance_m(previous, payload)
+            if drift > max_drift:
+                LOGGER.warning(
+                    "skip persisting last_trusted pose: jump %.1fm exceeds %.1fm",
+                    drift,
+                    max_drift,
+                )
+                return
         self.store.save_last_trusted_pose(
             str(self.config.robot.current_map_id or ""),
             str(self.config.robot.current_map_version or ""),
-            {
-                "x": float(pose.x),
-                "y": float(pose.y),
-                "z": float(pose.z),
-                "yaw": float(pose.yaw),
-                "sampled_at": pose.sampled_at,
-                "source": "last_trusted_localization",
-            },
+            payload,
         )
 
     def _emit_localization_alert(self, event_type: str, severity: str, code: str, label: str, attributes: dict) -> None:
@@ -765,6 +781,15 @@ class EdgeAgentApplication:
                 "localization transition ignored by auto recovery while an operator request is active"
             )
             return
+        # Open-sky NDT often fails while centimetre-grade RTK is already the
+        # pose. Dual-antenna heading can also flicker while fixed XY remains
+        # good; pausing here cancels Nav2 and freezes outdoor patrols.
+        if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
+            LOGGER.info(
+                "localization transition %s ignored while outdoor RTK position is fixed",
+                reason,
+            )
+            return
         # Alert before the early returns below: localization degrading is worth
         # reporting even when no task is running and there is nothing to pause.
         if not self._localization_alert_notified:
@@ -822,36 +847,125 @@ class EdgeAgentApplication:
         active = getattr(self.navigation, "operator_localization_active", None)
         return bool(callable(active) and active())
 
+    def _trusted_seed_max_drift_m(self) -> float:
+        return float(getattr(self.config.safety, "localization_trusted_seed_max_drift_m", 15.0))
+
+    def _rtk_usable_for_recovery(self) -> bool:
+        getter = getattr(self.navigation, "localization_decision", None)
+        decision = getter() if callable(getter) else {}
+        if not isinstance(decision, dict):
+            return False
+        return (
+            decision.get("rtk_usable") is True
+            and decision.get("rtk_heading_usable") is True
+        )
+
     def _localization_recovery_seed(self) -> dict | None:
-        # A recently verified pose is a substantially safer first recovery seed
-        # than the pending waypoint. Route yaw is often unset (0) and a loop
-        # round can start at the route end, far from the robot's true heading.
-        pose = self.navigation.latest_trusted_pose()
-        if not pose:
-            pose = self.store.load_last_trusted_pose(
-                str(self.config.robot.current_map_id or ""),
-                str(self.config.robot.current_map_version or ""),
-            )
-        if pose:
-            seed = dict(pose)
-            seed.setdefault("source", "last_trusted")
-            return seed
-        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
-        waypoint = waypoint_getter() if callable(waypoint_getter) else None
-        if waypoint and waypoint.get("waypoint_index") is not None and waypoint.get("x") is not None and waypoint.get("y") is not None:
-            LOGGER.info("localization seed fallback: current waypoint index=%s round=%s", waypoint.get("waypoint_index"), waypoint.get("round_number"))
-            return {"x": float(waypoint["x"]), "y": float(waypoint["y"]), "z": float(waypoint.get("z", 0.0) or 0.0), "yaw": float(waypoint.get("yaw", 0.0) or 0.0), "source": "current_waypoint"}
         latest_getter = getattr(self.navigation, "latest_pose", None)
         latest = latest_getter() if callable(latest_getter) else None
-        if latest is None:
-            return None
-        return {
-            "x": float(latest.x),
-            "y": float(latest.y),
-            "z": float(getattr(latest, "z", 0.0) or 0.0),
-            "yaw": float(latest.yaw),
-            "source": "last_trusted",
-        }
+        memory_trusted = None
+        trusted_getter = getattr(self.navigation, "latest_trusted_pose", None)
+        if callable(trusted_getter):
+            memory_trusted = trusted_getter()
+        disk_trusted = self.store.load_last_trusted_pose(
+            str(self.config.robot.current_map_id or ""),
+            str(self.config.robot.current_map_version or ""),
+        )
+        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
+        waypoint = waypoint_getter() if callable(waypoint_getter) else None
+        seed = select_recovery_seed(
+            latest_pose=latest,
+            memory_trusted=memory_trusted,
+            disk_trusted=disk_trusted,
+            waypoint=waypoint,
+            max_drift_m=self._trusted_seed_max_drift_m(),
+        )
+        if seed and seed.get("source") == "current_waypoint":
+            LOGGER.info(
+                "localization seed fallback: current waypoint index=%s round=%s",
+                seed.get("waypoint_index"),
+                (waypoint or {}).get("round_number"),
+            )
+        return seed
+
+    def _attempt_rtk_recovery(self) -> bool:
+        if self._rtk_pose_is_driving():
+            LOGGER.info("automatic recovery left the GPS pose in place; resuming the task")
+            self._handle_task_localization_recovered()
+            return True
+        # LIO-primary outdoor mode: fixed RTK XY is already correcting the pose.
+        # Do not force a dual-antenna reseeding cycle when heading is flickering.
+        if self._rtk_position_good_for_navigation():
+            getter = getattr(self.navigation, "localization_decision", None)
+            decision = getter() if callable(getter) else {}
+            source = str((decision or {}).get("active_source") or "")
+            if source in {"lio_imu", "rtk_imu"}:
+                LOGGER.info(
+                    "automatic recovery left the outdoor LIO/RTK pose in place; resuming the task"
+                )
+                self._handle_task_localization_recovered()
+                return True
+        if self._recover_with_fixed_rtk():
+            self._handle_task_localization_recovered()
+            return True
+        return False
+
+    def _wait_for_rtk_recovery(self) -> bool:
+        if not self._rtk_usable_for_recovery() or self._rtk_good_for_navigation():
+            return False
+        retry_seconds = float(
+            getattr(self.config.safety, "localization_rtk_float_retry_seconds", 5.0)
+        )
+        deadline = time.monotonic() + max(0.0, retry_seconds)
+        LOGGER.warning(
+            "RTK is usable but not fixed; waiting up to %.1fs before NDT relocalization",
+            retry_seconds,
+        )
+        while time.monotonic() < deadline:
+            if self._rtk_good_for_navigation():
+                try:
+                    return self._attempt_rtk_recovery()
+                except Exception as exc:
+                    LOGGER.warning("RTK recovery after float flicker failed: %s", exc)
+                    return False
+            time.sleep(0.5)
+        return False
+
+    def _wait_for_post_handoff_resume(self, timeout_seconds: float | None = None) -> bool:
+        """Resume after an NDT commit when LIO/RTK becomes usable a few seconds later.
+
+        `RELOCALIZATION_HANDOFF_FAILED` means the best NDT pose was already written,
+        but FAST-LIO did not report `absolute_stable` inside the handoff window.
+        Outdoor dogs often settle shortly afterward (or regain fixed RTK XY). Waiting
+        here keeps the existing pause/resume contract instead of abandoning self-heal.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = float(
+                getattr(self.config.safety, "localization_handoff_settle_seconds", 8.0)
+            )
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            if self._operator_localization_active():
+                return False
+            if not self.task_executor.is_paused_for_localization():
+                return True
+            if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
+                try:
+                    if self._attempt_rtk_recovery():
+                        return True
+                except Exception as exc:
+                    LOGGER.warning("post-handoff RTK recovery failed: %s", exc)
+                    return False
+            getter = getattr(self.navigation, "localization_decision", None)
+            decision = getter() if callable(getter) else {}
+            if isinstance(decision, dict) and decision.get("absolute_stable") is True:
+                LOGGER.info(
+                    "localization became absolute-stable after NDT commit; resuming task"
+                )
+                self._handle_task_localization_recovered()
+                return True
+            time.sleep(0.5)
+        return False
 
     def _localization_waypoint_seeds(self) -> list[dict]:
         """Return ordered, de-duplicated waypoint seeds around the pending point."""
@@ -874,6 +988,50 @@ class EdgeAgentApplication:
             seeds.append({"x": float(point["x"]), "y": float(point["y"]), "z": float(point.get("z", 0.0) or 0.0), "yaw": float(point.get("yaw", 0.0) or 0.0), "source": "waypoint", "waypoint_index": candidate_index})
         return seeds
 
+    def _rtk_good_for_navigation(self) -> bool:
+        getter = getattr(self.navigation, "localization_decision", None)
+        decision = getter() if callable(getter) else {}
+        if not isinstance(decision, dict):
+            return False
+        if decision.get("rtk_good_for_navigation") is True:
+            return True
+        return (
+            decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+            and decision.get("rtk_heading_usable") is True
+        )
+
+    def _rtk_position_good_for_navigation(self) -> bool:
+        getter = getattr(self.navigation, "localization_decision", None)
+        decision = getter() if callable(getter) else {}
+        if not isinstance(decision, dict):
+            return False
+        if decision.get("rtk_position_good_for_navigation") is True:
+            return True
+        return (
+            decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+        )
+
+    def _rtk_pose_is_driving(self) -> bool:
+        getter = getattr(self.navigation, "localization_decision", None)
+        decision = getter() if callable(getter) else {}
+        if not isinstance(decision, dict):
+            return False
+        return (
+            str(decision.get("active_source") or "") == "rtk_imu"
+            and self._rtk_good_for_navigation()
+        )
+
+    def _recover_with_fixed_rtk(self) -> bool:
+        seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
+        if not callable(seed_rtk):
+            return False
+        self._hold_motion_for_relocalize()
+        seed_rtk()
+        LOGGER.info("automatic recovery accepted a fixed RTK pose")
+        return True
+
     def _recover_task_localization(self, reason: str = "localization_lost") -> None:
         try:
             if self._operator_localization_active():
@@ -887,6 +1045,42 @@ class EdgeAgentApplication:
             while first_cycle or self.task_executor.is_paused_for_localization():
                 first_cycle = False
                 cycle += 1
+                if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
+                    try:
+                        if self._attempt_rtk_recovery():
+                            return
+                    except Exception as exc:
+                        LOGGER.warning("fixed RTK recovery failed: %s", exc)
+                    if not self.task_executor.is_paused_for_localization():
+                        return
+                    elapsed = time.time() - started_at
+                    self._report_localization_recovery_state(reason, cycle, elapsed, max_cycles)
+                    if max_cycles and cycle >= max_cycles:
+                        LOGGER.error(
+                            "localization recovery gave up after %d cycles (%.0fs); escalating",
+                            cycle,
+                            elapsed,
+                        )
+                        self._emit_localization_alert(
+                            "localization_recovery_failed",
+                            "critical",
+                            "LOCALIZATION_RECOVERY_FAILED",
+                            "定位恢复失败，需人工介入",
+                            {
+                                **self._localization_alert_attributes(reason),
+                                "recovery_cycles": cycle,
+                                "recovery_elapsed_seconds": round(elapsed, 1),
+                            },
+                        )
+                        return
+                    LOGGER.warning(
+                        "fixed RTK XY is available; skipping open-sky NDT search and retrying GPS in %.1fs",
+                        cycle_retry,
+                    )
+                    time.sleep(cycle_retry)
+                    continue
+                if self._wait_for_rtk_recovery():
+                    return
                 primary_seed = self._localization_recovery_seed()
                 waypoint_seeds = self._localization_waypoint_seeds()
                 seeds = []
@@ -939,15 +1133,39 @@ class EdgeAgentApplication:
                                 )
                                 return
                             if error_code == "RELOCALIZATION_HANDOFF_FAILED":
-                                # NDT has already produced and committed a
-                                # verified map pose. Trying another waypoint
-                                # here would overwrite that optimum while LIO
-                                # is still taking ownership.
-                                LOGGER.error(
+                                # NDT already committed the map pose; LIO absolute
+                                # handoff just did not settle in time. Do not exit
+                                # the recovery worker — that permanently parks the
+                                # paused task with no further self-heal attempts.
+                                LOGGER.warning(
                                     "best NDT pose committed but LIO handoff failed; "
-                                    "keeping the robot stopped at the committed pose"
+                                    "continuing self-heal instead of giving up"
                                 )
-                                return
+                                if (
+                                    self._rtk_usable_for_recovery()
+                                    or self._rtk_good_for_navigation()
+                                    or self._rtk_position_good_for_navigation()
+                                ):
+                                    LOGGER.warning(
+                                        "NDT/LIO handoff failed; switching to RTK recovery"
+                                    )
+                                    try:
+                                        if self._wait_for_rtk_recovery() or (
+                                            (
+                                                self._rtk_good_for_navigation()
+                                                or self._rtk_position_good_for_navigation()
+                                            )
+                                            and self._attempt_rtk_recovery()
+                                        ):
+                                            return
+                                    except Exception as rtk_exc:
+                                        LOGGER.warning(
+                                            "RTK recovery after NDT handoff failed: %s",
+                                            rtk_exc,
+                                        )
+                                if self._wait_for_post_handoff_resume():
+                                    return
+                                break
                             LOGGER.warning("active relocalize cycle %d waypoint=%s failed: %s", cycle, seed.get("waypoint_index"), exc)
                     if cycle == 1:
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)

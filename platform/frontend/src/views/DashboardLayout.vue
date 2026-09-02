@@ -3,7 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { useTheme } from '../composables/useTheme'
-import { API_BASE, fetchRobotMappingStatus, fetchRobots } from '../services/api'
+import { navigationItems } from '../modules/index.js'
+import { loadRuntimeConfig } from '../services/runtimeConfig.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,32 +14,8 @@ const expandedMenus = ref({})
 const tabletMenuOpen = ref(false)
 const tabletMenuButton = ref(null)
 const tabletSidebar = ref(null)
-const mappingAlert = ref(null)
-const robots = ref([])
-let mappingPollTimer = null
-let mappingAlertEventSource = null
-let lastMappingAlertKey = ''
-let mappingStatusRefreshing = false
-
-const menuItems = [
-  { label: '保安值守', path: '/dashboard/guard-duty' },
-  { label: '监测中心', path: '/dashboard/overview' },
-  { label: '远程控制', path: '/dashboard/remote-control' },
-  { label: '远程 AI 开发', path: '/dashboard/remote-development' },
-  { label: '仿真与回放检查', path: '/dashboard/validation' },
-  { label: '回放调试台', path: '/dashboard/replay-debug' },
-  { label: '统计分析', path: '/dashboard/analytics' },
-  { label: '事件中心', path: '/dashboard/events' },
-  { label: '机器人管理', path: '/dashboard/robots' },
-  { label: '巡检任务', path: '/dashboard/tasks', children: [
-    { label: '任务列表', path: '/dashboard/tasks' },
-    { label: '巡检日历', path: '/dashboard/tasks/calendar' },
-    { label: '地图管理', path: '/dashboard/tasks/maps' },
-    { label: '路径规划', path: '/dashboard/tasks/routes' },
-    { label: '禁区管理', path: '/dashboard/tasks/zones' },
-    { label: '轨迹回放', path: '/dashboard/tasks/tracks' },
-  ]},
-]
+const enabledModules = ref([])
+const menuItems = computed(() => navigationItems(enabledModules.value))
 
 const user = computed(() => {
   try {
@@ -57,7 +34,7 @@ function menuContainsPath(item) {
 }
 
 function expandActiveMenu() {
-  menuItems.forEach((item, index) => {
+  menuItems.value.forEach((item, index) => {
     if (item.children?.some(menuContainsPath)) expandedMenus.value[index] = true
     item.children?.forEach((child, childIndex) => {
       if (child.children?.some(menuContainsPath)) expandedMenus.value[`${index}-${childIndex}`] = true
@@ -105,129 +82,22 @@ function logout() {
   router.push('/login')
 }
 
-function mappingHealthFromStatus(status) {
-  const progress = status?.result?.save_progress || {}
-  const health = progress.slam_health || {}
-  const diverged = progress.error_code === 'SLAM_DIVERGED' || health.state === 'diverged'
-  const degraded = health.state === 'degraded'
-  if (!diverged && !degraded) return null
-  return {
-    robotId: status.robot_id,
-    robotCode: status.robot_code || '',
-    diverged,
-    title: diverged ? '建图已停采，请立即停止遥控' : '建图质量正在恶化',
-    message: diverged
-      ? '定位已发散，关键帧不再记录。请停止走场，到地图页点击“停止并生成救援地图”。'
-      : (health.warning || progress.error || '位姿异常，请放慢或原地停下'),
-  }
-}
-
-function announceMappingAlert(alert) {
-  const key = `${alert.robotId}:${alert.diverged ? 'diverged' : 'degraded'}`
-  if (key === lastMappingAlertKey) return
-  lastMappingAlertKey = key
-  try {
-    const context = new window.AudioContext()
-    const oscillator = context.createOscillator()
-    const gain = context.createGain()
-    oscillator.type = 'square'
-    oscillator.frequency.value = alert.diverged ? 880 : 520
-    gain.gain.value = 0.08
-    oscillator.connect(gain)
-    gain.connect(context.destination)
-    oscillator.start()
-    oscillator.stop(context.currentTime + (alert.diverged ? 0.45 : 0.2))
-  } catch {}
-  if (!window.speechSynthesis) return
-  window.speechSynthesis.cancel()
-  const utterance = new SpeechSynthesisUtterance(alert.diverged
-    ? '建图定位已发散，请立即停止遥控走场'
-    : '建图质量正在恶化，请放慢或停下')
-  utterance.lang = 'zh-CN'
-  utterance.rate = 1
-  window.speechSynthesis.speak(utterance)
-}
-
-function applyMappingAlert(alert) {
-  mappingAlert.value = alert
-  if (alert) announceMappingAlert(alert)
-  else lastMappingAlertKey = ''
-}
-
-async function refreshMappingAlerts() {
-  if (mappingStatusRefreshing) return
-  mappingStatusRefreshing = true
-  try {
-    if (!robots.value.length) robots.value = await fetchRobots()
-    const snapshots = await Promise.all(robots.value.map(async (robot) => {
-      try {
-        return await fetchRobotMappingStatus(robot.id)
-      } catch {
-        return null
-      }
-    }))
-    const next = snapshots.map(mappingHealthFromStatus).find(item => item)
-    if (next) applyMappingAlert(next)
-    else {
-      mappingAlert.value = null
-      lastMappingAlertKey = ''
-    }
-  } catch {
-    // Keep the last banner if polling fails; SSE still covers the diverge event.
-  } finally {
-    mappingStatusRefreshing = false
-  }
-}
-
-function setupMappingAlertStream() {
-  const token = localStorage.getItem('inspection_token')
-  if (!token || typeof EventSource === 'undefined') return
-  mappingAlertEventSource?.close()
-  mappingAlertEventSource = new EventSource(`${API_BASE}/events/stream/?token=${encodeURIComponent(token)}`)
-  mappingAlertEventSource.addEventListener('inspection_event_created', (message) => {
-    let payload = {}
-    try {
-      payload = JSON.parse(message.data || '{}')
-    } catch {
-      return
-    }
-    const event = payload.event || {}
-    const eventType = String(event.event_type || '')
-    const sourceCode = String(event.source_code || '')
-    if (eventType !== 'slam_diverged' && sourceCode !== 'SLAM_DIVERGED' && event.title !== '建图定位已发散') return
-    applyMappingAlert({
-      robotId: event.robot || payload.robot?.id,
-      robotCode: payload.robot?.code || '',
-      diverged: true,
-      title: '建图已停采，请立即停止遥控',
-      message: event.description || '定位已发散，关键帧不再记录。请停止走场，到地图页点击“停止并生成救援地图”。',
-    })
-  })
-}
-
 onMounted(() => {
+  loadRuntimeConfig().then((config) => { enabledModules.value = config.enabled_modules }).catch(() => {})
   expandActiveMenu()
   document.addEventListener('keydown', handleTabletMenuKeydown)
   window.addEventListener('orientationchange', handleOrientationChange)
-  refreshMappingAlerts()
-  mappingPollTimer = window.setInterval(refreshMappingAlerts, 2000)
-  setupMappingAlertStream()
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', handleTabletMenuKeydown)
   window.removeEventListener('orientationchange', handleOrientationChange)
   document.body.classList.remove('tablet-menu-locked')
-  if (mappingPollTimer) window.clearInterval(mappingPollTimer)
-  mappingAlertEventSource?.close()
-  window.speechSynthesis?.cancel()
 })
 
 watch(() => route.path, () => {
   expandActiveMenu()
   closeTabletMenu()
-  if (mappingAlert.value?.diverged) return
-  refreshMappingAlerts()
 })
 
 </script>
@@ -354,22 +224,12 @@ watch(() => route.path, () => {
         </div>
       </header>
 
-      <div
-        v-if="mappingAlert"
-        class="mapping-live-alert"
-        :class="{ diverged: mappingAlert.diverged }"
-        role="alert"
-      >
-        <div>
-          <strong>{{ mappingAlert.title }}</strong>
-          <span>{{ mappingAlert.robotCode ? `${mappingAlert.robotCode}：` : '' }}{{ mappingAlert.message }}</span>
-        </div>
-        <router-link class="mapping-live-alert-link" to="/dashboard/tasks/maps">
-          去地图页处理
-        </router-link>
-      </div>
-
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <Suspense>
+          <template #default><component :is="Component" /></template>
+          <template #fallback><div class="page-loading-state" role="status">页面加载中…</div></template>
+        </Suspense>
+      </router-view>
     </section>
   </div>
 </template>

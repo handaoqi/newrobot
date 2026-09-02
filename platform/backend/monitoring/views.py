@@ -3023,6 +3023,28 @@ class RobotNavigationStatusView(APIView):
                 "nav.initial_pose", "nav.relocalize",
             ]
         ).order_by("-issued_at").first()
+        localization_command = robot.remote_commands.filter(
+            command_type__in=["nav.initial_pose", "nav.relocalize"]
+        ).order_by("-issued_at").first()
+
+        def _command_payload(item, *, include_result=False):
+            if not item:
+                return None
+            payload = {
+                "id": str(item.id),
+                "command_type": item.command_type,
+                "status": item.status,
+                "issued_at": item.issued_at,
+                "published_at": item.published_at,
+                "acknowledged_at": item.acknowledged_at,
+                "finished_at": item.finished_at,
+                "error_code": item.error_code,
+                "error_message": item.error_message,
+            }
+            if include_result:
+                payload["result_payload"] = item.result_payload or {}
+            return payload
+
         return Response(
             {
                 "robot_id": robot.id,
@@ -3035,17 +3057,8 @@ class RobotNavigationStatusView(APIView):
                 "ros_ready": robot.ros_ready,
                 "nav_ready": robot.nav_ready,
                 "status": RobotStatusSerializer(latest).data if latest else None,
-                "command": {
-                    "id": str(command.id),
-                    "command_type": command.command_type,
-                    "status": command.status,
-                    "issued_at": command.issued_at,
-                    "published_at": command.published_at,
-                    "acknowledged_at": command.acknowledged_at,
-                    "finished_at": command.finished_at,
-                    "error_code": command.error_code,
-                    "error_message": command.error_message,
-                } if command else None,
+                "command": _command_payload(command),
+                "localization_command": _command_payload(localization_command, include_result=True),
             }
         )
 

@@ -5,6 +5,7 @@ import { useAsyncPoller } from '../composables/useAsyncPoller'
 import AppToast from '../components/AppToast.vue'
 import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
+import { useMappingAlerts } from '../composables/useMappingAlerts'
 import { resolveBatteryPercent } from '../utils/battery'
 import {
   API_BASE,
@@ -83,6 +84,7 @@ const recordingSaving = ref(false)
 const videoStageRef = ref(null)
 const streamUnavailable = ref(false)
 const liveDetectionState = ref({ detections: [] })
+const { mappingAlert } = useMappingAlerts()
 let alertEventSource = null
 let holdTimer = null
 let holdAction = null
@@ -907,6 +909,10 @@ function handleVisibilityChange() {
 <template>
   <section v-if="!loading && overview" class="page-grid overview-page">
     <div class="content-column">
+      <div v-if="mappingAlert" class="mapping-live-alert" :class="{ diverged: mappingAlert.diverged }" role="alert">
+        <div><strong>{{ mappingAlert.title }}</strong><span>{{ mappingAlert.robotCode ? `${mappingAlert.robotCode}：` : '' }}{{ mappingAlert.message }}</span></div>
+        <router-link class="mapping-live-alert-link" to="/dashboard/tasks/maps">去地图页处理</router-link>
+      </div>
       <section class="top-summary">
         <article class="status-pill online">
           <span class="dot"></span>

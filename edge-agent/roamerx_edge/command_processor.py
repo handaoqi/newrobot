@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .local_store import LocalStore
-from .protocol import MessageEnvelope, ProtocolError, build_ack, build_result, decode_message, now_iso
+from .protocol import MessageEnvelope, ProtocolError, build_ack, build_progress, build_result, decode_message, now_iso
 from .safety_policy import SafetyPolicy
 from .task_executor import TaskExecutor
 from .teleop_skill_executor import TeleopSkillExecutor
@@ -24,6 +24,7 @@ class CommandProcessor:
         task_executor: TaskExecutor,
         publish_ack: Callable[[str, dict], None],
         publish_result: Callable[[str, dict], None],
+        publish_progress: Callable[[str, dict], None] | None = None,
         mapping_adapter=None,
         map_activation_adapter=None,
         navigation_stack_adapter=None,
@@ -49,6 +50,7 @@ class CommandProcessor:
         self.audio_control_adapter = audio_control_adapter
         self.publish_ack = publish_ack
         self.publish_result = publish_result
+        self.publish_progress = publish_progress or (lambda *_args, **_kwargs: None)
         self._navigation_command_lock = threading.Lock()
         # Pose commands bypass the navigation-stack lock so they can seed a
         # nav.start that is waiting for localization. They still need their
@@ -383,10 +385,17 @@ class CommandProcessor:
                 None,
             )
             operator_scope_started = False
+            set_progress = getattr(
+                self.localization_adapter, "set_attempt_progress_callback", None
+            )
             try:
                 if callable(begin_operator):
                     begin_operator()
                     operator_scope_started = True
+                if callable(set_progress):
+                    set_progress(
+                        lambda payload: self._emit_command_progress(envelope, started_at, payload)
+                    )
                 localization_bootstrap = self._ensure_initial_pose_subscriber()
                 if envelope.message_type == "nav.initial_pose":
                     if str(command.get("seed_source") or "") == "rtk":
@@ -441,10 +450,14 @@ class CommandProcessor:
                     result_payload["navigation_start"] = self._start_navigation_after_localization()
             finally:
                 try:
-                    if operator_scope_started and callable(end_operator):
-                        end_operator()
+                    if callable(set_progress):
+                        set_progress(None)
                 finally:
-                    self._localization_command_lock.release()
+                    try:
+                        if operator_scope_started and callable(end_operator):
+                            end_operator()
+                    finally:
+                        self._localization_command_lock.release()
         else:
             wait_seconds = 90.0 if envelope.message_type in {
                 "nav.start", "nav.restart", "nav.recover",
@@ -512,6 +525,20 @@ class CommandProcessor:
                 "no trusted pose exists for this map; select an approximate pose on the map first",
             )
         return seed
+
+    def _emit_command_progress(self, envelope: MessageEnvelope, started_at: str, result: dict) -> None:
+        try:
+            progress = build_progress(
+                envelope,
+                result=result if isinstance(result, dict) else {},
+                started_at=started_at,
+            )
+            self.publish_progress(envelope.payload["command_id"], progress)
+        except Exception:
+            LOGGER.exception(
+                "failed to publish localization command progress for %s",
+                envelope.payload.get("command_id"),
+            )
 
     def _execute_teleop(self, envelope: MessageEnvelope, started_at: str) -> dict:
         teleop_adapter = self.localization_adapter

@@ -5,3 +5,19 @@ db.sqlite3
 media/
 data/
 tests/
+
+# Never copy local credentials or private keys into an image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials/
+secrets/
+
+# Source-control and local runtime metadata are not needed at runtime.
+.git/
+*.log
+staticfiles/

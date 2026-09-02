@@ -16,7 +16,7 @@ class FakeNavigation:
         self.initial_pose = None
         self.teleop_actions = []
         self.teleop_velocities = []
-        self.pose = SimpleNamespace(x=3.0, y=4.0)
+        self.pose = SimpleNamespace(x=3.0, y=4.0, yaw=0.0)
         self.rtk_initial_pose_requests = 0
         self.global_relocalize_requests = []
         self.progressive_relocalize_requests = []

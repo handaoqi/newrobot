@@ -207,6 +207,12 @@ if(BUILD_TESTING)
   target_include_directories(correction_policy_test PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+  ament_add_gtest(rtk_primary_policy_test
+    test/rtk_primary_policy_test.cpp
+  )
+  target_include_directories(rtk_primary_policy_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
   ament_add_gtest(relocalization_geometry_policy_test
     test/relocalization_geometry_policy_test.cpp
     src/localization/relocalization_geometry.cpp

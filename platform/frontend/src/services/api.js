@@ -1,83 +1,10 @@
-import { createTTLCache } from './cache'
+import { API_BASE, listCache, request } from './api/client.js'
 
-export const API_BASE = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/, '')
-
-export const listCache = createTTLCache({ ttlMs: 30_000 })
+export { API_BASE, listCache, request }
 const ROBOT_LIST_TIMEOUT_MS = 8_000
 
 function summaryPath(path) {
   return `${path}${path.includes('?') ? '&' : '?'}view=summary`
-}
-
-async function request(path, options = {}) {
-  const { timeoutMs, signal: callerSignal, ...fetchOptions } = options
-  const token = localStorage.getItem('inspection_token')
-  const headers = { ...(fetchOptions.headers || {}) }
-  if (!(fetchOptions.body instanceof FormData)) headers['Content-Type'] = 'application/json'
-
-  if (token) {
-    headers.Authorization = `Token ${token}`
-  }
-
-  let timeoutHandle = null
-  let timeoutTriggered = false
-  let requestController = null
-  let removeCallerAbortListener = null
-  let requestSignal = callerSignal
-  if (timeoutMs > 0) {
-    requestController = new AbortController()
-    requestSignal = requestController.signal
-    const abortFromCaller = () => requestController.abort()
-    if (callerSignal) {
-      if (callerSignal.aborted) requestController.abort()
-      else {
-        callerSignal.addEventListener('abort', abortFromCaller, { once: true })
-        removeCallerAbortListener = () => callerSignal.removeEventListener('abort', abortFromCaller)
-      }
-    }
-    timeoutHandle = setTimeout(() => {
-      timeoutTriggered = true
-      requestController.abort()
-    }, timeoutMs)
-  }
-
-  let response
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...fetchOptions,
-      headers,
-      ...(requestSignal ? { signal: requestSignal } : {}),
-    })
-  } catch (error) {
-    if (timeoutTriggered && !callerSignal?.aborted) {
-      const timeoutError = new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`)
-      timeoutError.code = 'REQUEST_TIMEOUT'
-      throw timeoutError
-    }
-    throw error
-  } finally {
-    if (timeoutHandle !== null) clearTimeout(timeoutHandle)
-    removeCallerAbortListener?.()
-  }
-
-  if (!response.ok) {
-    const errorPayload = await response.json().catch(() => ({ detail: '请求失败' }))
-    const error = new Error(errorPayload.detail || '请求失败')
-    error.payload = errorPayload
-    error.status = response.status
-    // 会话过期/令牌失效：全站统一清理并跳转登录，避免各页因未捕获而白屏卡死。
-    if (response.status === 401 && path !== '/auth/login/') {
-      localStorage.removeItem('inspection_token')
-      localStorage.removeItem('inspection_user')
-      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
-        window.location.assign('/login')
-      }
-    }
-    throw error
-  }
-
-  if (response.status === 204) return {}
-  return response.json()
 }
 
 export async function login(payload) {

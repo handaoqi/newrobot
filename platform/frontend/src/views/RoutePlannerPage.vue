@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAsyncPoller } from '../composables/useAsyncPoller'
 import {
   fetchMapSummaries,
@@ -57,6 +57,27 @@ import {
   initializeProgressiveLocalization,
   shouldInitializeFromRtk,
 } from '../services/progressiveLocalization'
+import {
+  attemptSeedPose,
+  attemptStatusClass,
+  attemptStatusLabel,
+  clearStoredAttemptSession,
+  emptyAttemptSession,
+  formatAttemptMetric,
+  formatAttemptPose,
+  isAttemptSessionTerminal,
+  localizationAttemptSessionFromCommand,
+  readStoredAttemptSession,
+  shouldShowAttemptMarkers,
+  withAttemptMarkerExpiry,
+  writeStoredAttemptSession,
+} from '../services/localizationAttemptSession'
+import {
+  appendRelocalizationMarker,
+  readStoredRelocalizationMarkers,
+  relocalizationMarkerTitle,
+  writeStoredRelocalizationMarkers,
+} from '../services/relocalizationMarkers'
 import { preferredExecutedItem } from '../utils/executionSelection'
 import { resolveBatteryPercent } from '../utils/battery'
 import { isLowBatteryBlocked, lowBatteryGuardMessage } from '../utils/guardDutyLowBattery'
@@ -98,6 +119,11 @@ const initialPoseStep = ref('position')
 const initialPoseHeadingTarget = ref(null)
 const localizationInitState = ref('idle')
 const localizationInitMessage = ref('')
+const localizationAttemptSession = ref(null)
+const localizationAttemptCardOpen = ref(true)
+const attemptMarkerTick = ref(0)
+const relocalizationMarkers = ref([])
+const lastLocalizationStatus = ref('')
 const poseHistory = ref([])
 const showPoseTrail = ref(true)
 const mappingTrace = ref([])
@@ -121,6 +147,19 @@ const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   taskMapTrajectory.value,
   selectedMap.value?.id,
 ))
+const visibleAttemptMarkers = computed(() => {
+  attemptMarkerTick.value
+  const session = localizationAttemptSession.value
+  if (!shouldShowAttemptMarkers(session)) return []
+  return session.attempts
+})
+const globalPlanPoints = computed(() => {
+  imageReadyTick.value
+  if (!robotMapMatches()) return []
+  const plan = navStatus.value?.status?.navigation?.global_plan
+  if (!plan?.updated || !Array.isArray(plan.points) || plan.points.length < 2) return []
+  return plan.points
+})
 const keyframePanelOpen = ref(false)
 const keyframePage = ref(1)
 const selectedKeyframeIndex = ref(null)
@@ -149,6 +188,7 @@ let drillAudioResolve = null
 let navigationStatusRefreshing = false
 let inspectionPointSequence = 0
 let initialSelectionApplied = false
+let attemptMarkerTimer = null
 
 const routeForm = ref({
   name: '',
@@ -157,6 +197,7 @@ const routeForm = ref({
   robot: null,
   description: '',
   scene_scope: 'indoor',
+  global_controller: 'theta_star',
 })
 const allWaypointsExpanded = computed(() => (
   waypoints.value.length > 0
@@ -166,12 +207,18 @@ const allWaypointsExpanded = computed(() => (
 onMounted(async () => {
   await loadData()
   await navigationPoller.run()
+  restoreAttemptSessionFromStatus()
+  restoreRelocalizationMarkers()
   window.addEventListener('resize', refreshImageGeometry)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', refreshImageGeometry)
   stopDrill(false)
+  if (attemptMarkerTimer) {
+    clearTimeout(attemptMarkerTimer)
+    attemptMarkerTimer = null
+  }
 })
 
 async function loadData() {
@@ -224,6 +271,11 @@ const selectedRobot = computed(() => {
     name: selectedRoute.value?.robot_name || selectedMap.value?.robot_name || '机器狗',
     code: selectedRoute.value?.robot_code || selectedMap.value?.robot_code || String(robotId),
   }
+})
+
+watch(() => selectedRobot.value?.id, () => {
+  restoreRelocalizationMarkers()
+  lastLocalizationStatus.value = ''
 })
 
 function resetWaypointExpansion() {
@@ -484,12 +536,30 @@ function normalizeWaypointLocalizationMode(mode) {
   return ['ndt', 'rtk', 'ukf'].includes(normalized) ? normalized : 'ndt'
 }
 
+function normalizeLocalController(mode) {
+  // RPP is retained as a legacy payload alias; the deployed controller
+  // server only registers FollowPath (MPPI).
+  return 'mppi'
+}
+
+function normalizeGlobalController(mode) {
+  const normalized = String(mode || 'theta_star').trim().toLowerCase()
+  return normalized === 'navfn' ? 'navfn' : 'theta_star'
+}
+
 function setWaypointLocalization(index, mode) {
   const normalized = normalizeWaypointLocalizationMode(mode)
   const allowed = mapIsLocalOnly.value && normalized === 'rtk' ? 'ndt' : normalized
   waypoints.value[index] = {
     ...waypoints.value[index],
     localization_mode: allowed,
+  }
+}
+
+function setWaypointLocalController(index, mode) {
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    local_controller: normalizeLocalController(mode),
   }
 }
 
@@ -897,6 +967,7 @@ async function handleSaveRoute() {
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
     scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
+    global_controller: normalizeGlobalController(routeForm.value.global_controller),
   }
 
   let savedRoute
@@ -972,6 +1043,7 @@ async function handleLoadRoute(route) {
   routeForm.value.map_data = route.map_data
   routeForm.value.map_set = route.map_set || null
   routeForm.value.scene_scope = route.scene_scope || routeMap?.scene_scope || 'indoor'
+  routeForm.value.global_controller = normalizeGlobalController(route.global_controller)
   if (mapChanged) clearInspectedMapPoints()
   await nextTick()
   const [, detailedMap] = await Promise.all([
@@ -1000,6 +1072,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     speech_template_name: point.speech_template_name || '',
     speech_text: point.speech_text || '',
     localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
+    local_controller: normalizeLocalController(point.local_controller),
     avoidance_to_next: point.avoidance_to_next !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
@@ -1053,6 +1126,7 @@ function withWaypointYaw(points) {
       speech_template_id: current.speech_template_id || null,
       speech_template_name: current.speech_template_name || '',
       localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
+      local_controller: normalizeLocalController(current.local_controller),
       avoidance_to_next: current.avoidance_to_next !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
@@ -1114,6 +1188,17 @@ function mappingTracePoints() {
   if (!geometry) return ''
   return mappingTrace.value
     .map(sample => pointDisplayPositionFromMap(sample.slam?.x, sample.slam?.y, geometry))
+    .filter(Boolean)
+    .map(point => `${point.x},${point.y}`)
+    .join(' ')
+}
+
+function globalPlanPolylinePoints() {
+  imageReadyTick.value
+  const geometry = getMapGeometry()
+  if (!geometry) return ''
+  return globalPlanPoints.value
+    .map(point => pointDisplayPositionFromMap(Number(point.x), Number(point.y), geometry))
     .filter(Boolean)
     .map(point => `${point.x},${point.y}`)
     .join(' ')
@@ -1196,6 +1281,15 @@ function recordPoseSample() {
   const y = Number(status.y)
   if (!Number.isFinite(x) || !Number.isFinite(y)) return
 
+  const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
+  if (localizationStatus === 'relocalized' && lastLocalizationStatus.value !== 'relocalized') {
+    registerRelocalizationMarker(
+      { x, y, yaw: Number(status.yaw || 0) },
+      { source: 'runtime', commandType: 'runtime.relocalized' },
+    )
+  }
+  lastLocalizationStatus.value = localizationStatus
+
   const sampleKey = status.sampled_at || status.received_at || `${x.toFixed(4)},${y.toFixed(4)},${status.yaw || 0}`
   if (sampleKey === lastPoseSampleKey.value) return
 
@@ -1229,13 +1323,14 @@ async function refreshNavigationStatus({ signal } = {}) {
       fetchRobotNavigationStatus(robotId, { signal }),
     ])
     navStatus.value = {
-      ...navigation,
-      status: status.status || navigation.status,
-      connection_status: status.connection_status || navigation.connection_status,
-      last_seen_at: status.last_seen_at || navigation.last_seen_at,
+      ...(navigation || {}),
+      status: status?.status || navigation?.status || null,
+      connection_status: status?.connection_status || navigation?.connection_status,
+      last_seen_at: status?.last_seen_at || navigation?.last_seen_at,
     }
     await refreshTaskMapExecution()
     recordPoseSample()
+    restoreAttemptSessionFromStatus()
     refreshImageGeometry()
   } catch (error) {
     if (error?.name === 'AbortError') return
@@ -1315,6 +1410,94 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function beginLocalizationAttemptSession({ phase = 'localization', commandType = '', commandId = '' } = {}) {
+  const robotId = selectedRobot.value?.id
+  if (robotId) clearStoredAttemptSession(robotId)
+  localizationAttemptSession.value = emptyAttemptSession({ phase, commandType, commandId })
+  localizationAttemptCardOpen.value = true
+  scheduleAttemptMarkerRefresh(localizationAttemptSession.value)
+}
+
+function scheduleAttemptMarkerRefresh(session) {
+  if (attemptMarkerTimer) {
+    clearTimeout(attemptMarkerTimer)
+    attemptMarkerTimer = null
+  }
+  const visibleUntil = Number(session?.markersVisibleUntil)
+  if (!Number.isFinite(visibleUntil)) return
+  const delay = visibleUntil - Date.now()
+  if (delay <= 0) {
+    attemptMarkerTick.value += 1
+    return
+  }
+  attemptMarkerTimer = setTimeout(() => {
+    attemptMarkerTick.value += 1
+    attemptMarkerTimer = null
+  }, delay + 50)
+}
+
+function registerRelocalizationMarker(pose, meta = {}) {
+  const robotId = selectedRobot.value?.id
+  if (!robotId || !robotMapMatches()) return
+  relocalizationMarkers.value = appendRelocalizationMarker(relocalizationMarkers.value, pose, meta)
+  writeStoredRelocalizationMarkers(robotId, relocalizationMarkers.value)
+}
+
+function restoreRelocalizationMarkers() {
+  const robotId = selectedRobot.value?.id
+  relocalizationMarkers.value = readStoredRelocalizationMarkers(robotId)
+}
+
+function maybeRegisterAttemptRelocalizationMarker(session) {
+  if (!session || !isAttemptSessionTerminal(session) || !session.bestMatchPose) return
+  const commandId = String(session.commandId || '')
+  if (commandId && relocalizationMarkers.value.some(item => item.commandId === commandId)) return
+  registerRelocalizationMarker(session.bestMatchPose, {
+    source: session.source || session.commandType || '定位尝试',
+    commandType: session.commandType || '',
+    commandId,
+  })
+}
+
+function applyLocalizationAttemptCommand(command, extras = {}) {
+  if (!command) return
+  const session = localizationAttemptSessionFromCommand(command, extras)
+  if (!session) return
+  localizationAttemptSession.value = session
+  const robotId = selectedRobot.value?.id
+  if (robotId) writeStoredAttemptSession(robotId, session)
+  maybeRegisterAttemptRelocalizationMarker(session)
+  scheduleAttemptMarkerRefresh(session)
+}
+
+function restoreAttemptSessionFromStatus() {
+  if (navCommandBusy.value) return
+  const robotId = selectedRobot.value?.id
+  const command = navStatus.value?.localization_command
+  if (command?.result_payload) {
+    applyLocalizationAttemptCommand(command, {
+      phase: 'localization',
+      showCandidates: true,
+    })
+    return
+  }
+  const stored = readStoredAttemptSession(robotId)
+  if (stored?.attempts?.length) {
+    localizationAttemptSession.value = withAttemptMarkerExpiry(stored)
+    scheduleAttemptMarkerRefresh(localizationAttemptSession.value)
+  }
+}
+
+function relocalizationHeadingStyle(marker) {
+  const yaw = Number(marker?.yaw || 0)
+  return { transform: `translate(-50%, -100%) rotate(${yaw}rad)` }
+}
+
+function attemptMarkerPosition(attempt) {
+  const pose = attempt?.matchedPose || attemptSeedPose(attempt)
+  return pose ? waypointDisplayPosition(pose) : null
+}
+
 function applyInitialPoseOutcome(command, submittedPose = manualInitialPose.value) {
   const outcome = initialPoseCommandOutcome(command, submittedPose)
   if (outcome.pose) {
@@ -1350,6 +1533,7 @@ async function initializeLocalization() {
   navCommandBusy.value = 'localization-init'
   localizationInitState.value = 'restarting'
   localizationInitMessage.value = '正在下发当前地图，并按地图类型重新初始化定位'
+  beginLocalizationAttemptSession({ phase: 'transfer', commandType: 'map.activate' })
   navError.value = ''
   try {
     const initialization = await initializeProgressiveLocalization({
@@ -1363,12 +1547,14 @@ async function initializeLocalization() {
         return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
       }),
       onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => applyLocalizationAttemptCommand(event.command, event),
       dependencies: {
         activateRouteMap,
         sendRobotNavigationCommand,
         waitForRobotCommand,
       },
     })
+    applyLocalizationAttemptCommand(initialization.command, { phase: 'localization', showCandidates: true })
     navStatus.value = initialization.activation.navigationStatus
     const completedLocalization = initialization.command
     const outcome = applyInitialPoseOutcome(completedLocalization)
@@ -1388,6 +1574,7 @@ async function initializeLocalization() {
     navError.value = localizationInitMessage.value
   } catch (error) {
     localizationInitState.value = 'failed'
+    if (error?.command) applyLocalizationAttemptCommand(error.command, { phase: 'localization', showCandidates: true })
     const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
     localizationInitMessage.value = outcome?.bestNdtCommitted
       ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
@@ -1407,6 +1594,7 @@ async function activeRelocalize() {
   navCommandBusy.value = 'relocalize'
   localizationInitState.value = 'waiting_convergence'
   localizationInitMessage.value = '正在静止搜索定位候选'
+  beginLocalizationAttemptSession({ phase: 'localization', commandType: 'nav.relocalize' })
   navError.value = ''
   try {
     const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
@@ -1423,12 +1611,14 @@ async function activeRelocalize() {
           return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
         }),
         onProgress: message => { localizationInitMessage.value = message },
+        onCommand: event => applyLocalizationAttemptCommand(event.command, event),
         dependencies: {
           activateRouteMap,
           sendRobotNavigationCommand,
           waitForRobotCommand,
         },
       })
+      applyLocalizationAttemptCommand(initialization.command, { phase: 'localization', showCandidates: true })
       const outcome = applyInitialPoseOutcome(initialization.command)
       for (let index = 0; index < 35; index += 1) {
         await sleep(2000)
@@ -1456,8 +1646,10 @@ async function activeRelocalize() {
       timeoutMs: 210_000,
       onProgress: latest => {
         localizationInitMessage.value = `正在静止搜索定位候选 · ${latest.status || 'created'}`
+        applyLocalizationAttemptCommand(latest, { phase: 'localization', showCandidates: true })
       },
     })
+    applyLocalizationAttemptCommand(completed, { phase: 'localization', showCandidates: true })
     const outcome = applyInitialPoseOutcome(completed, manualInitialPose.value)
     for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
@@ -1471,6 +1663,7 @@ async function activeRelocalize() {
     throw new Error('主动重定位未在限定时间内收敛')
   } catch (error) {
     localizationInitState.value = 'failed'
+    if (error?.command) applyLocalizationAttemptCommand(error.command, { phase: 'localization', showCandidates: true })
     const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
     localizationInitMessage.value = outcome?.bestNdtCommitted
       ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
@@ -1513,11 +1706,13 @@ async function handleActivateSelectedMap() {
   navError.value = ''
   localizationInitState.value = 'waiting_convergence'
   localizationInitMessage.value = '正在检查机器狗地图'
+  beginLocalizationAttemptSession({ phase: 'transfer', commandType: 'map.activate' })
   try {
     const result = await activateAndRelocalizeMap({
       mapId: selectedMap.value.id,
       robotId,
       onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => applyLocalizationAttemptCommand(event.command, event),
     })
     navStatus.value = result.navigationStatus
     localizationInitState.value = 'done'
@@ -1605,6 +1800,7 @@ async function publishInitialPose(confirmRequired = true, manageBusy = true) {
       timeoutMs: 120_000,
       onProgress: latest => {
         localizationInitMessage.value = `NDT初始定位 · ${latest.status || 'created'}`
+        applyLocalizationAttemptCommand(latest, { phase: 'localization', showCandidates: true })
       },
     })
     const outcome = applyInitialPoseOutcome(completed, submittedPose)
@@ -2303,6 +2499,7 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     u: Number((imageX / geometry.mapWidth).toFixed(8)),
     v: Number((imageY / geometry.mapHeight).toFixed(8)),
     localization_mode: 'ndt',
+    local_controller: 'mppi',
     avoidance_to_next: true,
     require_yaw: false,
     dwell_seconds: 0,
@@ -2382,6 +2579,13 @@ async function handleDeleteRoute(route) {
                 <option value="indoor">室内</option>
                 <option value="transition" :disabled="mapIsLocalOnly">室内外过渡</option>
                 <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
+              </select>
+            </label>
+            <label>
+              <span>全局控制器</span>
+              <select v-model="routeForm.global_controller">
+                <option value="theta_star">Theta*</option>
+                <option value="navfn">NavFn (A*)</option>
               </select>
             </label>
           </div>
@@ -2479,6 +2683,12 @@ async function handleDeleteRoute(route) {
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
                         <span>到下个点避障</span>
+                      </label>
+                      <label>
+                        <span>局部控制器</span>
+                        <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
+                          <option value="mppi">MPPI</option>
+                        </select>
                       </label>
                       <label>
                         <span>定位校正方式</span>
@@ -2698,6 +2908,36 @@ async function handleDeleteRoute(route) {
             <small v-if="localizationInitMessage" class="command-note">
               定位初始化 {{ localizationInitState }} · {{ localizationInitMessage }}
             </small>
+            <div v-if="localizationAttemptSession" class="localization-attempt-card">
+              <button type="button" class="localization-attempt-toggle" @click="localizationAttemptCardOpen = !localizationAttemptCardOpen">
+                <strong>定位尝试过程</strong>
+                <span>{{ localizationAttemptSession.phase === 'transfer' ? '地图下发中' : (localizationAttemptSession.status || localizationInitState) }}</span>
+                <small>{{ localizationAttemptCardOpen ? '收起' : '展开' }}</small>
+              </button>
+              <div v-if="localizationAttemptCardOpen" class="localization-attempt-body">
+                <p v-if="localizationAttemptSession.phase === 'transfer'" class="command-note">文件传输阶段只显示命令进度，进入地图定位后再展示候选点。</p>
+                <p v-if="localizationAttemptSession.livePose">实时位姿 {{ formatAttemptPose(localizationAttemptSession.livePose) }}</p>
+                <p v-if="localizationAttemptSession.bestMatchPose">
+                  最优位姿 {{ formatAttemptPose(localizationAttemptSession.bestMatchPose) }}
+                  <span v-if="localizationAttemptSession.bestNdtCandidate">
+                    · 来源 {{ localizationAttemptSession.source || 'NDT' }}
+                    · NDT {{ formatAttemptMetric(localizationAttemptSession.bestNdtCandidate.matching_error) }}
+                    · 内点 {{ localizationAttemptSession.bestNdtCandidate.inlier_fraction == null ? '—' : `${(Number(localizationAttemptSession.bestNdtCandidate.inlier_fraction) * 100).toFixed(1)}%` }}
+                  </span>
+                </p>
+                <ol v-if="localizationAttemptSession.showCandidates && localizationAttemptSession.attempts.length" class="localization-attempt-list">
+                  <li v-for="attempt in localizationAttemptSession.attempts" :key="attempt.index" :class="attemptStatusClass(attempt.status)">
+                    <strong>{{ attempt.index }}</strong>
+                    <span>{{ attemptStatusLabel(attempt.status) }}</span>
+                    <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
+                    <small v-if="attempt.livePose">实时 {{ formatAttemptPose(attempt.livePose) }}</small>
+                    <small v-if="attempt.matchingError !== null">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
+                    <small v-if="attempt.inlierFraction !== null">内点 {{ (attempt.inlierFraction * 100).toFixed(1) }}%</small>
+                    <small v-if="attempt.rejectReason">{{ attempt.rejectReason }}</small>
+                  </li>
+                </ol>
+              </div>
+            </div>
             <div class="state-machine-panel">
               <div class="debug-header">
                 <strong>导航状态机</strong>
@@ -2820,6 +3060,10 @@ async function handleDeleteRoute(route) {
                     <polyline :points="mappingTracePoints()" fill="none" stroke="#0f766e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
 
+                  <svg v-if="globalPlanPolylinePoints()" class="global-plan-lines">
+                    <polyline :points="globalPlanPolylinePoints()" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 5" />
+                  </svg>
+
                   <svg v-if="showPoseTrail && poseHistory.length > 1" class="pose-trail-lines">
                     <polyline :points="poseTrailPoints()" fill="none" stroke="#f97316" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
@@ -2847,6 +3091,25 @@ async function handleDeleteRoute(route) {
                       :title="lossMarkerTitle(point)"
                     >
                       <i :style="lossHeadingStyle(point)"></i><small>{{ point.sequence }}</small>
+                    </div>
+                    <div
+                      v-for="attempt in visibleAttemptMarkers"
+                      :key="`attempt-${attempt.index}`"
+                      class="localization-attempt-marker"
+                      :class="attemptStatusClass(attempt.status)"
+                      :style="attemptMarkerPosition(attempt)"
+                      :title="`候选 ${attempt.index} ${attemptStatusLabel(attempt.status)} ${formatAttemptPose(attempt.seedPose)}`"
+                    >
+                      {{ attempt.index }}
+                    </div>
+                    <div
+                      v-for="marker in relocalizationMarkers"
+                      :key="`relocalization-${marker.id}`"
+                      class="planner-relocalization-marker"
+                      :style="waypointDisplayPosition(marker)"
+                      :title="relocalizationMarkerTitle(marker)"
+                    >
+                      <i :style="relocalizationHeadingStyle(marker)"></i><small>{{ marker.sequence }}</small>
                     </div>
                     <div v-if="robotDisplayPosition()" class="robot-marker" :class="{ untrusted: !robotMapPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
                       <RobotDogIcon :size="28" />
@@ -4257,6 +4520,7 @@ async function handleDeleteRoute(route) {
 }
 
 .mapping-trace-lines,
+.global-plan-lines,
 .pose-trail-lines {
   position: absolute;
   inset: 0;
@@ -4264,6 +4528,10 @@ async function handleDeleteRoute(route) {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+.global-plan-lines {
+  z-index: 3;
 }
 
 .inspected-map-marker {
@@ -4535,6 +4803,60 @@ async function handleDeleteRoute(route) {
   50% { opacity: 0.42; }
 }
 
+.localization-attempt-card {
+  margin: 0.6rem 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+.localization-attempt-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.localization-attempt-toggle span,
+.localization-attempt-toggle small { color: #64748b; font-size: 0.78rem; }
+.localization-attempt-toggle small { margin-left: auto; }
+.localization-attempt-body { padding: 0 0.75rem 0.75rem; font-size: 0.78rem; color: #334155; }
+.localization-attempt-list { margin: 0.4rem 0 0; padding: 0; list-style: none; display: grid; gap: 0.35rem; }
+.localization-attempt-list li {
+  display: grid;
+  grid-template-columns: 1.6rem 4rem 1fr;
+  gap: 0.25rem 0.5rem;
+  align-items: start;
+  padding: 0.35rem 0.45rem;
+  border-radius: 8px;
+  background: #fff;
+}
+.localization-attempt-list li small { grid-column: 2 / -1; color: #64748b; }
+.localization-attempt-list li.accepted { background: #ecfdf5; }
+.localization-attempt-list li.active { background: #fff7ed; }
+.localization-attempt-list li.failed { background: #fef2f2; }
+.localization-attempt-marker {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #fff;
+  background: #94a3b8;
+  border: 2px solid #fff;
+  z-index: 2;
+  pointer-events: none;
+}
+.localization-attempt-marker.active { background: #f59e0b; }
+.localization-attempt-marker.failed { background: #ef4444; }
+.localization-attempt-marker.accepted { background: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,0.28); }
 .robot-marker {
   position: absolute;
   width: 30px;
@@ -4638,6 +4960,50 @@ async function handleDeleteRoute(route) {
   transform: translateX(-50%);
 }
 
+.planner-relocalization-marker {
+  position: absolute;
+  z-index: 4;
+  width: 28px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+}
+
+.planner-relocalization-marker::before {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #7c3aed;
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, .28);
+}
+
+.planner-relocalization-marker i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  width: 0;
+  height: 0;
+  border-right: 5px solid transparent;
+  border-bottom: 15px solid #5b21b6;
+  border-left: 5px solid transparent;
+  transform-origin: 50% 100%;
+}
+
+.planner-relocalization-marker small {
+  position: absolute;
+  top: 26px;
+  left: 50%;
+  min-width: 16px;
+  padding: 1px 3px;
+  color: #fff;
+  background: #6d28d9;
+  font-size: 9px;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
 .initial-pose-marker {
   position: absolute;
   transform: translate(-50%, -50%);
@@ -4667,6 +5033,7 @@ async function handleDeleteRoute(route) {
   transform-origin: 50% 72%;
 }
 
+.global-plan-lines,
 .pose-trail-lines,
 .path-lines,
 .initial-pose-heading-line,

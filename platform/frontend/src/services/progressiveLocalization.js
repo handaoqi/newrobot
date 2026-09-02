@@ -65,6 +65,7 @@ export async function initializeProgressiveLocalization({
   sceneScope = 'indoor',
   coordinateMode = '',
   onProgress = () => {},
+  onCommand = () => {},
   dependencies = {},
 }) {
   const activateMap = dependencies.activateRouteMap
@@ -79,6 +80,7 @@ export async function initializeProgressiveLocalization({
     robotId,
     mapVersion,
     onProgress,
+    onCommand,
   })
 
   let rtkAttempt = null
@@ -95,7 +97,10 @@ export async function initializeProgressiveLocalization({
       const createdRtkCommand = await sendCommand(robotId, 'initial-pose', rtkPayload)
       const command = await waitCommand(robotId, createdRtkCommand, {
         timeoutMs: 90_000,
-        onProgress: latest => onProgress(`RTK固定解与本地NDT验证 · ${latest.status || 'created'}`),
+        onProgress: latest => {
+          onProgress(`RTK固定解与本地NDT验证 · ${latest.status || 'created'}`)
+          onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'rtk' })
+        },
       })
       onProgress('RTK固定解与本地NDT验证通过')
       return {
@@ -118,7 +123,10 @@ export async function initializeProgressiveLocalization({
   const createdCommand = await sendCommand(robotId, 'relocalize', payload)
   const command = await waitCommand(robotId, createdCommand, {
     timeoutMs: progressiveLocalizationTimeoutMs(payload),
-    onProgress: latest => onProgress(`渐进定位 · ${latest.status || 'created'}`),
+    onProgress: latest => {
+      onProgress(`渐进定位 · ${latest.status || 'created'}`)
+      onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'progressive' })
+    },
   })
   return {
     activation,

@@ -1,0 +1,16 @@
+services:
+  frontend:
+    image: roamerx/platform-frontend:v1.0.0-amd64
+    container_name: roamerx-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:13000:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${ROAMERX_FRONTEND_CONFIG:-./modules.json}:/usr/share/nginx/html/modules.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 12

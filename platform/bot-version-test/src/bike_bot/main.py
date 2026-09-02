@@ -451,6 +451,18 @@ def detection_worker(
         while not stop_event.is_set():
             with person_mode_lock:
                 person_detection_enabled = person_mode_state["enabled"]
+            cooldown_remaining = detector.event_cooldown_remaining()
+            if cooldown_remaining > 0:
+                LOGGER.info(
+                    "bicycle alert cooldown pausing detection remaining_s=%.2f",
+                    cooldown_remaining,
+                )
+                stop_event.wait(cooldown_remaining)
+                inference_limiter.reset()
+                if stop_event.is_set():
+                    break
+                LOGGER.info("bicycle alert cooldown expired, resuming detection")
+                continue
             target_inference_rate_hz = selected_inference_rate_hz(
                 detector.config.detection.inference_rate_hz,
                 detector.config.detection.person_follow_inference_rate_hz,

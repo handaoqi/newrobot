@@ -1,67 +1,69 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import DashboardLayout from '../views/DashboardLayout.vue'
-
-const AnalyticsPage = () => import('../views/AnalyticsPage.vue')
-const DashboardOverview = () => import('../views/DashboardOverview.vue')
-const EventsPage = () => import('../views/EventsPage.vue')
-const GuardDutyPage = () => import('../views/GuardDutyPage.vue')
-const LoginPage = () => import('../views/LoginPage.vue')
-const RemoteControlPage = () => import('../views/RemoteControlPage.vue')
-const RobotsPage = () => import('../views/RobotsPage.vue')
-const TasksPage = () => import('../views/TasksPage.vue')
-const TaskExecutionPage = () => import('../views/TaskExecutionPage.vue')
-const PatrolCalendarPage = () => import('../views/PatrolCalendarPage.vue')
-const MapsPage = () => import('../views/MapsPage.vue')
-const RoutePlannerPage = () => import('../views/RoutePlannerPage.vue')
-const ZoneManagerPage = () => import('../views/ZoneManagerPage.vue')
-const TrackPlaybackPage = () => import('../views/TrackPlaybackPage.vue')
-const RemoteDevelopmentPage = () => import('../views/RemoteDevelopmentPage.vue')
-const ValidationJobsPage = () => import('../views/ValidationJobsPage.vue')
-const ReplayDebugPage = () => import('../views/ReplayDebugPage.vue')
+import ConfigurationErrorPage from '../views/ConfigurationErrorPage.vue'
+import LoginPage from '../views/LoginPage.vue'
+import ModuleNotInstalledPage from '../views/ModuleNotInstalledPage.vue'
+import NotFoundPage from '../views/NotFoundPage.vue'
+import { MODULES } from '../modules/index.js'
+import { loadRuntimeConfig, homePathForConfig } from '../services/runtimeConfig.js'
 
 const routes = [
-  { path: '/', redirect: '/dashboard/overview' },
   { path: '/login', name: 'login', component: LoginPage },
+  { path: '/configuration-error', name: 'configuration-error', component: ConfigurationErrorPage },
   {
     path: '/dashboard',
     component: DashboardLayout,
     meta: { requiresAuth: true },
     children: [
-      { path: 'overview', name: 'overview', meta: { title: '实时监测中心' }, component: DashboardOverview },
-      { path: 'guard-duty', name: 'guard-duty', meta: { title: '保安值守' }, component: GuardDutyPage },
-      { path: 'remote-control', name: 'remote-control', meta: { title: '远程控制' }, component: RemoteControlPage },
-      { path: 'remote-development', name: 'remote-development', meta: { title: '远程 AI 开发' }, component: RemoteDevelopmentPage },
-      { path: 'validation', name: 'validation', meta: { title: '仿真与回放检查' }, component: ValidationJobsPage },
-      { path: 'replay-debug', name: 'replay-debug', meta: { title: '回放调试台' }, component: ReplayDebugPage },
-      { path: 'analytics', name: 'analytics', meta: { title: '统计分析中心' }, component: AnalyticsPage },
-      { path: 'events', name: 'events', meta: { title: '事件中心' }, component: EventsPage },
-      { path: 'robots', name: 'robots', meta: { title: '机器人管理' }, component: RobotsPage },
-      { path: 'tasks', name: 'tasks', meta: { title: '巡检任务' }, component: TasksPage },
-      { path: 'tasks/calendar', name: 'patrol-calendar', meta: { title: '巡检日历' }, component: PatrolCalendarPage },
-      { path: 'task-executions/:executionId', name: 'task-execution', meta: { title: '任务执行详情' }, component: TaskExecutionPage },
-      { path: 'tasks/maps', name: 'maps', meta: { title: '地图管理' }, component: MapsPage },
-      { path: 'tasks/routes', name: 'routes', meta: { title: '路径规划' }, component: RoutePlannerPage },
-      { path: 'tasks/zones', name: 'zones', meta: { title: '禁区管理' }, component: ZoneManagerPage },
-      { path: 'tasks/tracks', name: 'tracks', meta: { title: '轨迹回放' }, component: TrackPlaybackPage },
+      ...MODULES.map((module) => ({
+        path: module.path.replace(/^\/dashboard\/?/, ''),
+        name: module.id,
+        component: module.component,
+        meta: { title: module.title, moduleId: module.id, requiresAuth: true },
+      })),
+      { path: 'module-not-installed', name: 'module-not-installed', component: ModuleNotInstalledPage, meta: { title: '页面未安装', requiresAuth: true } },
     ],
   },
+  { path: '/', name: 'home', component: { template: '<div />' } },
+  { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFoundPage, meta: { notFound: true } },
 ]
 
-const router = createRouter({
-  history: createWebHistory(),
-  routes,
-})
+const router = createRouter({ history: createWebHistory(), routes })
+let runtimeConfigPromise = null
 
-router.beforeEach((to) => {
-  const token = localStorage.getItem('inspection_token')
-  if (to.meta.requiresAuth && !token) {
-    return { name: 'login' }
+function readConfig() {
+  if (!runtimeConfigPromise) runtimeConfigPromise = loadRuntimeConfig()
+  return runtimeConfigPromise
+}
+
+export function resetRuntimeConfigForTests() {
+  runtimeConfigPromise = null
+}
+
+router.beforeEach(async (to) => {
+  let config
+  try {
+    config = await readConfig()
+  } catch (error) {
+    if (to.name !== 'configuration-error') return { name: 'configuration-error', query: { message: error.message } }
+    return true
   }
-  if (to.name === 'login' && token) {
-    return { name: 'overview' }
+
+  const token = localStorage.getItem('inspection_token')
+  if (to.name === 'home') return { path: homePathForConfig(config) }
+  if (to.meta.requiresAuth && !token) return { name: 'login', query: { redirect: to.fullPath } }
+  if (to.name === 'login' && token) return { path: homePathForConfig(config) }
+  if (to.meta.moduleId && !config.enabled_modules.includes(to.meta.moduleId)) {
+    return { name: 'module-not-installed', query: { moduleId: to.meta.moduleId, redirect: to.fullPath } }
   }
   return true
+})
+
+router.onError((error, to) => {
+  if (to?.name !== 'configuration-error') {
+    router.push({ name: 'configuration-error', query: { message: `页面加载失败：${error?.message || '未知错误'}` } })
+  }
 })
 
 export default router

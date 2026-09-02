@@ -18,6 +18,11 @@ import {
   localizationRecoveryLabel,
 } from '../services/taskMapState'
 import { resolveTaskRosbagStatus } from '../services/taskRosbagState'
+import {
+  formatWaypointLabel,
+  resolveTaskExecutionWaypointProgress,
+  taskExecutionWaypointClass,
+} from '../services/taskExecutionWaypointProgress'
 
 const route = useRoute()
 const execution = ref(null)
@@ -30,8 +35,11 @@ const imageReadyTick = ref(0)
 let timer
 
 const actions = computed(() => executionActions(execution.value?.state))
-const waypoints = computed(() => execution.value?.route_snapshot?.waypoints || [])
-const currentIndex = computed(() => execution.value?.current_waypoint_index ?? 0)
+const waypointProgress = computed(() => resolveTaskExecutionWaypointProgress(execution.value))
+const waypoints = computed(() => waypointProgress.value.waypoints)
+const currentIndex = computed(() => waypointProgress.value.currentIndex)
+const currentMapPointNumber = computed(() => waypointProgress.value.currentMapPointNumber)
+const waypointStates = computed(() => waypointProgress.value.states)
 const currentTarget = computed(() => waypoints.value[currentIndex.value] || waypoints.value[0] || null)
 const latestCommand = computed(() => {
   const commands = execution.value?.commands || []
@@ -268,7 +276,7 @@ function buildFailureInfo() {
     return {
       severity: 'bad',
       title: '有航点未到达',
-      summary: `${indexes.map(index => `第 ${index + 1} 个点`).join('、') || '部分航点'} 没有完成。通常是目标点在障碍区、膨胀区，或到目标点的路径被实时障碍堵住。`,
+      summary: `${indexes.map(index => formatWaypointLabel(waypoints.value, index)).join('、') || '部分航点'} 没有完成。通常是目标点在障碍区、膨胀区，或到目标点的路径被实时障碍堵住。`,
       detail: message || 'Nav2 reported missed waypoints',
       waypointIndexes: indexes,
       suggestion: '检查失败点是否落在可通行区域，观察地图上失败点、机器人最终位置和绿色轨迹之间的距离。',
@@ -319,10 +327,13 @@ function buildFailureInfo() {
 }
 
 function waypointClass(index) {
-  if (failedWaypointIndexes.value.includes(index)) return 'failed'
-  if (index < currentIndex.value) return 'done'
-  if (index === currentIndex.value && isActive.value) return 'current'
-  return ''
+  return taskExecutionWaypointClass({
+    index,
+    states: waypointStates.value,
+    currentIndex: currentIndex.value,
+    failedIndexes: failedWaypointIndexes.value,
+    isActive: isActive.value,
+  })
 }
 
 function statusText() {
@@ -333,7 +344,8 @@ function statusText() {
 
 function targetText() {
   if (!currentTarget.value) return '暂无目标点'
-  return `${currentTarget.value.name || `点${currentIndex.value + 1}`} (${Number(currentTarget.value.x).toFixed(2)}, ${Number(currentTarget.value.y).toFixed(2)})`
+  const label = currentTarget.value.name || `${currentMapPointNumber.value}号点`
+  return `${label} (${Number(currentTarget.value.x).toFixed(2)}, ${Number(currentTarget.value.y).toFixed(2)})`
 }
 
 function formatBytes(value) {
@@ -489,7 +501,7 @@ onBeforeUnmount(() => {
           <span class="panel-badge">{{ actions.statusLabel }}</span>
         </div>
         <div class="metrics-grid">
-          <div class="metric-card"><strong>{{ currentIndex + 1 }} / {{ execution.total_waypoints || waypoints.length }}</strong><span>当前航点</span></div>
+          <div class="metric-card"><strong>{{ currentMapPointNumber }}号</strong><span>当前目标 · 执行 {{ currentIndex + 1 }}/{{ execution.total_waypoints || waypoints.length }}</span></div>
           <div class="metric-card"><strong>第 {{ execution.round_number || 1 }} 轮</strong><span>循环轮次</span></div>
           <div class="metric-card"><strong>{{ progress }}%</strong><span>任务进度</span></div>
           <div class="metric-card"><strong>{{ robotStatus?.connection_status || 'unknown' }}</strong><span>设备连接</span></div>
@@ -532,7 +544,7 @@ onBeforeUnmount(() => {
           <div v-for="(point, index) in waypoints" :key="point.waypoint_id || index" class="execution-waypoint" :class="waypointClass(index)">
             <span>{{ point.map_point_number ?? point.sequence + 1 }}</span>
             <div>
-              <strong>{{ point.name || `点${index + 1}` }}</strong>
+              <strong>{{ point.name || `${point.map_point_number ?? index + 1}号点` }}</strong>
               <small>x {{ Number(point.x).toFixed(2) }} / y {{ Number(point.y).toFixed(2) }}</small>
             </div>
           </div>

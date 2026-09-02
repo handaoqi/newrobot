@@ -116,6 +116,23 @@ class AudioCommandClient:
             return
 
         payload = command.get("payload") or {}
+        source = str(payload.get("source") or "")
+        skipped_sources = set(getattr(self.config.audio_playback, "skip_patrol_speech_sources", ()) or ())
+        if source in skipped_sources:
+            LOGGER.info(
+                "skipping patrol speech/alert playback id=%s source=%s",
+                command_id,
+                source,
+            )
+            self._write_waypoint_status(command_id, payload, "finished")
+            self.report(
+                command_id,
+                "finished",
+                {"skipped": True, "source": source, "reason": "patrol_speech_disabled"},
+                "",
+            )
+            return
+
         audio_url = str(payload.get("audio_url") or "").strip()
         if not audio_url:
             self.report(command_id, "failed", {}, "audio_url is required")

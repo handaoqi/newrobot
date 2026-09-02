@@ -29,11 +29,11 @@ export const HOST = {
   /** Upstream's own bar. We hide it and drive its controls from ours. */
   playbackBar: '[data-testid="playback-controls"]',
   /**
-   * The clock. Note the descendant `input`: the element carrying the testid is
-   * the MUI TextField *wrapper*, whose .value is undefined and .textContent is
-   * empty. Reading the wrapper looks like "the host exposes no clock".
+   * The clock. The primary selector targets the MUI TextField's descendant
+   * input; Lichtblick 1.28.1 omits that wrapper testid after a file source is
+   * attached, so the disabled text input is the stable fallback.
    */
-  clockInput: '[data-testid="PlaybackTime-text"] input',
+  clockInput: '[data-testid="PlaybackTime-text"] input, [data-testid="playback-controls"] input[type="text"][disabled]',
   /** Playhead marker; its inline `left` is the position as a percentage. */
   playheadMarker: '[data-testid="playback-slider"] [style*="left"]',
   /**
@@ -219,6 +219,19 @@ export function createLichtblickBridge(getFrame) {
     }
   }
 
+  /**
+   * A missing mounted bundle is easy to mistake for a slow first boot: the
+   * platform SPA also answers unknown paths with its own index.html. Detect
+   * that specific fallback before waiting two minutes for a Lichtblick test id
+   * that can never appear.
+   */
+  const assertHostDocument = () => {
+    const d = doc()
+    if (d.title === 'Vite + Vue' && d.querySelector('#app') && !d.querySelector('#root')) {
+      throw new Error('Lichtblick 宿主未部署：/foxglove/ 返回了平台前端页面')
+    }
+  }
+
   return {
     HOST,
 
@@ -229,6 +242,7 @@ export function createLichtblickBridge(getFrame) {
      * boundary.
      */
     async ready(options) {
+      assertHostDocument()
       await waitFor(HOST.appShell, options)
     },
 

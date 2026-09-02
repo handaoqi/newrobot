@@ -12,9 +12,10 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from .alert_policy import BicycleAlertPolicy
 from .config import AppConfig, ModelConfig
 from .models import BoundingBox, DetectionPayload, now_iso
-from .tracking import IoUTracker, TrackingDetection
+from .tracking import IoUTracker, TrackedObject, TrackingDetection
 
 LOGGER = logging.getLogger(__name__)
 CUDA_PROVIDER = "CUDAExecutionProvider"
@@ -276,7 +277,10 @@ class YoloDetector:
             track_ttl_seconds=config.detection.track_ttl_seconds,
             duplicate_alert_seconds=config.detection.duplicate_alert_seconds,
         )
-        self._last_event_at = 0.0
+        self.alert_policy = BicycleAlertPolicy(
+            confirm_frames=config.detection.event_confirm_frames,
+            cooldown_seconds=config.detection.event_cooldown_seconds,
+        )
 
     def _resolve_backend(self, backend: str, model_path: str) -> str:
         normalized = backend.lower()
@@ -430,16 +434,54 @@ class YoloDetector:
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.video.height)
         return capture
 
-    def should_emit_event(self) -> bool:
-        now = time.time()
-        if now - self._last_event_at < self.config.detection.event_cooldown_seconds:
-            return False
-        self._last_event_at = now
-        return True
+    def event_cooldown_remaining(self, now: float | None = None) -> float:
+        return self.alert_policy.cooldown_remaining(time.time() if now is None else now)
+
+    def _bicycle_event_candidates(
+        self, detections: list[TrackingDetection] | list[TrackedObject]
+    ) -> list[TrackingDetection] | list[TrackedObject]:
+        return [item for item in detections if item.label in self.event_labels]
+
+    def _build_bicycle_event(self, frame, candidate: TrackingDetection | TrackedObject) -> FrameEvent:
+        x1, y1, width, height = candidate.bbox
+        bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
+        detection = DetectionPayload(
+            type=self.config.detection.event_type,
+            label=self.config.detection.event_label,
+            confidence=round(candidate.confidence, 4),
+            risk_level=self.config.detection.risk_level,
+            object_class=candidate.label,
+            track_id=getattr(candidate, "track_id", None),
+            bbox=bbox,
+            event_time=now_iso(),
+        )
+        return FrameEvent(frame=frame.copy(), detection=detection)
+
+    def _confirmed_bicycle_events(
+        self,
+        frame,
+        detections: list[TrackingDetection] | list[TrackedObject],
+        now: float | None = None,
+    ) -> list[FrameEvent]:
+        now = time.time() if now is None else now
+        if not self.emit_events:
+            return []
+        candidates = self._bicycle_event_candidates(detections)
+        confirmed = self.alert_policy.observe(bool(candidates), now)
+        if not confirmed:
+            return []
+        best = max(candidates, key=lambda item: item.confidence)
+        LOGGER.info(
+            "bicycle alert confirmed frames=%d cooldown_s=%.1f track_id=%s confidence=%.3f",
+            self.config.detection.event_confirm_frames,
+            self.config.detection.event_cooldown_seconds,
+            getattr(best, "track_id", None) or "",
+            best.confidence,
+        )
+        return [self._build_bicycle_event(frame, best)]
 
     def detect(self, frame) -> DetectionResult:
         raw_detections = self._predict(frame)
-        events: list[FrameEvent] = []
         preview_frame = frame.copy()
         target_detections: list[TrackingDetection] = []
 
@@ -474,21 +516,7 @@ class YoloDetector:
             )
 
         if not self.config.detection.tracking_enabled:
-            for target in target_detections:
-                if not self.should_emit_event():
-                    continue
-                x1, y1, width, height = target.bbox
-                bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
-                detection = DetectionPayload(
-                    type=self.config.detection.event_type,
-                    label=self.config.detection.event_label,
-                    confidence=round(target.confidence, 4),
-                    risk_level=self.config.detection.risk_level,
-                    object_class=target.label,
-                    bbox=bbox,
-                    event_time=now_iso(),
-                )
-                events.append(FrameEvent(frame=frame.copy(), detection=detection))
+            events = self._confirmed_bicycle_events(frame, target_detections)
             return DetectionResult(
                 events=events,
                 preview_frame=preview_frame,
@@ -511,21 +539,7 @@ class YoloDetector:
                 cv2.LINE_AA,
             )
 
-            if not self.emit_events or track.label not in self.event_labels or not self.tracker.should_alert(track.track_id):
-                continue
-
-            bbox = BoundingBox(x=x1, y=y1, width=width, height=height)
-            detection = DetectionPayload(
-                type=self.config.detection.event_type,
-                label=self.config.detection.event_label,
-                confidence=round(track.confidence, 4),
-                risk_level=self.config.detection.risk_level,
-                object_class=track.label,
-                track_id=track.track_id,
-                bbox=bbox,
-                event_time=now_iso(),
-            )
-            events.append(FrameEvent(frame=frame.copy(), detection=detection))
+        events = self._confirmed_bicycle_events(frame, tracked_targets)
         return DetectionResult(
             events=events,
             preview_frame=preview_frame,

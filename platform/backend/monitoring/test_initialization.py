@@ -39,6 +39,8 @@ class PlatformInitializationTests(TestCase):
         self.assertEqual(AlertSkillBinding.objects.count(), 5)
         expected_names = {template[0] for template in DEFAULT_SPEECH_TEMPLATES}
         self.assertEqual(len(expected_names), 12)
+        self.assertEqual(SpeechTemplate.objects.count(), 12)
+        self.assertFalse(SpeechTemplate.objects.filter(name="低电量自动回充").exists())
         actual_templates = {
             name: (text, category)
             for name, text, category in SpeechTemplate.objects.filter(

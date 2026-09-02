@@ -969,9 +969,33 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             "waypoint_names",
             "description",
             "scene_scope",
+            "global_controller",
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        normalized_waypoints = []
+        for point in data.get("waypoints") or []:
+            if isinstance(point, dict):
+                normalized = dict(point)
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                normalized = {
+                    "x": point[0],
+                    "y": point[1],
+                    "yaw": point[2] if len(point) >= 3 else 0.0,
+                }
+            else:
+                normalized_waypoints.append(point)
+                continue
+            # RPP was stored by the old UI, but is not registered by the
+            # deployed navigo controller server. Expose the actual fallback
+            # so the route page and API agree with the execution snapshot.
+            normalized["local_controller"] = "mppi"
+            normalized_waypoints.append(normalized)
+        data["waypoints"] = normalized_waypoints
+        return data
 
     def validate_waypoints(self, value):
         for index, point in enumerate(value):
@@ -995,6 +1019,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
         if invalid_modes:
             raise serializers.ValidationError("途经点定位方式只能是 NDT、UKF 或 RTK")
+        invalid_local_controllers = [
+            point.get("local_controller")
+            for point in value
+            if isinstance(point, dict)
+            and str(point.get("local_controller") or "mppi").lower() not in {"rpp", "mppi"}
+        ]
+        if invalid_local_controllers:
+            raise serializers.ValidationError("途经点局部控制器当前只能使用 MPPI")
         try:
             template_ids = {
                 int(point["speech_template_id"])
@@ -1023,6 +1055,9 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         scene_scope = attrs.get("scene_scope")
         if scene_scope is None and self.instance is not None:
             scene_scope = self.instance.scene_scope
+        global_controller = attrs.get("global_controller")
+        if global_controller is not None and str(global_controller).lower() not in {"theta_star", "navfn"}:
+            raise serializers.ValidationError("路线全局控制器只能是 Theta* 或 NavFn (A*)")
         if map_data is not None:
             try:
                 validate_route_against_map(
@@ -1042,7 +1077,7 @@ class PatrolRouteSummarySerializer(PatrolRouteSerializer):
     class Meta(PatrolRouteSerializer.Meta):
         fields = [
             "id", "name", "map_data", "map_name", "map_set", "map_set_name", "robot",
-            "robot_name", "robot_code", "waypoint_count", "description", "scene_scope",
+            "robot_name", "robot_code", "waypoint_count", "description", "scene_scope", "global_controller",
             "latest_execution", "created_at", "updated_at",
         ]
 

@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,9 @@ class FakeTelemetry:
 
     def on_scan_matching_status(self, _msg):
         self.scan_samples += 1
+
+    def on_localization(self, _msg):
+        return None
 
     def localization_decision(self):
         return dict(self.decision)
@@ -52,6 +56,30 @@ def test_lio_motion_anomaly_bypasses_localization_loss_debounce():
     assert triggered.wait(1.0)
     assert reasons == ["lio_motion_anomaly"]
     assert adapter._localization_recovery_armed is True
+
+
+def test_lio_motion_anomaly_ignored_when_rtk_xy_is_fixed():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry()
+    adapter._lio_motion_anomaly_notified = False
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    adapter._localization_failure_cb = lambda reason: triggered.set()
+    message = SimpleNamespace(
+        data=(
+            '{"lio_motion_anomaly":true,"lio_motion_anomaly_reason":"yaw_step_exceeded",'
+            '"rtk_usable":true,"rtk_quality":"fixed","rtk_heading_usable":false,'
+            '"rtk_good_for_navigation":false,"rtk_position_good_for_navigation":true}'
+        )
+    )
+
+    adapter._on_localization_decision(message)
+    adapter._on_localization_decision(message)
+
+    assert not triggered.wait(0.2)
+    assert adapter._localization_recovery_armed is False
+    assert adapter._lio_motion_anomaly_notified is False
 
 
 def test_fresh_normal_streak_requires_consecutive_successes():
@@ -184,44 +212,83 @@ def test_best_ndt_candidate_uses_verified_streak_and_seed_gate():
     assert result["eligible"] is True
 
 
-def test_active_relocalize_commits_verified_ndt_instead_of_advancing_candidate():
+def test_candidate_rank_prefers_stable_frames_then_inliers():
+    weaker = {
+        "eligible": True,
+        "stable_frames": 2,
+        "inlier_fraction": 0.95,
+        "matching_error": 0.05,
+        "geometric_rmse": 0.04,
+        "position_correction_m": 0.1,
+        "yaw_correction_deg": 1.0,
+    }
+    stronger = {
+        "eligible": True,
+        "stable_frames": 5,
+        "inlier_fraction": 0.70,
+        "matching_error": 0.20,
+        "geometric_rmse": 0.15,
+        "position_correction_m": 0.4,
+        "yaw_correction_deg": 8.0,
+    }
+    assert RosAdapter._candidate_rank(stronger) < RosAdapter._candidate_rank(weaker)
+
+
+def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 7
     adapter._persist_relocalization_state = lambda _payload: None
     adapter._trusted_pose_cb = None
     adapter._last_trusted_pose_report_monotonic = 0.0
-    localized = SimpleNamespace(x=0.2, y=0.1, z=0.0, yaw=0.3)
+    adapter._last_trusted_pose = None
+    localized = SimpleNamespace(x=0.4, y=0.1, z=0.0, yaw=0.2, localization_status="normal")
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: localized)
     calls = []
-    candidate = {
-        "eligible": True,
-        "verified": True,
-        "matched_pose": {"x": 0.2, "y": 0.1, "z": 0.0, "yaw": 0.3},
-        "matching_error": 0.12,
-        "inlier_fraction": 0.8,
-    }
 
     def set_once(pose, generation):
         calls.append((dict(pose), generation))
         if len(calls) == 1:
             raise ProtocolError(
                 "INITIAL_POSE_NOT_ACCEPTED",
-                "handoff pending",
-                details={"best_ndt_candidate": candidate},
+                "weak match",
+                details={"best_ndt_candidate": {
+                    "eligible": True,
+                    "stable_frames": 3,
+                    "inlier_fraction": 0.60,
+                    "matching_error": 0.22,
+                    "matched_pose": {"x": 0.1, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                }},
             )
-        return {
-            "localized_pose": {"x": 0.2, "y": 0.1, "yaw": 0.3},
-            "localization_status": "normal",
-        }
+        if len(calls) == 2:
+            raise ProtocolError(
+                "INITIAL_POSE_NOT_ACCEPTED",
+                "best match",
+                details={"best_ndt_candidate": {
+                    "eligible": True,
+                    "stable_frames": 5,
+                    "inlier_fraction": 0.91,
+                    "matching_error": 0.08,
+                    "matched_pose": {"x": 0.4, "y": 0.1, "z": 0.0, "yaw": 0.2},
+                }},
+            )
+        if pose.get("x") == 0.4 and pose.get("require_absolute") is not False and len(calls) > 2:
+            return {
+                "localized_pose": {"x": 0.4, "y": 0.1, "yaw": 0.2},
+                "localization_status": "normal",
+            }
+        raise ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no match", details={})
 
     adapter._set_initial_pose_once = set_once
 
-    result = adapter.active_relocalize({"x": 0.0, "y": 0.0, "yaw": 0.0, "max_attempts": 12})
+    result = adapter.active_relocalize({
+        "x": 0.0, "y": 0.0, "yaw": 0.0, "max_attempts": 3, "candidate_wait_seconds": 1.0,
+    })
 
-    assert len(calls) == 2
-    assert calls[1][0]["x"] == 0.2
-    assert calls[1][0]["yaw"] == 0.3
+    assert len(calls) == 4
+    assert calls[-1][0]["x"] == 0.4
     assert result["best_ndt_committed"] is True
+    assert result["best_match_pose"]["x"] == 0.4
+    assert [item["status"] for item in result["attempts"][:2]] == ["rejected", "accepted"]
 
 
 def test_active_relocalize_executes_the_one_meter_candidates():
@@ -230,6 +297,7 @@ def test_active_relocalize_executes_the_one_meter_candidates():
     adapter._persist_relocalization_state = lambda _payload: None
     adapter._trusted_pose_cb = None
     adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter._last_trusted_pose = None
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
     calls = []
 
@@ -263,19 +331,26 @@ def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order(
     adapter._persist_relocalization_state = lambda _payload: None
     adapter._trusted_pose_cb = None
     adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter._last_trusted_pose = None
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
     calls = []
 
     def set_once(pose, generation):
         calls.append((dict(pose), generation))
         # All twenty origin candidates and the first route point fail.  The
-        # second route point then supplies the accepted exact seed.
+        # second route point then supplies the accepted exact seed, and the
+        # ranked winner is committed afterwards.
         if len(calls) <= 21:
             raise ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no match", details={})
         return {
             "localized_pose": {"x": pose["x"], "y": pose["y"], "yaw": pose["yaw"]},
             "localization_status": "normal",
-            "best_ndt_candidate": {"matching_error": 0.12, "inlier_fraction": 0.8},
+            "best_ndt_candidate": {
+                "eligible": True,
+                "matching_error": 0.12,
+                "inlier_fraction": 0.8,
+                "matched_pose": {"x": pose["x"], "y": pose["y"], "yaw": pose["yaw"]},
+            },
         }
 
     adapter._set_initial_pose_once = set_once
@@ -289,12 +364,13 @@ def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order(
         wait_seconds=120.0,
     )
 
-    assert len(calls) == 22
+    assert len(calls) == 23
     origin_positions = {(call[0]["x"], call[0]["y"]) for call in calls[:20]}
     assert {(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)} <= origin_positions
-    assert [(call[0]["x"], call[0]["y"]) for call in calls[-2:]] == [
+    assert [(call[0]["x"], call[0]["y"]) for call in calls[20:22]] == [
         (1.0, 2.0), (3.0, 4.0),
     ]
+    assert calls[-1][0]["x"] == 3.0
     assert result["selected_stage"] == "route_waypoint"
     assert result["selected_waypoint_index"] == 1
     assert result["localized_pose"]["x"] == 3.0
@@ -437,6 +513,13 @@ def test_only_absolute_ndt_or_rtk_decision_is_trusted():
         "policy_source_ready": False,
     }
     assert adapter._absolute_localization_stable() is False
+    adapter.telemetry.decision = {
+        "active_source": "rtk_imu",
+        "absolute_stable": True,
+        "rtk_good_for_navigation": True,
+        "policy_source_ready": False,
+    }
+    assert adapter._absolute_localization_stable() is True
 
 
 def test_localization_policy_preserves_ukf_mode():
@@ -448,6 +531,89 @@ def test_localization_policy_preserves_ukf_mode():
 
     assert result == {"topic": "/localization/policy", "source": "ukf", "phase": "moving"}
     assert published[0].data == "moving:ukf"
+
+
+def test_good_rtk_ignores_ndt_degradation_before_active_source_switches():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "unavailable",
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    })
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.5, ndt_failure_samples=1)
+    adapter._ndt_failure_count = 0
+    adapter._ndt_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    adapter._localization_failure_cb = lambda reason: triggered.set()
+    bad = SimpleNamespace(has_converged=False, matching_error=1.2, inlier_fraction=0.0)
+
+    adapter._on_scan_matching_status(bad)
+    adapter._on_scan_matching_status(bad)
+    adapter._on_scan_matching_status(bad)
+
+    assert not triggered.is_set()
+    assert adapter._ndt_failure_count == 0
+
+
+def test_lost_status_ignored_when_rtk_xy_is_fixed_without_heading():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "lio_imu",
+        "rtk_good_for_navigation": False,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": False,
+        "rtk_position_good_for_navigation": True,
+    })
+    adapter.safety_config = SimpleNamespace(localization_loss_samples=1)
+    adapter._localization_lost_count = 0
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    adapter._latest_speed = 0.0
+    adapter._localization_sample_condition = threading.Condition()
+    adapter._localization_sample_sequence = 0
+    adapter._localization_status_samples = []
+    adapter.operator_localization_active = lambda: False
+    failures = []
+    adapter._localization_failure_cb = failures.append
+
+    adapter._on_localization(SimpleNamespace(status=4, speed=0.0))
+    adapter._on_localization(SimpleNamespace(status=4, speed=0.0))
+
+    assert failures == []
+    assert adapter._localization_lost_count == 0
+
+
+def test_lost_status_ignored_when_rtk_is_good_for_navigation():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "unavailable",
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    })
+    adapter.safety_config = SimpleNamespace(localization_loss_samples=1)
+    adapter._localization_lost_count = 0
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    adapter._latest_speed = 0.0
+    adapter._localization_sample_condition = threading.Condition()
+    adapter._localization_sample_sequence = 0
+    adapter._localization_status_samples = []
+    adapter.operator_localization_active = lambda: False
+    failures = []
+    adapter._localization_failure_cb = failures.append
+
+    adapter._on_localization(SimpleNamespace(status=4, speed=0.0))
+    adapter._on_localization(SimpleNamespace(status=4, speed=0.0))
+
+    assert failures == []
+    assert adapter._localization_lost_count == 0
+    assert adapter._localization_failure_notified is False
 
 
 def test_rtk_primary_ignores_ndt_degradation():
@@ -496,6 +662,32 @@ def test_lio_primary_ndt_degradation_triggers_recovery():
     assert triggered.wait(1.0)
     assert reasons == ["ndt_degraded"]
     assert adapter._localization_recovery_armed is True
+
+
+def test_fixed_rtk_ignores_ndt_degradation_during_heading_flicker():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "lio_imu",
+        "rtk_good_for_navigation": False,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": False,
+        "correction_policy": "ndt",
+    })
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.5, ndt_failure_samples=1)
+    adapter._ndt_failure_count = 0
+    adapter._ndt_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    adapter._localization_failure_cb = lambda reason: triggered.set()
+    bad = SimpleNamespace(has_converged=False, matching_error=1.2, inlier_fraction=0.0)
+
+    adapter._on_scan_matching_status(bad)
+    adapter._on_scan_matching_status(bad)
+    adapter._on_scan_matching_status(bad)
+
+    assert not triggered.is_set()
+    assert adapter._ndt_failure_count == 0
 
 
 def test_lio_primary_fixed_rtk_policy_ignores_unused_ndt_degradation():
@@ -727,3 +919,50 @@ def test_ready_probes_are_serialized_across_background_threads():
     second.join(1)
 
     assert calls == [45.0, 0.5]
+
+
+def test_scan_reports_side_clearance_for_bypass():
+    adapter = object.__new__(RosAdapter)
+    adapter._front_obstacle_distance_m = None
+    adapter._left_clearance_m = None
+    adapter._right_clearance_m = None
+    scan = SimpleNamespace(
+        ranges=[0.5, 1.2, 1.5],
+        range_min=0.05,
+        angle_min=-0.8,
+        angle_increment=0.8,
+    )
+    adapter._on_scan(scan)
+    assert adapter._left_clearance_m == pytest.approx(1.5, abs=0.05)
+    assert adapter._front_obstacle_distance_m is None
+
+
+def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
+    adapter = object.__new__(RosAdapter)
+    adapter._raw_forward_command = 0.0
+    adapter._actual_forward_command = 0.0
+    adapter._raw_lateral_command = 0.0
+    adapter._actual_lateral_command = 0.0
+    adapter._raw_turn_command = 0.0
+    adapter._actual_turn_command = 0.0
+    adapter._latest_speed = 0.0
+    adapter._front_obstacle_distance_m = None
+    adapter._left_clearance_m = None
+    adapter._right_clearance_m = None
+    adapter._global_plan_points = []
+    adapter._global_plan_updated_monotonic = 0.0
+    adapter._global_plan_stale_seconds = 30.0
+
+    adapter._on_global_plan(SimpleNamespace(poses=[
+        SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=1.0, y=2.0))),
+        SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=3.0, y=4.0))),
+    ]))
+
+    fresh = adapter.obstacle_monitor_snapshot()["global_plan"]
+    assert fresh["updated"] is True
+    assert fresh["points"] == [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}]
+
+    adapter._global_plan_updated_monotonic = time.monotonic() - 31.0
+    stale = adapter.obstacle_monitor_snapshot()["global_plan"]
+    assert stale["updated"] is False
+    assert stale["points"] == []

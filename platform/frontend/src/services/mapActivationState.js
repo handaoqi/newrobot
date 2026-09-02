@@ -5,11 +5,12 @@ export function expectedLegacyMapVersion(mapId) {
 }
 
 export function navigationMapIdentity(payload = {}) {
-  const status = payload.status || {}
+  const safe = payload && typeof payload === 'object' ? payload : {}
+  const status = safe.status || {}
   const currentMap = status.current_map || {}
   return {
-    mapId: String(currentMap.map_id || status.map_id || payload.current_map_id || ''),
-    mapVersion: String(currentMap.map_version || status.map_version || payload.current_map_version || ''),
+    mapId: String(currentMap.map_id || status.map_id || safe.current_map_id || ''),
+    mapVersion: String(currentMap.map_version || status.map_version || safe.current_map_version || ''),
   }
 }
 

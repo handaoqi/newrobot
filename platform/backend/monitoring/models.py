@@ -680,6 +680,12 @@ class PatrolRoute(BaseTimestampModel):
     waypoint_names = models.JSONField(default=list, verbose_name="途经点名称数组")
     description = models.TextField(blank=True, verbose_name="路线描述")
     scene_scope = models.CharField(max_length=32, blank=True, default="indoor", verbose_name="场景范围")
+    global_controller = models.CharField(
+        max_length=32,
+        blank=True,
+        default="theta_star",
+        verbose_name="全局控制器",
+    )
 
     class Meta:
         verbose_name = "巡逻路线"

@@ -74,6 +74,7 @@ class PlatformMqttClient:
             "robots/+/events/task",
             "robots/+/events/alert",
             "robots/+/commands/+/ack",
+            "robots/+/commands/+/progress",
             "robots/+/commands/+/result",
             "robots/+/sync/state",
             "robots/+/dev/presence",

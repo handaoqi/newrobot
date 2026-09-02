@@ -47,12 +47,14 @@ detection:
   event_label: bicycle
   risk_level: medium
   event_cooldown_seconds: 10
+  event_confirm_frames: 3
   min_box_area: 4000
   tracking_enabled: true
   tracker_iou_threshold: 0.3
   track_ttl_seconds: 30
   duplicate_alert_seconds: 10
   event_classes: [bicycle]
+  # 2 Hz detection; alarm after 3 consecutive bicycle frames, then pause 10s.
   person_detection_enabled: true
   person_report_interval_seconds: 0.4
   inference_rate_hz: 2.0

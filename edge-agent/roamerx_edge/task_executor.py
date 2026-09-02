@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from math import atan2, cos, hypot, isfinite, sin
+from math import atan2, cos, hypot, isfinite, pi, sin
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -20,6 +20,7 @@ from .map_coordinate import (
 )
 from .map_package_finalize import load_map_manifest
 from .protocol import MessageEnvelope, ProtocolError, now_iso
+from .localization_recovery import select_recovery_seed
 
 
 LOGGER = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ LOGGER = logging.getLogger(__name__)
 # copy so the outbound legs are not skipped.  After the first copy is marked
 # complete, a later resume must also refuse to jump to the return copy.
 WAYPOINT_COLOCATION_M = 1.0
+# Outdoor reverse starts often sit 1.0–1.5 m off the end click after RTK
+# re-anchor. Use a looser gate so the dog does not cruise back to point N.
+REVERSE_START_COLOCATION_M = 1.5
 # Hand-clicked return-to-start points are often 1-2 m off the original click.
 # If the nearest waypoint is the route end and the robot is also that close
 # to waypoint 1, start the outbound legs instead of treating 1..N-1 as done.
@@ -40,6 +44,28 @@ WAYPOINT_STRAIGHTEN_M = 0.40
 # Nav2 feedback arrives around 20 Hz.  UI progress does not need that rate,
 # and persisting every sample can monopolize the platform SQLite writer.
 TASK_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+# Speech/dwell waypoints are dispatched as a one-pose batch, but the travel
+# leg is still a cruise. Switch to the slow DiffDrive profile only inside
+# this radius so MPPI can detour on the way.
+PATROL_FINAL_APPROACH_M = 1.0
+# First stall recoveries leave the Nav2 goal in place so FollowPath / BT
+# Backup can replan. Reverse+redispatch is the last automatic attempt.
+OBSTACLE_LOCAL_RECOVERY_ATTEMPTS = 2
+BYPASS_LATERAL_M = 1.8
+BYPASS_FORWARD_M = 0.5
+BYPASS_MIN_SIDE_CLEARANCE_M = 0.8
+# Skip the in-place pre-leg turn when already facing the next waypoint.
+DEPARTURE_HEADING_ALIGN_RAD = 0.35  # ~20 deg
+# Outdoor RPP final-approach spins weave for minutes; abort and cruise instead.
+DEPARTURE_HEADING_TIMEOUT_SECONDS = 20.0
+# Quadruped coast after Nav2 reports goal reached; wait before measuring pose.
+HOLD_FINAL_POSE_TIMEOUT_SECONDS = 3.0
+# Stopped at a waypoint: give RTK/NDT time to pull FAST-LIO back before leaving.
+WAYPOINT_SETTLE_TIMEOUT_SECONDS = 12.0
+# Match localization lio_primary.drift_xy_m default; above this, wait for correction.
+WAYPOINT_CORRECTION_DRIFT_M = 0.30
+# How long ABSOLUTE_LOCALIZATION_REQUIRED may wait before giving up the watch.
+ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS = 120.0
 
 
 def _waypoint_xy(waypoint: dict) -> tuple[float, float] | None:
@@ -164,7 +190,9 @@ class NavigationAdapter(Protocol):
         final_approach: bool = False,
         live: bool = False,
         outdoor: bool | None = None,
+        local_controller: str = "mppi",
     ) -> None: ...
+    def set_global_controller(self, mode: str) -> None: ...
 
 
 @dataclass
@@ -197,6 +225,8 @@ class TaskExecutor:
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         standup_confirmation_timeout_seconds: float = 12.0,
+        navigation_dispatch_retry_seconds: float = 5.0,
+        navigation_dispatch_retry_budget_seconds: float = 300.0,
         map_set_coordinator=None,
         obstacle_speech=None,
         waypoint_speech=None,
@@ -211,6 +241,11 @@ class TaskExecutor:
         self.docking_goal_tolerance_m = docking_goal_tolerance_m
         self.docking_goal_yaw_tolerance_rad = docking_goal_yaw_tolerance_rad
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
+        self.navigation_dispatch_retry_seconds = max(0.5, float(navigation_dispatch_retry_seconds))
+        self.navigation_dispatch_retry_budget_seconds = max(
+            self.navigation_dispatch_retry_seconds,
+            float(navigation_dispatch_retry_budget_seconds),
+        )
         self.map_set_coordinator = map_set_coordinator
         self.obstacle_speech = obstacle_speech
         self.waypoint_speech = waypoint_speech
@@ -222,6 +257,12 @@ class TaskExecutor:
         self._goal_offset = 0
         self._departure_heading_index: int | None = None
         self._departure_heading_completed_index: int | None = None
+        # When set, a successful in-place turn should cruise to this waypoint
+        # instead of running the post-arrival absolute-localization path.
+        self._departure_cruise_index: int | None = None
+        self._departure_heading_timer: threading.Timer | None = None
+        self._absolute_pause_watch_stop: threading.Event | None = None
+        self._absolute_pause_watch_thread: threading.Thread | None = None
         self._last_progress_emit_at: float | None = None
         self._obstacle_monitor_stop = threading.Event()
         self._obstacle_monitor_thread = None
@@ -231,9 +272,16 @@ class TaskExecutor:
         self._leave_route_announced = False
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
+        self._obstacle_recovery_active = False
+        self._expected_recovery_cancels = 0
+        self._bypass_active = False
         self._task_started_at = None
         self._blocked_retry_timer = None
+        self._nav_dispatch_retry_timer = None
+        self._nav_dispatch_retry_started_at: float | None = None
+        self._pending_dispatch_index: int | None = None
         self._paused_for_localization = False
+        self._paused_localization_reason: str | None = None
         self._navigation_prepared = False
         self._segment_avoidance_enabled = True
         self._dispatched_count = 0
@@ -255,10 +303,13 @@ class TaskExecutor:
     def stop(self) -> None:
         self._stop_obstacle_monitor()
         self._stop_task_rosbag()
+        self._cancel_departure_heading_timeout()
+        self._cancel_absolute_localization_resume_watch()
         self._restore_navigation_profile()
         if self._blocked_retry_timer:
             self._blocked_retry_timer.cancel()
             self._blocked_retry_timer = None
+        self._clear_nav_dispatch_retry()
 
     def _obstacle_monitor_enabled(self) -> bool:
         return bool(
@@ -297,10 +348,45 @@ class TaskExecutor:
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
 
+    def _localization_allows_obstacle_monitor(self, observation: dict | None = None) -> bool:
+        """Ignore collision-limited 'obstacles' while localization is not Normal.
+
+        Collision Monitor zeros /cmd_vel on status!=3. Treating that as a
+        physical obstacle triggers reverse/bypass while the dog should hold.
+        """
+        if isinstance(observation, dict) and "localization_normal" in observation:
+            return bool(observation.get("localization_normal"))
+        diagnostics = getattr(self.navigation, "localization_diagnostics", None)
+        if not callable(diagnostics):
+            return True
+        try:
+            payload = diagnostics() or {}
+        except Exception:
+            return True
+        raw = payload.get("raw_pose") if isinstance(payload, dict) else None
+        status = str(
+            (payload or {}).get("localization_status")
+            or ((raw or {}).get("localization_status") if isinstance(raw, dict) else "")
+            or ""
+        ).lower()
+        if not status:
+            return True
+        return status == "normal"
+
     def _evaluate_obstacle_progress(self) -> None:
         if not self.context or self.context.state != "running" or not self._obstacle_monitor_enabled():
             return
         observation = self.navigation.obstacle_monitor_snapshot()
+        if not self._localization_allows_obstacle_monitor(observation):
+            # Localization loss already pauses navigation; do not open an
+            # obstacle episode from the zeroed cmd_vel that follows.
+            if (
+                self._last_obstacle_seen_at is not None
+                and time.monotonic() - self._last_obstacle_seen_at
+                >= self.obstacle_speech.obstacle_clear_seconds
+            ):
+                self._reset_obstacle_episode()
+            return
         obstacle_distance = observation.get("front_obstacle_distance_m")
         raw_planar = abs(float(observation.get("requested_planar_speed_mps") or 0.0))
         actual_planar = abs(float(observation.get("actual_planar_speed_mps") or 0.0))
@@ -359,7 +445,11 @@ class TaskExecutor:
         self._recovery_attempts += 1
         self._obstacle_progress_anchor_at = now
         self._emit_obstacle_speech("recovery_attempt", self._recovery_attempts, observation)
-        if self._recovery_attempts <= 3:
+        if self._recovery_attempts <= OBSTACLE_LOCAL_RECOVERY_ATTEMPTS:
+            # Keep FollowWaypoints running. Collision Monitor may be zeroing
+            # /cmd_vel, but cancelling here prevents Nav2 Backup + replan.
+            self._request_local_replanning()
+        elif self._recovery_attempts <= 3:
             self._perform_obstacle_reverse()
         if self._recovery_attempts >= 3:
             self._leave_route_announced = True
@@ -374,32 +464,180 @@ class TaskExecutor:
                  "reported_at": now_iso()}, "",
             )
 
+    def _request_local_replanning(self) -> None:
+        """Ask Nav2 to refresh the local view without dropping the current goal."""
+        clearer = getattr(self.navigation, "clear_local_costmap", None)
+        if callable(clearer):
+            try:
+                clearer()
+            except Exception:
+                LOGGER.warning("local costmap clear failed during obstacle stall", exc_info=True)
+        LOGGER.info(
+            "obstacle stall: Nav2 goal kept so FollowPath recovery can replan (attempt %s)",
+            self._recovery_attempts,
+        )
+
     def _perform_obstacle_reverse(self) -> None:
-        """Safely back away a short distance before retrying the current goal."""
+        """Back up, then re-dispatch so planning continues after the safety stop."""
         cancel = getattr(self.navigation, "cancel_navigation", None)
         velocity = getattr(self.navigation, "teleop_velocity", None)
         stop = getattr(self.navigation, "stop_motion", None)
-        if not callable(velocity):
-            LOGGER.warning("obstacle recovery requested but teleop reverse is unavailable")
-            return
-        if callable(cancel):
-            cancel(timeout_seconds=2.0)
-        speed = -abs(float(getattr(self.obstacle_speech, "reverse_speed_mps", 0.12)))
-        duration = max(0.2, min(float(getattr(self.obstacle_speech, "reverse_duration_seconds", 1.5)), 3.0))
-        LOGGER.warning("obstacle recovery reverse start speed=%.2f duration=%.2fs", speed, duration)
-        deadline = time.monotonic() + duration
+        self._obstacle_recovery_active = True
         try:
-            while time.monotonic() < deadline:
-                velocity(vx=speed, vy=0.0, yaw_rate=0.0)
-                time.sleep(0.1)
-        finally:
-            if callable(stop):
+            if callable(cancel):
+                self._expected_recovery_cancels += 1
+                cancel(timeout_seconds=2.0)
+            if callable(velocity):
+                speed = -abs(float(getattr(self.obstacle_speech, "reverse_speed_mps", 0.12)))
+                duration = max(
+                    0.2,
+                    min(float(getattr(self.obstacle_speech, "reverse_duration_seconds", 1.5)), 3.0),
+                )
+                LOGGER.warning(
+                    "obstacle recovery reverse start speed=%.2f duration=%.2fs",
+                    speed,
+                    duration,
+                )
+                deadline = time.monotonic() + duration
+                try:
+                    while time.monotonic() < deadline:
+                        velocity(vx=speed, vy=0.0, yaw_rate=0.0)
+                        time.sleep(0.1)
+                finally:
+                    if callable(stop):
+                        stop()
+                    else:
+                        velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+                    LOGGER.warning("obstacle recovery reverse finished")
+            elif callable(stop):
                 stop()
             else:
-                velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
-            LOGGER.warning("obstacle recovery reverse finished")
+                LOGGER.warning("obstacle recovery reverse skipped; teleop reverse is unavailable")
+            self._redispatch_after_obstacle_recovery()
+        finally:
+            self._obstacle_recovery_active = False
+
+    def _redispatch_after_obstacle_recovery(self) -> None:
+        if not self.context or self.context.state != "running":
+            return
+        observation = {}
+        snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
+        if callable(snapshot):
+            try:
+                observation = snapshot() or {}
+            except Exception:
+                LOGGER.warning("obstacle snapshot failed before bypass redispatch", exc_info=True)
+        via = self._obstacle_bypass_via(observation)
+        if via is not None:
+            LOGGER.info(
+                "dispatching obstacle bypass via x=%.2f y=%.2f toward waypoint %s",
+                via["x"],
+                via["y"],
+                self.context.current_waypoint_index,
+            )
+            self._dispatch_bypass_via(via)
+            return
+        LOGGER.info(
+            "obstacle reverse complete; re-dispatching waypoint %s",
+            self.context.current_waypoint_index,
+        )
+        self._send_from(self.context.current_waypoint_index)
+
+    def _obstacle_bypass_via(self, observation: dict) -> dict | None:
+        """Pick a short lateral via along the route toward the pending waypoint.
+
+        Clearances are measured in the robot body frame, but the via itself must
+        advance toward the goal. Using body-forward when yaw is wrong (common
+        after a failed departure turn) walks the dog into the wall it just
+        reversed away from.
+        """
+        if not self.context:
+            return None
+        pose = self.navigation.latest_pose() if self.navigation else None
+        if pose is None:
+            return None
+        try:
+            x = float(pose.x)
+            y = float(pose.y)
+            yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if not waypoints:
+            return None
+        index = min(max(0, self.context.current_waypoint_index), len(waypoints) - 1)
+        target = waypoints[index]
+        try:
+            target_x = float(target["x"])
+            target_y = float(target["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        goal_dx = target_x - x
+        goal_dy = target_y - y
+        # If we are already on the pending waypoint (final approach / restart on
+        # the nearest point), aim the bypass at the next leg instead of failing
+        # open and redispatching into the same wall.
+        if hypot(goal_dx, goal_dy) < 0.3 and index + 1 < len(waypoints):
+            nxt = waypoints[index + 1]
+            try:
+                target = nxt
+                target_x = float(nxt["x"])
+                target_y = float(nxt["y"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            goal_dx = target_x - x
+            goal_dy = target_y - y
+            index = index + 1
+        if hypot(goal_dx, goal_dy) < 0.3:
+            return None
+        goal_yaw = atan2(goal_dy, goal_dx)
+        goal_forward_x, goal_forward_y = cos(goal_yaw), sin(goal_yaw)
+        goal_left_x, goal_left_y = -sin(goal_yaw), cos(goal_yaw)
+        left = observation.get("left_clearance_m")
+        right = observation.get("right_clearance_m")
+        left_m = float("inf") if left is None else float(left)
+        right_m = float("inf") if right is None else float(right)
+        if max(left_m, right_m) < BYPASS_MIN_SIDE_CLEARANCE_M:
+            return None
+        # Map body-frame left/right clearances into the goal frame. When the
+        # dog faces away from the waypoint, body-left is goal-right.
+        robot_left_x, robot_left_y = -sin(yaw), cos(yaw)
+        align = robot_left_x * goal_left_x + robot_left_y * goal_left_y
+        if align >= 0.0:
+            goal_left_clear_m, goal_right_clear_m = left_m, right_m
+        else:
+            goal_left_clear_m, goal_right_clear_m = right_m, left_m
+        side = 1.0 if goal_left_clear_m >= goal_right_clear_m else -1.0
+        via_x = x + BYPASS_FORWARD_M * goal_forward_x + side * BYPASS_LATERAL_M * goal_left_x
+        via_y = y + BYPASS_FORWARD_M * goal_forward_y + side * BYPASS_LATERAL_M * goal_left_y
+        if hypot(via_x - x, via_y - y) < 0.3:
+            return None
+        if hypot(via_x - target_x, via_y - target_y) < 0.5:
+            return None
+        return {
+            "x": via_x,
+            "y": via_y,
+            "yaw": atan2(target_y - via_y, target_x - via_x),
+            "waypoint_id": f"bypass-{index}",
+            "map_point_number": target.get("map_point_number"),
+        }
+
+    def _dispatch_bypass_via(self, via: dict) -> None:
+        self._apply_navigation_profile(self.context.current_waypoint_index, force_final=False)
+        self._patrol_final_approach_applied = False
+        self._bypass_active = True
+        self._goal_offset = self.context.current_waypoint_index
+        self._dispatched_count = 1
+        accepted = self.navigation.send_waypoints([via], self.on_feedback, self.on_navigation_result)
+        if accepted:
+            return
+        self._bypass_active = False
+        LOGGER.warning("obstacle bypass via was rejected; retrying the original waypoint")
+        self._send_from(self.context.current_waypoint_index)
 
     def _emit_obstacle_speech(self, stage: str, attempt: int, observation: dict) -> None:
+        if self.obstacle_speech is None or not bool(getattr(self.obstacle_speech, "announce", True)):
+            return
         titles = {
             "obstacle_detected": "发现障碍物",
             "recovery_attempt": "后退尝试避障",
@@ -524,7 +762,11 @@ class TaskExecutor:
                     "holding the task paused after zeroing motion"
                 )
 
+            # Drop any in-flight pre-leg spin so a late Nav2 success cannot
+            # cruise to a stale index after recovery redispatches.
+            self._clear_departure_heading(cancel_navigation=False)
             self._paused_for_localization = True
+            self._paused_localization_reason = "lost"
             self.context.state = "paused"
             self.context.state_version += 1
             self._persist()
@@ -537,17 +779,35 @@ class TaskExecutor:
     def on_localization_recovered(self) -> None:
         """Resume a safety-paused task after localization is stably normal."""
         with self._lock:
-            if (
-                not self.context
-                or self.context.state != "paused"
-                or not self._paused_for_localization
-            ):
+            self._cancel_absolute_localization_resume_watch()
+            if not self.context or self.context.state in self.TERMINAL_STATES:
                 return
             # Keep the pending target. Re-picking the nearest remaining point
             # on a round-trip treats the return copy (point 4 of 1-2-3-2-1) as
             # closer and skips the outbound legs.
             resume_index = max(0, self.context.current_waypoint_index)
+            pause_reason = self._paused_localization_reason
+            if self.context.state == "running":
+                # Automatic RTK recovery often cancels Nav2 after the task has
+                # already been marked running again. Re-dispatch the pending
+                # goal instead of leaving the dog standing with no Nav2 action.
+                if self._speech_waiting_index is not None:
+                    self._paused_for_localization = False
+                    self._paused_localization_reason = None
+                    return
+                self._paused_for_localization = False
+                self._paused_localization_reason = None
+                self._clear_departure_heading(cancel_navigation=True)
+                LOGGER.info(
+                    "localization recovered while the task is running; re-dispatching from waypoint %s",
+                    resume_index,
+                )
+                self._send_from(resume_index)
+                return
+            if self.context.state != "paused" or not self._paused_for_localization:
+                return
             self._paused_for_localization = False
+            self._paused_localization_reason = None
             self.context.state = "resuming"
             self.context.state_version += 1
             self._persist()
@@ -570,7 +830,34 @@ class TaskExecutor:
                     self._waypoint_localization_ready_index = None
                     self._continue_after_waypoint(reached_index)
                 return
+            # Absolute-correction pauses happen after Nav2 already accepted the
+            # waypoint. Re-cruising the same click only weaves in place; advance.
+            if pause_reason == "absolute_required":
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                LOGGER.info(
+                    "absolute localization pause cleared at waypoint %s; continuing to next leg",
+                    resume_index,
+                )
+                self._continue_after_waypoint(resume_index)
+                return
+            self._clear_departure_heading(cancel_navigation=True)
             self._send_from(resume_index)
+            # Pre-leg face-turn keeps state at "resuming" until cruise starts;
+            # mark running once a Nav2 goal (spin or cruise) is accepted.
+            if (
+                self.context.state == "resuming"
+                and (
+                    self._departure_heading_index is not None
+                    or self._dispatched_count > 0
+                )
+            ):
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
 
     def reconcile_center_state(self, execution_id: str, expected_state: str | None) -> bool:
         with self._lock:
@@ -616,6 +903,9 @@ class TaskExecutor:
                 route["execution_order"] = "reverse_from_route_end"
                 route["initial_map_point_number"] = route["waypoints"][0].get("map_point_number")
                 initial_waypoint_index = 0
+            self._strip_non_navigation_waypoint_actions(route)
+            if base_waypoints is not None:
+                self._strip_non_navigation_waypoint_actions({"waypoints": base_waypoints})
             self.context = TaskContext(
                 task_execution_id=envelope.payload["task_execution_id"],
                 state="accepted",
@@ -786,10 +1076,113 @@ class TaskExecutor:
             else:
                 self._send_from(self.context.current_waypoint_index)
 
+    def _localization_decision(self) -> dict:
+        getter = getattr(self.navigation, "localization_decision", None)
+        decision = getter() if callable(getter) else {}
+        if isinstance(decision, dict) and decision:
+            return decision
+        diagnostics = getattr(self.navigation, "localization_diagnostics", None)
+        payload = diagnostics() if callable(diagnostics) else {}
+        nested = (payload or {}).get("decision") if isinstance(payload, dict) else {}
+        return nested if isinstance(nested, dict) else {}
+
+    def _rtk_good_for_navigation(self) -> bool:
+        decision = self._localization_decision()
+        if decision.get("rtk_good_for_navigation") is True:
+            return True
+        return (
+            decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+            and decision.get("rtk_heading_usable") is True
+        )
+
+    def _rtk_position_good_for_navigation(self) -> bool:
+        decision = self._localization_decision()
+        if decision.get("rtk_position_good_for_navigation") is True:
+            return True
+        return (
+            decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+        )
+
+    def _startup_rtk_xy_needs_reanchor(self, decision: dict) -> bool:
+        """True when LIO map pose has drifted away from fixed RTK before Nav2 starts."""
+        try:
+            rtk_x = float(decision["rtk_x"])
+            rtk_y = float(decision["rtk_y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not isfinite(rtk_x) or not isfinite(rtk_y):
+            return False
+        pose_xy = self._current_pose_xy()
+        if pose_xy is None:
+            return False
+        return hypot(pose_xy[0] - rtk_x, pose_xy[1] - rtk_y) > WAYPOINT_CORRECTION_DRIFT_M
+
     def initialize_before_navigation(self) -> None:
         """Require a verified absolute pose before the first Nav2 goal."""
         if not self.context or self.context.state != "accepted":
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
+        decision = self._localization_decision()
+        if self._rtk_good_for_navigation() or (
+            self._rtk_position_good_for_navigation()
+            and str(decision.get("active_source") or "") == "lio_imu"
+            and bool(decision.get("absolute_stable"))
+        ):
+            if (
+                decision.get("active_source") == "rtk_imu"
+                and bool(decision.get("absolute_stable"))
+            ):
+                LOGGER.info("startup localization already on fixed RTK")
+                return
+            if (
+                decision.get("active_source") == "lio_imu"
+                and bool(decision.get("absolute_stable"))
+                and self._rtk_position_good_for_navigation()
+            ):
+                if self._startup_rtk_xy_needs_reanchor(decision):
+                    seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
+                    if callable(seed_rtk):
+                        pose_xy = self._current_pose_xy() or (0.0, 0.0)
+                        LOGGER.warning(
+                            "startup LIO↔RTK XY drift=%.2fm; re-anchoring from fixed RTK",
+                            hypot(
+                                float(decision["rtk_x"]) - pose_xy[0],
+                                float(decision["rtk_y"]) - pose_xy[1],
+                            ),
+                        )
+                        try:
+                            seed_rtk()
+                            return
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "startup RTK re-anchor failed (%s); continuing on current LIO pose",
+                                exc,
+                            )
+                LOGGER.info("startup localization on FAST-LIO with fixed RTK XY")
+                return
+            seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
+            if not callable(seed_rtk):
+                if self._rtk_position_good_for_navigation() and bool(
+                    decision.get("absolute_stable")
+                ):
+                    LOGGER.info("startup localization accepts stable outdoor pose without RTK seed API")
+                    return
+                raise ProtocolError(
+                    "INITIALIZATION_FAILED",
+                    "fixed RTK is available but GPS initialization is unavailable",
+                )
+            try:
+                LOGGER.info("startup localization using fixed RTK")
+                seed_rtk()
+                return
+            except ProtocolError:
+                raise
+            except Exception as exc:
+                raise ProtocolError(
+                    "INITIALIZATION_FAILED",
+                    f"fixed RTK was available but GPS pose was not accepted: {exc}",
+                ) from exc
         diagnostics = getattr(self.navigation, "localization_diagnostics", lambda: {})()
         quality = (diagnostics or {}).get("quality") or {}
         if (diagnostics or {}).get("localization_status") == "normal" and quality.get("absolute_stable", True):
@@ -800,19 +1193,34 @@ class TaskExecutor:
         relocalize = getattr(self.navigation, "active_relocalize", None)
         seen = set()
         if callable(relocalize):
+            map_info = dict(self.context.route_snapshot.get("map") or {})
+            latest_getter = getattr(self.navigation, "latest_pose", None)
+            latest = latest_getter() if callable(latest_getter) else None
             trusted_pose_getter = getattr(self.navigation, "latest_trusted_pose", None)
-            trusted_pose = trusted_pose_getter() if callable(trusted_pose_getter) else None
-            if not trusted_pose:
-                map_info = dict(self.context.route_snapshot.get("map") or {})
-                trusted_pose = self.store.load_last_trusted_pose(
-                    str(map_info.get("map_id") or ""),
-                    str(map_info.get("map_version") or ""),
-                )
-            if trusted_pose:
-                trusted_seed = dict(trusted_pose)
+            memory_trusted = trusted_pose_getter() if callable(trusted_pose_getter) else None
+            disk_trusted = self.store.load_last_trusted_pose(
+                str(map_info.get("map_id") or ""),
+                str(map_info.get("map_version") or ""),
+            )
+            waypoint = points[index] if index < len(points) else None
+            max_drift = float(
+                getattr(getattr(self, "safety_config", None), "localization_trusted_seed_max_drift_m", 15.0)
+            )
+            startup_seed = select_recovery_seed(
+                latest_pose=latest,
+                memory_trusted=memory_trusted,
+                disk_trusted=disk_trusted,
+                waypoint=waypoint,
+                max_drift_m=max_drift,
+            )
+            if startup_seed:
+                trusted_seed = dict(startup_seed)
                 trusted_seed.update({"max_attempts": 12, "source": "startup_trusted"})
                 try:
-                    LOGGER.info("startup localization using last trusted pose")
+                    LOGGER.info(
+                        "startup localization using %s seed",
+                        startup_seed.get("source"),
+                    )
                     relocalize(trusted_seed)
                     return
                 except Exception as exc:
@@ -853,11 +1261,214 @@ class TaskExecutor:
         self.context.current_segment_index = segment_index
         self._dispatch_navigation(goal_start_index)
 
+    def _clear_departure_heading(self, *, cancel_navigation: bool = False) -> None:
+        """Drop an in-flight pre-leg spin so a later redispatch owns Nav2."""
+        self._cancel_departure_heading_timeout()
+        had_departure = (
+            self._departure_heading_index is not None
+            or self._departure_cruise_index is not None
+        )
+        self._departure_heading_index = None
+        self._departure_cruise_index = None
+        self._departure_heading_completed_index = None
+        if not had_departure:
+            return
+        LOGGER.info("cleared in-flight departure heading before re-dispatch")
+        if cancel_navigation:
+            cancel = getattr(self.navigation, "cancel_navigation", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    LOGGER.warning(
+                        "failed to cancel navigation while clearing departure heading",
+                        exc_info=True,
+                    )
+        self._restore_navigation_profile()
+
+    def _cancel_departure_heading_timeout(self) -> None:
+        timer = self._departure_heading_timer
+        self._departure_heading_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _arm_departure_heading_timeout(self) -> None:
+        self._cancel_departure_heading_timeout()
+        timer = threading.Timer(
+            DEPARTURE_HEADING_TIMEOUT_SECONDS,
+            self._on_departure_heading_timeout,
+        )
+        timer.daemon = True
+        self._departure_heading_timer = timer
+        timer.start()
+
+    def _on_departure_heading_timeout(self) -> None:
+        with self._lock:
+            if not self.context or self.context.state != "running":
+                return
+            if (
+                self._departure_heading_index is None
+                and self._departure_cruise_index is None
+            ):
+                return
+            cruise_index = self._departure_cruise_index
+            reached_index = self._departure_heading_index
+            LOGGER.warning(
+                "departure heading timed out after %.1fs; continuing without in-place align "
+                "(reached=%s cruise=%s)",
+                DEPARTURE_HEADING_TIMEOUT_SECONDS,
+                reached_index,
+                cruise_index,
+            )
+            self._clear_departure_heading(cancel_navigation=True)
+            if cruise_index is not None:
+                self._dispatch_navigation(cruise_index)
+                return
+            if reached_index is not None:
+                self._departure_heading_completed_index = reached_index
+                # Re-enter the post-arrival path without another spin.
+                self._continue_after_waypoint(reached_index)
+
+    def _should_skip_departure_heading(self) -> bool:
+        """Outdoor in-place yaw goals weave; skip and let cruise align on the move."""
+        return self._outdoor_navigation_profile()
+
+    def _reverse_start_colocation_m(self) -> float:
+        if self._outdoor_navigation_profile():
+            return REVERSE_START_COLOCATION_M
+        return WAYPOINT_COLOCATION_M
+
+    def _advance_past_colocated_waypoints(self, index: int) -> int:
+        """Skip poses the robot already occupies before dispatching a cruise.
+
+        Reverse loop starts at the route end. Cruising back to that same click
+        produces a long in-place spin and local weaving. Only apply this for
+        reverse execution orders so a normal outbound start that begins on
+        waypoint 1 still dispatches the full route.
+        """
+        if not self.context or self._is_docking_task():
+            return index
+        order = str(self.context.route_snapshot.get("execution_order") or "")
+        if order not in {"reverse_from_route_end", "reverse"}:
+            return index
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        pose_xy = self._current_pose_xy()
+        if pose_xy is None or index < 0 or index >= len(waypoints):
+            return index
+        colocation_m = self._reverse_start_colocation_m()
+        advanced = index
+        while advanced < len(waypoints) - 1:
+            xy = _waypoint_xy(waypoints[advanced])
+            if xy is None:
+                break
+            if hypot(pose_xy[0] - xy[0], pose_xy[1] - xy[1]) > colocation_m:
+                break
+            LOGGER.info(
+                "skipping colocated waypoint %d before dispatch (within %.2fm)",
+                advanced,
+                colocation_m,
+            )
+            progress = self._build_progress_locked(
+                advanced,
+                "waypoint_reached",
+                advanced + 1,
+                None,
+            )
+            self.event_callback("task.progress", progress, "")
+            self._last_reached_index = max(self._last_reached_index, advanced)
+            self._last_target_index = max(self._last_target_index, advanced)
+            advanced += 1
+        if advanced != index:
+            self.context.current_waypoint_index = advanced
+            self.context.state_version += 1
+            self._persist()
+        return advanced
+
     def _send_from(self, index: int) -> None:
+        # Face the travel direction before every cruise leg. Restart, obstacle
+        # redispatch, and localization recovery all enter here and previously
+        # skipped the post-arrival departure turn.
+        index = self._advance_past_colocated_waypoints(index)
+        if self._maybe_face_travel_direction(index):
+            return
         self._dispatch_navigation(index)
 
+    def _heading_error_rad(self, desired_yaw: float, current_yaw: float) -> float:
+        return atan2(sin(desired_yaw - current_yaw), cos(desired_yaw - current_yaw))
+
+    def _maybe_face_travel_direction(self, target_index: int) -> bool:
+        """Rotate in place toward the travel leg when the heading error is large."""
+        if not self.context or self._is_docking_task():
+            return False
+        if self._should_skip_departure_heading():
+            return False
+        if self._departure_heading_index is not None or self._departure_cruise_index is not None:
+            return False
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if target_index < 0 or target_index >= len(waypoints):
+            return False
+        pose = self.navigation.latest_pose() if self.navigation else None
+        if pose is None:
+            return False
+        try:
+            x = float(pose.x)
+            y = float(pose.y)
+            yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
+            target_x = float(waypoints[target_index]["x"])
+            target_y = float(waypoints[target_index]["y"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        dx, dy = target_x - x, target_y - y
+        if hypot(dx, dy) < 0.3:
+            return False
+        desired = atan2(dy, dx)
+        error = self._heading_error_rad(desired, yaw)
+        if abs(error) <= DEPARTURE_HEADING_ALIGN_RAD:
+            return False
+        current = waypoints[max(0, target_index - 1)] if target_index > 0 else waypoints[target_index]
+        goal = {
+            "x": x,
+            "y": y,
+            "yaw": desired,
+            "require_yaw": True,
+            "waypoint_id": current.get("waypoint_id"),
+            "map_point_number": current.get("map_point_number"),
+        }
+        setter = getattr(self.navigation, "set_waypoint_profile", None)
+        if callable(setter):
+            setter(
+                avoid_obstacles=bool(current.get("avoidance_to_next", True)),
+                require_yaw=True,
+                final_approach=True,
+                outdoor=self._outdoor_navigation_profile(),
+                local_controller=str(current.get("local_controller") or "mppi"),
+            )
+        self._departure_heading_index = max(0, target_index - 1)
+        self._departure_cruise_index = target_index
+        self._goal_offset, self._dispatched_count = self._departure_heading_index, 1
+        accepted = self.navigation.send_waypoints([goal], self.on_feedback, self.on_navigation_result)
+        if not accepted:
+            self._departure_heading_index = None
+            self._departure_cruise_index = None
+            self._restore_navigation_profile()
+            return False
+        self._arm_departure_heading_timeout()
+        self.on_feedback(0, milestone="departure_heading_dispatched")
+        LOGGER.info(
+            "pre-leg departure heading toward waypoint %d yaw=%.3f (error=%.1fdeg)",
+            target_index,
+            desired,
+            abs(error) * 180.0 / pi,
+        )
+        return True
+
     def _batch_end_index(self, start_index: int) -> int:
-        """Last exclusive index of one Nav2 goal. Patrol vias share a goal; stops split it."""
+        """Last exclusive index of one Nav2 goal.
+
+        Patrol always stops at every waypoint so Edge can settle localization,
+        heading, and other health before the next leg. Docking remains one pose
+        at a time as well.
+        """
         waypoints = self.context.route_snapshot["waypoints"]
         total = len(waypoints)
         if self._is_docking_task():
@@ -865,37 +1476,7 @@ class TaskExecutor:
         end = total
         if self._segments:
             end = min(self._segments[self.context.current_segment_index].end_index, total)
-        start_wp = waypoints[start_index]
-        start_correction_mode = waypoint_localization_mode(start_wp.get("localization_mode"))
-        if (
-            bool(start_wp.get("require_yaw", False))
-            or float(start_wp.get("dwell_seconds") or 0) > 0
-            or bool(start_wp.get("speech_template_id"))
-        ):
-            return start_index + 1
-        for index in range(start_index + 1, end):
-            # A correction mode belongs to the target waypoint. End the Nav2
-            # goal before a mode boundary so the current waypoint can be
-            # confirmed with its requested source before dispatching the next.
-            if waypoint_localization_mode(
-                waypoints[index].get("localization_mode")
-            ) != start_correction_mode:
-                return index
-            waypoint = waypoints[index]
-            # A heading-constrained waypoint must be the final pose of its
-            # own goal.  The goal-yaw profile is selected from the batch
-            # target, so keeping it behind a pass-through waypoint would make
-            # Nav2 accept the position while ignoring the requested turn.
-            if bool(waypoint.get("require_yaw", False)):
-                return index
-            if index == end - 1:
-                break
-            if (
-                float(waypoint.get("dwell_seconds") or 0) > 0
-                or bool(waypoint.get("speech_template_id"))
-            ):
-                return index + 1
-        return self._through_poses_end_index(waypoints, start_index, end)
+        return min(start_index + 1, end)
 
     def _current_pose_xy(self) -> tuple[float, float] | None:
         pose = self.navigation.latest_pose() if self.navigation else None
@@ -909,6 +1490,13 @@ class TaskExecutor:
         if not isfinite(x) or not isfinite(y):
             return None
         return x, y
+
+    def _distance_to_waypoint(self, waypoint: dict | None) -> float | None:
+        xy = _waypoint_xy(waypoint or {})
+        pose_xy = self._current_pose_xy()
+        if xy is None or pose_xy is None:
+            return None
+        return hypot(pose_xy[0] - xy[0], pose_xy[1] - xy[1])
 
     def _through_poses_end_index(self, waypoints: list, start_index: int, end: int) -> int:
         """Keep a through-poses goal from ending at the robot's current cluster.
@@ -946,13 +1534,24 @@ class TaskExecutor:
 
     def _apply_batch_travel_yaw(self, batch: list[dict], start_index: int) -> None:
         """Point pass-through poses along the Nav2 goal, not the cloud click yaw."""
+        route = self.context.route_snapshot["waypoints"]
         for item_index, waypoint in enumerate(batch):
             stop = item_index + 1 == len(batch)
+            route_index = start_index + item_index
             if stop and bool(waypoint.get("require_yaw", False)):
                 waypoint["yaw"] = float(waypoint.get("yaw") or 0.0)
                 continue
             if not stop:
                 nxt = batch[item_index + 1]
+                dx = float(nxt["x"]) - float(waypoint["x"])
+                dy = float(nxt["y"]) - float(waypoint["y"])
+                if hypot(dx, dy) >= 1e-3:
+                    waypoint["yaw"] = atan2(dy, dx)
+                    continue
+            # Last pose in this Nav2 batch but not the route terminus: face the
+            # next leg (outgoing), not the incoming segment from the previous click.
+            if stop and route_index + 1 < len(route):
+                nxt = route[route_index + 1]
                 dx = float(nxt["x"]) - float(waypoint["x"])
                 dy = float(nxt["y"]) - float(waypoint["y"])
                 if hypot(dx, dy) >= 1e-3:
@@ -966,7 +1565,7 @@ class TaskExecutor:
                     waypoint["yaw"] = atan2(dy, dx)
                     continue
             waypoint["yaw"] = self._dispatch_yaw(
-                start_index + item_index, waypoint, stop=stop
+                route_index, waypoint, stop=stop
             )
 
     def _dispatch_yaw(self, index: int, waypoint: dict, *, stop: bool) -> float:
@@ -1015,24 +1614,32 @@ class TaskExecutor:
                     max_shift,
                 )
         single = len(batch) == 1
-        # A one-pose batch is a real stop even when it is not the route's
-        # overall last point (speech, dwell and localization boundaries split
-        # patrols this way).  Cruise speed has a larger turning radius than
-        # the 0.35 m goal window and can make the dog orbit such a waypoint.
-        initial_final_approach = single and not self._is_docking_task()
+        # Speech/dwell splits create a one-pose batch, but that travel leg is
+        # still a cruise. Use the slow DiffDrive profile only for a yaw stop
+        # or when the robot is already inside the last metre.
+        require_yaw_stop = single and bool(waypoints[last_index].get("require_yaw", False))
+        remaining = self._distance_to_waypoint(waypoints[last_index])
+        already_close = remaining is not None and remaining <= PATROL_FINAL_APPROACH_M
+        initial_final_approach = (
+            (not self._is_docking_task()) and (require_yaw_stop or already_close)
+        )
         self._patrol_final_approach_applied = initial_final_approach
+        self._bypass_active = False
         self._apply_navigation_profile(
             index,
-            force_final=initial_final_approach,
-            force_require_yaw=single and bool(waypoints[last_index].get("require_yaw", False)),
+            force_final=(
+                initial_final_approach if not self._is_docking_task() else None
+            ),
+            force_require_yaw=require_yaw_stop,
         )
         self._set_localization_policy(batch[0], "moving")
         self._goal_offset = index
         self._dispatched_count = len(batch)
         accepted = self.navigation.send_waypoints(batch, self.on_feedback, self.on_navigation_result)
         if not accepted:
-            self._fail("NAV_STACK_NOT_READY", "FollowWaypoints goal was rejected")
+            self._schedule_nav_dispatch_retry(index)
             return
+        self._clear_nav_dispatch_retry()
         self.context.current_waypoint_index = index
         self.context.state = "running"
         self.context.state_version += 1
@@ -1089,31 +1696,228 @@ class TaskExecutor:
         setter(mode, phase)
         self._last_localization_policy = policy
 
-    def _absolute_localization_ready(self, timeout_seconds: float = 5.0) -> bool:
+    def _needs_stationary_correction(self, decision: dict) -> bool:
+        """True when a stopped robot still has correctable absolute drift."""
+        if bool(decision.get("correction_smoothing_active")):
+            return True
+        if bool(decision.get("lio_motion_anomaly")):
+            return False
+        rtk_can_correct = (
+            decision.get("rtk_position_good_for_navigation") is True
+            or str(decision.get("rtk_quality") or "").lower() == "fixed"
+        )
+        rtk_drift = decision.get("rtk_drift") if isinstance(decision.get("rtk_drift"), dict) else {}
+        try:
+            rtk_xy = float(rtk_drift.get("xy_m")) if rtk_drift.get("xy_m") is not None else None
+        except (TypeError, ValueError):
+            rtk_xy = None
+        try:
+            rtk_thr = float(rtk_drift.get("threshold_xy_m") or WAYPOINT_CORRECTION_DRIFT_M)
+        except (TypeError, ValueError):
+            rtk_thr = WAYPOINT_CORRECTION_DRIFT_M
+        if rtk_can_correct and rtk_xy is not None and rtk_xy > rtk_thr:
+            return True
+        rtk_decision = str(decision.get("rtk_drift_decision") or rtk_drift.get("decision") or "")
+        # Only wait on true pending gates. Accept/corrected names mean the
+        # localization node already chose a correction; either smoothing is
+        # active (handled above) or residual XY is already within the gate.
+        rtk_pending = rtk_decision in {
+            "stable_pending",
+            "rtk_stable_pending",
+            "awaiting_rtk_self_stable",
+        }
+        if (
+            rtk_can_correct
+            and rtk_pending
+            and (rtk_xy is None or rtk_xy > rtk_thr)
+        ):
+            return True
+        if self._outdoor_navigation_profile():
+            return False
+        ndt_drift = decision.get("ndt_drift") if isinstance(decision.get("ndt_drift"), dict) else {}
+        try:
+            ndt_xy = float(ndt_drift.get("xy_m")) if ndt_drift.get("xy_m") is not None else None
+        except (TypeError, ValueError):
+            ndt_xy = None
+        try:
+            ndt_thr = float(ndt_drift.get("threshold_xy_m") or WAYPOINT_CORRECTION_DRIFT_M)
+        except (TypeError, ValueError):
+            ndt_thr = WAYPOINT_CORRECTION_DRIFT_M
+        if ndt_xy is not None and ndt_xy > ndt_thr and bool(decision.get("ndt_healthy")):
+            return True
+        ndt_decision = str(decision.get("ndt_drift_decision") or ndt_drift.get("decision") or "")
+        if ndt_decision in {"stable_pending"} and (
+            ndt_xy is None or ndt_xy > ndt_thr
+        ):
+            return True
+        return False
+
+    def _outdoor_settle_can_continue(self, decision: dict) -> bool:
+        """Outdoor arrival may proceed without pausing for absolute correction.
+
+        Field issue: settle timeout previously paused with
+        ABSOLUTE_LOCALIZATION_REQUIRED even when fixed RTK + LIO were already
+        usable. That pause does not self-heal, so the dog stands forever.
+        """
+        if bool(decision.get("lio_motion_anomaly")):
+            return False
+        if bool(decision.get("correction_smoothing_active")):
+            return False
+        source = str(decision.get("active_source") or "")
+        if source == "rtk_imu" and bool(decision.get("absolute_stable")):
+            return True
+        if source != "lio_imu":
+            return False
+        rtk_ok = (
+            decision.get("rtk_position_good_for_navigation") is True
+            or str(decision.get("rtk_quality") or "").lower() == "fixed"
+            or self._rtk_position_good_for_navigation()
+        )
+        if rtk_ok:
+            return True
+        # No usable RTK: only continue when nothing is still asking for a pull-in.
+        return not self._needs_stationary_correction(decision)
+
+    def _cancel_absolute_localization_resume_watch(self) -> None:
+        stop = self._absolute_pause_watch_stop
+        self._absolute_pause_watch_stop = None
+        self._absolute_pause_watch_thread = None
+        if stop is not None:
+            stop.set()
+
+    def _arm_absolute_localization_resume_watch(self) -> None:
+        """Auto-resume ABSOLUTE_LOCALIZATION_REQUIRED once RTK/LIO is usable again."""
+        self._cancel_absolute_localization_resume_watch()
+        stop = threading.Event()
+        self._absolute_pause_watch_stop = stop
+
+        def _loop() -> None:
+            deadline = time.monotonic() + ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS
+            while not stop.wait(0.5):
+                if time.monotonic() > deadline:
+                    LOGGER.warning(
+                        "absolute localization resume watch timed out after %.0fs",
+                        ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS,
+                    )
+                    return
+                with self._lock:
+                    if (
+                        not self.context
+                        or self.context.state != "paused"
+                        or not self._paused_for_localization
+                    ):
+                        return
+                    decision = self._localization_decision()
+                    outdoor = self._outdoor_navigation_profile()
+                    if outdoor:
+                        ready = self._outdoor_settle_can_continue(decision)
+                    else:
+                        ready = (
+                            not bool(decision.get("lio_motion_anomaly"))
+                            and not bool(decision.get("correction_smoothing_active"))
+                            and bool(decision.get("absolute_stable"))
+                            and str(decision.get("active_source") or "")
+                            in {"lio_imu", "rtk_imu", "ndt_imu"}
+                        )
+                if not ready:
+                    continue
+                LOGGER.info(
+                    "absolute localization pause cleared (source=%s rtk=%s); resuming task",
+                    decision.get("active_source"),
+                    decision.get("rtk_quality"),
+                )
+                self.on_localization_recovered()
+                return
+
+        thread = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name="absolute-loc-resume-watch",
+        )
+        self._absolute_pause_watch_thread = thread
+        thread.start()
+
+    def _absolute_localization_ready(self, timeout_seconds: float | None = None) -> bool:
         getter = getattr(self.navigation, "localization_decision", None)
         if not callable(getter):
             return True
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        outdoor = self._outdoor_navigation_profile()
+        if timeout_seconds is None:
+            timeout_seconds = WAYPOINT_SETTLE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         while time.monotonic() <= deadline:
             decision = getter() or {}
-            source = str(decision.get("active_source") or "")
-            policy_source_ready = decision.get("policy_source_ready")
+            if bool(decision.get("lio_motion_anomaly")):
+                LOGGER.warning(
+                    "waypoint settle blocked by LIO motion anomaly reason=%s",
+                    decision.get("lio_motion_anomaly_reason") or "unknown",
+                )
+                return False
             correction_active = bool(decision.get("correction_smoothing_active", False))
-            if correction_active:
+            needs_correction = self._needs_stationary_correction(decision)
+            if correction_active or needs_correction:
                 # Keep the controller at the safety boundary while the
                 # localization node is moving map->lio_odom.  A single stop
                 # command can be overwritten by an active Nav2 controller.
                 stop_motion = getattr(self.navigation, "stop_motion", None)
                 if callable(stop_motion):
                     stop_motion()
+                time.sleep(0.1)
+                continue
+            source = str(decision.get("active_source") or "")
+            policy_source_ready = decision.get("policy_source_ready")
+            if outdoor:
+                # Outdoor LIO-primary patrol: after any pending RTK XY pull-in,
+                # accept a healthy FAST-LIO pose without dual-antenna heading.
+                if source == "lio_imu":
+                    return True
+                if source == "rtk_imu" and bool(decision.get("absolute_stable")):
+                    return True
+                time.sleep(0.1)
+                continue
+            if (
+                self._rtk_good_for_navigation()
+                and source == "rtk_imu"
+                and bool(decision.get("absolute_stable"))
+            ):
+                return True
             if (
                 source in {"ndt_imu", "rtk_imu", "lio_imu"}
                 and bool(decision.get("absolute_stable"))
                 and (policy_source_ready is None or policy_source_ready is True)
-                and not correction_active
             ):
                 return True
             time.sleep(0.1)
+        decision = getter() or {}
+        if bool(decision.get("lio_motion_anomaly")):
+            return False
+        if outdoor:
+            if self._outdoor_settle_can_continue(decision):
+                if self._needs_stationary_correction(decision):
+                    LOGGER.warning(
+                        "outdoor waypoint settle timed out with residual absolute drift; "
+                        "continuing on FAST-LIO because fixed RTK/LIO remains usable "
+                        "(decision=%s xy=%s)",
+                        decision.get("rtk_drift_decision"),
+                        (decision.get("rtk_drift") or {}).get("xy_m")
+                        if isinstance(decision.get("rtk_drift"), dict)
+                        else None,
+                    )
+                else:
+                    LOGGER.warning(
+                        "outdoor waypoint arrival timed out waiting for a settled pose; "
+                        "continuing on FAST-LIO without further absolute correction"
+                    )
+                return True
+            LOGGER.warning(
+                "outdoor waypoint settle timed out without a usable absolute pose; "
+                "pausing so localization can recover before the next leg "
+                "(source=%s rtk=%s smoothing=%s)",
+                decision.get("active_source"),
+                decision.get("rtk_quality"),
+                decision.get("correction_smoothing_active"),
+            )
+            return False
         return False
 
     def _prepare_robot_for_navigation(self) -> bool:
@@ -1137,7 +1941,10 @@ class TaskExecutor:
     def pause_task(self, execution_id: str) -> dict:
         with self._lock:
             self._paused_for_localization = False
+            self._paused_localization_reason = None
+            self._cancel_absolute_localization_resume_watch()
             self._assert_execution(execution_id)
+            self._clear_nav_dispatch_retry()
             self._stop_obstacle_monitor()
             if self.context.state == "paused":
                 return {"final_task_state": "paused", "state_version": self.context.state_version, "robot_stopped": True}
@@ -1193,6 +2000,8 @@ class TaskExecutor:
     def resume_task(self, execution_id: str, resume_index: int) -> dict:
         with self._lock:
             self._paused_for_localization = False
+            self._paused_localization_reason = None
+            self._cancel_absolute_localization_resume_watch()
             self._assert_execution(execution_id)
             if self.context.state == "running":
                 return {"final_task_state": "running", "state_version": self.context.state_version, "resume_from_waypoint_index": self.context.current_waypoint_index}
@@ -1262,6 +2071,7 @@ class TaskExecutor:
     def cancel_task(self, execution_id: str) -> dict:
         with self._lock:
             self._assert_execution(execution_id)
+            self._clear_nav_dispatch_retry()
             self._stop_obstacle_monitor()
             if self.context.state in self.TERMINAL_STATES:
                 # A task can finish between the low-battery active-state check
@@ -1332,8 +2142,14 @@ class TaskExecutor:
                 and not self._patrol_final_approach_applied
                 and milestone != "waypoint_reached"
             ):
-                self._patrol_final_approach_applied = True
-                apply_final = True
+                remaining = distance_remaining_m
+                if remaining is None:
+                    remaining = self._distance_to_waypoint(
+                        self.context.route_snapshot["waypoints"][dispatched_final_index]
+                    )
+                if remaining is not None and remaining <= PATROL_FINAL_APPROACH_M:
+                    self._patrol_final_approach_applied = True
+                    apply_final = True
             if milestone == "target_dispatched":
                 if current_waypoint_index > self._last_target_index:
                     progress_updates.append(
@@ -1488,6 +2304,15 @@ class TaskExecutor:
             if not self.context or self.context.state in self.TERMINAL_STATES | {"pausing", "cancelling", "paused"}:
                 return
             if status == "succeeded":
+                if self._bypass_active:
+                    self._bypass_active = False
+                    resume_index = self.context.current_waypoint_index
+                    LOGGER.info(
+                        "obstacle bypass via reached; resuming waypoint %s",
+                        resume_index,
+                    )
+                    self._send_from(resume_index)
+                    return
                 self._stop_obstacle_monitor()
                 missed = list((details or {}).get("missed_waypoints") or [])
                 if missed:
@@ -1500,7 +2325,17 @@ class TaskExecutor:
                 departure_heading_completed = self._departure_heading_index is not None
                 if departure_heading_completed:
                     reached_index = self._departure_heading_index
+                    cruise_index = self._departure_cruise_index
+                    self._cancel_departure_heading_timeout()
                     self._departure_heading_index = None
+                    self._departure_cruise_index = None
+                    if cruise_index is not None:
+                        LOGGER.info(
+                            "pre-leg departure heading complete; cruising to waypoint %d",
+                            cruise_index,
+                        )
+                        self._dispatch_navigation(cruise_index)
+                        return
                     self._departure_heading_completed_index = reached_index
                 else:
                     reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
@@ -1525,8 +2360,12 @@ class TaskExecutor:
                 if not departure_heading_completed and self._dispatch_departure_heading(reached_index):
                     return
                 self._set_localization_policy(reached_waypoint, "stationary")
-                speech_required = bool(reached_waypoint.get("speech_template_id"))
-                if speech_required:
+                speech_configured = (
+                    self._waypoint_speech_enabled()
+                    and bool(reached_waypoint.get("speech_template_id"))
+                )
+                speech_blocks = speech_configured and self._waypoint_speech_blocks_navigation()
+                if speech_blocks:
                     self._clear_waypoint_speech_status(reached_index)
                     # Speech and localization settling run independently; the
                     # next waypoint is gated on both completion conditions.
@@ -1536,6 +2375,7 @@ class TaskExecutor:
                     self.navigation.stop_motion()
                     self._restore_navigation_profile()
                     self._paused_for_localization = True
+                    self._paused_localization_reason = "absolute_required"
                     self.context.state = "paused"
                     self.context.current_waypoint_index = reached_index
                     self.context.state_version += 1
@@ -1545,6 +2385,7 @@ class TaskExecutor:
                         code="ABSOLUTE_LOCALIZATION_REQUIRED",
                         message="waypoint reached by FAST-LIO; waiting for the requested correction source",
                     )
+                    self._arm_absolute_localization_resume_watch()
                     return
                 self._waypoint_localization_ready_index = reached_index
                 self.on_feedback(
@@ -1553,7 +2394,7 @@ class TaskExecutor:
                     milestone="waypoint_reached",
                     completed_waypoints=reached_index + 1,
                 )
-                if speech_required:
+                if speech_blocks:
                     if self._speech_wait_finished:
                         self._speech_waiting_index = None
                         self._speech_wait_finished = False
@@ -1563,6 +2404,22 @@ class TaskExecutor:
                 self._waypoint_localization_ready_index = None
                 self._continue_after_waypoint(reached_index)
             elif status == "cancelled":
+                if self._expected_recovery_cancels > 0:
+                    self._expected_recovery_cancels -= 1
+                    LOGGER.info("ignoring Nav2 cancel from obstacle recovery")
+                    return
+                if self._obstacle_recovery_active or self._bypass_active:
+                    LOGGER.info("ignoring Nav2 cancel while obstacle recovery is in progress")
+                    return
+                if self.context.state == "running":
+                    # FollowPath/BT recovery can cancel a child goal. Keep the
+                    # task alive and put a goal back on the current waypoint.
+                    LOGGER.warning(
+                        "Nav2 cancelled while the task is running; re-dispatching waypoint %s",
+                        self.context.current_waypoint_index,
+                    )
+                    self._send_from(self.context.current_waypoint_index)
+                    return
                 self._stop_obstacle_monitor()
                 self._stop_task_rosbag()
                 self._restore_navigation_profile()
@@ -1580,19 +2437,51 @@ class TaskExecutor:
             return False
         if self._is_docking_task():
             return False
+        if self._should_skip_departure_heading():
+            LOGGER.info(
+                "skipping outdoor departure heading at waypoint %d; cruising will align on the move",
+                reached_index,
+            )
+            return False
         waypoints = self.context.route_snapshot.get("waypoints") or []
         next_index = reached_index + 1
         if next_index >= len(waypoints):
             return False
         current, target = waypoints[reached_index], waypoints[next_index]
-        dx, dy = float(target["x"]) - float(current["x"]), float(target["y"]) - float(current["y"])
+        pose = self.navigation.latest_pose() if self.navigation else None
+        if pose is not None:
+            try:
+                x = float(pose.x)
+                y = float(pose.y)
+                target_x = float(target["x"])
+                target_y = float(target["y"])
+            except (AttributeError, KeyError, TypeError, ValueError):
+                x = y = target_x = target_y = None
+        else:
+            x = y = target_x = target_y = None
+        if x is not None and y is not None and target_x is not None and target_y is not None:
+            dx, dy = target_x - x, target_y - y
+            if hypot(dx, dy) < 1e-3:
+                dx = float(target["x"]) - float(current["x"])
+                dy = float(target["y"]) - float(current["y"])
+        else:
+            dx = float(target["x"]) - float(current["x"])
+            dy = float(target["y"]) - float(current["y"])
         if hypot(dx, dy) < 1e-3:
             return False
-        pose = self.navigation.latest_pose() if self.navigation else None
+        desired = atan2(dy, dx)
+        if pose is not None:
+            try:
+                yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
+            except (AttributeError, TypeError, ValueError):
+                yaw = None
+            else:
+                if abs(self._heading_error_rad(desired, yaw)) <= DEPARTURE_HEADING_ALIGN_RAD:
+                    return False
         goal = {
-            "x": float(getattr(pose, "x", current["x"])),
-            "y": float(getattr(pose, "y", current["y"])),
-            "yaw": atan2(dy, dx),
+            "x": float(getattr(pose, "x", current["x"]) if pose is not None else current["x"]),
+            "y": float(getattr(pose, "y", current["y"]) if pose is not None else current["y"]),
+            "yaw": desired,
             "require_yaw": True,
             "waypoint_id": current.get("waypoint_id"),
             "map_point_number": current.get("map_point_number"),
@@ -1604,14 +2493,17 @@ class TaskExecutor:
                 require_yaw=True,
                 final_approach=True,
                 outdoor=self._outdoor_navigation_profile(),
+                local_controller=str(current.get("local_controller") or "mppi"),
             )
         self._departure_heading_index = reached_index
+        self._departure_cruise_index = None
         self._goal_offset, self._dispatched_count = reached_index, 1
         accepted = self.navigation.send_waypoints([goal], self.on_feedback, self.on_navigation_result)
         if not accepted:
             self._departure_heading_index = None
             self._restore_navigation_profile()
             return False
+        self._arm_departure_heading_timeout()
         self.on_feedback(0, milestone="departure_heading_dispatched")
         LOGGER.info("departure heading dispatched at waypoint %d toward %d yaw=%.3f", reached_index, next_index, goal["yaw"])
         return True
@@ -1711,6 +2603,32 @@ class TaskExecutor:
                 "",
             )
 
+    def _waypoint_speech_enabled(self) -> bool:
+        speech = self.waypoint_speech
+        if speech is None:
+            return False
+        return bool(getattr(speech, "enabled", False))
+
+    def _waypoint_speech_blocks_navigation(self) -> bool:
+        return self._waypoint_speech_enabled() and bool(
+            getattr(self.waypoint_speech, "block_navigation", False)
+        )
+
+    def _strip_non_navigation_waypoint_actions(self, route: dict) -> None:
+        """Drop speech/alert waypoint extras so navigation ignores them."""
+        if self._waypoint_speech_enabled():
+            return
+        stripped = 0
+        for waypoint in route.get("waypoints") or []:
+            if waypoint.pop("speech_template_id", None) is not None:
+                stripped += 1
+            waypoint.pop("speech_template_name", None)
+        if stripped:
+            LOGGER.info(
+                "waypoint speech disabled; stripped speech templates from %d waypoints",
+                stripped,
+            )
+
     def _waypoint_speech_status_path(self, waypoint_index: int) -> Path | None:
         if not self.context or not self.waypoint_speech:
             return None
@@ -1745,11 +2663,58 @@ class TaskExecutor:
         )
         self._speech_wait_thread.start()
 
+    def _complete_waypoint_speech_wait(
+        self,
+        execution_id: str,
+        waypoint_index: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Finish a speech wait without failing the task.
+
+        Playback/alert outcomes are treated as successful for navigation so a
+        stuck speaker or missing status file cannot abort the route.
+        """
+        if not self.context or self.context.task_execution_id != execution_id:
+            return
+        if self.context.state == "paused":
+            self._speech_wait_finished = True
+            LOGGER.warning(
+                "waypoint %d speech %s while paused; continuing after resume",
+                waypoint_index,
+                reason,
+            )
+            return
+        if self.context.state != "running":
+            return
+        self._speech_wait_finished = True
+        if self._waypoint_localization_ready_index != waypoint_index:
+            LOGGER.warning(
+                "waypoint %d speech %s before localization settled; will continue after ready",
+                waypoint_index,
+                reason,
+            )
+            return
+        self._speech_waiting_index = None
+        self._speech_wait_finished = False
+        self._waypoint_localization_ready_index = None
+        if reason != "finished":
+            LOGGER.warning(
+                "waypoint %d speech %s; treating as success and continuing navigation",
+                waypoint_index,
+                reason,
+            )
+        self._continue_after_waypoint(waypoint_index)
+
     def _wait_for_waypoint_speech(self, execution_id: str, waypoint_index: int) -> None:
         path = self._waypoint_speech_status_path(waypoint_index)
         if not path:
             with self._lock:
-                self._fail("WAYPOINT_SPEECH_UNAVAILABLE", "waypoint speech status channel is not configured")
+                self._complete_waypoint_speech_wait(
+                    execution_id,
+                    waypoint_index,
+                    reason="unavailable",
+                )
             return
         deadline = time.monotonic() + float(self.waypoint_speech.timeout_seconds)
         while time.monotonic() < deadline:
@@ -1767,38 +2732,27 @@ class TaskExecutor:
             state = str(status.get("status") or "")
             if state == "finished":
                 with self._lock:
-                    if not self.context or self.context.task_execution_id != execution_id:
-                        return
-                    if self.context.state == "paused":
-                        self._speech_wait_finished = True
-                        return
-                    if self.context.state != "running":
-                        return
-                    self._speech_wait_finished = True
-                    if self._waypoint_localization_ready_index != waypoint_index:
-                        return
-                    self._speech_waiting_index = None
-                    self._speech_wait_finished = False
-                    self._waypoint_localization_ready_index = None
-                    self._continue_after_waypoint(waypoint_index)
+                    self._complete_waypoint_speech_wait(
+                        execution_id,
+                        waypoint_index,
+                        reason="finished",
+                    )
                 return
             if state in {"failed", "superseded"}:
                 with self._lock:
-                    if self.context and self.context.task_execution_id == execution_id:
-                        self._speech_waiting_index = None
-                        self._fail(
-                            "WAYPOINT_SPEECH_FAILED",
-                            str(status.get("error_message") or f"waypoint speech {state}"),
-                        )
+                    self._complete_waypoint_speech_wait(
+                        execution_id,
+                        waypoint_index,
+                        reason=state,
+                    )
                 return
             time.sleep(float(self.waypoint_speech.poll_interval_seconds))
         with self._lock:
-            if self.context and self.context.task_execution_id == execution_id:
-                self._speech_waiting_index = None
-                self._fail(
-                    "WAYPOINT_SPEECH_TIMEOUT",
-                    f"waypoint {waypoint_index} speech did not finish within {self.waypoint_speech.timeout_seconds:.0f}s",
-                )
+            self._complete_waypoint_speech_wait(
+                execution_id,
+                waypoint_index,
+                reason="timeout",
+            )
 
     def _is_docking_task(self) -> bool:
         return bool(self.context and (self.context.docking or {}).get("enabled"))
@@ -1846,6 +2800,10 @@ class TaskExecutor:
             final_approach = bool(force_final) or precision_goal
         self._segment_avoidance_enabled = avoid_obstacles
         outdoor_profile = self._outdoor_navigation_profile()
+        local_controller = str(target.get("local_controller") or "mppi")
+        global_setter = getattr(self.navigation, "set_global_controller", None)
+        if callable(global_setter):
+            global_setter(str(self.context.route_snapshot.get("global_controller") or "theta_star"))
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if callable(setter):
             setter(
@@ -1853,6 +2811,7 @@ class TaskExecutor:
                 require_yaw=require_yaw,
                 final_approach=final_approach,
                 outdoor=outdoor_profile,
+                local_controller=local_controller,
             )
         outdoor_setter = getattr(self.navigation, "apply_outdoor_gps_profile", None)
         if callable(outdoor_setter):
@@ -1880,6 +2839,16 @@ class TaskExecutor:
             "transition",
         }
 
+    def _waypoint_local_controller(self, waypoint_index: int | None = None) -> str:
+        if not self.context:
+            return "mppi"
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if not waypoints:
+            return "mppi"
+        index = self.context.current_waypoint_index if waypoint_index is None else waypoint_index
+        index = min(max(index, 0), len(waypoints) - 1)
+        return str(waypoints[index].get("local_controller") or "mppi")
+
     def _apply_patrol_final_approach(self) -> None:
         """Slow the live FollowPath goal; do not touch costmaps or docking precision."""
         setter = getattr(self.navigation, "set_waypoint_profile", None)
@@ -1890,6 +2859,7 @@ class TaskExecutor:
             "require_yaw": False,
             "final_approach": True,
             "outdoor": self._outdoor_navigation_profile(),
+            "local_controller": self._waypoint_local_controller(),
         }
         try:
             setter(**kwargs, live=True)
@@ -1911,6 +2881,7 @@ class TaskExecutor:
                     require_yaw=False,
                     final_approach=False,
                     outdoor=self._outdoor_navigation_profile(),
+                    local_controller=self._waypoint_local_controller(),
                 )
             if self._is_docking_task():
                 precision_setter = getattr(self.navigation, "set_goal_precision", None)
@@ -1919,6 +2890,92 @@ class TaskExecutor:
                 self._restore_docking_profile()
         except Exception:
             LOGGER.exception("failed to restore default navigation profile")
+
+
+    def _clear_nav_dispatch_retry(self) -> None:
+        if self._nav_dispatch_retry_timer:
+            self._nav_dispatch_retry_timer.cancel()
+            self._nav_dispatch_retry_timer = None
+        self._nav_dispatch_retry_started_at = None
+        self._pending_dispatch_index = None
+
+    def _schedule_nav_dispatch_retry(self, index: int) -> None:
+        """Keep the task alive when Nav2 rejects a goal and retry dispatch.
+
+        Localization recovery often resumes before FollowWaypoints is ready.
+        Failing the whole patrol there is worse than waiting and re-sending.
+        """
+        if not self.context or self.context.state in self.TERMINAL_STATES | {"cancelling"}:
+            return
+        now = time.monotonic()
+        if self._nav_dispatch_retry_started_at is None:
+            self._nav_dispatch_retry_started_at = now
+        elapsed = now - self._nav_dispatch_retry_started_at
+        budget = self.navigation_dispatch_retry_budget_seconds
+        if elapsed >= budget:
+            self._clear_nav_dispatch_retry()
+            self._fail(
+                "NAV_STACK_NOT_READY",
+                "FollowWaypoints goal was rejected after "
+                f"{budget:.0f}s of retries",
+            )
+            return
+        self._pending_dispatch_index = index
+        self.context.current_waypoint_index = index
+        if self.context.state not in {"paused", "pausing"}:
+            self.context.state = "running"
+        self.context.state_version += 1
+        self._persist()
+        remaining = max(0.0, budget - elapsed)
+        self.event_callback(
+            "task.progress",
+            {
+                "task_execution_id": self.context.task_execution_id,
+                "state": self.context.state,
+                "state_version": self.context.state_version,
+                "current_waypoint_index": index,
+                "completed_waypoints": index,
+                "total_waypoints": len(self.context.route_snapshot["waypoints"]),
+                "distance_remaining_m": None,
+                "estimated_time_remaining_s": round(remaining),
+                "nav_stack_retry": True,
+                "reported_at": now_iso(),
+            },
+            "",
+        )
+        delay = self.navigation_dispatch_retry_seconds
+        LOGGER.warning(
+            "Nav2 goal rejected at waypoint %s; retrying in %.1fs (%.0fs budget left)",
+            index,
+            delay,
+            remaining,
+        )
+        if self._nav_dispatch_retry_timer:
+            self._nav_dispatch_retry_timer.cancel()
+        self._nav_dispatch_retry_timer = threading.Timer(delay, self._retry_nav_dispatch)
+        self._nav_dispatch_retry_timer.daemon = True
+        self._nav_dispatch_retry_timer.start()
+
+    def _retry_nav_dispatch(self) -> None:
+        with self._lock:
+            if not self.context or self.context.state in self.TERMINAL_STATES | {"cancelling"}:
+                return
+            if self.context.state in {"paused", "pausing"} and self._paused_for_localization:
+                # Wait for localization recovery to re-dispatch; do not fight it.
+                self._nav_dispatch_retry_timer = threading.Timer(
+                    self.navigation_dispatch_retry_seconds,
+                    self._retry_nav_dispatch,
+                )
+                self._nav_dispatch_retry_timer.daemon = True
+                self._nav_dispatch_retry_timer.start()
+                return
+            index = (
+                self._pending_dispatch_index
+                if self._pending_dispatch_index is not None
+                else self.context.current_waypoint_index
+            )
+            LOGGER.info("retrying Nav2 dispatch from waypoint %s", index)
+            self._send_from(index)
 
     def _hold_blocked_task(self) -> bool:
         """Keep a genuinely obstructed task alive and retry it for five minutes."""
@@ -1984,7 +3041,7 @@ class TaskExecutor:
                 self._obstacle_progress_anchor_at = None
             self._send_from(self.context.current_waypoint_index)
 
-    def _hold_final_pose(self) -> bool:
+    def _hold_final_pose(self, timeout_seconds: float = HOLD_FINAL_POSE_TIMEOUT_SECONDS) -> bool:
         """Stop the dog before measuring the last waypoint.
 
         Nav2's checker does not require zero velocity, and a quadruped still
@@ -1995,13 +3052,20 @@ class TaskExecutor:
         if callable(stop_motion):
             stop_motion()
         is_stopped = getattr(self.navigation, "is_robot_stopped", None)
-        if callable(is_stopped):
+        if not callable(is_stopped):
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while time.monotonic() <= deadline:
             try:
-                return bool(is_stopped())
+                if bool(is_stopped()):
+                    return True
             except Exception:
                 LOGGER.exception("robot stop confirmation failed")
                 return False
-        return True
+            if callable(stop_motion):
+                stop_motion()
+            time.sleep(0.1)
+        return False
 
     def _final_pose_error(self) -> tuple[str, str] | None:
         if not self.context:
@@ -2050,8 +3114,11 @@ class TaskExecutor:
     def _fail(self, code: str, message: str) -> None:
         if not self.context:
             return
+        self._clear_nav_dispatch_retry()
         self._stop_task_rosbag()
         self._navigation_prepared = False
+        self._departure_heading_index = None
+        self._departure_cruise_index = None
         self._restore_navigation_profile()
         self.context.state = "failed"
         self.context.state_version += 1

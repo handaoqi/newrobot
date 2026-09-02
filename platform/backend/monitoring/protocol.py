@@ -80,6 +80,7 @@ UPLINK_MESSAGE_TYPES = {
     "trajectory.batch",
     "trajectory.ack",
     "command.ack",
+    "command.progress",
     "command.result",
     "task.progress",
     "task.round_started",
@@ -216,6 +217,11 @@ def validate_payload(envelope: MessageEnvelope) -> None:
         _uuid(_required(payload, "command_id"), "command_id")
         if _required(payload, "ack") not in {"accepted", "rejected"}:
             raise ProtocolError("INVALID_MESSAGE", "ack must be accepted or rejected")
+    elif envelope.message_type == "command.progress":
+        _uuid(_required(payload, "command_id"), "command_id")
+        result = payload.get("result")
+        if result is not None and not isinstance(result, dict):
+            raise ProtocolError("INVALID_MESSAGE", "command progress result must be an object")
     elif envelope.message_type == "command.result":
         _uuid(_required(payload, "command_id"), "command_id")
         if _required(payload, "status") not in {"succeeded", "failed", "cancelled", "timed_out"}:
@@ -247,6 +253,10 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         for field in ("avoidance_to_next", "require_yaw"):
             if field in waypoint and not isinstance(waypoint[field], bool):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
+        if "local_controller" in waypoint:
+            mode = str(waypoint["local_controller"]).lower()
+            if mode not in {"rpp", "mppi"}:
+                raise ProtocolError("INVALID_MESSAGE", "waypoint local_controller must be mppi (rpp is a legacy alias)")
         if "dwell_seconds" in waypoint:
             dwell_seconds = waypoint["dwell_seconds"]
             if isinstance(dwell_seconds, bool) or not isinstance(dwell_seconds, (int, float)) or not 0 <= dwell_seconds <= 3600:
@@ -254,6 +264,9 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         actions = waypoint.get("actions", [])
         if not isinstance(actions, list) or any(action != "snapshot" for action in actions):
             raise ProtocolError("INVALID_MESSAGE", "P0 waypoint actions only support snapshot")
+    global_controller = str(route.get("global_controller") or "theta_star").lower()
+    if global_controller not in {"theta_star", "navfn"}:
+        raise ProtocolError("INVALID_MESSAGE", "route_snapshot global_controller must be theta_star or navfn")
     record_rosbag = command.get("record_rosbag")
     if record_rosbag is not None and not isinstance(record_rosbag, bool):
         raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")

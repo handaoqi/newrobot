@@ -94,6 +94,47 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(self.command.status, "succeeded")
         self.assertEqual(self.execution.state, "completed")
 
+    def test_command_progress_updates_executing_payload_without_finishing(self):
+        ack = self.envelope(
+            "command.ack",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "ack": "accepted",
+                "acknowledged_at": timezone.now().isoformat(),
+                "reason_code": None,
+                "reason_message": None,
+                "duplicate": False,
+                "edge_state_version": 2,
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+        progress = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "status": "executing",
+                "started_at": timezone.now().isoformat(),
+                "result": {
+                    "localization_attempts": {
+                        "state": "running",
+                        "attempts": [
+                            {"index": 1, "status": "verifying", "x": 1.0, "y": 2.0, "yaw": 0.1},
+                        ],
+                    }
+                },
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", progress)
+        self.command.refresh_from_db()
+        self.assertEqual(self.command.status, "executing")
+        self.assertEqual(
+            self.command.result_payload["localization_attempts"]["attempts"][0]["status"],
+            "verifying",
+        )
+        self.assertIsNone(self.command.finished_at)
+
     def test_sync_reconciles_edge_terminal_state_and_releases_robot(self):
         result = handle_mqtt_message(
             "robots/rx-001/sync/state",

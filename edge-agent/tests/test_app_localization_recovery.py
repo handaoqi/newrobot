@@ -32,6 +32,9 @@ class FakeNavigation:
 class FakeTaskExecutor:
     context = None
 
+    def __init__(self):
+        self.recovered = 0
+
     def is_paused_for_localization(self):
         return True
 
@@ -40,6 +43,9 @@ class FakeTaskExecutor:
 
     def on_localization_lost(self):
         return None
+
+    def on_localization_recovered(self):
+        self.recovered += 1
 
 
 class IdleTaskExecutor:
@@ -76,7 +82,8 @@ def test_recovery_seed_prefers_trusted_pose_over_pending_waypoint():
     )
     application.store = SimpleNamespace(load_last_trusted_pose=lambda *_args: None)
     application.config = SimpleNamespace(
-        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1")
+        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1"),
+        safety=SimpleNamespace(localization_trusted_seed_max_drift_m=15.0),
     )
     application.task_executor = SimpleNamespace(
         current_localization_waypoint=lambda: {
@@ -91,6 +98,190 @@ def test_recovery_seed_prefers_trusted_pose_over_pending_waypoint():
     seed = application._localization_recovery_seed()
 
     assert seed == {"x": 9.43, "y": -0.52, "yaw": -2.36, "source": "last_trusted"}
+
+
+class RtkNavigation:
+    def __init__(self):
+        self.rtk_calls = 0
+        self.relocalize_calls = 0
+        self.motion_holds = 0
+
+    def localization_decision(self):
+        return {
+            "rtk_good_for_navigation": True,
+            "rtk_usable": True,
+            "rtk_quality": "fixed",
+            "rtk_heading_usable": True,
+        }
+
+    def set_initial_pose_from_rtk(self, wait_seconds=30.0):
+        self.rtk_calls += 1
+        return {"source": "rtk_fixed"}
+
+    def active_relocalize(self, seed):
+        self.relocalize_calls += 1
+        raise AssertionError("NDT recovery must not run when RTK is good")
+
+    def latest_trusted_pose(self):
+        return {"x": 1.0, "y": 2.0, "yaw": 0.3}
+
+    def cancel_navigation(self):
+        self.motion_holds += 1
+        return True
+
+    def stop_motion(self):
+        return None
+
+
+def test_recovery_uses_rtk_when_fixed_solution_is_good(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = RtkNavigation()
+    application.task_executor = FakeTaskExecutor()
+    application.navigation_stack_adapter = SimpleNamespace(restarts=0)
+    _wire_recovery_collaborators(application)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+
+    application._recover_task_localization()
+
+    assert application.navigation.rtk_calls == 1
+    assert application.navigation.relocalize_calls == 0
+    assert application.navigation.motion_holds >= 1
+    assert application.task_executor.recovered == 1
+    assert application._localization_recovery_lock.acquire(blocking=False)
+
+
+def test_recovery_skips_rtk_reseed_when_gps_pose_is_already_driving(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = RtkNavigation()
+    application.navigation.localization_decision = lambda: {
+        "active_source": "rtk_imu",
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+    application.task_executor = FakeTaskExecutor()
+    application.navigation_stack_adapter = SimpleNamespace(restarts=0)
+    _wire_recovery_collaborators(application)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+
+    application._recover_task_localization()
+
+    assert application.navigation.rtk_calls == 0
+    assert application.navigation.relocalize_calls == 0
+    assert application.task_executor.recovered == 1
+    assert application._localization_recovery_lock.acquire(blocking=False)
+
+
+def test_localization_loss_ignored_while_outdoor_rtk_xy_is_fixed(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.task_executor = IdleTaskExecutor()
+    application.navigation = SimpleNamespace(
+        localization_decision=lambda: {
+            "rtk_good_for_navigation": False,
+            "rtk_position_good_for_navigation": True,
+            "rtk_usable": True,
+            "rtk_quality": "fixed",
+            "rtk_heading_usable": False,
+            "active_source": "lio_imu",
+        }
+    )
+    application._localization_alert_notified = False
+
+    def unexpected_thread(**_kwargs):
+        raise AssertionError("fixed RTK XY must not pause the task for LIO recovery")
+
+    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+
+    application._handle_task_localization_loss("lio_motion_anomaly")
+
+    assert application.task_executor.loss_notifications == 0
+
+
+def test_localization_loss_ignored_while_outdoor_rtk_is_good(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.task_executor = IdleTaskExecutor()
+    application.navigation = RtkNavigation()
+    application._localization_alert_notified = False
+
+    def unexpected_thread(**_kwargs):
+        raise AssertionError("good RTK must not pause the task for NDT recovery")
+
+    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+
+    application._handle_task_localization_loss("ndt_degraded")
+
+    assert application.task_executor.loss_notifications == 0
+
+
+def test_handoff_failed_keeps_self_heal_and_resumes_on_fixed_rtk_xy(monkeypatch):
+    """NDT commit + LIO handoff timeout must not abandon the paused task forever."""
+    from roamerx_edge.protocol import ProtocolError
+
+    class HandoffNav:
+        def __init__(self):
+            self.relocalize_calls = 0
+            self.rtk_calls = 0
+            self.motion_holds = 0
+            self._decision = {
+                "active_source": "lio_imu",
+                "absolute_stable": False,
+                "rtk_good_for_navigation": False,
+                "rtk_position_good_for_navigation": False,
+                "rtk_usable": True,
+                "rtk_quality": "float",
+                "rtk_heading_usable": False,
+            }
+
+        def localization_decision(self):
+            return dict(self._decision)
+
+        def latest_trusted_pose(self):
+            return {"x": 13.9, "y": 12.3, "yaw": 0.3}
+
+        def active_relocalize(self, seed):
+            self.relocalize_calls += 1
+            # Pose is committed; outdoor RTK XY becomes fixed a moment later.
+            self._decision = {
+                "active_source": "lio_imu",
+                "absolute_stable": False,
+                "rtk_good_for_navigation": False,
+                "rtk_position_good_for_navigation": True,
+                "rtk_usable": True,
+                "rtk_quality": "fixed",
+                "rtk_heading_usable": False,
+            }
+            raise ProtocolError(
+                "RELOCALIZATION_HANDOFF_FAILED",
+                "best NDT pose was committed but FAST-LIO did not become stable",
+                details={"best_ndt_committed": True},
+            )
+
+        def set_initial_pose_from_rtk(self, wait_seconds=30.0):
+            self.rtk_calls += 1
+            raise AssertionError("XY-fixed outdoor recovery must not force RTK reseed")
+
+        def cancel_navigation(self):
+            self.motion_holds += 1
+            return True
+
+        def stop_motion(self):
+            return None
+
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = HandoffNav()
+    application.task_executor = FakeTaskExecutor()
+    application.navigation_stack_adapter = SimpleNamespace(restarts=0)
+    _wire_recovery_collaborators(application)
+    application.config.safety.localization_handoff_settle_seconds = 2.0
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+
+    application._recover_task_localization()
+
+    assert application.navigation.relocalize_calls == 1
+    assert application.navigation.rtk_calls == 0
+    assert application.task_executor.recovered == 1
+    assert application._localization_recovery_lock.acquire(blocking=False)
 
 
 def test_recovery_attempts_trusted_pose_before_waypoint_candidates(monkeypatch):
@@ -140,6 +331,7 @@ def _wire_recovery_collaborators(application, *, max_cycles=0):
     )
     application._localization_recovery_lock = threading.Lock()
     application._localization_recovery_lock.acquire()
+    application._localization_alert_notified = False
 
 
 def test_recovery_retries_a_new_cycle_after_three_quick_failures(monkeypatch):
@@ -417,3 +609,71 @@ def test_mapping_divergence_event_does_not_rescue_before_flush():
     application._handle_mapping_divergence_event({"writer_flushed": False})
 
     assert calls == ["passive"]
+
+
+def test_recovery_seed_prefers_latest_pose_over_stale_trusted():
+    application = object.__new__(EdgeAgentApplication)
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1"),
+        safety=SimpleNamespace(localization_trusted_seed_max_drift_m=15.0),
+    )
+    application.store = SimpleNamespace(
+        load_last_trusted_pose=lambda *_args: {
+            "x": 3.63,
+            "y": 1.02,
+            "yaw": 0.1,
+            "source": "last_trusted_localization",
+        }
+    )
+    application.navigation = SimpleNamespace(
+        latest_pose=lambda: SimpleNamespace(x=41.7, y=8.0, z=0.0, yaw=-0.5),
+        latest_trusted_pose=lambda: {"x": 3.63, "y": 1.02, "yaw": 0.1},
+    )
+    application.task_executor = SimpleNamespace(current_localization_waypoint=lambda: None)
+
+    seed = application._localization_recovery_seed()
+
+    assert seed == {
+        "x": 41.7,
+        "y": 8.0,
+        "z": 0.0,
+        "yaw": -0.5,
+        "source": "latest_pose",
+    }
+
+
+
+def test_wait_for_rtk_recovery_retries_until_fixed(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.config = SimpleNamespace(
+        safety=SimpleNamespace(localization_rtk_float_retry_seconds=2.0),
+    )
+    navigation = RtkNavigation()
+    calls = {"count": 0}
+
+    def localization_decision():
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return {
+                "rtk_usable": True,
+                "rtk_heading_usable": True,
+                "rtk_quality": "float",
+            }
+        return {
+            "active_source": "rtk_imu",
+            "rtk_good_for_navigation": True,
+            "rtk_usable": True,
+            "rtk_quality": "fixed",
+            "rtk_heading_usable": True,
+        }
+
+    navigation.localization_decision = localization_decision
+    application.navigation = navigation
+    application.task_executor = FakeTaskExecutor()
+    application.telemetry = SimpleNamespace(on_localization_recovery=lambda _state: None)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock.__setitem__("now", clock["now"] + 0.6) or clock["now"])
+
+    assert application._wait_for_rtk_recovery() is True
+    assert application.task_executor.recovered == 1

@@ -80,10 +80,10 @@ python backend/manage.py shell -c \
 
 验收标准：
 
-- 所有迁移显示 `[X]`，当前至少包含 `0054_seed_eleven_speech_templates`。
+- 所有迁移显示 `[X]`，当前至少包含 `0070_remove_legacy_low_battery_template`。
 - Django `check` 无错误。
 - 全新正式库只有指定操作员、指定机器人和基础播报/技能配置。
-- `SpeechTemplate` 至少包含架构文档列出的 11 个名称；当前基线总数为 11。
+- `SpeechTemplate` 至少包含架构文档列出的 12 个名称；当前基线总数为 12，且不应存在已废弃的“低电量自动回充”模板。
 - 全新正式库不包含地图、路线、任务和排班样例。
 
 ## 5. NX Edge 初始化
@@ -152,6 +152,6 @@ ssh 3588 /home/firefly/dogrobot-runtime/scripts/verify.sh
 | 初始化后出现演示地图 | 检查 `ENABLE_DEMO_SEED`，生产必须为 `false` |
 | 首次初始化提示缺少密码 | 设置 `PLATFORM_OPERATOR_PASSWORD` 后重新执行 |
 | Edge `integrity_check` 失败 | 停止 Edge Agent，保留故障库，先从备份恢复，禁止直接删库 |
-| 模板少于 11 条 | 确认迁移 `0054` 已应用，再执行 `initialize_platform` 补缺 |
+| 模板少于 12 条，或仍存在“低电量自动回充” | 确认最新迁移（至少 `0070`）已应用，再执行 `initialize_platform` 补缺 |
 | 3588 显示 `preserved ...=lying` | 正常，表示保留当前充电模式，而非初始化失败 |
 | Docker 与 systemd 同时启动失败 | 停止旧平台服务，只保留一套 API/worker/scheduler |

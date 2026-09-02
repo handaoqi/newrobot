@@ -343,3 +343,24 @@ def build_result(
             "result": result,
         },
     )
+
+def build_progress(
+    envelope: MessageEnvelope,
+    *,
+    result: dict,
+    started_at: str,
+) -> dict:
+    return build_envelope(
+        message_type="command.progress",
+        robot_id=envelope.robot_id,
+        session_id=envelope.session_id,
+        trace_id=envelope.trace_id,
+        payload={
+            "command_id": envelope.payload["command_id"],
+            "task_execution_id": envelope.payload.get("task_execution_id"),
+            "status": "executing",
+            "started_at": started_at,
+            "result": result,
+        },
+    )
+

@@ -65,6 +65,12 @@ obstacle_speech:
   minimum_blocked_task_seconds: 300.0
   navigation_retry_seconds: 5.0
 
+waypoint_speech:
+  status_dir: /home/dogrobot/runtime/nx-edge/data/audio-status
+  timeout_seconds: 120.0
+  poll_interval_seconds: 0.2
+  block_navigation: false
+
 storage:
   sqlite_path: "/var/lib/roamerx-edge/edge.db"
   trajectory_outbox_limit: 720

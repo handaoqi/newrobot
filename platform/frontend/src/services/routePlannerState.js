@@ -175,10 +175,11 @@ export function initialPoseCommandOutcome(command, submittedPose = null) {
     : null
   const localizedPose = finitePose(result.localized_pose)
   const matchedPose = finitePose(candidate?.matched_pose)
+  const bestMatchPose = finitePose(result.best_match_pose)
   return {
-    pose: localizedPose || matchedPose || finitePose(submittedPose),
+    pose: localizedPose || bestMatchPose || matchedPose || finitePose(submittedPose),
     localizedPose,
-    matchedPose,
+    matchedPose: bestMatchPose || matchedPose,
     bestNdtCommitted: result.best_ndt_committed === true,
     handoffPending: result.handoff_pending === true,
     matchingError: candidate?.matching_error !== null

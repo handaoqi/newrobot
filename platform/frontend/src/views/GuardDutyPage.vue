@@ -244,7 +244,8 @@ function createLoopSessionId() {
 
 function navigationReady(payload = navigationStatus.value) {
   const mapId = presetTask.value?.map_id || routeData.value?.map_data
-  return Boolean(mapId) && navigationReadyForMap(payload, mapId, expectedLegacyMapVersion(mapId))
+  if (!payload || !mapId) return false
+  return navigationReadyForMap(payload, mapId, expectedLegacyMapVersion(mapId))
 }
 
 function syncLocalizationState(payload = navigationStatus.value) {

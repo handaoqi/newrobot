@@ -23,6 +23,7 @@ import { parse as parseRosDefinition } from '@foxglove/rosmsg'
 import { MessageReader } from '@foxglove/rosmsg2-serialization'
 import { FoxgloveClient } from '@foxglove/ws-protocol'
 import { McapIndexedReader } from '@mcap/core'
+import { decompress as decompressZstd } from 'fzstd'
 
 /** Samples kept per signal in live mode, ~10 minutes of a 20 Hz topic. */
 const LIVE_SAMPLE_CAP = 12_000
@@ -146,7 +147,16 @@ function emptyStore(signals) {
  * is what keeps our charts locked to the host's playhead instead of chasing it.
  */
 export async function openBagSource(file, signals, { onProgress } = {}) {
-  const reader = await McapIndexedReader.Initialize({ readable: new FileReadable(file) })
+  const reader = await McapIndexedReader.Initialize({
+    readable: new FileReadable(file),
+    decompressHandlers: {
+      zstd: (buffer, decompressedSize) => {
+        const size = Number(decompressedSize)
+        if (!Number.isSafeInteger(size)) throw new Error('MCAP zstd chunk is too large for browser decoding')
+        return decompressZstd(buffer, new Uint8Array(size))
+      },
+    },
+  })
 
   const wanted = new Map()
   for (const signal of signals) {

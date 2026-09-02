@@ -320,6 +320,8 @@ def _dispatch(
         return {"accepted": True}
     if message_type == "command.ack":
         return _handle_command_ack(envelope, robot)
+    if message_type == "command.progress":
+        return _handle_command_progress(envelope, robot)
     if message_type == "command.result":
         return _handle_command_result(envelope, robot)
     if message_type.startswith("task."):
@@ -446,6 +448,36 @@ def _handle_command_ack(envelope: MessageEnvelope, robot: Robot) -> dict:
             payload=payload,
         )
     realtime_publisher.publish_task_event(str(execution.id), payload) if execution else None
+    return {"status": command.status}
+
+
+
+def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
+    payload = envelope.payload
+    command = _get_command(payload, robot)
+    terminal = {"succeeded", "failed", "cancelled", "rejected", "timed_out", "expired"}
+    if command.status in terminal:
+        return {"ignored": True, "status": command.status}
+    if command.status in {"created", "published", "accepted"}:
+        command.status = "executing"
+        if command.started_at is None:
+            command.started_at = _event_time(payload, "started_at") or timezone.now()
+    incoming = payload.get("result") or {}
+    if not isinstance(incoming, dict):
+        incoming = {}
+    merged = dict(command.result_payload or {})
+    merged.update(incoming)
+    command.result_payload = merged
+    command.save(update_fields=["status", "started_at", "result_payload", "updated_at"])
+    CommandEvent.objects.get_or_create(
+        message_id=envelope.message_id,
+        defaults={
+            "command": command,
+            "event_type": "progress",
+            "source": "edge",
+            "payload": payload,
+        },
+    )
     return {"status": command.status}
 
 

@@ -42,6 +42,11 @@ def assert_transition_allowed(current: str, target: str) -> None:
         raise TaskStateError(f"invalid task state transition: {current} -> {target}")
 
 
+def _normalize_global_controller(value: object | None) -> str:
+    normalized = str(value or "theta_star").strip().lower()
+    return normalized if normalized in {"theta_star", "navfn"} else "theta_star"
+
+
 def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
     normalized = []
     names = route.waypoint_names or []
@@ -64,6 +69,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_template_name = str(raw.get("speech_template_name") or "")
             speech_text = str(raw.get("speech_text") or "")
             localization_mode = str(raw.get("localization_mode") or "ndt").lower()
+            local_controller = str(raw.get("local_controller") or "mppi").lower()
             avoidance_to_next = bool(raw.get("avoidance_to_next", True))
             require_yaw = bool(raw.get("require_yaw", False))
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
@@ -78,6 +84,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_template_name = ""
             speech_text = ""
             localization_mode = "ndt"
+            local_controller = "mppi"
             avoidance_to_next = True
             require_yaw = False
         else:
@@ -93,6 +100,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             "dwell_seconds": round(dwell_seconds, 1),
                 "actions": actions,
                 "localization_mode": localization_mode if localization_mode in {"ndt", "rtk", "ukf"} else "ndt",
+                # RPP is a legacy route value. The deployed navigo stack only
+                # registers FollowPath (MPPI), so old routes remain executable.
+                "local_controller": "mppi" if local_controller in {"rpp", "mppi"} else "mppi",
                 "avoidance_to_next": avoidance_to_next,
                 "require_yaw": require_yaw,
             }
@@ -129,6 +139,7 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
             "completeness": map_data.map_completeness,
         },
         "scene_scope": getattr(route, "scene_scope", "") or map_data.scene_scope or "indoor",
+        "global_controller": _normalize_global_controller(getattr(route, "global_controller", "")),
         "waypoints": normalize_waypoints(route),
     }
     if route.map_set_id:

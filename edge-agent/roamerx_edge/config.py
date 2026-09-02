@@ -83,6 +83,18 @@ class SafetyConfig:
     # for a human is the safest outcome - but the escalation alert still fires so the
     # situation is visible instead of a task silently paused forever.
     localization_recovery_max_cycles: int = 0
+    # Reject persisted or in-memory trusted seeds that disagree with the live
+    # published pose by more than this distance during automatic recovery.
+    localization_trusted_seed_max_drift_m: float = 15.0
+    # Wait briefly for RTK to return to fixed before falling back to NDT seeds.
+    localization_rtk_float_retry_seconds: float = 5.0
+    # After NDT commits a pose but LIO absolute handoff times out, wait this long
+    # for absolute_stable / fixed RTK XY before starting another recovery cycle.
+    localization_handoff_settle_seconds: float = 8.0
+    # After localization recovery (or any dispatch), Nav2 may briefly reject
+    # FollowWaypoints. Keep the task alive and retry instead of failing.
+    navigation_dispatch_retry_seconds: float = 5.0
+    navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
     final_waypoint_tolerance_m: float = 0.45
@@ -93,6 +105,7 @@ class SafetyConfig:
 @dataclass
 class ObstacleSpeechConfig:
     enabled: bool = True
+    announce: bool = True
     obstacle_clear_seconds: float = 3.0
     no_progress_seconds: float = 5.0
     min_progress_m: float = 0.5
@@ -109,6 +122,9 @@ class WaypointSpeechConfig:
     status_dir: str = "/home/dogrobot/runtime/nx-edge/data/audio-status"
     timeout_seconds: float = 120.0
     poll_interval_seconds: float = 0.2
+    enabled: bool = True
+    # When enabled=true and this is false, still never block/fail navigation.
+    block_navigation: bool = False
 
 
 @dataclass

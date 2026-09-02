@@ -61,6 +61,7 @@
 #include <localization/correction_policy.hpp>
 #include <localization/global_relocalization_policy.hpp>
 #include <localization/lio_motion_guard.hpp>
+#include <localization/rtk_primary_policy.hpp>
 
 #include <localization/msg/scan_matching_status.hpp>
 #include <robots_dog_msgs/srv/load_map.hpp>
@@ -332,6 +333,22 @@ public:
       0.0, declare_parameter<double>("lio_primary.correction_gate.post_suppression_seconds", 3.0));
     lio_correction_cooldown_gate_.configure(
       lio_correction_min_interval_s_, lio_correction_post_suppression_s_);
+    // Fixed RTK that stays self-consistent for this window is fully trusted for
+    // LIO anchor correction, even when LIO has drifted farther than
+    // max_correction_jump_m. Instantaneous RTK source jumps still reject.
+    rtk_trust_stable_window_s_ = std::max(
+      0.5, declare_parameter<double>("lio_primary.rtk_trust.stable_window_seconds", 3.0));
+    rtk_trust_stable_span_m_ = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("lio_primary.rtk_trust.stable_span_m", 0.35)));
+    rtk_trusted_correction_translation_rate_mps_ = static_cast<float>(std::max(
+      static_cast<double>(lio_correction_translation_rate_mps_),
+      declare_parameter<double>(
+        "lio_primary.rtk_trust.trusted_correction_translation_rate_mps", 1.0)));
+    rtk_trusted_correction_rotation_rate_radps_ = static_cast<float>(std::max(
+      static_cast<double>(lio_correction_rotation_rate_radps_),
+      declare_parameter<double>(
+        "lio_primary.rtk_trust.trusted_correction_rotation_rate_degps", 30.0)
+        * M_PI / 180.0));
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -427,11 +444,16 @@ public:
       1.0, declare_parameter<double>("point_cloud_processing.slow_callback_ms", 80.0));
     ndt_failure_hysteresis_frames_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("source_arbiter.ndt_failure_hysteresis_frames", 3)));
-    prefer_fixed_rtk_ = declare_parameter<bool>("source_arbiter.prefer_fixed_rtk", true);
+    // Outdoor default: FAST-LIO stays the continuous pose; fixed RTK XY (and
+    // optional heading) correct intermittently. Enabling prefer_fixed_rtk still
+    // requires sustained dual-antenna heading before GPS drives the pose.
+    prefer_fixed_rtk_ = declare_parameter<bool>("source_arbiter.prefer_fixed_rtk", false);
     rtk_primary_promote_samples_ = static_cast<int>(std::max<int64_t>(
-      1, declare_parameter<int>("source_arbiter.rtk_primary_promote_samples", 2)));
+      1, declare_parameter<int>("source_arbiter.rtk_primary_promote_samples", 20)));
     rtk_primary_demote_samples_ = static_cast<int>(std::max<int64_t>(
-      1, declare_parameter<int>("source_arbiter.rtk_primary_demote_samples", 3)));
+      1, declare_parameter<int>("source_arbiter.rtk_primary_demote_samples", 8)));
+    rtk_primary_handoff_suppress_s_ = std::max(
+      0.0, declare_parameter<double>("source_arbiter.rtk_primary_handoff_suppress_seconds", 2.5));
     std::vector<double> gnss_lever_arm = declare_parameter<std::vector<double>>("gnss_fusion.lever_arm_base", {-0.05, 0.0, 0.15});
     if (gnss_lever_arm.size() >= 3) {
       gnss_lever_arm_base_ << gnss_lever_arm[0], gnss_lever_arm[1], gnss_lever_arm[2];
@@ -676,10 +698,11 @@ public:
         lio_options);
       RCLCPP_INFO(
         get_logger(),
-        "FAST-LIO-only continuous source enabled: topic=%s max_age=%.2fs drift_xy=%.2fm "
+        "FAST-LIO continuous source enabled (RTK fixed+heading overrides to GPS): topic=%s "
+        "max_age=%.2fs drift_xy=%.2fm "
         "drift_yaw=%.1fdeg motion_guard=[%.1fdeg/frame, %.1fdeg/s] hysteresis=%d "
         "absolute_cap=%.2fm smoothing=[%.2fm/s, %.1fdeg/s] "
-        "dynamic_covariance=%s (NDT/RTK intermittent corrections)",
+        "dynamic_covariance=%s (NDT/RTK intermittent corrections while RTK is poor)",
         lio_odom_topic_.c_str(), lio_max_age_s_, lio_drift_xy_m_,
         lio_drift_yaw_rad_ * 180.0 / M_PI,
         lio_max_yaw_step_rad_ * 180.0 / M_PI,
@@ -885,7 +908,7 @@ private:
       RCLCPP_INFO(get_logger(),
         "PoseEstimator seeded with gyro bias [%.6f, %.6f, %.6f] rad/s (|bg| = %.4f deg/s)",
         bias_gyro.x(), bias_gyro.y(), bias_gyro.z(), bias_gyro.norm() * 180.0 / M_PI);
-    } else {
+    } else if (use_imu) {
       RCLCPP_WARN(get_logger(),
         "PoseEstimator built before static IMU calibration finished; gyro bias starts at zero "
         "and will be written back once calibration succeeds");
@@ -1071,6 +1094,8 @@ private:
     float initial_rotation_rad = 0.0f;
     float remaining_translation_m = 0.0f;
     float remaining_rotation_rad = 0.0f;
+    float translation_rate_mps = 0.25f;
+    float rotation_rate_radps = 8.0f * static_cast<float>(M_PI) / 180.0f;
 
     void reset() {
       active = false;
@@ -1082,11 +1107,15 @@ private:
       initial_rotation_rad = 0.0f;
       remaining_translation_m = 0.0f;
       remaining_rotation_rad = 0.0f;
+      translation_rate_mps = 0.25f;
+      rotation_rate_radps = 8.0f * static_cast<float>(M_PI) / 180.0f;
     }
   };
 
   // Shared 0.30 m / 3-frame / no-jump gate for NDT/VGICP and RTK while LIO is
   // the indoor primary observation. Neither source is fused every UKF frame.
+  // RTK may additionally use trust_stable_source so a fixed, self-consistent
+  // GPS solution can correct large LIO drift; only instantaneous RTK jumps reject.
   struct AuxiliaryDriftGate {
     int consecutive = 0;
     bool has_prev_source = false;
@@ -1122,6 +1151,11 @@ private:
       correction_latched = true;
       last_decision = "corrected_once";
     }
+  };
+
+  struct RtkStabilitySample {
+    int64_t stamp_ns = 0;
+    Eigen::Vector2f xy = Eigen::Vector2f::Zero();
   };
 
   static Eigen::Isometry3f poseFromOdometry(const nav_msgs::msg::Odometry& msg) {
@@ -1228,8 +1262,51 @@ private:
     lio_has_previous_pose_ = lio_anchor_valid_;
   }
 
+  bool rtkPositionGoodForNavigation(const RtkObservation& observation) const {
+    return localization::rtkPositionGoodForNavigation(
+      observation.usable, observation.quality);
+  }
+
+  bool withinRtkPrimaryHandoffSuppress() const {
+    if (rtk_primary_handoff_suppress_until_ns_ <= 0) {
+      return false;
+    }
+    return steadyNowNanoseconds() < rtk_primary_handoff_suppress_until_ns_;
+  }
+
+  void suppressLioMotionAnomalyForRtkHandoff(const char* reason) {
+    const std::int64_t now_ns = steadyNowNanoseconds();
+    const std::int64_t suppress_ns = static_cast<std::int64_t>(
+      rtk_primary_handoff_suppress_s_ * 1e9);
+    rtk_primary_handoff_suppress_until_ns_ = now_ns + std::max<std::int64_t>(0, suppress_ns);
+    if (lio_motion_anomaly_active_) {
+      clearLioMotionAnomaly(reason);
+    } else {
+      resetLioAnchor();
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "Suppressing FAST-LIO motion anomaly for %.1fs after %s (RTK XY remains navigation safety net)",
+      rtk_primary_handoff_suppress_s_, reason);
+  }
+
   void latchLioMotionAnomaly(const LioMotionGuardResult& result) {
     if (lio_motion_anomaly_active_) {
+      return;
+    }
+    const RtkObservation rtk = currentRtkObservation(get_clock()->now());
+    if (withinRtkPrimaryHandoffSuppress() || rtkPositionGoodForNavigation(rtk)) {
+      // Outdoor fixed RTK XY can re-anchor LIO. Freezing the pose on a yaw-step
+      // during dual-antenna flicker cancels Nav2 while GPS is still centimetre-grade.
+      RCLCPP_WARN(
+        get_logger(),
+        "Rejecting FAST-LIO frame (%s yaw_step=%.1fdeg) without latching anomaly; "
+        "RTK XY fixed=%s handoff_suppress=%s",
+        result.reason.c_str(),
+        result.yaw_step_rad * 180.0 / M_PI,
+        rtkPositionGoodForNavigation(rtk) ? "yes" : "no",
+        withinRtkPrimaryHandoffSuppress() ? "yes" : "no");
+      resetLioAnchor();
       return;
     }
     lio_motion_anomaly_active_ = true;
@@ -1319,7 +1396,9 @@ private:
       const Eigen::Isometry3f& target_map_T_base,
       const CorrectionNoise& noise,
       const char* source,
-      const rclcpp::Time& stamp) {
+      const rclcpp::Time& stamp,
+      float translation_rate_mps = -1.0f,
+      float rotation_rate_radps = -1.0f) {
     const std::int64_t steady_now_ns = steadyNowNanoseconds();
     if (!lio_anchor_valid_ || pending_lio_correction_.active ||
         !lio_correction_cooldown_gate_.canStart(steady_now_ns) ||
@@ -1352,6 +1431,10 @@ private:
     pending_lio_correction_.initial_rotation_rad = rotation_delta;
     pending_lio_correction_.remaining_translation_m = translation_m;
     pending_lio_correction_.remaining_rotation_rad = rotation_delta;
+    pending_lio_correction_.translation_rate_mps =
+      translation_rate_mps > 0.0f ? translation_rate_mps : lio_correction_translation_rate_mps_;
+    pending_lio_correction_.rotation_rate_radps =
+      rotation_rate_radps > 0.0f ? rotation_rate_radps : lio_correction_rotation_rate_radps_;
     last_correction_xy_variance_ = noise.horizontal_variance;
     last_correction_z_variance_ = noise.vertical_variance;
     last_correction_orientation_variance_ = noise.orientation_variance;
@@ -1383,7 +1466,8 @@ private:
       pending_lio_correction_.target_map_T_lio.translation();
     const Eigen::Vector3f translation_delta = target_translation - current_translation;
     const float translation_m = translation_delta.norm();
-    const float translation_step = lio_correction_translation_rate_mps_ * static_cast<float>(dt);
+    const float translation_step =
+      pending_lio_correction_.translation_rate_mps * static_cast<float>(dt);
     const float translation_ratio = translation_m > 1.0e-6f
       ? std::min(1.0f, translation_step / translation_m) : 1.0f;
     lio_map_T_lio_.translation() =
@@ -1398,7 +1482,8 @@ private:
       target_orientation.coeffs() *= -1.0f;
     }
     const float rotation_rad = current_orientation.angularDistance(target_orientation);
-    const float rotation_step = lio_correction_rotation_rate_radps_ * static_cast<float>(dt);
+    const float rotation_step =
+      pending_lio_correction_.rotation_rate_radps * static_cast<float>(dt);
     const float rotation_ratio = rotation_rad > 1.0e-6f
       ? std::min(1.0f, rotation_step / rotation_rad) : 1.0f;
     const Eigen::Quaternionf next_orientation =
@@ -1510,6 +1595,59 @@ private:
     return true;
   }
 
+  bool updateRtkSelfStability(
+      const Eigen::Vector3f& source_xy, int64_t sample_stamp_ns, float source_step_m) {
+    if (sample_stamp_ns <= 0 || !source_xy.head<2>().allFinite()) {
+      rtk_stability_window_.clear();
+      rtk_self_stable_ = false;
+      return false;
+    }
+    // Instantaneous RTK jumps invalidate the trust window immediately.
+    if (source_step_m > lio_max_correction_jump_m_) {
+      rtk_stability_window_.clear();
+      rtk_self_stable_ = false;
+      RtkStabilitySample sample;
+      sample.stamp_ns = sample_stamp_ns;
+      sample.xy = source_xy.head<2>();
+      rtk_stability_window_.push_back(sample);
+      return false;
+    }
+    if (!rtk_stability_window_.empty() &&
+        sample_stamp_ns == rtk_stability_window_.back().stamp_ns) {
+      return rtk_self_stable_;
+    }
+    RtkStabilitySample sample;
+    sample.stamp_ns = sample_stamp_ns;
+    sample.xy = source_xy.head<2>();
+    rtk_stability_window_.push_back(sample);
+    const int64_t window_ns =
+      static_cast<int64_t>(rtk_trust_stable_window_s_ * 1.0e9);
+    while (!rtk_stability_window_.empty() &&
+           sample_stamp_ns - rtk_stability_window_.front().stamp_ns > window_ns) {
+      rtk_stability_window_.pop_front();
+    }
+    if (rtk_stability_window_.size() < 2) {
+      rtk_self_stable_ = false;
+      return false;
+    }
+    const double span_s = static_cast<double>(
+      rtk_stability_window_.back().stamp_ns - rtk_stability_window_.front().stamp_ns) *
+      1.0e-9;
+    if (span_s + 1.0e-3 < rtk_trust_stable_window_s_) {
+      rtk_self_stable_ = false;
+      return false;
+    }
+    Eigen::Vector2f min_xy = rtk_stability_window_.front().xy;
+    Eigen::Vector2f max_xy = min_xy;
+    for (const auto& item : rtk_stability_window_) {
+      min_xy = min_xy.cwiseMin(item.xy);
+      max_xy = max_xy.cwiseMax(item.xy);
+    }
+    const float span_m = (max_xy - min_xy).norm();
+    rtk_self_stable_ = span_m <= rtk_trust_stable_span_m_;
+    return rtk_self_stable_;
+  }
+
   AuxiliaryGateStatus evaluateAuxiliaryDriftGate(
       AuxiliaryDriftGate& gate,
       const char* source,
@@ -1519,7 +1657,9 @@ private:
       const Eigen::Vector2f& correction_xy,
       float residual_xy,
       float residual_yaw,
-      int64_t sample_stamp_ns) {
+      int64_t sample_stamp_ns,
+      bool trust_stable_source = false,
+      bool ignore_lio_residual_cap = false) {
     if (sample_stamp_ns != 0 && sample_stamp_ns == gate.last_stamp_ns) {
       if (gate.consecutive > 0 && gate.consecutive < lio_drift_hysteresis_frames_) {
         return AuxiliaryGateStatus::pending;
@@ -1532,32 +1672,65 @@ private:
       gate.last_decision = "quality_rejected";
       return AuxiliaryGateStatus::reject;
     }
-    if (residual_xy > static_cast<float>(gnss_max_residual_)) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "%s residual %.2fm exceeds %.2fm; rejecting as a jump",
-        source, residual_xy, gnss_max_residual_);
-      gate.reset();
-      gate.last_decision = "jump_rejected";
-      return AuxiliaryGateStatus::reject;
+
+    float source_step = 0.0f;
+    if (gate.has_prev_source) {
+      source_step = (source_xy.head<2>() - gate.prev_source_xy.head<2>()).norm();
     }
-    if (residual_xy > lio_max_correction_jump_m_ ||
-        residual_yaw > lio_max_correction_yaw_rad_) {
+
+    // Hard-reject on LIO↔source residual size only for sources that are not a
+    // fixed, self-checked RTK stream. Fixed RTK may sit several metres from a
+    // drifted LIO pose; that disagreement is the reason to correct, not reject.
+    // Instantaneous RTK source jumps are handled below via source_step.
+    if (!trust_stable_source && !ignore_lio_residual_cap) {
+      if (residual_xy > static_cast<float>(gnss_max_residual_)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "%s residual %.2fm exceeds %.2fm; rejecting as a jump",
+          source, residual_xy, gnss_max_residual_);
+        gate.reset();
+        gate.last_decision = "jump_rejected";
+        return AuxiliaryGateStatus::reject;
+      }
+      if (residual_xy > lio_max_correction_jump_m_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "%s absolute correction rejected: xy=%.2fm/%.2fm yaw=%.1fdeg",
+          source, residual_xy, lio_max_correction_jump_m_,
+          residual_yaw * 180.0 / M_PI);
+        gate.reset();
+        gate.last_decision = "absolute_correction_rejected";
+        return AuxiliaryGateStatus::reject;
+      }
+    } else if (residual_xy > 50.0f) {
+      // Sanity only: ignore pathological residuals while trusting RTK.
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "%s absolute correction rejected: xy=%.2fm/%.2fm yaw=%.1fdeg/%.1fdeg",
-        source, residual_xy, lio_max_correction_jump_m_,
-        residual_yaw * 180.0 / M_PI,
-        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
-      gate.reset();
-      gate.last_decision = "absolute_correction_rejected";
+        "%s residual %.2fm exceeds sanity cap 50.0m while RTK quality is fixed",
+        source, residual_xy);
+      gate.resetConsecutive();
+      gate.last_decision = "sanity_rejected";
       return AuxiliaryGateStatus::reject;
     }
 
+    // Oversized yaw is untrusted (dual-antenna flicker, bad match yaw). Keep
+    // the XY gate alive and let the correction caller discard yaw.
+    if (residual_yaw > lio_max_correction_yaw_rad_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "%s yaw residual %.1fdeg exceeds %.1fdeg; XY correction may still proceed",
+        source, residual_yaw * 180.0 / M_PI,
+        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+      residual_yaw = 0.0f;
+    }
+
     if (gate.has_prev_source) {
-      const float source_step =
-        (source_xy.head<2>() - gate.prev_source_xy.head<2>()).norm();
       const float residual_delta = std::fabs(residual_xy - gate.prev_residual_xy);
-      if (source_step > lio_max_correction_jump_m_ ||
-          (gate.consecutive > 0 && residual_delta > lio_max_correction_jump_m_)) {
+      const bool source_jumped = source_step > lio_max_correction_jump_m_;
+      // Growing LIO↔RTK residual is expected while LIO drifts; only the RTK
+      // source jump itself is untrusted when ignore_lio_residual_cap is set.
+      const bool residual_jumped =
+        !trust_stable_source &&
+        !ignore_lio_residual_cap &&
+        gate.consecutive > 0 &&
+        residual_delta > lio_max_correction_jump_m_;
+      if (source_jumped || residual_jumped) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
           "%s jumped (source=%.2fm residual_delta=%.2fm); restarting 3-frame gate",
           source, source_step, residual_delta);
@@ -1583,14 +1756,44 @@ private:
       return AuxiliaryGateStatus::reject;
     }
 
-    if (gate.correction_latched) {
+    // Fixed RTK may re-correct after a prior latch whenever LIO drifts again.
+    // The latch still blocks one-shot NDT/VGICP absolute corrections.
+    if (gate.correction_latched && !trust_stable_source && !ignore_lio_residual_cap) {
       gate.last_decision = "single_correction_latched";
       return AuxiliaryGateStatus::reject;
+    }
+    if (gate.correction_latched && (trust_stable_source || ignore_lio_residual_cap)) {
+      gate.correction_latched = false;
+    }
+
+    // Large LIO↔RTK residual may only be applied after the RTK stream itself
+    // is self-stable (~3s). While waiting, do not hard-reject — LIO residual
+    // will keep changing and must not poison the gate.
+    if (ignore_lio_residual_cap &&
+        !trust_stable_source &&
+        residual_xy > lio_max_correction_jump_m_) {
+      gate.has_prev_source = true;
+      gate.prev_source_xy = source_xy;
+      gate.prev_correction_xy = correction_xy;
+      gate.prev_residual_xy = residual_xy;
+      gate.prev_residual_yaw = residual_yaw;
+      gate.last_stamp_ns = sample_stamp_ns;
+      gate.consecutive = 0;
+      gate.last_decision = "awaiting_rtk_self_stable";
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "%s waiting for %.1fs self-stable window before trusting xy=%.2fm "
+        "(source_step=%.2fm)",
+        source, rtk_trust_stable_window_s_, residual_xy, source_step);
+      return AuxiliaryGateStatus::pending;
     }
 
     const bool residual_stable = !gate.has_prev_source ||
       ((correction_xy - gate.prev_correction_xy).norm() <= lio_stable_xy_tolerance_m_ &&
-       std::fabs(residual_yaw - gate.prev_residual_yaw) <= lio_stable_yaw_tolerance_rad_);
+       std::fabs(residual_yaw - gate.prev_residual_yaw) <= lio_stable_yaw_tolerance_rad_) ||
+      // When trusting RTK, the filter/LIO residual may keep growing while RTK
+      // itself is steady. Require only the RTK source to stay put.
+      ((trust_stable_source || ignore_lio_residual_cap) &&
+       source_step <= rtk_trust_stable_span_m_);
     gate.has_prev_source = true;
     gate.prev_source_xy = source_xy;
     gate.prev_correction_xy = correction_xy;
@@ -1606,10 +1809,10 @@ private:
 
     ++gate.consecutive;
     if (gate.consecutive < lio_drift_hysteresis_frames_) {
-      gate.last_decision = "stable_pending";
+      gate.last_decision = trust_stable_source ? "rtk_stable_pending" : "stable_pending";
       return AuxiliaryGateStatus::pending;
     }
-    gate.last_decision = "stable_accept";
+    gate.last_decision = trust_stable_source ? "rtk_stable_accept" : "stable_accept";
     return AuxiliaryGateStatus::accept;
   }
 
@@ -1642,10 +1845,18 @@ private:
     last_ndt_drift_xy_m_ = drift_xy;
     last_ndt_drift_yaw_rad_ = drift_yaw;
     last_ndt_orientation_delta_rad_ = pose_estimator->quat().angularDistance(ndt_orientation);
-    const bool drifted = drift_xy >= lio_drift_xy_m_ || drift_yaw >= lio_drift_yaw_rad_;
+    const bool yaw_trusted = drift_yaw <= lio_max_correction_yaw_rad_;
+    if (!yaw_trusted) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "NDT/VGICP yaw residual %.1fdeg exceeds %.1fdeg; discarding yaw, XY-only",
+        drift_yaw * 180.0 / M_PI,
+        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+    }
+    const bool drifted = drift_xy >= lio_drift_xy_m_ ||
+      (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       ndt_drift_gate_, "NDT/VGICP", true, drifted, ndt_position,
-      correction_xy, drift_xy, drift_yaw,
+      correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
       stamp.nanoseconds());
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -1659,8 +1870,14 @@ private:
     }
     Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
     target_map_T_base.translation() = ndt_position;
-    target_map_T_base.linear() = ndt_orientation.toRotationMatrix();
-    const CorrectionNoise noise = scanMatchCorrectionNoise(match);
+    // Keep current LIO yaw when the match yaw is untrustworthy.
+    target_map_T_base.linear() = yaw_trusted
+      ? ndt_orientation.toRotationMatrix()
+      : pose_estimator->quat().normalized().toRotationMatrix();
+    CorrectionNoise noise = scanMatchCorrectionNoise(match);
+    if (!yaw_trusted) {
+      noise.orientation_variance = lio_orientation_variance_;
+    }
     if (!scheduleLioAnchorCorrection(
           target_map_T_base, noise, "NDT/VGICP", stamp)) {
       ndt_drift_gate_.resetConsecutive();
@@ -1672,10 +1889,11 @@ private:
     lio_corrected_this_frame_ = true;
     RCLCPP_WARN(get_logger(),
       "NDT/VGICP queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg score=%.3f "
-      "inlier=%.3f Rxy=%.4f Ryaw=%.5f method=%s",
-      drift_xy, drift_yaw * 180.0 / M_PI, match.fitness_score_,
+      "inlier=%.3f Rxy=%.4f Ryaw=%.5f method=%s heading=%s",
+      drift_xy, yaw_trusted ? drift_yaw * 180.0 / M_PI : 0.0, match.fitness_score_,
       last_ndt_inlier_fraction_, noise.horizontal_variance,
-      noise.orientation_variance, match.method_.c_str());
+      noise.orientation_variance, match.method_.c_str(),
+      yaw_trusted ? "yes" : "discarded");
     return true;
   }
 
@@ -1685,6 +1903,23 @@ private:
       return false;
     }
     last_rtk_aux_observation_stamp_ns_ = observation.stamp_ns;
+    const bool quality_ok = rtkCorrectionQualityOk(observation);
+    if (!quality_ok) {
+      rtk_stability_window_.clear();
+      rtk_self_stable_ = false;
+    }
+    // Keep the RTK self-stability window alive even while a smooth correction
+    // is in flight. Otherwise the 3s window expires mid-correction and the
+    // next large residual is treated as untrusted again.
+    Eigen::Vector3f rtk_position_for_stability = observation.position;
+    float source_step_for_stability = 0.0f;
+    if (rtk_drift_gate_.has_prev_source) {
+      source_step_for_stability =
+        (rtk_position_for_stability.head<2>() -
+         rtk_drift_gate_.prev_source_xy.head<2>()).norm();
+    }
+    const bool rtk_self_stable = quality_ok && updateRtkSelfStability(
+      rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
     if (!pose_estimator || lio_corrected_this_frame_ ||
         pending_lio_correction_.active) {
       if (lio_corrected_this_frame_) {
@@ -1692,7 +1927,6 @@ private:
       }
       return false;
     }
-    const bool quality_ok = rtkCorrectionQualityOk(observation);
     const Eigen::Vector3f ukf_position = pose_estimator->pos();
     Eigen::Vector3f rtk_position = observation.position;
     if (!gnss_use_elevation_) {
@@ -1703,20 +1937,43 @@ private:
     if (observation.heading_usable) {
       drift_yaw = pose_estimator->quat().angularDistance(observation.orientation);
     }
+    // Self-stable fixed RTK trusts dual-antenna heading the same way it trusts
+    // XY. The normal 30 deg gate still protects against heading flicker while
+    // the RTK stream is not yet self-stable.
+    const bool yaw_trusted = localization::rtkHeadingTrustedForCorrection(
+      observation.heading_usable, drift_yaw, lio_max_correction_yaw_rad_,
+      rtk_self_stable);
+    if (observation.heading_usable && !yaw_trusted) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "RTK heading residual %.1fdeg exceeds %.1fdeg; discarding yaw, XY-only "
+        "(rtk_self_stable=no)",
+        drift_yaw * 180.0 / M_PI,
+        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+    } else if (observation.heading_usable && rtk_self_stable &&
+               drift_yaw > lio_max_correction_yaw_rad_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "RTK heading residual %.1fdeg exceeds %.1fdeg; trusting yaw because "
+        "fixed RTK is self_stable",
+        drift_yaw * 180.0 / M_PI,
+        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+    }
     const bool drifted = drift_xy >= lio_drift_xy_m_ ||
-      (observation.heading_usable && drift_yaw >= lio_drift_yaw_rad_);
+      (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const Eigen::Vector2f correction_xy =
       rtk_position.head<2>() - ukf_position.head<2>();
+    // Fixed RTK: never hard-reject because LIO drifted far. Only wait for the
+    // RTK self-stability window before applying oversized corrections.
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       rtk_drift_gate_, "RTK", quality_ok, drifted, rtk_position,
-      correction_xy, drift_xy, drift_yaw,
-      observation.stamp_ns);
+      correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
+      observation.stamp_ns, rtk_self_stable, /*ignore_lio_residual_cap=*/quality_ok);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "LIO/RTK drift pending correction: xy=%.3fm yaw=%.1fdeg frames=%d/%d quality=%s",
+        "LIO/RTK drift pending correction: xy=%.3fm yaw=%.1fdeg frames=%d/%d "
+        "quality=%s rtk_self_stable=%s",
         drift_xy, drift_yaw * 180.0 / M_PI,
         rtk_drift_gate_.consecutive, lio_drift_hysteresis_frames_,
-        observation.quality.c_str());
+        observation.quality.c_str(), rtk_self_stable ? "yes" : "no");
       return false;
     }
     if (status != AuxiliaryGateStatus::accept) {
@@ -1725,7 +1982,7 @@ private:
 
     Eigen::Quaternionf orientation = pose_estimator->quat();
     float orientation_variance = lio_orientation_variance_;
-    if (gnss_use_heading_ && observation.heading_usable) {
+    if (gnss_use_heading_ && yaw_trusted) {
       orientation = observation.orientation;
       orientation_variance = static_cast<float>(std::max(
         observation.heading_std_rad * observation.heading_std_rad,
@@ -1738,8 +1995,16 @@ private:
     Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
     target_map_T_base.translation() = rtk_position;
     target_map_T_base.linear() = orientation.normalized().toRotationMatrix();
+    const float translation_rate = rtk_self_stable
+      ? rtk_trusted_correction_translation_rate_mps_
+      : lio_correction_translation_rate_mps_;
+    const float rotation_rate = (rtk_self_stable && yaw_trusted)
+      ? rtk_trusted_correction_rotation_rate_radps_
+      : lio_correction_rotation_rate_radps_;
     if (!scheduleLioAnchorCorrection(
-          target_map_T_base, noise, "RTK", timeOnStampClock(observation.stamp_ns, get_clock()->now()))) {
+          target_map_T_base, noise, "RTK",
+          timeOnStampClock(observation.stamp_ns, get_clock()->now()),
+          translation_rate, rotation_rate)) {
       rtk_drift_gate_.resetConsecutive();
       rtk_drift_gate_.last_decision = "correction_schedule_rejected";
       return false;
@@ -1751,9 +2016,12 @@ private:
     last_rtk_map_position_ = rtk_position;
     RCLCPP_WARN(get_logger(),
       "RTK queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg quality=%s "
-      "heading=%s Rxy=%.4f Ryaw=%.5f",
-      drift_xy, drift_yaw * 180.0 / M_PI, observation.quality.c_str(),
-      observation.heading_usable ? "yes" : "no",
+      "heading=%s self_stable=%s rate=%.2fm/s Rxy=%.4f Ryaw=%.5f",
+      drift_xy, yaw_trusted ? drift_yaw * 180.0 / M_PI : 0.0,
+      observation.quality.c_str(),
+      yaw_trusted ? "yes" : (observation.heading_usable ? "discarded" : "no"),
+      rtk_self_stable ? "yes" : "no",
+      translation_rate,
       noise.horizontal_variance, noise.orientation_variance);
     return true;
   }
@@ -1966,66 +2234,44 @@ private:
   }
 
   bool rtkGoodForNavigation(const RtkObservation& observation) const {
-    return observation.usable &&
-      observation.heading_usable &&
-      observation.quality == "fixed";
+    // Continuous GPS drive still needs dual-antenna heading. Fixed XY alone is
+    // exposed separately as rtk_position_good_for_navigation.
+    return localization::rtkGoodForPrimaryDrive(
+      observation.usable, observation.heading_usable, observation.quality);
   }
 
   void updateRtkAutoPrimary(const RtkObservation& observation, const rclcpp::Time& stamp) {
+    (void)stamp;
     if (!prefer_fixed_rtk_ || !source_arbiter_enable_) {
-      rtk_auto_primary_latched_ = false;
-      rtk_auto_primary_good_frames_ = 0;
-      rtk_auto_primary_bad_frames_ = 0;
-      return;
-    }
-    // Once map initialization has succeeded, FAST-LIO is the only continuous
-    // UKF driver. RTK remains an absolute, timestamp-deduplicated correction;
-    // it must not take ownership merely because LIO is temporarily stale.
-    if (enable_lio_primary_ && is_init_success_) {
       if (rtk_auto_primary_latched_) {
-        RCLCPP_INFO(get_logger(),
-          "FAST-LIO-only policy active; RTK primary latch cleared");
+        suppressLioMotionAnomalyForRtkHandoff("prefer_fixed_rtk disabled");
       }
       rtk_auto_primary_latched_ = false;
       rtk_auto_primary_good_frames_ = 0;
       rtk_auto_primary_bad_frames_ = 0;
       return;
     }
-    // Indoor LIO-primary: RTK is an auxiliary gated source, never the pose owner
-    // while FAST-LIO odom is healthy. Outdoor RTK-primary still latches after LIO drops.
-    const bool lio_holds_primary = enable_lio_primary_ && is_init_success_ &&
-      has_trusted_ndt_pose_ && lioOdomFresh(stamp);
-    if (lio_holds_primary) {
-      if (rtk_auto_primary_latched_) {
-        rtk_auto_primary_latched_ = false;
-        RCLCPP_INFO(get_logger(),
-          "Indoor LIO primary is healthy; RTK demoted to a gated auxiliary");
-      }
-      rtk_auto_primary_good_frames_ = 0;
-      rtk_auto_primary_bad_frames_ = 0;
-      return;
-    }
-    if (rtkGoodForNavigation(observation)) {
-      rtk_auto_primary_bad_frames_ = 0;
-      rtk_auto_primary_good_frames_ = std::min(
-        rtk_auto_primary_good_frames_ + 1, rtk_primary_promote_samples_);
-      if (!rtk_auto_primary_latched_ &&
-          rtk_auto_primary_good_frames_ >= rtk_primary_promote_samples_) {
-        rtk_auto_primary_latched_ = true;
-        RCLCPP_INFO(get_logger(),
-          "Outdoor RTK is fixed with a valid heading; overriding route preference '%s' for RTK-primary navigation",
-          preferred_source_.c_str());
-      }
-      return;
-    }
-    rtk_auto_primary_good_frames_ = 0;
-    rtk_auto_primary_bad_frames_ = std::min(
-      rtk_auto_primary_bad_frames_ + 1, rtk_primary_demote_samples_);
-    if (rtk_auto_primary_latched_ &&
-        rtk_auto_primary_bad_frames_ >= rtk_primary_demote_samples_) {
-      rtk_auto_primary_latched_ = false;
+    RtkPrimaryLatchState latch_state;
+    latch_state.latched = rtk_auto_primary_latched_;
+    latch_state.good_frames = rtk_auto_primary_good_frames_;
+    latch_state.bad_frames = rtk_auto_primary_bad_frames_;
+    const bool was_latched = latch_state.latched;
+    updateRtkPrimaryLatch(
+      latch_state,
+      RtkPrimaryLatchConfig{rtk_primary_promote_samples_, rtk_primary_demote_samples_},
+      rtkGoodForNavigation(observation));
+    rtk_auto_primary_latched_ = latch_state.latched;
+    rtk_auto_primary_good_frames_ = latch_state.good_frames;
+    rtk_auto_primary_bad_frames_ = latch_state.bad_frames;
+    if (!was_latched && rtk_auto_primary_latched_) {
       RCLCPP_INFO(get_logger(),
-        "RTK is no longer good for primary navigation (quality=%s heading=%s usable=%s); falling back to NDT",
+        "Outdoor RTK is fixed with a valid heading; GPS is the navigation pose (FAST-LIO/NDT paused)");
+      return;
+    }
+    if (was_latched && !rtk_auto_primary_latched_) {
+      suppressLioMotionAnomalyForRtkHandoff("RTK primary demoted");
+      RCLCPP_INFO(get_logger(),
+        "RTK is no longer good for primary navigation (quality=%s heading=%s usable=%s); falling back to FAST-LIO/NDT",
         observation.quality.c_str(),
         observation.heading_usable ? "yes" : "no",
         observation.usable ? "yes" : "no");
@@ -2039,6 +2285,14 @@ private:
   rclcpp::Time timeOnStampClock(
       const builtin_interfaces::msg::Time& msg, const rclcpp::Time& stamp) const {
     return rclcpp::Time(msg, stamp.get_clock_type());
+  }
+
+  rclcpp::Time latestGnssStamp(const rclcpp::Time& fallback) {
+    std::lock_guard<std::mutex> lock(gnss_mutex_);
+    if (!has_gnss_) {
+      return fallback;
+    }
+    return timeOnStampClock(latest_gnss_.header.stamp, fallback);
   }
 
   RtkObservation currentRtkObservation(const rclcpp::Time& stamp) {
@@ -2361,11 +2615,14 @@ private:
         << "\",\"correction_selection_reason\":\"" << last_correction_selection_reason_
         << "\",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
         << ",\"rtk_good_for_navigation\":" << (rtkGoodForNavigation(rtk) ? "true" : "false")
+        << ",\"rtk_position_good_for_navigation\":"
+        << (rtkPositionGoodForNavigation(rtk) ? "true" : "false")
         << ",\"phase\":\"" << motion_phase_
         << "\",\"ndt_healthy\":" << (last_ndt_healthy_ ? "true" : "false")
         << ",\"ndt_score\":" << last_ndt_score_
         << ",\"lio_primary\":" << (enable_lio_primary_ ? "true" : "false")
-        << ",\"single_continuous_source_enforced\":" << (enable_lio_primary_ ? "true" : "false")
+        << ",\"single_continuous_source_enforced\":"
+        << ((enable_lio_primary_ && !rtk_auto_primary_latched_) ? "true" : "false")
         << ",\"lio_healthy\":"
         << (lioOdomFresh(stamp) && !lio_motion_anomaly_active_ ? "true" : "false")
         << ",\"lio_anchored\":" << (lio_anchor_valid_ ? "true" : "false")
@@ -2681,18 +2938,13 @@ private:
     }
     advanceGlobalRelocalizationGeneration(reason);
     pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
-    has_trusted_ndt_pose_ = false;
     resetLioAnchor();
-    is_init_success_ = false;
     global_search_required_ = false;
     global_candidate_applied_ = false;
     resetInitializationValidation();
-    localization_state_ = 1;
     is_extrapolating_ = false;
     gl_once_gate_ = false;
     consecutive_match_failures_ = 0;
-    runtime_relocalization_attempted_ = true;
-    gnss_recovery_seed_pending_ = true;
     last_gnss_recovery_attempt_ = std::chrono::steady_clock::now();
     last_global_localization_attempt_ = last_gnss_recovery_attempt_;
     {
@@ -2704,6 +2956,46 @@ private:
       odom_prediction_initialized_ = false;
       consumed_robot_odom_sequence_ = latest_robot_odom_sequence_;
     }
+    const RtkObservation rtk = currentRtkObservation(get_clock()->now());
+    if (rtkGoodForNavigation(rtk) && applyRtkObservation(rtk)) {
+      // Only latch GPS as the continuous driver when prefer_fixed_rtk is on.
+      // Otherwise keep FAST-LIO primary and treat this as an absolute seed/correct.
+      if (prefer_fixed_rtk_) {
+        rtk_auto_primary_latched_ = true;
+        rtk_auto_primary_good_frames_ = rtk_primary_promote_samples_;
+        rtk_auto_primary_bad_frames_ = 0;
+      } else {
+        rtk_auto_primary_latched_ = false;
+        rtk_auto_primary_good_frames_ = 0;
+        rtk_auto_primary_bad_frames_ = 0;
+      }
+      has_trusted_ndt_pose_ = true;
+      gnss_recovery_seed_pending_ = false;
+      runtime_relocalization_attempted_ = false;
+      localization_state_ = 2;
+      initialization_verified_ = true;
+      initialization_state_ = "localized";
+      // Align the continuous LIO map←odom bridge to the RTK XY+yaw seed now so
+      // the next LIO frame does not reintroduce a large yaw residual.
+      reanchorLioToUkf();
+      const float seeded_yaw = yawFromRotation(last_init_quat_.toRotationMatrix());
+      RCLCPP_INFO(get_logger(),
+        "Fixed RTK accepted as %s for %s without NDT validation "
+        "x=%.3f y=%.3f yaw=%.1fdeg heading=%s lio_anchor=%s",
+        prefer_fixed_rtk_ ? "navigation pose" : "absolute seed (LIO remains continuous)",
+        reason, last_init_pos_.x(), last_init_pos_.y(), seeded_yaw * 180.0 / M_PI,
+        rtk.heading_usable ? "rtk" : "missing",
+        lio_anchor_valid_ ? "aligned" : "pending");
+      return true;
+    }
+    has_trusted_ndt_pose_ = false;
+    is_init_success_ = false;
+    rtk_auto_primary_latched_ = false;
+    rtk_auto_primary_good_frames_ = 0;
+    rtk_auto_primary_bad_frames_ = 0;
+    localization_state_ = 1;
+    runtime_relocalization_attempted_ = true;
+    gnss_recovery_seed_pending_ = true;
     return true;
   }
 
@@ -3069,9 +3361,8 @@ private:
     // Use the previous frame's RTK-primary latch so this callback can skip
     // cloud conversion before the expensive PCL work. Promotion/demotion still
     // runs later in the same callback from the latest RTK sample.
-    const bool skip_lidar_matching =
-      is_init_success_ && !enable_lio_primary_ && source_arbiter_enable_ && !bridge_active_ &&
-      rtk_auto_primary_latched_;
+    const bool skip_lidar_matching = rtkPrimaryShouldDrive(
+      source_arbiter_enable_, bridge_active_, rtk_auto_primary_latched_);
     if (skip_lidar_matching != lidar_matching_paused_for_rtk_) {
       lidar_matching_paused_for_rtk_ = skip_lidar_matching;
       if (skip_lidar_matching) {
@@ -3170,7 +3461,13 @@ private:
       if (elapsed >= gnss_auto_recovery_retry_seconds_ &&
           resetPoseEstimatorFromFixedRtk("automatic recovery")) {
         gnss_seeded_this_frame = true;
-        RCLCPP_INFO(get_logger(), "Pose estimator reseeded from fixed RTK XY and heading; validating with local NDT");
+        if (is_init_success_) {
+          RCLCPP_INFO(get_logger(),
+            "Pose estimator set from fixed RTK; GPS is the navigation source");
+        } else {
+          RCLCPP_INFO(get_logger(),
+            "Pose estimator reseeded from fixed RTK XY and heading; validating with local NDT");
+        }
       }
     }
 
@@ -3385,13 +3682,17 @@ private:
         pose_estimator->predict_odom(odom_delta);
       }
     }
-    const RtkObservation rtk_observation = currentRtkObservation(rclcpp::Time(stamp));
-    updateRtkAutoPrimary(rtk_observation, rclcpp::Time(stamp));
+    const rclcpp::Time frame_stamp(stamp);
+    const RtkObservation rtk_observation = currentRtkObservation(frame_stamp);
+    // Latch GPS quality from the GNSS sample itself. A queued lidar stamp can
+    // make a centimetre-grade fix look stale (|lidar-gnss| > max_age), unlatch
+    // skip, run open-sky NDT, and pause the patrol task.
+    updateRtkAutoPrimary(currentRtkObservation(latestGnssStamp(frame_stamp)), frame_stamp);
     // Only a latched fixed-RTK + heading solution pauses LiDAR matching.
     // A route waypoint that merely prefers rtk, or a float/usable position
     // without a valid heading, must keep NDT available as the fallback.
-    const bool rtk_primary = !enable_lio_primary_ && source_arbiter_enable_ && !bridge_active_ &&
-      rtk_auto_primary_latched_;
+    const bool rtk_primary = rtkPrimaryShouldDrive(
+      source_arbiter_enable_, bridge_active_, rtk_auto_primary_latched_);
     if (rtk_primary) {
       resetLioAnchor();
     }
@@ -3417,7 +3718,17 @@ private:
     // Obstacle extraction remains on the independent 10 Hz laser scan chain.
     // Scan matching is reduced to 2 Hz while moving and restored to every
     // LiDAR frame while stationary or during initialization.
-    const bool run_ndt = work_decision.run_ndt && !rtk_primary;
+    // Outdoor fixed RTK already provides absolute XY (and trusted heading when
+    // self-stable). Running NDT+VGICP every few frames while LIO is stable
+    // burns ~0.5s/callback and can fight the RTK seed with a wrong yaw.
+    // Keep matching for init/recovery and when RTK is not fixed.
+    const bool outdoor_rtk_fixed =
+      rtk_observation.usable && rtk_observation.quality == "fixed";
+    const bool skip_match_for_outdoor_rtk =
+      enable_lio_primary_ && outdoor_rtk_fixed && is_init_success_ &&
+      schedule_input.lio_stable;
+    const bool run_ndt =
+      work_decision.run_ndt && !rtk_primary && !skip_match_for_outdoor_rtk;
     perf.run_ndt = run_ndt;
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
     std::optional<PoseEstimator::MatchResult> current_match_result;
@@ -3468,6 +3779,8 @@ private:
         current_ndt_sample_healthy,
         rtk_observation,
         rclcpp::Time(stamp));
+    } else if (rtk_primary) {
+      policy_source_ready_ = true;
     } else if (enable_lio_primary_ && is_init_success_) {
       policy_source_ready_ = false;
     }
@@ -3482,6 +3795,7 @@ private:
         odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp)));
     } else if (rtk_primary) {
       absolute_pose_valid = applyRtkObservation(rtk_observation);
+      policy_source_ready_ = absolute_pose_valid;
       active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
       absolute_observation_updated = absolute_pose_valid &&
         rtk_observation.stamp_ns != last_absolute_observation_stamp_ns_;
@@ -4551,10 +4865,16 @@ private:
     double imu_valid_ratio = imu_total_count > 0 ? (double)imu_valid_count / imu_total_count : 0.0;
     
     ss << "Lidar: " << lidar_valid_count << "/" << lidar_total_count 
-       << " (" << std::fixed << std::setprecision(1) << (lidar_valid_ratio * 100.0) << "%)"
-       << " | IMU: " << imu_valid_count << "/" << imu_total_count 
-       << " (" << std::fixed << std::setprecision(1) << (imu_valid_ratio * 100.0) << "%)"
-       << " | Pose History: " << (has_valid_pose_history_ ? "Available" : "Not Available")
+       << " (" << std::fixed << std::setprecision(1) << (lidar_valid_ratio * 100.0) << "%)";
+    if (!use_imu) {
+      // Raw IMU is intentionally not subscribed under lio_primary; FAST-LIO
+      // already couples Mid-360 IMU into /odom/lio_odom.
+      ss << " | IMU: n/a (via LIO)";
+    } else {
+      ss << " | IMU: " << imu_valid_count << "/" << imu_total_count 
+         << " (" << std::fixed << std::setprecision(1) << (imu_valid_ratio * 100.0) << "%)";
+    }
+    ss << " | Pose History: " << (has_valid_pose_history_ ? "Available" : "Not Available")
        << " | Confidence: " << std::fixed << std::setprecision(2) << current_confidence_; 
     return ss.str();
   }
@@ -4892,7 +5212,7 @@ private:
                 updateLidarStatus(false);
             }
         }  
-        if (imu_status_buffer_.size() > 0) {
+        if (use_imu && imu_status_buffer_.size() > 0) {
             double imu_time_diff = (current_time - last_imu_data_time_).seconds();
             if (imu_time_diff > sensor_timeout_threshold_) {
                 updateImuStatus(false);
@@ -5347,9 +5667,11 @@ private:
   std::chrono::steady_clock::time_point last_gnss_recovery_attempt_{};
   bool gnss_recovery_seed_pending_ = false;
   bool source_arbiter_enable_ = true;
-  bool prefer_fixed_rtk_ = true;
-  int rtk_primary_promote_samples_ = 2;
-  int rtk_primary_demote_samples_ = 3;
+  bool prefer_fixed_rtk_ = false;
+  int rtk_primary_promote_samples_ = 20;
+  int rtk_primary_demote_samples_ = 8;
+  double rtk_primary_handoff_suppress_s_ = 2.5;
+  std::int64_t rtk_primary_handoff_suppress_until_ns_ = 0;
   int rtk_auto_primary_good_frames_ = 0;
   int rtk_auto_primary_bad_frames_ = 0;
   bool rtk_auto_primary_latched_ = false;
@@ -5549,6 +5871,13 @@ private:
   float lio_suppressed_covariance_scale_ = 100.0f;
   float lio_max_correction_jump_m_ = 1.50f;
   float lio_max_correction_yaw_rad_ = 30.0f * static_cast<float>(M_PI) / 180.0f;
+  double rtk_trust_stable_window_s_ = 3.0;
+  float rtk_trust_stable_span_m_ = 0.35f;
+  float rtk_trusted_correction_translation_rate_mps_ = 1.0f;
+  float rtk_trusted_correction_rotation_rate_radps_ =
+    30.0f * static_cast<float>(M_PI) / 180.0f;
+  bool rtk_self_stable_ = false;
+  std::deque<RtkStabilitySample> rtk_stability_window_;
   float lio_correct_xy_variance_ = 0.010f;
   float lio_correct_z_variance_ = 0.020f;
   float lio_correct_orientation_variance_ = 0.001f;

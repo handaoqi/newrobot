@@ -21,6 +21,7 @@ from .services.command_service import CommandService
 from .services.docking_service import dispatch_docking_task
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError, assert_transition_allowed
+from .serializers import PatrolRouteSerializer
 from .management.commands.run_device_worker import Command as DeviceWorkerCommand
 
 
@@ -97,6 +98,31 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(waypoint["yaw"], 1.25)
         self.assertIs(waypoint["require_yaw"], True)
         self.assertIs(waypoint["avoidance_to_next"], False)
+
+
+    def test_route_snapshot_preserves_controller_settings(self):
+        self.route.global_controller = "navfn"
+        self.route.waypoints = [{
+            "x": 1,
+            "y": 2,
+            "yaw": 0,
+            "local_controller": "mppi",
+        }]
+        self.route.save(update_fields=["global_controller", "waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.assertEqual(execution.route_snapshot["global_controller"], "navfn")
+        self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "mppi")
+
+    def test_route_snapshot_migrates_legacy_rpp_to_registered_mppi(self):
+        self.route.waypoints = [{"x": 1, "y": 2, "yaw": 0, "local_controller": "rpp"}]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "mppi")
+
+    def test_route_representation_exposes_registered_controller_for_legacy_points(self):
+        self.route.waypoints = [[1, 2], {"x": 3, "y": 4, "local_controller": "rpp"}]
+        data = PatrolRouteSerializer(self.route).data
+        self.assertEqual([point["local_controller"] for point in data["waypoints"]], ["mppi", "mppi"])
 
     def test_route_snapshot_preserves_fractional_dwell_seconds(self):
         self.route.waypoints = [{

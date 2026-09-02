@@ -1,0 +1,22 @@
+{
+  "name": "@roamerx/design-inspect-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Design Inspect 浏览器端与 VS Code 扩展端共享的 Payload 契约",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./payload.js": "./payload.js",
+    "./styles.js": "./styles.js"
+  },
+  "files": [
+    "index.js",
+    "payload.js",
+    "styles.js"
+  ],
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "license": "UNLICENSED"
+}

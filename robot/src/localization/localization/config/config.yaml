@@ -32,11 +32,11 @@ localization:
       max_rotation_per_scan_rad: 0.70
       min_points: 200
       num_threads: 2
-    # Indoor primary: FAST-LIO2 frontend odom into the UKF every frame.
-    # NDT/VGICP and RTK are the same class of auxiliary: they do not enter the
-    # UKF every frame. One correction fires only after 0.30 m drift (or 5 deg
-    # yaw), a healthy match / fixed RTK, 3 consecutive stable frames, and no
-    # violent source jump.
+    # Indoor / poor-RTK primary: FAST-LIO2 frontend odom into the UKF every
+    # frame. NDT/VGICP is the absolute correction. Fixed RTK that stays
+    # self-consistent for ~3s is fully trusted to correct LIO drift; only an
+    # instantaneous RTK jump is rejected. prefer_fixed_rtk may still promote
+    # GPS as the continuous navigation source when dual-antenna heading is good.
     lio_primary:
       enable: true
       topic: "/odom/lio_odom"
@@ -59,6 +59,17 @@ localization:
       suppressed_covariance_scale: 100.0
       max_correction_jump_m: 1.50
       max_correction_yaw_deg: 30.0
+      # Fixed RTK trust: LIO↔RTK residual size never hard-rejects a fixed
+      # solution. Oversized corrections apply only after GPS itself stays
+      # within stable_span_m for stable_window_seconds. Only instantaneous
+      # RTK source jumps (>max_correction_jump_m) are untrusted.
+      # Self-stable fixed RTK also trusts dual-antenna heading (bypasses the
+      # 30 deg yaw gate) so XY-only corrections cannot leave a yaw death spiral.
+      rtk_trust:
+        stable_window_seconds: 3.0
+        stable_span_m: 0.35
+        trusted_correction_translation_rate_mps: 1.0
+        trusted_correction_rotation_rate_degps: 30.0
       correct_xy_variance: 0.010
       correct_z_variance: 0.020
       correct_orientation_variance: 0.001
@@ -105,6 +116,8 @@ localization:
     # IMU parameters
     # FAST-LIO already tightly couples this Mid-360 IMU with each scan. The
     # localization UKF consumes /odom/lio_odom and must not integrate it again.
+    # With use_imu=false the Sensor Status line reports "IMU: n/a (via LIO)"
+    # instead of a misleading 0/10.
     use_imu: false
     invert_acc: false
     invert_gyro: false
@@ -141,12 +154,17 @@ localization:
 
     source_arbiter:
       enable: true
-      # Used only when lio_primary.enable=false. With FAST-LIO enabled, RTK and
-      # NDT/VGICP are timestamp-deduplicated intermittent corrections and can
-      # never become continuous UKF drivers after map initialization.
-      prefer_fixed_rtk: true
-      rtk_primary_promote_samples: 2
-      rtk_primary_demote_samples: 3
+      # Outdoor default keeps FAST-LIO as the continuous pose. Fixed RTK XY
+      # corrects intermittently; dual-antenna heading is optional for path
+      # following (Nav2 uses waypoint-to-waypoint travel yaw). Set true only
+      # when sustained dual-antenna heading is known-good and GPS should drive.
+      prefer_fixed_rtk: false
+      # When prefer_fixed_rtk is enabled, require ~2s of fixed+heading before
+      # promoting and ~0.8s of loss before demoting, then suppress LIO yaw-step
+      # false positives during the handoff.
+      rtk_primary_promote_samples: 20
+      rtk_primary_demote_samples: 8
+      rtk_primary_handoff_suppress_seconds: 2.5
       # LiDAR is approximately 10 Hz. FAST-LIO remains the continuous source;
       # scan matching is the 2 Hz absolute correction/health observation.
       initialization_ndt_stride: 2

@@ -356,6 +356,30 @@ a { color: inherit; }
   border: 1px solid var(--chip-border);
 }
 .dashboard-shell { min-height: 100vh; display: grid; grid-template-columns: 280px 1fr; }
+
+.module-not-installed,
+.page-render-error {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 56px 24px;
+}
+.module-not-installed h2,
+.page-render-error h1 { margin: 0; }
+.module-not-installed p,
+.page-render-error p { color: var(--muted); line-height: 1.7; }
+.module-install-command {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.module-install-command code { color: var(--cyan); font-family: ui-monospace, SFMono-Regular, monospace; }
+.page-loading-state { padding: 56px 24px; color: var(--muted); }
 .sidebar { padding: 28px 22px; border-right: 1px solid var(--line); background: var(--sidebar-bg); backdrop-filter: blur(20px); }
 .brand-block h1 { margin: 8px 0 0; font-size: 28px; }
 .menu-list { display: grid; gap: 10px; margin-top: 34px; }

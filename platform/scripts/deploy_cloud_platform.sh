@@ -12,6 +12,13 @@ WITH_NGINX=false
 NGINX_SNIPPET_SOURCE="$PROJECT_DIR/deploy/nginx/roamerx-compression.conf"
 NGINX_SNIPPET_PATH="${ROAMERX_NGINX_SNIPPET_PATH:-/etc/nginx/conf.d/roamerx-compression.conf}"
 NGINX_CONFIG_PATH="${ROAMERX_NGINX_CONFIG_PATH:-/etc/nginx/nginx.conf}"
+LOCAL_LICHTBLICK_DIST="${ROAMERX_LICHTBLICK_DIST:-$PROJECT_DIR/../runtime/platform/install/lichtblick-web/dist}"
+LOCAL_LICHTBLICK_LAYOUT="${ROAMERX_LICHTBLICK_LAYOUT:-$PROJECT_DIR/../docs/yuwang/embedded_scene_layout.json}"
+PREPARE_LICHTBLICK_INDEX="$PROJECT_DIR/../robot/script/robot/inject_lichtblick_layout.py"
+
+if [[ ! -d "$LOCAL_LICHTBLICK_DIST" && -d "$PROJECT_DIR/../runtime/nx-edge/install/lichtblick-web/dist" ]]; then
+  LOCAL_LICHTBLICK_DIST="$PROJECT_DIR/../runtime/nx-edge/install/lichtblick-web/dist"
+fi
 
 usage() {
   cat <<'EOF'
@@ -27,6 +34,7 @@ Options:
 
 Environment overrides:
   ROAMERX_CLOUD_HOST, ROAMERX_CLOUD_ROOT, ROAMERX_CLOUD_URL
+  ROAMERX_LICHTBLICK_DIST, ROAMERX_LICHTBLICK_LAYOUT
   ROAMERX_NGINX_SNIPPET_PATH, ROAMERX_NGINX_CONFIG_PATH
 EOF
 }
@@ -49,11 +57,46 @@ fi
 
 if "$DEPLOY_FRONTEND"; then
   echo "[deploy] Building frontend locally..."
-  (cd "$PROJECT_DIR/frontend" && npm run build)
+  # The legacy cloud server serves the full operator UI, including the three
+  # replay pages. Container releases use the opposite build target in the
+  # frontend Dockerfile and intentionally leave those pages out.
+  (cd "$PROJECT_DIR/frontend" && VITE_BUILD_TARGET=server npm run build)
+  prepared_lichtblick_index=""
+  if [[ -d "$LOCAL_LICHTBLICK_DIST" && -f "$LOCAL_LICHTBLICK_LAYOUT" ]]; then
+    prepared_lichtblick_index="$(mktemp)"
+    python3 "$PREPARE_LICHTBLICK_INDEX" \
+      --dist "$LOCAL_LICHTBLICK_DIST" \
+      --layout "$LOCAL_LICHTBLICK_LAYOUT" \
+      --output "$prepared_lichtblick_index"
+  fi
   echo "[deploy] Syncing frontend dist..."
   # Publish the build as a mirror so stale content-hashed bundles cannot be
   # selected by an old cached index or left behind after a build changes.
-  rsync -a --delete "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
+  # The Lichtblick tree is published separately below. Keep it out of this
+  # mirror so a large bundle sync cannot leave /foxglove/ temporarily missing.
+  rsync -a --delete --exclude='foxglove/' "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
+  if [[ -d "$LOCAL_LICHTBLICK_DIST" ]]; then
+    echo "[deploy] Syncing Lichtblick bundle..."
+    rsync -a --delete "$LOCAL_LICHTBLICK_DIST/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/foxglove/"
+    if [[ -n "$prepared_lichtblick_index" ]]; then
+      echo "[deploy] Installing injected Lichtblick layout..."
+      scp "$prepared_lichtblick_index" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/foxglove/index.html" >/dev/null
+      local_lichtblick_index_sha="$(sha256sum "$prepared_lichtblick_index" | awk '{print $1}')"
+      remote_lichtblick_index_sha="$(ssh "$CLOUD_HOST" "sha256sum '$REMOTE_ROOT/frontend/dist/foxglove/index.html'" | awk '{print $1}')"
+      if [[ -z "$local_lichtblick_index_sha" || "$local_lichtblick_index_sha" != "$remote_lichtblick_index_sha" ]]; then
+        echo "[deploy] Lichtblick index verification failed (local=$local_lichtblick_index_sha remote=$remote_lichtblick_index_sha)" >&2
+        rm -f "$prepared_lichtblick_index"
+        exit 1
+      fi
+      echo "[deploy] Lichtblick index verified: $remote_lichtblick_index_sha"
+    else
+      echo "[deploy] Warning: default layout not found at $LOCAL_LICHTBLICK_LAYOUT; Lichtblick will open without the embedded scene layout." >&2
+    fi
+    ssh "$CLOUD_HOST" "chmod -R a+rX '$REMOTE_ROOT/frontend/dist/foxglove'"
+  else
+    echo "[deploy] Warning: Lichtblick bundle not found at $LOCAL_LICHTBLICK_DIST; /foxglove/ will remain unavailable." >&2
+  fi
+  [[ -z "$prepared_lichtblick_index" ]] || rm -f "$prepared_lichtblick_index"
   # The build workspace may use restrictive file permissions. Nginx must be
   # able to traverse the directory and read every static asset after syncing.
   ssh "$CLOUD_HOST" "chmod -R a+rX '$REMOTE_ROOT/frontend/dist'"

@@ -42,6 +42,7 @@ export async function waitForRobotCommand(robotId, command, {
   timeoutMs = 180_000,
   intervalMs = 1_000,
   onProgress = () => {},
+  onCommand = () => {},
 } = {}) {
   if (!robotId || !command?.id) throw new Error('设备命令信息不完整')
   let latest = command
@@ -76,8 +77,9 @@ export async function activateAndRelocalizeMap({
   robotId,
   mapVersion = expectedLegacyMapVersion(mapId),
   onProgress = () => {},
+  onCommand = () => {},
 }) {
-  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress })
+  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress, onCommand })
   let navigationStatus = activation.navigationStatus
 
   if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
@@ -114,7 +116,10 @@ export async function activateAndRelocalizeMap({
     })
     await waitForRobotCommand(robotId, relocalizeCommand, {
       timeoutMs: 180_000,
-      onProgress: latest => onProgress(`可信位置重定位：${latest.status || 'created'}`),
+      onProgress: latest => {
+        onProgress(`可信位置重定位：${latest.status || 'created'}`)
+        onCommand({ phase: 'localization', command: latest, showCandidates: true })
+      },
     })
   } catch (error) {
     const errorCode = error?.command?.error_code || error?.command?.ack_reason_code || ''
@@ -128,7 +133,10 @@ export async function activateAndRelocalizeMap({
     })
     await waitForRobotCommand(robotId, globalCommand, {
       timeoutMs: 180_000,
-      onProgress: latest => onProgress(`全局重定位：${latest.status || 'created'}`),
+      onProgress: latest => {
+        onProgress(`全局重定位：${latest.status || 'created'}`)
+        onCommand({ phase: 'localization', command: latest, showCandidates: true })
+      },
     })
   }
 
@@ -163,6 +171,7 @@ export async function activateRouteMap({
   robotId,
   mapVersion = expectedLegacyMapVersion(mapId),
   onProgress = () => {},
+  onCommand = () => {},
 }) {
   if (!mapId) throw new Error('路线未绑定地图')
   if (!robotId) throw new Error('路线未绑定机器狗')
@@ -186,7 +195,10 @@ export async function activateRouteMap({
     if (!command) throw new Error('地图未绑定机器狗，无法下发设备切换命令')
     await waitForRobotCommand(robotId, command, {
       timeoutMs: 180_000,
-      onProgress: latest => onProgress(`地图下发：${latest.status || 'created'}`),
+      onProgress: latest => {
+        onProgress(`地图下发：${latest.status || 'created'}`)
+        onCommand({ phase: 'transfer', command: latest, showCandidates: false })
+      },
     })
   }
 

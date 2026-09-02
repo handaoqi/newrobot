@@ -219,7 +219,9 @@ controller_server:
     progress_checker:
       plugin: "navigo_path_controller::SimpleProgressChecker"
       required_movement_radius: 0.15
-      movement_time_allowance: 20.0
+      # Fail FollowPath soon enough that BT Backup/replan runs before Edge
+      # reverse. Collision Monitor can zero speed while the goal is still active.
+      movement_time_allowance: 8.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "navigo_path_controller::SimpleGoalChecker"
@@ -410,7 +412,9 @@ collision_monitor:
       type: "polygon"
       # Last-resort collision brake. Start in front of the body so lidar zero
       # returns and self-reflections do not trigger an emergency stop.
-      points: [0.90, 0.22, 0.90, -0.22, 0.55, -0.22, 0.55, 0.22]
+      # Keep this closer than MPPI's detour horizon so CostCritic can yaw
+      # around a box before the last-resort stop. Slowdown still starts at 1.2 m.
+      points: [0.68, 0.22, 0.68, -0.22, 0.55, -0.22, 0.55, 0.22]
       action_type: "stop"
       max_points: 3
       visualize: true

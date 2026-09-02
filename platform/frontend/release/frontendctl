@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Offline frontend installer and module switcher."""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+VERSION = "v1.0.0"
+MODULES = ["overview", "guard-duty", "remote-control", "remote-development", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
+RECOMMENDS = {
+    "overview": ["robots"], "guard-duty": ["overview", "remote-control", "events", "tasks", "task-execution"],
+    "remote-control": ["overview", "guard-duty"], "analytics": ["events"], "events": ["guard-duty", "analytics"],
+    "robots": ["overview"], "tasks": ["patrol-calendar", "task-execution", "maps", "routes"],
+    "patrol-calendar": ["tasks", "task-execution"], "task-execution": ["tasks", "patrol-calendar"],
+    "maps": ["routes", "zones"], "routes": ["maps", "zones", "tasks"], "zones": ["maps", "routes"],
+}
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(os.environ.get("ROAMERX_FRONTEND_STATE_DIR", "/var/lib/roamerx/frontend"))
+CONFIG = Path(os.environ.get("ROAMERX_FRONTEND_CONFIG", str(STATE / "modules.json")))
+COMPOSE = Path(os.environ.get("ROAMERX_FRONTEND_COMPOSE", str(ROOT / "compose.frontend.yml")))
+
+def config(ids=None):
+    return {"schema_version": 1, "release_version": VERSION, "enabled_modules": ids or MODULES.copy()}
+
+def read_config():
+    try:
+        value = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return config()
+    ids = value.get("enabled_modules")
+    if value.get("schema_version") != 1 or value.get("release_version") != VERSION or not isinstance(ids, list) or not ids or any(i not in MODULES for i in ids) or len(set(ids)) != len(ids):
+        raise SystemExit(f"模块配置无效：{CONFIG}")
+    return config(ids)
+
+def write_config(value):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="modules.", suffix=".json", dir=CONFIG.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+        os.replace(name, CONFIG)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+def compose(*args):
+    environment = os.environ.copy()
+    environment.setdefault("ROAMERX_FRONTEND_CONFIG", str(CONFIG))
+    return subprocess.run(["docker", "compose", "-f", str(COMPOSE), *args], check=False, env=environment).returncode
+
+def cmd_modules(args):
+    current = read_config()
+    if args.action == "list":
+        for module in MODULES: print(("* " if module in current["enabled_modules"] else "  ") + module)
+        return 0
+    ids = list(args.ids or [])
+    unknown = [i for i in ids if i not in MODULES]
+    if unknown: raise SystemExit("未知模块：" + ", ".join(unknown))
+    if args.action == "enable":
+        if not ids: raise SystemExit("请指定模块 ID")
+        if not args.ignore_recommended and not args.with_recommended:
+            raise SystemExit("非交互启用必须指定 --with-recommended 或 --ignore-recommended")
+        if args.with_recommended:
+            ids += [r for i in ids for r in RECOMMENDS.get(i, [])]
+        current["enabled_modules"] = list(dict.fromkeys(current["enabled_modules"] + ids))
+    else:
+        current["enabled_modules"] = [i for i in current["enabled_modules"] if i not in ids]
+        if not current["enabled_modules"]: raise SystemExit("至少需要保留一个业务模块")
+    write_config(current); print(json.dumps(current, ensure_ascii=False, indent=2)); return 0
+
+def verify():
+    read_config()
+    for url in ("http://127.0.0.1:13000/healthz", "http://127.0.0.1:13000/release.json", "http://127.0.0.1:13000/modules.json"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status != 200: return 1
+        except Exception as error:
+            print(f"verify failed: {url}: {error}", file=sys.stderr); return 1
+    print("frontend verify: ok"); return 0
+
+def main():
+    parser = argparse.ArgumentParser(prog="frontendctl")
+    sub = parser.add_subparsers(dest="command", required=True)
+    modules = sub.add_parser("modules"); modules.add_argument("action", choices=["list", "enable", "disable"]); modules.add_argument("ids", nargs="*"); modules.add_argument("--with-recommended", action="store_true"); modules.add_argument("--ignore-recommended", action="store_true")
+    for name in ("up", "verify", "activate", "rollback", "status"):
+        sub.add_parser(name)
+    args = parser.parse_args()
+    if args.command == "modules": return cmd_modules(args)
+    if args.command == "up":
+        read_config(); write_config(read_config()); return compose("up", "-d")
+    if args.command == "verify": return verify()
+    if args.command == "status": return compose("ps")
+    nginx_a = Path("/etc/nginx/conf.d/roamerx-center-https.conf")
+    nginx_b = Path("/etc/nginx/conf.d/roamerx-center.conf")
+    backup = STATE / "nginx-backup"
+    if args.command == "activate":
+        backup.mkdir(parents=True, exist_ok=True)
+        for path in (nginx_a, nginx_b):
+            if path.exists() and not (backup / path.name).exists(): shutil.copy2(path, backup / path.name)
+        print("Nginx activation template is packaged under release/nginx; copy it to the host, then run nginx -t.")
+        return 0
+    if args.command == "rollback":
+        for path in (nginx_a, nginx_b):
+            saved = backup / path.name
+            if saved.exists(): shutil.copy2(saved, path)
+        subprocess.run(["nginx", "-t"], check=True); subprocess.run(["systemctl", "reload", "nginx"], check=True); return 0
+    return 0
+
+if __name__ == "__main__": sys.exit(main())
