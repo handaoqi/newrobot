@@ -988,6 +988,7 @@ async function ensureLoopNavigationReady(onProgress = () => {}) {
         mapId,
         robotId: robot.id,
         mapVersion,
+        waypoints: routeWaypoints.value,
         onProgress: repairProgress,
       })
       return outcome.navigationStatus

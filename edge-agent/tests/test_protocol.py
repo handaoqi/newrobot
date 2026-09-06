@@ -89,6 +89,18 @@ def test_accepts_nav_relocalize_with_global_seed():
     assert decode_message(payload).payload["command"]["seed_source"] == "global"
 
 
+def test_accepts_legacy_quick_then_global_relocalize_seed():
+    payload = json.loads(FIXTURE.read_text())
+    payload["message_type"] = "nav.relocalize"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {
+        "seed_source": "quick_then_global",
+        "scene_scope": "indoor",
+        "coordinate_mode": "local_only",
+    }
+    assert decode_message(payload).payload["command"]["seed_source"] == "quick_then_global"
+
+
 def test_nav_relocalize_rejects_unknown_seed_source():
     payload = json.loads(FIXTURE.read_text())
     payload["message_type"] = "nav.relocalize"

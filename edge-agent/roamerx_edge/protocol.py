@@ -247,7 +247,9 @@ def validate_command(envelope: MessageEnvelope) -> None:
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]
         seed_source = str(command.get("seed_source") or "last_trusted").strip()
-        if not supplied and seed_source not in {"mapping_start", "last_trusted", "global", "progressive"}:
+        if not supplied and seed_source not in {
+            "mapping_start", "last_trusted", "global", "progressive", "quick_then_global",
+        }:
             raise ProtocolError(
                 "INVALID_MESSAGE",
                 "nav.relocalize requires x, y and yaw or a supported seed_source",

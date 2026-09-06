@@ -31,6 +31,19 @@ test('initialization sends mapping-origin and route-waypoint candidates for prog
   assert.equal(progressiveLocalizationTimeoutMs(payload), 420_000)
 })
 
+test('active relocalization payload keeps the manually selected pose as a candidate', () => {
+  const manualPose = { x: 5, y: 6, yaw: 0.4 }
+  const payload = buildProgressiveLocalizationPayload({
+    mapId: 7,
+    mapVersion: 'v7',
+    waypoints: [manualPose, { x: 9, y: 10, yaw: -0.2 }],
+  })
+
+  assert.equal(payload.seed_source, 'progressive')
+  assert.deepEqual(payload.waypoints[0], manualPose)
+  assert.deepEqual(payload.waypoints[1], { x: 9, y: 10, yaw: -0.2 })
+})
+
 test('progressive initialization uses a bounded budget without accepting invalid points', () => {
   const payload = buildProgressiveLocalizationPayload({
     mapId: 7,

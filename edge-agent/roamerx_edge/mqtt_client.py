@@ -99,7 +99,7 @@ class EdgeMqttClient:
             LOGGER.info("MQTT msg topic=%s type=%s", message.topic, payload.get("message_type", "?"))
             if message.topic.endswith("/commands") and self._command_handler:
                 threading.Thread(
-                    target=self._command_handler,
+                    target=self._run_command_handler,
                     args=(payload,),
                     daemon=True,
                     name="mqtt-command",
@@ -108,6 +108,19 @@ class EdgeMqttClient:
                 self._sync_handler(payload)
         except Exception:
             LOGGER.exception("failed to handle center message topic=%s", message.topic)
+
+    def _run_command_handler(self, payload: dict) -> None:
+        """Keep command exceptions out of the MQTT callback thread.
+
+        Command validation and device execution are deliberately handled in a
+        worker thread.  A malformed or incompatible command must be logged as
+        a command failure, not terminate the worker with an uncaught traceback
+        while the platform waits for an acknowledgement.
+        """
+        try:
+            self._command_handler(payload)
+        except Exception:
+            LOGGER.exception("command handler failed")
 
     def publish_presence(self, message_type: str, payload: dict, retain: bool = False) -> None:
         self.publish(

@@ -194,7 +194,13 @@ class NavigationBoundaryManager:
 
     def observe_pose(self, map_id: str, x: float, y: float) -> dict:
         if not self.active or str(self.active.get("map_id") or "") != str(map_id):
-            return {"violation": "", "speed_limit_mps": None, "events": []}
+            return {
+                "violation": "",
+                "violation_changed": False,
+                "speed_limit_mps": None,
+                "speed_changed": False,
+                "events": [],
+            }
         violation = ""
         margin = max(0.0, float(self.active.get("safety_margin_m") or 0.0))
         outer = self.active.get("outer_polygon") or []

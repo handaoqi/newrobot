@@ -73,6 +73,19 @@ def test_boundary_persists_and_enforces_margin_route_and_speed(tmp_path):
     store.close()
 
 
+def test_boundary_observation_is_safe_before_map_activation(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    observation = NavigationBoundaryManager(store).observe_pose("map-1", 0.0, 0.0)
+    assert observation == {
+        "violation": "",
+        "violation_changed": False,
+        "speed_limit_mps": None,
+        "speed_changed": False,
+        "events": [],
+    }
+    store.close()
+
+
 def test_keepout_mask_rasterizes_outer_boundary_forbidden_zone_and_margin(tmp_path):
     result = write_keepout_mask({
         "map_id": "map-1", "revision": 1,
