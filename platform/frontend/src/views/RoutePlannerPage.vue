@@ -3713,8 +3713,8 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   --route-main-action-height: 38px;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(260px, 0.8fr) minmax(300px, 0.9fr);
-  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
+  grid-template-rows: auto minmax(620px, max-content) auto auto;
   column-gap: 1rem;
   row-gap: 0.45rem;
   height: auto;
@@ -3863,7 +3863,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 {
   grid-column: 4;
-  grid-row: 2;
+  grid-row: 3;
   align-self: stretch;
   min-height: 620px;
   height: auto;
@@ -4803,8 +4803,8 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
-  grid-column: 3;
-  grid-row: 3;
+  grid-column: 4;
+  grid-row: 2;
   min-width: 0;
   min-height: 0;
   max-height: 58px;
@@ -5347,7 +5347,7 @@ async function handleDeleteRoute(route) {
 }
 
 .route-keyframe-row {
-  grid-column: 1 / span 2;
+  grid-column: 1 / span 3;
   grid-row: 3;
   min-width: 0;
   align-self: start;
