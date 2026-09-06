@@ -46,6 +46,9 @@ known_hosts*
 /.ros/
 /.ssh/
 /.vscode-server/
+/.copilot/
+/.cursor/
+/.cursor-server/
 /.wget-hsts
 /.codex-robot-write-test
 /.bashrc.before-*
@@ -66,3 +69,7 @@ known_hosts*
 # not reproducible project sources.
 /platform/frontend/*.tmp.mjs
 /runtime/roamerx-build-quarantine-*/
+/vscode:/
+/vscode-remote:/
+/roamerx-platform-docker-validation-*.tar.gz
+/roamerx-platform-docker-validation-*.sha256

@@ -291,6 +291,89 @@ def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     assert [item["status"] for item in result["attempts"][:2]] == ["rejected", "accepted"]
 
 
+def test_quick_then_global_stops_on_strict_optimal_ndt_candidate():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_quick_search_seconds=30.0,
+        localization_optimal_ndt_score=0.01,
+    )
+    adapter._start_localization_operation = lambda *_args, **_kwargs: 7
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._report_localization_attempts = lambda *_args, **_kwargs: None
+    adapter.latest_trusted_pose = lambda: {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.0}
+    adapter._current_live_pose = lambda: None
+    adapter._relocalization_candidates = lambda x, y, z, yaw: [
+        {"x": x, "y": y, "z": z, "yaw": yaw},
+        {"x": x, "y": y, "z": z, "yaw": yaw + 0.5},
+    ]
+
+    def probe(seed, _generation, **kwargs):
+        return {
+            "index": kwargs["index"],
+            "status": "rejected",
+            "seed_pose": seed,
+            "stage": kwargs["extra"]["stage"],
+            "ndt_candidate": {
+                "eligible": True,
+                "matching_error": 0.009,
+                "stable_frames": 3,
+                "required_stable_frames": 3,
+                "matched_pose": {**seed},
+            },
+        }
+
+    adapter._probe_localization_seed = probe
+    adapter._commit_best_relocalization_candidate = (
+        lambda _generation, _seed, candidate, _attempts: {
+            "best_ndt_candidate": candidate,
+            "best_match_pose": candidate["matched_pose"],
+            "best_ndt_committed": True,
+        }
+    )
+    adapter._global_relocalize_once = lambda *_args: pytest.fail("global search must stay idle")
+
+    result = adapter.quick_then_global_relocalize(
+        origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        scene_scope="indoor",
+        wait_seconds=60.0,
+    )
+
+    assert result["early_stopped"] is True
+    assert result["global_search_started"] is False
+    assert result["evaluated_candidate_count"] == 1
+    assert result["attempts"][1]["status"] == "skipped"
+
+
+def test_rtk_drift_verification_requires_fresh_consecutive_samples_below_threshold():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_rtk_max_drift_m=0.30,
+        localization_rtk_required_samples=3,
+    )
+    adapter._assert_localization_operation = lambda _generation: None
+    samples = iter([
+        {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
+         "rtk_drift": {"sample_stamp_ns": 10, "source": "aligned_fast_lio", "xy_m": 0.31}},
+        {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
+         "rtk_drift": {"sample_stamp_ns": 11, "source": "aligned_fast_lio", "xy_m": 0.20}},
+        {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
+         "rtk_drift": {"sample_stamp_ns": 12, "source": "aligned_fast_lio", "xy_m": 0.19}},
+        {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
+         "rtk_drift": {"sample_stamp_ns": 13, "source": "aligned_fast_lio", "xy_m": 0.18}},
+    ])
+    adapter._localization_decision = lambda: next(samples)
+
+    result = adapter._wait_for_verified_rtk_drift(
+        timeout_seconds=1.0,
+        generation=7,
+        after_stamp_ns=9,
+    )
+
+    assert result["verified"] is True
+    assert result["stable_frames"] == 3
+    assert result["xy_m"] == pytest.approx(0.18)
+
+
 def test_active_relocalize_executes_the_one_meter_candidates():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 12
@@ -869,6 +952,48 @@ def test_planner_profile_restores_indoor_defaults_and_enables_outdoor_rtk():
             "GridBased.tolerance": 2.0,
         },
     )
+    before = len(calls)
+    adapter.apply_outdoor_gps_profile(outdoor=True)
+    assert len(calls) == before
+
+
+def test_waypoint_profile_skips_identical_rewrite(monkeypatch):
+    adapter = object.__new__(RosAdapter)
+    adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
+    monkeypatch.setattr(
+        "roamerx_edge.ros_adapter.Bool",
+        lambda: SimpleNamespace(data=False),
+    )
+    adapter._rtk_is_navigation_pose_source = lambda: False
+    adapter.set_local_controller = lambda *_args, **_kwargs: None
+    calls = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: calls.append(node)
+
+    kwargs = dict(avoid_obstacles=True, require_yaw=False, outdoor=True)
+    adapter.set_waypoint_profile(**kwargs)
+    first = len(calls)
+    assert first > 0
+    adapter.set_waypoint_profile(**kwargs)
+    assert len(calls) == first
+
+
+def test_remote_param_cooldown_skips_unavailable_nodes():
+    from roamerx_edge.protocol import ProtocolError
+
+    adapter = object.__new__(RosAdapter)
+    adapter._remote_param_cache = {}
+    adapter._remote_param_unavailable_until = {}
+    adapter._mark_remote_param_unavailable("/collision_monitor")
+    try:
+        adapter._set_remote_parameters(
+            "/collision_monitor",
+            {"PolygonStop.enabled": True},
+            code="WAYPOINT_PROFILE_FAILED",
+            attempts=1,
+        )
+        assert False, "expected cooldown ProtocolError"
+    except ProtocolError as exc:
+        assert "cooldown" in str(exc).lower() or "recently unavailable" in str(exc).lower()
 
 
 def test_disabling_goal_precision_does_not_raise_on_timeout(monkeypatch):

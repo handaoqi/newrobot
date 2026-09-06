@@ -34,9 +34,9 @@ localization:
       num_threads: 2
     # Indoor / poor-RTK primary: FAST-LIO2 frontend odom into the UKF every
     # frame. NDT/VGICP is the absolute correction. Fixed RTK that stays
-    # self-consistent for ~3s is fully trusted to correct LIO drift; only an
-    # instantaneous RTK jump is rejected. prefer_fixed_rtk may still promote
-    # GPS as the continuous navigation source when dual-antenna heading is good.
+    # self-consistent for ~1s is fully trusted to correct LIO drift; only an
+    # instantaneous RTK jump is rejected. Outdoor navigation now promotes
+    # GPS as the continuous Nav2 pose when dual-antenna heading is also good.
     lio_primary:
       enable: true
       topic: "/odom/lio_odom"
@@ -61,15 +61,19 @@ localization:
       max_correction_yaw_deg: 30.0
       # Fixed RTK trust: LIO↔RTK residual size never hard-rejects a fixed
       # solution. Oversized corrections apply only after GPS itself stays
-      # within stable_span_m for stable_window_seconds. Only instantaneous
+      # within stable_span_m for stable_window_seconds (~1s). Only instantaneous
       # RTK source jumps (>max_correction_jump_m) are untrusted.
       # Self-stable fixed RTK also trusts dual-antenna heading (bypasses the
       # 30 deg yaw gate) so XY-only corrections cannot leave a yaw death spiral.
+      # While navigating, fixed RTK is preferred over NDT for pose regulation.
       rtk_trust:
-        stable_window_seconds: 3.0
+        stable_window_seconds: 1.0
         stable_span_m: 0.35
         trusted_correction_translation_rate_mps: 1.0
         trusted_correction_rotation_rate_degps: 30.0
+        # Prefer fixed RTK over NDT whenever both are eligible (lost recovery
+        # and in-motion navigation pose regulation).
+        prefer_fixed_for_correction: true
       correct_xy_variance: 0.010
       correct_z_variance: 0.020
       correct_orientation_variance: 0.001
@@ -94,8 +98,10 @@ localization:
         completion_rotation_deg: 0.25
       correction_gate:
         # Shared by NDT/VGICP and RTK so auxiliary sources cannot ping-pong.
-        min_interval_seconds: 3.0
-        post_suppression_seconds: 3.0
+        # Keep near the 1s RTK trust window so fixed RTK can keep regulating
+        # Nav2 pose during motion without waiting several seconds between pulls.
+        min_interval_seconds: 1.0
+        post_suppression_seconds: 1.0
     # navigation_bringup's odom_to_tf_broadcaster is the sole owner of
     # map->odom and odom->base_link.  It converts /odom/localization_odom to
     # /odom/nav2, so do not also publish a controller-odometry TF chain here.
@@ -154,11 +160,11 @@ localization:
 
     source_arbiter:
       enable: true
-      # Outdoor default keeps FAST-LIO as the continuous pose. Fixed RTK XY
-      # corrects intermittently; dual-antenna heading is optional for path
-      # following (Nav2 uses waypoint-to-waypoint travel yaw). Set true only
-      # when sustained dual-antenna heading is known-good and GPS should drive.
-      prefer_fixed_rtk: false
+      # Outdoor navigation: fixed RTK XY + dual-antenna heading drives Nav2
+      # when both stay good for ~2s. FAST-LIO/NDT remains the fallback if
+      # GPS or heading drops. LIO-only path following is too easy to walk
+      # off an RTK-aligned map when scan matching cannot re-anchor.
+      prefer_fixed_rtk: true
       # When prefer_fixed_rtk is enabled, require ~2s of fixed+heading before
       # promoting and ~0.8s of loss before demoting, then suppress LIO yaw-step
       # false positives during the handoff.

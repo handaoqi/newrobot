@@ -120,6 +120,56 @@ const navigationStatus = {
   },
 }
 
+const developmentTask = {
+  id: 'dev-task-1',
+  robot: 1,
+  workspace: 'robot-main',
+  model: 'gpt-5.6-terra',
+  prompt: '检查室外 RTK 定位链路，并说明当前状态。',
+  status: 'running',
+  status_label: '执行中',
+  created_at: '2026-08-24T08:30:00+08:00',
+  started_at: '2026-08-24T08:30:05+08:00',
+  finished_at: null,
+  exit_code: null,
+  can_cancel: true,
+  codex_thread_id: 'thread-tablet-development',
+}
+
+const developmentConversation = {
+  codex_thread_id: developmentTask.codex_thread_id,
+  tasks: [developmentTask],
+  turns: [{
+    task: developmentTask,
+    events: [
+      {
+        sequence: 1,
+        type: 'status',
+        stream: 'stdout',
+        text: 'Codex 正在检查定位遥测与 RTK 状态。',
+        occurred_at: '2026-08-24T08:30:06+08:00',
+      },
+      {
+        sequence: 2,
+        type: 'output',
+        stream: 'stdout',
+        text: '实时输出应始终可见，不应被会话记录覆盖。',
+        occurred_at: '2026-08-24T08:30:07+08:00',
+      },
+    ],
+  }],
+}
+
+const developmentVoiceRecognitions = Array.from({ length: 8 }, (_, index) => ({
+  id: index + 1,
+  outcome: 'accepted',
+  outcome_label: '已执行',
+  created_at: `2026-08-24T08:${String(20 + index).padStart(2, '0')}:00+08:00`,
+  transcript: `小太阳，继续第 ${index + 1} 条远程开发指令。`,
+  asr_engine: 'whisper',
+  command: '继续开发',
+}))
+
 const patrolTasks = [{
   id: 40,
   name: '公园主通道例行巡检',
@@ -137,11 +187,47 @@ const routeDetail = {
   id: 10,
   name: '南门—主步道—活动广场',
   map_data: 20,
+  robot: 1,
+  waypoint_names: ['南门', '主步道', '活动广场'],
+  description: '主步道巡检路线',
+  scene_scope: 'indoor',
+  global_controller: 'navfn',
   waypoints: [
-    { id: 1, name: '南门', sequence: 0, map_point_number: 1, x: 1, y: 1, yaw: 0 },
-    { id: 2, name: '主步道', sequence: 1, map_point_number: 2, x: 3, y: 2, yaw: 0.4 },
+    { id: 1, name: '南门', sequence: 0, map_point_number: 1, x: 1, y: 1, yaw: 0, global_controller: 'theta_star' },
+    { id: 2, name: '主步道', sequence: 1, map_point_number: 2, x: 3, y: 2, yaw: 0.4, global_controller: 'navfn' },
     { id: 3, name: '活动广场', sequence: 2, map_point_number: 3, x: 5, y: 4, yaw: 0.8 },
   ],
+}
+
+const routeSummary = {
+  id: routeDetail.id,
+  name: routeDetail.name,
+  map_data: routeDetail.map_data,
+  robot: routeDetail.robot,
+  waypoint_count: routeDetail.waypoints.length,
+  // Compatibility shape from older deployments: a compact summary may
+  // contain an empty placeholder even though waypoint_count is non-zero.
+  waypoints: [],
+  global_controller: routeDetail.global_controller,
+  latest_execution: {
+    id: 'route-execution-10',
+    state: 'completed',
+    created_at: '2026-08-24T08:30:00+08:00',
+  },
+}
+
+const defaultRouteExecution = {
+  id: 'route-execution-10',
+  route: 10,
+  route_name: routeDetail.name,
+  state: 'completed',
+  completed_waypoints: 3,
+  current_waypoint_index: 2,
+  created_at: '2026-08-24T08:30:00+08:00',
+  started_at: '2026-08-24T08:30:01+08:00',
+  finished_at: '2026-08-24T08:30:12+08:00',
+  route_snapshot: { waypoints: routeDetail.waypoints },
+  events: [],
 }
 
 const mapDetail = {
@@ -171,9 +257,17 @@ function responseFor(pathname, method) {
     return { robot_id: 1, robot_code: robot.code, result: { save_progress: { slam_health: { state: 'healthy' } } } }
   }
   if (path === '/robots/1/navigation/status/') return navigationStatus
+  if (path === '/development/agents/') return [{ robot: 1, status: 'online', agent_version: '0.1.0' }]
+  if (path === '/development/conversations/main/') return developmentConversation
+  if (path === '/development/tasks/') return [developmentTask]
+  if (path === '/voice-recognitions/') return developmentVoiceRecognitions
   if (path === '/patrol-tasks/') return patrolTasks
+  if (path === '/routes/') return [routeSummary]
   if (path === '/routes/10/') return routeDetail
+  if (path === '/maps/') return [mapDetail]
+  if (path === '/map-sets/') return []
   if (path === '/maps/20/') return mapDetail
+  if (path === '/maps/20/mapping-trace/') return { samples: [] }
   if (path === '/speech-categories/') return [{ id: 1, name: '现场提醒' }]
   if (path === '/speech-templates/') {
     return [{ id: 1, name: '文明通行提醒', text: '您好，请保持通道畅通。', category: 1, category_name: '现场提醒' }]
@@ -183,7 +277,11 @@ function responseFor(pathname, method) {
   return {}
 }
 
-export async function installTabletMocks(page, { authenticated }) {
+export async function installTabletMocks(page, {
+  authenticated,
+  routeExecution = defaultRouteExecution,
+  mapThumbnailUrl = null,
+} = {}) {
   await page.addInitScript(({ shouldAuthenticate }) => {
     if (shouldAuthenticate) {
       localStorage.setItem('inspection_token', 'tablet-visual-token')
@@ -203,7 +301,25 @@ export async function installTabletMocks(page, { authenticated }) {
 
   await page.route('**/api/**', async (route) => {
     const request = route.request()
-    const body = responseFor(new URL(request.url()).pathname, request.method())
+    const pathname = new URL(request.url()).pathname
+    if (!pathname.startsWith('/api/')) {
+      await route.fallback()
+      return
+    }
+    const apiPath = pathname.replace(/^\/api/, '')
+    let body
+    if (apiPath === '/routes/10/execute/' && request.method() === 'POST') {
+      body = routeExecution
+    } else if (apiPath === `/task-executions/${routeExecution.id}/`) {
+      body = routeExecution
+    } else if (apiPath === `/task-executions/${routeExecution.id}/trajectory/`) {
+      body = { points: [] }
+    } else if (mapThumbnailUrl && ['/maps/', '/maps/20/'].includes(apiPath)) {
+      const map = { ...mapDetail, thumbnail_url: mapThumbnailUrl }
+      body = apiPath === '/maps/' ? [map] : map
+    } else {
+      body = responseFor(pathname, request.method())
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',

@@ -22,10 +22,14 @@ import {
   navigateSingleGoal,
   sendRobotNavigationCommand,
   restartRobotSensor,
+  fetchMapNavigationBoundary,
+  saveMapNavigationBoundary,
+  publishMapNavigationBoundary,
   synthesizeSpeech,
 } from '../services/api'
 import { API_BASE } from '../services/api'
 import RobotDogIcon from '../components/RobotDogIcon.vue'
+import SystemLogPanel from '../components/SystemLogPanel.vue'
 import {
   KEYFRAME_PAGE_SIZE,
   MAP_ZOOM_MAX,
@@ -55,7 +59,6 @@ import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from 
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import {
   initializeProgressiveLocalization,
-  shouldInitializeFromRtk,
 } from '../services/progressiveLocalization'
 import {
   attemptSeedPose,
@@ -81,6 +84,11 @@ import {
 import { preferredExecutedItem } from '../utils/executionSelection'
 import { resolveBatteryPercent } from '../utils/battery'
 import { isLowBatteryBlocked, lowBatteryGuardMessage } from '../utils/guardDutyLowBattery'
+import {
+  buildTaskExecutionTimeline,
+  resolveTaskExecutionWaypointProgress,
+  taskExecutionIsActive,
+} from '../services/taskExecutionWaypointProgress'
 
 const maps = ref([])
 const mapSets = ref([])
@@ -96,6 +104,10 @@ const speechCategories = ref([])
 const speechTemplates = ref([])
 const selectedMap = ref(null)
 const selectedMapVersion = () => expectedLegacyMapVersion(selectedMap.value?.id)
+const mapOriginDisplay = computed(() => selectedMap.value?.origin_display || null)
+const mapFrameOrigin = computed(() => mapOriginDisplay.value?.map || { x: 0, y: 0, yaw: 0 })
+const occupancyGridOrigin = computed(() => mapOriginDisplay.value?.occupancy_grid || null)
+const rtkEnuOrigin = computed(() => mapOriginDisplay.value?.rtk_enu || null)
 const selectedRoute = ref(null)
 const waypoints = ref([])
 const waypointNames = ref([])
@@ -109,6 +121,8 @@ const navStatus = ref(null)
 const navCommandBusy = ref('')
 const sensorCommandBusy = ref('')
 const navError = ref('')
+const routeLoadError = ref('')
+const routeLoading = ref(false)
 const routeExecuteBusy = ref(false)
 const lastExecution = ref(null)
 const taskMapExecution = ref(null)
@@ -126,6 +140,7 @@ const relocalizationMarkers = ref([])
 const lastLocalizationStatus = ref('')
 const poseHistory = ref([])
 const showPoseTrail = ref(true)
+const showLocalizationAttemptPoints = ref(true)
 const mappingTrace = ref([])
 const mappingTraceLoading = ref(false)
 const showMappingTrace = ref(true)
@@ -142,6 +157,13 @@ const waypointYawErrors = ref([])
 const waypointYawConfirmed = ref([])
 const singleGoalIndex = ref(null)
 const selectedSingleGoalIndex = ref(0)
+const selectedLogPoint = ref(null)
+const boundaryConfig = ref(null)
+const boundaryEditing = ref(false)
+const boundaryDrawType = ref('outer')
+const boundaryDraftPoints = ref([])
+const boundaryBusy = ref('')
+const boundaryError = ref('')
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   taskMapExecution.value,
   taskMapTrajectory.value,
@@ -149,6 +171,7 @@ const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
 ))
 const visibleAttemptMarkers = computed(() => {
   attemptMarkerTick.value
+  if (!showLocalizationAttemptPoints.value) return []
   const session = localizationAttemptSession.value
   if (!shouldShowAttemptMarkers(session)) return []
   return session.attempts
@@ -170,8 +193,11 @@ const drillCurrentIndex = ref(null)
 const drillMessage = ref('')
 const drillTimeline = ref([])
 const drillTimelineOpen = ref(false)
+const drillTimelineMode = ref('simulation')
 const drillElapsedSeconds = ref(0)
 const drillCurrentSpeed = ref(0)
+const routePreviewRequestedAt = ref(0)
+const routePreviewError = ref('')
 const expandedWaypoints = ref(new Set())
 const routeListOpen = ref(false)
 const navigationPoller = useAsyncPoller((signal) => refreshNavigationStatus({ signal }), {
@@ -189,6 +215,12 @@ let navigationStatusRefreshing = false
 let inspectionPointSequence = 0
 let initialSelectionApplied = false
 let attemptMarkerTimer = null
+let routeLoadSequence = 0
+
+const GLOBAL_CONTROLLER_OPTIONS = [
+  { value: 'theta_star', label: 'Theta*' },
+  { value: 'navfn', label: 'NavFn (A*)' },
+]
 
 const routeForm = ref({
   name: '',
@@ -203,6 +235,51 @@ const allWaypointsExpanded = computed(() => (
   waypoints.value.length > 0
   && waypoints.value.every((_, index) => expandedWaypoints.value.has(index))
 ))
+const routeExecutionProgress = computed(() => resolveTaskExecutionWaypointProgress(taskMapExecution.value))
+const routeExecutionTimeline = computed(() => buildTaskExecutionTimeline(taskMapExecution.value, {
+  requestedAt: routePreviewRequestedAt.value,
+  requestError: routePreviewError.value,
+}))
+const displayedDrillTimeline = computed(() => (
+  drillTimelineMode.value === 'execution' ? routeExecutionTimeline.value : drillTimeline.value
+))
+const routeExecutionRunning = computed(() => (
+  drillTimelineMode.value === 'execution'
+  && (routeExecuteBusy.value || taskExecutionIsActive(taskMapExecution.value))
+))
+const timelineRunning = computed(() => (
+  drillTimelineMode.value === 'execution' ? routeExecutionRunning.value : drillRunning.value
+))
+const drillTimelineSourceLabel = computed(() => (
+  drillTimelineMode.value === 'execution' ? '真实预演' : '模拟演练'
+))
+const drillTimelineEmptyText = computed(() => (
+  drillTimelineMode.value === 'execution'
+    ? '路线下发后，这里会按顺序显示航点目标下发和实际到达过程。'
+    : '点击“演练开始”后，这里会记录模拟移动、到达点位和播报内容。'
+))
+const drillTimelineSummary = computed(() => {
+  if (drillTimelineMode.value === 'execution') {
+    const progress = routeExecutionProgress.value
+    const execution = taskMapExecution.value
+    const currentTarget = progress.activeTarget
+    const currentLabel = currentTarget?.payload?.waypoint?.map_point_number
+      ?? progress.currentMapPointNumber
+    const speed = Number(navStatus.value?.status?.speed_mps || 0)
+    return [
+      { label: '用时', value: formatDrillElapsed(drillElapsedSeconds.value) },
+      { label: '当前目标', value: currentLabel !== null && currentLabel !== undefined ? `${currentLabel}号点` : (execution ? '等待目标' : '等待下发') },
+      { label: '进度', value: `${Number(execution?.completed_waypoints || 0)} / ${progress.totalWaypoints || waypoints.value.length}` },
+      { label: '当前速度', value: `${speed.toFixed(2)} m/s` },
+    ]
+  }
+  return [
+    { label: '用时', value: formatDrillElapsed(drillElapsedSeconds.value) },
+    { label: '当前点位', value: drillCurrentIndex.value == null ? '未开始' : (waypointNames.value[drillCurrentIndex.value] || `点${drillCurrentIndex.value + 1}`) },
+    { label: '当前速度', value: `${drillCurrentSpeed.value.toFixed(2)} m/s` },
+    { label: '事件', value: String(displayedDrillTimeline.value.length) },
+  ]
+})
 
 onMounted(async () => {
   await loadData()
@@ -213,6 +290,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  routeLoadSequence += 1
   window.removeEventListener('resize', refreshImageGeometry)
   stopDrill(false)
   if (attemptMarkerTimer) {
@@ -278,8 +356,171 @@ watch(() => selectedRobot.value?.id, () => {
   lastLocalizationStatus.value = ''
 })
 
+watch(() => displayedDrillTimeline.value.at(-1)?.id, () => {
+  nextTick(() => {
+    if (drillTimelineListRef.value) {
+      drillTimelineListRef.value.scrollTop = drillTimelineListRef.value.scrollHeight
+    }
+  })
+})
+
+watch(() => selectedMap.value?.id, async (mapId) => {
+  boundaryEditing.value = false
+  boundaryDraftPoints.value = []
+  selectedLogPoint.value = null
+  boundaryError.value = ''
+  if (!mapId) {
+    boundaryConfig.value = null
+    return
+  }
+  try {
+    boundaryConfig.value = await fetchMapNavigationBoundary(mapId)
+  } catch (error) {
+    boundaryConfig.value = null
+    boundaryError.value = error.message || '导航边界加载失败'
+  }
+})
+
+function startBoundaryDrawing(type) {
+  ensureBoundaryConfig()
+  boundaryEditing.value = true
+  boundaryDrawType.value = type
+  boundaryDraftPoints.value = []
+  initialPoseMode.value = false
+  boundaryError.value = ''
+}
+
+function ensureBoundaryConfig() {
+  if (boundaryConfig.value) return boundaryConfig.value
+  boundaryConfig.value = {
+    revision: 0,
+    active_revision: 0,
+    apply_status: 'unconfigured',
+    outer_polygon: [],
+    safety_margin_m: 0.2,
+    zones: [],
+  }
+  return boundaryConfig.value
+}
+
+function toggleBoundaryEditing() {
+  if (!boundaryEditing.value) ensureBoundaryConfig()
+  boundaryEditing.value = !boundaryEditing.value
+  if (!boundaryEditing.value) boundaryDraftPoints.value = []
+  boundaryError.value = ''
+}
+
+function cancelBoundaryDrawing() {
+  boundaryDraftPoints.value = []
+  boundaryError.value = ''
+}
+
+function finishBoundaryDrawing() {
+  if (boundaryDraftPoints.value.length < 3) {
+    boundaryError.value = '至少需要三个边界点'
+    return
+  }
+  const polygon = boundaryDraftPoints.value.map(point => [Number(point.x), Number(point.y)])
+  if (!boundaryConfig.value) boundaryConfig.value = { revision: 0, outer_polygon: [], safety_margin_m: 0.2, zones: [] }
+  if (boundaryDrawType.value === 'outer') boundaryConfig.value.outer_polygon = polygon
+  else {
+    const labels = { forbidden: '禁入区', restricted: '限速区', warning: '警告区' }
+    boundaryConfig.value.zones.push({
+      name: `${labels[boundaryDrawType.value]}${boundaryConfig.value.zones.length + 1}`,
+      zone_type: boundaryDrawType.value,
+      polygon,
+      active: true,
+      speed_limit_mps: boundaryDrawType.value === 'restricted' ? 0.15 : null,
+      warning_distance_m: 0.5,
+      description: '',
+    })
+  }
+  boundaryDraftPoints.value = []
+  boundaryError.value = ''
+}
+
+function removeBoundaryZone(index) {
+  boundaryConfig.value.zones.splice(index, 1)
+}
+
+async function saveBoundaryDraft() {
+  if (!selectedMap.value || !boundaryConfig.value?.outer_polygon?.length) {
+    boundaryError.value = '请先绘制可行驶外边界'
+    return
+  }
+  boundaryBusy.value = 'save'
+  boundaryError.value = ''
+  try {
+    boundaryConfig.value = await saveMapNavigationBoundary(selectedMap.value.id, boundaryConfig.value)
+  } catch (error) {
+    boundaryError.value = error.message || '导航边界保存失败'
+  } finally {
+    boundaryBusy.value = ''
+  }
+}
+
+async function publishBoundary() {
+  if (!selectedMap.value || !boundaryConfig.value?.revision) {
+    boundaryError.value = '请先保存边界草稿'
+    return
+  }
+  boundaryBusy.value = 'publish'
+  boundaryError.value = ''
+  try {
+    const published = await publishMapNavigationBoundary(selectedMap.value.id, selectedRobot.value?.id)
+    boundaryConfig.value = published
+    if (published.command_id && selectedRobot.value?.id) {
+      await waitForRobotCommand(
+        selectedRobot.value.id,
+        { id: published.command_id, status: 'created' },
+        { timeoutMs: 240_000 },
+      )
+      boundaryConfig.value = await fetchMapNavigationBoundary(selectedMap.value.id)
+    }
+  } catch (error) {
+    boundaryError.value = error.message || '导航边界发布失败'
+    try {
+      boundaryConfig.value = await fetchMapNavigationBoundary(selectedMap.value.id)
+    } catch {
+      // Keep the publish error as the operator-facing diagnosis.
+    }
+  } finally {
+    boundaryBusy.value = ''
+  }
+}
+
+function boundaryPolygonPoints(polygon = []) {
+  return polygon.map(point => pointDisplayPositionFromMap(point[0], point[1])).filter(Boolean).map(point => `${point.x},${point.y}`).join(' ')
+}
+
+function boundaryDraftPolyline() {
+  return boundaryDraftPoints.value.map(point => pointDisplayPositionFromMap(point.x, point.y)).filter(Boolean).map(point => `${point.x},${point.y}`).join(' ')
+}
+
+function boundaryStatusPresentation() {
+  const boundary = boundaryConfig.value
+  if (!boundary?.outer_polygon?.length) {
+    return { tone: 'warning', title: '导航边界未配置', detail: '当前地图按兼容模式运行；建议绘制外边界并发布后再执行任务。' }
+  }
+  if (boundary.apply_status === 'failed') {
+    return { tone: 'error', title: `边界 v${boundary.revision} 发布失败`, detail: boundary.apply_error || '请检查 Edge 与 Nav2 日志后重试。' }
+  }
+  if (boundary.apply_status === 'applying') {
+    return { tone: 'applying', title: `边界 v${boundary.revision} 正在发布`, detail: 'Edge 确认并加载 Nav2 过滤图层后才会标记为生效。' }
+  }
+  if (Number(boundary.active_revision || 0) < Number(boundary.revision || 0)) {
+    return { tone: 'warning', title: `草稿 v${boundary.revision} 尚未生效`, detail: `机器人继续使用已生效版本 v${boundary.active_revision || 0}。` }
+  }
+  return { tone: 'active', title: `导航边界 v${boundary.active_revision} 已生效`, detail: '外边界、禁入区和安全距离已参与 Nav2 规划与 Edge 运行时保护。' }
+}
+
+function locateSystemLog(log) {
+  selectedLogPoint.value = { x: Number(log.x), y: Number(log.y), yaw: Number(log.yaw || 0) }
+  nextTick(() => centerMapOnPoint(selectedLogPoint.value))
+}
+
 function resetWaypointExpansion() {
-  expandedWaypoints.value = new Set()
+  expandedWaypoints.value = new Set(waypoints.value.map((_, index) => index))
 }
 
 function isWaypointExpanded(index) {
@@ -328,6 +569,10 @@ function seedRobotsFromMapsAndRoutes() {
 }
 
 async function handleMapSelect(map) {
+  resetDrillTimelineView()
+  routeLoadSequence += 1
+  routeLoading.value = false
+  routeLoadError.value = ''
   selectedMap.value = map
   selectedRoute.value = null
   lastExecution.value = null
@@ -349,6 +594,7 @@ async function handleMapSelect(map) {
     robot: routeForm.value.robot || robots.value[0]?.id || map?.robot || 1,
     description: '',
     scene_scope: map?.scene_scope || 'indoor',
+    global_controller: 'theta_star',
   }
   refreshImageGeometry()
   refreshNavigationStatus()
@@ -406,6 +652,11 @@ function handleMapClick(event) {
 
   const imagePoint = displayToImagePoint(displayX, displayY, geometry)
   const clickedMapPoint = imagePointToWaypoint(imagePoint, geometry)
+  if (boundaryEditing.value) {
+    boundaryDraftPoints.value.push({ x: clickedMapPoint.x, y: clickedMapPoint.y })
+    boundaryError.value = ''
+    return
+  }
   const clickAction = resolveMapClickAction(mapClickMode.value, initialPoseMode.value)
   if (clickAction === 'initial_pose') {
     const clickedPose = imagePointToWaypoint(imagePoint, geometry, Number(manualInitialPose.value?.yaw || 0))
@@ -458,6 +709,7 @@ function handleMapClick(event) {
   resetInspectedMapPoint()
   const waypoint = imagePointToWaypoint(imagePoint, geometry)
   waypoints.value.push(waypoint)
+  expandedWaypoints.value = new Set([...expandedWaypoints.value, waypoints.value.length - 1])
   waypointNames.value.push(`点${waypoints.value.length}`)
   waypointYawDrafts.value.push(waypointYawDegrees(waypoint).toFixed(1))
   waypointYawErrors.value.push('')
@@ -563,6 +815,13 @@ function setWaypointLocalController(index, mode) {
   }
 }
 
+function setWaypointGlobalController(index, mode) {
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    global_controller: normalizeGlobalController(mode),
+  }
+}
+
 const mapIsLocalOnly = computed(() => {
   const mode = selectedMap.value?.coordinate_mode || ''
   return mode === 'local_only'
@@ -609,7 +868,16 @@ async function executeSingleGoal(index) {
   if (!confirm(`确认通过云平台导航到${waypointNames.value[index] || `点${index + 1}`}？`)) return
   navCommandBusy.value = 'single-goal'; singleGoalIndex.value = index; navError.value = ''
   try {
-    await navigateSingleGoal(robotId, { frame_id: 'map', x: Number(point.x), y: Number(point.y), yaw: Number(point.yaw || 0), require_yaw: Boolean(point.require_yaw), map_id: selectedMap.value.id, map_version: selectedMapVersion() })
+    await navigateSingleGoal(robotId, {
+      frame_id: 'map',
+      x: Number(point.x),
+      y: Number(point.y),
+      yaw: Number(point.yaw || 0),
+      require_yaw: Boolean(point.require_yaw),
+      global_controller: normalizeGlobalController(point.global_controller || routeForm.value.global_controller),
+      map_id: selectedMap.value.id,
+      map_version: selectedMapVersion(),
+    })
     navError.value = `已下发单点导航：${waypointNames.value[index] || `点${index + 1}`}`
   } catch (error) { navError.value = error.message || '单点导航下发失败' }
   finally { navCommandBusy.value = ''; singleGoalIndex.value = null; await refreshNavigationStatus() }
@@ -749,6 +1017,56 @@ function stopDrillClock() {
   }
 }
 
+function syncExecutionTimelineClock(execution = taskMapExecution.value) {
+  if (drillTimelineMode.value !== 'execution') return
+  const createdAt = Date.parse(execution?.created_at || execution?.started_at || '')
+  const startedAt = routePreviewRequestedAt.value
+    || (Number.isFinite(createdAt) ? createdAt : Date.now())
+  drillStartedAt = startedAt
+  const finishedAt = Date.parse(execution?.finished_at || '')
+  const terminal = execution && !taskExecutionIsActive(execution)
+  const endedAt = terminal && Number.isFinite(finishedAt) ? finishedAt : Date.now()
+  drillElapsedSeconds.value = Math.max(0, (endedAt - startedAt) / 1000)
+  if (terminal || routePreviewError.value) stopDrillClock()
+  else startDrillClock()
+}
+
+function openExecutionTimeline(execution = null, requestedAt = Date.now()) {
+  if (drillRunning.value) stopDrill(false)
+  drillTimelineMode.value = 'execution'
+  drillTimelineOpen.value = true
+  routePreviewRequestedAt.value = Number(requestedAt) || Date.now()
+  routePreviewError.value = ''
+  syncExecutionTimelineClock(execution)
+}
+
+function clearDisplayedDrillTimeline() {
+  if (timelineRunning.value) return
+  if (drillTimelineMode.value === 'execution') {
+    routePreviewRequestedAt.value = 0
+    routePreviewError.value = ''
+    drillTimelineMode.value = 'simulation'
+    drillElapsedSeconds.value = 0
+    drillStartedAt = null
+    stopDrillClock()
+    drillTimelineOpen.value = false
+    return
+  }
+  clearDrillTimeline()
+}
+
+function resetDrillTimelineView() {
+  if (drillRunning.value) stopDrill(false)
+  routePreviewRequestedAt.value = 0
+  routePreviewError.value = ''
+  drillTimelineMode.value = 'simulation'
+  drillTimeline.value = []
+  drillTimelineOpen.value = false
+  drillElapsedSeconds.value = 0
+  drillStartedAt = null
+  stopDrillClock()
+}
+
 function clearDrillTimeline() {
   if (drillRunning.value) return
   drillTimeline.value = []
@@ -881,6 +1199,9 @@ async function startDrill() {
     alert('演练至少需要起点和终点两个途经点')
     return
   }
+  drillTimelineMode.value = 'simulation'
+  routePreviewRequestedAt.value = 0
+  routePreviewError.value = ''
   drillCancelled = false
   drillTimeline.value = []
   drillTimelineOpen.value = true
@@ -1010,40 +1331,84 @@ async function handleSaveRoute() {
 }
 
 async function handleLoadRoute(route) {
-  const routeSummary = route
-  if (!route.waypoints) {
-    route = {
-      ...routeSummary,
-      ...await fetchRouteDetail(route.id),
-      latest_execution: routeSummary.latest_execution || null,
+  const routeSummary = { ...route }
+  const loadSequence = ++routeLoadSequence
+  routeLoading.value = true
+  routeLoadError.value = ''
+
+  let hydratedRoute
+  try {
+    const routeDetail = routeSummary.id
+      ? await fetchRouteDetail(routeSummary.id)
+      : routeSummary
+    if (loadSequence !== routeLoadSequence) return
+    if (!Array.isArray(routeDetail?.waypoints) || routeDetail.waypoints.length === 0) {
+      const expected = routeSummary.waypoint_count
+      if (typeof expected === 'number' && expected > 0) {
+        throw new Error(`路线摘要为 ${expected} 个点，详情未返回途经点数据`)
+      }
+      if (!Array.isArray(routeDetail?.waypoints)) {
+        throw new Error('路线详情未返回途经点数据')
+      }
     }
+    if (typeof routeSummary.waypoint_count === 'number'
+      && routeSummary.waypoint_count !== routeDetail.waypoints.length) {
+      throw new Error(`路线摘要为 ${routeSummary.waypoint_count} 个点，详情返回 ${routeDetail.waypoints.length} 个点`)
+    }
+    hydratedRoute = {
+      ...routeSummary,
+      ...routeDetail,
+      latest_execution: routeSummary.latest_execution || routeDetail.latest_execution || null,
+    }
+  } catch (error) {
+    if (loadSequence === routeLoadSequence) {
+      routeLoadError.value = `路线“${routeSummary.name || routeSummary.id || ''}”加载失败：${error.message || '未知错误'}`
+    }
+    return
+  } finally {
+    if (loadSequence === routeLoadSequence) routeLoading.value = false
   }
-  selectedRoute.value = route
-  lastExecution.value = route.latest_execution || null
-  resetWaypointExpansion()
-  let routeMap = maps.value.find(m => String(m.id) === String(route.map_data))
-    || (String(selectedMap.value?.id || '') === String(route.map_data) ? selectedMap.value : null)
-  if (!routeMap && route.map_data) {
+
+  if (loadSequence !== routeLoadSequence) return
+  if (String(selectedRoute.value?.id || '') !== String(hydratedRoute.id || '')) {
+    resetDrillTimelineView()
+  }
+  selectedRoute.value = hydratedRoute
+  lastExecution.value = hydratedRoute.latest_execution || null
+  const routeGlobalController = normalizeGlobalController(hydratedRoute.global_controller)
+  let routeMap = maps.value.find(m => String(m.id) === String(hydratedRoute.map_data))
+    || (String(selectedMap.value?.id || '') === String(hydratedRoute.map_data) ? selectedMap.value : null)
+  if (!routeMap && hydratedRoute.map_data) {
     try {
-      routeMap = await fetchMapDetail(route.map_data)
+      routeMap = await fetchMapDetail(hydratedRoute.map_data)
     } catch (error) {
       console.warn('加载路线关联地图失败:', error)
     }
   }
+  if (loadSequence !== routeLoadSequence) return
   const mapChanged = String(routeMap?.id) !== String(selectedMap.value?.id)
   selectedMap.value = routeMap
-  waypoints.value = (route.waypoints || []).map(point => ({ ...point }))
-  waypointNames.value = route.waypoint_names?.length
-    ? [...route.waypoint_names]
+  routeForm.value.global_controller = routeGlobalController
+  waypoints.value = hydratedRoute.waypoints.map(point => {
+    const normalizedPoint = Array.isArray(point)
+      ? { x: point[0], y: point[1], yaw: point[2] || 0 }
+      : { ...point }
+    return {
+      ...normalizedPoint,
+      global_controller: normalizeGlobalController(normalizedPoint.global_controller || routeGlobalController),
+    }
+  })
+  resetWaypointExpansion()
+  waypointNames.value = hydratedRoute.waypoint_names?.length
+    ? [...hydratedRoute.waypoint_names]
     : waypoints.value.map((_, index) => `点${index + 1}`)
   resetWaypointYawEditors()
-  routeForm.value.name = route.name
-  routeForm.value.description = route.description
-  routeForm.value.robot = route.robot || robots.value[0]?.id || null
-  routeForm.value.map_data = route.map_data
-  routeForm.value.map_set = route.map_set || null
-  routeForm.value.scene_scope = route.scene_scope || routeMap?.scene_scope || 'indoor'
-  routeForm.value.global_controller = normalizeGlobalController(route.global_controller)
+  routeForm.value.name = hydratedRoute.name
+  routeForm.value.description = hydratedRoute.description
+  routeForm.value.robot = hydratedRoute.robot || robots.value[0]?.id || null
+  routeForm.value.map_data = hydratedRoute.map_data
+  routeForm.value.map_set = hydratedRoute.map_set || null
+  routeForm.value.scene_scope = hydratedRoute.scene_scope || routeMap?.scene_scope || 'indoor'
   if (mapChanged) clearInspectedMapPoints()
   await nextTick()
   const [, detailedMap] = await Promise.all([
@@ -1073,6 +1438,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     speech_text: point.speech_text || '',
     localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
     local_controller: normalizeLocalController(point.local_controller),
+    global_controller: normalizeGlobalController(point.global_controller || routeForm.value.global_controller),
     avoidance_to_next: point.avoidance_to_next !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
@@ -1127,6 +1493,7 @@ function withWaypointYaw(points) {
       speech_template_name: current.speech_template_name || '',
       localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
       local_controller: normalizeLocalController(current.local_controller),
+      global_controller: normalizeGlobalController(current.global_controller || routeForm.value.global_controller),
       avoidance_to_next: current.avoidance_to_next !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
@@ -1151,6 +1518,22 @@ function waypointDisplayPosition(point) {
     left: `${imageX * (geometry.rect.width / geometry.mapWidth)}px`,
     top: `${imageY * (geometry.rect.height / geometry.mapHeight)}px`,
   }
+}
+
+function originPoseText(origin, xKey = 'x', yKey = 'y') {
+  if (!origin) return '未配置'
+  const x = Number(origin[xKey])
+  const y = Number(origin[yKey])
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return '未配置'
+  return `map (${x.toFixed(3)}, ${y.toFixed(3)})`
+}
+
+function rtkOriginTitle() {
+  const origin = rtkEnuOrigin.value
+  if (!origin) return '当前地图未锁定 RTK ENU 原点'
+  const latitude = Number(origin.latitude)
+  const longitude = Number(origin.longitude)
+  return `RTK ENU 原点 · ${latitude.toFixed(8)}, ${longitude.toFixed(8)} · ${originPoseText(origin, 'map_x', 'map_y')}`
 }
 
 function pathPolylinePoints() {
@@ -1282,12 +1665,6 @@ function recordPoseSample() {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return
 
   const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
-  if (localizationStatus === 'relocalized' && lastLocalizationStatus.value !== 'relocalized') {
-    registerRelocalizationMarker(
-      { x, y, yaw: Number(status.yaw || 0) },
-      { source: 'runtime', commandType: 'runtime.relocalized' },
-    )
-  }
   lastLocalizationStatus.value = localizationStatus
 
   const sampleKey = status.sampled_at || status.received_at || `${x.toFixed(4)},${y.toFixed(4)},${status.yaw || 0}`
@@ -1354,6 +1731,19 @@ async function refreshTaskMapExecution() {
     ])
     taskMapExecution.value = detail
     taskMapTrajectory.value = track.points || []
+    const executionMatchesRoute = !detail?.route
+      || !selectedRoute.value?.id
+      || String(detail.route) === String(selectedRoute.value.id)
+    if (taskExecutionIsActive(detail) && executionMatchesRoute && !drillRunning.value) {
+      if (drillTimelineMode.value !== 'execution') {
+        const createdAt = Date.parse(detail.created_at || detail.started_at || '')
+        openExecutionTimeline(detail, Number.isFinite(createdAt) ? createdAt : Date.now())
+      } else {
+        syncExecutionTimelineClock(detail)
+      }
+    } else if (drillTimelineMode.value === 'execution') {
+      syncExecutionTimelineClock(detail)
+    }
   } catch {
     // Navigation status remains useful even if a historical execution was removed.
   }
@@ -1449,13 +1839,16 @@ function restoreRelocalizationMarkers() {
 }
 
 function maybeRegisterAttemptRelocalizationMarker(session) {
-  if (!session || !isAttemptSessionTerminal(session) || !session.bestMatchPose) return
+  if (!session || !isAttemptSessionTerminal(session) || !session.bestMatchPose || !session.optimalVerified) return
   const commandId = String(session.commandId || '')
   if (commandId && relocalizationMarkers.value.some(item => item.commandId === commandId)) return
   registerRelocalizationMarker(session.bestMatchPose, {
     source: session.source || session.commandType || '定位尝试',
     commandType: session.commandType || '',
     commandId,
+    verification: session.rtkDrift?.verified
+      ? `RTK漂移 ${formatAttemptMetric(session.rtkDrift.xy_m)}m`
+      : `NDT ${formatAttemptMetric(session.bestNdtCandidate?.matching_error)} < 0.01`,
   })
 }
 
@@ -1599,42 +1992,13 @@ async function activeRelocalize() {
   try {
     const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
     const coordinateMode = selectedMap.value?.coordinate_mode || ''
-    if (!manualInitialPose.value && shouldInitializeFromRtk({ sceneScope, coordinateMode })) {
-      const initialization = await initializeProgressiveLocalization({
-        mapId: selectedMap.value?.id,
-        robotId,
-        mapVersion: selectedMapVersion(),
-        sceneScope,
-        coordinateMode,
-        waypoints: waypoints.value.map(point => {
-          const normalized = normalizeStoredWaypoint(point)
-          return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
-        }),
-        onProgress: message => { localizationInitMessage.value = message },
-        onCommand: event => applyLocalizationAttemptCommand(event.command, event),
-        dependencies: {
-          activateRouteMap,
-          sendRobotNavigationCommand,
-          waitForRobotCommand,
-        },
-      })
-      applyLocalizationAttemptCommand(initialization.command, { phase: 'localization', showCandidates: true })
-      const outcome = applyInitialPoseOutcome(initialization.command)
-      for (let index = 0; index < 35; index += 1) {
-        await sleep(2000)
-        await refreshNavigationStatus()
-        if (!localizationSampleStale() && localizationLabel() === 'normal' && !localizationQualityStale()) {
-          localizationInitState.value = 'done'
-          localizationInitMessage.value = initialPoseOutcomeMessage('室外主动重定位完成', outcome)
-          return
-        }
-      }
-      throw new Error('室外主动重定位未在限定时间内收敛')
-    }
     const payload = {
-      seed_source: manualInitialPose.value ? 'last_trusted' : 'global',
+      seed_source: 'quick_then_global',
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
+      scene_scope: sceneScope,
+      coordinate_mode: coordinateMode,
+      wait_seconds: 120,
     }
     if (manualInitialPose.value) {
       payload.x = Number(manualInitialPose.value.x)
@@ -1685,15 +2049,22 @@ async function handleExecuteRoute() {
     return
   }
   if (!confirm(`确定执行路线 "${selectedRoute.value.name}" 吗？请确认现场路径安全。`)) return
+  openExecutionTimeline(null, Date.now())
+  taskMapExecution.value = null
+  taskMapTrajectory.value = []
+  lastExecution.value = null
   routeExecuteBusy.value = true
   navError.value = ''
   try {
     lastExecution.value = await executeRoute(selectedRoute.value.id)
     taskMapExecution.value = lastExecution.value
     taskMapTrajectory.value = []
+    syncExecutionTimelineClock(lastExecution.value)
     await refreshNavigationStatus()
   } catch (error) {
     navError.value = error.message || '路线执行失败'
+    routePreviewError.value = navError.value
+    syncExecutionTimelineClock(null)
   } finally {
     routeExecuteBusy.value = false
   }
@@ -1711,6 +2082,9 @@ async function handleActivateSelectedMap() {
     const result = await activateAndRelocalizeMap({
       mapId: selectedMap.value.id,
       robotId,
+      mapVersion: selectedMapVersion(),
+      sceneScope: routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor',
+      coordinateMode: selectedMap.value.coordinate_mode || 'local_only',
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
     })
@@ -2500,6 +2874,7 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     v: Number((imageY / geometry.mapHeight).toFixed(8)),
     localization_mode: 'ndt',
     local_controller: 'mppi',
+    global_controller: normalizeGlobalController(routeForm.value.global_controller),
     avoidance_to_next: true,
     require_yaw: false,
     dwell_seconds: 0,
@@ -2584,8 +2959,9 @@ async function handleDeleteRoute(route) {
             <label>
               <span>全局控制器</span>
               <select v-model="routeForm.global_controller">
-                <option value="theta_star">Theta*</option>
-                <option value="navfn">NavFn (A*)</option>
+                <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
               </select>
             </label>
           </div>
@@ -2628,8 +3004,10 @@ async function handleDeleteRoute(route) {
                 </button>
               </div>
               <div class="route-step-content waypoint-panel-content">
-                <div v-if="waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
-                <div v-else class="waypoint-list">
+                <div v-if="routeLoading" class="empty-hint">正在加载路线途经点...</div>
+                <div v-if="routeLoadError" class="empty-hint waypoint-load-error">{{ routeLoadError }}</div>
+                <div v-if="!routeLoading && !routeLoadError && waypoints.length === 0" class="empty-hint">点击地图添加途经点</div>
+                <div v-if="waypoints.length > 0" class="waypoint-list">
                   <div v-for="(point, index) in waypoints" :key="index" class="waypoint-item">
                     <div class="waypoint-title-row">
                       <button type="button" class="waypoint-expand-toggle" @click="toggleWaypointExpanded(index)">
@@ -2691,6 +3069,17 @@ async function handleDeleteRoute(route) {
                         </select>
                       </label>
                       <label>
+                        <span>全局控制器</span>
+                        <select
+                          :value="point.global_controller || routeForm.global_controller || 'theta_star'"
+                          @change="setWaypointGlobalController(index, $event.target.value)"
+                        >
+                          <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </option>
+                        </select>
+                      </label>
+                      <label>
                         <span>定位校正方式</span>
                         <select :value="point.localization_mode || 'ndt'" @change="setWaypointLocalization(index, $event.target.value)">
                           <option value="ndt">NDT / FastVGICP 校正</option>
@@ -2737,27 +3126,31 @@ async function handleDeleteRoute(route) {
               </div>
             </div>
 
-            <aside v-if="drillTimelineOpen" class="drill-timeline-panel route-timeline-column">
+            <aside class="drill-timeline-panel route-timeline-column" :class="{ open: drillTimelineOpen }">
               <div class="drill-timeline-header">
                 <div>
                   <span>演练记录</span>
-                  <strong>时间轴</strong>
+                  <strong>时间轴 · {{ drillTimelineSourceLabel }}</strong>
                 </div>
                 <div class="drill-timeline-actions">
-                  <button class="btn btn-sm" :disabled="drillRunning || !drillTimeline.length" @click="clearDrillTimeline">清空</button>
-                  <button type="button" class="btn btn-sm" @click="drillTimelineOpen = false">折叠</button>
+                  <button class="btn btn-sm" :disabled="timelineRunning || !displayedDrillTimeline.length" @click="clearDisplayedDrillTimeline">
+                    {{ drillTimelineMode === 'execution' ? '清空视图' : '清空' }}
+                  </button>
+                  <button type="button" class="btn btn-sm" @click="drillTimelineOpen = !drillTimelineOpen">
+                    {{ drillTimelineOpen ? '折叠' : '展开' }}
+                  </button>
                 </div>
               </div>
-              <div class="drill-timeline-summary">
-                <div><span>用时</span><strong>{{ formatDrillElapsed(drillElapsedSeconds) }}</strong></div>
-                <div><span>当前速度</span><strong>{{ drillCurrentSpeed.toFixed(2) }} m/s</strong></div>
-                <div><span>事件</span><strong>{{ drillTimeline.length }}</strong></div>
+              <div v-if="drillTimelineOpen" class="drill-timeline-summary">
+                <div v-for="item in drillTimelineSummary" :key="item.label">
+                  <span>{{ item.label }}</span><strong :title="item.value">{{ item.value }}</strong>
+                </div>
               </div>
-              <div v-if="!drillTimeline.length" class="drill-timeline-empty">
-                点击“演练”后，这里会记录移动、到达点位和播报内容。
+              <div v-if="drillTimelineOpen && !displayedDrillTimeline.length" class="drill-timeline-empty">
+                {{ drillTimelineEmptyText }}
               </div>
-              <div v-else ref="drillTimelineListRef" class="drill-timeline-list">
-                <article v-for="event in drillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
+              <div v-else-if="drillTimelineOpen" ref="drillTimelineListRef" class="drill-timeline-list">
+                <article v-for="event in displayedDrillTimeline" :key="event.id" class="drill-timeline-item" :class="`event-${event.type}`">
                   <div class="timeline-node"></div>
                   <div class="timeline-content">
                     <div class="timeline-time">
@@ -2774,15 +3167,6 @@ async function handleDeleteRoute(route) {
                 </article>
               </div>
             </aside>
-
-            <button
-              v-if="!drillTimelineOpen && (drillRunning || drillTimeline.length)"
-              type="button"
-              class="btn btn-sm drill-timeline-reopen"
-              @click="drillTimelineOpen = true"
-            >
-              显示演练记录
-            </button>
           </div>
 
           <div class="panel-section route-step-panel route-step-4">
@@ -2831,6 +3215,18 @@ async function handleDeleteRoute(route) {
                 <span>当前位置</span>
                 <strong>{{ robotPoseText() }}</strong>
               </div>
+              <div>
+                <span>地图原点</span>
+                <strong>{{ originPoseText(mapFrameOrigin) }}</strong>
+              </div>
+              <div>
+                <span>栅格左下角</span>
+                <strong>{{ originPoseText(occupancyGridOrigin) }}</strong>
+              </div>
+              <div>
+                <span>RTK原点</span>
+                <strong :title="rtkOriginTitle()">{{ rtkEnuOrigin ? originPoseText(rtkEnuOrigin, 'map_x', 'map_y') : '未锁定' }}</strong>
+              </div>
             </div>
             <p v-if="!robotMapMatches()" class="form-error">当前机器人上报地图与页面地图不一致，暂不显示位置。</p>
             <p v-if="localizationSampleStale()" class="form-error">定位数据未持续更新，请检查导航/定位栈是否启动。</p>
@@ -2867,7 +3263,16 @@ async function handleDeleteRoute(route) {
               <button class="btn btn-sm" :class="{ 'btn-primary': showPoseTrail }" @click="showPoseTrail = !showPoseTrail">
                 {{ showPoseTrail ? '隐藏尾迹' : '显示尾迹' }}
               </button>
+              <button class="btn btn-sm" :class="{ 'btn-primary': showLocalizationAttemptPoints }" @click="showLocalizationAttemptPoints = !showLocalizationAttemptPoints">
+                {{ showLocalizationAttemptPoints ? '隐藏定位尝试点' : '显示定位尝试点' }}
+              </button>
               <button class="btn btn-sm" :disabled="poseHistory.length === 0" @click="clearPoseHistory">清空尾迹</button>
+            </div>
+            <div class="localization-algorithm-note">
+              <span><strong>下发地图</strong> 应用地图后先快速搜索，失败才进行全图位置与 360° 航向搜索。</span>
+              <span><strong>初始化定位</strong> 室外先验 RTK 固定解，漂移连续小于 0.30 m；否则快速搜索后全局回退。</span>
+              <span><strong>主动重定位</strong> 优先使用手选点、可信位姿和建图原点；NDT 健康且分数低于 0.01 即停止尝试并采用最优解。</span>
+              <span><i class="legend-relocalization-dot"></i> 紫色标记仅表示已验证并提交成功的重定位位置。</span>
             </div>
             <div v-if="initialPoseMode || manualInitialPose" class="initial-pose-panel">
               <div class="initial-pose-guide">
@@ -2917,6 +3322,16 @@ async function handleDeleteRoute(route) {
               <div v-if="localizationAttemptCardOpen" class="localization-attempt-body">
                 <p v-if="localizationAttemptSession.phase === 'transfer'" class="command-note">文件传输阶段只显示命令进度，进入地图定位后再展示候选点。</p>
                 <p v-if="localizationAttemptSession.livePose">实时位姿 {{ formatAttemptPose(localizationAttemptSession.livePose) }}</p>
+                <p v-if="localizationAttemptSession.evaluatedCandidateCount != null">
+                  已评估 {{ localizationAttemptSession.evaluatedCandidateCount }} / {{ localizationAttemptSession.candidateCount || 0 }} 个候选
+                  · {{ localizationAttemptSession.globalSearchStarted ? '已进入全局搜索' : '快速搜索阶段' }}
+                  <span v-if="localizationAttemptSession.earlyStopped"> · 已达到最优阈值并提前停止</span>
+                </p>
+                <p v-if="localizationAttemptSession.rtkDrift">
+                  RTK/Fast-LIO 漂移 {{ formatAttemptMetric(localizationAttemptSession.rtkDrift.xy_m) }} m
+                  · 阈值 &lt; {{ formatAttemptMetric(localizationAttemptSession.rtkDrift.threshold_xy_m, 2) }} m
+                  · {{ localizationAttemptSession.rtkDrift.verified ? '通过' : '验证中' }}
+                </p>
                 <p v-if="localizationAttemptSession.bestMatchPose">
                   最优位姿 {{ formatAttemptPose(localizationAttemptSession.bestMatchPose) }}
                   <span v-if="localizationAttemptSession.bestNdtCandidate">
@@ -2995,7 +3410,16 @@ async function handleDeleteRoute(route) {
                 <div class="map-click-mode" aria-label="地图点击模式">
                   <button type="button" :class="{ active: mapClickMode === 'waypoint' }" @click="setMapClickMode('waypoint')">添加途经点</button>
                   <button type="button" :class="{ active: mapClickMode === 'inspect' }" @click="setMapClickMode('inspect')">查看位置</button>
+                  <button type="button" :class="{ active: boundaryEditing }" @click="toggleBoundaryEditing">边界编辑</button>
                 </div>
+                <span
+                  class="map-mode-inline"
+                  :class="{ error: mapInteractionError }"
+                  :title="boundaryEditing ? '选择区域类型后在地图上依次点击顶点，至少三个点后闭合' : (mapInteractionError || mapModeHintText())"
+                >
+                  <strong>{{ boundaryEditing ? '边界编辑' : (mapClickMode === 'waypoint' ? '添加途经点' : '查看位置') }}</strong>
+                  <span>{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
+                </span>
                 <span class="mapping-trace-summary">
                   {{ mappingTraceLoading ? '正在加载关键帧' : `关键帧 ${mappingTrace.length} 个` }}
                 </span>
@@ -3008,10 +3432,36 @@ async function handleDeleteRoute(route) {
                   </button>
                 </div>
               </div>
-              <div class="map-mode-hint" :class="{ error: mapInteractionError }">
-                <strong>当前模式：{{ mapClickMode === 'waypoint' ? '添加途经点' : '查看位置' }}</strong>
-                <span>{{ mapInteractionError || mapModeHintText() }}</span>
+              <div :class="['boundary-policy-status', boundaryStatusPresentation().tone]">
+                <strong>{{ boundaryStatusPresentation().title }}</strong>
+                <span>{{ boundaryStatusPresentation().detail }}</span>
+                <div class="boundary-legend" aria-label="导航区域图例">
+                  <i class="outer"></i>外边界 <i class="forbidden"></i>禁入 <i class="restricted"></i>限速 <i class="warning"></i>警告
+                </div>
               </div>
+              <section v-if="boundaryEditing && boundaryConfig" class="boundary-editor">
+                <div class="boundary-editor-actions">
+                  <button v-for="item in [['outer','外边界'],['forbidden','禁入区'],['restricted','限速区'],['warning','警告区']]" :key="item[0]" type="button" class="btn btn-sm" :class="{ 'btn-primary': boundaryDrawType === item[0] }" @click="startBoundaryDrawing(item[0])">{{ item[1] }}</button>
+                  <button type="button" class="btn btn-sm" :disabled="boundaryDraftPoints.length < 3" @click="finishBoundaryDrawing">闭合区域</button>
+                  <button type="button" class="btn btn-sm" :disabled="!boundaryDraftPoints.length" @click="boundaryDraftPoints.pop()">撤销一点</button>
+                  <button type="button" class="btn btn-sm" @click="cancelBoundaryDrawing">取消绘制</button>
+                  <label>安全距离 <input v-model.number="boundaryConfig.safety_margin_m" type="number" min="0" max="5" step="0.05" /></label>
+                  <button type="button" class="btn btn-sm btn-primary" :disabled="!!boundaryBusy" @click="saveBoundaryDraft">{{ boundaryBusy === 'save' ? '保存中' : '保存草稿' }}</button>
+                  <button type="button" class="btn btn-sm btn-primary" :disabled="!!boundaryBusy || !boundaryConfig?.revision" @click="publishBoundary">{{ boundaryBusy === 'publish' ? '发布中' : '发布到机器人' }}</button>
+                  <span class="boundary-revision">草稿 v{{ boundaryConfig?.revision || 0 }} · 生效 v{{ boundaryConfig?.active_revision || 0 }} · {{ boundaryConfig?.apply_status || 'unconfigured' }}</span>
+                </div>
+                <p v-if="boundaryError" class="form-error">{{ boundaryError }}</p>
+                <div v-if="boundaryConfig?.zones?.length" class="boundary-zone-list">
+                  <div v-for="(zone, index) in boundaryConfig.zones" :key="zone.id || index" :class="`zone-${zone.zone_type}`">
+                    <input v-model="zone.name" />
+                    <span>{{ zone.zone_type === 'forbidden' ? '禁入' : zone.zone_type === 'restricted' ? '限速' : '警告' }}</span>
+                    <label><input v-model="zone.active" type="checkbox" />启用</label>
+                    <label v-if="zone.zone_type === 'restricted'">上限 <input v-model.number="zone.speed_limit_mps" type="number" min="0.05" max="0.3" step="0.05" /> m/s</label>
+                    <label v-if="zone.zone_type === 'warning'">提前 <input v-model.number="zone.warning_distance_m" type="number" min="0" max="10" step="0.1" /> m</label>
+                    <button type="button" class="btn btn-sm btn-danger" @click="removeBoundaryZone(index)">删除</button>
+                  </div>
+                </div>
+              </section>
               <div ref="mapViewportRef" class="map-container">
                 <div
                   v-if="confirmedInspectedPoints.length || inspectedMapPoint"
@@ -3056,6 +3506,12 @@ async function handleDeleteRoute(route) {
                 <div v-if="selectedMap.thumbnail_url" class="map-image-layer" :style="mapImageLayerStyle">
                   <img ref="mapImageRef" :src="getFullUrl(selectedMap.thumbnail_url)" alt="地图预览" @load="refreshImageGeometry" @click="handleMapClick" />
 
+                  <svg v-if="boundaryConfig?.outer_polygon?.length || boundaryDraftPoints.length" class="navigation-boundary-layer">
+                    <polygon v-if="boundaryConfig?.outer_polygon?.length" :points="boundaryPolygonPoints(boundaryConfig.outer_polygon)" class="boundary-outer" />
+                    <polygon v-for="(zone, index) in (boundaryConfig?.zones || [])" :key="`boundary-zone-${zone.id || index}`" :points="boundaryPolygonPoints(zone.polygon)" :class="`boundary-zone boundary-${zone.zone_type}`" />
+                    <polyline v-if="boundaryDraftPoints.length" :points="boundaryDraftPolyline()" class="boundary-draft" />
+                  </svg>
+
                   <svg v-if="showMappingTrace && mappingTrace.length > 1" class="mapping-trace-lines">
                     <polyline :points="mappingTracePoints()" fill="none" stroke="#0f766e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
@@ -3069,6 +3525,19 @@ async function handleDeleteRoute(route) {
                   </svg>
 
                   <div class="waypoint-markers">
+                    <div class="planner-map-origin-marker" :style="waypointDisplayPosition(mapFrameOrigin)" title="地图坐标原点 map (0, 0)">M</div>
+                    <div
+                      v-if="occupancyGridOrigin"
+                      class="planner-grid-origin-marker"
+                      :style="waypointDisplayPosition(occupancyGridOrigin)"
+                      title="map.yaml origin：栅格图左下角在 map 坐标中的位置"
+                    >G</div>
+                    <div
+                      v-if="rtkEnuOrigin"
+                      class="planner-rtk-origin-marker"
+                      :style="waypointDisplayPosition({ x: rtkEnuOrigin.map_x, y: rtkEnuOrigin.map_y })"
+                      :title="rtkOriginTitle()"
+                    >R</div>
                     <div
                       v-for="(point, index) in waypoints"
                       :key="index"
@@ -3103,7 +3572,7 @@ async function handleDeleteRoute(route) {
                       {{ attempt.index }}
                     </div>
                     <div
-                      v-for="marker in relocalizationMarkers"
+                      v-for="marker in (showLocalizationAttemptPoints ? relocalizationMarkers : [])"
                       :key="`relocalization-${marker.id}`"
                       class="planner-relocalization-marker"
                       :style="waypointDisplayPosition(marker)"
@@ -3119,6 +3588,7 @@ async function handleDeleteRoute(route) {
                     <div v-if="manualInitialPose" class="initial-pose-marker" :style="waypointDisplayPosition(manualInitialPose)">
                       <span :style="initialPoseHeadingStyle()"></span>
                     </div>
+                    <div v-if="selectedLogPoint" class="system-log-map-marker" :style="waypointDisplayPosition(selectedLogPoint)" title="当前选中日志位置">L</div>
                     <div
                       v-for="(item, index) in confirmedInspectedPoints"
                       :key="`inspect-${item.id}`"
@@ -3148,55 +3618,56 @@ async function handleDeleteRoute(route) {
                 </div>
                 <div v-else class="map-placeholder">地图预览不可用</div>
               </div>
-              <section v-if="selectedMap.thumbnail_url" class="keyframe-panel" :class="{ open: keyframePanelOpen }">
-                <button type="button" class="keyframe-panel-toggle" @click="keyframePanelOpen = !keyframePanelOpen">
-                  <span>建图关键帧（{{ mappingTrace.length }}）</span>
-                  <strong>{{ keyframePanelOpen ? '收起' : '展开' }}</strong>
-                </button>
-                <div v-if="keyframePanelOpen" class="keyframe-panel-body">
-                  <div v-if="mappingTraceLoading" class="keyframe-empty">正在加载关键帧</div>
-                  <div v-else-if="!mappingTrace.length" class="keyframe-empty">当前地图没有关键帧定位记录</div>
-                  <template v-else>
-                    <div class="keyframe-table-scroll">
-                      <table class="keyframe-table">
-                        <thead>
-                          <tr>
-                            <th>序号</th>
-                            <th>采样时间</th>
-                            <th>NDT x / y / yaw</th>
-                            <th>RTK x / y / yaw / 状态</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <tr
-                            v-for="(sample, rowIndex) in keyframePageData.rows"
-                            :key="sample.index ?? keyframePageData.start + rowIndex"
-                            :class="{ selected: selectedKeyframeIndex === (sample.index ?? keyframePageData.start + rowIndex) }"
-                            @click="selectKeyframe(sample, rowIndex)"
-                          >
-                            <td>{{ sample.index ?? keyframePageData.start + rowIndex + 1 }}</td>
-                            <td>{{ mappingSampleTime(sample) }}</td>
-                            <td>{{ poseText(sample.slam) }}</td>
-                            <td>{{ rtkPoseText(sample.rtk) }}</td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                    <div class="keyframe-pagination">
-                      <button type="button" class="btn btn-sm" :disabled="keyframePageData.page <= 1" @click="changeKeyframePage(-1)">上一页</button>
-                      <span>{{ keyframePageData.page }} / {{ keyframePageData.pageCount }}</span>
-                      <button type="button" class="btn btn-sm" :disabled="keyframePageData.page >= keyframePageData.pageCount" @click="changeKeyframePage(1)">下一页</button>
-                    </div>
-                  </template>
-                </div>
-              </section>
             </div>
 
           </div>
 
         </div>
+        <section v-if="selectedMap?.thumbnail_url" class="keyframe-panel route-keyframe-row" :class="{ open: keyframePanelOpen }">
+          <button type="button" class="keyframe-panel-toggle" @click="keyframePanelOpen = !keyframePanelOpen">
+            <span>建图关键帧（{{ mappingTrace.length }}）</span>
+            <strong>{{ keyframePanelOpen ? '收起' : '展开' }}</strong>
+          </button>
+          <div v-if="keyframePanelOpen" class="keyframe-panel-body">
+            <div v-if="mappingTraceLoading" class="keyframe-empty">正在加载关键帧</div>
+            <div v-else-if="!mappingTrace.length" class="keyframe-empty">当前地图没有关键帧定位记录</div>
+            <template v-else>
+              <div class="keyframe-table-scroll">
+                <table class="keyframe-table">
+                  <thead>
+                    <tr>
+                      <th>序号</th>
+                      <th>采样时间</th>
+                      <th>NDT x / y / yaw</th>
+                      <th>RTK x / y / yaw / 状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="(sample, rowIndex) in keyframePageData.rows"
+                      :key="sample.index ?? keyframePageData.start + rowIndex"
+                      :class="{ selected: selectedKeyframeIndex === (sample.index ?? keyframePageData.start + rowIndex) }"
+                      @click="selectKeyframe(sample, rowIndex)"
+                    >
+                      <td>{{ sample.index ?? keyframePageData.start + rowIndex + 1 }}</td>
+                      <td>{{ mappingSampleTime(sample) }}</td>
+                      <td>{{ poseText(sample.slam) }}</td>
+                      <td>{{ rtkPoseText(sample.rtk) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="keyframe-pagination">
+                <button type="button" class="btn btn-sm" :disabled="keyframePageData.page <= 1" @click="changeKeyframePage(-1)">上一页</button>
+                <span>{{ keyframePageData.page }} / {{ keyframePageData.pageCount }}</span>
+                <button type="button" class="btn btn-sm" :disabled="keyframePageData.page >= keyframePageData.pageCount" @click="changeKeyframePage(1)">下一页</button>
+              </div>
+            </template>
+          </div>
+        </section>
       </div>
     </section>
+    <SystemLogPanel :robot-id="selectedRobot?.id" :map-id="selectedMap?.id" @locate="locateSystemLog" />
   </section>
 </template>
 
@@ -3249,7 +3720,7 @@ async function handleDeleteRoute(route) {
   --route-main-action-height: 38px;
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
-  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto;
+  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto;
   column-gap: 1rem;
   row-gap: 0.45rem;
   height: auto;
@@ -3267,16 +3738,7 @@ async function handleDeleteRoute(route) {
 }
 
 .route-waypoint-column {
-  display: flex;
-  grid-column: 4;
-  grid-row: 2;
-  min-width: 0;
-  min-height: 0;
-  height: 100%;
-  flex-direction: column;
-  gap: 0.45rem;
-  overflow-x: hidden;
-  overflow-y: auto;
+  display: contents;
 }
 
 .route-config-panel {
@@ -3406,10 +3868,11 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-3 {
+  grid-column: 4;
+  grid-row: 2;
   align-self: stretch;
-  min-height: 520px;
-  height: auto;
-  flex: 0 0 calc(100% - 88px);
+  min-height: 620px;
+  height: 100%;
   max-height: none;
   overflow: hidden;
 }
@@ -3422,7 +3885,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-5 {
   grid-column: 1 / -1;
-  grid-row: 3;
+  grid-row: 4;
   align-self: start;
   overflow: visible;
 }
@@ -3551,6 +4014,12 @@ async function handleDeleteRoute(route) {
   font-size: 0.875rem;
   text-align: center;
   padding: 1rem;
+}
+
+.waypoint-load-error {
+  color: #b42318;
+  background: #fef3f2;
+  border-radius: 6px;
 }
 
 .waypoint-list {
@@ -3755,6 +4224,27 @@ async function handleDeleteRoute(route) {
   flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.75rem;
+}
+
+.localization-algorithm-note {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid #ddd6fe;
+  border-radius: 4px;
+  color: #4c1d95;
+  background: #f5f3ff;
+  font-size: 0.72rem;
+}
+
+.legend-relocalization-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 0.25rem;
+  border-radius: 50%;
+  background: #7c3aed;
 }
 
 .command-note {
@@ -4174,13 +4664,16 @@ async function handleDeleteRoute(route) {
 .map-toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
+  justify-content: flex-start;
+  flex-wrap: nowrap;
   gap: 8px;
+  overflow-x: auto;
   padding: 8px;
   border: 1px solid #d0d5dd;
   border-radius: 6px;
   background: #fff;
+  scrollbar-width: thin;
+  white-space: nowrap;
 }
 
 .map-toolbar button {
@@ -4212,25 +4705,34 @@ async function handleDeleteRoute(route) {
   font-size: 0.72rem;
 }
 
-.map-mode-hint {
+.map-mode-inline {
   display: flex;
-  min-height: 38px;
+  min-width: 150px;
+  min-height: 34px;
+  flex: 1 1 220px;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.5rem 0.7rem;
+  gap: 0.45rem;
+  overflow: hidden;
+  padding: 0.35rem 0.55rem;
   border: 1px solid #bcd7ff;
   border-radius: 5px;
   color: #344054;
   background: #f5f9ff;
-  font-size: 0.76rem;
+  font-size: 0.72rem;
 }
 
-.map-mode-hint strong {
+.map-mode-inline strong {
   flex: 0 0 auto;
   color: #175cd3;
 }
 
-.map-mode-hint.error {
+.map-mode-inline > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-mode-inline.error {
   border-color: #fda29b;
   color: #b42318;
   background: #fff5f5;
@@ -4239,6 +4741,7 @@ async function handleDeleteRoute(route) {
 .map-click-mode,
 .map-display-controls {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 4px;
 }
@@ -4256,16 +4759,23 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
+  grid-column: 4;
+  grid-row: 3;
   min-width: 0;
   min-height: 0;
-  max-height: none;
-  flex: 1 1 50%;
+  max-height: 58px;
+  align-self: start;
   padding: 0.85rem;
   border: 1px solid #fed7aa;
   border-radius: 12px;
   flex-direction: column;
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 12px 30px rgba(124, 45, 18, 0.12);
+}
+
+.drill-timeline-panel.open {
+  min-height: 280px;
+  max-height: 520px;
 }
 
 .drill-timeline-actions {
@@ -4305,7 +4815,7 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.4rem;
   margin-top: 0.7rem;
 }
@@ -4388,13 +4898,29 @@ async function handleDeleteRoute(route) {
   box-shadow: 0 0 0 2px #93c5fd;
 }
 
+.event-dispatch .timeline-node,
+.event-created .timeline-node,
+.event-accepted .timeline-node,
+.event-target .timeline-node,
+.event-start .timeline-node {
+  background: #2563eb;
+  box-shadow: 0 0 0 2px #93c5fd;
+}
+
+.event-pause .timeline-node,
+.event-resume .timeline-node {
+  background: #d97706;
+  box-shadow: 0 0 0 2px #fcd34d;
+}
+
 .event-arrival .timeline-node,
 .event-complete .timeline-node {
   background: #16a34a;
   box-shadow: 0 0 0 2px #86efac;
 }
 
-.event-stop .timeline-node {
+.event-stop .timeline-node,
+.event-error .timeline-node {
   background: #dc2626;
   box-shadow: 0 0 0 2px #fca5a5;
 }
@@ -4456,6 +4982,124 @@ async function handleDeleteRoute(route) {
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.14);
 }
 
+.boundary-editor {
+  margin: 0.65rem 0;
+  padding: 0.7rem;
+  border: 1px solid #bfdbfe;
+  border-radius: 10px;
+  background: #eff6ff;
+}
+
+.boundary-policy-status {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 0.55rem 0.8rem;
+  margin: 0.55rem 0;
+  padding: 0.55rem 0.7rem;
+  border-left: 4px solid #f59e0b;
+  border-radius: 7px;
+  color: #78350f;
+  background: #fffbeb;
+  font-size: 0.76rem;
+}
+
+.boundary-policy-status.active { border-left-color: #16a34a; color: #14532d; background: #f0fdf4; }
+.boundary-policy-status.applying { border-left-color: #2563eb; color: #1e3a8a; background: #eff6ff; }
+.boundary-policy-status.error { border-left-color: #dc2626; color: #7f1d1d; background: #fef2f2; }
+
+.boundary-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.28rem;
+  white-space: nowrap;
+}
+
+.boundary-legend i {
+  width: 12px;
+  height: 12px;
+  margin-left: 0.25rem;
+  border: 2px solid #2563eb;
+  background: rgba(37, 99, 235, 0.08);
+}
+
+.boundary-legend i.forbidden { border-color: #dc2626; background: rgba(220, 38, 38, 0.28); }
+.boundary-legend i.restricted { border-color: #7c3aed; background: rgba(124, 58, 237, 0.2); }
+.boundary-legend i.warning { border-color: #d97706; background: rgba(245, 158, 11, 0.2); }
+
+.boundary-editor-actions,
+.boundary-zone-list > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.boundary-editor-actions label,
+.boundary-zone-list label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: #334155;
+  font-size: 0.76rem;
+}
+
+.boundary-editor input {
+  width: 92px;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid #94a3b8;
+  border-radius: 5px;
+}
+
+.boundary-editor input[type="checkbox"] {
+  width: auto;
+}
+
+.boundary-revision {
+  color: #475569;
+  font-size: 0.72rem;
+}
+
+.boundary-zone-list {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.boundary-zone-list > div {
+  padding: 0.45rem;
+  border-left: 4px solid #f59e0b;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.boundary-zone-list > div.zone-forbidden { border-left-color: #dc2626; }
+.boundary-zone-list > div.zone-restricted { border-left-color: #7c3aed; }
+.boundary-zone-list > div.zone-warning { border-left-color: #f59e0b; }
+.boundary-zone-list > div > input:first-child { width: 150px; }
+
+.navigation-boundary-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.boundary-outer {
+  fill: rgba(37, 99, 235, 0.06);
+  stroke: #2563eb;
+  stroke-width: 3;
+  stroke-dasharray: 9 5;
+}
+
+.boundary-zone { stroke-width: 2.5; }
+.boundary-forbidden { fill: rgba(220, 38, 38, 0.28); stroke: #dc2626; }
+.boundary-restricted { fill: rgba(124, 58, 237, 0.2); stroke: #7c3aed; }
+.boundary-warning { fill: rgba(245, 158, 11, 0.2); stroke: #d97706; }
+.boundary-draft { fill: rgba(14, 165, 233, 0.12); stroke: #0891b2; stroke-width: 2.5; stroke-dasharray: 5 4; }
+
 .map-container img {
   width: 100%;
   height: auto;
@@ -4495,6 +5139,23 @@ async function handleDeleteRoute(route) {
   font-weight: bold;
   transform: translate(-50%, -50%);
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.system-log-map-marker {
+  position: absolute;
+  z-index: 18;
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  color: #fff;
+  background: #0f172a;
+  box-shadow: 0 0 0 3px #38bdf8, 0 4px 10px rgba(15, 23, 42, 0.35);
+  font-size: 11px;
+  font-weight: 900;
+  transform: translate(-50%, -50%);
 }
 
 .waypoint-heading-arrow {
@@ -4579,6 +5240,7 @@ async function handleDeleteRoute(route) {
 }
 
 .mapping-trace-summary {
+  flex: 0 0 auto;
   padding: 7px 10px;
   border: 1px solid #99d5ce;
   border-radius: 4px;
@@ -4649,6 +5311,13 @@ async function handleDeleteRoute(route) {
   border: 1px solid #d0d5dd;
   border-radius: 6px;
   background: #fff;
+}
+
+.route-keyframe-row {
+  grid-column: 1 / span 3;
+  grid-row: 3;
+  min-width: 0;
+  align-self: start;
 }
 
 .keyframe-panel-toggle {
@@ -4968,6 +5637,43 @@ async function handleDeleteRoute(route) {
   transform: translate(-50%, -50%);
 }
 
+.planner-map-origin-marker,
+.planner-grid-origin-marker,
+.planner-rtk-origin-marker {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 2px solid #fff;
+  border-radius: 3px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  transform: translate(-50%, -50%) rotate(45deg);
+  box-shadow: 0 0 0 2px rgba(15, 23, 42, .2);
+}
+
+.planner-map-origin-marker {
+  background: #2563eb;
+}
+
+.planner-grid-origin-marker {
+  background: #475569;
+}
+
+.planner-rtk-origin-marker {
+  background: #0891b2;
+}
+
+.planner-map-origin-marker,
+.planner-grid-origin-marker,
+.planner-rtk-origin-marker {
+  line-height: 1;
+  text-shadow: 0 1px rgba(0, 0, 0, .25);
+}
+
 .planner-relocalization-marker::before {
   content: '';
   position: absolute;
@@ -5083,10 +5789,7 @@ async function handleDeleteRoute(route) {
   }
 
   .route-waypoint-column {
-    grid-column: 1;
-    grid-row: auto;
-    height: auto;
-    overflow: visible;
+    display: contents;
   }
 
   .route-waypoint-column .route-step-3 {
@@ -5102,10 +5805,20 @@ async function handleDeleteRoute(route) {
     .route-drill-panel,
     .route-step-5,
     .map-preview-area,
-    .route-timeline-column {
+    .route-timeline-column,
+    .route-keyframe-row {
     grid-column: 1;
     grid-row: auto;
   }
+
+  .route-step-4 { grid-row: 1; }
+  .route-config-panel { grid-row: 2; }
+  .route-drill-panel { grid-row: 3; }
+  .map-preview-area { grid-row: 4; }
+  .route-step-3 { grid-row: 5; }
+  .route-keyframe-row { grid-row: 6; }
+  .route-timeline-column { grid-row: 7; }
+  .route-step-5 { grid-row: 8; }
 
   .route-step-3 {
     min-height: 0;
@@ -5139,7 +5852,10 @@ async function handleDeleteRoute(route) {
   }
 
   .drill-timeline-panel {
-    flex: 0 0 auto;
+    max-height: 58px;
+  }
+
+  .drill-timeline-panel.open {
     max-height: 420px;
   }
 
@@ -5165,7 +5881,7 @@ async function handleDeleteRoute(route) {
 [data-theme="dark"] .localization-debug-panel,
 [data-theme="dark"] .waypoint-item,
 [data-theme="dark"] .route-item,
-[data-theme="dark"] .map-mode-hint,
+[data-theme="dark"] .map-mode-inline,
 [data-theme="dark"] .initial-pose-panel,
 [data-theme="dark"] .route-save-hints,
 [data-theme="dark"] .map-inspection-row {
@@ -5237,7 +5953,7 @@ async function handleDeleteRoute(route) {
   background: rgba(67, 213, 255, 0.12);
 }
 
-[data-theme="dark"] .map-mode-hint {
+[data-theme="dark"] .map-mode-inline {
   color: var(--text);
   background: rgba(67, 213, 255, 0.1);
 }
@@ -5296,16 +6012,18 @@ async function handleDeleteRoute(route) {
     padding: 0.65rem;
   }
   .map-inspection-list { top: 18px; left: 18px; max-width: calc(100% - 36px); }
-  .map-toolbar { align-items: stretch; }
+  .map-toolbar { align-items: center; }
   .map-display-controls,
-  .map-click-mode { flex: 1 1 100%; justify-content: space-between; }
-  .map-click-mode button { flex: 1 1 0; min-width: 0; }
-  .map-mode-hint { align-items: flex-start; flex-direction: column; }
+  .map-click-mode { flex: 0 0 auto; justify-content: flex-start; }
+  .map-click-mode button { flex: 0 0 auto; min-width: 82px; }
+  .map-mode-inline { min-width: 140px; flex-basis: 180px; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
   .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
   .waypoint-heading-input input { min-width: 0; }
   .waypoint-list { height: auto; }
-  .drill-timeline-panel { max-height: 360px; padding: 0.7rem; }
+  .drill-timeline-panel { max-height: 54px; padding: 0.7rem; }
+  .drill-timeline-panel.open { max-height: 360px; }
+  .drill-timeline-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .keyframe-pagination { justify-content: space-between; gap: 0.4rem; }
 }
 

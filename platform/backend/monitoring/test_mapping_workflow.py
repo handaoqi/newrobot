@@ -4,8 +4,11 @@ from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
+from types import SimpleNamespace
 
 from .models import MapData, RemoteCommand, Robot, RobotStatusLatest
+from .serializers import MapDataSerializer
+from .views import RobotNavigationRelocalizeView
 
 
 class MappingWorkflowApiTests(TestCase):
@@ -78,6 +81,46 @@ class MappingWorkflowApiTests(TestCase):
         self.assertEqual(command.command_type, "mapping.origin_extract_global")
         self.assertEqual(command.payload["global_enu"]["origin_latitude"], 39.9)
         self.assertEqual(command.payload["global_enu"]["confirmed_heading_deg"], 93.2)
+
+    def test_map_serializer_exposes_map_and_locked_rtk_origins(self):
+        map_data = MapData.objects.create(
+            name="双原点地图",
+            robot=self.robot,
+            origin=[-10.0, -20.0, 0.25],
+            description=json.dumps({
+                "gnss_origin_yaml": (
+                    "alignment_locked: 1\n"
+                    "origin_latitude: 39.9\n"
+                    "origin_longitude: 116.4\n"
+                    "origin_altitude: 42.0\n"
+                    "map_offset_x: 1.25\n"
+                    "map_offset_y: -0.75\n"
+                    "enu_to_map_yaw: 0.1\n"
+                ),
+            }),
+        )
+        origins = MapDataSerializer(map_data).data["origin_display"]
+        self.assertEqual(origins["map"], {"x": 0.0, "y": 0.0, "yaw": 0.0, "frame_id": "map"})
+        self.assertEqual(origins["occupancy_grid"]["x"], -10.0)
+        self.assertEqual(origins["rtk_enu"]["latitude"], 39.9)
+        self.assertEqual(origins["rtk_enu"]["map_x"], 1.25)
+
+    def test_relocalize_payload_accepts_quick_then_global_metadata(self):
+        payload = RobotNavigationRelocalizeView().build_payload(
+            SimpleNamespace(data={
+                "seed_source": "quick_then_global",
+                "scene_scope": "outdoor",
+                "coordinate_mode": "rtk_fixed",
+                "x": 1.0,
+                "y": 2.0,
+                "yaw": 0.3,
+            }),
+            self.robot,
+        )
+        self.assertEqual(payload["seed_source"], "quick_then_global")
+        self.assertEqual(payload["scene_scope"], "outdoor")
+        self.assertEqual(payload["coordinate_mode"], "rtk_fixed")
+        self.assertEqual(payload["wait_seconds"], 120.0)
 
     def test_origin_status_alias_returns_unified_mapping_snapshot(self):
         response = self.client.get(f"/api/robots/{self.robot.id}/mapping/origin/status/")

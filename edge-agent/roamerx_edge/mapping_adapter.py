@@ -1948,6 +1948,12 @@ class MappingAdapter:
                     manifest = refreshed
             except ProtocolError as exc:
                 fallback_error = str(exc)
+                if scene_scope != "indoor":
+                    raise ProtocolError(
+                        "MAP_OPTIMIZATION_FAILED",
+                        "outdoor GTSAM must apply RTK XY to the saved map: "
+                        + str(exc),
+                    ) from exc
                 LOGGER.warning("C++ GTSAM global optimization handoff failed; keeping raw LIO map: %s", exc)
         optimization_duration = round(time.monotonic() - optimization_started, 3)
         timing = {
@@ -1960,6 +1966,17 @@ class MappingAdapter:
             timing=timing,
             fallback_error=fallback_error,
         )
+        if scene_scope != "indoor":
+            rtk_count = int((summary.get("factors") or {}).get("rtk_position") or 0)
+            if not summary.get("applied") or rtk_count <= 0:
+                raise ProtocolError(
+                    "MAP_OPTIMIZATION_FAILED",
+                    "outdoor GTSAM must apply RTK XY to the saved map: "
+                    + str(
+                        summary.get("fallback_error")
+                        or f"applied={summary.get('applied')} rtk_position={rtk_count}"
+                    ),
+                )
         if summary.get("candidate_applied") and not summary.get("applied"):
             selection = self._restore_raw_map_products(work_dir)
             summary["map_output_selection"] = selection

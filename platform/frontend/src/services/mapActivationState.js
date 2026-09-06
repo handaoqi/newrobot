@@ -41,14 +41,27 @@ export function shouldFallbackToGlobalRelocalization(errorCode) {
 }
 
 export function navigationReadyForMap(payload, mapId, mapVersion = expectedLegacyMapVersion(mapId)) {
-  const status = payload?.status || {}
+  return navigationUnreadinessReason(payload, mapId, mapVersion) === null
+}
+
+export function navigationUnreadinessReason(payload, mapId, mapVersion = expectedLegacyMapVersion(mapId)) {
+  if (!payload) return '尚未获取定位状态'
+  if (payload.connection_status !== 'online') return '机器人不在线'
   const identity = navigationMapIdentity(payload)
-  const localizationStatus = status.localization_status || payload?.localization_status
-  const navReady = status.nav_ready ?? payload?.nav_ready
-  return payload?.connection_status === 'online'
-    && identity.mapId === String(mapId || '')
-    && identity.mapVersion === String(mapVersion || '')
-    && localizationStatus === 'normal'
-    && Boolean(navReady)
-    && navigationStatusFresh(payload)
+  if (!identity.mapId) return '尚未加载任务地图'
+  if (identity.mapId !== String(mapId || '')) return '当前地图与任务地图不一致'
+  if (identity.mapVersion !== String(mapVersion || '')) return '当前地图版本与任务地图不一致'
+  const status = payload.status || {}
+  const localizationStatus = status.localization_status || payload.localization_status
+  if (localizationStatus && localizationStatus !== 'normal') {
+    if (localizationStatus === 'lost') return '定位丢失，待恢复'
+    if (localizationStatus === 'initializing') return '定位初始化中'
+    return `定位状态：${localizationStatus}`
+  }
+  const navReady = status.nav_ready ?? payload.nav_ready
+  if (!navReady) return '导航栈未就绪'
+  if (!navigationStatusFresh(payload)) return '定位数据未刷新'
+  return localizationStatus === 'normal' && Boolean(navReady)
+    ? null
+    : '定位或导航栈未就绪'
 }

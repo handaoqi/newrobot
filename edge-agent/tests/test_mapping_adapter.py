@@ -166,6 +166,39 @@ def test_post_save_validation_rejects_unstructured_or_wrong_map_output(tmp_path,
     assert second["indoor"]["success"] == 0
 
 
+def test_outdoor_finalize_fails_when_rtk_xy_is_not_applied(tmp_path, monkeypatch):
+    session_dir = tmp_path / "20260904_150000_001"
+    session_dir.mkdir()
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession("session", "map", "", "saving", "now", "now")
+    monkeypatch.setattr(mapping_adapter_module, "finalize_map_package", lambda *_args, **_kwargs: {
+        "keyframe_count": 8,
+        "loop_status": "no_valid_loop",
+        "loop_closure_count": 0,
+        "loop_candidate_count": 0,
+        "completeness": "complete",
+    })
+    monkeypatch.setattr(mapping_adapter_module, "build_optimization_summary", lambda *_args, **_kwargs: {
+        "stage": "quality_rejected",
+        "success": True,
+        "applied": False,
+        "candidate_applied": True,
+        "trajectory_source": "raw",
+        "use_gps": True,
+        "auto_activation_allowed": False,
+        "fallback_error": "optimized trajectory rejected: max_xy_correction_m_above_limit",
+        "factors": {"rtk_position": 8},
+        "corrections": [],
+    })
+    monkeypatch.setattr(adapter, "_call_ros_service", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "_snapshot_raw_map_products", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ProtocolError) as error:
+        adapter._finalize_session_package(session_dir, {"scene_scope": "outdoor"})
+    assert error.value.code == "MAP_OPTIMIZATION_FAILED"
+    assert "RTK XY" in str(error.value)
+
+
 def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch):
     session_dir = tmp_path / "20260825_180000_001"
     session_dir.mkdir()

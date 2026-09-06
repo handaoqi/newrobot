@@ -1,5 +1,5 @@
 {
   "schema_version": 1,
   "release_version": "v1.0.0",
-  "enabled_modules": ["overview", "guard-duty", "remote-control", "remote-development", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
+  "enabled_modules": ["overview", "guard-duty", "remote-control", "remote-development", "scene-visualizer", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
 }

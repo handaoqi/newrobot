@@ -583,6 +583,7 @@ def test_mapping_divergence_event_requests_passive_then_rescues():
         confirmed_remote_teleop_action=lambda *args, **kwargs: calls.append(("passive", args, kwargs))
     )
     application.mapping_adapter = SimpleNamespace(
+        session=SimpleNamespace(state="mapping"),
         auto_rescue_diverged_mapping=lambda event: calls.append(("rescue", event))
     )
     application._mapping_rescue_lock = threading.Lock()
@@ -595,6 +596,23 @@ def test_mapping_divergence_event_requests_passive_then_rescues():
     assert calls[1] == ("rescue", event)
 
 
+def test_mapping_divergence_event_ignored_without_active_session():
+    application = object.__new__(EdgeAgentApplication)
+    calls = []
+    application.navigation = SimpleNamespace(
+        confirmed_remote_teleop_action=lambda *args, **kwargs: calls.append("passive")
+    )
+    application.mapping_adapter = SimpleNamespace(
+        session=None,
+        auto_rescue_diverged_mapping=lambda event: calls.append("rescue"),
+    )
+    application._mapping_rescue_lock = threading.Lock()
+
+    application._handle_mapping_divergence_event({"writer_flushed": True})
+
+    assert calls == []
+
+
 def test_mapping_divergence_event_does_not_rescue_before_flush():
     application = object.__new__(EdgeAgentApplication)
     calls = []
@@ -602,6 +620,7 @@ def test_mapping_divergence_event_does_not_rescue_before_flush():
         confirmed_remote_teleop_action=lambda *args, **kwargs: calls.append("passive")
     )
     application.mapping_adapter = SimpleNamespace(
+        session=SimpleNamespace(state="mapping"),
         auto_rescue_diverged_mapping=lambda event: calls.append("rescue")
     )
     application._mapping_rescue_lock = threading.Lock()

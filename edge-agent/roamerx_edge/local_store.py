@@ -8,9 +8,10 @@ from typing import Any
 
 
 class LocalStore:
-    def __init__(self, path: str, *, trajectory_outbox_limit: int = 720) -> None:
+    def __init__(self, path: str, *, trajectory_outbox_limit: int = 720, system_log_outbox_limit: int = 500) -> None:
         self.path = path
         self.trajectory_outbox_limit = max(1, int(trajectory_outbox_limit))
+        self.system_log_outbox_limit = max(1, int(system_log_outbox_limit))
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(path, check_same_thread=False)
@@ -83,6 +84,21 @@ class LocalStore:
               )
             """,
             (self.trajectory_outbox_limit,),
+        )
+
+    def _prune_system_log_outbox_locked(self) -> None:
+        self._connection.execute(
+            """
+            DELETE FROM outbox
+            WHERE message_type = 'system.log.batch'
+              AND id NOT IN (
+                  SELECT id FROM outbox
+                  WHERE message_type = 'system.log.batch'
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (self.system_log_outbox_limit,),
         )
 
     def get_processed_command(self, command_id: str) -> dict[str, Any] | None:
@@ -187,6 +203,8 @@ class LocalStore:
             )
             if payload["message_type"] == "trajectory.batch":
                 self._prune_trajectory_outbox_locked()
+            elif payload["message_type"] == "system.log.batch":
+                self._prune_system_log_outbox_locked()
 
     def list_pending_outbox(self, limit: int = 100) -> list[dict]:
         rows = self._connection.execute(

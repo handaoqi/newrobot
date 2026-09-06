@@ -3544,6 +3544,22 @@ namespace robot::slam
             }
             graph_keyframes.push_back(frame);
         }
+        if (use_gnss_fusion_ && gnss_origin_initialized_ && gnss_alignment_locked_)
+        {
+            const std::size_t rtk_frames = std::count_if(
+                graph_keyframes.begin(), graph_keyframes.end(),
+                [](const GlobalGraphKeyframe& frame) { return frame.has_rtk_position; });
+            if (rtk_frames == 0)
+            {
+                keyframe_writer_error_ =
+                    "global factor graph failed: outdoor GNSS origin is locked but no RTK XY factors were created";
+                RCLCPP_ERROR(get_logger(), "%s", keyframe_writer_error_.c_str());
+                return false;
+            }
+            RCLCPP_INFO(get_logger(),
+                "Outdoor GTSAM will apply RTK XY factors on %zu/%zu keyframes",
+                rtk_frames, graph_keyframes.size());
+        }
         global_factor_graph_result_ = global_factor_graph_->optimize(graph_keyframes, loop_closures);
         if (!global_factor_graph_result_.success)
         {

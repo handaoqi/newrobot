@@ -63,6 +63,8 @@ set(msg_files
         "msg/RectangleWithCentre.msg"
         "msg/Relocalization.msg"
         "msg/RslidarPacket.msg"
+        "msg/SemanticObject3D.msg"
+        "msg/SemanticObjectArray.msg"
         "msg/SlamState.msg"
         "msg/StartNavigation.msg"
         "msg/Trajectory.msg"

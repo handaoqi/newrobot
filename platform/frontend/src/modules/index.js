@@ -21,6 +21,7 @@ const productionDefinitions = [
   { id: 'maps', title: '地图管理', path: '/dashboard/tasks/maps', parentId: 'tasks', component: () => import('../views/MapsPage.vue'), recommended: ['routes', 'zones'] },
   { id: 'routes', title: '路径规划', path: '/dashboard/tasks/routes', parentId: 'tasks', component: () => import('../views/RoutePlannerPage.vue'), recommended: ['maps', 'zones', 'tasks'] },
   { id: 'zones', title: '禁区管理', path: '/dashboard/tasks/zones', parentId: 'tasks', component: () => import('../views/ZoneManagerPage.vue'), recommended: ['maps', 'routes'] },
+  { id: 'scene-visualizer', title: '场景视角调试', path: '/dashboard/tasks/scene-visualizer', parentId: 'tasks', component: () => import('../views/SceneVisualizerPage.vue'), recommended: ['maps', 'routes'] },
 ]
 
 const serverReplayDefinitions = [

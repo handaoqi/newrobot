@@ -119,5 +119,40 @@ TEST(GlobalFactorGraphTest, RejectsImuIntervalWithInconsistentEndpointVelocity)
     EXPECT_NEAR(result.optimized_poses.back().translation().norm(), 0.0, 1e-5);
 }
 
+TEST(GlobalFactorGraphTest, RtkXyPullKeepsLioZAndAcceptsMetreJump)
+{
+    GlobalFactorGraphConfig config;
+    config.use_imu_factor = false;
+    config.use_loop = false;
+    config.max_pose_jump_m = 25.0;
+    config.max_abs_z_change_m = 1.5;
+    GlobalFactorGraph graph(config);
+
+    const std::size_t count = 12;
+    std::vector<GlobalGraphKeyframe> keyframes(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const double t = static_cast<double>(i);
+        const double frac = t / static_cast<double>(count - 1);
+        keyframes[i].index = i;
+        keyframes[i].stamp = t;
+        const double lio_z = (i + 1 == count) ? 1.0 : 0.10 * t;
+        keyframes[i].initial_pose = gtsam::Pose3(gtsam::Rot3(), gtsam::Point3(t, 0.0, lio_z));
+        keyframes[i].has_rtk_position = true;
+        keyframes[i].rtk_position = gtsam::Point3(t + 2.20 * frac, -1.80 * frac, 10.0);
+        keyframes[i].rtk_position_sigma = 0.05;
+    }
+
+    const auto result = graph.optimize(keyframes, {});
+
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.rtk_position_factor_count, count);
+    EXPECT_NEAR(result.optimized_poses.front().x(), 0.0, 0.05);
+    EXPECT_NEAR(result.optimized_poses.front().y(), 0.0, 0.05);
+    EXPECT_NEAR(result.optimized_poses.back().z(), 1.0, 1e-6);
+    EXPECT_GT(result.optimized_poses.back().x(), 12.0);
+    EXPECT_LT(result.optimized_poses.back().y(), -0.8);
+}
+
 }  // namespace
 }  // namespace robot::slam

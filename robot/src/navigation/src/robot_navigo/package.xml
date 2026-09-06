@@ -29,6 +29,8 @@
   <exec_depend>navigo_bt_navigator</exec_depend>
   <exec_depend>navigo_core</exec_depend>
   <exec_depend>navigo_costmap_2d</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
   <build_depend>robots_dog_msgs</build_depend>
   <exec_depend>robots_dog_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>

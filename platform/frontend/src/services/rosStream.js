@@ -297,3 +297,82 @@ export function openLiveSource(url, signals, { onUpdate, onError } = {}) {
     },
   }
 }
+
+/** Subscribe to complete decoded messages for a native scene renderer. */
+export function openLiveMessageSource(url, topics, { onMessage, onReady, onError } = {}) {
+  const wanted = new Set(topics)
+  const decoders = new Map()
+  const topicBySubscription = new Map()
+  const socket = new WebSocket(url, SUBPROTOCOLS)
+  const client = new FoxgloveClient({ ws: socket })
+
+  client.on('error', error => onError?.(error))
+  client.on('advertise', channels => {
+    for (const channel of channels) {
+      if (!wanted.has(channel.topic)) continue
+      const decode = makeDecoder(channel)
+      if (!decode) continue
+      const subscription = client.subscribe(channel.id)
+      topicBySubscription.set(subscription, channel.topic)
+      decoders.set(subscription, decode)
+    }
+    onReady?.({ subscribed: [...topicBySubscription.values()] })
+  })
+  client.on('message', ({ subscriptionId, timestamp, data }) => {
+    const topic = topicBySubscription.get(subscriptionId)
+    const decode = decoders.get(subscriptionId)
+    if (!topic || !decode) return
+    try {
+      const message = decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+      onMessage?.({ topic, timestamp: Number(timestamp) / 1e9, message })
+    } catch (error) {
+      onError?.(new Error(`${topic} 解码失败：${error.message}`))
+    }
+  })
+
+  return {
+    close() {
+      try { client.close() } catch { /* socket is already closed */ }
+    },
+  }
+}
+
+/** Sequentially decode selected MCAP topics without uploading the local file. */
+export async function scanBagMessages(file, topics, { onMessage, onProgress } = {}) {
+  const reader = await McapIndexedReader.Initialize({
+    readable: new FileReadable(file),
+    decompressHandlers: {
+      zstd: (buffer, decompressedSize) => {
+        const size = Number(decompressedSize)
+        if (!Number.isSafeInteger(size)) throw new Error('MCAP zstd chunk is too large for browser decoding')
+        return decompressZstd(buffer, new Uint8Array(size))
+      },
+    },
+  })
+  const wanted = new Set(topics)
+  const decoders = new Map()
+  const start = reader.statistics?.messageStartTime ?? 0n
+  const end = reader.statistics?.messageEndTime ?? start
+  const span = Math.max(1, Number(end - start) / 1e9)
+  let seen = 0
+  for await (const item of reader.readMessages({ topics: [...wanted] })) {
+    const channel = reader.channelsById.get(item.channelId)
+    if (!channel) continue
+    if (!decoders.has(item.channelId)) {
+      const schema = channel.schemaId ? reader.schemasById.get(channel.schemaId) : undefined
+      decoders.set(item.channelId, makeDecoder({ ...channel, schema }))
+    }
+    const decode = decoders.get(item.channelId)
+    if (!decode) continue
+    try {
+      onMessage?.({
+        topic: channel.topic,
+        timestamp: Number(item.logTime - start) / 1e9,
+        message: decode(item.data),
+      })
+    } catch { /* retain the rest of a partially damaged recording */ }
+    if (++seen % 1000 === 0) onProgress?.(Math.min(1, Number(item.logTime - start) / 1e9 / span))
+  }
+  onProgress?.(1)
+  return { duration: span }
+}

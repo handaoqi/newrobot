@@ -32,6 +32,7 @@ from .models import (
     AlertSkillBinding,
     InspectionEvent,
     CalendarDay,
+    DebugLogSession,
     MediaAsset,
     PatrolTask,
     PatrolSchedule,
@@ -42,6 +43,7 @@ from .models import (
     RecordedAudio,
     SpeechCategory,
     SpeechTemplate,
+    SystemLog,
     RobotSession,
     RobotStatusLatest,
     RobotTelemetry,
@@ -49,6 +51,7 @@ from .models import (
     ScheduleRun,
     TrajectoryPoint,
     MapData,
+    MapNavigationBoundary,
     MapSet,
     MapSetMember,
     PatrolRoute,
@@ -63,12 +66,16 @@ from .services.command_service import CommandService
 from .services.docking_service import DockingDispatchError, dispatch_docking_task
 from .services.schedule_service import ScheduleService
 from .services.task_service import TaskExecutionService, TaskStateError
+from .services.navigation_boundary_service import boundary_payload, normalize_boundary_payload, point_allowed_by_boundary
+from .services.map_scene_service import SceneArtifactError, build_scene_manifest, scene_cloud_path
+from .services.system_log_service import emit_center_log
 from .services import asr_service, tts_service
 from .services.alert_skill_service import resolve_alert_template
 from .serializers import (
     AlertSkillBindingSerializer,
     AlertSkillPreviewSerializer,
     EventSerializer,
+    DebugLogSessionSerializer,
     CalendarDaySerializer,
     MediaAssetSerializer,
     MediaUploadSerializer,
@@ -102,6 +109,7 @@ from .serializers import (
     TaskExecutionSerializer,
     TrajectoryPointSerializer,
     ScheduleRunSerializer,
+    SystemLogSerializer,
 )
 
 
@@ -815,6 +823,7 @@ class LoginView(APIView):
                 "user": {
                     "username": user.username,
                     "display_name": f"{user.first_name}{user.last_name}".strip() or user.username,
+                    "is_staff": user.is_staff,
                 },
             }
         )
@@ -2649,6 +2658,87 @@ class MapDataMappingTraceView(APIView):
         return Response({"format": "roamerx.mapping-trace.empty", "frame_id": "map", "alignment_locked": False, "samples": []})
 
 
+class MapDataSceneView(APIView):
+    """Return the immutable rendering contract for the experimental scene viewer."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        return Response(build_scene_manifest(map_data))
+
+
+class MapDataSceneCloudView(APIView):
+    """Serve a bounded point-cloud preview with cache and byte-range support."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @staticmethod
+    def _chunks(path, start, length, chunk_size=1024 * 1024):
+        with path.open("rb") as stream:
+            stream.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = stream.read(min(chunk_size, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        try:
+            path, checksum, point_count = scene_cloud_path(map_data)
+        except (OSError, zipfile.BadZipFile, SceneArtifactError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        etag = f'"{checksum}-scene-{path.stat().st_size}"'
+        if request.headers.get("If-None-Match") == etag:
+            response = HttpResponse(status=304)
+            response["ETag"] = etag
+            return response
+
+        file_size = path.stat().st_size
+        start, end = 0, file_size - 1
+        response_status = 200
+        range_header = request.headers.get("Range", "")
+        if range_header.startswith("bytes=") and "," not in range_header:
+            left, separator, right = range_header[6:].partition("-")
+            try:
+                if not separator:
+                    raise ValueError
+                if left:
+                    start = int(left)
+                    end = int(right) if right else file_size - 1
+                else:
+                    suffix = int(right)
+                    start = max(0, file_size - suffix)
+                end = min(end, file_size - 1)
+                if start < 0 or end < start or start >= file_size:
+                    raise ValueError
+                response_status = 206
+            except ValueError:
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{file_size}"
+                return response
+
+        length = end - start + 1
+        response = StreamingHttpResponse(
+            self._chunks(path, start, length),
+            status=response_status,
+            content_type="application/vnd.pointcloud",
+        )
+        response["Accept-Ranges"] = "bytes"
+        response["Content-Length"] = str(length)
+        response["ETag"] = etag
+        response["Cache-Control"] = "private, max-age=86400"
+        response["X-Point-Count"] = str(point_count)
+        response["Content-Disposition"] = f'inline; filename="map-{map_data.pk}-scene.pcd"'
+        if response_status == 206:
+            response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        return response
+
+
 class RobotMappingStatusView(APIView):
     """查询机器狗建图命令状态，包含连接状态和 edge_agent 真实建图状态机。"""
     permission_classes = [permissions.AllowAny]
@@ -3026,6 +3116,11 @@ class RobotNavigationStatusView(APIView):
         localization_command = robot.remote_commands.filter(
             command_type__in=["nav.initial_pose", "nav.relocalize"]
         ).order_by("-issued_at").first()
+        current_boundary = (
+            MapNavigationBoundary.objects.filter(map_data_id=robot.current_map_id).first()
+            if str(robot.current_map_id or "").isdigit()
+            else None
+        )
 
         def _command_payload(item, *, include_result=False):
             if not item:
@@ -3059,8 +3154,153 @@ class RobotNavigationStatusView(APIView):
                 "status": RobotStatusSerializer(latest).data if latest else None,
                 "command": _command_payload(command),
                 "localization_command": _command_payload(localization_command, include_result=True),
+                "navigation_boundary": {
+                    "revision": current_boundary.revision,
+                    "active_revision": current_boundary.active_revision,
+                    "apply_status": current_boundary.apply_status,
+                    "apply_error": current_boundary.apply_error,
+                } if current_boundary else None,
             }
         )
+
+
+class RobotSystemLogListView(APIView):
+    """Cursor-style structured logs for the route planner console."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        now = timezone.now()
+        DebugLogSession.objects.filter(
+            robot=robot,
+            status__in=["starting", "active"],
+            expires_at__lte=now,
+        ).update(status="expired", stopped_at=now)
+        queryset = SystemLog.objects.filter(robot=robot)
+        levels = {item.upper() for item in request.query_params.get("levels", "").split(",") if item}
+        modules = {item for item in request.query_params.get("modules", "").split(",") if item}
+        if levels:
+            queryset = queryset.filter(level__in=levels)
+        if modules:
+            queryset = queryset.filter(module__in=modules)
+        if request.query_params.get("trace_id"):
+            queryset = queryset.filter(trace_id=request.query_params["trace_id"])
+        if request.query_params.get("task_execution_id"):
+            queryset = queryset.filter(task_execution_id=request.query_params["task_execution_id"])
+        if request.query_params.get("command_id"):
+            queryset = queryset.filter(command_id=request.query_params["command_id"])
+        if request.query_params.get("map_id"):
+            queryset = queryset.filter(map_data_id=request.query_params["map_id"])
+        query = str(request.query_params.get("q") or "").strip()
+        if query:
+            queryset = queryset.filter(
+                Q(message__icontains=query) | Q(event_code__icontains=query) | Q(source__icontains=query)
+            )
+        after = parse_datetime(str(request.query_params.get("after") or ""))
+        before = parse_datetime(str(request.query_params.get("before") or ""))
+        if after:
+            queryset = queryset.filter(occurred_at__gt=after)
+        if before:
+            queryset = queryset.filter(occurred_at__lt=before)
+        try:
+            limit = min(200, max(1, int(request.query_params.get("limit", 100))))
+        except ValueError:
+            return Response({"detail": "limit 参数无效"}, status=status.HTTP_400_BAD_REQUEST)
+        rows = list(queryset.select_related("task_execution", "command", "map_data")[:limit])
+        active_debug = DebugLogSession.objects.filter(
+            robot=robot,
+            status__in=["starting", "active"],
+            expires_at__gt=now,
+        ).first()
+        return Response({
+            "results": SystemLogSerializer(rows, many=True).data,
+            "cursor": rows[0].occurred_at.isoformat() if rows else request.query_params.get("after"),
+            "has_more": queryset.count() > len(rows),
+            "debug_session": DebugLogSessionSerializer(active_debug).data if active_debug else None,
+        })
+
+
+class RobotDebugLogSessionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, robot_id):
+        if not request.user.is_staff:
+            return Response({"detail": "只有管理员可以开启 DEBUG 日志"}, status=status.HTTP_403_FORBIDDEN)
+        robot = get_object_or_404(Robot, pk=robot_id)
+        allowed_modules = {choice[0] for choice in SystemLog.MODULE_CHOICES}
+        modules = request.data.get("modules") or sorted(allowed_modules)
+        if not isinstance(modules, list) or not modules or any(module not in allowed_modules for module in modules):
+            return Response({"detail": "DEBUG 模块无效"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            duration_seconds = int(request.data.get("duration_seconds", 900))
+            sample_hz = float(request.data.get("sample_hz", 1.0))
+        except (TypeError, ValueError):
+            return Response({"detail": "DEBUG 时长和采样率必须是数值"}, status=status.HTTP_400_BAD_REQUEST)
+        if not 300 <= duration_seconds <= 1800:
+            return Response({"detail": "DEBUG 时长必须在 5 到 30 分钟之间"}, status=status.HTTP_400_BAD_REQUEST)
+        if not 0.1 <= sample_hz <= 5:
+            return Response({"detail": "DEBUG 采样率必须在 0.1 到 5 Hz 之间"}, status=status.HTTP_400_BAD_REQUEST)
+        now = timezone.now()
+        DebugLogSession.objects.filter(
+            robot=robot,
+            status__in=["starting", "active"],
+        ).update(status="stopped", stopped_at=now)
+        session = DebugLogSession.objects.create(
+            robot=robot,
+            modules=modules,
+            sample_hz=sample_hz,
+            expires_at=now + timedelta(seconds=duration_seconds),
+            created_by=request.user,
+        )
+        command = CommandService.create_robot_command(
+            robot=robot,
+            command_type="diagnostics.log_config",
+            payload={
+                "enabled": True,
+                "session_id": str(session.id),
+                "modules": modules,
+                "sample_hz": sample_hz,
+                "expires_at": session.expires_at.isoformat(),
+            },
+            operator=request.user,
+            expiry_seconds=60,
+        )
+        emit_center_log(
+            robot=robot, level="INFO", module="system", event_code="debug.session_requested",
+            message="已请求开启限时 DEBUG 日志", data={"modules": modules, "sample_hz": sample_hz, "duration_seconds": duration_seconds},
+            command=command,
+        )
+        data = DebugLogSessionSerializer(session).data
+        data["command_id"] = str(command.id)
+        return Response(data, status=status.HTTP_201_CREATED)
+
+
+class RobotDebugLogSessionDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, robot_id, session_id):
+        if not request.user.is_staff:
+            return Response({"detail": "只有管理员可以停止 DEBUG 日志"}, status=status.HTTP_403_FORBIDDEN)
+        robot = get_object_or_404(Robot, pk=robot_id)
+        session = get_object_or_404(DebugLogSession, pk=session_id, robot=robot)
+        now = timezone.now()
+        if session.status not in {"stopped", "expired"}:
+            session.status = "stopped"
+            session.stopped_at = now
+            session.save(update_fields=["status", "stopped_at", "updated_at"])
+        command = CommandService.create_robot_command(
+            robot=robot,
+            command_type="diagnostics.log_config",
+            payload={"enabled": False, "session_id": str(session.id)},
+            operator=request.user,
+            expiry_seconds=60,
+        )
+        emit_center_log(
+            robot=robot, level="INFO", module="system", event_code="debug.session_stopped",
+            message="已请求停止 DEBUG 日志", command=command,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class RobotNavigationCommandView(APIView):
@@ -3085,6 +3325,15 @@ class RobotNavigationCommandView(APIView):
             },
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=self.expiry_seconds,
+        )
+        emit_center_log(
+            robot=robot,
+            level="INFO",
+            module="relocalization" if self.command_type == "nav.relocalize" else "navigation",
+            event_code=f"{self.command_type}.requested",
+            message=f"已下发{command.get_command_type_display()}",
+            data={"map_id": command.payload.get("map_id"), "map_version": command.payload.get("map_version")},
+            command=command,
         )
         return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
@@ -3135,6 +3384,11 @@ class RobotNavigationInitialPoseView(APIView):
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=60,
         )
+        emit_center_log(
+            robot=robot, level="INFO", module="localization", event_code="localization.initial_pose_requested",
+            message="已下发初始定位", data={"seed_source": seed_source, **coordinates}, command=command,
+            pose=coordinates,
+        )
         return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
 
@@ -3150,13 +3404,43 @@ class RobotNavigationSingleGoalView(APIView):
             coords = {field: float(request.data[field]) for field in ("x", "y", "yaw")}
         except (TypeError, ValueError, KeyError):
             return Response({"detail": "单点导航需要数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
+        global_controller = str(request.data.get("global_controller") or "theta_star").strip().lower()
+        if global_controller not in {"theta_star", "navfn"}:
+            return Response(
+                {"detail": "单点导航全局控制器只能是 Theta* 或 NavFn (A*)。"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        map_id = str(request.data.get("map_id") or robot.current_map_id or "")
+        boundary = MapNavigationBoundary.objects.filter(map_data_id=map_id).first() if map_id.isdigit() else None
+        boundary_revision = boundary.active_revision if boundary and boundary.active_revision > 0 else None
+        if boundary_revision:
+            active = boundary_payload(boundary, active=True)
+            point = [coords["x"], coords["y"]]
+            allowed, reason = point_allowed_by_boundary(point, active)
+            if reason == "outside":
+                return Response({"detail": "单点导航目标位于可行驶外边界之外"}, status=status.HTTP_400_BAD_REQUEST)
+            if not allowed:
+                return Response({"detail": "单点导航目标位于禁入区内"}, status=status.HTTP_400_BAD_REQUEST)
+        command_payload = {
+            "reason": "route_planner_single_goal",
+            "frame_id": request.data.get("frame_id") or "map",
+            "map_id": map_id,
+            "map_version": request.data.get("map_version") or robot.current_map_version or "",
+            "require_yaw": bool(request.data.get("require_yaw", True)),
+            "global_controller": global_controller,
+            **coords,
+        }
+        if boundary_revision:
+            command_payload["boundary_revision"] = boundary_revision
         command = CommandService.create_robot_command(
             robot=robot, command_type="nav.single_goal",
-            payload={"reason": "route_planner_single_goal", "frame_id": request.data.get("frame_id") or "map",
-                     "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
-                     "map_version": request.data.get("map_version") or robot.current_map_version or "",
-                     "require_yaw": bool(request.data.get("require_yaw", True)), **coords},
+            payload=command_payload,
             operator=request.user if request.user.is_authenticated else None, expiry_seconds=180)
+        emit_center_log(
+            robot=robot, level="INFO", module="planner", event_code="planner.single_goal_requested",
+            message="已下发单点导航目标", data={**coords, "global_controller": global_controller}, command=command,
+            pose=coords,
+        )
         return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
 
@@ -3189,9 +3473,11 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
 
     def build_payload(self, request, robot: Robot) -> dict:
         seed_source = str(request.data.get("seed_source") or "last_trusted").strip()
-        if seed_source not in {"last_trusted", "mapping_start", "global", "progressive"}:
-            raise ValueError("主动重定位方式必须是渐进初始化、可信位姿、建图起点或全局搜索")
-        default_wait_seconds = 90.0 if seed_source == "global" else 180.0
+        if seed_source not in {
+            "last_trusted", "mapping_start", "global", "progressive", "quick_then_global",
+        }:
+            raise ValueError("主动重定位方式必须是快速后全局、渐进初始化、可信位姿、建图起点或全局搜索")
+        default_wait_seconds = 120.0 if seed_source in {"global", "quick_then_global"} else 180.0
         wait_seconds = float(request.data.get("wait_seconds") or default_wait_seconds)
         if not math.isfinite(wait_seconds) or wait_seconds <= 0:
             raise ValueError("主动重定位等待时间必须是正数")
@@ -3203,6 +3489,8 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
             "map_id": str(request.data.get("map_id") or robot.current_map_id or ""),
             "map_version": request.data.get("map_version") or robot.current_map_version or "",
             "wait_seconds": wait_seconds,
+            "scene_scope": str(request.data.get("scene_scope") or "indoor").strip().lower(),
+            "coordinate_mode": str(request.data.get("coordinate_mode") or "local_only").strip().lower(),
         }
         if seed_source == "progressive":
             raw_waypoints = request.data.get("waypoints") or []
@@ -3483,7 +3771,13 @@ class PatrolRouteListView(APIView):
     def post(self, request):
         serializer = PatrolRouteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        route = serializer.save()
+        emit_center_log(
+            robot=route.robot, level="INFO", module="waypoint", event_code="route.created",
+            message=f"路线“{route.name}”已创建",
+            data={"route_id": route.id, "waypoint_count": len(route.waypoints or []), "global_controller": route.global_controller},
+            map_data=route.map_data,
+        )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -3502,9 +3796,22 @@ class PatrolRouteDetailView(APIView):
     def put(self, request, pk):
         try:
             route = PatrolRoute.objects.get(pk=pk)
+            before = list(route.waypoints or [])
             serializer = PatrolRouteSerializer(route, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
-            serializer.save()
+            route = serializer.save()
+            emit_center_log(
+                robot=route.robot, level="INFO", module="waypoint", event_code="route.waypoints_updated",
+                message=f"路线“{route.name}”航点配置已更新",
+                data={
+                    "route_id": route.id,
+                    "before_count": len(before),
+                    "after_count": len(route.waypoints or []),
+                    "before": before,
+                    "after": route.waypoints or [],
+                },
+                map_data=route.map_data,
+            )
             return Response(serializer.data)
         except PatrolRoute.DoesNotExist:
             return Response({"detail": "路线不存在"}, status=status.HTTP_404_NOT_FOUND)
@@ -3743,6 +4050,118 @@ class ZoneDetailView(APIView):
         except Zone.DoesNotExist:
             return Response({"detail": "禁区不存在"}, status=status.HTTP_404_NOT_FOUND)
 
+
+class MapNavigationBoundaryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, map_id):
+        map_data = get_object_or_404(MapData, pk=map_id)
+        boundary, _ = MapNavigationBoundary.objects.get_or_create(map_data=map_data)
+        return Response(boundary_payload(boundary))
+
+    @transaction.atomic
+    def put(self, request, map_id):
+        map_data = get_object_or_404(MapData, pk=map_id)
+        boundary, _ = MapNavigationBoundary.objects.select_for_update().get_or_create(map_data=map_data)
+        expected_revision = request.data.get("revision")
+        if expected_revision is not None:
+            try:
+                expected_revision = int(expected_revision)
+            except (TypeError, ValueError):
+                return Response({"detail": "边界版本必须是整数"}, status=status.HTTP_400_BAD_REQUEST)
+            if expected_revision != boundary.revision:
+                return Response(
+                    {"detail": "边界已被其他用户修改，请刷新后重试", "current_revision": boundary.revision},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        normalized = normalize_boundary_payload(request.data)
+        boundary.outer_polygon = normalized["outer_polygon"]
+        boundary.safety_margin_m = normalized["safety_margin_m"]
+        boundary.revision += 1
+        boundary.apply_status = "draft"
+        boundary.apply_error = ""
+        boundary.save()
+
+        retained_ids = []
+        for item in normalized["zones"]:
+            zone = None
+            if item.get("id"):
+                zone = Zone.objects.filter(pk=item["id"], map_data=map_data).first()
+            if zone is None:
+                zone = Zone(map_data=map_data)
+            for field in (
+                "name", "zone_type", "polygon", "description", "active",
+                "speed_limit_mps", "warning_distance_m",
+            ):
+                setattr(zone, field, item[field])
+            zone.save()
+            retained_ids.append(zone.id)
+        map_data.zones.exclude(id__in=retained_ids).delete()
+        robot = map_data.robot or Robot.objects.filter(routes__map_data=map_data).distinct().first()
+        if robot:
+            emit_center_log(
+                robot=robot, level="INFO", module="boundary", event_code="boundary.draft_saved",
+                message=f"导航边界草稿已保存，版本 {boundary.revision}",
+                data={"revision": boundary.revision, "zone_count": len(retained_ids), "safety_margin_m": boundary.safety_margin_m},
+                map_data=map_data,
+            )
+        return Response(boundary_payload(boundary))
+
+
+class MapNavigationBoundaryPublishView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, map_id):
+        map_data = get_object_or_404(MapData.objects.select_for_update(), pk=map_id)
+        boundary = get_object_or_404(MapNavigationBoundary.objects.select_for_update(), map_data=map_data)
+        if not boundary.outer_polygon or boundary.revision <= 0:
+            return Response({"detail": "请先保存可行驶外边界"}, status=status.HTTP_409_CONFLICT)
+        robot_id = request.data.get("robot_id")
+        robot = (
+            Robot.objects.filter(pk=robot_id).first() if robot_id
+            else map_data.robot or Robot.objects.filter(routes__map_data=map_data).distinct().first()
+        )
+        if robot is None:
+            return Response({"detail": "地图未关联机器人，无法发布边界"}, status=status.HTTP_409_CONFLICT)
+        if str(robot.current_map_id or "") and str(robot.current_map_id) != str(map_data.id):
+            return Response(
+                {"detail": "只能向机器人当前活动地图发布边界，请先切换并确认地图"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if not map_data.resolution or not map_data.width or not map_data.height or len(map_data.origin or []) < 2:
+            return Response(
+                {"detail": "地图缺少分辨率、尺寸或原点，无法生成 Nav2 边界掩膜"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).exists():
+            return Response({"detail": "机器人正在执行任务，只能保存草稿，停止任务后才能发布"}, status=status.HTTP_409_CONFLICT)
+        payload = boundary_payload(boundary)
+        command = CommandService.create_robot_command(
+            robot=robot,
+            command_type="map.boundary_apply",
+            payload={
+                "reason": "route_planner_boundary_publish",
+                "map_id": str(map_data.id),
+                "map_version": robot.current_map_version or str(map_data.id),
+                "boundary": payload,
+            },
+            operator=request.user if request.user.is_authenticated else None,
+            expiry_seconds=180,
+        )
+        boundary.apply_status = "applying"
+        boundary.apply_error = ""
+        boundary.apply_command = command
+        boundary.save(update_fields=["apply_status", "apply_error", "apply_command", "updated_at"])
+        emit_center_log(
+            robot=robot, level="INFO", module="boundary", event_code="boundary.publish_requested",
+            message=f"正在发布导航边界版本 {boundary.revision}",
+            data={"revision": boundary.revision, "zone_count": len(payload["zones"])},
+            command=command, map_data=map_data,
+        )
+        response = boundary_payload(boundary)
+        response["command_id"] = str(command.id)
+        return Response(response, status=status.HTTP_202_ACCEPTED)
 
 class TrackListView(APIView):
     """轨迹记录列表视图"""

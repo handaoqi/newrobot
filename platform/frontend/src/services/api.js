@@ -410,6 +410,40 @@ export async function fetchRobotNavigationStatus(robotId, { signal } = {}) {
   return request(`/robots/${robotId}/navigation/status/`, { signal })
 }
 
+export async function fetchRobotSystemLogs(robotId, filters = {}) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== null && value !== undefined && value !== '') params.set(key, String(value))
+  }
+  return request(`/robots/${robotId}/system-logs/?${params.toString()}`)
+}
+
+export async function startRobotDebugLogSession(robotId, payload = {}) {
+  return request(`/robots/${robotId}/debug-log-sessions/`, {
+    method: 'POST', body: JSON.stringify(payload),
+  })
+}
+
+export async function stopRobotDebugLogSession(robotId, sessionId) {
+  return request(`/robots/${robotId}/debug-log-sessions/${sessionId}/`, { method: 'DELETE' })
+}
+
+export async function fetchMapNavigationBoundary(mapId) {
+  return request(`/maps/${mapId}/navigation-boundaries/`)
+}
+
+export async function saveMapNavigationBoundary(mapId, payload) {
+  return request(`/maps/${mapId}/navigation-boundaries/`, {
+    method: 'PUT', body: JSON.stringify(payload),
+  })
+}
+
+export async function publishMapNavigationBoundary(mapId, robotId) {
+  return request(`/maps/${mapId}/navigation-boundaries/publish/`, {
+    method: 'POST', body: JSON.stringify({ robot_id: robotId || null }),
+  })
+}
+
 export async function sendRobotNavigationCommand(robotId, action, payload = {}) {
   const allowed = new Set(['probe', 'start', 'restart', 'recover', 'relocalize', 'stop', 'initial-pose'])
   if (!allowed.has(action)) throw new Error('不支持的导航命令')
@@ -524,6 +558,21 @@ export async function fetchMapDetail(mapId, { signal } = {}) {
 
 export async function fetchMapMappingTrace(mapId) {
   return request(`/maps/${mapId}/mapping-trace/`)
+}
+
+export async function fetchMapScene(mapId, { signal } = {}) {
+  return request(`/maps/${mapId}/scene/`, { signal })
+}
+
+export async function fetchMapSceneCloud(mapId, { signal } = {}) {
+  const token = localStorage.getItem('inspection_token')
+  const headers = token ? { Authorization: `Token ${token}` } : {}
+  const response = await fetch(`${API_BASE}/maps/${mapId}/scene-cloud/`, { headers, signal })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ detail: '三维点云加载失败' }))
+    throw new Error(payload.detail || '三维点云加载失败')
+  }
+  return response.arrayBuffer()
 }
 
 export async function createMap(payload) {

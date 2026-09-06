@@ -35,7 +35,9 @@ COMMAND_TYPES = {
     "nav.initial_pose",
     "nav.single_goal",
     "nav.relocalize",
+    "diagnostics.log_config",
     "map.activate",
+    "map.boundary_apply",
     "map.optimize",
     "sensor.restart",
     "charge.start",
@@ -96,6 +98,7 @@ UPLINK_MESSAGE_TYPES = {
     "task.cancelled",
     "task.interrupted",
     "alert.event",
+    "system.log.batch",
     "sync.request",
     "sync.response",
 }
@@ -213,6 +216,8 @@ def validate_payload(envelope: MessageEnvelope) -> None:
             raise ProtocolError("INVALID_MESSAGE", "command must be an object")
         if envelope.message_type == "task.start":
             _validate_task_start(command)
+        elif envelope.message_type == "nav.single_goal":
+            _validate_nav_single_goal(command)
     elif envelope.message_type == "command.ack":
         _uuid(_required(payload, "command_id"), "command_id")
         if _required(payload, "ack") not in {"accepted", "rejected"}:
@@ -233,6 +238,22 @@ def validate_payload(envelope: MessageEnvelope) -> None:
         normalize_timestamp(_required(payload, "occurred_at"))
         _required(payload, "event_type")
         _required(payload, "severity")
+    elif envelope.message_type == "system.log.batch":
+        entries = _required(payload, "entries")
+        if not isinstance(entries, list) or len(entries) > 100:
+            raise ProtocolError("INVALID_MESSAGE", "system.log.batch entries must contain at most 100 items")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ProtocolError("INVALID_MESSAGE", "system log entry must be an object")
+            if str(_required(entry, "level")).upper() not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+                raise ProtocolError("INVALID_MESSAGE", "invalid system log level")
+            if str(_required(entry, "module")) not in {
+                "localization", "navigation", "avoidance", "relocalization",
+                "waypoint", "planner", "boundary", "system",
+            }:
+                raise ProtocolError("INVALID_MESSAGE", "invalid system log module")
+            _required(entry, "event_code")
+            _required(entry, "message")
 
 
 def _validate_task_start(command: dict[str, Any]) -> None:
@@ -257,6 +278,10 @@ def _validate_task_start(command: dict[str, Any]) -> None:
             mode = str(waypoint["local_controller"]).lower()
             if mode not in {"rpp", "mppi"}:
                 raise ProtocolError("INVALID_MESSAGE", "waypoint local_controller must be mppi (rpp is a legacy alias)")
+        if "global_controller" in waypoint:
+            mode = str(waypoint["global_controller"]).lower()
+            if mode not in {"theta_star", "navfn"}:
+                raise ProtocolError("INVALID_MESSAGE", "waypoint global_controller must be theta_star or navfn")
         if "dwell_seconds" in waypoint:
             dwell_seconds = waypoint["dwell_seconds"]
             if isinstance(dwell_seconds, bool) or not isinstance(dwell_seconds, (int, float)) or not 0 <= dwell_seconds <= 3600:
@@ -270,6 +295,19 @@ def _validate_task_start(command: dict[str, Any]) -> None:
     record_rosbag = command.get("record_rosbag")
     if record_rosbag is not None and not isinstance(record_rosbag, bool):
         raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
+
+
+def _validate_nav_single_goal(command: dict[str, Any]) -> None:
+    for coordinate in ("x", "y", "yaw"):
+        value = command.get(coordinate)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ProtocolError("INVALID_MESSAGE", f"nav.single_goal {coordinate} must be numeric")
+    global_controller = str(command.get("global_controller") or "theta_star").lower()
+    if global_controller not in {"theta_star", "navfn"}:
+        raise ProtocolError(
+            "INVALID_MESSAGE",
+            "nav.single_goal global_controller must be theta_star or navfn",
+        )
 
 
 def _validate_trajectory_batch(payload: dict[str, Any]) -> None:

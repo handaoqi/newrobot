@@ -8,6 +8,7 @@ import {
   navigationMapIdentity,
   navigationReadyForMap,
   navigationStatusFresh,
+  navigationUnreadinessReason,
   shouldFallbackToGlobalRelocalization,
 } from '../src/services/mapActivationState.js'
 
@@ -77,4 +78,29 @@ test('saving a route prepares its map, localization and navigation stack', () =>
   assert.match(saveHandler, /await activateAndRelocalizeMap\(/)
   assert.doesNotMatch(saveHandler, /await activateRouteMap\(/)
   assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
+})
+
+test('unreadiness reason distinguishes missing map, lost localization and Nav2 down', () => {
+  const sampledAt = new Date().toISOString()
+  const base = {
+    connection_status: 'online',
+    status: {
+      sampled_at: sampledAt,
+      map_id: '9',
+      map_version: 'legacy-mapdata-9',
+      localization_status: 'normal',
+      nav_ready: true,
+    },
+  }
+  assert.equal(navigationUnreadinessReason(base, 9), null)
+  assert.equal(navigationUnreadinessReason({ ...base, connection_status: 'offline' }, 9), '机器人不在线')
+  assert.equal(navigationUnreadinessReason({
+    ...base,
+    status: { ...base.status, localization_status: 'lost' },
+  }, 9), '定位丢失，待恢复')
+  assert.equal(navigationUnreadinessReason({
+    ...base,
+    status: { ...base.status, nav_ready: false },
+  }, 9), '导航栈未就绪')
+  assert.equal(navigationUnreadinessReason({ connection_status: 'online', status: {} }, 9), '尚未加载任务地图')
 })

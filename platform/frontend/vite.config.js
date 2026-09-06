@@ -25,6 +25,18 @@ export default defineConfig(({ mode }) => {
   const isContainerBuild = (process.env.VITE_BUILD_TARGET || '').trim() === 'container'
   return {
     plugins: [vue(), ...(isContainerBuild ? [containerModulesPlugin()] : [])],
+    ...(isContainerBuild ? {} : {
+      build: {
+        rollupOptions: {
+          output: {
+            manualChunks(id) {
+              if (id.includes('/node_modules/three/')) return 'scene-three'
+              if (id.includes('/node_modules/@mcap/') || id.includes('/node_modules/@foxglove/') || id.includes('/node_modules/fzstd/')) return 'ros-replay'
+            },
+          },
+        },
+      },
+    }),
     server: {
       host: '0.0.0.0',
       port: 5173,

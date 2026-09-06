@@ -20,7 +20,9 @@ class FakeNavigation:
         self.rtk_initial_pose_requests = 0
         self.global_relocalize_requests = []
         self.progressive_relocalize_requests = []
+        self.quick_then_global_requests = []
         self.operator_localization_events = []
+        self.global_controllers = []
 
     def begin_operator_localization(self):
         self.operator_localization_events.append("begin")
@@ -29,8 +31,12 @@ class FakeNavigation:
         self.operator_localization_events.append("end")
 
     def send_waypoints(self, waypoints, feedback_cb, result_cb):
+        self.sent_waypoints = waypoints
         self.result_cb = result_cb
         return True
+
+    def set_global_controller(self, mode):
+        self.global_controllers.append(mode)
 
     def cancel_navigation(self, timeout_seconds=5):
         return True
@@ -62,6 +68,14 @@ class FakeNavigation:
         self.progressive_relocalize_requests.append(request)
         return {
             "mode": "progressive_stationary_search",
+            "selected_stage": "mapping_origin",
+            "motion_commanded": False,
+        }
+
+    def quick_then_global_relocalize(self, **request):
+        self.quick_then_global_requests.append(request)
+        return {
+            "mode": "quick_then_global",
             "selected_stage": "mapping_origin",
             "motion_commanded": False,
         }
@@ -559,6 +573,43 @@ def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
     store.close()
 
 
+def test_nav_single_goal_applies_global_controller(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.single_goal"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "x": 1.0,
+        "y": 2.0,
+        "yaw": 0.5,
+        "global_controller": "navfn",
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(
+            SafetyConfig(),
+            RuntimeSafetyState(localization_status="normal", nav_ready=True),
+        ),
+        task_executor=TaskExecutor(
+            store,
+            navigation,
+            event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert navigation.global_controllers == ["navfn"]
+    assert navigation.sent_waypoints[0]["global_controller"] == "navfn"
+    store.close()
+
+
 def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.initial_pose"
@@ -782,7 +833,7 @@ def test_trusted_pose_relocalization_preserves_operator_search_controls(tmp_path
     store.close()
 
 
-def test_active_relocalization_global_does_not_require_seed(tmp_path):
+def test_active_relocalization_global_uses_quick_then_global_without_seed(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.relocalize"
     raw["payload"].pop("task_execution_id", None)
@@ -805,7 +856,10 @@ def test_active_relocalization_global_does_not_require_seed(tmp_path):
     _, result = processor.handle_command(raw)
 
     assert result["payload"]["status"] == "succeeded"
-    assert navigation.global_relocalize_requests == [42.0]
+    request = navigation.quick_then_global_requests[0]
+    assert request["origin"] is None
+    assert request["manual_seed"] is None
+    assert request["wait_seconds"] == 42.0
     store.close()
 
 

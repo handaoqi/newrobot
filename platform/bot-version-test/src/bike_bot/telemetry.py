@@ -177,23 +177,22 @@ class TelemetryClient:
             )
             return False
 
-    def send_person_detections(self, tracked_objects: list, *, captured_at: str | None = None) -> bool:
+    def send_person_detections(
+        self,
+        tracked_objects: list,
+        *,
+        captured_at: str | None = None,
+        captured_at_unix: float | None = None,
+        source_frame_id: int | None = None,
+    ) -> bool:
         endpoint = self.config.telemetry.person_detection_endpoint
-        if not endpoint:
-            return False
-        monotonic_now = time.monotonic()
-        if monotonic_now - self._last_person_report_at < self.config.detection.person_report_interval_seconds:
-            return False
-        if not self._person_report_lock.acquire(blocking=False):
-            return False
-        self._last_person_report_at = monotonic_now
         with self._video_lock:
             frame_width = self._actual_frame_width or self.config.video.width
             frame_height = self._actual_frame_height or self.config.video.height
         detections = []
         for track in tracked_objects:
             label = str(track.label).lower()
-            if label not in {"person", "bicycle", "bike", "自行车"}:
+            if label not in {"person", "pedestrian", "bicycle", "bike", "自行车", "car", "truck", "bus", "motorcycle"}:
                 continue
             x, y, width, height = track.bbox
             detections.append(
@@ -210,8 +209,19 @@ class TelemetryClient:
             "frame_width": frame_width,
             "frame_height": frame_height,
             "captured_at": captured_at or now_iso(),
+            "captured_at_unix": float(captured_at_unix or time.time()),
+            "source_frame_id": int(source_frame_id or 0),
             "detections": detections,
         }
+        self._write_local_detection_snapshot(payload)
+        if not endpoint:
+            return bool(detections)
+        monotonic_now = time.monotonic()
+        if monotonic_now - self._last_person_report_at < self.config.detection.person_report_interval_seconds:
+            return False
+        if not self._person_report_lock.acquire(blocking=False):
+            return False
+        self._last_person_report_at = monotonic_now
         headers = {
             "Content-Type": "application/json",
             "X-Device-Code": self.config.robot.code,
@@ -226,6 +236,20 @@ class TelemetryClient:
             name="person-detection-reporter",
         ).start()
         return True
+
+    def _write_local_detection_snapshot(self, payload: dict) -> None:
+        path_value = str(self.config.telemetry.local_person_detection_path or "").strip()
+        if not path_value:
+            return
+        path = Path(path_value)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as exc:
+            LOGGER.warning("local detection snapshot write failed path=%s error=%s", path, exc)
+            temporary.unlink(missing_ok=True)
 
     def fetch_person_detection_enabled(self) -> bool | None:
         endpoint = self.config.telemetry.person_detection_endpoint

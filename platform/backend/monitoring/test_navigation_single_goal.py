@@ -24,6 +24,7 @@ class NavigationSingleGoalTests(TestCase):
                 "y": -0.5,
                 "yaw": 0.75,
                 "require_yaw": True,
+                "global_controller": "navfn",
                 "map_id": "7",
                 "map_version": "v3",
             },
@@ -41,11 +42,27 @@ class NavigationSingleGoalTests(TestCase):
                 "map_id": "7",
                 "map_version": "v3",
                 "require_yaw": True,
+                "global_controller": "navfn",
                 "x": 1.25,
                 "y": -0.5,
                 "yaw": 0.75,
             },
         )
+
+    def test_navigation_single_goal_rejects_invalid_global_controller(self):
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/navigation/single-goal/",
+            {
+                "x": 1.25,
+                "y": -0.5,
+                "yaw": 0.75,
+                "global_controller": "invalid",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(RemoteCommand.objects.count(), 0)
 
     def test_progressive_relocalization_forwards_ordered_route_waypoints(self):
         response = self.client.post(

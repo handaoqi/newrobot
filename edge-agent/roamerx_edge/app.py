@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from .alert_bridge import AlertBridge
 from .audio_control_adapter import AudioControlAdapter
@@ -21,7 +22,9 @@ from .map_set_coordinator import MapSetCoordinator
 from .mapping_adapter import MappingAdapter
 from .media_client import MediaClient
 from .mqtt_client import EdgeMqttClient
+from .structured_logging import StructuredLogEmitter
 from .navigation_stack_adapter import NavigationStackAdapter
+from .navigation_boundary import NavigationBoundaryManager
 from .protocol import ProtocolError, build_envelope, now_iso
 from .power_mode_controller import PowerModeController
 from .person_follow_controller import PersonFollowController
@@ -44,6 +47,7 @@ class EdgeAgentApplication:
         self.store = LocalStore(
             config.storage.sqlite_path,
             trajectory_outbox_limit=config.storage.trajectory_outbox_limit,
+            system_log_outbox_limit=config.storage.system_log_outbox_limit,
         )
         self.stop_event = threading.Event()
         self.safety_state = RuntimeSafetyState(
@@ -61,6 +65,13 @@ class EdgeAgentApplication:
             config.charge_control,
         )
         self.mqtt = EdgeMqttClient(config, self.store)
+        self.structured_logs = StructuredLogEmitter(self.mqtt.publish_system_logs)
+        self.navigation_boundary = NavigationBoundaryManager(
+            self.store,
+            self.structured_logs,
+            mask_dir=config.navigation_stack.boundary_filter_dir,
+            map_yaml_path=str(Path(config.mapping.map_dir) / "map.yaml"),
+        )
         self.media_client = MediaClient(config.media, config.robot.id)
         self.ros_runtime = None
         if navigation is None:
@@ -163,6 +174,8 @@ class EdgeAgentApplication:
             sensor_control_adapter=self.sensor_control_adapter,
             charge_control_adapter=self.charge_control_adapter,
             audio_control_adapter=self.audio_control_adapter,
+            structured_logs=self.structured_logs,
+            navigation_boundary=self.navigation_boundary,
         )
         self.trajectory = TrajectoryBuffer(
             robot_id=config.robot.id,
@@ -188,6 +201,8 @@ class EdgeAgentApplication:
         self.charge_control_adapter.observe_power(self.telemetry.latest_power())
         self.power_mode_controller.refresh_service_status(self.telemetry.latest_power())
         self._publish_online()
+        self.structured_logs.emit("INFO", "system", "edge.started", "Edge Agent 已启动")
+        self.structured_logs.flush()
         self._publish_sync_request()
         self._threads = [
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat"),
@@ -195,6 +210,7 @@ class EdgeAgentApplication:
             threading.Thread(target=self._trajectory_loop, daemon=True, name="trajectory"),
             threading.Thread(target=self._outbox_loop, daemon=True, name="outbox"),
             threading.Thread(target=self._system_telemetry_loop, daemon=True, name="system-telemetry"),
+            threading.Thread(target=self._boundary_loop, daemon=True, name="navigation-boundary"),
         ]
         for thread in self._threads:
             thread.start()
@@ -205,6 +221,8 @@ class EdgeAgentApplication:
         self.task_executor.stop()
         for thread in self._threads:
             thread.join(timeout=3)
+        self.structured_logs.emit("INFO", "system", "edge.stopping", "Edge Agent 正在停止")
+        self.structured_logs.flush()
         self.mqtt.disconnect()
         if self.ros_runtime:
             self.ros_runtime.stop()
@@ -301,6 +319,10 @@ class EdgeAgentApplication:
                     "audio.volume",
                     "map.activate",
                     "map.optimize",
+                    "map.boundary_apply",
+                    "diagnostics.log_config",
+                    "structured_logs.v1",
+                    "navigation_boundaries.v1",
                     "map_set.v1",
                     "teleop.takeover_enter",
                     "teleop.takeover_exit",
@@ -411,6 +433,34 @@ class EdgeAgentApplication:
                 snapshot["navigation"] = obstacle_snapshot() if callable(obstacle_snapshot) else {}
                 snapshot["power_mode"] = self.power_mode_controller.snapshot()
                 self.mqtt.publish_status(snapshot)
+                pose = self.telemetry.latest_pose()
+                pose_payload = {"x": pose.x, "y": pose.y, "yaw": pose.yaw} if pose else None
+                localization = snapshot.get("localization") or {}
+                self.structured_logs.emit(
+                    "DEBUG", "localization", "localization.sample", "定位变量采样",
+                    data={
+                        "status": snapshot.get("localization_status"),
+                        "quality": snapshot.get("localization_quality"),
+                        "decision": localization.get("decision"),
+                    },
+                    pose=pose_payload,
+                    map_id=self.config.robot.current_map_id,
+                    task_execution_id=context.task_execution_id if context else None,
+                )
+                navigation_snapshot = snapshot.get("navigation") or {}
+                self.structured_logs.emit(
+                    "DEBUG", "avoidance", "avoidance.sample", "避障变量采样",
+                    data={
+                        "front_obstacle_distance_m": navigation_snapshot.get("front_obstacle_distance_m"),
+                        "requested_speed_mps": navigation_snapshot.get("requested_speed_mps"),
+                        "actual_speed_mps": navigation_snapshot.get("actual_speed_mps"),
+                        "global_plan": navigation_snapshot.get("global_plan"),
+                    },
+                    pose=pose_payload,
+                    map_id=self.config.robot.current_map_id,
+                    task_execution_id=context.task_execution_id if context else None,
+                )
+                self.structured_logs.flush()
             except Exception:
                 LOGGER.exception("failed to publish telemetry status")
 
@@ -435,6 +485,77 @@ class EdgeAgentApplication:
     def _outbox_loop(self) -> None:
         while not self.stop_event.wait(2):
             self.mqtt.replay_outbox()
+
+    def _boundary_loop(self) -> None:
+        while not self.stop_event.wait(0.1):
+            pose = self.telemetry.latest_pose()
+            if not pose:
+                continue
+            try:
+                observation = self.navigation_boundary.observe_pose(
+                    self.config.robot.current_map_id, float(pose.x), float(pose.y),
+                )
+                for transition, zone in observation["events"]:
+                    transition_labels = {
+                        "entered": "进入", "exited": "离开",
+                        "approaching": "接近", "approach_cleared": "远离",
+                    }
+                    self.structured_logs.emit(
+                        "WARNING" if transition in {"entered", "approaching"} else "INFO",
+                        "boundary", f"boundary.zone_{transition}",
+                        f"机器人{transition_labels.get(transition, transition)}导航区域 {zone}",
+                        data={"zone": zone}, map_id=self.config.robot.current_map_id,
+                        pose={"x": pose.x, "y": pose.y, "yaw": pose.yaw},
+                    )
+                if observation["speed_changed"]:
+                    setter = getattr(self.navigation, "set_boundary_speed_limit", None)
+                    speed_applied = True
+                    try:
+                        if callable(setter):
+                            setter(observation["speed_limit_mps"])
+                    except Exception as exc:
+                        speed_applied = False
+                        self.navigation_boundary.retry_speed_application()
+                        self.structured_logs.emit(
+                            "ERROR", "boundary", "boundary.speed_limit_failed",
+                            "导航区域限速应用失败，将自动重试",
+                            data={"speed_limit_mps": observation["speed_limit_mps"], "error": str(exc)},
+                            map_id=self.config.robot.current_map_id,
+                            pose={"x": pose.x, "y": pose.y, "yaw": pose.yaw},
+                        )
+                    if speed_applied:
+                        self.structured_logs.emit(
+                            "INFO", "boundary", "boundary.speed_limit_changed",
+                            "导航区域限速已更新",
+                            data={"speed_limit_mps": observation["speed_limit_mps"]},
+                            map_id=self.config.robot.current_map_id,
+                            pose={"x": pose.x, "y": pose.y, "yaw": pose.yaw},
+                        )
+                if observation["violation"] and observation["violation_changed"]:
+                    stop_errors = []
+                    cancel = getattr(self.navigation, "cancel_navigation", None)
+                    try:
+                        if callable(cancel):
+                            cancel(timeout_seconds=1.0)
+                    except Exception as exc:
+                        stop_errors.append(f"cancel_navigation: {exc}")
+                    velocity = getattr(self.navigation, "teleop_velocity", None)
+                    try:
+                        if callable(velocity):
+                            velocity(0.0, 0.0, 0.0)
+                    except Exception as exc:
+                        stop_errors.append(f"zero_velocity: {exc}")
+                    self.structured_logs.emit(
+                        "ERROR", "boundary", "boundary.runtime_violation",
+                        "机器人触发硬导航边界，已取消导航并停车",
+                        data={"violation": observation["violation"], "stop_errors": stop_errors},
+                        map_id=self.config.robot.current_map_id,
+                        pose={"x": pose.x, "y": pose.y, "yaw": pose.yaw},
+                    )
+                    if stop_errors:
+                        self.navigation_boundary.retry_violation_stop()
+            except Exception as exc:
+                LOGGER.warning("navigation boundary monitor failed: %s", exc)
 
     def _system_telemetry_loop(self) -> None:
         while True:
@@ -462,6 +583,10 @@ class EdgeAgentApplication:
         if not diverged:
             if state in {"", "idle", "cancelled", "exited", "completed"}:
                 self._mapping_divergence_notified = False
+            return
+        # Stale save_progress from a previous mapping session must not put a
+        # patrol into SAFE_HOLD / passive.
+        if state in {"", "idle", "cancelled", "exited", "completed", "failed"}:
             return
         if self._mapping_divergence_notified:
             return
@@ -516,8 +641,24 @@ class EdgeAgentApplication:
                     LOGGER.warning("mapping SAFE_HOLD passive confirmation failed; retry %d/3", attempt + 1)
                     time.sleep(0.25)
 
+    def _mapping_session_is_active(self) -> bool:
+        adapter = getattr(self, "mapping_adapter", None)
+        session = getattr(adapter, "session", None)
+        state = str(getattr(session, "state", "") or "")
+        return state not in {"", "idle", "cancelled", "exited", "completed", "failed"}
+
     def _handle_mapping_divergence_event(self, event: dict) -> None:
-        """Immediately immobilize the robot, then rescue only after SLAM flushed evidence."""
+        """Immobilize only during an active mapping session, then rescue after flush.
+
+        `/slam/divergence_event` is transient_local. A leftover SAFE_HOLD from
+        the previous mapping run would otherwise lie the dog down mid-patrol.
+        """
+        if not self._mapping_session_is_active():
+            LOGGER.warning(
+                "ignoring mapping divergence event with no active mapping session: %s",
+                event,
+            )
+            return
         self._request_mapping_passive()
         if not bool(event.get("writer_flushed")):
             LOGGER.error("SAFE_HOLD writer did not flush; preserving session for manual recovery: %s", event)

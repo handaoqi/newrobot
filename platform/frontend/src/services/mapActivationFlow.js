@@ -8,7 +8,6 @@ import {
   expectedLegacyMapVersion,
   navigationMapIdentity,
   navigationReadyForMap,
-  shouldFallbackToGlobalRelocalization,
 } from './mapActivationState.js'
 
 const TERMINAL_COMMAND_STATES = new Set([
@@ -76,6 +75,8 @@ export async function activateAndRelocalizeMap({
   mapId,
   robotId,
   mapVersion = expectedLegacyMapVersion(mapId),
+  sceneScope = 'indoor',
+  coordinateMode = 'local_only',
   onProgress = () => {},
   onCommand = () => {},
 }) {
@@ -107,38 +108,22 @@ export async function activateAndRelocalizeMap({
     }
   }
 
-  onProgress('地图已应用，正在准备定位栈并使用最近可信位置重定位')
-  try {
-    const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-      seed_source: 'last_trusted',
-    })
-    await waitForRobotCommand(robotId, relocalizeCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => {
-        onProgress(`可信位置重定位：${latest.status || 'created'}`)
-        onCommand({ phase: 'localization', command: latest, showCandidates: true })
-      },
-    })
-  } catch (error) {
-    const errorCode = error?.command?.error_code || error?.command?.ack_reason_code || ''
-    if (!shouldFallbackToGlobalRelocalization(errorCode)) throw error
-    onProgress('无可用可信位姿，正在搜索全图位置与 360° 航向')
-    const globalCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-      seed_source: 'global',
-      wait_seconds: 90,
-    })
-    await waitForRobotCommand(robotId, globalCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => {
-        onProgress(`全局重定位：${latest.status || 'created'}`)
-        onCommand({ phase: 'localization', command: latest, showCandidates: true })
-      },
-    })
-  }
+  onProgress('地图已应用，先快速搜索可信位置与建图原点，失败后自动进入全局搜索')
+  const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
+    map_id: String(mapId),
+    map_version: mapVersion,
+    seed_source: 'quick_then_global',
+    scene_scope: sceneScope,
+    coordinate_mode: coordinateMode,
+    wait_seconds: 120,
+  })
+  await waitForRobotCommand(robotId, relocalizeCommand, {
+    timeoutMs: 360_000,
+    onProgress: latest => {
+      onProgress(`快速定位/全局回退：${latest.status || 'created'}`)
+      onCommand({ phase: 'localization', command: latest, showCandidates: true })
+    },
+  })
 
   navigationStatus = await fetchRobotNavigationStatus(robotId)
   if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {

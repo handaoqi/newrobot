@@ -23,6 +23,7 @@
 | `/dashboard/tasks/maps` | 地图管理 | 地图上传、建图、清理与活动地图 |
 | `/dashboard/tasks/routes` | 路径规划 | 地图选点、路线保存与导航测试 |
 | `/dashboard/tasks/zones` | 禁区管理 | 地图关联的禁区配置 |
+| `/dashboard/tasks/scene-visualizer` | 场景视角调试 | 只读查看地图场景、点云、路线和定位证据 |
 | `/dashboard/tasks/tracks` | 轨迹回放 | 历史轨迹列表与回放 |
 
 路由守卫规则：

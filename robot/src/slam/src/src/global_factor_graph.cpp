@@ -60,14 +60,14 @@ gtsam::SharedNoiseModel robustCovariance(const gtsam::Matrix6& covariance, doubl
         gtsam::noiseModel::Gaussian::Covariance(safe));
 }
 
-class LeverArmPositionFactor : public gtsam::NoiseModelFactorN<gtsam::Pose3>
+class LeverArmXyPositionFactor : public gtsam::NoiseModelFactorN<gtsam::Pose3>
 {
 public:
     using Base = gtsam::NoiseModelFactorN<gtsam::Pose3>;
-    using This = LeverArmPositionFactor;
+    using This = LeverArmXyPositionFactor;
 
-    LeverArmPositionFactor() = default;
-    LeverArmPositionFactor(Key key, const gtsam::Point3& measurement,
+    LeverArmXyPositionFactor() = default;
+    LeverArmXyPositionFactor(Key key, const gtsam::Point3& measurement,
         const gtsam::Point3& lever_arm, const gtsam::SharedNoiseModel& model)
         : Base(model, key), measurement_(measurement), lever_arm_(lever_arm) {}
 
@@ -88,12 +88,17 @@ public:
     gtsam::Vector evaluateError(const gtsam::Pose3& pose,
         boost::optional<gtsam::Matrix&> H = boost::none) const override
     {
-        const auto error = pose.translation() + pose.rotation().rotate(lever_arm_) - measurement_;
+        const auto antenna = pose.translation() + pose.rotation().rotate(lever_arm_);
+        gtsam::Vector2 error;
+        error << antenna.x() - measurement_.x(), antenna.y() - measurement_.y();
         if (H)
         {
-            *H = gtsam::numericalDerivative11<gtsam::Vector3, gtsam::Pose3>(
+            *H = gtsam::numericalDerivative11<gtsam::Vector2, gtsam::Pose3>(
                 [this](const gtsam::Pose3& value) {
-                    return value.translation() + value.rotation().rotate(lever_arm_) - measurement_;
+                    const auto predicted = value.translation() + value.rotation().rotate(lever_arm_);
+                    gtsam::Vector2 residual;
+                    residual << predicted.x() - measurement_.x(), predicted.y() - measurement_.y();
+                    return residual;
                 }, pose);
         }
         return error;
@@ -335,9 +340,11 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
             if (frame.has_rtk_position)
             {
                 const double sigma = std::max(config_.rtk_position_sigma_floor, frame.rtk_position_sigma);
-                const auto sigmas = (gtsam::Vector(3) << sigma, sigma, sigma).finished();
-                graph.add(LeverArmPositionFactor(key, frame.rtk_position, frame.rtk_lever_arm,
-                    robustDiagonal(sigmas, config_.robust_huber_k)));
+                const auto sigmas = (gtsam::Vector(2) << sigma, sigma).finished();
+                // RTK XY is the map datum. Metre-scale LIO drift is the signal
+                // we want to correct, so do not Huber-downweight it as an outlier.
+                graph.add(LeverArmXyPositionFactor(key, frame.rtk_position, frame.rtk_lever_arm,
+                    gtsam::noiseModel::Diagonal::Sigmas(sigmas)));
                 ++result.rtk_position_factor_count;
             }
             if (frame.has_rtk_heading)
@@ -384,39 +391,31 @@ GlobalFactorGraphResult GlobalFactorGraph::optimize(
         result.covariances.reserve(keyframes.size());
         gtsam::Marginals marginals(graph, optimized, gtsam::Marginals::QR);
         double max_jump = 0.0;
-        double max_abs_z = 0.0;
-        double initial_z_min = keyframes.front().initial_pose.z();
-        double initial_z_max = initial_z_min;
-        double optimized_z_min = std::numeric_limits<double>::infinity();
-        double optimized_z_max = -std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < keyframes.size(); ++i)
         {
             const Key key = gtsam::Symbol('x', i);
             const Pose3 pose = optimized.at<Pose3>(key);
             const auto& initial = keyframes[i].initial_pose;
-            result.optimized_poses.push_back(pose);
+            // Occupancy and Nav2 use XY. Keep LIO Z so GNSS altitude / IMU
+            // stacking cannot reject a valid RTK XY pull.
+            const Pose3 xy_pose(
+                pose.rotation(),
+                gtsam::Point3(pose.x(), pose.y(), initial.z()));
+            result.optimized_poses.push_back(xy_pose);
             const gtsam::Matrix covariance = marginals.marginalCovariance(key);
             gtsam::Matrix6 covariance6 = gtsam::Matrix6::Identity();
             if (covariance.rows() == 6 && covariance.cols() == 6 && covariance.allFinite())
                 covariance6 = covariance;
             result.covariances.push_back(covariance6);
-            max_jump = std::max(max_jump, (pose.translation() - initial.translation()).norm());
-            max_abs_z = std::max(max_abs_z, std::fabs(pose.z() - initial.z()));
-            initial_z_min = std::min(initial_z_min, initial.z());
-            initial_z_max = std::max(initial_z_max, initial.z());
-            optimized_z_min = std::min(optimized_z_min, pose.z());
-            optimized_z_max = std::max(optimized_z_max, pose.z());
+            max_jump = std::max(max_jump, std::hypot(pose.x() - initial.x(), pose.y() - initial.y()));
         }
-        const double z_span_growth = (optimized_z_max - optimized_z_min) - (initial_z_max - initial_z_min);
-        if (max_jump > config_.max_pose_jump_m || max_abs_z > config_.max_abs_z_change_m
-            || z_span_growth > config_.max_abs_z_change_m)
+        if (max_jump > config_.max_pose_jump_m)
         {
             result.success = false;
             result.optimized_poses.clear();
             result.covariances.clear();
             std::ostringstream message;
-            message << "optimization rejected: max_jump=" << max_jump
-                    << "m max_abs_z=" << max_abs_z << "m z_span_growth=" << z_span_growth << "m";
+            message << "optimization rejected: max_xy_jump=" << max_jump << "m";
             result.error = message.str();
             return result;
         }

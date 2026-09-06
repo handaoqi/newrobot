@@ -220,3 +220,35 @@ def test_continuity_guard_reports_offending_pair_and_normalized_rate(tmp_path):
     assert summary["factors"]["imu_kinematic_rejected"] == 1
     assert summary["factors"]["max_imu_kinematic_residual_mps"] == pytest.approx(0.42)
     assert "adjacent_corrections" not in summary_without_corrections(summary)
+
+
+def test_outdoor_rtk_anchor_applies_metre_scale_xy_correction(tmp_path):
+    raw = [(index, 10.0 + index, index * 10.0, 0.0, 0.0) for index in range(8)]
+    optimized = [
+        (index, 10.0 + index, index * 10.0 + index * 0.275, index * 0.225, 0.0)
+        for index in range(8)
+    ]
+    _write_trajectory(tmp_path / "trajectory_raw.csv", raw)
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", optimized)
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 20,
+        "lio_between_factor_count": 7,
+        "imu_factor_count": 7,
+        "rtk_position_factor_count": 8,
+        "rtk_heading_factor_count": 8,
+        "error_before": 40.0,
+        "error_after": 8.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="outdoor")
+
+    assert summary["optimization_mode"] == "fast_lio2_slam_anchored"
+    assert summary["applied"] is True
+    assert summary["stage"] == "no_valid_loop"
+    assert summary["trajectory_source"] == "optimized"
+    assert summary["auto_activation_allowed"] is True
+    assert summary["inertial_smoothing_guard"]["passed"] is True
+    assert summary["factors"]["rtk_position"] == 8
+    assert summary["inertial_smoothing_guard"]["measurements"]["max_xy_correction_m"] == pytest.approx(
+        math.hypot(7 * 0.275, 7 * 0.225), abs=1e-4
+    )

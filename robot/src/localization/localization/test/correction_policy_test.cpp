@@ -59,5 +59,30 @@ TEST(CorrectionPolicy, UkfRejectsConflictingSources) {
   EXPECT_EQ(selection.reason, "ukf_source_conflict");
 }
 
+
+TEST(CorrectionPolicy, PreferFixedRtkWinsEvenOnConflictOrLowerVariance) {
+  auto ndt = candidate(0.0, 0.001, 10);
+  auto rtk = candidate(1.0, 0.05, 20);
+  const auto conflict_without = selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, false);
+  EXPECT_EQ(conflict_without.source, CorrectionSource::conflict);
+
+  const auto preferred = selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, true);
+  EXPECT_EQ(preferred.source, CorrectionSource::rtk);
+  EXPECT_EQ(preferred.reason, "ukf_prefer_fixed_rtk");
+
+  ndt = candidate(0.0, 0.001, 30);
+  rtk = candidate(0.05, 0.05, 40);
+  const auto variance_without = selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, false);
+  EXPECT_EQ(variance_without.source, CorrectionSource::ndt);
+
+  const auto variance_with = selectCorrectionSource(
+    CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, true);
+  EXPECT_EQ(variance_with.source, CorrectionSource::rtk);
+  EXPECT_EQ(variance_with.reason, "ukf_prefer_fixed_rtk");
+}
+
 }  // namespace
 }  // namespace localization

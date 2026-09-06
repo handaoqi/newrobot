@@ -14,6 +14,9 @@ dependencies = [
   "numpy>=1.24,<3",
 ]
 
+[project.scripts]
+roamerx-semantic-projection = "roamerx_edge.semantic_projection_node:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["roamerx_edge*"]

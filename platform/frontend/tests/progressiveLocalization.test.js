@@ -8,7 +8,7 @@ import {
   shouldInitializeFromRtk,
 } from '../src/services/progressiveLocalization.js'
 
-test('progressive initialization sends every route waypoint in order', () => {
+test('initialization validates route points but sends the bounded quick-global strategy', () => {
   const payload = buildProgressiveLocalizationPayload({
     mapId: 7,
     mapVersion: 'v7',
@@ -19,26 +19,24 @@ test('progressive initialization sends every route waypoint in order', () => {
   })
 
   assert.deepEqual(payload, {
-    seed_source: 'progressive',
+    seed_source: 'quick_then_global',
     map_id: 7,
     map_version: 'v7',
-    waypoints: [
-      { x: 1, y: 2, yaw: 0.1 },
-      { x: 3, y: 4, yaw: -0.2 },
-    ],
-    wait_seconds: 180,
+    scene_scope: 'indoor',
+    coordinate_mode: 'local_only',
+    wait_seconds: 120,
   })
-  assert.equal(progressiveLocalizationTimeoutMs(payload), 420_000)
+  assert.equal(progressiveLocalizationTimeoutMs(payload), 360_000)
 })
 
-test('progressive initialization scales its budget without accepting invalid points', () => {
+test('quick-global initialization uses a fixed budget without accepting invalid points', () => {
   const payload = buildProgressiveLocalizationPayload({
     mapId: 7,
     mapVersion: 'v7',
     waypoints: Array.from({ length: 30 }, (_, index) => ({ x: index, y: index + 1, yaw: 0 })),
   })
 
-  assert.equal(payload.wait_seconds, 308)
+  assert.equal(payload.wait_seconds, 120)
   assert.throws(
     () => buildProgressiveLocalizationPayload({ waypoints: [{ x: 1, y: null, yaw: 0 }] }),
     /第 1 个路线航点坐标无效/,
@@ -73,11 +71,10 @@ test('guard duty and route planner share one activation and localization orchest
 
   assert.equal(calls[0][0], 'activate')
   assert.deepEqual(calls[1].slice(0, 3), ['send', 3, 'relocalize'])
-  assert.equal(calls[1][3].seed_source, 'progressive')
-  assert.equal(calls[1][3].waypoints.length, 1)
-  assert.deepEqual(calls[2], ['wait', 3, 'command-1', 420_000])
+  assert.equal(calls[1][3].seed_source, 'quick_then_global')
+  assert.deepEqual(calls[2], ['wait', 3, 'command-1', 360_000])
   assert.equal(result.command.status, 'succeeded')
-  assert.ok(progress.some(message => message.includes('静态航向、1米范围')))
+  assert.ok(progress.some(message => message.includes('30秒快速定位')))
 })
 
 test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before progressive search', async () => {
@@ -115,7 +112,7 @@ test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before prog
   assert.equal(result.rtkAttempted, true)
 })
 
-test('outdoor RTK failure falls back to progressive search ending in global matching', async () => {
+test('outdoor RTK failure falls back to quick search with global fallback', async () => {
   const calls = []
   const progress = []
   const result = await initializeProgressiveLocalization({
@@ -144,11 +141,11 @@ test('outdoor RTK failure falls back to progressive search ending in global matc
   })
 
   assert.deepEqual(calls.map(call => call[1]), ['initial-pose', 'relocalize'])
-  assert.equal(calls[1][2].seed_source, 'progressive')
-  assert.equal(result.selectedSource, 'progressive')
+  assert.equal(calls[1][2].seed_source, 'quick_then_global')
+  assert.equal(result.selectedSource, 'quick_then_global')
   assert.equal(result.rtkAttempt.errorCode, 'RTK_POSE_UNAVAILABLE')
-  assert.ok(progress.some(message => message.includes('转入渐进定位')))
-  assert.ok(progress.some(message => message.includes('全局匹配')))
+  assert.ok(progress.some(message => message.includes('转入快速定位')))
+  assert.ok(progress.some(message => message.includes('全局搜索')))
 })
 
 test('local-only maps never attempt RTK even when scene metadata is inconsistent', () => {

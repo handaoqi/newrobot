@@ -524,8 +524,15 @@ onBeforeUnmount(() => {
 @media (max-width: 900px) {
   .dev-page { height: auto; min-height: 0; }
   .dev-toolbar { align-items: flex-start; flex-direction: column; }
-  .dev-grid { grid-template-columns: 1fr; }
-  .dev-history { max-height: 300px; }
+  /* On a phone, live output is the working surface. Keep the history after it
+     so a long prior conversation cannot take over the first screen. */
+  .dev-grid { grid-template-areas: "main" "history"; grid-template-columns: 1fr; }
+  .dev-main { grid-area: main; }
+  .dev-history { grid-area: history; }
+  /* The history panel used to be both first and visually overflow its grid
+     row. Keep it as one contained scroll region after the terminal. */
+  .dev-history { max-height: min(300px, 38svh); overflow-y: auto; overscroll-behavior: contain; }
+  .dev-history .task-list, .dev-history .voice-history-list { max-height: none; overflow: visible; }
   .dev-main { grid-template-rows: 560px auto; }
 }
 @media (max-width: 620px) {

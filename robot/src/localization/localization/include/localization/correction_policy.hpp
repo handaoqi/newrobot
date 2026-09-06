@@ -94,7 +94,8 @@ inline CorrectionSelection selectCorrectionSource(
     double conflict_xy_m,
     double conflict_yaw_rad,
     double drift_xy_m,
-    double drift_yaw_rad) {
+    double drift_yaw_rad,
+    bool prefer_fixed_rtk = false) {
   if (mode == CorrectionPolicyMode::ndt) {
     return ndt.eligible
       ? CorrectionSelection{CorrectionSource::ndt, "ndt_policy_selected"}
@@ -113,6 +114,13 @@ inline CorrectionSelection selectCorrectionSource(
   }
   if (!ndt.eligible && rtk.eligible) {
     return {CorrectionSource::rtk, "ukf_only_rtk_eligible"};
+  }
+
+  // Fixed RTK and NDT both run, but a fixed RTK candidate is authoritative for
+  // navigation pose regulation and lost-localization recovery. Prefer RTK even
+  // when the sources disagree or NDT reports a lower variance.
+  if (prefer_fixed_rtk) {
+    return {CorrectionSource::rtk, "ukf_prefer_fixed_rtk"};
   }
 
   const double disagreement_xy = std::hypot(ndt.x - rtk.x, ndt.y - rtk.y);

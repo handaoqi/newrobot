@@ -75,6 +75,14 @@ class SafetyConfig:
     localization_loss_samples: int = 5
     ndt_failure_score: float = 0.5
     ndt_failure_samples: int = 3
+    # A candidate below this stricter score is already good enough to stop a
+    # bounded initialization search.  The normal NDT health gate remains
+    # ndt_failure_score so a usable map does not fail merely for missing the
+    # optimal early-stop target.
+    localization_optimal_ndt_score: float = 0.01
+    localization_quick_search_seconds: float = 30.0
+    localization_rtk_max_drift_m: float = 0.30
+    localization_rtk_required_samples: int = 3
     localization_recovery_attempts: int = 3
     localization_recovery_retry_seconds: float = 5.0
     localization_recovery_cycle_seconds: float = 30.0
@@ -93,7 +101,7 @@ class SafetyConfig:
     localization_handoff_settle_seconds: float = 8.0
     # After localization recovery (or any dispatch), Nav2 may briefly reject
     # FollowWaypoints. Keep the task alive and retry instead of failing.
-    navigation_dispatch_retry_seconds: float = 5.0
+    navigation_dispatch_retry_seconds: float = 2.0
     navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
@@ -134,6 +142,7 @@ class StorageConfig:
     # of offline trajectory while preventing stale batches from growing
     # without bound or blocking control events behind them.
     trajectory_outbox_limit: int = 720
+    system_log_outbox_limit: int = 500
 
 
 @dataclass
@@ -233,6 +242,7 @@ class NavigationStackConfig:
     command_timeout_seconds: int = 45
     rosbag_script: str = "/home/dogrobot/robot/script/robot/navigation_rosbag.sh"
     rosbag_stop_timeout_seconds: int = 45
+    boundary_filter_dir: str = "/home/dogrobot/runtime/nx-edge/data/navigation_boundary"
 
 
 @dataclass

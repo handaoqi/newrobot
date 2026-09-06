@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -9,11 +10,13 @@ from django.core import signing
 from django.utils import timezone
 from rest_framework import serializers
 from PIL import Image, ImageDraw
+import yaml
 
 from .models import (
     AlertSkillBinding,
     CalendarDay,
     CommandEvent,
+    DebugLogSession,
     InspectionEvent,
     MediaAsset,
     PatrolTask,
@@ -30,12 +33,14 @@ from .models import (
     TaskExecutionEvent,
     TrajectoryPoint,
     MapData,
+    MapNavigationBoundary,
     MapSet,
     MapSetMember,
     PatrolRoute,
     Zone,
     Track,
     ScheduleRun,
+    SystemLog,
     GoldenBaseline,
     ValidationArtifact,
     ValidationAttempt,
@@ -47,6 +52,7 @@ from .models import (
 )
 
 from .services.map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
+from .services.navigation_boundary_service import validate_waypoints_against_boundary
 
 
 def _snapshot_path(snapshot_url: str) -> Path | None:
@@ -591,7 +597,10 @@ class PersonDetectionIngestSerializer(serializers.Serializer):
             if not track_id or width <= 0 or height <= 0:
                 continue
             label = str(item.get("label", "person")).strip().lower()
-            if label not in {"person", "bicycle", "bike", "自行车"}:
+            if label not in {
+                "person", "pedestrian", "bicycle", "bike", "自行车",
+                "car", "truck", "bus", "motorcycle",
+            }:
                 continue
             cleaned.append(
                 {
@@ -810,6 +819,7 @@ class MapDataSerializer(serializers.ModelSerializer):
     package_url = serializers.SerializerMethodField()
     file_size = serializers.SerializerMethodField()
     optimization_summary = serializers.SerializerMethodField()
+    origin_display = serializers.SerializerMethodField()
 
     class Meta:
         model = MapData
@@ -842,6 +852,7 @@ class MapDataSerializer(serializers.ModelSerializer):
             "map_completeness",
             "mapping_metrics",
             "optimization_summary",
+            "origin_display",
             "file_size",
             "created_at",
             "updated_at",
@@ -901,6 +912,49 @@ class MapDataSerializer(serializers.ModelSerializer):
             return manifest["optimization"]
         return {}
 
+    def get_origin_display(self, obj):
+        def finite(value, default=None):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return default
+            return number if math.isfinite(number) else default
+
+        grid = list(obj.origin or [])
+        result = {
+            "map": {"x": 0.0, "y": 0.0, "yaw": 0.0, "frame_id": "map"},
+            "occupancy_grid": {
+                "x": finite(grid[0], 0.0) if len(grid) > 0 else 0.0,
+                "y": finite(grid[1], 0.0) if len(grid) > 1 else 0.0,
+                "yaw": finite(grid[2], 0.0) if len(grid) > 2 else 0.0,
+            },
+            "rtk_enu": None,
+        }
+        try:
+            description = json.loads(obj.description or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            description = {}
+        origin_text = description.get("gnss_origin_yaml") if isinstance(description, dict) else ""
+        try:
+            rtk = yaml.safe_load(origin_text) if origin_text else {}
+        except yaml.YAMLError:
+            rtk = {}
+        if not isinstance(rtk, dict) or not rtk.get("alignment_locked"):
+            return result
+        result["rtk_enu"] = {
+            "alignment_locked": True,
+            "latitude": finite(rtk.get("origin_latitude")),
+            "longitude": finite(rtk.get("origin_longitude")),
+            "altitude": finite(rtk.get("origin_altitude")),
+            "map_x": finite(rtk.get("map_offset_x"), 0.0),
+            "map_y": finite(rtk.get("map_offset_y"), 0.0),
+            "map_z": finite(rtk.get("map_offset_z"), 0.0),
+            "enu_to_map_yaw": finite(rtk.get("enu_to_map_yaw"), 0.0),
+            "confirmed_heading_deg": finite(rtk.get("confirmed_heading_deg")),
+            "datum": str(rtk.get("datum") or "WGS84"),
+        }
+        return result
+
 
 class MapDataSummarySerializer(MapDataSerializer):
     """Compact map representation for selectors and cards."""
@@ -910,6 +964,7 @@ class MapDataSummarySerializer(MapDataSerializer):
             "id", "name", "robot", "robot_name", "robot_code", "thumbnail", "thumbnail_url",
             "resolution", "width", "height", "origin", "active", "parent_map", "coordinate_mode",
             "scene_scope", "localization_mode", "origin_status", "map_completeness", "file_size",
+            "origin_display",
             "created_at", "updated_at",
         ]
 
@@ -976,6 +1031,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        route_global_controller = str(data.get("global_controller") or "theta_star").lower()
+        if route_global_controller not in {"theta_star", "navfn"}:
+            route_global_controller = "theta_star"
+            data["global_controller"] = route_global_controller
+        # Summary responses omit waypoints. Do not inject an empty list — the
+        # route planner treats [] as "already hydrated" and skips detail fetch.
+        if "waypoints" not in data:
+            return data
         normalized_waypoints = []
         for point in data.get("waypoints") or []:
             if isinstance(point, dict):
@@ -993,6 +1056,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             # deployed navigo controller server. Expose the actual fallback
             # so the route page and API agree with the execution snapshot.
             normalized["local_controller"] = "mppi"
+            waypoint_global_controller = str(
+                normalized.get("global_controller") or route_global_controller
+            ).lower()
+            normalized["global_controller"] = (
+                waypoint_global_controller
+                if waypoint_global_controller in {"theta_star", "navfn"}
+                else route_global_controller
+            )
             normalized_waypoints.append(normalized)
         data["waypoints"] = normalized_waypoints
         return data
@@ -1027,6 +1098,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
         if invalid_local_controllers:
             raise serializers.ValidationError("途经点局部控制器当前只能使用 MPPI")
+        invalid_global_controllers = [
+            point.get("global_controller")
+            for point in value
+            if isinstance(point, dict)
+            and str(point.get("global_controller") or "theta_star").lower() not in {"theta_star", "navfn"}
+        ]
+        if invalid_global_controllers:
+            raise serializers.ValidationError("途经点全局控制器只能是 Theta* 或 NavFn (A*)")
         try:
             template_ids = {
                 int(point["speech_template_id"])
@@ -1067,6 +1146,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
                 )
             except MapConstraintError as exc:
                 raise serializers.ValidationError(exc.message) from exc
+            validate_waypoints_against_boundary(map_data, waypoints or [])
         return attrs
 
 
@@ -1117,8 +1197,33 @@ class ZoneSerializer(serializers.ModelSerializer):
             "polygon",
             "description",
             "active",
+            "speed_limit_mps",
+            "warning_distance_m",
             "created_at",
             "updated_at",
+        ]
+
+
+class SystemLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SystemLog
+        fields = [
+            "id", "robot", "occurred_at", "received_at", "level", "module",
+            "event_code", "message", "source", "data", "trace_id",
+            "task_execution", "command", "map_data", "waypoint_index",
+            "x", "y", "yaw", "repeat_count",
+        ]
+
+
+class DebugLogSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DebugLogSession
+        fields = [
+            "id", "robot", "modules", "sample_hz", "status", "started_at",
+            "expires_at", "stopped_at", "created_by",
+        ]
+        read_only_fields = [
+            "id", "status", "started_at", "expires_at", "stopped_at", "created_by",
         ]
 
 

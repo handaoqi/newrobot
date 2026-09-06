@@ -173,6 +173,7 @@ class LatestFrameSample:
     frame_id: int
     frame: Any
     read_at: float
+    captured_at_unix: float
     source_fps: float
     wait_seconds: float
     dropped_frames: int
@@ -188,6 +189,7 @@ class LatestFrameCapture:
         self._frame: Any | None = None
         self._frame_id = 0
         self._frame_read_at = 0.0
+        self._frame_captured_at_unix = 0.0
         self._source_fps = 0.0
         self._sample_rate_hz = max(0.0, detector.config.detection.inference_rate_hz)
         self._exception: BaseException | None = None
@@ -231,6 +233,7 @@ class LatestFrameCapture:
                 frame_id=frame_id,
                 frame=self._frame,
                 read_at=self._frame_read_at,
+                captured_at_unix=self._frame_captured_at_unix,
                 source_fps=self._source_fps,
                 wait_seconds=time.perf_counter() - started_at,
                 dropped_frames=dropped_frames,
@@ -336,6 +339,7 @@ class LatestFrameCapture:
                     self._frame_id = source_frame_id
                     self._frame = frame
                     self._frame_read_at = read_at
+                    self._frame_captured_at_unix = time.time()
                     self._condition.notify_all()
 
                 now = time.perf_counter()
@@ -498,7 +502,9 @@ def detection_worker(
             live_tracks = [
                 track
                 for track in (result.tracked_objects or [])
-                if str(track.label).lower() in {"bicycle", "bike", "自行车"}
+                if str(track.label).lower() in {
+                    "bicycle", "bike", "自行车", "car", "truck", "bus", "motorcycle",
+                }
             ]
             if person_detection_enabled:
                 if person_detector is not None:
@@ -512,7 +518,11 @@ def detection_worker(
                         for track in (result.tracked_objects or [])
                         if str(track.label).lower() == "person"
                     )
-            client.send_person_detections(live_tracks)
+            client.send_person_detections(
+                live_tracks,
+                captured_at_unix=sample.captured_at_unix,
+                source_frame_id=sample.frame_id,
+            )
             detect_seconds = time.perf_counter() - detect_started_at
             target_count = result.target_count
             preview_started_at = time.perf_counter()

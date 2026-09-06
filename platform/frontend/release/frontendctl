@@ -12,13 +12,14 @@ import urllib.request
 from pathlib import Path
 
 VERSION = "v1.0.0"
-MODULES = ["overview", "guard-duty", "remote-control", "remote-development", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
+MODULES = ["overview", "guard-duty", "remote-control", "remote-development", "scene-visualizer", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
 RECOMMENDS = {
     "overview": ["robots"], "guard-duty": ["overview", "remote-control", "events", "tasks", "task-execution"],
     "remote-control": ["overview", "guard-duty"], "analytics": ["events"], "events": ["guard-duty", "analytics"],
     "robots": ["overview"], "tasks": ["patrol-calendar", "task-execution", "maps", "routes"],
     "patrol-calendar": ["tasks", "task-execution"], "task-execution": ["tasks", "patrol-calendar"],
     "maps": ["routes", "zones"], "routes": ["maps", "zones", "tasks"], "zones": ["maps", "routes"],
+    "scene-visualizer": ["maps", "routes"],
 }
 
 ROOT = Path(__file__).resolve().parent

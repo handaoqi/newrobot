@@ -17,15 +17,21 @@ function normalizeWaypoint(point, index) {
   return { x, y, yaw }
 }
 
-export function buildProgressiveLocalizationPayload({ mapId, mapVersion, waypoints = [] }) {
-  const normalizedWaypoints = waypoints.map(normalizeWaypoint)
-  const waitSeconds = Math.min(900, Math.max(180, 60 + (normalizedWaypoints.length + 1) * 8))
+export function buildProgressiveLocalizationPayload({
+  mapId,
+  mapVersion,
+  waypoints = [],
+  sceneScope = 'indoor',
+  coordinateMode = 'local_only',
+}) {
+  waypoints.forEach(normalizeWaypoint)
   return {
-    seed_source: 'progressive',
+    seed_source: 'quick_then_global',
     map_id: mapId,
     map_version: mapVersion,
-    waypoints: normalizedWaypoints,
-    wait_seconds: waitSeconds,
+    scene_scope: sceneScope,
+    coordinate_mode: coordinateMode,
+    wait_seconds: 120,
   }
 }
 
@@ -114,25 +120,27 @@ export async function initializeProgressiveLocalization({
       const errorCode = commandErrorCode(error)
       if (!RTK_FALLBACK_CODES.has(errorCode)) throw error
       rtkAttempt = { status: 'failed', errorCode }
-      onProgress(`RTK固定解不可用或本地NDT未收敛（${errorCode}），转入渐进定位`)
+      onProgress(`RTK固定解不可用或漂移未达标（${errorCode}），转入快速定位`)
     }
   }
 
-  const payload = buildProgressiveLocalizationPayload({ mapId, mapVersion, waypoints })
-  onProgress('地图已下发，正在依次尝试建图原点、静态航向、1米范围、路线航点和全局匹配')
+  const payload = buildProgressiveLocalizationPayload({
+    mapId, mapVersion, waypoints, sceneScope, coordinateMode,
+  })
+  onProgress('地图已下发，先进行30秒快速定位；未找到合格解时再启动全局搜索')
   const createdCommand = await sendCommand(robotId, 'relocalize', payload)
   const command = await waitCommand(robotId, createdCommand, {
     timeoutMs: progressiveLocalizationTimeoutMs(payload),
     onProgress: latest => {
-      onProgress(`渐进定位 · ${latest.status || 'created'}`)
-      onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'progressive' })
+      onProgress(`快速定位/全局回退 · ${latest.status || 'created'}`)
+      onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'quick_then_global' })
     },
   })
   return {
     activation,
     payload,
     command,
-    selectedSource: 'progressive',
+    selectedSource: 'quick_then_global',
     rtkAttempted: Boolean(rtkAttempt),
     rtkAttempt,
   }

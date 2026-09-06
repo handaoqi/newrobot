@@ -49,8 +49,12 @@ import {
   isLowBatteryTaskError,
   lowBatteryGuardMessage,
 } from '../utils/guardDutyLowBattery'
-import { activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
-import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
+import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
+import {
+  ensureGuardDutyLoopNavigationReady,
+  loopRestMilliseconds,
+} from '../services/guardDutyLoopNavRepair'
+import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
 import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
 import {
   activeGuardDutyTarget,
@@ -107,8 +111,11 @@ let refreshTimer = null
 let executionTimer = null
 let loopTimer = null
 let loopLeaseTimer = null
+let streamRetryTimer = null
 let loopCycleBusy = false
 let loopLeaseOwned = false
+let loopNavRepairBusy = false
+let loopNavRepairToken = 0
 const loopOwnerId = globalThis.crypto?.randomUUID?.()
   || `guard-${Date.now()}-${Math.random().toString(16).slice(2)}`
 let localizationRunId = 0
@@ -228,6 +235,7 @@ const localizationInitLabel = computed(() => ({
   initializing: '初始化中',
   success: '初始化成功',
   failed: '初始化失败',
+  not_ready: '定位/导航未就绪',
 }[localizationInitState.value] || '地图未初始化'))
 
 function sleep(ms) {
@@ -266,8 +274,11 @@ function syncLocalizationState(payload = navigationStatus.value) {
     localizationInitMessage.value = command.error_message || command.error_code || '最近一次定位初始化失败'
     return
   }
-  localizationInitState.value = 'uninitialized'
-  localizationInitMessage.value = '地图未初始化'
+  const mapId = presetTask.value?.map_id || routeData.value?.map_data
+  const reason = navigationUnreadinessReason(payload, mapId, expectedLegacyMapVersion(mapId))
+  const uninitialized = !reason || reason === '尚未获取定位状态' || reason === '尚未加载任务地图'
+  localizationInitState.value = uninitialized ? 'uninitialized' : 'not_ready'
+  localizationInitMessage.value = reason || '地图未初始化'
 }
 
 function formatTime(value) {
@@ -819,6 +830,8 @@ function restoreLoopState(robotId) {
 }
 
 function finishLoop(message, { notify = true } = {}) {
+  loopNavRepairToken += 1
+  loopNavRepairBusy = false
   loopActive.value = false
   loopState.value = 'completed'
   loopStoppedAt.value = Date.now()
@@ -831,6 +844,8 @@ function finishLoop(message, { notify = true } = {}) {
 
 async function stopLoop({ notify = true, clearExecution = true } = {}) {
   if (!loopActive.value) return null
+  loopNavRepairToken += 1
+  loopNavRepairBusy = false
   const executionId = guardDutyLoopCleanupExecutionId(loopCurrentExecutionId.value, execution.value)
   const shouldClearExecution = clearExecution && Boolean(executionId)
   loopActive.value = false
@@ -872,8 +887,18 @@ async function launchTask({ fromLoop = false } = {}) {
     return null
   }
   if (fromLoop && !navigationReady()) {
-    showToast('定位或导航栈未就绪，本轮稍后重试', { variant: 'alert' })
-    return null
+    try {
+      const readiness = await ensureLoopNavigationReady((message) => {
+        loopMessage.value = message
+      })
+      if (!readiness.ok) {
+        showToast('定位或导航栈未就绪，本轮稍后重试', { variant: 'alert' })
+        return null
+      }
+    } catch (error) {
+      showToast(error.message || '定位或导航栈未就绪，本轮稍后重试', { variant: 'alert' })
+      return null
+    }
   }
   busy.value = true
   try {
@@ -931,12 +956,79 @@ async function captureLoopDistance() {
   persistLoopState()
 }
 
-function scheduleNextLoopRound(message = '') {
-  const restMilliseconds = Math.max(0, Number(loopRestMinutes.value || 0) * 60 * 1000)
+function scheduleNextLoopRound(message = '', { shortRetry = false } = {}) {
+  const restMilliseconds = loopRestMilliseconds(loopRestMinutes.value, { shortRetry })
   loopState.value = 'resting'
   loopRestUntil.value = Date.now() + restMilliseconds
-  loopMessage.value = message || `第 ${loopRounds.value} 轮完成，休息 ${loopRestMinutes.value} 分钟`
+  const defaultMessage = shortRetry
+    ? `启动或导航维护失败，${Math.round(restMilliseconds / 1000)} 秒后重试`
+    : `第 ${loopRounds.value} 轮完成，休息 ${loopRestMinutes.value} 分钟`
+  loopMessage.value = message || defaultMessage
   persistLoopState()
+  // Use the rest window to bring Nav2 / localization back instead of idle waiting.
+  void startLoopRestNavigationRepair()
+}
+
+function loopTargetMapId() {
+  return presetTask.value?.map_id || routeData.value?.map_data || mapData.value?.id || null
+}
+
+async function ensureLoopNavigationReady(onProgress = () => {}) {
+  const robot = latestRobot.value
+  const mapId = loopTargetMapId()
+  if (!robot?.id || !mapId) {
+    throw new Error('缺少机器人或任务地图，无法维护导航栈')
+  }
+  const mapVersion = expectedLegacyMapVersion(mapId)
+  const result = await ensureGuardDutyLoopNavigationReady({
+    fetchStatus: () => fetchRobotNavigationStatus(robot.id),
+    isReady: (status) => navigationReadyForMap(status, mapId, mapVersion),
+    repair: async ({ onProgress: repairProgress }) => {
+      const outcome = await activateAndRelocalizeMap({
+        mapId,
+        robotId: robot.id,
+        mapVersion,
+        onProgress: repairProgress,
+      })
+      return outcome.navigationStatus
+    },
+    onProgress,
+  })
+  if (result.status) {
+    navigationStatus.value = result.status
+    syncLocalizationState(result.status)
+  }
+  return result
+}
+
+async function startLoopRestNavigationRepair() {
+  if (!loopActive.value || loopNavRepairBusy) return
+  const token = ++loopNavRepairToken
+  loopNavRepairBusy = true
+  try {
+    const result = await ensureLoopNavigationReady((message) => {
+      if (token !== loopNavRepairToken || !loopActive.value) return
+      if (loopState.value === 'resting' || loopState.value === 'starting') {
+        loopMessage.value = message
+      }
+    })
+    if (token !== loopNavRepairToken || !loopActive.value) return
+    if (result.ok && loopState.value === 'resting') {
+      loopMessage.value = `轮次休息中，导航/定位已就绪（剩余 ${formatDuration(restRemainingMilliseconds.value)}）`
+      persistLoopState()
+    } else if (!result.ok && loopState.value === 'resting') {
+      loopMessage.value = '轮次休息维护未完成，将在休息结束后再次修复'
+      persistLoopState()
+    }
+  } catch (error) {
+    if (token !== loopNavRepairToken || !loopActive.value) return
+    if (loopState.value === 'resting') {
+      loopMessage.value = `轮次休息维护失败：${error.message || '请检查导航栈'}，休息结束后将重试`
+      persistLoopState()
+    }
+  } finally {
+    if (token === loopNavRepairToken) loopNavRepairBusy = false
+  }
 }
 
 async function runLoopCycle() {
@@ -964,10 +1056,37 @@ async function runLoopCycle() {
     if (loopState.value === 'resting') {
       if (nowMs.value < loopRestUntil.value || busy.value) return
       loopState.value = 'starting'
-      loopMessage.value = '正在启动下一轮巡检'
+      loopMessage.value = '休息结束，正在确认导航/定位就绪'
       persistLoopState()
+      while (loopNavRepairBusy && loopActive.value) {
+        await sleep(500)
+        if (!loopActive.value) return
+      }
+      try {
+        const readiness = await ensureLoopNavigationReady((message) => {
+          if (loopActive.value && (loopState.value === 'starting' || loopState.value === 'resting')) {
+            loopMessage.value = message
+          }
+        })
+        if (!readiness.ok) {
+          if (loopActive.value) {
+            scheduleNextLoopRound('导航/定位仍未就绪，短间隔后重试修复', { shortRetry: true })
+          }
+          return
+        }
+      } catch (error) {
+        if (loopActive.value) {
+          scheduleNextLoopRound(
+            `导航栈修复失败：${error.message || '未知错误'}，短间隔后重试`,
+            { shortRetry: true },
+          )
+        }
+        return
+      }
       const started = await launchTask({ fromLoop: true })
-      if (!started && loopActive.value) scheduleNextLoopRound('下一轮启动失败，休息后自动重试')
+      if (!started && loopActive.value) {
+        scheduleNextLoopRound('下一轮启动失败，短间隔后重试', { shortRetry: true })
+      }
       return
     }
 
@@ -979,13 +1098,15 @@ async function runLoopCycle() {
     if (loopCurrentExecutionId.value && String(execution.value?.id || '') === String(loopCurrentExecutionId.value)) {
       await captureLoopDistance()
       scheduleNextLoopRound(execution.value?.state === 'completed'
-        ? `第 ${loopRounds.value} 轮完成，进入休息`
-        : `第 ${loopRounds.value} 轮已结束，休息后继续下一轮`)
+        ? `第 ${loopRounds.value} 轮完成，进入休息并维护导航栈`
+        : `第 ${loopRounds.value} 轮已结束，休息中维护导航栈后继续`)
       return
     }
 
     const started = await launchTask({ fromLoop: true })
-    if (!started && loopActive.value) scheduleNextLoopRound('任务启动失败，休息后自动重试')
+    if (!started && loopActive.value) {
+      scheduleNextLoopRound('任务启动失败，短间隔后重试', { shortRetry: true })
+    }
   } finally {
     loopCycleBusy = false
   }
@@ -1028,7 +1149,9 @@ async function toggleLoop() {
   loopMessage.value = '正在启动第 1 轮巡检'
   persistLoopState()
   const started = await launchTask({ fromLoop: true })
-  if (!started && loopActive.value) scheduleNextLoopRound('第 1 轮启动失败，休息后自动重试')
+  if (!started && loopActive.value) {
+    scheduleNextLoopRound('第 1 轮启动失败，短间隔后重试', { shortRetry: true })
+  }
 }
 
 async function controlTask() {
@@ -1179,6 +1302,15 @@ function showVideoNotice({ message, variant }) {
   showToast(message, variant ? { variant } : undefined)
 }
 
+function handleStreamError() {
+  streamUnavailable.value = true
+  if (streamRetryTimer) return
+  streamRetryTimer = window.setTimeout(() => {
+    streamRetryTimer = null
+    streamUnavailable.value = false
+  }, 8000)
+}
+
 onMounted(async () => {
   let loaded = false
   try {
@@ -1206,6 +1338,7 @@ onBeforeUnmount(() => {
   window.clearInterval(executionTimer)
   window.clearInterval(loopTimer)
   window.clearInterval(loopLeaseTimer)
+  if (streamRetryTimer) window.clearTimeout(streamRetryTimer)
   window.removeEventListener('storage', handleLoopStorageChange)
   window.removeEventListener('resize', refreshImageGeometry)
   releaseLoopOwnership()
@@ -1247,7 +1380,7 @@ watch(playUrlKey, () => {
               :loading="dataLoading"
               object-fit="contain"
               @notice="showVideoNotice"
-              @stream-error="streamUnavailable = true"
+              @stream-error="handleStreamError"
             >
               <template #empty>
                 <div class="guard-video-empty">
@@ -1536,7 +1669,8 @@ watch(playUrlKey, () => {
 .guard-localization-copy > strong { font-size: 15px; }
 .guard-localization-copy > strong.is-success { color: #14734c; }
 .guard-localization-copy > strong.is-failed { color: #b8322c; }
-.guard-localization-copy > strong.is-initializing { color: #b0640e; }
+.guard-localization-copy > strong.is-initializing,
+.guard-localization-copy > strong.is-not_ready { color: #b0640e; }
 .guard-localization-copy > small { grid-column: 1 / -1; overflow: hidden; color: #71818c; text-overflow: ellipsis; white-space: nowrap; }
 .guard-primary, .guard-secondary, .guard-danger, .guard-initialize { min-height: 52px; padding: 0 22px; border: 0; font: inherit; font-weight: 800; cursor: pointer; }
 .guard-primary { color: #fff; background: #19724d; }

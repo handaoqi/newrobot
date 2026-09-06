@@ -710,6 +710,8 @@ class Zone(BaseTimestampModel):
     polygon = models.JSONField(default=list, verbose_name="多边形坐标点 [[x1,y1],[x2,y2],...]")
     description = models.TextField(blank=True, verbose_name="禁区描述")
     active = models.BooleanField(default=True, verbose_name="是否启用")
+    speed_limit_mps = models.FloatField(null=True, blank=True, verbose_name="限速值(m/s)")
+    warning_distance_m = models.FloatField(default=0.5, verbose_name="提前警告距离(m)")
 
     class Meta:
         verbose_name = "禁区"
@@ -718,6 +720,50 @@ class Zone(BaseTimestampModel):
 
     def __str__(self) -> str:
         return self.name
+
+
+class MapNavigationBoundary(BaseTimestampModel):
+    """Versioned navigation geofence for one map.
+
+    ``revision`` is the latest saved draft while ``active_revision`` is the
+    last revision acknowledged by the Edge Agent. Keeping the two separate
+    prevents an unfinished edit from silently changing a running robot.
+    """
+
+    APPLY_STATUS_CHOICES = [
+        ("unconfigured", "未配置"),
+        ("draft", "草稿"),
+        ("applying", "应用中"),
+        ("active", "已生效"),
+        ("failed", "应用失败"),
+    ]
+
+    map_data = models.OneToOneField(
+        MapData,
+        related_name="navigation_boundary",
+        on_delete=models.CASCADE,
+    )
+    outer_polygon = models.JSONField(default=list, blank=True)
+    safety_margin_m = models.FloatField(default=0.2)
+    revision = models.PositiveIntegerField(default=0)
+    active_revision = models.PositiveIntegerField(default=0)
+    active_payload = models.JSONField(default=dict, blank=True)
+    apply_status = models.CharField(
+        max_length=16,
+        choices=APPLY_STATUS_CHOICES,
+        default="unconfigured",
+    )
+    apply_error = models.TextField(blank=True)
+    apply_command = models.ForeignKey(
+        "RemoteCommand",
+        related_name="boundary_applications",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["map_data_id"]
 
 
 class Track(BaseTimestampModel):
@@ -922,7 +968,9 @@ class RemoteCommand(BaseTimestampModel):
         ("nav.initial_pose", "设置初始定位"),
         ("nav.single_goal", "单点导航"),
         ("nav.relocalize", "主动重定位"),
+        ("diagnostics.log_config", "配置诊断日志"),
         ("map.activate", "切换活动地图"),
+        ("map.boundary_apply", "应用导航边界"),
         ("map.optimize", "离线回环优化"),
         ("sensor.restart", "重启传感器"),
         ("charge.start", "开始充电"),
@@ -1028,6 +1076,101 @@ class CommandEvent(BaseTimestampModel):
         indexes = [models.Index(fields=["command", "event_at"], name="command_event_time_idx")]
 
 
+class DebugLogSession(BaseTimestampModel):
+    STATUS_CHOICES = [
+        ("starting", "启动中"),
+        ("active", "已启用"),
+        ("stopped", "已停止"),
+        ("expired", "已到期"),
+        ("failed", "失败"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="debug_log_sessions", on_delete=models.CASCADE)
+    modules = models.JSONField(default=list)
+    sample_hz = models.FloatField(default=1.0)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="starting")
+    started_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    stopped_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="debug_log_sessions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [models.Index(fields=["robot", "-expires_at"], name="debug_log_robot_exp_idx")]
+
+
+class SystemLog(BaseTimestampModel):
+    LEVEL_CHOICES = [
+        ("DEBUG", "DEBUG"),
+        ("INFO", "INFO"),
+        ("WARNING", "WARNING"),
+        ("ERROR", "ERROR"),
+    ]
+    MODULE_CHOICES = [
+        ("localization", "定位"),
+        ("navigation", "导航"),
+        ("avoidance", "避障"),
+        ("relocalization", "主动重定位"),
+        ("waypoint", "航点调整"),
+        ("planner", "路径规划"),
+        ("boundary", "导航边界"),
+        ("system", "系统"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="system_logs", on_delete=models.CASCADE)
+    occurred_at = models.DateTimeField(default=timezone.now)
+    received_at = models.DateTimeField(default=timezone.now)
+    level = models.CharField(max_length=8, choices=LEVEL_CHOICES)
+    module = models.CharField(max_length=24, choices=MODULE_CHOICES)
+    event_code = models.CharField(max_length=96)
+    message = models.CharField(max_length=500)
+    source = models.CharField(max_length=64, default="center")
+    data = models.JSONField(default=dict, blank=True)
+    trace_id = models.UUIDField(null=True, blank=True, db_index=True)
+    task_execution = models.ForeignKey(
+        TaskExecution,
+        related_name="system_logs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    command = models.ForeignKey(
+        RemoteCommand,
+        related_name="system_logs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    map_data = models.ForeignKey(
+        MapData,
+        related_name="system_logs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    waypoint_index = models.IntegerField(null=True, blank=True)
+    x = models.FloatField(null=True, blank=True)
+    y = models.FloatField(null=True, blank=True)
+    yaw = models.FloatField(null=True, blank=True)
+    repeat_count = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        ordering = ["-occurred_at", "-id"]
+        indexes = [
+            models.Index(fields=["robot", "-occurred_at"], name="syslog_robot_time_idx"),
+            models.Index(fields=["robot", "level", "-occurred_at"], name="syslog_level_time_idx"),
+            models.Index(fields=["task_execution", "-occurred_at"], name="syslog_task_time_idx"),
+        ]
+
+
 class InboundMessage(models.Model):
     message_id = models.UUIDField(primary_key=True)
     robot = models.ForeignKey(Robot, related_name="inbound_messages", on_delete=models.CASCADE)
@@ -1044,6 +1187,11 @@ class InboundMessage(models.Model):
     )
     error_message = models.TextField(blank=True)
     raw_payload = models.JSONField(default=dict)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["process_status", "received_at"], name="inbound_status_time_idx"),
+        ]
 
 
 class RobotStatusLatest(models.Model):

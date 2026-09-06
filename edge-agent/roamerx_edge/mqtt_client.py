@@ -151,6 +151,21 @@ class EdgeMqttClient:
             qos=1,
         )
 
+    def publish_system_logs(self, entries: list[dict], urgent: bool = False) -> None:
+        if not entries:
+            return
+        self.publish(
+            self._topic("events/system-log"),
+            build_envelope(
+                message_type="system.log.batch",
+                robot_id=self.config.robot.id,
+                session_id=self.session_id,
+                sequence=self._next_sequence(),
+                payload={"entries": entries[:100]},
+            ),
+            qos=1 if urgent or any(item.get("level") != "DEBUG" for item in entries) else 0,
+        )
+
     def publish_alert(self, payload: dict, trace_id: str = "") -> None:
         self.publish(
             self._topic("events/alert"),

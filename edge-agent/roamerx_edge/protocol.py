@@ -17,7 +17,8 @@ NAV_COMMAND_TYPES = {
     "nav.status", "nav.start", "nav.restart", "nav.recover", "nav.stop",
     "nav.initial_pose", "nav.relocalize", "nav.single_goal",
 }
-MAP_COMMAND_TYPES = {"map.activate", "map.optimize"}
+MAP_COMMAND_TYPES = {"map.activate", "map.optimize", "map.boundary_apply"}
+DIAGNOSTICS_COMMAND_TYPES = {"diagnostics.log_config"}
 SENSOR_COMMAND_TYPES = {"sensor.restart"}
 CHARGE_COMMAND_TYPES = {"charge.start", "charge.stop"}
 MOTION_CONTROL_COMMAND_TYPES = {"motion.start", "motion.stop"}
@@ -55,6 +56,7 @@ COMMAND_TYPES = (
     | MAPPING_COMMAND_TYPES
     | NAV_COMMAND_TYPES
     | MAP_COMMAND_TYPES
+    | DIAGNOSTICS_COMMAND_TYPES
     | SENSOR_COMMAND_TYPES
     | CHARGE_COMMAND_TYPES
     | MOTION_CONTROL_COMMAND_TYPES
@@ -174,10 +176,23 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("avoidance_to_next", "require_yaw"):
                 if field in waypoint and not isinstance(waypoint[field], bool):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
+            if "global_controller" in waypoint:
+                mode = str(waypoint["global_controller"]).lower()
+                if mode not in {"theta_star", "navfn"}:
+                    raise ProtocolError(
+                        "INVALID_MESSAGE",
+                        "waypoint global_controller must be theta_star or navfn",
+                    )
             if "dwell_seconds" in waypoint:
                 dwell_seconds = waypoint["dwell_seconds"]
                 if isinstance(dwell_seconds, bool) or not isinstance(dwell_seconds, (int, float)) or not 0 <= dwell_seconds <= 3600:
                     raise ProtocolError("INVALID_MESSAGE", "waypoint dwell_seconds must be between 0 and 3600")
+        route_global_controller = str(route.get("global_controller") or "theta_star").lower()
+        if route_global_controller not in {"theta_star", "navfn"}:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                "route global_controller must be theta_star or navfn",
+            )
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
@@ -215,6 +230,12 @@ def validate_command(envelope: MessageEnvelope) -> None:
             value = command.get(field)
             if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"nav.single_goal {field} must be numeric")
+        global_controller = str(command.get("global_controller") or "theta_star").lower()
+        if global_controller not in {"theta_star", "navfn"}:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                "nav.single_goal global_controller must be theta_star or navfn",
+            )
     if envelope.message_type == "nav.relocalize":
         command = payload["command"]
         supplied = [field for field in ("x", "y", "yaw") if command.get(field) is not None]
@@ -258,6 +279,26 @@ def validate_command(envelope: MessageEnvelope) -> None:
         selected = command.get("selected_candidates")
         if not isinstance(selected, list) or not selected:
             raise ProtocolError("INVALID_MESSAGE", "map.optimize requires selected_candidates")
+    if envelope.message_type == "map.boundary_apply":
+        command = payload["command"]
+        boundary = command.get("boundary")
+        if not str(command.get("map_id") or "").strip() or not isinstance(boundary, dict):
+            raise ProtocolError("INVALID_MESSAGE", "map.boundary_apply requires map_id and boundary")
+        if not isinstance(boundary.get("revision"), int) or boundary["revision"] <= 0:
+            raise ProtocolError("INVALID_MESSAGE", "map.boundary_apply revision must be positive")
+        if not isinstance(boundary.get("outer_polygon"), list) or len(boundary["outer_polygon"]) < 3:
+            raise ProtocolError("INVALID_MESSAGE", "map.boundary_apply requires an outer polygon")
+    if envelope.message_type == "diagnostics.log_config":
+        command = payload["command"]
+        if not isinstance(command.get("enabled"), bool):
+            raise ProtocolError("INVALID_MESSAGE", "diagnostics.log_config enabled must be boolean")
+        if command.get("enabled"):
+            modules = command.get("modules")
+            if not isinstance(modules, list) or not modules:
+                raise ProtocolError("INVALID_MESSAGE", "diagnostics.log_config modules must be a list")
+            sample_hz = command.get("sample_hz")
+            if isinstance(sample_hz, bool) or not isinstance(sample_hz, (int, float)) or not 0.1 <= sample_hz <= 5:
+                raise ProtocolError("INVALID_MESSAGE", "diagnostics.log_config sample_hz must be between 0.1 and 5")
     if envelope.message_type == "sensor.restart":
         sensor = str(payload["command"].get("sensor") or "").strip().lower()
         if sensor not in {"lidar", "imu", "lidar_imu", "rtk"}:
@@ -363,4 +404,3 @@ def build_progress(
             "result": result,
         },
     )
-

@@ -125,3 +125,29 @@ test('terminal relocalize command sets marker expiry metadata', () => {
   assert.ok(session.markersVisibleUntil > Date.now())
   assert.equal(shouldShowAttemptMarkers(session, session.markersVisibleUntil), false)
 })
+
+test('only strict NDT or verified RTK results qualify as optimal markers', () => {
+  const ndt = localizationAttemptSessionFromCommand({
+    status: 'succeeded',
+    result_payload: {
+      best_ndt_committed: true,
+      best_ndt_candidate: { matching_error: 0.009, matched_pose: { x: 1, y: 2, yaw: 0 } },
+    },
+  })
+  assert.equal(ndt.optimalVerified, true)
+
+  const ordinary = localizationAttemptSessionFromCommand({
+    status: 'succeeded',
+    result_payload: {
+      best_ndt_committed: true,
+      best_ndt_candidate: { matching_error: 0.01, matched_pose: { x: 1, y: 2, yaw: 0 } },
+    },
+  })
+  assert.equal(ordinary.optimalVerified, false)
+
+  const rtk = localizationAttemptSessionFromCommand({
+    status: 'succeeded',
+    result_payload: { rtk_drift: { xy_m: 0.29, verified: true } },
+  })
+  assert.equal(rtk.optimalVerified, true)
+})

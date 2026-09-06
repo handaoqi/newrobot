@@ -1,0 +1,10 @@
+string track_id
+string class_name
+float32 confidence
+geometry_msgs/Pose pose
+geometry_msgs/Vector3 dimensions
+float32 position_std_m
+bool dynamic
+string projection_method
+string calibration_id
+uint32[4] source_bbox

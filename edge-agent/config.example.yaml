@@ -45,6 +45,10 @@ safety:
   localization_loss_samples: 5
   ndt_failure_score: 0.5
   ndt_failure_samples: 3
+  localization_optimal_ndt_score: 0.01
+  localization_quick_search_seconds: 30.0
+  localization_rtk_max_drift_m: 0.30
+  localization_rtk_required_samples: 3
   localization_recovery_attempts: 3
   localization_recovery_retry_seconds: 5.0
   localization_recovery_cycle_seconds: 30.0
@@ -155,6 +159,7 @@ navigation_stack:
   command_timeout_seconds: 45
   rosbag_script: "/home/dogrobot/robot/script/robot/navigation_rosbag.sh"
   rosbag_stop_timeout_seconds: 45
+  boundary_filter_dir: "/home/dogrobot/runtime/nx-edge/data/navigation_boundary"
 
 teleop_control:
   script_path: "/home/dogrobot/robot/script/robot/start_teleop_control.sh"

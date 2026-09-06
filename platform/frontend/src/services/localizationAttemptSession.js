@@ -5,6 +5,7 @@ export const ATTEMPT_STATUS_LABELS = {
   accepted: '成功',
   rejected: '失败',
   failed: '失败',
+  skipped: '已跳过',
 }
 
 export const LOCALIZATION_ATTEMPT_COMMAND_TYPES = new Set([
@@ -114,7 +115,19 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     bestMatchPose,
     bestNdtCandidate: raw.best_ndt_candidate || result.best_ndt_candidate || null,
     source: raw.selected_stage || raw.source || extras.source || '',
+    earlyStopped: Boolean(raw.early_stopped ?? result.early_stopped),
+    stopReason: raw.stop_reason || result.stop_reason || '',
+    candidateCount: Number(raw.candidate_count ?? result.candidate_count ?? attemptSource.length),
+    evaluatedCandidateCount: Number(raw.evaluated_candidate_count ?? result.evaluated_candidate_count ?? attemptSource.length),
+    globalSearchStarted: Boolean(raw.global_search_started ?? result.global_search_started),
+    rtkDrift: raw.rtk_drift || result.rtk_drift || null,
+    bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
   }
+  const score = finiteNumber(session.bestNdtCandidate?.matching_error)
+  session.optimalVerified = Boolean(
+    session.rtkDrift?.verified
+    || (session.bestNdtCommitted && score !== null && score < 0.01),
+  )
   return withAttemptMarkerExpiry(session)
 }
 
@@ -130,6 +143,14 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     bestMatchPose: null,
     bestNdtCandidate: null,
     source: '',
+    earlyStopped: false,
+    stopReason: '',
+    candidateCount: 0,
+    evaluatedCandidateCount: 0,
+    globalSearchStarted: false,
+    rtkDrift: null,
+    bestNdtCommitted: false,
+    optimalVerified: false,
   }
 }
 
@@ -146,6 +167,7 @@ export function attemptStatusClass(status) {
   if (status === 'accepted') return 'accepted'
   if (status === 'verifying' || status === 'started') return 'active'
   if (status === 'rejected' || status === 'failed') return 'failed'
+  if (status === 'skipped') return 'skipped'
   return 'waiting'
 }
 

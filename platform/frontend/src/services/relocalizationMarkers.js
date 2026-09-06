@@ -8,7 +8,7 @@ function finitePose(value) {
 }
 
 export function relocalizationMarkerStorageKey(robotId) {
-  return `roamerx.relocalizationMarkers.${robotId || 'unknown'}`
+  return `roamerx.relocalizationMarkers.v2.${robotId || 'unknown'}`
 }
 
 export function createRelocalizationMarker(pose, {
@@ -16,6 +16,7 @@ export function createRelocalizationMarker(pose, {
   commandType = '',
   commandId = '',
   occurredAt = new Date().toISOString(),
+  verification = '',
 } = {}) {
   const normalized = finitePose(pose)
   if (!normalized) return null
@@ -26,6 +27,7 @@ export function createRelocalizationMarker(pose, {
     commandType: String(commandType || ''),
     commandId: String(commandId || ''),
     occurredAt,
+    verification: String(verification || ''),
   }
 }
 
@@ -71,5 +73,6 @@ export function writeStoredRelocalizationMarkers(robotId, markers) {
 export function relocalizationMarkerTitle(marker) {
   const source = marker?.source || marker?.commandType || '重定位'
   const time = marker?.occurredAt ? new Date(marker.occurredAt).toLocaleString('zh-CN', { hour12: false }) : '—'
-  return `${source} · x ${Number(marker.x).toFixed(3)} / y ${Number(marker.y).toFixed(3)} · ${time}`
+  const verification = marker?.verification ? ` · ${marker.verification}` : ''
+  return `${source} · x ${Number(marker.x).toFixed(3)} / y ${Number(marker.y).toFixed(3)}${verification} · ${time}`
 }

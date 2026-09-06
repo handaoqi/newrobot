@@ -349,6 +349,8 @@ public:
       declare_parameter<double>(
         "lio_primary.rtk_trust.trusted_correction_rotation_rate_degps", 30.0)
         * M_PI / 180.0));
+    prefer_fixed_rtk_for_correction_ = declare_parameter<bool>(
+      "lio_primary.rtk_trust.prefer_fixed_for_correction", true);
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -1398,10 +1400,11 @@ private:
       const char* source,
       const rclcpp::Time& stamp,
       float translation_rate_mps = -1.0f,
-      float rotation_rate_radps = -1.0f) {
+      float rotation_rate_radps = -1.0f,
+      bool bypass_cooldown = false) {
     const std::int64_t steady_now_ns = steadyNowNanoseconds();
     if (!lio_anchor_valid_ || pending_lio_correction_.active ||
-        !lio_correction_cooldown_gate_.canStart(steady_now_ns) ||
+        (!bypass_cooldown && !lio_correction_cooldown_gate_.canStart(steady_now_ns)) ||
         !target_map_T_base.matrix().allFinite()) {
       return false;
     }
@@ -1767,7 +1770,7 @@ private:
     }
 
     // Large LIO↔RTK residual may only be applied after the RTK stream itself
-    // is self-stable (~3s). While waiting, do not hard-reject — LIO residual
+    // is self-stable (~1s). While waiting, do not hard-reject — LIO residual
     // will keep changing and must not poison the gate.
     if (ignore_lio_residual_cap &&
         !trust_stable_source &&
@@ -1808,7 +1811,8 @@ private:
     }
 
     ++gate.consecutive;
-    if (gate.consecutive < lio_drift_hysteresis_frames_) {
+    const int required_frames = trust_stable_source ? 1 : lio_drift_hysteresis_frames_;
+    if (gate.consecutive < required_frames) {
       gate.last_decision = trust_stable_source ? "rtk_stable_pending" : "stable_pending";
       return AuxiliaryGateStatus::pending;
     }
@@ -1920,6 +1924,11 @@ private:
     }
     const bool rtk_self_stable = quality_ok && updateRtkSelfStability(
       rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
+    // Lost/stationary recovery still requires the 1s no-drift window.
+    // During navigation, a fixed RTK solution is trusted immediately for pose
+    // regulation (instantaneous RTK jumps are still rejected above).
+    const bool trust_rtk = rtk_self_stable ||
+      (motion_phase_ == "moving" && quality_ok);
     if (!pose_estimator || lio_corrected_this_frame_ ||
         pending_lio_correction_.active) {
       if (lio_corrected_this_frame_) {
@@ -1942,14 +1951,14 @@ private:
     // the RTK stream is not yet self-stable.
     const bool yaw_trusted = localization::rtkHeadingTrustedForCorrection(
       observation.heading_usable, drift_yaw, lio_max_correction_yaw_rad_,
-      rtk_self_stable);
+      trust_rtk);
     if (observation.heading_usable && !yaw_trusted) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "RTK heading residual %.1fdeg exceeds %.1fdeg; discarding yaw, XY-only "
         "(rtk_self_stable=no)",
         drift_yaw * 180.0 / M_PI,
         lio_max_correction_yaw_rad_ * 180.0 / M_PI);
-    } else if (observation.heading_usable && rtk_self_stable &&
+    } else if (observation.heading_usable && trust_rtk &&
                drift_yaw > lio_max_correction_yaw_rad_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "RTK heading residual %.1fdeg exceeds %.1fdeg; trusting yaw because "
@@ -1966,14 +1975,15 @@ private:
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       rtk_drift_gate_, "RTK", quality_ok, drifted, rtk_position,
       correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
-      observation.stamp_ns, rtk_self_stable, /*ignore_lio_residual_cap=*/quality_ok);
+      observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/quality_ok);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "LIO/RTK drift pending correction: xy=%.3fm yaw=%.1fdeg frames=%d/%d "
-        "quality=%s rtk_self_stable=%s",
+        "quality=%s rtk_self_stable=%s trust_rtk=%s",
         drift_xy, drift_yaw * 180.0 / M_PI,
         rtk_drift_gate_.consecutive, lio_drift_hysteresis_frames_,
-        observation.quality.c_str(), rtk_self_stable ? "yes" : "no");
+        observation.quality.c_str(), rtk_self_stable ? "yes" : "no",
+        trust_rtk ? "yes" : "no");
       return false;
     }
     if (status != AuxiliaryGateStatus::accept) {
@@ -1995,16 +2005,16 @@ private:
     Eigen::Isometry3f target_map_T_base = Eigen::Isometry3f::Identity();
     target_map_T_base.translation() = rtk_position;
     target_map_T_base.linear() = orientation.normalized().toRotationMatrix();
-    const float translation_rate = rtk_self_stable
+    const float translation_rate = trust_rtk
       ? rtk_trusted_correction_translation_rate_mps_
       : lio_correction_translation_rate_mps_;
-    const float rotation_rate = (rtk_self_stable && yaw_trusted)
+    const float rotation_rate = (trust_rtk && yaw_trusted)
       ? rtk_trusted_correction_rotation_rate_radps_
       : lio_correction_rotation_rate_radps_;
     if (!scheduleLioAnchorCorrection(
           target_map_T_base, noise, "RTK",
           timeOnStampClock(observation.stamp_ns, get_clock()->now()),
-          translation_rate, rotation_rate)) {
+          translation_rate, rotation_rate, /*bypass_cooldown=*/trust_rtk)) {
       rtk_drift_gate_.resetConsecutive();
       rtk_drift_gate_.last_decision = "correction_schedule_rejected";
       return false;
@@ -2131,11 +2141,12 @@ private:
     }
 
     if (preferred_correction_mode_ == CorrectionPolicyMode::ukf &&
-        ndt.eligible && rtk.eligible) {
+        ndt.eligible && rtk.eligible && !prefer_fixed_rtk_for_correction_) {
       const auto conflict_check = selectCorrectionSource(
         preferred_correction_mode_, ndt, rtk,
         lio_drift_xy_m_, lio_drift_yaw_rad_,
-        lio_drift_xy_m_, lio_drift_yaw_rad_);
+        lio_drift_xy_m_, lio_drift_yaw_rad_,
+        prefer_fixed_rtk_for_correction_);
       if (conflict_check.source == CorrectionSource::conflict) {
         ndt_drift_gate_.resetConsecutive();
         rtk_drift_gate_.resetConsecutive();
@@ -2172,7 +2183,8 @@ private:
     const CorrectionSelection selection = selectCorrectionSource(
       preferred_correction_mode_, ndt, rtk,
       lio_drift_xy_m_, lio_drift_yaw_rad_,
-      lio_drift_xy_m_, lio_drift_yaw_rad_);
+      lio_drift_xy_m_, lio_drift_yaw_rad_,
+      prefer_fixed_rtk_for_correction_);
     last_correction_candidate_source_ = correctionSourceName(selection.source);
     last_correction_selection_reason_ = selection.reason;
 
@@ -2576,6 +2588,25 @@ private:
       rtk.orientation.toRotationMatrix()(0, 0));
     const bool rtk_heading_available = rtk_position_available && rtk.heading_usable &&
       std::isfinite(rtk_map_yaw);
+    Eigen::Vector3f lio_map_position = Eigen::Vector3f::Zero();
+    bool lio_map_position_available = false;
+    if (lio_anchor_valid_) {
+      Eigen::Isometry3f lio_T_base = Eigen::Isometry3f::Identity();
+      if (currentLioPose(lio_T_base)) {
+        const Eigen::Isometry3f map_T_base = lio_map_T_lio_ * lio_T_base;
+        if (map_T_base.matrix().allFinite()) {
+          lio_map_position = map_T_base.translation();
+          lio_map_position_available = true;
+        }
+      }
+    }
+    const bool rtk_lio_drift_available = rtk_position_available && lio_map_position_available;
+    const float rtk_lio_dx = rtk_lio_drift_available
+      ? rtk.position.x() - lio_map_position.x() : 0.0f;
+    const float rtk_lio_dy = rtk_lio_drift_available
+      ? rtk.position.y() - lio_map_position.y() : 0.0f;
+    const float rtk_lio_drift_xy = rtk_lio_drift_available
+      ? std::hypot(rtk_lio_dx, rtk_lio_dy) : 0.0f;
     std::string rtk_blocked_reason = "none";
     if (!use_gnss_fusion_) {
       rtk_blocked_reason = "gnss_fusion_disabled";
@@ -2724,6 +2755,29 @@ private:
     } else {
       out << "null";
     }
+    out << ",\"rtk_drift\":{\"sample_stamp_ns\":" << rtk.stamp_ns
+        << ",\"source\":\"aligned_fast_lio\""
+        << ",\"threshold_xy_m\":" << lio_drift_xy_m_
+        << ",\"dx_m\":";
+    if (rtk_lio_drift_available) {
+      out << rtk_lio_dx;
+    } else {
+      out << "null";
+    }
+    out << ",\"dy_m\":";
+    if (rtk_lio_drift_available) {
+      out << rtk_lio_dy;
+    } else {
+      out << "null";
+    }
+    out << ",\"xy_m\":";
+    if (rtk_lio_drift_available) {
+      out << rtk_lio_drift_xy;
+    } else {
+      out << "null";
+    }
+    out << ",\"self_stable\":" << (rtk_self_stable_ ? "true" : "false")
+        << ",\"decision\":\"" << rtk_drift_gate_.last_decision << "\"}";
     out
         << ",\"bridge_distance_m\":" << bridge_distance_m_
         << ",\"bridge_elapsed_s\":"
@@ -2782,7 +2836,17 @@ private:
     gnss_map_origin_loaded_ = false;
     gnss_correction_count_ = 0;
 
-    const std::filesystem::path meta_path = std::filesystem::path(map_path).parent_path() / "gnss_origin.yaml";
+    // map.pcd is often the compatibility symlink map/map.pcd -> current/map.pcd.
+    // Resolve it so gnss_origin.yaml is loaded from the session directory, not
+    // from the map root that may no longer have a sibling origin pointer.
+    const std::filesystem::path pcd_path(map_path);
+    std::error_code canonical_error;
+    const std::filesystem::path canonical_pcd =
+      std::filesystem::weakly_canonical(pcd_path, canonical_error);
+    const std::filesystem::path map_dir = canonical_error
+      ? pcd_path.parent_path()
+      : canonical_pcd.parent_path();
+    const std::filesystem::path meta_path = map_dir / "gnss_origin.yaml";
     if (!std::filesystem::exists(meta_path)) {
       RCLCPP_WARN(get_logger(), "GNSS map origin not found beside map: %s", meta_path.c_str());
       return false;
@@ -2960,15 +3024,13 @@ private:
     if (rtkGoodForNavigation(rtk) && applyRtkObservation(rtk)) {
       // Only latch GPS as the continuous driver when prefer_fixed_rtk is on.
       // Otherwise keep FAST-LIO primary and treat this as an absolute seed/correct.
-      if (prefer_fixed_rtk_) {
-        rtk_auto_primary_latched_ = true;
-        rtk_auto_primary_good_frames_ = rtk_primary_promote_samples_;
-        rtk_auto_primary_bad_frames_ = 0;
-      } else {
-        rtk_auto_primary_latched_ = false;
-        rtk_auto_primary_good_frames_ = 0;
-        rtk_auto_primary_bad_frames_ = 0;
-      }
+      // Do not bypass the normal RTK-primary promotion window here. Keeping
+      // LIO active for the first samples lets the edge verify the freshly
+      // established map<-lio anchor against fixed RTK before declaring the
+      // initialization complete.
+      rtk_auto_primary_latched_ = false;
+      rtk_auto_primary_good_frames_ = 0;
+      rtk_auto_primary_bad_frames_ = 0;
       has_trusted_ndt_pose_ = true;
       gnss_recovery_seed_pending_ = false;
       runtime_relocalization_attempted_ = false;
@@ -2982,7 +3044,7 @@ private:
       RCLCPP_INFO(get_logger(),
         "Fixed RTK accepted as %s for %s without NDT validation "
         "x=%.3f y=%.3f yaw=%.1fdeg heading=%s lio_anchor=%s",
-        prefer_fixed_rtk_ ? "navigation pose" : "absolute seed (LIO remains continuous)",
+        prefer_fixed_rtk_ ? "absolute seed pending RTK-primary promotion" : "absolute seed (LIO remains continuous)",
         reason, last_init_pos_.x(), last_init_pos_.y(), seeded_yaw * 180.0 / M_PI,
         rtk.heading_usable ? "rtk" : "missing",
         lio_anchor_valid_ ? "aligned" : "pending");
@@ -5408,8 +5470,9 @@ private:
     /**
      * @brief Load the scan context keyframe database shipped beside the map.
      *
-     * Same convention loadGnssOriginForMap already uses: the map session directory is
-     * map.pcd's parent. A missing or unreadable database is not an error - relocalization
+     * Same convention loadGnssOriginForMap already uses: resolve map.pcd so the
+     * session directory is the canonical parent, not the map-root symlink.
+     * A missing or unreadable database is not an error - relocalization
      * simply keeps the stock last-trusted-pose seed.
      */
     void loadScanContextForMap(const std::string& map_path) {
@@ -5877,6 +5940,7 @@ private:
   float rtk_trusted_correction_rotation_rate_radps_ =
     30.0f * static_cast<float>(M_PI) / 180.0f;
   bool rtk_self_stable_ = false;
+  bool prefer_fixed_rtk_for_correction_ = true;
   std::deque<RtkStabilitySample> rtk_stability_window_;
   float lio_correct_xy_variance_ = 0.010f;
   float lio_correct_z_variance_ = 0.020f;

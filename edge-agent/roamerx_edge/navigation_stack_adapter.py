@@ -122,6 +122,45 @@ class NavigationStackAdapter:
             }
         return self.reload_map(pcd_path, yaml_path)
 
+    def reload_boundary_filter(self) -> dict:
+        """Reload the generated keepout mask, bootstrapping new filter nodes when needed."""
+        mask_yaml = str(Path(self.config.boundary_filter_dir) / "keepout_mask.yaml")
+        if not Path(mask_yaml).exists():
+            raise ProtocolError("BOUNDARY_MASK_MISSING", f"keepout mask not found: {mask_yaml}")
+        status_payload = self.status()
+        stdout = str(status_payload.get("stdout") or "")
+        navigation_running = any(token in stdout for token in (
+            "robot_navigo navigation_bringup.launch.py", "navigo_container", "/planner_server",
+        ))
+        if not navigation_running:
+            return {"action": "reload_boundary_filter", "deferred": True, "mask_yaml": mask_yaml}
+        request = "{map_url: '" + mask_yaml.replace("'", "'\\''") + "'}"
+        script = (
+            "source /opt/ros/humble/setup.bash && "
+            "source /home/dogrobot/robot/install/setup.bash && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} "
+            "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
+            "timeout 25 ros2 service call /filter_mask_server/load_map nav2_msgs/srv/LoadMap "
+            + shlex.quote(request)
+        )
+        completed = subprocess.run(
+            ["bash", "-lc", script], check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=max(self.config.command_timeout_seconds, 35),
+        )
+        if completed.returncode == 0:
+            return {
+                "action": "reload_boundary_filter", "deferred": False,
+                "mask_yaml": mask_yaml, "stdout": completed.stdout[-3000:],
+            }
+        restarted = self.restart({"reason": "boundary_filter_bootstrap"})
+        return {
+            "action": "reload_boundary_filter", "deferred": False,
+            "recovery": "navigation_restart", "mask_yaml": mask_yaml,
+            "reload_error": (completed.stderr or completed.stdout)[-3000:],
+            "restart": restarted,
+        }
+
     def _looks_ready(self, stdout: str) -> bool:
         required = (
             "/planner_server",

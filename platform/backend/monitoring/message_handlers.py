@@ -20,6 +20,8 @@ from .models import (
     SpeechTemplate,
     TrajectoryBatchReceipt,
     TrajectoryPoint,
+    DebugLogSession,
+    MapNavigationBoundary,
 )
 from .protocol import MessageEnvelope, ProtocolError, parse_message
 from .realtime_gateway import realtime_publisher
@@ -27,6 +29,7 @@ from .serializers import EventSerializer, TaskExecutionSerializer
 from .services.alert_service import AlertService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
+from .services.system_log_service import emit_center_log, ingest_batch
 from .services import tts_service
 from .services.alert_skill_service import resolve_alert_template
 
@@ -359,6 +362,8 @@ def _dispatch(
             "registered": event is not None,
             "event_id": str(event.event_id) if event else str(payload["event_id"]),
         }
+    if message_type == "system.log.batch":
+        return ingest_batch(robot, payload, envelope_trace_id=envelope.trace_id)
     if message_type == "sync.request":
         return _handle_sync(envelope, robot, publish_response)
     return {"ignored": True}
@@ -416,6 +421,18 @@ def _get_command(payload: dict, robot: Robot) -> RemoteCommand:
         raise ProtocolError("UNKNOWN_COMMAND", "command not found") from exc
 
 
+def _command_log_module(command_type: str) -> str:
+    if command_type == "nav.relocalize":
+        return "relocalization"
+    if command_type == "nav.single_goal":
+        return "planner"
+    if command_type.startswith("nav."):
+        return "navigation"
+    if command_type == "map.boundary_apply":
+        return "boundary"
+    return "system"
+
+
 def _handle_command_ack(envelope: MessageEnvelope, robot: Robot) -> dict:
     payload = envelope.payload
     command = _get_command(payload, robot)
@@ -433,6 +450,17 @@ def _handle_command_ack(envelope: MessageEnvelope, robot: Robot) -> dict:
         source="edge",
         message_id=envelope.message_id,
         payload=payload,
+    )
+    emit_center_log(
+        robot=robot,
+        level="INFO" if accepted else "WARNING",
+        module=_command_log_module(command.command_type),
+        event_code=f"{command.command_type}.{'accepted' if accepted else 'rejected'}",
+        message=f"{command.get_command_type_display()}{'已接受' if accepted else '被拒绝'}",
+        data={"reason_code": command.ack_reason_code, "reason_message": command.ack_reason_message},
+        command=command,
+        task_execution=command.task_execution,
+        dedupe_seconds=2,
     )
     execution = command.task_execution
     if execution and command.command_type == "task.start":
@@ -478,6 +506,17 @@ def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
             "payload": payload,
         },
     )
+    emit_center_log(
+        robot=robot,
+        level="INFO",
+        module=_command_log_module(command.command_type),
+        event_code=f"{command.command_type}.progress",
+        message=f"{command.get_command_type_display()}执行中",
+        data=incoming,
+        command=command,
+        task_execution=command.task_execution,
+        dedupe_seconds=2,
+    )
     return {"status": command.status}
 
 
@@ -514,6 +553,48 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
             "payload": payload,
         },
     )
+    success = terminal_status == "succeeded"
+    emit_center_log(
+        robot=robot,
+        level="INFO" if success else "ERROR",
+        module=_command_log_module(command.command_type),
+        event_code=f"{command.command_type}.{'succeeded' if success else 'failed'}",
+        message=f"{command.get_command_type_display()}{'完成' if success else '失败'}",
+        data={
+            "result": command.result_payload,
+            "error_code": command.error_code,
+            "error_message": command.error_message,
+        },
+        command=command,
+        task_execution=command.task_execution,
+    )
+    if command.command_type == "diagnostics.log_config":
+        session_id = command.payload.get("session_id")
+        session = DebugLogSession.objects.filter(pk=session_id, robot=robot).first()
+        if session:
+            if success:
+                session.status = "active" if command.payload.get("enabled") else "stopped"
+                if not command.payload.get("enabled"):
+                    session.stopped_at = command.finished_at or timezone.now()
+            else:
+                session.status = "failed"
+            session.save(update_fields=["status", "stopped_at", "updated_at"])
+    if command.command_type == "map.boundary_apply":
+        boundary_data = command.payload.get("boundary") or {}
+        boundary = MapNavigationBoundary.objects.filter(
+            map_data_id=command.payload.get("map_id"),
+            apply_command=command,
+        ).first()
+        if boundary:
+            if success:
+                boundary.active_revision = int(boundary_data.get("revision") or boundary.revision)
+                boundary.active_payload = boundary_data
+                boundary.apply_status = "active" if boundary.active_revision == boundary.revision else "draft"
+                boundary.apply_error = ""
+            else:
+                boundary.apply_status = "failed"
+                boundary.apply_error = command.error_message or command.error_code
+            boundary.save(update_fields=["active_revision", "active_payload", "apply_status", "apply_error", "updated_at"])
     execution = command.task_execution
     if execution:
         final_state = command.result_payload.get("final_task_state")
@@ -588,6 +669,12 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
     if envelope.message_type == "task.obstacle_speech":
         command = _queue_obstacle_speech(execution, robot, payload)
+        emit_center_log(
+            robot=robot, level="WARNING", module="avoidance",
+            event_code=f"avoidance.{payload.get('speech_stage') or 'obstacle'}",
+            message="避障流程触发", data=payload, task_execution=execution,
+            waypoint_index=payload.get("waypoint_index"),
+        )
         realtime_publisher.publish_task_event(
             str(execution.id),
             {"type": "obstacle_speech", "payload": payload, "audio_command_id": command.id if command else None},
@@ -642,6 +729,32 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         except TaskStateError:
             if target != execution.state:
                 raise
+    if envelope.message_type == "task.progress":
+        milestone = str(payload.get("milestone") or "progress")
+        module = "waypoint" if milestone == "waypoint_reached" else "navigation"
+        emit_center_log(
+            robot=robot, level="INFO", module=module,
+            event_code=f"{module}.{milestone}",
+            message="航点已到达" if milestone == "waypoint_reached" else "导航任务进度更新",
+            data=payload, task_execution=execution,
+            waypoint_index=(
+                payload.get("execution_waypoint_index")
+                if payload.get("execution_waypoint_index") is not None
+                else payload.get("current_waypoint_index")
+            ),
+            dedupe_seconds=2,
+        )
+    else:
+        state = payload.get("state") or envelope.message_type.removeprefix("task.")
+        level = "ERROR" if state == "failed" else "WARNING" if state in {"paused", "interrupted", "cancelled"} else "INFO"
+        reason = str(payload.get("reason_code") or "")
+        module = "localization" if "localization" in reason.lower() else "navigation"
+        emit_center_log(
+            robot=robot, level=level, module=module,
+            event_code=envelope.message_type,
+            message=f"巡检任务状态变更为 {state}",
+            data=payload, task_execution=execution,
+        )
     realtime_publisher.publish_task_event(str(execution.id), TaskExecutionSerializer(execution).data)
     return {"state": execution.state, "state_version": execution.state_version}
 

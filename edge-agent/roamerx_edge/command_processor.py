@@ -34,6 +34,8 @@ class CommandProcessor:
         sensor_control_adapter=None,
         charge_control_adapter=None,
         audio_control_adapter=None,
+        structured_logs=None,
+        navigation_boundary=None,
     ) -> None:
         self.robot_id = robot_id
         self.store = store
@@ -48,6 +50,8 @@ class CommandProcessor:
         self.sensor_control_adapter = sensor_control_adapter
         self.charge_control_adapter = charge_control_adapter
         self.audio_control_adapter = audio_control_adapter
+        self.structured_logs = structured_logs
+        self.navigation_boundary = navigation_boundary
         self.publish_ack = publish_ack
         self.publish_result = publish_result
         self.publish_progress = publish_progress or (lambda *_args, **_kwargs: None)
@@ -75,6 +79,11 @@ class CommandProcessor:
         started_at = now_iso()
         ack = None
         try:
+            self._structured(
+                "INFO", self._module_for_command(envelope.message_type),
+                f"{envelope.message_type}.received", f"收到命令 {envelope.message_type}",
+                envelope=envelope,
+            )
             if datetime.now(timezone.utc) >= datetime.fromisoformat(
                 envelope.payload["expires_at"].replace("Z", "+00:00")
             ):
@@ -92,6 +101,22 @@ class CommandProcessor:
                     # rejects every legitimate cross-map docking task.
                     self._prepare_docking_map(envelope.payload["command"])
                 self.safety.wait_until_localization_stable()
+                if self.navigation_boundary:
+                    self.navigation_boundary.validate_route(envelope.payload["command"]["route_snapshot"])
+                route_snapshot = envelope.payload["command"]["route_snapshot"]
+                route_waypoints = route_snapshot.get("waypoints") or []
+                self._structured(
+                    "DEBUG", "planner", "planner.route_input", "巡检路线规划输入",
+                    data={
+                        "route_id": route_snapshot.get("route_id"),
+                        "waypoint_count": len(route_waypoints),
+                        "global_controller": route_snapshot.get("global_controller"),
+                        "boundary_revision": route_snapshot.get("boundary_revision"),
+                        "first_waypoint": route_waypoints[0] if route_waypoints else None,
+                        "last_waypoint": route_waypoints[-1] if route_waypoints else None,
+                    },
+                    envelope=envelope,
+                )
                 self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
                 # The acknowledgement must carry the same task version sequence
                 # as task.started/task.progress.  Previously it reused a
@@ -118,6 +143,12 @@ class CommandProcessor:
                 self.publish_result(command_id, result)
             return ack, result
         except ProtocolError as exc:
+            self._structured(
+                "WARNING" if ack is None else "ERROR",
+                self._module_for_command(envelope.message_type),
+                f"{envelope.message_type}.failed", f"命令 {envelope.message_type} 失败：{exc.message}",
+                data={"error_code": exc.code}, envelope=envelope,
+            )
             if ack is None:
                 ack = build_ack(
                     envelope,
@@ -152,6 +183,11 @@ class CommandProcessor:
             return ack, result
         except Exception as exc:
             LOGGER.exception("unexpected error executing command %s", command_id)
+            self._structured(
+                "ERROR", self._module_for_command(envelope.message_type),
+                f"{envelope.message_type}.internal_error", f"命令 {envelope.message_type} 发生内部错误",
+                data={"error": str(exc)}, envelope=envelope,
+            )
             if prepared_task_start and ack is not None:
                 try:
                     self.task_executor.force_exit(envelope.payload["task_execution_id"])
@@ -282,6 +318,8 @@ class CommandProcessor:
         if map_payload.get("local_map_dir"):
             map_payload["local_map_dir"] = map_payload["local_map_dir"]
         activated = self.map_activation_adapter.activate(map_payload)
+        if self.navigation_boundary:
+            self.navigation_boundary.activate_map(map_payload["map_id"], map_payload["map_version"])
         self.navigation_stack_adapter.switch_map()
         navigation = self.task_executor.navigation
         if not navigation.wait_until_ready(timeout_seconds=45):
@@ -311,6 +349,23 @@ class CommandProcessor:
             return self._execute_mapping(envelope, started_at)
         if envelope.message_type.startswith("map."):
             return self._execute_map(envelope, started_at)
+        if envelope.message_type == "diagnostics.log_config":
+            if not self.structured_logs:
+                raise ProtocolError("STRUCTURED_LOGS_UNAVAILABLE", "structured logging is not configured")
+            command = envelope.payload.get("command") or {}
+            result_payload = self.structured_logs.configure_debug(
+                enabled=command.get("enabled", False),
+                modules=command.get("modules"),
+                sample_hz=command.get("sample_hz", 1.0),
+                expires_at=command.get("expires_at"),
+            )
+            self._structured(
+                "INFO", "system", "debug.configuration_applied",
+                "DEBUG 日志配置已应用", data=result_payload, envelope=envelope,
+            )
+            if self.structured_logs:
+                self.structured_logs.flush()
+            return build_result(envelope, status="succeeded", result=result_payload, started_at=started_at)
         if envelope.message_type.startswith("nav."):
             return self._execute_navigation(envelope, started_at)
         if envelope.message_type.startswith("teleop."):
@@ -354,7 +409,26 @@ class CommandProcessor:
             navigation = getattr(self.task_executor, "navigation", None)
             if navigation is None:
                 raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation adapter is not configured")
-            goal = {"x": float(command["x"]), "y": float(command["y"]), "yaw": float(command["yaw"]), "require_yaw": bool(command.get("require_yaw", True))}
+            global_controller = str(command.get("global_controller") or "theta_star")
+            global_setter = getattr(navigation, "set_global_controller", None)
+            if callable(global_setter):
+                global_setter(global_controller)
+            goal = {
+                "x": float(command["x"]),
+                "y": float(command["y"]),
+                "yaw": float(command["yaw"]),
+                "require_yaw": bool(command.get("require_yaw", True)),
+                "global_controller": global_controller,
+            }
+            if self.navigation_boundary:
+                self.navigation_boundary.validate_point(
+                    str(command.get("map_id") or ""), goal["x"], goal["y"],
+                    expected_revision=command.get("boundary_revision"),
+                )
+            self._structured(
+                "DEBUG", "planner", "planner.single_goal_input", "单点规划输入",
+                data=goal, envelope=envelope, pose={"x": goal["x"], "y": goal["y"], "yaw": goal["yaw"]},
+            )
             accepted = navigation.send_waypoints([goal], lambda *_: None, lambda *_: None)
             if not accepted:
                 raise ProtocolError("NAV_GOAL_REJECTED", "Nav2 rejected the single-point goal")
@@ -389,6 +463,17 @@ class CommandProcessor:
                 self.localization_adapter, "set_attempt_progress_callback", None
             )
             try:
+                self._structured(
+                    "DEBUG", "relocalization" if envelope.message_type == "nav.relocalize" else "localization",
+                    f"{envelope.message_type}.input", "定位算法输入",
+                    data={
+                        "seed_source": command.get("seed_source"),
+                        "wait_seconds": command.get("wait_seconds"),
+                        "candidate_waypoint_count": len(command.get("waypoints") or []),
+                        "coordinate_mode": command.get("coordinate_mode"),
+                        "scene_scope": command.get("scene_scope"),
+                    }, envelope=envelope,
+                )
                 if callable(begin_operator):
                     begin_operator()
                     operator_scope_started = True
@@ -428,9 +513,32 @@ class CommandProcessor:
                             waypoints=list(command.get("waypoints") or []),
                             wait_seconds=float(command.get("wait_seconds", 180.0)),
                         )
-                    elif seed_source == "global":
-                        result_payload = self.localization_adapter.global_relocalize(
-                            wait_seconds=float(command.get("wait_seconds", 90.0)),
+                    elif seed_source in {"global", "quick_then_global"}:
+                        try:
+                            origin = (
+                                self.map_activation_adapter.mapping_start_pose()
+                                if self.map_activation_adapter else None
+                            )
+                        except ProtocolError as exc:
+                            origin = {
+                                "unavailable_error_code": exc.code,
+                                "unavailable_error_message": exc.message,
+                            }
+                        supplied = all(
+                            command.get(field) is not None for field in ("x", "y", "yaw")
+                        )
+                        manual_seed = None
+                        if supplied:
+                            manual_seed = {
+                                field: float(command.get(field, 0.0))
+                                for field in ("x", "y", "z", "yaw")
+                            }
+                        result_payload = self.localization_adapter.quick_then_global_relocalize(
+                            origin=origin,
+                            manual_seed=manual_seed,
+                            scene_scope=str(command.get("scene_scope") or "indoor"),
+                            coordinate_mode=str(command.get("coordinate_mode") or "local_only"),
+                            wait_seconds=float(command.get("wait_seconds", 120.0)),
                         )
                     else:
                         seed = self._resolve_localization_seed(command)
@@ -440,7 +548,8 @@ class CommandProcessor:
                     result_payload["localization_bootstrap"] = localization_bootstrap
                 progressive_initialization = (
                     envelope.message_type == "nav.relocalize"
-                    and str(command.get("seed_source") or "") == "progressive"
+                    and str(command.get("seed_source") or "")
+                    in {"progressive", "quick_then_global"}
                 )
                 should_start_navigation = localization_bootstrap is not None or bool(
                     command.get("start_navigation", progressive_initialization)
@@ -448,6 +557,11 @@ class CommandProcessor:
                 if should_start_navigation:
                     result_payload = dict(result_payload or {})
                     result_payload["navigation_start"] = self._start_navigation_after_localization()
+                self._structured(
+                    "DEBUG", "relocalization" if envelope.message_type == "nav.relocalize" else "localization",
+                    f"{envelope.message_type}.output", "定位算法输出",
+                    data=result_payload, envelope=envelope,
+                )
             finally:
                 try:
                     if callable(set_progress):
@@ -780,6 +894,21 @@ class CommandProcessor:
         )
 
     def _execute_map(self, envelope: MessageEnvelope, started_at: str) -> dict:
+        if envelope.message_type == "map.boundary_apply":
+            if not self.navigation_boundary:
+                raise ProtocolError("BOUNDARY_UNAVAILABLE", "navigation boundary manager is not configured")
+            command = envelope.payload.get("command") or {}
+            current_map_id = str(self.safety.state.current_map_id or "")
+            if current_map_id and current_map_id != str(command.get("map_id") or ""):
+                raise ProtocolError(
+                    "BOUNDARY_MAP_MISMATCH",
+                    f"导航边界地图 {command.get('map_id')} 与当前地图 {current_map_id} 不一致",
+                )
+            result_payload = self.navigation_boundary.apply(command)
+            boundary_reloader = getattr(self.navigation_stack_adapter, "reload_boundary_filter", None)
+            if callable(boundary_reloader):
+                result_payload["nav2_filter_reload"] = boundary_reloader()
+            return build_result(envelope, status="succeeded", result=result_payload, started_at=started_at)
         if not self.map_activation_adapter:
             raise ProtocolError("MAP_ACTIVATION_UNAVAILABLE", "map activation adapter is not configured")
         command = envelope.payload.get("command") or {}
@@ -791,6 +920,8 @@ class CommandProcessor:
                     "机器人正在执行任务，不能切换活动地图",
                 )
             result_payload = self.map_activation_adapter.activate(command)
+            if self.navigation_boundary:
+                self.navigation_boundary.activate_map(command.get("map_id"), command.get("map_version"))
             if not self.navigation_stack_adapter:
                 raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")
             active_files = result_payload["current_map"]["active_files"]
@@ -805,6 +936,9 @@ class CommandProcessor:
                     active_files["map.pcd"],
                     active_files["map.yaml"],
                 )
+            boundary_reloader = getattr(self.navigation_stack_adapter, "reload_boundary_filter", None)
+            if not result_payload["map_reload"].get("deferred") and callable(boundary_reloader):
+                result_payload["boundary_filter_reload"] = boundary_reloader()
             # A map-local pose cannot be carried across maps.  The map is
             # loaded now, but a fresh map-specific initial pose is required
             # before task admission can consider localization usable.
@@ -827,6 +961,37 @@ class CommandProcessor:
             result=result_payload,
             started_at=started_at,
         )
+
+    @staticmethod
+    def _module_for_command(command_type: str) -> str:
+        if command_type == "nav.relocalize":
+            return "relocalization"
+        if command_type == "nav.initial_pose":
+            return "localization"
+        if command_type == "nav.single_goal":
+            return "planner"
+        if command_type.startswith("nav."):
+            return "navigation"
+        if command_type == "map.boundary_apply":
+            return "boundary"
+        return "system"
+
+    def _structured(self, level, module, event_code, message, *, data=None, envelope=None, pose=None):
+        if not self.structured_logs:
+            return
+        context = {}
+        if envelope:
+            command = envelope.payload.get("command") or {}
+            route_map = ((command.get("route_snapshot") or {}).get("map") or {})
+            context = {
+                "trace_id": envelope.trace_id,
+                "command_id": envelope.payload.get("command_id"),
+                "task_execution_id": envelope.payload.get("task_execution_id"),
+                "map_id": command.get("map_id") or route_map.get("map_id"),
+            }
+        if pose:
+            context["pose"] = pose
+        self.structured_logs.emit(level, module, event_code, message, data=data, **context)
 
     def _state_version(self) -> int:
         context = self.task_executor.context

@@ -140,6 +140,20 @@ COMMAND_START_EXPIRY_SECONDS = int(os.getenv("COMMAND_START_EXPIRY_SECONDS", "30
 COMMAND_CONTROL_EXPIRY_SECONDS = int(os.getenv("COMMAND_CONTROL_EXPIRY_SECONDS", "15"))
 TASK_MAX_DURATION_SECONDS = int(os.getenv("TASK_MAX_DURATION_SECONDS", "1800"))
 
+# Raw MQTT packets exist for short-term de-duplication and troubleshooting;
+# their business results are persisted separately.  Keep terminal packet data
+# bounded so a high-rate robot cannot exhaust the SQLite volume.
+INBOUND_MESSAGE_RETENTION_DAYS = int(os.getenv("INBOUND_MESSAGE_RETENTION_DAYS", "30"))
+INBOUND_MESSAGE_FAILED_RETENTION_DAYS = int(os.getenv("INBOUND_MESSAGE_FAILED_RETENTION_DAYS", "180"))
+SYSTEM_LOG_DEBUG_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_DEBUG_RETENTION_DAYS", "7"))
+SYSTEM_LOG_INFO_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_INFO_RETENTION_DAYS", "30"))
+SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS", "180"))
+SYSTEM_LOG_CLEANUP_BATCH_SIZE = int(os.getenv("SYSTEM_LOG_CLEANUP_BATCH_SIZE", "2000"))
+INBOUND_MESSAGE_CLEANUP_BATCH_SIZE = max(1, int(os.getenv("INBOUND_MESSAGE_CLEANUP_BATCH_SIZE", "2000")))
+INBOUND_MESSAGE_CLEANUP_INTERVAL_SECONDS = max(
+    60, int(os.getenv("INBOUND_MESSAGE_CLEANUP_INTERVAL_SECONDS", "3600"))
+)
+
 # Validation recordings and results are large immutable blobs. Production uses
 # the self-hosted S3-compatible service from runtime/platform/compose.yaml;
 # tests and a developer checkout can use the local backend without credentials.

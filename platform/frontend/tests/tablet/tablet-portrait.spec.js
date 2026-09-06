@@ -248,6 +248,47 @@ test('landscape orientation uses the permanent left desktop menu even on mobile'
   }
 })
 
+test('remote development keeps live output ahead of contained history on a phone', async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The handset regression runs once in Chromium')
+  const context = await browser.newContext({
+    baseURL: 'http://127.0.0.1:4173',
+    colorScheme: 'light',
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 390, height: 844 },
+    screen: { width: 390, height: 844 },
+  })
+  try {
+    const page = await context.newPage()
+    await installTabletMocks(page, { authenticated: true })
+    await page.goto('/dashboard/remote-development')
+    await expect(page.locator('.dev-history')).toBeVisible()
+    await expect(page.locator('.terminal-shell')).toBeVisible()
+    const layout = await page.evaluate(() => {
+      const history = document.querySelector('.dev-history')
+      const terminal = document.querySelector('.terminal-shell')
+      const historyRect = history.getBoundingClientRect()
+      const terminalRect = terminal.getBoundingClientRect()
+      const style = getComputedStyle(history)
+      return {
+        historyTop: historyRect.top,
+        terminalBottom: terminalRect.bottom,
+        historyScrollHeight: history.scrollHeight,
+        historyClientHeight: history.clientHeight,
+        overflowY: style.overflowY,
+      }
+    })
+    expect(layout.historyTop).toBeGreaterThanOrEqual(layout.terminalBottom)
+    expect(layout.historyScrollHeight).toBeGreaterThan(layout.historyClientHeight)
+    expect(['auto', 'scroll']).toContain(layout.overflowY)
+    await page.goto('about:blank')
+  } finally {
+    await context.close()
+  }
+})
+
 test('a square viewport follows the portrait right-side floating menu rule', async ({ browser }, testInfo) => {
   test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'The orientation boundary regression runs once in Chromium')
   const context = await browser.newContext({

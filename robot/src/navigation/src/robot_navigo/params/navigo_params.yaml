@@ -163,6 +163,7 @@ global_costmap:
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "inflation_layer"]
+      filters: ["keepout_filter"]
       static_layer:
         plugin: "navigo_costmap_2d::StaticLayer"
         map_subscribe_transient_local: False
@@ -175,7 +176,28 @@ global_costmap:
         plugin: "navigo_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
         inflation_radius: 0.4
+      keepout_filter:
+        plugin: "navigo_costmap_2d::KeepoutFilter"
+        enabled: True
+        filter_info_topic: "/costmap_filter_info"
+        transform_tolerance: 0.2
       always_send_full_costmap: False
+
+filter_mask_server:
+  ros__parameters:
+    use_sim_time: False
+    yaml_filename: "/home/dogrobot/runtime/nx-edge/data/navigation_boundary/keepout_mask.yaml"
+    topic_name: "keepout_filter_mask"
+    frame_id: "map"
+
+costmap_filter_info_server:
+  ros__parameters:
+    use_sim_time: False
+    type: 0
+    filter_info_topic: "costmap_filter_info"
+    mask_topic: "keepout_filter_mask"
+    base: 0.0
+    multiplier: 1.0
 
 map_server:
   ros__parameters:

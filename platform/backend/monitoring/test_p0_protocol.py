@@ -27,6 +27,12 @@ class ProtocolContractTests(SimpleTestCase):
         with self.assertRaises(ProtocolError):
             parse_message(payload)
 
+    def test_rejects_invalid_waypoint_global_controller(self):
+        payload = json.loads(self.fixture_path.read_text())
+        payload["payload"]["command"]["route_snapshot"]["waypoints"][0]["global_controller"] = "invalid"
+        with self.assertRaises(ProtocolError):
+            parse_message(payload)
+
     def test_accepts_nav_recover_command(self):
         payload = json.loads(self.fixture_path.read_text())
         payload["message_type"] = "nav.recover"
@@ -39,9 +45,27 @@ class ProtocolContractTests(SimpleTestCase):
         payload = json.loads(self.fixture_path.read_text())
         payload["message_type"] = "nav.single_goal"
         payload["payload"].pop("task_execution_id", None)
-        payload["payload"]["command"] = {"x": 1.25, "y": -0.5, "yaw": 0.75}
+        payload["payload"]["command"] = {
+            "x": 1.25,
+            "y": -0.5,
+            "yaw": 0.75,
+            "global_controller": "navfn",
+        }
         envelope = parse_message(payload)
         self.assertEqual(envelope.message_type, "nav.single_goal")
+
+    def test_rejects_invalid_nav_single_goal_global_controller(self):
+        payload = json.loads(self.fixture_path.read_text())
+        payload["message_type"] = "nav.single_goal"
+        payload["payload"].pop("task_execution_id", None)
+        payload["payload"]["command"] = {
+            "x": 1.25,
+            "y": -0.5,
+            "yaw": 0.75,
+            "global_controller": "invalid",
+        }
+        with self.assertRaises(ProtocolError):
+            parse_message(payload)
 
     def test_accepts_mapping_origin_workflow_commands(self):
         for command_type in (

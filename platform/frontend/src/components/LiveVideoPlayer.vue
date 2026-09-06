@@ -38,6 +38,8 @@ let setupVersion = 0
 let mediaModulesPromise = null
 let playerSetupTimer = null
 let audioReconnectTimer = null
+let streamRetryTimer = null
+let streamRetryAttempt = 0
 
 function loadMediaModules() {
   if (!mediaModulesPromise) {
@@ -53,7 +55,7 @@ function loadMediaModules() {
 }
 
 const HISTORY_BUFFER_SECONDS = 30 * 60
-const streamProbeTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 1800)
+const streamProbeTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 4000)
 const streamStartupTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_STARTUP_TIMEOUT_MS || 10000)
 const playUrls = computed(() => props.playUrls || {})
 const sourceKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
@@ -248,10 +250,29 @@ function destroyPlayers() {
   }
 }
 
+function clearStreamRetryTimer() {
+  if (!streamRetryTimer) return
+  window.clearTimeout(streamRetryTimer)
+  streamRetryTimer = null
+}
+
 function markStreamUnavailable() {
-  streamUnavailable.value = true
   streamLoading.value = false
   destroyPlayers()
+  const delays = [2000, 5000, 10000]
+  if (playbackMode.value === 'live' && streamRetryAttempt < delays.length && (playUrls.value.flv || playUrls.value.hls)) {
+    const delay = delays[streamRetryAttempt]
+    streamRetryAttempt += 1
+    notify(`视频流中断，${Math.round(delay / 1000)} 秒后重试`, 'info')
+    clearStreamRetryTimer()
+    streamRetryTimer = window.setTimeout(() => {
+      streamRetryTimer = null
+      streamUnavailable.value = false
+      schedulePlayerSetup()
+    }, delay)
+    return
+  }
+  streamUnavailable.value = true
   emit('stream-error')
 }
 
@@ -418,6 +439,7 @@ async function setupPlayer({ preferHls = false } = {}) {
       applyBrowserAudio(element)
       startLiveGuard()
       clearStreamStartupTimer()
+      streamRetryAttempt = 0
       streamLoading.value = false
       return
     }
@@ -437,7 +459,7 @@ async function setupPlayer({ preferHls = false } = {}) {
       })
       hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
         if (frozen) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamLoading.value = false }).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamRetryAttempt = 0; streamLoading.value = false }).catch(markStreamUnavailable)
         if (frozen) streamLoading.value = false
       })
       hlsPlayer.loadSource(hlsSource)
@@ -449,7 +471,7 @@ async function setupPlayer({ preferHls = false } = {}) {
       element.src = isFrozenPlayback.value ? await freezeHistoryManifest(hls) : hls
       element.addEventListener('loadedmetadata', () => {
         if (isFrozenPlayback.value) applyHistoryPosition(element)
-        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamLoading.value = false }).catch(markStreamUnavailable)
+        else element.play().then(() => applyBrowserAudio(element)).then(startLiveGuard).then(() => { clearStreamStartupTimer(); streamRetryAttempt = 0; streamLoading.value = false }).catch(markStreamUnavailable)
         if (isFrozenPlayback.value) streamLoading.value = false
       }, { once: true })
       armStreamStartupTimer(version)
@@ -467,6 +489,7 @@ async function setupPlayer({ preferHls = false } = {}) {
 watch(sourceKey, (nextSource, previousSource) => {
   if (nextSource === previousSource) return
   streamUnavailable.value = false
+  streamRetryAttempt = 0
   playbackMode.value = 'live'
   historyPlaybackPaused.value = false
   schedulePlayerSetup()
@@ -508,6 +531,7 @@ watch(() => props.robotId, () => {
 onMounted(() => { void setupPlayer() })
 onBeforeUnmount(() => {
   clearAudioReconnectTimer()
+  clearStreamRetryTimer()
   destroyPlayers()
 })
 

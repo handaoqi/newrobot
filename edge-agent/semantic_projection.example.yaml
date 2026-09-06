@@ -1,0 +1,13 @@
+calibration:
+  # Replace every value with the measured camera/LiDAR calibration before use.
+  id: front-camera-lidar-v1
+  image_size: [1280, 720]
+  camera_matrix: [900.0, 0.0, 640.0, 0.0, 900.0, 360.0, 0.0, 0.0, 1.0]
+  distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+  # Homogeneous transform: point_camera = lidar_to_camera * point_lidar.
+  # This identity matrix is a schema example, not a valid installation value.
+  lidar_to_camera:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]

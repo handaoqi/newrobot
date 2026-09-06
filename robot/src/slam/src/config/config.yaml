@@ -154,6 +154,7 @@
         # unified_mapping.launch.py only overrides this from the explicit
         # ROAMERX_AUTO_LOOP_OPTIMIZATION deployment policy.
         use_loop: false
+        # XY-only RTK jump gate. GNSS altitude is not applied to the map.
         max_pose_jump_m: 25.0
         max_abs_z_change_m: 1.5
         rtk_position_sigma_floor: 0.20

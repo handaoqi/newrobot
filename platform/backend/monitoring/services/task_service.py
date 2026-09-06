@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from ..models import PatrolRoute, PatrolTask, Robot, TaskExecution, TaskExecutionEvent
 from .map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
+from .navigation_boundary_service import boundary_payload
 
 
 class TaskStateError(ValueError):
@@ -50,6 +51,7 @@ def _normalize_global_controller(value: object | None) -> str:
 def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
     normalized = []
     names = route.waypoint_names or []
+    route_global_controller = _normalize_global_controller(getattr(route, "global_controller", ""))
     for index, raw in enumerate(route.waypoints or []):
         if isinstance(raw, dict):
             x = raw.get("x")
@@ -70,6 +72,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_text = str(raw.get("speech_text") or "")
             localization_mode = str(raw.get("localization_mode") or "ndt").lower()
             local_controller = str(raw.get("local_controller") or "mppi").lower()
+            global_controller = _normalize_global_controller(
+                raw.get("global_controller") or route_global_controller
+            )
             avoidance_to_next = bool(raw.get("avoidance_to_next", True))
             require_yaw = bool(raw.get("require_yaw", False))
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
@@ -85,6 +90,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_text = ""
             localization_mode = "ndt"
             local_controller = "mppi"
+            global_controller = route_global_controller
             avoidance_to_next = True
             require_yaw = False
         else:
@@ -103,6 +109,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 # RPP is a legacy route value. The deployed navigo stack only
                 # registers FollowPath (MPPI), so old routes remain executable.
                 "local_controller": "mppi" if local_controller in {"rpp", "mppi"} else "mppi",
+                "global_controller": global_controller,
                 "avoidance_to_next": avoidance_to_next,
                 "require_yaw": require_yaw,
             }
@@ -142,6 +149,13 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
         "global_controller": _normalize_global_controller(getattr(route, "global_controller", "")),
         "waypoints": normalize_waypoints(route),
     }
+    try:
+        boundary = map_data.navigation_boundary
+    except Exception:
+        boundary = None
+    if boundary and boundary.active_revision > 0:
+        snapshot["boundary_revision"] = boundary.active_revision
+        snapshot["boundary"] = boundary_payload(boundary, active=True)
     if route.map_set_id:
         members = list(route.map_set.members.select_related("map_data").all())
         snapshot["map_set"] = {
