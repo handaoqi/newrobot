@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient
 
-from .models import DebugLogSession, MapData, MapNavigationBoundary, RemoteCommand, Robot, SystemLog
+from .models import DebugLogSession, MapData, MapNavigationBoundary, PatrolRoute, RemoteCommand, Robot, SystemLog
 from .services.navigation_boundary_service import validate_waypoints_against_boundary
 from .services.system_log_service import ingest_batch
 
@@ -25,6 +25,7 @@ class SystemLogApiTests(TestCase):
                 "level": "WARNING",
                 "module": "avoidance",
                 "event_code": "avoidance.blocked",
+                "dedupe_key": "front-blocked",
                 "message": "前方持续受阻",
                 "data": {"front_distance_m": 0.18, "token": "must-not-leak"},
                 "pose": {"x": 1.0, "y": 2.0, "yaw": 0.3},
@@ -66,6 +67,33 @@ class SystemLogApiTests(TestCase):
         self.assertEqual(session.status, "starting")
         self.assertEqual(command.command_type, "diagnostics.log_config")
         self.assertEqual(command.payload["sample_hz"], 2.0)
+
+    def test_diagnostic_event_accepts_only_confirmed_waypoint_edits(self):
+        map_data = MapData.objects.create(name="Log Map", robot=self.robot)
+        route = PatrolRoute.objects.create(
+            name="Log Route", map_data=map_data, robot=self.robot,
+            waypoints=[{"waypoint_id": "wp-1", "x": 1, "y": 2}],
+        )
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            f"/api/robots/{self.robot.id}/system-logs/diagnostic-events/",
+            {
+                "event_code": "waypoint.edit_confirmed",
+                "route_id": route.id,
+                "waypoint_id": "wp-1",
+                "waypoint_index": 0,
+                "data": {"before": {"x": 1}, "after": {"x": 1.5}},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(SystemLog.objects.get().event_code, "waypoint.edit_confirmed")
+        denied = self.client.post(
+            f"/api/robots/{self.robot.id}/system-logs/diagnostic-events/",
+            {"event_code": "waypoint.mouse_probe", "route_id": route.id},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 400)
 
 
 class NavigationBoundaryApiTests(TestCase):

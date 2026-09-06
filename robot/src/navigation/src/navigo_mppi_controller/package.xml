@@ -24,6 +24,7 @@
   <depend>tf2</depend>
   <depend>tf2_eigen</depend>
   <depend>tf2_ros</depend>
+  <depend>angles</depend>
   <depend>std_msgs</depend>
   <depend>xtensor</depend>
   <depend>libomp-dev</depend>

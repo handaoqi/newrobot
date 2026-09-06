@@ -1,31 +1,25 @@
 from __future__ import annotations
 
-# The deployed navigo controller server currently loads only FollowPath, whose
-# implementation is MPPI. Keep this registry aligned with navigo_params.yaml;
-# advertising an unregistered plugin makes the task fail after dispatch.
+# Keep selector ids aligned with the plugin lists in navigo_params.yaml.
 DEFAULT_LOCAL_CONTROLLER = "mppi"
 DEFAULT_GLOBAL_CONTROLLER = "theta_star"
 
-LOCAL_CONTROLLERS = frozenset({"mppi"})
+LOCAL_CONTROLLERS = frozenset({"mppi", "rpp"})
 GLOBAL_CONTROLLERS = frozenset({"theta_star", "navfn"})
 
 LOCAL_CONTROLLER_PLUGIN_IDS = {
     "mppi": "FollowPath",
+    "rpp": "RPP",
 }
 
 GLOBAL_CONTROLLER_PLUGIN_IDS = {
     "theta_star": "ThetaStar",
-    "navfn": "GridBased",
+    "navfn": "NavFn",
 }
 
 
 def normalize_local_controller(value: object | None) -> str:
     normalized = str(value or DEFAULT_LOCAL_CONTROLLER).strip().lower()
-    # RPP was accepted by older route payloads but is not a plugin in the
-    # custom navigo controller server. Treat it as a legacy alias so old
-    # routes remain executable with the registered MPPI controller.
-    if normalized == "rpp":
-        return DEFAULT_LOCAL_CONTROLLER
     return normalized if normalized in LOCAL_CONTROLLERS else DEFAULT_LOCAL_CONTROLLER
 
 

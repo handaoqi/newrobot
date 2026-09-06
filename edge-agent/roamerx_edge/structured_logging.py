@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import json
+from collections import deque
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -50,6 +51,8 @@ class StructuredLogEmitter:
         self._debug_expires_monotonic = 0.0
         self._sample_interval = 1.0
         self._last_debug: dict[tuple[str, str], float] = {}
+        self._debug_window = deque()
+        self._last_rate_warning = 0.0
 
     def configure_debug(self, *, enabled: bool, modules=None, sample_hz: float = 1.0, expires_at=None) -> dict:
         with self._lock:
@@ -92,6 +95,20 @@ class StructuredLogEmitter:
             with self._lock:
                 if now - self._last_debug.get(key, 0.0) < self._sample_interval:
                     return False
+                while self._debug_window and now - self._debug_window[0] >= 1.0:
+                    self._debug_window.popleft()
+                if len(self._debug_window) >= 30:
+                    if now - self._last_rate_warning >= 60.0:
+                        self._last_rate_warning = now
+                        self._entries.append({
+                            "occurred_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                            "level": "WARNING", "module": "system",
+                            "event_code": "system.debug_rate_limited",
+                            "message": "DEBUG 日志超过30条/秒，已限流",
+                            "source": "edge", "data": {"limit_per_second": 30},
+                        })
+                    return False
+                self._debug_window.append(now)
                 self._last_debug[key] = now
         entry = {
             "occurred_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),

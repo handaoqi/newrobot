@@ -2,10 +2,23 @@
 
 ## 1. 文档状态
 
-- 状态：设计评审稿，尚未实施。
+- 状态：分阶段实施中（本轮已完成 P0 单航点边界、P1 算法插件注册；到点事务/恢复仲裁仍待后续阶段）。
 - 适用范围：平台路径配置、边缘任务执行器、定位节点、Nav2 导航栈、状态展示与语音播报。
 - 目标：把“到点、校正、转向、下一段规划、避障、自愈”收敛成可验证的单一状态机，消除航点漏报、重复播报、错误跳点、配置名实不符以及多套恢复流程互相抢占等问题。
-- 本文只描述方案和实施顺序，不代表当前代码已经具备目标能力。
+- 本文同时记录实施状态；未标记为“已完成”的项目仍不可视为生产闭环。
+
+### 1.1 本轮执行步骤（2026-09-06）
+
+| 步骤 | 状态 | 实施内容 |
+| --- | --- | --- |
+| 1 | 已完成 | Edge `_batch_end_index()` 固定按单航点 dispatch，不再默认合并为 `NavigateThroughPoses`。 |
+| 2 | 已完成 | Nav2 planner 注册 `ThetaStar` 与 `NavFn`；`NavFn.use_astar=true` 对应 A*，ThetaStar 对 NavFn 路径做栅格视线松弛。 |
+| 3 | 已完成 | Nav2 controller 注册 `FollowPath`（MPPI）与 `RPP`（Regulated Pure Pursuit）两个独立插件。 |
+| 4 | 已完成 | Edge selector 映射 `theta_star→ThetaStar`、`navfn→NavFn`、`mppi→FollowPath`、`rpp→RPP`，并下发对应参数。 |
+| 5 | 已完成（静态/构建） | Python selector 单测、XML/YAML 解析与两个 ROS 包编译安装已通过；真实运行时 selector 读回需在设备上执行。 |
+| 6 | 待执行 | 到点确认新鲜位姿/连续多帧、完整 `LegProfile`、恢复仲裁器、dwell 和统一幂等键。 |
+
+本轮明确不合并航点：每个航点完成校正和业务确认后，才以校正后的新鲜位姿生成下一段；`NavigateThroughPoses` 保留为底层能力但不作为默认业务路径。
 
 ## 2. 结论摘要
 
@@ -38,8 +51,8 @@
 | `dwell_seconds` | 到点停留时间 | 当前只影响切批，Nav2 实际仍使用全局固定 200 ms 等待 |
 | `actions` | 如 `snapshot` | 已进入快照，但未找到完整的动作执行闭环 |
 | `localization_mode` | `ndt`、`rtk`、`ukf` | 能影响静止/运动定位策略，应纳入段配置边界 |
-| `local_controller` | `mppi`，`rpp` 为兼容别名 | 目前只有 MPPI，不能称为真实控制器切换 |
-| `global_controller` | `theta_star` 或 `navfn` | 名称与真实算法不一致 |
+| `local_controller` | `mppi` 或 `rpp` | 分别映射 `FollowPath`（MPPI）和 `RPP` 插件 |
+| `global_controller` | `theta_star` 或 `navfn` | 分别映射 `ThetaStar` 和 `NavFn(use_astar=true)` |
 | `avoidance_to_next` | 下一段是否避障 | 当前会连硬急停一起关闭，风险过大 |
 | 语音模板 | 到点播报内容 | 阻塞策略是全局配置，不是航点显式语义 |
 
@@ -52,7 +65,7 @@
   → Edge 选择任务起点和执行方向
   → Edge 计算本批次终点
   → 设置定位/规划/控制/避障参数
-  → 单点：FollowWaypoints；多点：NavigateThroughPoses
+  → 单点：FollowWaypoints（当前默认每个航点独立发送）
   → Nav2 全局规划与 MPPI 局部跟踪
   → 批次终点停车并等待定位校正
   → Edge 检查到点距离
@@ -74,7 +87,7 @@
 - 定位模式变化；
 - 地图分段边界。
 
-普通室内连续点会合并为 `NavigateThroughPoses`。接近共线的点击点还会用约 0.40 m 的 Douglas-Peucker 容差简化 Nav2 投影轨迹，但原始点击点仍用于任务记录。
+当前实现已取消普通室内连续点的默认合并；每个航点独立 action，避免定位校正、恢复和控制器配置跨点失效。`NavigateThroughPoses` 仍可由底层接口支持，但不参与本计划的默认业务执行。
 
 当前缺口：批次不会因为 `global_controller`、`local_controller` 或 `avoidance_to_next` 变化而必然切分。配置只在批次发送前应用，所以批次中间航点的配置可能从未生效。
 

@@ -85,6 +85,7 @@ class EdgeAgentApplication:
                 self.safety_state,
                 config.mapping,
                 config.imu_cross_check,
+                self.structured_logs,
             )
             self.ros_runtime = RosRuntime(navigation)
         self.navigation = navigation
@@ -99,7 +100,7 @@ class EdgeAgentApplication:
         self.task_executor = TaskExecutor(
             self.store,
             navigation,
-            event_callback=self.mqtt.publish_task_event,
+            event_callback=self._publish_task_event,
             start_result_callback=self._publish_start_result,
             final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
             docking_goal_tolerance_m=config.safety.docking_goal_tolerance_m,
@@ -110,6 +111,13 @@ class EdgeAgentApplication:
             waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,
         )
+        set_log_context_provider = getattr(navigation, "set_log_context_provider", None)
+        if callable(set_log_context_provider):
+            set_log_context_provider(lambda: {
+                "trace_id": self.task_executor.context.trace_id if self.task_executor.context else None,
+                "task_execution_id": self.task_executor.context.task_execution_id if self.task_executor.context else None,
+                "map_id": config.robot.current_map_id,
+            })
         set_localization_failure_callback = getattr(
             navigation, "set_localization_failure_callback", None
         )
@@ -211,6 +219,7 @@ class EdgeAgentApplication:
             threading.Thread(target=self._outbox_loop, daemon=True, name="outbox"),
             threading.Thread(target=self._system_telemetry_loop, daemon=True, name="system-telemetry"),
             threading.Thread(target=self._boundary_loop, daemon=True, name="navigation-boundary"),
+            threading.Thread(target=self._log_flush_loop, daemon=True, name="structured-log-flush"),
         ]
         for thread in self._threads:
             thread.start()
@@ -481,6 +490,13 @@ class EdgeAgentApplication:
                     self.mqtt.replay_outbox()
             except Exception:
                 LOGGER.exception("failed to sample trajectory")
+
+    def _log_flush_loop(self) -> None:
+        while not self.stop_event.wait(1.0):
+            try:
+                self.structured_logs.flush()
+            except Exception:
+                LOGGER.exception("failed to flush structured logs")
 
     def _outbox_loop(self) -> None:
         while not self.stop_event.wait(2):
@@ -782,6 +798,14 @@ class EdgeAgentApplication:
         )
         self.store.save_command_result(command_id, payload)
         self.mqtt.publish_result(command_id, payload)
+
+    def _publish_task_event(self, event_type: str, payload: dict, trace_id: str = "") -> None:
+        context = self.task_executor.context
+        trace_id = str(trace_id or payload.get("trace_id") or (context.trace_id if context else ""))
+        event_payload = dict(payload or {})
+        if trace_id:
+            event_payload.setdefault("trace_id", trace_id)
+        self.mqtt.publish_task_event(event_type, event_payload, trace_id)
 
     @staticmethod
     def _read_boot_id() -> str:

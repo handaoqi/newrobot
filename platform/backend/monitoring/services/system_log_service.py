@@ -10,7 +10,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from ..models import MapData, RemoteCommand, SystemLog, TaskExecution
+from ..models import MapData, PatrolRoute, RemoteCommand, SystemLog, TaskExecution
 
 
 LEVELS = {choice[0] for choice in SystemLog.LEVEL_CHOICES}
@@ -64,7 +64,7 @@ def _coordinate(value):
     return float(value) if math.isfinite(float(value)) else None
 
 
-def emit_center_log(*, robot, level: str, module: str, event_code: str, message: str, data=None, command=None, task_execution=None, map_data=None, trace_id=None, waypoint_index=None, pose=None, dedupe_seconds: int = 0):
+def emit_center_log(*, robot, level: str, module: str, event_code: str, message: str, data=None, command=None, task_execution=None, map_data=None, route=None, trace_id=None, waypoint_index=None, waypoint_id="", round_number=None, nav_goal_generation=None, localization_generation=None, dedupe_key="", pose=None, dedupe_seconds: int = 0):
     pose = pose or {}
     if map_data is None:
         candidate = (getattr(command, "payload", None) or {}).get("map_id") if command else None
@@ -72,12 +72,15 @@ def emit_center_log(*, robot, level: str, module: str, event_code: str, message:
             candidate = ((task_execution.route_snapshot or {}).get("map") or {}).get("map_id")
         if str(candidate or "").isdigit():
             map_data = MapData.objects.filter(pk=candidate).first()
-    if dedupe_seconds > 0:
+    dedupe_key = str(dedupe_key or "")[:160]
+    if dedupe_seconds > 0 and dedupe_key:
         previous = SystemLog.objects.filter(
             robot=robot,
+            trace_id=_uuid_or_none(trace_id or getattr(command, "trace_id", None)),
             level=level,
             module=module,
             event_code=event_code,
+            dedupe_key=dedupe_key,
             command=command,
             task_execution=task_execution,
             occurred_at__gte=timezone.now() - timedelta(seconds=dedupe_seconds),
@@ -99,8 +102,14 @@ def emit_center_log(*, robot, level: str, module: str, event_code: str, message:
         command=command,
         task_execution=task_execution,
         map_data=map_data,
+        route=route,
         trace_id=_uuid_or_none(trace_id or getattr(command, "trace_id", None)),
         waypoint_index=waypoint_index,
+        waypoint_id=str(waypoint_id or "")[:128],
+        round_number=round_number,
+        nav_goal_generation=nav_goal_generation,
+        localization_generation=localization_generation,
+        dedupe_key=dedupe_key,
         x=pose.get("x"),
         y=pose.get("y"),
         yaw=pose.get("yaw"),
@@ -128,15 +137,19 @@ def ingest_batch(robot, payload: dict, *, envelope_trace_id=None) -> dict:
         pose = raw.get("pose") if isinstance(raw.get("pose"), dict) else {}
         event_code = str(raw.get("event_code") or "unknown")[:96]
         source = str(raw.get("source") or "edge")[:64]
+        entry_trace_id = _uuid_or_none(raw.get("trace_id")) or envelope_trace_id
+        dedupe_key = str(raw.get("dedupe_key") or "")[:160]
         previous = SystemLog.objects.filter(
             robot=robot,
+            trace_id=entry_trace_id,
             level=level,
             module=module,
             event_code=event_code,
             source=source,
+            dedupe_key=dedupe_key,
             occurred_at__gte=occurred_at - timedelta(seconds=5),
         ).order_by("-occurred_at").first()
-        if previous and previous.message == str(raw.get("message") or "")[:500] and level != "DEBUG":
+        if previous and dedupe_key and previous.message == str(raw.get("message") or "")[:500] and level != "DEBUG":
             previous.repeat_count += _repeat_count(raw.get("repeat_count"))
             previous.occurred_at = occurred_at
             previous.data = sanitize_data(raw.get("data") or {})
@@ -151,7 +164,13 @@ def ingest_batch(robot, payload: dict, *, envelope_trace_id=None) -> dict:
                 message=str(raw.get("message") or event_code)[:500],
                 source=source,
                 data=sanitize_data(raw.get("data") or {}),
-                trace_id=_uuid_or_none(raw.get("trace_id")) or envelope_trace_id,
+                trace_id=entry_trace_id,
+                route=PatrolRoute.objects.filter(pk=raw.get("route_id"), robot=robot).first() if str(raw.get("route_id") or "").isdigit() else None,
+                waypoint_id=str(raw.get("waypoint_id") or "")[:128],
+                round_number=raw.get("round_number") if isinstance(raw.get("round_number"), int) else None,
+                nav_goal_generation=raw.get("nav_goal_generation") if isinstance(raw.get("nav_goal_generation"), int) else None,
+                localization_generation=raw.get("localization_generation") if isinstance(raw.get("localization_generation"), int) else None,
+                dedupe_key=dedupe_key,
                 command=command,
                 task_execution=task,
                 map_data=map_data,

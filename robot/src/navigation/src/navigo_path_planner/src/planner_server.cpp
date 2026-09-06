@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <sstream>
 
 #include "builtin_interfaces/msg/duration.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
@@ -137,6 +138,7 @@ PlannerServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
 
   // Initialize pubs & subs
   plan_publisher_ = create_publisher<nav_msgs::msg::Path>("plan", 1);
+  performance_publisher_ = create_publisher<std_msgs::msg::String>("/planner/performance", 10);
 
   // Create the action servers for path planning to a pose and through poses
   action_server_pose_ = std::make_unique<ActionServerToPose>(
@@ -164,6 +166,7 @@ PlannerServer::on_activate(const rclcpp_lifecycle::State & /*state*/)
   RCLCPP_INFO(get_logger(), "Activating");
 
   plan_publisher_->on_activate();
+  performance_publisher_->on_activate();
   action_server_pose_->activate();
   action_server_poses_->activate();
   costmap_ros_->activate();
@@ -199,6 +202,7 @@ PlannerServer::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   action_server_pose_->deactivate();
   action_server_poses_->deactivate();
   plan_publisher_->on_deactivate();
+  performance_publisher_->on_deactivate();
 
   /*
    * The costmap is also a lifecycle node, so it may have already fired on_deactivate
@@ -230,6 +234,7 @@ PlannerServer::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
   action_server_pose_.reset();
   action_server_poses_.reset();
   plan_publisher_.reset();
+  performance_publisher_.reset();
   tf_.reset();
 
   costmap_ros_->cleanup();
@@ -514,25 +519,52 @@ PlannerServer::getPlan(
   const geometry_msgs::msg::PoseStamped & goal,
   const std::string & planner_id)
 {
+  const auto started_at = std::chrono::steady_clock::now();
+  auto publish_performance = [this, &started_at, &planner_id](const nav_msgs::msg::Path & path, bool success) {
+    if (!performance_publisher_ || !performance_publisher_->is_activated()) {
+      return;
+    }
+    const auto duration_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started_at).count();
+    std::ostringstream json;
+    json << "{\"schema\":\"roamerx.planner-performance.v1\",\"success\":"
+         << (success ? "true" : "false") << ",\"planner_id\":\"" << planner_id
+         << "\",\"duration_ms\":" << duration_ms << ",\"path_points\":" << path.poses.size();
+    if (!path.poses.empty()) {
+      json << ",\"start\":{" << "\"x\":" << path.poses.front().pose.position.x
+           << ",\"y\":" << path.poses.front().pose.position.y << "},\"goal\":{"
+           << "\"x\":" << path.poses.back().pose.position.x
+           << ",\"y\":" << path.poses.back().pose.position.y << "}";
+    }
+    json << "}";
+    std_msgs::msg::String message;
+    message.data = json.str();
+    performance_publisher_->publish(message);
+  };
   RCLCPP_DEBUG(
     get_logger(), "Attempting to a find path from (%.2f, %.2f) to "
     "(%.2f, %.2f).", start.pose.position.x, start.pose.position.y,
     goal.pose.position.x, goal.pose.position.y);
 
   if (planners_.find(planner_id) != planners_.end()) {
-    return planners_[planner_id]->createPlan(start, goal);
+    auto path = planners_[planner_id]->createPlan(start, goal);
+    publish_performance(path, !path.poses.empty());
+    return path;
   } else {
     if (planners_.size() == 1 && planner_id.empty()) {
       RCLCPP_WARN_ONCE(
         get_logger(), "No planners specified in action call. "
         "Server will use only plugin %s in server."
         " This warning will appear once.", planner_ids_concat_.c_str());
-      return planners_[planners_.begin()->first]->createPlan(start, goal);
+      auto path = planners_[planners_.begin()->first]->createPlan(start, goal);
+      publish_performance(path, !path.poses.empty());
+      return path;
     } else {
       RCLCPP_ERROR(
         get_logger(), "planner %s is not a valid planner. "
         "Planner names are: %s", planner_id.c_str(),
         planner_ids_concat_.c_str());
+      publish_performance(nav_msgs::msg::Path(), false);
     }
   }
 

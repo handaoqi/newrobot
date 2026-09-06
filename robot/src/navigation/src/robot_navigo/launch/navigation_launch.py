@@ -127,7 +127,7 @@ def generate_launch_description():
                 remappings=remappings,
             ),
             Node(
-                package='nav2_map_server',
+                package='navigo_map_server',
                 executable='map_server',
                 name='filter_mask_server',
                 output='screen',
@@ -138,7 +138,7 @@ def generate_launch_description():
                 remappings=remappings,
             ),
             Node(
-                package='nav2_map_server',
+                package='navigo_map_server',
                 executable='costmap_filter_info_server',
                 name='costmap_filter_info_server',
                 output='screen',
@@ -274,16 +274,20 @@ def generate_launch_description():
                         parameters=[configured_params],
                         remappings=remappings,
                     ),
+                    # Keepout filter nodes must use navigo_map_server. Loading
+                    # stock nav2_map_server into this container resolves
+                    # libmap_io.so to the navigo copy, which does not export
+                    # nav2_map_server::loadMapFromYaml and kills the process.
                     ComposableNode(
-                        package='nav2_map_server',
-                        plugin='nav2_map_server::MapServer',
+                        package='navigo_map_server',
+                        plugin='navigo_map_server::MapServer',
                         name='filter_mask_server',
                         parameters=[configured_params],
                         remappings=remappings,
                     ),
                     ComposableNode(
-                        package='nav2_map_server',
-                        plugin='nav2_map_server::CostmapFilterInfoServer',
+                        package='navigo_map_server',
+                        plugin='navigo_map_server::CostmapFilterInfoServer',
                         name='costmap_filter_info_server',
                         parameters=[configured_params],
                         remappings=remappings,

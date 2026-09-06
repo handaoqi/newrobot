@@ -4,11 +4,12 @@ export const API_BASE = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/,
 export const listCache = createTTLCache({ ttlMs: 30_000 })
 
 export async function request(path, options = {}) {
-  const { timeoutMs, signal: callerSignal, ...fetchOptions } = options
+  const { timeoutMs, signal: callerSignal, traceId, ...fetchOptions } = options
   const token = localStorage.getItem('inspection_token')
   const headers = { ...(fetchOptions.headers || {}) }
   if (!(fetchOptions.body instanceof FormData)) headers['Content-Type'] = 'application/json'
   if (token) headers.Authorization = `Token ${token}`
+  if (traceId) headers['X-Trace-Id'] = traceId
 
   let controller
   let timeoutHandle

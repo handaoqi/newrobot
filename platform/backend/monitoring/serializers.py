@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1069,6 +1070,20 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         return data
 
     def validate_waypoints(self, value):
+        normalized_value = []
+        for index, point in enumerate(value or []):
+            if isinstance(point, dict):
+                normalized = dict(point)
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                normalized = {"x": point[0], "y": point[1], "yaw": point[2] if len(point) >= 3 else 0.0}
+            else:
+                raise serializers.ValidationError(f"途经点 {index + 1} 格式无效")
+            normalized.setdefault("waypoint_id", f"wp-{uuid.uuid4().hex}")
+            normalized_value.append(normalized)
+        value = normalized_value
+        ids = [str(point["waypoint_id"]) for point in value]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("同一路线的 waypoint_id 不能重复")
         for index, point in enumerate(value):
             if not isinstance(point, dict):
                 continue
@@ -1210,8 +1225,9 @@ class SystemLogSerializer(serializers.ModelSerializer):
         fields = [
             "id", "robot", "occurred_at", "received_at", "level", "module",
             "event_code", "message", "source", "data", "trace_id",
-            "task_execution", "command", "map_data", "waypoint_index",
-            "x", "y", "yaw", "repeat_count",
+            "task_execution", "command", "map_data", "route", "waypoint_index",
+            "waypoint_id", "round_number", "nav_goal_generation",
+            "localization_generation", "dedupe_key", "x", "y", "yaw", "repeat_count",
         ]
 
 

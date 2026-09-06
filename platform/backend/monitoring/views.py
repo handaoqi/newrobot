@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -124,6 +125,36 @@ def _person_detection_is_stale(state: RobotPersonDetectionState) -> bool:
 
 User = get_user_model()
 LOGGER = logging.getLogger(__name__)
+
+
+def _request_trace_id(request):
+    """Return the caller's workflow trace, rejecting malformed values."""
+    value = str(request.headers.get("X-Trace-Id") or "").strip()
+    if not value:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValidationError({"trace_id": "X-Trace-Id 必须是合法 UUID"})
+
+
+def _encode_log_cursor(row):
+    raw = f"{row.occurred_at.isoformat()}|{row.id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_log_cursor(value):
+    if not value:
+        return None
+    try:
+        padded = str(value) + "=" * (-len(str(value)) % 4)
+        occurred, identifier = base64.urlsafe_b64decode(padded.encode()).decode().rsplit("|", 1)
+        parsed = parse_datetime(occurred)
+        if parsed is None:
+            raise ValueError("invalid timestamp")
+        return parsed, uuid.UUID(identifier)
+    except (TypeError, ValueError, UnicodeError):
+        raise ValidationError({"cursor": "日志游标无效"})
 
 
 def build_public_media_url(request, saved_path: str) -> str:
@@ -2282,6 +2313,7 @@ class MapDataSetActiveView(APIView):
                     payload=_map_activation_payload(map_data, request),
                     operator=request.user if request.user.is_authenticated else None,
                     expiry_seconds=120,
+                    trace_id=_request_trace_id(request),
                 )
             serializer = MapDataSerializer(map_data, context={"request": request})
             data = serializer.data
@@ -2944,6 +2976,7 @@ class RobotMappingCommandView(APIView):
             payload=self.build_payload(request, robot),
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=self.expiry_seconds,
+            trace_id=_request_trace_id(request),
         )
         return Response(
             {
@@ -3182,8 +3215,14 @@ class RobotSystemLogListView(APIView):
         modules = {item for item in request.query_params.get("modules", "").split(",") if item}
         if levels:
             queryset = queryset.filter(level__in=levels)
+        if not request.user.is_staff:
+            queryset = queryset.exclude(level="DEBUG")
         if modules:
             queryset = queryset.filter(module__in=modules)
+        if request.query_params.get("route_id"):
+            queryset = queryset.filter(route_id=request.query_params["route_id"])
+        if request.query_params.get("waypoint_id"):
+            queryset = queryset.filter(waypoint_id=request.query_params["waypoint_id"])
         if request.query_params.get("trace_id"):
             queryset = queryset.filter(trace_id=request.query_params["trace_id"])
         if request.query_params.get("task_execution_id"):
@@ -3197,17 +3236,25 @@ class RobotSystemLogListView(APIView):
             queryset = queryset.filter(
                 Q(message__icontains=query) | Q(event_code__icontains=query) | Q(source__icontains=query)
             )
-        after = parse_datetime(str(request.query_params.get("after") or ""))
-        before = parse_datetime(str(request.query_params.get("before") or ""))
-        if after:
+        after_cursor = _decode_log_cursor(request.query_params.get("after_cursor"))
+        before_cursor = _decode_log_cursor(request.query_params.get("before_cursor"))
+        after = parse_datetime(str(request.query_params.get("after") or "")) if not after_cursor else None
+        before = parse_datetime(str(request.query_params.get("before") or "")) if not before_cursor else None
+        if after_cursor:
+            after_time, after_id = after_cursor
+            queryset = queryset.filter(Q(occurred_at__gt=after_time) | Q(occurred_at=after_time, id__gt=after_id))
+        elif after:
             queryset = queryset.filter(occurred_at__gt=after)
-        if before:
+        if before_cursor:
+            before_time, before_id = before_cursor
+            queryset = queryset.filter(Q(occurred_at__lt=before_time) | Q(occurred_at=before_time, id__lt=before_id))
+        elif before:
             queryset = queryset.filter(occurred_at__lt=before)
         try:
             limit = min(200, max(1, int(request.query_params.get("limit", 100))))
         except ValueError:
             return Response({"detail": "limit 参数无效"}, status=status.HTTP_400_BAD_REQUEST)
-        rows = list(queryset.select_related("task_execution", "command", "map_data")[:limit])
+        rows = list(queryset.select_related("task_execution", "command", "map_data", "route")[:limit])
         active_debug = DebugLogSession.objects.filter(
             robot=robot,
             status__in=["starting", "active"],
@@ -3215,10 +3262,125 @@ class RobotSystemLogListView(APIView):
         ).first()
         return Response({
             "results": SystemLogSerializer(rows, many=True).data,
-            "cursor": rows[0].occurred_at.isoformat() if rows else request.query_params.get("after"),
+            "cursor": _encode_log_cursor(rows[0]) if rows else request.query_params.get("after_cursor") or request.query_params.get("after"),
+            "newest_cursor": _encode_log_cursor(rows[0]) if rows else None,
+            "oldest_cursor": _encode_log_cursor(rows[-1]) if rows else None,
             "has_more": queryset.count() > len(rows),
             "debug_session": DebugLogSessionSerializer(active_debug).data if active_debug else None,
         })
+
+
+class RobotSystemLogStreamView(APIView):
+    """Database-backed SSE stream; works across Gunicorn workers."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        levels = {item.upper() for item in request.query_params.get("levels", "").split(",") if item}
+        modules = {item for item in request.query_params.get("modules", "").split(",") if item}
+        if not request.user.is_staff:
+            levels.discard("DEBUG")
+        if not levels:
+            levels = {"INFO", "WARNING", "ERROR"} if not request.user.is_staff else set()
+        trace_id = request.query_params.get("trace_id")
+        if trace_id:
+            try:
+                trace_id = uuid.UUID(trace_id)
+            except ValueError:
+                raise ValidationError({"trace_id": "trace_id 必须是合法 UUID"})
+        initial = request.query_params.get("after_cursor") or request.headers.get("Last-Event-ID")
+        cursor = _decode_log_cursor(initial) if initial else None
+        map_id = request.query_params.get("map_id")
+        task_id = request.query_params.get("task_execution_id")
+        command_id = request.query_params.get("command_id")
+        route_id = request.query_params.get("route_id")
+        waypoint_id = request.query_params.get("waypoint_id")
+        query = str(request.query_params.get("q") or "").strip()
+
+        def stream():
+            nonlocal cursor
+            last_keepalive = time.monotonic()
+            try:
+                yield "event: connected\ndata: {}\n\n"
+                while True:
+                    close_old_connections()
+                    queryset = SystemLog.objects.filter(robot=robot)
+                    if levels:
+                        queryset = queryset.filter(level__in=levels)
+                    if modules:
+                        queryset = queryset.filter(module__in=modules)
+                    if trace_id:
+                        queryset = queryset.filter(trace_id=trace_id)
+                    if map_id:
+                        queryset = queryset.filter(map_data_id=map_id)
+                    if task_id:
+                        queryset = queryset.filter(task_execution_id=task_id)
+                    if command_id:
+                        queryset = queryset.filter(command_id=command_id)
+                    if route_id:
+                        queryset = queryset.filter(route_id=route_id)
+                    if waypoint_id:
+                        queryset = queryset.filter(waypoint_id=waypoint_id)
+                    if query:
+                        queryset = queryset.filter(
+                            Q(message__icontains=query) | Q(event_code__icontains=query) | Q(source__icontains=query)
+                        )
+                    if cursor:
+                        cursor_time, cursor_id = cursor
+                        queryset = queryset.filter(
+                            Q(occurred_at__gt=cursor_time) | Q(occurred_at=cursor_time, id__gt=cursor_id)
+                        )
+                    rows = list(queryset.select_related("task_execution", "command", "map_data", "route").order_by("occurred_at", "id")[:100])
+                    for row in rows:
+                        cursor = (row.occurred_at, row.id)
+                        event_id = _encode_log_cursor(row)
+                        payload = json.dumps(SystemLogSerializer(row).data, ensure_ascii=False, default=str)
+                        yield f"id: {event_id}\nevent: system_log\ndata: {payload}\n\n"
+                    now = time.monotonic()
+                    if not rows and now - last_keepalive >= 15:
+                        yield ": keepalive\n\n"
+                        last_keepalive = now
+                    time.sleep(1.0)
+            finally:
+                close_old_connections()
+
+        response = StreamingHttpResponse(stream(), content_type="text/event-stream")
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        return response
+
+
+class RobotSystemLogDiagnosticEventView(APIView):
+    """Accept the small, explicit set of durable operator diagnostics."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    ALLOWED_EVENTS = {"waypoint.edit_confirmed"}
+
+    def post(self, request, robot_id):
+        robot = get_object_or_404(Robot, pk=robot_id)
+        event_code = str(request.data.get("event_code") or "")
+        if event_code not in self.ALLOWED_EVENTS:
+            return Response({"detail": "不允许记录该诊断事件"}, status=status.HTTP_400_BAD_REQUEST)
+        route_id = request.data.get("route_id")
+        route = get_object_or_404(PatrolRoute, pk=route_id, robot=robot)
+        data = request.data.get("data") or {}
+        if not isinstance(data, dict):
+            return Response({"detail": "data 必须是对象"}, status=status.HTTP_400_BAD_REQUEST)
+        log = emit_center_log(
+            robot=robot,
+            level="INFO",
+            module="waypoint",
+            event_code=event_code,
+            message=str(request.data.get("message") or "航点编辑已确认"),
+            data=data,
+            route=route,
+            map_data=route.map_data,
+            trace_id=_request_trace_id(request),
+            waypoint_id=request.data.get("waypoint_id") or "",
+            waypoint_index=request.data.get("waypoint_index"),
+        )
+        return Response(SystemLogSerializer(log).data, status=status.HTTP_201_CREATED)
 
 
 class RobotDebugLogSessionView(APIView):
@@ -3265,6 +3427,7 @@ class RobotDebugLogSessionView(APIView):
             },
             operator=request.user,
             expiry_seconds=60,
+            trace_id=_request_trace_id(request),
         )
         emit_center_log(
             robot=robot, level="INFO", module="system", event_code="debug.session_requested",
@@ -3295,6 +3458,7 @@ class RobotDebugLogSessionDetailView(APIView):
             payload={"enabled": False, "session_id": str(session.id)},
             operator=request.user,
             expiry_seconds=60,
+            trace_id=_request_trace_id(request),
         )
         emit_center_log(
             robot=robot, level="INFO", module="system", event_code="debug.session_stopped",
@@ -3325,6 +3489,7 @@ class RobotNavigationCommandView(APIView):
             },
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=self.expiry_seconds,
+            trace_id=_request_trace_id(request),
         )
         emit_center_log(
             robot=robot,
@@ -3383,6 +3548,7 @@ class RobotNavigationInitialPoseView(APIView):
             },
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=60,
+            trace_id=_request_trace_id(request),
         )
         emit_center_log(
             robot=robot, level="INFO", module="localization", event_code="localization.initial_pose_requested",
@@ -3435,7 +3601,10 @@ class RobotNavigationSingleGoalView(APIView):
         command = CommandService.create_robot_command(
             robot=robot, command_type="nav.single_goal",
             payload=command_payload,
-            operator=request.user if request.user.is_authenticated else None, expiry_seconds=180)
+            operator=request.user if request.user.is_authenticated else None,
+            expiry_seconds=180,
+            trace_id=_request_trace_id(request),
+        )
         emit_center_log(
             robot=robot, level="INFO", module="planner", event_code="planner.single_goal_requested",
             message="已下发单点导航目标", data={**coords, "global_controller": global_controller}, command=command,
@@ -3539,6 +3708,7 @@ class RobotNavigationRelocalizeView(RobotNavigationCommandView):
             payload=payload,
             operator=request.user if request.user.is_authenticated else None,
             expiry_seconds=self.expiry_seconds,
+            trace_id=_request_trace_id(request),
         )
         return Response(RemoteCommandSerializer(command).data, status=status.HTTP_202_ACCEPTED)
 
@@ -3776,7 +3946,7 @@ class PatrolRouteListView(APIView):
             robot=route.robot, level="INFO", module="waypoint", event_code="route.created",
             message=f"路线“{route.name}”已创建",
             data={"route_id": route.id, "waypoint_count": len(route.waypoints or []), "global_controller": route.global_controller},
-            map_data=route.map_data,
+            map_data=route.map_data, route=route, trace_id=_request_trace_id(request),
         )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -3810,7 +3980,7 @@ class PatrolRouteDetailView(APIView):
                     "before": before,
                     "after": route.waypoints or [],
                 },
-                map_data=route.map_data,
+                map_data=route.map_data, route=route, trace_id=_request_trace_id(request),
             )
             return Response(serializer.data)
         except PatrolRoute.DoesNotExist:
@@ -3880,6 +4050,7 @@ def _create_and_dispatch_execution(
     loop_session_id,
     round_number,
     command_options,
+    trace_id=None,
 ):
     """Create one task.start command, replaying the same loop round safely.
 
@@ -3904,6 +4075,7 @@ def _create_and_dispatch_execution(
                     "task.start",
                     operator,
                     command_options=command_options,
+                    trace_id=trace_id,
                 )
             return execution, True
         except (IntegrityError, TaskStateError):
@@ -3990,6 +4162,7 @@ class PatrolRouteExecuteView(APIView):
                     "loop_execution": loop_execution,
                     "loop_total": loop_total,
                 },
+                trace_id=_request_trace_id(request),
             )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)

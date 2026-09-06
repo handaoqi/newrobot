@@ -23,6 +23,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "robots_dog_msgs/msg/localization.hpp"
 
 #include "tf2/time.h"
@@ -104,6 +105,7 @@ protected:
    * @param robot_action Robot action to publish
    */
   void publishVelocity(const Action & robot_action);
+  void publishState(const Action & robot_action);
 
   /**
    * @brief Supporting routine obtaining all ROS-parameters
@@ -216,6 +218,7 @@ protected:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_in_sub_;
   /// @brief Output cmd_vel publisher
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_out_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>::SharedPtr state_pub_;
 
   /// @brief Whether main routine is active
   bool process_active_;

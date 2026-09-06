@@ -273,7 +273,7 @@ def test_pause_resume_cancel(tmp_path):
     nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
     resumed = executor.resume_task(executor.context.task_execution_id, 1)
     assert resumed["final_task_state"] == "running"
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     cancelled = executor.cancel_task(executor.context.task_execution_id)
     assert cancelled["final_task_state"] == "cancelled"
     store.close()
@@ -342,7 +342,7 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     executor.start_task(command("task.start"))
 
     assert executor.context.current_waypoint_index == 1
-    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-2"]
     assert events[0][0] == "task.started"
     assert events[0][1]["initial_waypoint_index"] == 1
     assert events[1][0] == "task.progress"
@@ -373,7 +373,7 @@ def test_navigation_feedback_switches_each_waypoint_correction_policy(tmp_path):
     )
 
     executor.start_task(envelope)
-    assert ids(nav.sent[-1]) == ["wp-1", "wp-2"]
+    assert ids(nav.sent[-1]) == ["wp-1"]
     drive_patrol(nav, until_ids=["wp-3"], executor=executor)
     assert ids(nav.sent[-1]) == ["wp-3"]
 
@@ -1089,7 +1089,7 @@ def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
         "wp-1",
     ]
     assert executor.context.current_waypoint_index == 1
-    assert ids(nav.sent[0]) == ["wp-2", "wp-1"]
+    assert ids(nav.sent[0]) == ["wp-2"]
     store.close()
 
 
@@ -1154,7 +1154,7 @@ def test_reverse_start_skips_colocated_route_end_and_faces_return_leg(tmp_path):
     _await_departure_heading(executor)
     assert cruised == [1]
     assert any(abs(cmd[2]) > 0 for cmd in nav.teleop)
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-1"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
     store.close()
 

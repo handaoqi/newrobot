@@ -34,6 +34,7 @@ set(dependencies_pkgs
   tf2_geometry_msgs
   tf2_eigen
   tf2_ros
+  angles
 )
 
 foreach(pkg IN LISTS dependencies_pkgs)
@@ -78,6 +79,7 @@ add_library(mppi_controller SHARED
   src/path_handler.cpp
   src/parameters_handler.cpp
   src/noise_generator.cpp
+  src/rpp_controller.cpp
 )
 
 add_library(mppi_critics SHARED

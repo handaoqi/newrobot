@@ -3,5 +3,8 @@
     <class type="navigo_mppi_controller::MPPIController" base_class_type="navigo_core::Controller">
       <description>MPPI Controller for Nav2</description>
     </class>
+    <class type="navigo_mppi_controller::RPPController" base_class_type="navigo_core::Controller">
+      <description>Regulated Pure Pursuit controller for deterministic waypoint tracking</description>
+    </class>
   </library>
 </class_libraries>

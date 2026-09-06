@@ -217,8 +217,15 @@ planner_server:
     expected_planner_frequency: 1.0
     odom_topic: /odom/nav2
     use_sim_time: False
-    planner_plugins: ["GridBased"]
-    GridBased:
+    planner_plugins: ["ThetaStar", "NavFn"]
+    ThetaStar:
+      plugin: "navigo_navfn_planner/ThetaStarPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
+      allow_straight_line_fallback: false
+      prefer_straight_line: false
+    NavFn:
       plugin: "navigo_navfn_planner/NavfnPlanner"
       # Indoor default: stay on the occupancy map and accept at most a small
       # reachable-cell adjustment. Edge switches to the 2.0 m straight-line
@@ -235,7 +242,7 @@ controller_server:
     odom_topic: "/odom/nav2"
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
-    controller_plugins: ["FollowPath"]
+    controller_plugins: ["FollowPath", "RPP"]
 
     # Progress checker parameters
     progress_checker:
@@ -372,6 +379,19 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 8.0
+
+    # Deterministic low-latency alternative to MPPI. Edge selects this plugin
+    # for short, precise or resource-constrained legs.
+    RPP:
+      plugin: "navigo_mppi_controller::RPPController"
+      desired_linear_vel: 0.25
+      min_linear_vel: 0.05
+      lookahead_dist: 0.65
+      min_lookahead_dist: 0.35
+      max_angular_vel: 0.45
+      rotate_to_heading_threshold: 0.785
+      rotate_to_heading_angular_vel: 0.35
+      curvature_speed_regulation: true
 
 
 smoother_server:

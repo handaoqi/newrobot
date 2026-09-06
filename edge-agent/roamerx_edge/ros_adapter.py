@@ -131,6 +131,7 @@ class RosAdapter(Node):
         safety_state: RuntimeSafetyState,
         mapping_config: MappingConfig | None = None,
         imu_cross_check_config: ImuCrossCheckConfig | None = None,
+        structured_logs=None,
     ) -> None:
         if not ROS_AVAILABLE:
             raise RuntimeError("ROS2 Python packages are not available")
@@ -155,6 +156,8 @@ class RosAdapter(Node):
         self._last_trusted_pose_report_monotonic = 0.0
         self._trusted_pose_frozen = False
         self._attempt_progress_cb: Callable | None = None
+        self.structured_logs = structured_logs
+        self._log_context_provider: Callable | None = None
         self._localization_sample_condition = threading.Condition()
         self._localization_sample_sequence = 0
         self._localization_status_samples = deque(maxlen=100)
@@ -239,6 +242,9 @@ class RosAdapter(Node):
         self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
+        self.create_subscription(String, "/planner/performance", self._on_planner_performance, 10)
+        self.create_subscription(String, "/mppi/performance", self._on_mppi_performance, 10)
+        self.create_subscription(String, "/collision_monitor/state", self._on_collision_state, 10)
         self.create_subscription(
             PoseStamped,
             "/localization/scan_match_pose",
@@ -343,6 +349,7 @@ class RosAdapter(Node):
         if not anomaly:
             self._lio_motion_anomaly_notified = False
             return
+
         # Fixed outdoor RTK XY is enough to keep the task moving. Dual-antenna
         # heading flicker often produces a one-frame LIO yaw step during the
         # RTK↔LIO handoff; that must not pause Nav2.
@@ -367,6 +374,44 @@ class RosAdapter(Node):
             daemon=True,
             name="lio-motion-anomaly-handler",
         ).start()
+
+    def set_log_context_provider(self, provider: Callable | None) -> None:
+        self._log_context_provider = provider
+
+    def _emit_ros_diagnostic(self, level: str, event_code: str, message: str, payload: dict) -> None:
+        if not self.structured_logs:
+            return
+        context = self._log_context_provider() if callable(self._log_context_provider) else {}
+        context = context if isinstance(context, dict) else {}
+        module = "planner" if event_code.startswith(("planner.", "mppi.")) else "avoidance"
+        self.structured_logs.emit(level, module, event_code, message, data=payload, **context)
+
+    def _diagnostic_payload(self, msg) -> dict | None:
+        try:
+            payload = json.loads(str(getattr(msg, "data", "") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("invalid ROS diagnostic payload")
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _on_planner_performance(self, msg) -> None:
+        payload = self._diagnostic_payload(msg)
+        if payload is not None:
+            level = "INFO" if payload.get("success", True) else "WARNING"
+            self._emit_ros_diagnostic(level, "planner.performance.sample", "规划器性能数据", payload)
+
+    def _on_mppi_performance(self, msg) -> None:
+        payload = self._diagnostic_payload(msg)
+        if payload is not None:
+            self._emit_ros_diagnostic("DEBUG", "mppi.performance.sample", "MPPI性能数据", payload)
+
+    def _on_collision_state(self, msg) -> None:
+        payload = self._diagnostic_payload(msg)
+        if payload is None:
+            return
+        state = str(payload.get("state") or "CLEAR").upper()
+        level = "INFO" if state == "CLEAR" else "WARNING"
+        self._emit_ros_diagnostic(level, "avoidance.collision_monitor.state", f"避障状态变为 {state}", payload)
 
     @staticmethod
     def _header_payload(header) -> dict:
@@ -1046,6 +1091,13 @@ class RosAdapter(Node):
     _REMOTE_PARAM_UNAVAILABLE_COOLDOWN_SECONDS = 120.0
 
     def send_waypoints(self, waypoints: list[dict], feedback_cb: Callable, result_cb: Callable) -> bool:
+        if len(waypoints) != 1:
+            LOGGER.error(
+                "rejecting non-single waypoint navigation request (count=%d); "
+                "Edge navigation semantics require one action per waypoint",
+                len(waypoints),
+            )
+            return False
         if not self.wait_until_ready(timeout_seconds=self._NAV_SEND_READY_TIMEOUT_SECONDS):
             return False
         poses = []
@@ -1060,23 +1112,12 @@ class RosAdapter(Node):
             pose.pose.orientation.w = math.cos(yaw / 2)
             poses.append(pose)
         self._feedback_cb = feedback_cb
-        self._sent_pose_count = len(poses)
-        use_through_poses = len(poses) > 1
-        if use_through_poses:
-            if not self._through_poses_client.wait_for_server(timeout_sec=5.0):
-                LOGGER.error("NavigateThroughPoses action server is unavailable")
-                return False
-            goal = NavigateThroughPoses.Goal()
-            goal.poses = poses
-            client = self._through_poses_client
-            feedback_cb_ros = self._on_through_poses_feedback
-            self._nav_cancel_action = self._through_poses_action
-        else:
-            goal = FollowWaypoints.Goal()
-            goal.poses = poses
-            client = self._action_client
-            feedback_cb_ros = self._on_feedback
-            self._nav_cancel_action = self.ros_config.follow_waypoints_action
+        self._sent_pose_count = 1
+        goal = FollowWaypoints.Goal()
+        goal.poses = poses
+        client = self._action_client
+        feedback_cb_ros = self._on_feedback
+        self._nav_cancel_action = self.ros_config.follow_waypoints_action
         future = client.send_goal_async(goal, feedback_callback=feedback_cb_ros)
         completed = threading.Event()
         future.add_done_callback(lambda _: completed.set())
@@ -2744,10 +2785,9 @@ class RosAdapter(Node):
             return
         plugin_id = global_controller_plugin_id(normalized)
         self._publish_nav_selector(self._planner_selector_pub, plugin_id)
-        if normalized == "navfn":
-            planner_params = {"GridBased.use_astar": True}
-        else:
-            planner_params = {"GridBased.use_astar": False}
+        planner_params = {
+            f"{plugin_id}.use_astar": normalized == "navfn",
+        }
         try:
             self._set_remote_parameters(
                 "/planner_server",
@@ -2804,7 +2844,9 @@ class RosAdapter(Node):
             self._rtk_is_navigation_pose_source() if outdoor is None else bool(outdoor)
         )
         local_obstacles = bool(avoid_obstacles)
-        use_mppi = normalize_local_controller(local_controller) == "mppi"
+        normalized_local = normalize_local_controller(local_controller)
+        use_mppi = normalized_local == "mppi"
+        use_rpp = normalized_local == "rpp"
         signature = (
             normalize_local_controller(local_controller),
             bool(require_yaw),
@@ -2854,10 +2896,34 @@ class RosAdapter(Node):
                 follow_applied = True
             except ProtocolError:
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
+        elif use_rpp:
+            params = {
+                "RPP.desired_linear_vel": 0.18 if final_approach else 0.25,
+                "RPP.min_linear_vel": 0.03 if final_approach else 0.05,
+                "RPP.lookahead_dist": 0.40 if final_approach else 0.65,
+                "RPP.min_lookahead_dist": 0.25 if final_approach else 0.35,
+                "RPP.max_angular_vel": 0.30 if require_yaw else 0.45,
+                "RPP.rotate_to_heading_threshold": 0.35 if require_yaw else 0.785,
+                "RPP.rotate_to_heading_angular_vel": 0.25 if require_yaw else 0.35,
+            }
+            self._boundary_base_velocity = {
+                "vx_max": float(params["RPP.desired_linear_vel"]),
+                "vx_min": 0.0,
+                "vy_max": 0.0,
+            }
+            try:
+                self._set_remote_parameters(
+                    "/controller_server", params,
+                    code="WAYPOINT_PROFILE_FAILED",
+                    attempts=2 if live else 3,
+                )
+                follow_applied = True
+            except ProtocolError:
+                LOGGER.warning("unable to apply RPP waypoint speed profile")
         if not live:
             for node_name, parameter_name, value in (
                 ("/local_costmap/local_costmap", "obstacle_layer.enabled", local_obstacles),
-                ("/collision_monitor", "PolygonStop.enabled", local_obstacles),
+                ("/collision_monitor", "PolygonStop.enabled", True),
                 ("/collision_monitor", "PolygonSlow.enabled", local_obstacles),
             ):
                 try:
@@ -2887,9 +2953,9 @@ class RosAdapter(Node):
             final_approach,
             live,
             follow_applied,
-            params.get("FollowPath.vx_min") if use_mppi else None,
-            params.get("FollowPath.vx_max") if use_mppi else None,
-            params.get("FollowPath.wz_max") if use_mppi else None,
+            params.get("FollowPath.vx_min") if use_mppi else params.get("RPP.min_linear_vel"),
+            params.get("FollowPath.vx_max") if use_mppi else params.get("RPP.desired_linear_vel"),
+            params.get("FollowPath.wz_max") if use_mppi else params.get("RPP.max_angular_vel"),
             params.get("FollowPath.PathAlignCritic.enabled") if use_mppi else None,
             params.get("FollowPath.CostCritic.enabled") if use_mppi else None,
             params.get("FollowPath.CostCritic.cost_weight") if use_mppi else None,
@@ -2902,17 +2968,27 @@ class RosAdapter(Node):
         )
         if getattr(self, "_outdoor_planner_profile", None) == use_outdoor_profile:
             return
+        # Keep this helper safe for lightweight test doubles and older restored
+        # adapters that predate the controller-selection fields.
+        # Older adapters used Nav2's GridBased plugin as the implicit profile;
+        # preserve that behavior when the selection field is absent.
+        raw_controller = getattr(self, "_active_global_controller", None)
+        plugin_id = (
+            global_controller_plugin_id(normalize_global_controller(raw_controller))
+            if raw_controller is not None
+            else "GridBased"
+        )
         params = (
             {
-                "GridBased.allow_straight_line_fallback": True,
-                "GridBased.prefer_straight_line": True,
-                "GridBased.tolerance": 2.0,
+                f"{plugin_id}.allow_straight_line_fallback": True,
+                f"{plugin_id}.prefer_straight_line": True,
+                f"{plugin_id}.tolerance": 2.0,
             }
             if use_outdoor_profile
             else {
-                "GridBased.allow_straight_line_fallback": False,
-                "GridBased.prefer_straight_line": False,
-                "GridBased.tolerance": 0.5,
+                f"{plugin_id}.allow_straight_line_fallback": False,
+                f"{plugin_id}.prefer_straight_line": False,
+                f"{plugin_id}.tolerance": 0.5,
             }
         )
         try:

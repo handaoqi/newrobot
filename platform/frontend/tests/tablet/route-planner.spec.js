@@ -14,9 +14,7 @@ test('saved route hydrates waypoint details and keeps per-waypoint global contro
   await expect(page.locator('.waypoint-details').first()).toBeVisible()
   await expect(page.locator('.waypoint-load-error')).toHaveCount(0)
 
-  const routeController = page.locator('.route-config-panel label').filter({ hasText: '全局控制器' }).locator('select')
-  const waypointControllers = waypointItems.locator('label').filter({ hasText: '全局控制器' }).locator('select')
-  await expect(routeController).toHaveValue('navfn')
+  const waypointControllers = waypointItems.locator('label').filter({ hasText: '全局规划器' }).locator('select')
   await expect(waypointControllers.nth(0)).toHaveValue('theta_star')
   await expect(waypointControllers.nth(1)).toHaveValue('navfn')
   await expect(waypointControllers.nth(2)).toHaveValue('navfn')
@@ -26,7 +24,6 @@ test('saved route hydrates waypoint details and keeps per-waypoint global contro
   await expect(waypointControllers.nth(0)).toHaveValue('theta_star')
   await expect(waypointControllers.nth(1)).toHaveValue('theta_star')
   await expect(waypointControllers.nth(2)).toHaveValue('navfn')
-  await expect(routeController).toHaveValue('navfn')
 
   page.on('dialog', dialog => dialog.accept())
   const saveRequestPromise = page.waitForRequest(request => (

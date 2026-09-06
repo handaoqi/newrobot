@@ -232,6 +232,7 @@ class TaskContext:
     round_number: int = 1
     loop_total: int = 1
     loop_base_waypoints: list[dict] | None = None
+    trace_id: str = ""
 
 
 class TaskExecutor:
@@ -961,6 +962,7 @@ class TaskExecutor:
                 self._strip_non_navigation_waypoint_actions({"waypoints": base_waypoints})
             self.context = TaskContext(
                 task_execution_id=envelope.payload["task_execution_id"],
+                trace_id=str(envelope.trace_id or ""),
                 state="accepted",
                 # The center creates state_version=0 then advances it to 1 for
                 # task.start dispatching.  The edge acknowledgement must be
@@ -1850,53 +1852,18 @@ class TaskExecutor:
     def _batch_end_index(self, start_index: int) -> int:
         """Last exclusive index of one Nav2 goal.
 
-        Outdoor/transition RTK patrol still stops at every waypoint so Edge can
-        settle localization and verify the click in both LIO and RTK. Indoor
-        patrol restores through-poses: vias share one Nav2 goal, and only a
-        speech/dwell/require_yaw stop or a correction-mode boundary splits it.
-        Docking remains one pose at a time.
+        Every waypoint is an independent Nav2 goal. This keeps localization
+        correction, arrival confirmation, dwell and recovery ownership scoped
+        to one leg; NavigateThroughPoses is intentionally not used here.
         """
         waypoints = self.context.route_snapshot["waypoints"]
         total = len(waypoints)
-        if self._is_docking_task():
-            return min(start_index + 1, total)
         end = total
         if self._segments:
             end = min(self._segments[self.context.current_segment_index].end_index, total)
-        if self._outdoor_navigation_profile():
-            return min(start_index + 1, end)
-        start_wp = waypoints[start_index]
-        start_correction_mode = waypoint_localization_mode(start_wp.get("localization_mode"))
-        if (
-            bool(start_wp.get("require_yaw", False))
-            or float(start_wp.get("dwell_seconds") or 0) > 0
-            or bool(start_wp.get("speech_template_id"))
-        ):
-            return start_index + 1
-        for index in range(start_index + 1, end):
-            # A correction mode belongs to the target waypoint. End the Nav2
-            # goal before a mode boundary so the current waypoint can be
-            # confirmed with its requested source before dispatching the next.
-            if waypoint_localization_mode(
-                waypoints[index].get("localization_mode")
-            ) != start_correction_mode:
-                return index
-            waypoint = waypoints[index]
-            # A heading-constrained waypoint must be the final pose of its
-            # own goal.  The goal-yaw profile is selected from the batch
-            # target, so keeping it behind a pass-through waypoint would make
-            # Nav2 accept the position while ignoring the requested turn.
-            if bool(waypoint.get("require_yaw", False)):
-                return index
-            if index == end - 1:
-                break
-            if (
-                float(waypoint.get("dwell_seconds") or 0) > 0
-                or bool(waypoint.get("speech_template_id"))
-            ):
-                return index + 1
-        return self._through_poses_end_index(waypoints, start_index, end)
-
+        # Do not merge adjacent waypoints. The next leg is generated only after
+        # the current waypoint has been confirmed with its fresh corrected pose.
+        return min(start_index + 1, end)
     def _current_pose_xy(self) -> tuple[float, float] | None:
         pose = self.navigation.latest_pose() if self.navigation else None
         if pose is None:
@@ -1916,40 +1883,6 @@ class TaskExecutor:
         if xy is None or pose_xy is None:
             return None
         return hypot(pose_xy[0] - xy[0], pose_xy[1] - xy[1])
-
-    def _through_poses_end_index(self, waypoints: list, start_index: int, end: int) -> int:
-        """Keep a through-poses goal from ending at the robot's current cluster.
-
-        NavigateThroughPoses is complete once the last pose is within the goal
-        checker. A round-trip that returns to start would therefore succeed
-        immediately if the robot is already standing on that cluster.
-        """
-        if end - start_index <= 1:
-            return end
-        last_xy = _waypoint_xy(waypoints[end - 1])
-        origin_xy = self._current_pose_xy() or _waypoint_xy(waypoints[start_index])
-        if last_xy is None or origin_xy is None:
-            return end
-        if hypot(origin_xy[0] - last_xy[0], origin_xy[1] - last_xy[1]) > ROUND_TRIP_START_MARGIN_M:
-            return end
-        farthest_index = start_index
-        farthest_dist = -1.0
-        for index in range(start_index, end):
-            xy = _waypoint_xy(waypoints[index])
-            if xy is None:
-                continue
-            dist = hypot(origin_xy[0] - xy[0], origin_xy[1] - xy[1])
-            if dist >= farthest_dist:
-                farthest_index = index
-                farthest_dist = dist
-        if farthest_index <= start_index or farthest_dist <= WAYPOINT_COLOCATION_M:
-            return end
-        LOGGER.info(
-            "splitting round-trip through-poses at farthest waypoint %d (%.2fm) so the goal is not already complete",
-            farthest_index,
-            farthest_dist,
-        )
-        return farthest_index + 1
 
     def _apply_batch_travel_yaw(self, batch: list[dict], start_index: int) -> None:
         """Point pass-through poses along the Nav2 goal, not the cloud click yaw."""
@@ -2885,6 +2818,7 @@ class TaskExecutor:
             }
         return {
             "task_execution_id": self.context.task_execution_id,
+            "trace_id": self.context.trace_id,
             "round_number": self.context.round_number,
             "state": "running",
             "state_version": self.context.state_version,
@@ -3574,6 +3508,7 @@ class TaskExecutor:
             "task.progress",
             {
                 "task_execution_id": self.context.task_execution_id,
+                "trace_id": self.context.trace_id,
                 "state": self.context.state,
                 "state_version": self.context.state_version,
                 "current_waypoint_index": index,
@@ -3638,6 +3573,7 @@ class TaskExecutor:
             "task.progress",
             {
                 "task_execution_id": self.context.task_execution_id,
+                "trace_id": self.context.trace_id,
                 "state": "running",
                 "state_version": self.context.state_version,
                 "current_waypoint_index": self.context.current_waypoint_index,
@@ -3812,6 +3748,9 @@ class TaskExecutor:
             self.store.save_task_context(self.context.__dict__)
         except sqlite3.ProgrammingError:
             LOGGER.debug("skip task persist; local store is already closed")
+
+    def _event_trace_id(self) -> str:
+        return str(self.context.trace_id if self.context else "")
 
     def _emit(
         self,

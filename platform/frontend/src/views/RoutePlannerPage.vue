@@ -1272,6 +1272,7 @@ async function handleSaveRoute() {
     return
   }
 
+  const traceId = newPlannerTraceId()
   const payload = {
     name: routeForm.value.name || `路线-${new Date().toLocaleString()}`,
     map_data: selectedMap.value.id,
@@ -1295,8 +1296,8 @@ async function handleSaveRoute() {
   let savedRoute
   try {
     savedRoute = selectedRoute.value?.id
-      ? await updateRoute(selectedRoute.value.id, payload)
-      : await createRoute(payload)
+      ? await updateRoute(selectedRoute.value.id, payload, { traceId })
+      : await createRoute(payload, { traceId })
     await loadData()
     const savedSummary = routes.value.find(route => String(route.id) === String(savedRoute.id))
     await handleLoadRoute(savedSummary || savedRoute)
@@ -1314,6 +1315,7 @@ async function handleSaveRoute() {
     const result = await activateAndRelocalizeMap({
       mapId: savedRoute.map_data,
       robotId: savedRoute.robot,
+      traceId,
       onProgress: message => { localizationInitMessage.value = message },
     })
     navStatus.value = result.navigationStatus
@@ -1757,12 +1759,13 @@ async function sendNavigationCommand(action) {
   }
   if (navCommandBusy.value) return
   navCommandBusy.value = action
+  const traceId = newPlannerTraceId()
   navError.value = ''
   try {
     const command = await sendRobotNavigationCommand(robotId, action, {
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
-    })
+    }, { traceId })
     await waitForRobotCommand(robotId, command, {
       timeoutMs: ['start', 'restart', 'recover'].includes(action) ? 240_000 : 90_000,
       onProgress: latest => {
@@ -1798,6 +1801,10 @@ async function handleRestartSensor(sensor) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function newPlannerTraceId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 function beginLocalizationAttemptSession({ phase = 'localization', commandType = '', commandId = '' } = {}) {
@@ -1924,6 +1931,7 @@ async function initializeLocalization() {
   }
 
   navCommandBusy.value = 'localization-init'
+  const traceId = newPlannerTraceId()
   localizationInitState.value = 'restarting'
   localizationInitMessage.value = '正在下发当前地图，并按地图类型重新初始化定位'
   beginLocalizationAttemptSession({ phase: 'transfer', commandType: 'map.activate' })
@@ -1946,6 +1954,7 @@ async function initializeLocalization() {
         sendRobotNavigationCommand,
         waitForRobotCommand,
       },
+      traceId,
     })
     applyLocalizationAttemptCommand(initialization.command, { phase: 'localization', showCandidates: true })
     navStatus.value = initialization.activation.navigationStatus
@@ -1985,6 +1994,7 @@ async function activeRelocalize() {
     return
   }
   navCommandBusy.value = 'relocalize'
+  const traceId = newPlannerTraceId()
   localizationInitState.value = 'waiting_convergence'
   localizationInitMessage.value = '正在静止搜索定位候选'
   beginLocalizationAttemptSession({ phase: 'localization', commandType: 'nav.relocalize' })
@@ -2005,7 +2015,7 @@ async function activeRelocalize() {
       payload.y = Number(manualInitialPose.value.y)
       payload.yaw = Number(manualInitialPose.value.yaw || 0)
     }
-    const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload)
+    const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload, { traceId })
     const completed = await waitForRobotCommand(robotId, command, {
       timeoutMs: 210_000,
       onProgress: latest => {
@@ -2050,13 +2060,14 @@ async function handleExecuteRoute() {
   }
   if (!confirm(`确定执行路线 "${selectedRoute.value.name}" 吗？请确认现场路径安全。`)) return
   openExecutionTimeline(null, Date.now())
+  const traceId = newPlannerTraceId()
   taskMapExecution.value = null
   taskMapTrajectory.value = []
   lastExecution.value = null
   routeExecuteBusy.value = true
   navError.value = ''
   try {
-    lastExecution.value = await executeRoute(selectedRoute.value.id)
+    lastExecution.value = await executeRoute(selectedRoute.value.id, { traceId })
     taskMapExecution.value = lastExecution.value
     taskMapTrajectory.value = []
     syncExecutionTimelineClock(lastExecution.value)
@@ -2074,6 +2085,7 @@ async function handleActivateSelectedMap() {
   const robotId = selectedRobot.value?.id
   if (!selectedMap.value?.id || !robotId || navCommandBusy.value) return
   navCommandBusy.value = 'map-activate'
+  const traceId = newPlannerTraceId()
   navError.value = ''
   localizationInitState.value = 'waiting_convergence'
   localizationInitMessage.value = '正在检查机器狗地图'
@@ -2085,6 +2097,7 @@ async function handleActivateSelectedMap() {
       mapVersion: selectedMapVersion(),
       sceneScope: routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value.coordinate_mode || 'local_only',
+      traceId,
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
     })
@@ -2163,13 +2176,14 @@ async function publishInitialPose(confirmRequired = true, manageBusy = true) {
   navError.value = ''
   localizationInitState.value = 'sending_pose'
   localizationInitMessage.value = '正在下发初始种子并等待NDT最优位姿'
+  const traceId = newPlannerTraceId()
   try {
     const command = await sendRobotNavigationCommand(robotId, 'initial-pose', {
       frame_id: 'map',
       ...submittedPose,
       map_id: selectedMap.value?.id,
       map_version: selectedMapVersion(),
-    })
+    }, { traceId })
     const completed = await waitForRobotCommand(robotId, command, {
       timeoutMs: 120_000,
       onProgress: latest => {
@@ -4657,11 +4671,15 @@ async function handleDeleteRoute(route) {
 
 .map-toolbar {
   display: flex;
+  height: 40px;
+  min-height: 40px;
+  box-sizing: border-box;
   align-items: center;
   justify-content: flex-start;
   flex-wrap: nowrap;
   gap: 8px;
   overflow-x: auto;
+  overflow-y: hidden;
   padding: 4px;
   border: 1px solid #d0d5dd;
   border-radius: 6px;

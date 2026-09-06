@@ -1135,6 +1135,18 @@ class SystemLog(BaseTimestampModel):
     source = models.CharField(max_length=64, default="center")
     data = models.JSONField(default=dict, blank=True)
     trace_id = models.UUIDField(null=True, blank=True, db_index=True)
+    route = models.ForeignKey(
+        PatrolRoute,
+        related_name="system_logs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    waypoint_id = models.CharField(max_length=128, blank=True)
+    round_number = models.PositiveIntegerField(null=True, blank=True)
+    nav_goal_generation = models.PositiveIntegerField(null=True, blank=True)
+    localization_generation = models.PositiveIntegerField(null=True, blank=True)
+    dedupe_key = models.CharField(max_length=160, blank=True)
     task_execution = models.ForeignKey(
         TaskExecution,
         related_name="system_logs",
@@ -1168,6 +1180,8 @@ class SystemLog(BaseTimestampModel):
             models.Index(fields=["robot", "-occurred_at"], name="syslog_robot_time_idx"),
             models.Index(fields=["robot", "level", "-occurred_at"], name="syslog_level_time_idx"),
             models.Index(fields=["task_execution", "-occurred_at"], name="syslog_task_time_idx"),
+            models.Index(fields=["robot", "trace_id", "-occurred_at"], name="syslog_trace_time_idx"),
+            models.Index(fields=["robot", "module", "dedupe_key", "-occurred_at"], name="syslog_dedupe_idx"),
         ]
 
 

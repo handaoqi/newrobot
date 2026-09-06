@@ -2,4 +2,7 @@
 	<class name="navigo_navfn_planner/NavfnPlanner" type="navigo_navfn_planner::NavfnPlanner" base_class_type="navigo_core::GlobalPlanner">
 	  <description></description>
 	</class>
+	<class name="navigo_navfn_planner/ThetaStarPlanner" type="navigo_navfn_planner::ThetaStarPlanner" base_class_type="navigo_core::GlobalPlanner">
+	  <description>Cost-aware Theta* line-of-sight relaxed planner</description>
+	</class>
 </library>

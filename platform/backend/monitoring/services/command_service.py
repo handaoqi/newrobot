@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 
 from django.conf import settings
@@ -30,6 +31,7 @@ class CommandService:
         command_type: str,
         operator=None,
         command_options: dict | None = None,
+        trace_id=None,
     ) -> RemoteCommand:
         if command_type not in cls.COMMAND_TARGET_STATES:
             raise ValueError(f"unsupported command type: {command_type}")
@@ -79,6 +81,7 @@ class CommandService:
             command_type=command_type,
             payload=command_payload,
             operator=operator,
+            trace_id=uuid.UUID(str(trace_id)) if trace_id else uuid.uuid4(),
             expires_at=timezone.now() + timedelta(seconds=expiry_seconds),
         )
         CommandEvent.objects.create(
@@ -193,6 +196,7 @@ class CommandService:
         payload: dict,
         operator=None,
         expiry_seconds: int | None = None,
+        trace_id=None,
     ) -> RemoteCommand:
         supported = {choice[0] for choice in RemoteCommand.TYPE_CHOICES}
         if command_type not in supported:
@@ -204,6 +208,7 @@ class CommandService:
             command_type=command_type,
             payload=payload,
             operator=operator,
+            trace_id=uuid.UUID(str(trace_id)) if trace_id else uuid.uuid4(),
             expires_at=timezone.now() + timedelta(seconds=expiry_seconds),
         )
         CommandEvent.objects.create(

@@ -79,8 +79,9 @@ export async function activateAndRelocalizeMap({
   coordinateMode = 'local_only',
   onProgress = () => {},
   onCommand = () => {},
+  traceId = '',
 }) {
-  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress, onCommand })
+  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress, onCommand, traceId })
   let navigationStatus = activation.navigationStatus
 
   if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
@@ -96,7 +97,7 @@ export async function activateAndRelocalizeMap({
     const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
       map_id: String(mapId),
       map_version: mapVersion,
-    })
+    }, { traceId })
     await waitForRobotCommand(robotId, startCommand, {
       timeoutMs: 180_000,
       onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
@@ -116,7 +117,7 @@ export async function activateAndRelocalizeMap({
     scene_scope: sceneScope,
     coordinate_mode: coordinateMode,
     wait_seconds: 120,
-  })
+  }, { traceId })
   await waitForRobotCommand(robotId, relocalizeCommand, {
     timeoutMs: 360_000,
     onProgress: latest => {
@@ -131,7 +132,7 @@ export async function activateAndRelocalizeMap({
     const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
       map_id: String(mapId),
       map_version: mapVersion,
-    })
+    }, { traceId })
     await waitForRobotCommand(robotId, startCommand, {
       timeoutMs: 180_000,
       onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
@@ -157,6 +158,7 @@ export async function activateRouteMap({
   mapVersion = expectedLegacyMapVersion(mapId),
   onProgress = () => {},
   onCommand = () => {},
+  traceId = '',
 }) {
   if (!mapId) throw new Error('路线未绑定地图')
   if (!robotId) throw new Error('路线未绑定机器狗')
@@ -172,7 +174,7 @@ export async function activateRouteMap({
       throw new Error('机器人正在执行任务，不能切换到新路线地图')
     }
     onProgress('正在下发地图到机器狗')
-    const activation = await setActiveMap(mapId)
+    const activation = await setActiveMap(mapId, { traceId })
     if (activation.robot && String(activation.robot) !== String(robotId)) {
       throw new Error('路线地图绑定的机器狗与任务机器狗不一致')
     }

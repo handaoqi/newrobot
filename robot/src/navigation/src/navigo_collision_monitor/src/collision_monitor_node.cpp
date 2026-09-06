@@ -73,6 +73,7 @@ CollisionMonitor::on_configure(const rclcpp_lifecycle::State & /*state*/)
     std::bind(&CollisionMonitor::cmdVelInCallback, this, std::placeholders::_1));
   cmd_vel_out_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
     cmd_vel_out_topic, 1);
+  state_pub_ = this->create_publisher<std_msgs::msg::String>("/collision_monitor/state", 10);
 
   if (require_healthy_localization_) {
     std::string localization_topic;
@@ -99,6 +100,7 @@ CollisionMonitor::on_activate(const rclcpp_lifecycle::State & /*state*/)
 
   // Activating lifecycle publisher
   cmd_vel_out_pub_->on_activate();
+  state_pub_->on_activate();
 
   // Activating polygons
   for (std::shared_ptr<Polygon> polygon : polygons_) {
@@ -137,6 +139,7 @@ CollisionMonitor::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 
   // Deactivating lifecycle publishers
   cmd_vel_out_pub_->on_deactivate();
+  state_pub_->on_deactivate();
 
   // Destroying bond connection
   destroyBond();
@@ -151,6 +154,7 @@ CollisionMonitor::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 
   cmd_vel_in_sub_.reset();
   cmd_vel_out_pub_.reset();
+  state_pub_.reset();
   localization_sub_.reset();
 
   polygons_.clear();
@@ -477,6 +481,7 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   if (robot_action.action_type != robot_action_prev_.action_type) {
     // Report changed robot behavior
     printAction(robot_action, action_polygon);
+    publishState(robot_action);
   }
 
   // Publish required robot velocity
@@ -486,6 +491,25 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   publishPolygons();
 
   robot_action_prev_ = robot_action;
+}
+
+void CollisionMonitor::publishState(const Action & robot_action)
+{
+  if (!state_pub_ || !state_pub_->is_activated()) {
+    return;
+  }
+  const char * state = "CLEAR";
+  if (robot_action.action_type == STOP) {
+    state = "STOP";
+  } else if (robot_action.action_type == SLOWDOWN || robot_action.action_type == APPROACH) {
+    state = "SLOW";
+  }
+  std_msgs::msg::String message;
+  message.data = std::string("{\"schema\":\"roamerx.collision-state.v1\",\"state\":\"") +
+    state + "\",\"velocity_x\":" + std::to_string(robot_action.req_vel.x) +
+    ",\"velocity_y\":" + std::to_string(robot_action.req_vel.y) +
+    ",\"velocity_w\":" + std::to_string(robot_action.req_vel.tw) + "}";
+  state_pub_->publish(message);
 }
 
 bool CollisionMonitor::processStopSlowdown(

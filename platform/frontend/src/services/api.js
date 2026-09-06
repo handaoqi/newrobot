@@ -418,6 +418,16 @@ export async function fetchRobotSystemLogs(robotId, filters = {}) {
   return request(`/robots/${robotId}/system-logs/?${params.toString()}`)
 }
 
+export async function openRobotSystemLogStream(robotId, filters = {}, { signal } = {}) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== null && value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const token = localStorage.getItem('inspection_token')
+  const headers = token ? { Authorization: `Token ${token}` } : {}
+  return fetch(`${API_BASE}/robots/${robotId}/system-logs/stream/?${params.toString()}`, { headers, signal })
+}
+
 export async function startRobotDebugLogSession(robotId, payload = {}) {
   return request(`/robots/${robotId}/debug-log-sessions/`, {
     method: 'POST', body: JSON.stringify(payload),
@@ -444,12 +454,12 @@ export async function publishMapNavigationBoundary(mapId, robotId) {
   })
 }
 
-export async function sendRobotNavigationCommand(robotId, action, payload = {}) {
+export async function sendRobotNavigationCommand(robotId, action, payload = {}, { traceId } = {}) {
   const allowed = new Set(['probe', 'start', 'restart', 'recover', 'relocalize', 'stop', 'initial-pose'])
   if (!allowed.has(action)) throw new Error('不支持的导航命令')
   return request(`/robots/${robotId}/navigation/${action}/`, {
     method: 'POST',
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload), traceId,
   })
 }
 
@@ -625,9 +635,9 @@ export async function downloadMap(mapId) {
   return response.blob()
 }
 
-export async function setActiveMap(mapId) {
+export async function setActiveMap(mapId, { traceId } = {}) {
   const result = await request(`/maps/${mapId}/set_active/`, {
-    method: 'POST',
+    method: 'POST', traceId,
   })
   listCache.invalidate('maps-summary')
   return result
@@ -670,19 +680,19 @@ export async function fetchRouteDetail(routeId, { signal } = {}) {
   return request(`/routes/${routeId}/`, { signal })
 }
 
-export async function createRoute(payload) {
+export async function createRoute(payload, { traceId } = {}) {
   const result = await request('/routes/', {
     method: 'POST',
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload), traceId,
   })
   listCache.invalidate('routes-summary')
   return result
 }
 
-export async function updateRoute(routeId, payload) {
+export async function updateRoute(routeId, payload, { traceId } = {}) {
   const result = await request(`/routes/${routeId}/`, {
     method: 'PUT',
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload), traceId,
   })
   listCache.invalidate('routes-summary')
   return result
@@ -702,6 +712,7 @@ export async function executeRoute(routeId, {
   loopSessionId = null,
   roundNumber = 1,
   loopTotal = 1,
+  traceId = '',
 } = {}) {
   const result = await request(`/routes/${routeId}/execute/`, {
     method: 'POST',
@@ -711,7 +722,7 @@ export async function executeRoute(routeId, {
       loop_session_id: loopSessionId,
       round_number: roundNumber,
       loop_total: loopTotal,
-    }),
+    }), traceId,
   })
   listCache.invalidate('routes-summary')
   return result
