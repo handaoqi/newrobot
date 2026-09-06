@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { fetchRobotStreamAudioCommand, setRobotStreamAudioCapture } from '../services/api'
+import { normalizeLivePlayUrls } from '../services/liveVideoUrl'
 
 const props = defineProps({
   playUrls: { type: Object, default: () => ({}) },
@@ -57,7 +58,10 @@ function loadMediaModules() {
 const HISTORY_BUFFER_SECONDS = 30 * 60
 const streamProbeTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_CONNECT_TIMEOUT_MS || 4000)
 const streamStartupTimeoutMs = Number(import.meta.env.VITE_VIDEO_STREAM_STARTUP_TIMEOUT_MS || 10000)
-const playUrls = computed(() => props.playUrls || {})
+const playUrls = computed(() => normalizeLivePlayUrls(
+  props.playUrls,
+  typeof window === 'undefined' ? '' : window.location.origin,
+))
 const sourceKey = computed(() => `${playUrls.value.flv || ''}\n${playUrls.value.hls || ''}`)
 const hasHistoryStream = computed(() => Boolean(playUrls.value.hls))
 const hasStream = computed(() => props.available && !streamUnavailable.value && Boolean(playUrls.value.flv || playUrls.value.hls))
@@ -281,13 +285,16 @@ async function canReachStream(url) {
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), streamProbeTimeoutMs)
   try {
-    await fetch(url, {
+    const response = await fetch(url, {
       method: 'GET',
-      mode: 'no-cors',
+      // A no-cors response is opaque and reports success for 404/502 too.
+      // Use a real same-origin/CORS request so a dead stream can fall back to
+      // HLS instead of leaving the player in a false loading state.
+      mode: 'cors',
       cache: 'no-store',
       signal: controller.signal,
     })
-    return true
+    return response.ok
   } catch {
     return false
   } finally {
