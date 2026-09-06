@@ -3872,7 +3872,7 @@ async function handleDeleteRoute(route) {
   grid-row: 2;
   align-self: stretch;
   min-height: 620px;
-  height: 100%;
+  height: auto;
   max-height: none;
   overflow: hidden;
 }
@@ -4668,7 +4668,7 @@ async function handleDeleteRoute(route) {
   flex-wrap: nowrap;
   gap: 8px;
   overflow-x: auto;
-  padding: 8px;
+  padding: 4px;
   border: 1px solid #d0d5dd;
   border-radius: 6px;
   background: #fff;
@@ -4678,7 +4678,7 @@ async function handleDeleteRoute(route) {
 
 .map-toolbar button {
   min-width: 34px;
-  height: 34px;
+  height: 30px;
   padding: 0 9px;
   border: 1px solid transparent;
   border-radius: 4px;
@@ -4708,7 +4708,9 @@ async function handleDeleteRoute(route) {
 .map-mode-inline {
   display: flex;
   min-width: 150px;
+  height: 34px;
   min-height: 34px;
+  box-sizing: border-box;
   flex: 1 1 220px;
   align-items: center;
   gap: 0.45rem;
@@ -4747,7 +4749,9 @@ async function handleDeleteRoute(route) {
 }
 
 .map-click-mode {
-  padding: 3px;
+  height: 34px;
+  box-sizing: border-box;
+  padding: 1px;
   border: 1px solid #d0d5dd;
   border-radius: 5px;
   background: #f8fafc;
@@ -4764,6 +4768,7 @@ async function handleDeleteRoute(route) {
   min-width: 0;
   min-height: 0;
   max-height: 58px;
+  box-sizing: border-box;
   align-self: start;
   padding: 0.85rem;
   border: 1px solid #fed7aa;
