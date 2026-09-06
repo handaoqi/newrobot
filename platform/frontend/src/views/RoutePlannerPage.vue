@@ -3863,7 +3863,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 {
   grid-column: 4;
-  grid-row: 3;
+  grid-row: 2;
   align-self: stretch;
   min-height: 620px;
   height: auto;
@@ -4804,7 +4804,7 @@ async function handleDeleteRoute(route) {
 .drill-timeline-panel {
   display: flex;
   grid-column: 4;
-  grid-row: 2;
+  grid-row: 3;
   min-width: 0;
   min-height: 0;
   max-height: 58px;
