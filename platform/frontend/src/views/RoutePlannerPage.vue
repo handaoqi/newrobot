@@ -3222,15 +3222,15 @@ async function handleDeleteRoute(route) {
                 <strong>{{ robotPoseText() }}</strong>
               </div>
               <div>
-                <span>1 地图原点 M</span>
+                <span>地图原点M</span>
                 <strong>{{ originPoseText(mapFrameOrigin) }}</strong>
               </div>
               <div>
-                <span>2 栅格左下角 G</span>
+                <span>栅格左下角G</span>
                 <strong>{{ originPoseText(occupancyGridOrigin) }}</strong>
               </div>
               <div>
-                <span>3 RTK原点 R</span>
+                <span>RTK原点R</span>
                 <strong :title="rtkOriginTitle()">{{ rtkEnuOrigin ? originPoseText(rtkEnuOrigin, 'map_x', 'map_y') : '未锁定' }}</strong>
               </div>
             </div>
@@ -3435,9 +3435,9 @@ async function handleDeleteRoute(route) {
                 <strong>{{ boundaryEditing ? '边界编辑' : (mapClickMode === 'waypoint' ? '添加途经点' : '查看位置') }}</strong>
                 <span class="map-mode-hint-text">{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
                 <span v-if="showLocalizationAttemptPoints" class="map-origin-legend" aria-label="坐标原点图例">
-                  <span class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-map"><b>M</b></i>1 地图原点 M</span>
-                  <span v-if="occupancyGridOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-grid"><b>G</b></i>2 栅格左下角 G</span>
-                  <span v-if="rtkEnuOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-rtk"><b>R</b></i>3 RTK原点 R</span>
+                  <span class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-map"><b>M</b></i>地图原点M</span>
+                  <span v-if="occupancyGridOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-grid"><b>G</b></i>栅格左下角G</span>
+                  <span v-if="rtkEnuOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-rtk"><b>R</b></i>RTK原点R</span>
                 </span>
               </div>
               <div :class="['boundary-policy-status', boundaryStatusPresentation().tone]">
