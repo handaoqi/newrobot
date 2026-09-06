@@ -269,9 +269,17 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
   Object.entries(TIMELINE_STAGE_ALIASES).forEach(([alias, canonical]) => {
     if (canonical === stageKey) aliases.add(alias)
   })
+  const recordAttemptIndexes = new Set(
+    (stageRecord?.attempts || [])
+      .map(attempt => Number(attempt?.index))
+      .filter(index => Number.isFinite(index)),
+  )
   const attempts = (session?.attempts || []).filter(attempt => (
     aliases.has(canonicalTimelineStage(attempt.stage))
     || (stageKey === 'mapping_origin_bounded' && attempt.source === 'mapping_origin')
+    || (stageKey === 'mapping_origin_bounded'
+      && !attempt.stage
+      && (session?.source === 'mapping_origin' || recordAttemptIndexes.has(Number(attempt.index))))
   ))
   if (attempts.length || !Array.isArray(stageRecord?.attempts)) return attempts
   return stageRecord.attempts.map((attempt, index) => normalizeAttempt({
@@ -313,6 +321,12 @@ function timelineStageTimes(stageKey, status, record, session) {
   let startedAt = firstTimestamp(record?.started_at, record?.startedAt)
   let finishedAt = firstTimestamp(record?.finished_at, record?.finishedAt)
 
+  // A stage that has not started must not inherit the command timestamp. That
+  // made future stages look as if they had started before the active stage.
+  if (!startedAt && timelineStatusClass(status) === 'waiting') {
+    return { startedAt: null, finishedAt: null }
+  }
+
   if (stageKey === 'localization_bootstrap') {
     startedAt = firstTimestamp(
       startedAt,
@@ -324,7 +338,7 @@ function timelineStageTimes(stageKey, status, record, session) {
       finishedAt,
       session?.localizationBootstrap?.finished_at,
       session?.localizationBootstrap?.finishedAt,
-      session?.localizationBootstrap ? commandStart : null,
+      session?.localizationBootstrap ? startedAt : null,
     )
   } else if (stageKey === 'best_candidate_commit') {
     startedAt = firstTimestamp(startedAt, session?.bestCandidateCommitStartedAt, commandStart)
@@ -347,14 +361,55 @@ function timelineStageTimes(stageKey, status, record, session) {
     finishedAt = firstTimestamp(finishedAt, historical?.finishedAt, commandStart)
   } else {
     startedAt = firstTimestamp(startedAt, commandStart)
-    if (timelineStatusClass(status) === 'done' || timelineStatusClass(status) === 'failed' || timelineStatusClass(status) === 'skipped') {
-      finishedAt = firstTimestamp(finishedAt, commandFinish)
-    }
   }
   if (!finishedAt && ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))) {
-    finishedAt = commandFinish
+    finishedAt = startedAt
   }
   return { startedAt, finishedAt }
+}
+
+function timestampMillis(value) {
+  if (!value) return null
+  const millis = Date.parse(value)
+  return Number.isFinite(millis) ? millis : null
+}
+
+function orderedTimelineTimes(session, timeline) {
+  let cursor = timestampMillis(firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt))
+  return timeline.map(step => {
+    let startedAt = step.startedAt
+    let finishedAt = step.finishedAt
+    let startedMillis = timestampMillis(startedAt)
+    let finishedMillis = timestampMillis(finishedAt)
+    const status = timelineStatusClass(step.status)
+
+    if (startedMillis === null && status !== 'waiting') {
+      startedMillis = cursor
+      startedAt = startedMillis === null ? null : new Date(startedMillis).toISOString()
+    }
+    if (startedMillis !== null && cursor !== null && startedMillis < cursor) {
+      startedMillis = cursor
+      startedAt = new Date(startedMillis).toISOString()
+    }
+    if (finishedMillis !== null && startedMillis !== null && finishedMillis < startedMillis) {
+      finishedMillis = startedMillis
+      finishedAt = new Date(finishedMillis).toISOString()
+    }
+    if (
+      finishedMillis === null
+      && startedMillis !== null
+      && ['done', 'failed', 'skipped'].includes(status)
+    ) {
+      const commandFinish = timestampMillis(session?.commandFinishedAt)
+      finishedMillis = commandFinish === null ? startedMillis : Math.max(commandFinish, startedMillis)
+      finishedAt = new Date(finishedMillis).toISOString()
+    }
+
+    if (finishedMillis !== null) cursor = finishedMillis
+    else if (startedMillis !== null) cursor = Math.max(cursor ?? startedMillis, startedMillis)
+
+    return { ...step, startedAt, finishedAt }
+  })
 }
 
 export function localizationAttemptTimeline(session) {
@@ -381,7 +436,9 @@ export function localizationAttemptTimeline(session) {
     ? commandStatus
     : 'accepted'
   add('map_transfer', transferStatus)
-  if (session.phase === 'transfer') return mergeTimelineHistory(session, timeline)
+  if (session.phase === 'transfer') {
+    return orderedTimelineTimes(session, mergeTimelineHistory(session, timeline))
+  }
 
   const bootstrapStatus = session.localizationBootstrap
     ? 'accepted'
@@ -429,7 +486,7 @@ export function localizationAttemptTimeline(session) {
       : (commandDone && session.status === 'accepted' ? 'searching' : 'waiting')
     add('navigation_start', navigationStatus)
   }
-  return mergeTimelineHistory(session, timeline)
+  return orderedTimelineTimes(session, mergeTimelineHistory(session, timeline))
 }
 
 function mergeTimelineHistory(session, currentTimeline) {

@@ -166,12 +166,14 @@ test('timeline keeps stage times and groups mapping-origin attempts under the or
             started_at: '2026-09-06T13:39:36.300Z',
             finished_at: '2026-09-06T13:40:38.000Z',
             attempts: [
-              { index: 1, stage: 'mapping_origin_bounded', status: 'rejected', x: 0, y: 0, yaw: 0 },
+              { index: 1, status: 'rejected', x: 0, y: 0, yaw: 0 },
+              { index: 2, status: 'waiting', x: 0.3, y: 0, yaw: 0 },
             ],
           },
         ],
         attempts: [
-          { index: 1, stage: 'mapping_origin_bounded', status: 'rejected', x: 0, y: 0, yaw: 0 },
+          { index: 1, status: 'rejected', x: 0, y: 0, yaw: 0 },
+          { index: 2, status: 'waiting', x: 0.3, y: 0, yaw: 0 },
         ],
       },
     },
@@ -180,7 +182,46 @@ test('timeline keeps stage times and groups mapping-origin attempts under the or
   const origin = localizationAttemptTimeline(session).find(item => item.key === 'mapping_origin_bounded')
   assert.equal(origin.startedAt, '2026-09-06T13:39:36.300Z')
   assert.equal(origin.finishedAt, '2026-09-06T13:40:38.000Z')
-  assert.equal(origin.attempts.length, 1)
+  assert.deepEqual(origin.attempts.map(attempt => attempt.index), [1, 2])
+})
+
+test('timeline does not timestamp future stages and keeps displayed times chronological', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-ordered-times',
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    started_at: '2026-09-06T13:00:00.000Z',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        strategy: ['mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match'],
+        stages: [
+          {
+            stage: 'mapping_origin_bounded',
+            status: 'rejected',
+            started_at: '2026-09-06T13:00:20.000Z',
+            finished_at: '2026-09-06T13:00:10.000Z',
+          },
+          {
+            stage: 'route_waypoints',
+            status: 'searching',
+            started_at: '2026-09-06T13:00:05.000Z',
+          },
+          { stage: 'keyframe_global_match', status: 'waiting' },
+        ],
+      },
+    },
+  })
+
+  const timeline = localizationAttemptTimeline(session)
+  const origin = timeline.find(item => item.key === 'mapping_origin_bounded')
+  const route = timeline.find(item => item.key === 'route_waypoints')
+  const global = timeline.find(item => item.key === 'keyframe_global_match')
+  assert.equal(origin.finishedAt, origin.startedAt)
+  assert.equal(route.startedAt, origin.finishedAt)
+  assert.equal(route.finishedAt, null)
+  assert.equal(global.startedAt, null)
+  assert.equal(global.finishedAt, null)
 })
 
 test('manual initial-pose command does not display unrelated global-search stages', () => {

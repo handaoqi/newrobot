@@ -2350,8 +2350,13 @@ class RosAdapter(Node):
         )
         deadline = time.monotonic() + max(1.0, float(seed.get("wait_seconds", 180.0)))
         official_snapshot = self.latest_trusted_pose()
+        attempt_metadata = {
+            key: seed[key]
+            for key in ("stage", "source", "waypoint_index")
+            if seed.get(key) is not None
+        }
         attempts = [
-            self._waiting_attempt(index, candidate)
+            {**self._waiting_attempt(index, candidate), **attempt_metadata}
             for index, candidate in enumerate(candidates[:max_attempts], start=1)
         ]
         session = {
