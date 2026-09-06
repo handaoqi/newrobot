@@ -3256,7 +3256,7 @@ async function handleDeleteRoute(route) {
                 {{ showPoseTrail ? '隐藏尾迹' : '显示尾迹' }}
               </button>
               <button class="btn btn-sm" :class="{ 'btn-primary': showLocalizationAttemptPoints }" @click="showLocalizationAttemptPoints = !showLocalizationAttemptPoints">
-                {{ showLocalizationAttemptPoints ? '隐藏定位尝试点' : '显示定位尝试点' }}
+                {{ showLocalizationAttemptPoints ? '隐藏尝试点及原点' : '显示尝试点及原点' }}
               </button>
               <button class="btn btn-sm" :disabled="poseHistory.length === 0" @click="clearPoseHistory">清空尾迹</button>
             </div>
@@ -3419,7 +3419,12 @@ async function handleDeleteRoute(route) {
                 :title="boundaryEditing ? '选择区域类型后在地图上依次点击顶点，至少三个点后闭合' : (mapInteractionError || mapModeHintText())"
               >
                 <strong>{{ boundaryEditing ? '边界编辑' : (mapClickMode === 'waypoint' ? '添加途经点' : '查看位置') }}</strong>
-                <span>{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
+                <span class="map-mode-hint-text">{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
+                <span v-if="showLocalizationAttemptPoints" class="map-origin-legend" aria-label="坐标原点图例">
+                  <span class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-map"><b>M</b></i>地图原点</span>
+                  <span v-if="occupancyGridOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-grid"><b>G</b></i>栅格左下角</span>
+                  <span v-if="rtkEnuOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-rtk"><b>R</b></i>RTK/ENU原点</span>
+                </span>
               </div>
               <div :class="['boundary-policy-status', boundaryStatusPresentation().tone]">
                 <strong>{{ boundaryStatusPresentation().title }}</strong>
@@ -3514,15 +3519,15 @@ async function handleDeleteRoute(route) {
                   </svg>
 
                   <div class="waypoint-markers">
-                    <div class="planner-map-origin-marker" :style="waypointDisplayPosition(mapFrameOrigin)" title="地图坐标原点 map (0, 0)">M</div>
+                    <div v-if="showLocalizationAttemptPoints" class="planner-map-origin-marker" :style="waypointDisplayPosition(mapFrameOrigin)" title="地图坐标原点 map (0, 0)">M</div>
                     <div
-                      v-if="occupancyGridOrigin"
+                      v-if="showLocalizationAttemptPoints && occupancyGridOrigin"
                       class="planner-grid-origin-marker"
                       :style="waypointDisplayPosition(occupancyGridOrigin)"
                       title="map.yaml origin：栅格图左下角在 map 坐标中的位置"
                     >G</div>
                     <div
-                      v-if="rtkEnuOrigin"
+                      v-if="showLocalizationAttemptPoints && rtkEnuOrigin"
                       class="planner-rtk-origin-marker"
                       :style="waypointDisplayPosition({ x: rtkEnuOrigin.map_x, y: rtkEnuOrigin.map_y })"
                       :title="rtkOriginTitle()"
@@ -3708,8 +3713,8 @@ async function handleDeleteRoute(route) {
 .route-planner-layout {
   --route-main-action-height: 38px;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
-  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto auto;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(260px, 0.8fr) minmax(300px, 0.9fr);
+  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto;
   column-gap: 1rem;
   row-gap: 0.45rem;
   height: auto;
@@ -3874,7 +3879,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-5 {
   grid-column: 1 / -1;
-  grid-row: 5;
+  grid-row: 4;
   align-self: start;
   overflow: visible;
 }
@@ -4716,10 +4721,57 @@ async function handleDeleteRoute(route) {
   color: #175cd3;
 }
 
-.map-mode-hint > span {
+.map-mode-hint-text {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.map-origin-legend {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.65rem;
+  margin-left: auto;
+  color: #475467;
+  font-size: 0.66rem;
+  white-space: nowrap;
+}
+
+.map-origin-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.map-origin-legend-icon {
+  display: inline-grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  border-radius: 3px;
+  color: #fff;
+  font-style: normal;
+  transform: rotate(45deg);
+}
+
+.map-origin-legend-icon b {
+  font-size: 0.6rem;
+  line-height: 1;
+  transform: rotate(-45deg);
+}
+
+.map-origin-legend-map {
+  background: #2563eb;
+}
+
+.map-origin-legend-grid {
+  background: #475569;
+}
+
+.map-origin-legend-rtk {
+  background: #0891b2;
 }
 
 .map-mode-hint.error {
@@ -4751,8 +4803,8 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
-  grid-column: 1 / span 3;
-  grid-row: 4;
+  grid-column: 3;
+  grid-row: 3;
   min-width: 0;
   min-height: 0;
   max-height: 58px;
@@ -5295,7 +5347,7 @@ async function handleDeleteRoute(route) {
 }
 
 .route-keyframe-row {
-  grid-column: 1 / span 3;
+  grid-column: 1 / span 2;
   grid-row: 3;
   min-width: 0;
   align-self: start;
@@ -5939,6 +5991,10 @@ async function handleDeleteRoute(route) {
   background: rgba(67, 213, 255, 0.1);
 }
 
+[data-theme="dark"] .map-origin-legend {
+  color: var(--muted);
+}
+
 [data-theme="dark"] .map-inspection-row span,
 [data-theme="dark"] .map-inspection-row small {
   color: var(--muted);
@@ -5998,6 +6054,8 @@ async function handleDeleteRoute(route) {
   .map-click-mode { flex: 0 0 auto; justify-content: flex-start; }
   .map-click-mode button { flex: 0 0 auto; min-width: 82px; }
   .map-mode-hint { min-height: 34px; }
+  .map-origin-legend { gap: 0.35rem; }
+  .map-origin-legend-item { font-size: 0; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
   .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
   .waypoint-heading-input input { min-width: 0; }
