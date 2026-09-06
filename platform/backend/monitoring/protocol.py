@@ -274,6 +274,10 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         for field in ("avoidance_to_next", "require_yaw"):
             if field in waypoint and not isinstance(waypoint[field], bool):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
+        if "arrival_policy" in waypoint and str(waypoint["arrival_policy"]).lower() not in {
+            "pass_through", "stop_and_confirm", "precision", "dock",
+        }:
+            raise ProtocolError("INVALID_MESSAGE", "waypoint arrival_policy is invalid")
         if "local_controller" in waypoint:
             mode = str(waypoint["local_controller"]).lower()
             if mode not in {"rpp", "mppi"}:

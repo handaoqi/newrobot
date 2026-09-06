@@ -227,6 +227,12 @@ const LOCAL_CONTROLLER_OPTIONS = [
   { value: 'mppi', label: 'MPPI（FollowPath）' },
   { value: 'rpp', label: 'RPP（Regulated Pure Pursuit）' },
 ]
+const ARRIVAL_POLICY_OPTIONS = [
+  { value: 'pass_through', label: '通过（不停留）' },
+  { value: 'stop_and_confirm', label: '停车校正确认' },
+  { value: 'precision', label: '精确到点' },
+  { value: 'dock', label: '停靠确认' },
+]
 const DEFAULT_GLOBAL_CONTROLLER = 'theta_star'
 
 const routeForm = ref({
@@ -801,6 +807,22 @@ function normalizeLocalController(mode) {
 function normalizeGlobalController(mode) {
   const normalized = String(mode || 'theta_star').trim().toLowerCase()
   return normalized === 'navfn' ? 'navfn' : 'theta_star'
+}
+
+function normalizeArrivalPolicy(value, point = {}) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (ARRIVAL_POLICY_OPTIONS.some(option => option.value === normalized)) return normalized
+  if (Number(point.dwell_seconds || 0) > 0 || point.require_yaw === true || (point.actions || []).length) {
+    return 'stop_and_confirm'
+  }
+  return 'stop_and_confirm'
+}
+
+function setWaypointArrivalPolicy(index, policy) {
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    arrival_policy: normalizeArrivalPolicy(policy, waypoints.value[index]),
+  }
 }
 
 function setWaypointLocalization(index, mode) {
@@ -1451,6 +1473,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
     local_controller: normalizeLocalController(point.local_controller),
     global_controller: normalizeGlobalController(point.global_controller || DEFAULT_GLOBAL_CONTROLLER),
+    arrival_policy: normalizeArrivalPolicy(point.arrival_policy, point),
     avoidance_to_next: point.avoidance_to_next !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
@@ -1506,6 +1529,7 @@ function withWaypointYaw(points) {
       localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
       local_controller: normalizeLocalController(current.local_controller),
       global_controller: normalizeGlobalController(current.global_controller || DEFAULT_GLOBAL_CONTROLLER),
+      arrival_policy: normalizeArrivalPolicy(current.arrival_policy, current),
       avoidance_to_next: current.avoidance_to_next !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
@@ -3075,6 +3099,17 @@ async function handleDeleteRoute(route) {
                           :value="point.dwell_seconds || 0"
                           @input="setWaypointDwell(index, $event.target.value)"
                         />
+                      </label>
+                      <label>
+                        <span>到点策略</span>
+                        <select
+                          :value="point.arrival_policy || 'stop_and_confirm'"
+                          @change="setWaypointArrivalPolicy(index, $event.target.value)"
+                        >
+                          <option v-for="option in ARRIVAL_POLICY_OPTIONS" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </option>
+                        </select>
                       </label>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />

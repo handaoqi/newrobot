@@ -53,6 +53,22 @@ def _normalize_local_controller(value: object | None) -> str:
     return normalized if normalized in {"mppi", "rpp"} else "mppi"
 
 
+def _normalize_arrival_policy(value: object | None, *, dwell_seconds: float = 0.0,
+                              require_yaw: bool = False, actions: list | None = None,
+                              is_last: bool = False) -> str:
+    """Normalize the explicit stop semantics while preserving legacy routes."""
+    normalized = str(value or "").strip().lower()
+    if normalized in {"pass_through", "stop_and_confirm", "precision", "dock"}:
+        return normalized
+    if is_last:
+        return "stop_and_confirm"
+    if dwell_seconds > 0 or require_yaw or actions:
+        return "stop_and_confirm"
+    # Legacy routes had no explicit semantics; fail closed and preserve the
+    # existing stop/settle behavior until operators opt into pass-through.
+    return "stop_and_confirm"
+
+
 def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
     normalized = []
     names = route.waypoint_names or []
@@ -82,6 +98,11 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             )
             avoidance_to_next = bool(raw.get("avoidance_to_next", True))
             require_yaw = bool(raw.get("require_yaw", False))
+            arrival_policy = _normalize_arrival_policy(
+                raw.get("arrival_policy"), dwell_seconds=dwell_seconds,
+                require_yaw=require_yaw, actions=actions,
+                is_last=index == len(route.waypoints or []) - 1,
+            )
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
             x, y = raw[0], raw[1]
             yaw = raw[2] if len(raw) >= 3 else 0.0
@@ -98,6 +119,10 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             global_controller = route_global_controller
             avoidance_to_next = True
             require_yaw = False
+            arrival_policy = _normalize_arrival_policy(
+                None, dwell_seconds=0, require_yaw=False, actions=[],
+                is_last=index == len(route.waypoints or []) - 1,
+            )
         else:
             raise TaskStateError(f"route waypoint {index} has invalid format")
         waypoint = {
@@ -115,6 +140,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "global_controller": global_controller,
                 "avoidance_to_next": avoidance_to_next,
                 "require_yaw": require_yaw,
+                "arrival_policy": arrival_policy,
             }
         if speech_template_id not in (None, ""):
             waypoint.update(

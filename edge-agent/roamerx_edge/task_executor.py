@@ -2912,6 +2912,18 @@ class TaskExecutor:
                     reached_index = self._goal_offset + max(self._dispatched_count, 1) - 1
                 reached_waypoint = self.context.route_snapshot["waypoints"][reached_index]
                 total_waypoints = len(self.context.route_snapshot["waypoints"])
+                if self._arrival_policy(reached_waypoint, reached_index) == "pass_through":
+                    # A pass-through point is progress only: do not trigger
+                    # stationary correction, dwell, actions, or arrival speech.
+                    self._waypoint_localization_ready_index = reached_index
+                    self.on_feedback(
+                        reached_index - self._goal_offset,
+                        0.0,
+                        milestone="waypoint_passed",
+                        completed_waypoints=reached_index + 1,
+                    )
+                    self._maybe_continue_after_waypoint(reached_index)
+                    return
                 # A FollowWaypoints success only means Nav2's goal checker
                 # accepted the pose; it does not guarantee that the
                 # quadruped has finished coasting.  Confirm zero motion before
@@ -3416,6 +3428,20 @@ class TaskExecutor:
             return False
         docking = getattr(self.context, "docking", None) or {}
         return bool(docking.get("enabled"))
+
+    def _arrival_policy(self, waypoint: dict | None, index: int | None = None) -> str:
+        """Return explicit arrival semantics, with a safe legacy default."""
+        waypoint = waypoint or {}
+        value = str(waypoint.get("arrival_policy") or "").strip().lower()
+        if value in {"pass_through", "stop_and_confirm", "precision", "dock"}:
+            return value
+        if index is not None and self._is_last_route_waypoint(index):
+            return "stop_and_confirm"
+        if waypoint.get("require_yaw") or float(waypoint.get("dwell_seconds") or 0) > 0:
+            return "stop_and_confirm"
+        if waypoint.get("actions") or waypoint.get("speech_template_id"):
+            return "stop_and_confirm"
+        return "stop_and_confirm"
 
     def _apply_docking_profile(self, waypoint_index: int) -> None:
         if not self._is_docking_task():
