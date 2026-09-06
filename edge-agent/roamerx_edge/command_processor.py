@@ -481,7 +481,14 @@ class CommandProcessor:
                     set_progress(
                         lambda payload: self._emit_command_progress(envelope, started_at, payload)
                     )
+                bootstrap_started_at = now_iso()
                 localization_bootstrap = self._ensure_initial_pose_subscriber()
+                if localization_bootstrap is not None:
+                    localization_bootstrap = {
+                        **localization_bootstrap,
+                        "started_at": localization_bootstrap.get("started_at") or bootstrap_started_at,
+                        "finished_at": localization_bootstrap.get("finished_at") or now_iso(),
+                    }
                 if envelope.message_type == "nav.initial_pose":
                     if str(command.get("seed_source") or "") == "rtk":
                         result_payload = self.localization_adapter.set_initial_pose_from_rtk(
@@ -556,7 +563,13 @@ class CommandProcessor:
                 )
                 if should_start_navigation:
                     result_payload = dict(result_payload or {})
-                    result_payload["navigation_start"] = self._start_navigation_after_localization()
+                    navigation_started_at = now_iso()
+                    navigation_start = self._start_navigation_after_localization()
+                    result_payload["navigation_start"] = {
+                        **navigation_start,
+                        "started_at": navigation_start.get("started_at") or navigation_started_at,
+                        "finished_at": navigation_start.get("finished_at") or now_iso(),
+                    }
                 self._structured(
                     "DEBUG", "relocalization" if envelope.message_type == "nav.relocalize" else "localization",
                     f"{envelope.message_type}.output", "定位算法输出",

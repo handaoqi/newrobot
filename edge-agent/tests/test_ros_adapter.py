@@ -457,6 +457,14 @@ def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order(
     assert result["selected_stage"] == "route_waypoint"
     assert result["selected_waypoint_index"] == 1
     assert result["localized_pose"]["x"] == 3.0
+    origin_stage = result["stages"][0]
+    route_stage = result["stages"][1]
+    assert origin_stage["stage"] == "mapping_origin_bounded"
+    assert origin_stage["status"] == "rejected"
+    assert origin_stage["started_at"] <= origin_stage["finished_at"]
+    assert all(item["stage"] == "mapping_origin_bounded" for item in origin_stage["attempts"])
+    assert route_stage["stage"] == "route_waypoints"
+    assert route_stage["started_at"] <= route_stage["finished_at"]
 
 
 def test_progressive_relocalize_falls_back_to_keyframe_global_match():

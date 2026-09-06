@@ -147,6 +147,42 @@ test('timeline preserves the RTK phase when it falls back to progressive localiz
   assert.equal(timeline[3].status, 'active')
 })
 
+test('timeline keeps stage times and groups mapping-origin attempts under the origin step', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-origin-times',
+    command_type: 'nav.relocalize',
+    status: 'succeeded',
+    issued_at: '2026-09-06T13:39:36.000Z',
+    started_at: '2026-09-06T13:39:36.200Z',
+    finished_at: '2026-09-06T13:41:22.000Z',
+    result_payload: {
+      localization_attempts: {
+        state: 'accepted',
+        strategy: ['mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match'],
+        stages: [
+          {
+            stage: 'mapping_origin_bounded',
+            status: 'rejected',
+            started_at: '2026-09-06T13:39:36.300Z',
+            finished_at: '2026-09-06T13:40:38.000Z',
+            attempts: [
+              { index: 1, stage: 'mapping_origin_bounded', status: 'rejected', x: 0, y: 0, yaw: 0 },
+            ],
+          },
+        ],
+        attempts: [
+          { index: 1, stage: 'mapping_origin_bounded', status: 'rejected', x: 0, y: 0, yaw: 0 },
+        ],
+      },
+    },
+  })
+
+  const origin = localizationAttemptTimeline(session).find(item => item.key === 'mapping_origin_bounded')
+  assert.equal(origin.startedAt, '2026-09-06T13:39:36.300Z')
+  assert.equal(origin.finishedAt, '2026-09-06T13:40:38.000Z')
+  assert.equal(origin.attempts.length, 1)
+})
+
 test('manual initial-pose command does not display unrelated global-search stages', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-manual',

@@ -18,7 +18,7 @@ from .navigation_controllers import (
     normalize_global_controller,
     normalize_local_controller,
 )
-from .protocol import ProtocolError
+from .protocol import ProtocolError, now_iso
 from .rtk_origin import RtkOriginPayloadCache
 from .safety_policy import RuntimeSafetyState
 from .telemetry_collector import TelemetryCollector
@@ -2054,10 +2054,19 @@ class RosAdapter(Node):
         all_attempts = []
         if origin and all(origin.get(field) is not None for field in ("x", "y", "yaw")):
             origin_seed = dict(origin)
+            origin_stage = {
+                "stage": "mapping_origin_bounded",
+                "status": "searching",
+                "started_at": now_iso(),
+            }
+            stages.append(origin_stage)
         else:
+            unavailable_at = now_iso()
             stages.append({
                 "stage": "mapping_origin_bounded",
                 "status": "unavailable",
+                "started_at": unavailable_at,
+                "finished_at": unavailable_at,
                 "error_code": (origin or {}).get("unavailable_error_code", "MAPPING_START_POSE_MISSING"),
                 "error_message": (origin or {}).get(
                     "unavailable_error_message", "map package has no usable mapping start pose"
@@ -2096,18 +2105,18 @@ class RosAdapter(Node):
                 result = self._active_relocalize_once({
                     **origin_seed,
                     "source": "mapping_origin",
+                    "stage": "mapping_origin_bounded",
                     "max_attempts": 20,
                     "wait_seconds": origin_budget,
                     "candidate_wait_seconds": 5.0,
                 }, generation, persist_state=False)
-                accepted = {
-                    "stage": "mapping_origin_bounded",
+                origin_stage.update({
                     "status": "accepted",
+                    "finished_at": now_iso(),
                     "attempts": result.get("attempts", []),
                     "best_ndt_candidate": result.get("best_ndt_candidate"),
                     "best_match_pose": result.get("best_match_pose"),
-                }
-                stages.append(accepted)
+                })
                 payload = {
                     **result,
                     "mode": "progressive_stationary_search",
@@ -2124,10 +2133,14 @@ class RosAdapter(Node):
                 details = dict(exc.details or {})
                 origin_attempts = list(details.get("attempts") or [])
                 all_attempts.extend(origin_attempts)
-                stages.append({
-                    "stage": "mapping_origin_bounded",
+                origin_stage.update({
                     "status": "rejected",
+                    "finished_at": now_iso(),
                     "error_code": exc.code,
+                    "error_message": (
+                        f"已评估 {len(origin_attempts)} 个建图原点及周边候选，均未通过 NDT 质量门限，"
+                        "已转入路线航点候选"
+                    ) if origin_attempts else exc.message,
                     "attempts": origin_attempts,
                     "best_ndt_candidate": details.get("best_ndt_candidate"),
                     "timed_out": details.get("timed_out", False),
@@ -2138,6 +2151,25 @@ class RosAdapter(Node):
         local_budget = max(0.0, deadline - time.monotonic() - 60.0)
         per_seed_wait = min(8.0, max(3.0, local_budget / max(1, len(seeds))))
         waypoint_attempts = []
+        route_stage = None
+        if seeds:
+            route_stage = {
+                "stage": "route_waypoints",
+                "status": "searching",
+                "started_at": now_iso(),
+            }
+            stages.append(route_stage)
+        else:
+            skipped_at = now_iso()
+            stages.append({
+                "stage": "route_waypoints",
+                "status": "skipped",
+                "started_at": skipped_at,
+                "finished_at": skipped_at,
+                "error_code": "NO_ROUTE_WAYPOINTS",
+            })
+        session.update(stages=stages, state="running")
+        self._report_localization_attempts(session)
         self._trusted_pose_frozen = True
         try:
             for stage_name, waypoint_index, seed in seeds:
@@ -2157,12 +2189,6 @@ class RosAdapter(Node):
                     }
                     all_attempts.append(skipped)
                     waypoint_attempts.append(skipped)
-                    stages.append({
-                        "stage": stage_name,
-                        "waypoint_index": waypoint_index,
-                        "status": "skipped",
-                        "error_code": "LOCAL_SEARCH_BUDGET_EXHAUSTED",
-                    })
                     continue
                 attempt = self._probe_localization_seed(
                     seed,
@@ -2179,14 +2205,15 @@ class RosAdapter(Node):
             if ranked is not None:
                 self._mark_out_ranked_attempts(all_attempts, ranked)
                 candidate = dict(ranked.get("ndt_candidate") or {})
-                stages.append({
-                    "stage": ranked.get("stage") or "route_waypoint",
-                    "waypoint_index": ranked.get("waypoint_index"),
+                route_stage.update({
                     "status": "accepted",
+                    "finished_at": now_iso(),
+                    "waypoint_index": ranked.get("waypoint_index"),
                     "attempts": waypoint_attempts,
                     "best_ndt_candidate": candidate,
                 })
                 self._trusted_pose_frozen = False
+                commit_started_at = now_iso()
                 committed = self._commit_best_relocalization_candidate(
                     generation,
                     {
@@ -2196,6 +2223,7 @@ class RosAdapter(Node):
                     candidate,
                     all_attempts,
                 )
+                commit_finished_at = now_iso()
                 payload = {
                     **committed,
                     "mode": "progressive_stationary_search",
@@ -2205,13 +2233,23 @@ class RosAdapter(Node):
                     "stages": stages,
                     "attempts": all_attempts,
                     "best_match_pose": (committed.get("best_ndt_candidate") or {}).get("matched_pose"),
+                    "best_candidate_commit_started_at": commit_started_at,
+                    "best_candidate_commit_finished_at": commit_finished_at,
                 }
                 self._report_localization_attempts({**payload, "state": "accepted"})
                 return payload
         finally:
             self._trusted_pose_frozen = False
 
-        stages.append({"stage": "keyframe_global_match", "status": "searching"})
+        if route_stage is not None:
+            route_stage.update({"status": "rejected", "finished_at": now_iso()})
+
+        global_stage = {
+            "stage": "keyframe_global_match",
+            "status": "searching",
+            "started_at": now_iso(),
+        }
+        stages.append(global_stage)
         session.update(state="global_searching", stages=stages, attempts=all_attempts)
         self._report_localization_attempts(session)
         try:
@@ -2219,7 +2257,7 @@ class RosAdapter(Node):
                 max(30.0, deadline - time.monotonic()), generation
             )
         except ProtocolError as exc:
-            stages[-1].update({"status": "failed", "error_code": exc.code})
+            global_stage.update({"status": "failed", "finished_at": now_iso(), "error_code": exc.code})
             details = {
                 "mode": "progressive_stationary_search",
                 "strategy": strategy,
@@ -2234,7 +2272,7 @@ class RosAdapter(Node):
                 "origin, all route waypoints, and keyframe/global matching failed",
                 details=details,
             ) from exc
-        stages[-1].update({"status": "accepted", "message": global_result.get("message")})
+        global_stage.update({"status": "accepted", "finished_at": now_iso(), "message": global_result.get("message")})
         payload = {
             **global_result,
             "mode": "progressive_stationary_search",
@@ -2341,7 +2379,10 @@ class RosAdapter(Node):
                     generation,
                     wait_seconds=min(candidate_wait_seconds, remaining),
                     index=index,
-                    extra={"source": seed.get("source", "operator_seed")},
+                    extra={
+                        "source": seed.get("source", "operator_seed"),
+                        **({"stage": seed["stage"]} if seed.get("stage") else {}),
+                    },
                 )
                 session["attempts"] = attempts
                 session["live_pose"] = self._current_live_pose()
@@ -2380,11 +2421,14 @@ class RosAdapter(Node):
             session["best_ndt_candidate"] = best_candidate
             session["best_match_pose"] = dict(best_candidate.get("matched_pose") or {})
             session["state"] = "committing_best"
+            commit_started_at = now_iso()
+            session["best_candidate_commit_started_at"] = commit_started_at
             self._report_localization_attempts(session, persist=persist_state)
             self._trusted_pose_frozen = False
             committed = self._commit_best_relocalization_candidate(
                 generation, seed, best_candidate, attempts
             )
+            commit_finished_at = now_iso()
             payload = {
                 **committed,
                 "best_match_pose": session["best_match_pose"],
@@ -2395,6 +2439,8 @@ class RosAdapter(Node):
                     1 for item in attempts if item.get("status") != "skipped"
                 ),
                 "candidate_count": max_attempts,
+                "best_candidate_commit_started_at": commit_started_at,
+                "best_candidate_commit_finished_at": commit_finished_at,
             }
             self._report_localization_attempts({**session, **payload, "state": "accepted"}, persist=persist_state)
             return payload

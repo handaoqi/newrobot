@@ -76,6 +76,10 @@ function finitePose(value) {
   return z === null ? { x, y, yaw } : { x, y, yaw, z }
 }
 
+function firstTimestamp(...values) {
+  return values.find(value => value !== null && value !== undefined && value !== '') || null
+}
+
 export function attemptSeedPose(attempt) {
   return finitePose(attempt?.seedPose || attempt?.seed_pose) || finitePose(attempt)
 }
@@ -105,7 +109,10 @@ function normalizeAttempt(attempt, index) {
     eligible: Boolean(attempt?.eligible || candidate.eligible),
     accepted: attempt?.accepted === true || attempt?.status === 'accepted',
     stage: attempt?.stage || '',
+    source: attempt?.source || '',
     waypointIndex: attempt?.waypoint_index,
+    startedAt: firstTimestamp(attempt?.started_at, attempt?.startedAt),
+    finishedAt: firstTimestamp(attempt?.finished_at, attempt?.finishedAt),
   }
 }
 
@@ -141,6 +148,9 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
   const session = {
     commandId: String(command.id || extras.commandId || ''),
     commandType: command.command_type || extras.commandType || '',
+    commandIssuedAt: firstTimestamp(command.issued_at, command.created_at),
+    commandStartedAt: firstTimestamp(command.started_at),
+    commandFinishedAt: firstTimestamp(command.finished_at),
     phase,
     showCandidates,
     status: raw.state || command.status || '',
@@ -174,6 +184,14 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
             : []))),
     localizationBootstrap: result.localization_bootstrap || raw.localization_bootstrap || null,
     navigationStart: result.navigation_start || raw.navigation_start || null,
+    bestCandidateCommitStartedAt: firstTimestamp(
+      raw.best_candidate_commit_started_at,
+      result.best_candidate_commit_started_at,
+    ),
+    bestCandidateCommitFinishedAt: firstTimestamp(
+      raw.best_candidate_commit_finished_at,
+      result.best_candidate_commit_finished_at,
+    ),
     selectedStage: raw.selected_stage || result.selected_stage || '',
     timelineHistory: Array.isArray(extras.timelineHistory) ? extras.timelineHistory : [],
   }
@@ -189,6 +207,9 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
   return {
     commandId: String(commandId || ''),
     commandType,
+    commandIssuedAt: null,
+    commandStartedAt: null,
+    commandFinishedAt: null,
     phase,
     showCandidates: phase !== 'transfer',
     status: '',
@@ -209,6 +230,8 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     stages: [],
     localizationBootstrap: null,
     navigationStart: null,
+    bestCandidateCommitStartedAt: null,
+    bestCandidateCommitFinishedAt: null,
     selectedStage: '',
     timelineHistory: [],
   }
@@ -227,7 +250,7 @@ function timelineStatusClass(status) {
   return 'waiting'
 }
 
-function timelineStatusLabel(status) {
+function timelineStatusLabel(status, stageKey = '') {
   const labels = {
     waiting: '待执行',
     active: '执行中',
@@ -235,15 +258,26 @@ function timelineStatusLabel(status) {
     failed: '失败',
     skipped: '已跳过',
   }
+  if (timelineStatusClass(status) === 'failed' && ['mapping_origin_bounded', 'route_waypoints'].includes(stageKey)) {
+    return '未通过，已转下一阶段'
+  }
   return labels[timelineStatusClass(status)]
 }
 
-function stageAttemptsFor(session, stageKey) {
+function stageAttemptsFor(session, stageKey, stageRecord = null) {
   const aliases = new Set([stageKey])
   Object.entries(TIMELINE_STAGE_ALIASES).forEach(([alias, canonical]) => {
     if (canonical === stageKey) aliases.add(alias)
   })
-  return (session?.attempts || []).filter(attempt => aliases.has(canonicalTimelineStage(attempt.stage)))
+  const attempts = (session?.attempts || []).filter(attempt => (
+    aliases.has(canonicalTimelineStage(attempt.stage))
+    || (stageKey === 'mapping_origin_bounded' && attempt.source === 'mapping_origin')
+  ))
+  if (attempts.length || !Array.isArray(stageRecord?.attempts)) return attempts
+  return stageRecord.attempts.map((attempt, index) => normalizeAttempt({
+    ...attempt,
+    stage: attempt?.stage || stageKey,
+  }, index))
 }
 
 function inferredStageStatus(session, stageKey, attempts, stageRecord) {
@@ -272,18 +306,72 @@ function timelineDetail(stageKey, status, attempts, session) {
   return meta.detail
 }
 
+function timelineStageTimes(stageKey, status, record, session) {
+  const commandStart = firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt)
+  const commandFinish = firstTimestamp(session?.commandFinishedAt)
+  const historical = (session?.timelineHistory || []).find(item => item?.key === stageKey)
+  let startedAt = firstTimestamp(record?.started_at, record?.startedAt)
+  let finishedAt = firstTimestamp(record?.finished_at, record?.finishedAt)
+
+  if (stageKey === 'localization_bootstrap') {
+    startedAt = firstTimestamp(
+      startedAt,
+      session?.localizationBootstrap?.started_at,
+      session?.localizationBootstrap?.startedAt,
+      commandStart,
+    )
+    finishedAt = firstTimestamp(
+      finishedAt,
+      session?.localizationBootstrap?.finished_at,
+      session?.localizationBootstrap?.finishedAt,
+      session?.localizationBootstrap ? commandStart : null,
+    )
+  } else if (stageKey === 'best_candidate_commit') {
+    startedAt = firstTimestamp(startedAt, session?.bestCandidateCommitStartedAt, commandStart)
+    finishedAt = firstTimestamp(finishedAt, session?.bestCandidateCommitFinishedAt, commandFinish)
+  } else if (stageKey === 'navigation_start') {
+    startedAt = firstTimestamp(
+      startedAt,
+      session?.navigationStart?.started_at,
+      session?.navigationStart?.startedAt,
+      commandStart,
+    )
+    finishedAt = firstTimestamp(
+      finishedAt,
+      session?.navigationStart?.finished_at,
+      session?.navigationStart?.finishedAt,
+      session?.navigationStart ? commandFinish : null,
+    )
+  } else if (stageKey === 'map_transfer' && session?.phase !== 'transfer') {
+    startedAt = firstTimestamp(startedAt, historical?.startedAt, commandStart)
+    finishedAt = firstTimestamp(finishedAt, historical?.finishedAt, commandStart)
+  } else {
+    startedAt = firstTimestamp(startedAt, commandStart)
+    if (timelineStatusClass(status) === 'done' || timelineStatusClass(status) === 'failed' || timelineStatusClass(status) === 'skipped') {
+      finishedAt = firstTimestamp(finishedAt, commandFinish)
+    }
+  }
+  if (!finishedAt && ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))) {
+    finishedAt = commandFinish
+  }
+  return { startedAt, finishedAt }
+}
+
 export function localizationAttemptTimeline(session) {
   if (!session) return []
   const timeline = []
-  const add = (key, status, attempts = [], detail = '') => {
+  const add = (key, status, attempts = [], detail = '', record = null) => {
     const meta = TIMELINE_STAGE_META[key] || { title: key, detail: '' }
+    const times = timelineStageTimes(key, status, record, session)
     timeline.push({
       key,
       title: meta.title,
       detail: detail || timelineDetail(key, status, attempts, session),
       status: timelineStatusClass(status),
-      statusLabel: timelineStatusLabel(status),
+      statusLabel: timelineStatusLabel(status, key),
       attempts,
+      startedAt: times.startedAt,
+      finishedAt: times.finishedAt,
     })
   }
 
@@ -318,13 +406,14 @@ export function localizationAttemptTimeline(session) {
   if (!stageKeys.length) stageKeys.push('mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match')
 
   stageKeys.forEach(key => {
-    const attempts = stageAttemptsFor(session, key)
     const record = stageRecords.get(key)
+    const attempts = stageAttemptsFor(session, key, record)
     add(
       key,
       inferredStageStatus(session, key, attempts, record),
       attempts,
       record?.error_message || record?.message || '',
+      record,
     )
   })
 

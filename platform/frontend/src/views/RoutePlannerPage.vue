@@ -1911,6 +1911,17 @@ function applyLocalizationAttemptCommand(command, extras = {}) {
   scheduleAttemptMarkerRefresh(session)
 }
 
+function localizationAttemptProgressText(session) {
+  const candidateCount = Number(session?.candidateCount || 0)
+  const evaluated = Number(session?.evaluatedCandidateCount || 0)
+  if (session?.globalSearchStarted) return '全局关键帧匹配阶段'
+  if (session?.commandType === 'nav.initial_pose') {
+    return session?.source === 'rtk' ? 'RTK 固定解验证阶段' : '正在验证手选初始位姿'
+  }
+  if (candidateCount <= 0) return '正在准备定位候选列表'
+  return `已评估 ${evaluated} / ${candidateCount} 个候选 · 原点/航点候选阶段`
+}
+
 function restoreAttemptSessionFromStatus() {
   if (navCommandBusy.value) return
   const robotId = selectedRobot.value?.id
@@ -3389,9 +3400,8 @@ async function handleDeleteRoute(route) {
               <div v-if="localizationAttemptCardOpen" class="localization-attempt-body">
                 <p v-if="localizationAttemptSession.phase === 'transfer'" class="command-note">文件传输阶段只显示命令进度，进入地图定位后再展示候选点。</p>
                 <p v-if="localizationAttemptSession.livePose">实时位姿 {{ formatAttemptPose(localizationAttemptSession.livePose) }}</p>
-                <p v-if="localizationAttemptSession.evaluatedCandidateCount != null">
-                  已评估 {{ localizationAttemptSession.evaluatedCandidateCount }} / {{ localizationAttemptSession.candidateCount || 0 }} 个候选
-                  · {{ localizationAttemptSession.globalSearchStarted ? '已进入全局搜索' : '快速搜索阶段' }}
+                <p v-if="localizationAttemptSession">
+                  {{ localizationAttemptProgressText(localizationAttemptSession) }}
                   <span v-if="localizationAttemptSession.earlyStopped"> · 已达到最优阈值并提前停止</span>
                 </p>
                 <p v-if="localizationAttemptSession.rtkDrift">
@@ -3421,6 +3431,9 @@ async function handleDeleteRoute(route) {
                         <span>{{ step.statusLabel }}</span>
                       </div>
                       <small>{{ step.detail }}</small>
+                      <div class="localization-timeline-time">
+                        开始 {{ formatDateTime(step.startedAt) }} · 完成 {{ formatDateTime(step.finishedAt) }}
+                      </div>
                       <div v-if="step.attempts.length" class="localization-timeline-attempts">
                         <div
                           v-for="attempt in step.attempts"
@@ -5707,6 +5720,7 @@ async function handleDeleteRoute(route) {
 .localization-timeline-step.done .localization-timeline-heading span { color: #166534; background: #bbf7d0; }
 .localization-timeline-step.failed .localization-timeline-heading span { color: #991b1b; background: #fecaca; }
 .localization-timeline-content > small { display: block; margin-top: 0.18rem; color: #64748b; line-height: 1.35; }
+.localization-timeline-time { margin-top: 0.16rem; color: #475569; font-size: 0.68rem; font-variant-numeric: tabular-nums; }
 .localization-timeline-attempts {
   display: grid;
   gap: 0.25rem;
