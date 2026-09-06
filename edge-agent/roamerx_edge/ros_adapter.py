@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import json
 import math
@@ -2106,6 +2107,7 @@ class RosAdapter(Node):
                     **origin_seed,
                     "source": "mapping_origin",
                     "stage": "mapping_origin_bounded",
+                    "stage_started_at": origin_stage["started_at"],
                     "max_attempts": 20,
                     "wait_seconds": origin_budget,
                     "candidate_wait_seconds": 5.0,
@@ -2355,6 +2357,14 @@ class RosAdapter(Node):
             for key in ("stage", "source", "waypoint_index")
             if seed.get(key) is not None
         }
+        stage_key = str(seed.get("stage") or "").strip()
+        active_stage = None
+        if stage_key:
+            active_stage = {
+                "stage": stage_key,
+                "status": "searching",
+                "started_at": seed.get("stage_started_at") or now_iso(),
+            }
         attempts = [
             {**self._waiting_attempt(index, candidate), **attempt_metadata}
             for index, candidate in enumerate(candidates[:max_attempts], start=1)
@@ -2363,6 +2373,8 @@ class RosAdapter(Node):
             "state": "running",
             "mode": "stationary_bounded_search",
             "source": seed.get("source", "operator_seed"),
+            "selected_stage": stage_key or None,
+            "stages": [active_stage] if active_stage else [],
             "seed": {k: seed.get(k) for k in ("x", "y", "z", "yaw", "waypoint_index")},
             "candidate_count": max_attempts,
             "attempts": attempts,
@@ -2414,6 +2426,13 @@ class RosAdapter(Node):
                     "localization_status": getattr(latest, "localization_status", None),
                     "timed_out": sum(1 for item in attempts if item.get("status") != "waiting") < max_attempts,
                 })
+                if active_stage is not None:
+                    active_stage.update({
+                        "status": "failed",
+                        "finished_at": now_iso(),
+                        "attempts": attempts,
+                        "timed_out": session["timed_out"],
+                    })
                 self._report_localization_attempts(session, persist=persist_state)
                 raise ProtocolError(
                     "ACTIVE_RELOCALIZATION_FAILED",
@@ -2434,6 +2453,14 @@ class RosAdapter(Node):
                 generation, seed, best_candidate, attempts
             )
             commit_finished_at = now_iso()
+            if active_stage is not None:
+                active_stage.update({
+                    "status": "accepted",
+                    "finished_at": commit_finished_at,
+                    "attempts": attempts,
+                    "best_ndt_candidate": best_candidate,
+                    "best_match_pose": session["best_match_pose"],
+                })
             payload = {
                 **committed,
                 "best_match_pose": session["best_match_pose"],
@@ -2599,11 +2626,15 @@ class RosAdapter(Node):
             LOGGER.warning("unable to restore official localization pose after failed search: %s", exc)
 
     def _report_localization_attempts(self, session: dict, *, persist: bool = True) -> None:
-        payload = {
+        # Progress consumers may serialize asynchronously.  A shallow copy
+        # lets later attempt/stage mutations rewrite an already published
+        # "searching" snapshot as "failed", which makes the UI jump back to
+        # the previous status and timestamp.
+        payload = copy.deepcopy({
             **session,
             "live_pose": session.get("live_pose") or self._current_live_pose(),
             "updated_at": time.time(),
-        }
+        })
         if persist:
             self._persist_relocalization_state(payload)
         callback = getattr(self, "_attempt_progress_cb", None)

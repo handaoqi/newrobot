@@ -250,10 +250,11 @@ function canonicalTimelineStage(value) {
 }
 
 function timelineStatusClass(status) {
-  if (status === 'accepted' || status === 'succeeded' || status === 'done') return 'done'
-  if (status === 'rejected' || status === 'failed' || status === 'unavailable') return 'failed'
-  if (status === 'searching' || status === 'running' || status === 'verifying' || status === 'executing') return 'active'
-  if (status === 'skipped') return 'skipped'
+  const normalized = String(status || '').trim().toLowerCase().replace(/[-\s]/g, '_')
+  if (['accepted', 'succeeded', 'done', 'completed'].includes(normalized)) return 'done'
+  if (['rejected', 'failed', 'unavailable', 'error'].includes(normalized)) return 'failed'
+  if (['searching', 'running', 'verifying', 'executing', 'active', 'started', 'in_progress'].includes(normalized)) return 'active'
+  if (['skipped', 'cancelled', 'canceled'].includes(normalized)) return 'skipped'
   return 'waiting'
 }
 
@@ -296,8 +297,9 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
 }
 
 function inferredStageStatus(session, stageKey, attempts, stageRecord) {
-  if (stageRecord?.status) return stageRecord.status
   if (attempts.some(attempt => attempt.status === 'verifying' || attempt.status === 'started')) return 'searching'
+  if (stageRecord?.status && timelineStatusClass(stageRecord.status) !== 'waiting') return stageRecord.status
+  if (stageRecord?.status) return stageRecord.status
   if (attempts.some(attempt => attempt.status === 'accepted')) return 'accepted'
   if (attempts.length && attempts.every(attempt => ['rejected', 'failed', 'skipped'].includes(attempt.status))) return 'rejected'
   const selectedStage = canonicalTimelineStage(session?.selectedStage)

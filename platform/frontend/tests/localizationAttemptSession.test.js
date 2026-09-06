@@ -225,6 +225,38 @@ test('timeline does not timestamp future stages and keeps displayed times chrono
   assert.equal(global.finishedAt, null)
 })
 
+test('active attempts override a stale waiting stage record', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-active-origin',
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    started_at: '2026-09-06T13:39:00.000Z',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        strategy: ['mapping_origin_bounded', 'route_waypoints'],
+        selected_stage: 'mapping_origin_bounded',
+        stages: [{
+          stage: 'mapping_origin_bounded',
+          status: 'waiting',
+          started_at: '2026-09-06T13:39:36.300Z',
+        }],
+        attempts: [{
+          index: 1,
+          stage: 'mapping_origin_bounded',
+          status: 'verifying',
+          x: 0,
+          y: 0,
+          yaw: 0,
+        }],
+      },
+    },
+  })
+  const origin = localizationAttemptTimeline(session).find(item => item.key === 'mapping_origin_bounded')
+  assert.equal(origin.status, 'active')
+  assert.equal(origin.startedAt, '2026-09-06T13:39:36.300Z')
+})
+
 test('manual initial-pose command does not display unrelated global-search stages', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-manual',

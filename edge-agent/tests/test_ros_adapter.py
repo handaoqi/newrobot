@@ -503,6 +503,40 @@ def test_progressive_relocalize_falls_back_to_keyframe_global_match():
     assert result["stages"][-1]["status"] == "accepted"
 
 
+def test_bounded_stage_progress_preserves_active_stage_and_timestamps():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 15
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    progress = []
+    adapter._attempt_progress_cb = lambda payload: progress.append(payload)
+    adapter._set_initial_pose_once = lambda _pose, _generation: (_ for _ in ()).throw(
+        ProtocolError("INITIAL_POSE_NOT_ACCEPTED", "no local match", details={})
+    )
+    with pytest.raises(ProtocolError):
+        adapter._active_relocalize_once({
+            "x": 0.0,
+            "y": 0.0,
+            "yaw": 0.0,
+            "source": "mapping_origin",
+            "stage": "mapping_origin_bounded",
+            "stage_started_at": "2026-09-06T13:39:36.300Z",
+            "max_attempts": 1,
+            "wait_seconds": 1,
+            "candidate_wait_seconds": 1,
+        }, 15, persist_state=False)
+
+    assert progress[0]["localization_attempts"]["selected_stage"] == "mapping_origin_bounded"
+    assert progress[0]["localization_attempts"]["stages"][0]["status"] == "searching"
+    final_stage = progress[-1]["localization_attempts"]["stages"][0]
+    assert final_stage["status"] == "failed"
+    assert final_stage["started_at"] == "2026-09-06T13:39:36.300Z"
+    assert final_stage["finished_at"] >= final_stage["started_at"]
+
+
 def test_operator_initial_pose_commits_verified_ndt_match():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 9
