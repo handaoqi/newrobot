@@ -24,14 +24,17 @@ export function buildProgressiveLocalizationPayload({
   sceneScope = 'indoor',
   coordinateMode = 'local_only',
 }) {
-  waypoints.forEach(normalizeWaypoint)
+  const normalizedWaypoints = waypoints.map(normalizeWaypoint)
+  const waitSeconds = Math.min(
+    900,
+    Math.max(180, 60 + (normalizedWaypoints.length + 1) * 8),
+  )
   return {
-    seed_source: 'quick_then_global',
+    seed_source: 'progressive',
     map_id: mapId,
     map_version: mapVersion,
-    scene_scope: sceneScope,
-    coordinate_mode: coordinateMode,
-    wait_seconds: 120,
+    waypoints: normalizedWaypoints,
+    wait_seconds: waitSeconds,
   }
 }
 
@@ -73,6 +76,7 @@ export async function initializeProgressiveLocalization({
   onProgress = () => {},
   onCommand = () => {},
   dependencies = {},
+  traceId = '',
 }) {
   const activateMap = dependencies.activateRouteMap
   const sendCommand = dependencies.sendRobotNavigationCommand
@@ -87,6 +91,7 @@ export async function initializeProgressiveLocalization({
     mapVersion,
     onProgress,
     onCommand,
+    traceId,
   })
 
   let rtkAttempt = null
@@ -100,7 +105,7 @@ export async function initializeProgressiveLocalization({
         wait_seconds: 30,
         start_navigation: true,
       }
-      const createdRtkCommand = await sendCommand(robotId, 'initial-pose', rtkPayload)
+      const createdRtkCommand = await sendCommand(robotId, 'initial-pose', rtkPayload, { traceId })
       const command = await waitCommand(robotId, createdRtkCommand, {
         timeoutMs: 90_000,
         onProgress: latest => {
@@ -125,22 +130,22 @@ export async function initializeProgressiveLocalization({
   }
 
   const payload = buildProgressiveLocalizationPayload({
-    mapId, mapVersion, waypoints, sceneScope, coordinateMode,
+    mapId, mapVersion, waypoints,
   })
-  onProgress('地图已下发，先进行30秒快速定位；未找到合格解时再启动全局搜索')
-  const createdCommand = await sendCommand(robotId, 'relocalize', payload)
+  onProgress('地图已下发，依次尝试建图原点、原点周边候选和路线航点，失败后进入全局搜索')
+  const createdCommand = await sendCommand(robotId, 'relocalize', payload, { traceId })
   const command = await waitCommand(robotId, createdCommand, {
     timeoutMs: progressiveLocalizationTimeoutMs(payload),
     onProgress: latest => {
-      onProgress(`快速定位/全局回退 · ${latest.status || 'created'}`)
-      onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'quick_then_global' })
+      onProgress(`原点/航点候选搜索 · ${latest.status || 'created'}`)
+      onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'progressive' })
     },
   })
   return {
     activation,
     payload,
     command,
-    selectedSource: 'quick_then_global',
+    selectedSource: 'progressive',
     rtkAttempted: Boolean(rtkAttempt),
     rtkAttempt,
   }
