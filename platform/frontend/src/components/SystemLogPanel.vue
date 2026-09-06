@@ -217,7 +217,10 @@ function inspect(item) {
 
 function clock(value) {
   if (!value) return '—'
-  return new Date(value).toLocaleTimeString('zh-CN', { hour12: false, fractionalSecondDigits: 3 })
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return '—'
+  const pad = part => String(part).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 watch([() => props.robotId, () => props.mapId], restartPolling, { immediate: true })
