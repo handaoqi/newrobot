@@ -2321,7 +2321,7 @@ function formatDateTime(value) {
   if (!value) return '—'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return String(value)
-  return date.toLocaleTimeString()
+  return formatClock(date)
 }
 
 function formatDateTimeWithAge(value) {
@@ -2329,8 +2329,13 @@ function formatDateTimeWithAge(value) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return String(value)
   const ageSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000))
-  if (ageSeconds < 60) return `${date.toLocaleTimeString()} / ${ageSeconds}s前`
-  return `${date.toLocaleTimeString()} / ${Math.floor(ageSeconds / 60)}分钟前`
+  if (ageSeconds < 60) return `${formatClock(date)} / ${ageSeconds}s前`
+  return `${formatClock(date)} / ${Math.floor(ageSeconds / 60)}分钟前`
+}
+
+function formatClock(date) {
+  const pad = value => String(value).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 function sampleIsStale(value, thresholdMs = 10000) {
