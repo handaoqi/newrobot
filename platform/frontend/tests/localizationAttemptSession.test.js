@@ -47,6 +47,7 @@ test('command progress snapshots keep candidate order and hide transfer-phase ma
   assert.equal(session.commandId, 'cmd-1')
   assert.equal(session.attempts.length, 3)
   assert.deepEqual(session.attempts.map(item => item.index), [1, 2, 3])
+  assert.deepEqual(session.attempts.map(item => item.candidateNumber), [1, 2, 3])
   assert.equal(session.attempts[1].matchingError, 0.12)
   assert.equal(session.attempts[1].inlierFraction, 0.81)
   assert.equal(formatAttemptPose(session.livePose), 'x 1.100 / y 2.200 / yaw 0.300')

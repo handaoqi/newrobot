@@ -95,8 +95,15 @@ function normalizeAttempt(attempt, index) {
     ? attempt.ndt_candidate
     : {}
   const seed = attemptSeedPose(attempt)
+  const candidateNumber = Number(
+    attempt?.candidate_number ?? attempt?.candidateNumber ?? attempt?.index,
+  )
+  const displayNumber = Number.isFinite(candidateNumber) ? candidateNumber : index + 1
   return {
-    index: Number.isFinite(Number(attempt?.index)) ? Number(attempt.index) : index + 1,
+    // Keep index for protocol compatibility; candidateNumber is the one
+    // display identity shared by the map marker and the stage list.
+    index: displayNumber,
+    candidateNumber: displayNumber,
     status: String(attempt?.status || 'waiting'),
     seedPose: seed,
     livePose: finitePose(attempt?.live_pose || attempt?.livePose),
@@ -271,7 +278,7 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
   })
   const recordAttemptIndexes = new Set(
     (stageRecord?.attempts || [])
-      .map(attempt => Number(attempt?.index))
+      .map(attempt => Number(attempt?.candidate_number ?? attempt?.candidateNumber ?? attempt?.index))
       .filter(index => Number.isFinite(index)),
   )
   const attempts = (session?.attempts || []).filter(attempt => (
@@ -279,7 +286,7 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
     || (stageKey === 'mapping_origin_bounded' && attempt.source === 'mapping_origin')
     || (stageKey === 'mapping_origin_bounded'
       && !attempt.stage
-      && (session?.source === 'mapping_origin' || recordAttemptIndexes.has(Number(attempt.index))))
+      && (session?.source === 'mapping_origin' || recordAttemptIndexes.has(Number(attempt.candidateNumber))))
   ))
   if (attempts.length || !Array.isArray(stageRecord?.attempts)) return attempts
   return stageRecord.attempts.map((attempt, index) => normalizeAttempt({
@@ -543,7 +550,12 @@ export function readStoredAttemptSession(robotId) {
     const raw = sessionStorage.getItem(localizationAttemptStorageKey(robotId))
     if (!raw) return null
     const session = JSON.parse(raw)
-    return withAttemptMarkerExpiry(session)
+    return withAttemptMarkerExpiry({
+      ...session,
+      attempts: Array.isArray(session.attempts)
+        ? session.attempts.map(normalizeAttempt)
+        : [],
+    })
   } catch {
     return null
   }

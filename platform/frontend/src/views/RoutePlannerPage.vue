@@ -3437,11 +3437,11 @@ async function handleDeleteRoute(route) {
                       <div v-if="step.attempts.length" class="localization-timeline-attempts">
                         <div
                           v-for="attempt in step.attempts"
-                          :key="`${step.key}-${attempt.index}`"
+                          :key="`${step.key}-${attempt.candidateNumber}`"
                           class="localization-timeline-attempt"
                           :class="attemptStatusClass(attempt.status)"
                         >
-                          <b>#{{ attempt.index }}</b>
+                          <b>#{{ attempt.candidateNumber }}</b>
                           <span>{{ attemptStatusLabel(attempt.status) }}</span>
                           <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
                           <small v-if="attempt.matchingError !== null">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
@@ -3666,13 +3666,13 @@ async function handleDeleteRoute(route) {
                     </div>
                     <div
                       v-for="attempt in visibleAttemptMarkers"
-                      :key="`attempt-${attempt.index}`"
+                      :key="`attempt-${attempt.candidateNumber}`"
                       class="localization-attempt-marker"
                       :class="attemptStatusClass(attempt.status)"
                       :style="attemptMarkerPosition(attempt)"
-                      :title="`候选 ${attempt.index} ${attemptStatusLabel(attempt.status)} ${formatAttemptPose(attempt.seedPose)}`"
+                      :title="`候选 ${attempt.candidateNumber} ${attemptStatusLabel(attempt.status)} ${formatAttemptPose(attempt.seedPose)}`"
                     >
-                      {{ attempt.index }}
+                      {{ attempt.candidateNumber }}
                     </div>
                     <div
                       v-for="marker in (showLocalizationAttemptPoints ? relocalizationMarkers : [])"
