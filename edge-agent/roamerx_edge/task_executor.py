@@ -22,6 +22,7 @@ from .map_coordinate import (
 from .map_package_finalize import load_map_manifest
 from .protocol import MessageEnvelope, ProtocolError, now_iso
 from .localization_recovery import select_recovery_seed
+from .recovery_arbiter import RecoveryArbiter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -300,6 +301,7 @@ class TaskExecutor:
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
         self._obstacle_recovery_active = False
+        self._recovery_arbiter = RecoveryArbiter()
         self._expected_recovery_cancels = 0
         self._bypass_active = False
         self._task_started_at = None
@@ -523,6 +525,10 @@ class TaskExecutor:
         cancel = getattr(self.navigation, "cancel_navigation", None)
         velocity = getattr(self.navigation, "teleop_velocity", None)
         stop = getattr(self.navigation, "stop_motion", None)
+        lease = self._recovery_arbiter.acquire("EDGE_OBSTACLE", "obstacle_reverse")
+        if lease is None:
+            LOGGER.warning("obstacle reverse skipped; another recovery owns movement: %s", self._recovery_arbiter.snapshot())
+            return
         self._obstacle_recovery_active = True
         try:
             if callable(cancel):
@@ -557,6 +563,7 @@ class TaskExecutor:
             self._redispatch_after_obstacle_recovery()
         finally:
             self._obstacle_recovery_active = False
+            self._recovery_arbiter.release(lease)
 
     def _redispatch_after_obstacle_recovery(self) -> None:
         if not self.context or self.context.state != "running":
