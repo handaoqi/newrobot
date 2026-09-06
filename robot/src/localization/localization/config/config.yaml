@@ -321,13 +321,13 @@ localization:
       initial_pose_settle_seconds: 0.75
       map_settle_seconds: 2.0
       # 兼容旧配置；新部署使用 scan_context_runtime_mode。true 等价于 active。
-      use_scan_context: false
+      use_scan_context: true
       # disabled: 不加载/运行；shadow: 后台运行检索和真实 GICP/ICP 但不写入位姿；
-      # active: 几何门通过后才允许把候选送入全图 ICP。地图149先以 shadow 采集现场样本；
-      # 自动成功率>=95%、误接受=0、误差<=0.30m/5deg 后才改为 active。
-      scan_context_runtime_mode: shadow
-      active_map_paths:
-        - /home/dogrobot/runtime/nx-edge/data/jszr/map/20260828_205712_005
+      # active: 几何门通过后才允许把候选送入全图 ICP。
+      scan_context_runtime_mode: active
+      # 不配置 active_map_paths 表示所有已加载且包含完整 scan_context 数据的地图，
+      # 这样新建地图无需再次修改配置或加入固定白名单。ROS 2 Humble 对空 YAML
+      # 序列解析为“无参数值”，因此必须省略该键，使用节点声明的空列表默认值。
       top_k: 10
       max_seeds_per_attempt: 10
       prefilter_candidates: 60

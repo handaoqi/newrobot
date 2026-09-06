@@ -2724,7 +2724,7 @@ private:
         << ",\"attempt_total\":" << relocalization_attempt_total_
         << ",\"best_source\":\"" << relocalization_best_source_
         << "\",\"best_score\":" << relocalization_best_score_
-        << "\",\"required\":" << (global_search_required_ ? "true" : "false")
+        << ",\"required\":" << (global_search_required_ ? "true" : "false")
         << ",\"candidate_applied\":" << (global_candidate_applied_ ? "true" : "false")
         << ",\"keyframe\":" << global_candidate_keyframe_
         << ",\"descriptor_distance\":" << global_candidate_distance_
