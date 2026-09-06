@@ -6,6 +6,7 @@ import {
   ATTEMPT_MARKER_VISIBLE_MS,
   emptyAttemptSession,
   formatAttemptPose,
+  localizationAttemptTimeline,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   shouldShowAttemptMarkers,
@@ -67,6 +68,103 @@ test('new operations start from an empty session and accepted status uses a dist
   assert.equal(attemptStatusClass('accepted'), 'accepted')
   assert.equal(attemptStatusClass('verifying'), 'active')
   assert.equal(attemptStatusClass('rejected'), 'failed')
+})
+
+test('localization timeline exposes ordered stages and every candidate result', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-timeline',
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    result_payload: {
+      localization_attempts: {
+        state: 'global_searching',
+        strategy: ['mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match'],
+        selected_stage: 'keyframe_global_match',
+        global_search_started: true,
+        stages: [
+          { stage: 'mapping_origin_bounded', status: 'rejected' },
+          { stage: 'route_waypoints', status: 'rejected' },
+          { stage: 'keyframe_global_match', status: 'searching' },
+        ],
+        attempts: [
+          { index: 1, stage: 'mapping_origin', status: 'rejected', x: 0, y: 0, yaw: 0, reject_reason: 'quality_gate' },
+          { index: 2, stage: 'route_waypoint', status: 'rejected', x: 2, y: 3, yaw: 0.2, reject_reason: 'quality_gate' },
+        ],
+      },
+    },
+  })
+
+  const timeline = localizationAttemptTimeline(session)
+  assert.deepEqual(timeline.map(step => step.key), [
+    'map_transfer',
+    'localization_bootstrap',
+    'mapping_origin_bounded',
+    'route_waypoints',
+    'keyframe_global_match',
+    'best_candidate_commit',
+    'navigation_start',
+  ])
+  assert.equal(timeline[0].status, 'done')
+  assert.equal(timeline[2].status, 'failed')
+  assert.equal(timeline[3].attempts.length, 1)
+  assert.equal(timeline[4].status, 'active')
+  assert.equal(timeline[5].status, 'waiting')
+})
+
+test('timeline preserves the RTK phase when it falls back to progressive localization', () => {
+  const rtk = localizationAttemptSessionFromCommand({
+    id: 'cmd-rtk',
+    command_type: 'nav.initial_pose',
+    status: 'failed',
+  }, { phase: 'localization', source: 'rtk' })
+  const progressive = localizationAttemptSessionFromCommand({
+    id: 'cmd-progressive',
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        strategy: ['mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match'],
+      },
+    },
+  }, {
+    phase: 'localization',
+    timelineHistory: localizationAttemptTimeline(rtk),
+  })
+
+  const timeline = localizationAttemptTimeline(progressive)
+  assert.deepEqual(timeline.map(step => step.key), [
+    'map_transfer',
+    'localization_bootstrap',
+    'rtk_fixed',
+    'mapping_origin_bounded',
+    'route_waypoints',
+    'keyframe_global_match',
+    'best_candidate_commit',
+    'navigation_start',
+  ])
+  assert.equal(timeline[2].status, 'failed')
+  assert.equal(timeline[3].status, 'active')
+})
+
+test('manual initial-pose command does not display unrelated global-search stages', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-manual',
+    command_type: 'nav.initial_pose',
+    status: 'succeeded',
+    result_payload: {
+      best_match_pose: { x: 1, y: 2, yaw: 0.1 },
+      best_ndt_committed: true,
+    },
+  })
+  const timeline = localizationAttemptTimeline(session)
+  assert.deepEqual(timeline.map(step => step.key), [
+    'map_transfer',
+    'localization_bootstrap',
+    'operator_initial_pose',
+    'best_candidate_commit',
+  ])
+  assert.equal(timeline[2].status, 'done')
 })
 
 test('refresh restore keeps the committed best match pose', () => {

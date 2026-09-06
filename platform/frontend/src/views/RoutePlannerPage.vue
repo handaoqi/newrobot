@@ -70,6 +70,7 @@ import {
   emptyAttemptSession,
   formatAttemptMetric,
   formatAttemptPose,
+  localizationAttemptTimeline,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   readStoredAttemptSession,
@@ -1895,7 +1896,13 @@ function maybeRegisterAttemptRelocalizationMarker(session) {
 
 function applyLocalizationAttemptCommand(command, extras = {}) {
   if (!command) return
-  const session = localizationAttemptSessionFromCommand(command, extras)
+  const timelineHistory = localizationAttemptSession.value
+    ? localizationAttemptTimeline(localizationAttemptSession.value)
+    : []
+  const session = localizationAttemptSessionFromCommand(command, {
+    ...extras,
+    timelineHistory,
+  })
   if (!session) return
   localizationAttemptSession.value = session
   const robotId = selectedRobot.value?.id
@@ -3400,15 +3407,36 @@ async function handleDeleteRoute(route) {
                     · 内点 {{ localizationAttemptSession.bestNdtCandidate.inlier_fraction == null ? '—' : `${(Number(localizationAttemptSession.bestNdtCandidate.inlier_fraction) * 100).toFixed(1)}%` }}
                   </span>
                 </p>
-                <ol v-if="localizationAttemptSession.showCandidates && localizationAttemptSession.attempts.length" class="localization-attempt-list">
-                  <li v-for="attempt in localizationAttemptSession.attempts" :key="attempt.index" :class="attemptStatusClass(attempt.status)">
-                    <strong>{{ attempt.index }}</strong>
-                    <span>{{ attemptStatusLabel(attempt.status) }}</span>
-                    <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
-                    <small v-if="attempt.livePose">实时 {{ formatAttemptPose(attempt.livePose) }}</small>
-                    <small v-if="attempt.matchingError !== null">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
-                    <small v-if="attempt.inlierFraction !== null">内点 {{ (attempt.inlierFraction * 100).toFixed(1) }}%</small>
-                    <small v-if="attempt.rejectReason">{{ attempt.rejectReason }}</small>
+                <ol v-if="localizationAttemptSession" class="localization-attempt-timeline">
+                  <li
+                    v-for="(step, stepIndex) in localizationAttemptTimeline(localizationAttemptSession)"
+                    :key="step.key"
+                    class="localization-timeline-step"
+                    :class="step.status"
+                  >
+                    <span class="localization-timeline-node">{{ stepIndex + 1 }}</span>
+                    <div class="localization-timeline-content">
+                      <div class="localization-timeline-heading">
+                        <strong>{{ step.title }}</strong>
+                        <span>{{ step.statusLabel }}</span>
+                      </div>
+                      <small>{{ step.detail }}</small>
+                      <div v-if="step.attempts.length" class="localization-timeline-attempts">
+                        <div
+                          v-for="attempt in step.attempts"
+                          :key="`${step.key}-${attempt.index}`"
+                          class="localization-timeline-attempt"
+                          :class="attemptStatusClass(attempt.status)"
+                        >
+                          <b>#{{ attempt.index }}</b>
+                          <span>{{ attemptStatusLabel(attempt.status) }}</span>
+                          <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
+                          <small v-if="attempt.matchingError !== null">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
+                          <small v-if="attempt.inlierFraction !== null">内点 {{ (attempt.inlierFraction * 100).toFixed(1) }}%</small>
+                          <small v-if="attempt.rejectReason">{{ attempt.rejectReason }}</small>
+                        </div>
+                      </div>
+                    </div>
                   </li>
                 </ol>
               </div>
@@ -5611,6 +5639,95 @@ async function handleDeleteRoute(route) {
 .localization-attempt-list li.accepted { background: #ecfdf5; }
 .localization-attempt-list li.active { background: #fff7ed; }
 .localization-attempt-list li.failed { background: #fef2f2; }
+.localization-attempt-timeline {
+  position: relative;
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.55rem 0 0;
+  padding: 0 0 0 1.7rem;
+  list-style: none;
+}
+.localization-attempt-timeline::before {
+  content: '';
+  position: absolute;
+  top: 0.7rem;
+  bottom: 0.7rem;
+  left: 0.55rem;
+  width: 2px;
+  background: #cbd5e1;
+}
+.localization-timeline-step {
+  position: relative;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+}
+.localization-timeline-step.active { border-color: #fbbf24; background: #fffbeb; }
+.localization-timeline-step.done { border-color: #86efac; background: #f0fdf4; }
+.localization-timeline-step.failed { border-color: #fca5a5; background: #fef2f2; }
+.localization-timeline-step.skipped { opacity: 0.72; }
+.localization-timeline-node {
+  position: absolute;
+  top: 0.55rem;
+  left: -1.7rem;
+  z-index: 1;
+  display: grid;
+  width: 1.15rem;
+  height: 1.15rem;
+  place-items: center;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  color: #fff;
+  background: #94a3b8;
+  box-shadow: 0 0 0 1px #cbd5e1;
+  font-size: 0.65rem;
+  font-weight: 800;
+}
+.localization-timeline-step.active .localization-timeline-node { background: #f59e0b; }
+.localization-timeline-step.done .localization-timeline-node { background: #16a34a; }
+.localization-timeline-step.failed .localization-timeline-node { background: #dc2626; }
+.localization-timeline-content { min-width: 0; }
+.localization-timeline-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.localization-timeline-heading strong { color: #0f172a; }
+.localization-timeline-heading span {
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  color: #475569;
+  background: #e2e8f0;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+.localization-timeline-step.active .localization-timeline-heading span { color: #92400e; background: #fde68a; }
+.localization-timeline-step.done .localization-timeline-heading span { color: #166534; background: #bbf7d0; }
+.localization-timeline-step.failed .localization-timeline-heading span { color: #991b1b; background: #fecaca; }
+.localization-timeline-content > small { display: block; margin-top: 0.18rem; color: #64748b; line-height: 1.35; }
+.localization-timeline-attempts {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+  padding-left: 0.45rem;
+  border-left: 2px solid #e2e8f0;
+}
+.localization-timeline-attempt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 5px;
+  background: #f8fafc;
+  font-size: 0.7rem;
+}
+.localization-timeline-attempt.active { background: #fff7ed; }
+.localization-timeline-attempt.accepted { background: #ecfdf5; }
+.localization-timeline-attempt.failed { background: #fef2f2; }
+.localization-timeline-attempt small { color: #64748b; }
 .localization-attempt-marker {
   position: absolute;
   width: 22px;
