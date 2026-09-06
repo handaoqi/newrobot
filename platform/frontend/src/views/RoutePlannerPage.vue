@@ -1314,12 +1314,16 @@ async function handleSaveRoute() {
   navError.value = ''
   localizationInitState.value = 'waiting_convergence'
   localizationInitMessage.value = '路线已保存，正在准备地图、定位与导航栈'
+  beginLocalizationAttemptSession({ phase: 'transfer', commandType: 'map.activate' })
   try {
     const result = await activateAndRelocalizeMap({
       mapId: savedRoute.map_data,
       robotId: savedRoute.robot,
+      sceneScope: routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor',
+      coordinateMode: selectedMap.value?.coordinate_mode || 'local_only',
       traceId,
       onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => applyLocalizationAttemptCommand(event.command, event),
     })
     navStatus.value = result.navigationStatus
     localizationInitState.value = 'done'
