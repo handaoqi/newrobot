@@ -221,6 +221,7 @@ const GLOBAL_CONTROLLER_OPTIONS = [
   { value: 'theta_star', label: 'Theta*' },
   { value: 'navfn', label: 'NavFn (A*)' },
 ]
+const DEFAULT_GLOBAL_CONTROLLER = 'theta_star'
 
 const routeForm = ref({
   name: '',
@@ -229,7 +230,6 @@ const routeForm = ref({
   robot: null,
   description: '',
   scene_scope: 'indoor',
-  global_controller: 'theta_star',
 })
 const allWaypointsExpanded = computed(() => (
   waypoints.value.length > 0
@@ -594,7 +594,6 @@ async function handleMapSelect(map) {
     robot: routeForm.value.robot || robots.value[0]?.id || map?.robot || 1,
     description: '',
     scene_scope: map?.scene_scope || 'indoor',
-    global_controller: 'theta_star',
   }
   refreshImageGeometry()
   refreshNavigationStatus()
@@ -874,7 +873,7 @@ async function executeSingleGoal(index) {
       y: Number(point.y),
       yaw: Number(point.yaw || 0),
       require_yaw: Boolean(point.require_yaw),
-      global_controller: normalizeGlobalController(point.global_controller || routeForm.value.global_controller),
+      global_controller: normalizeGlobalController(point.global_controller || DEFAULT_GLOBAL_CONTROLLER),
       map_id: selectedMap.value.id,
       map_version: selectedMapVersion(),
     })
@@ -1288,7 +1287,9 @@ async function handleSaveRoute() {
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
     scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
-    global_controller: normalizeGlobalController(routeForm.value.global_controller),
+    // Keep the legacy route-level field for older consumers; actual planner
+    // selection is carried by each waypoint below.
+    global_controller: DEFAULT_GLOBAL_CONTROLLER,
   }
 
   let savedRoute
@@ -1388,7 +1389,6 @@ async function handleLoadRoute(route) {
   if (loadSequence !== routeLoadSequence) return
   const mapChanged = String(routeMap?.id) !== String(selectedMap.value?.id)
   selectedMap.value = routeMap
-  routeForm.value.global_controller = routeGlobalController
   waypoints.value = hydratedRoute.waypoints.map(point => {
     const normalizedPoint = Array.isArray(point)
       ? { x: point[0], y: point[1], yaw: point[2] || 0 }
@@ -1438,7 +1438,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     speech_text: point.speech_text || '',
     localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
     local_controller: normalizeLocalController(point.local_controller),
-    global_controller: normalizeGlobalController(point.global_controller || routeForm.value.global_controller),
+    global_controller: normalizeGlobalController(point.global_controller || DEFAULT_GLOBAL_CONTROLLER),
     avoidance_to_next: point.avoidance_to_next !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
@@ -1493,7 +1493,7 @@ function withWaypointYaw(points) {
       speech_template_name: current.speech_template_name || '',
       localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
       local_controller: normalizeLocalController(current.local_controller),
-      global_controller: normalizeGlobalController(current.global_controller || routeForm.value.global_controller),
+      global_controller: normalizeGlobalController(current.global_controller || DEFAULT_GLOBAL_CONTROLLER),
       avoidance_to_next: current.avoidance_to_next !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
@@ -2874,7 +2874,7 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     v: Number((imageY / geometry.mapHeight).toFixed(8)),
     localization_mode: 'ndt',
     local_controller: 'mppi',
-    global_controller: normalizeGlobalController(routeForm.value.global_controller),
+    global_controller: DEFAULT_GLOBAL_CONTROLLER,
     avoidance_to_next: true,
     require_yaw: false,
     dwell_seconds: 0,
@@ -2954,14 +2954,6 @@ async function handleDeleteRoute(route) {
                 <option value="indoor">室内</option>
                 <option value="transition" :disabled="mapIsLocalOnly">室内外过渡</option>
                 <option value="outdoor" :disabled="mapIsLocalOnly">室外</option>
-              </select>
-            </label>
-            <label>
-              <span>全局控制器</span>
-              <select v-model="routeForm.global_controller">
-                <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
-                  {{ option.label }}
-                </option>
               </select>
             </label>
           </div>
@@ -3069,9 +3061,9 @@ async function handleDeleteRoute(route) {
                         </select>
                       </label>
                       <label>
-                        <span>全局控制器</span>
+                        <span>全局规划器</span>
                         <select
-                          :value="point.global_controller || routeForm.global_controller || 'theta_star'"
+                          :value="point.global_controller || DEFAULT_GLOBAL_CONTROLLER"
                           @change="setWaypointGlobalController(index, $event.target.value)"
                         >
                           <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
@@ -3412,17 +3404,6 @@ async function handleDeleteRoute(route) {
                   <button type="button" :class="{ active: mapClickMode === 'inspect' }" @click="setMapClickMode('inspect')">查看位置</button>
                   <button type="button" :class="{ active: boundaryEditing }" @click="toggleBoundaryEditing">边界编辑</button>
                 </div>
-                <span
-                  class="map-mode-inline"
-                  :class="{ error: mapInteractionError }"
-                  :title="boundaryEditing ? '选择区域类型后在地图上依次点击顶点，至少三个点后闭合' : (mapInteractionError || mapModeHintText())"
-                >
-                  <strong>{{ boundaryEditing ? '边界编辑' : (mapClickMode === 'waypoint' ? '添加途经点' : '查看位置') }}</strong>
-                  <span>{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
-                </span>
-                <span class="mapping-trace-summary">
-                  {{ mappingTraceLoading ? '正在加载关键帧' : `关键帧 ${mappingTrace.length} 个` }}
-                </span>
                 <div class="map-display-controls">
                   <button type="button" title="缩小" aria-label="缩小" :disabled="mapZoom <= MAP_ZOOM_MIN" @click="adjustMapZoom(-MAP_ZOOM_STEP)">−</button>
                   <button type="button" class="map-zoom-value" title="恢复 100%" @click="resetMapZoom">{{ Math.round(mapZoom * 100) }}%</button>
@@ -3431,6 +3412,14 @@ async function handleDeleteRoute(route) {
                     {{ showMappingTrace ? '隐藏轨迹' : '显示轨迹' }}
                   </button>
                 </div>
+              </div>
+              <div
+                class="map-mode-hint"
+                :class="{ error: mapInteractionError }"
+                :title="boundaryEditing ? '选择区域类型后在地图上依次点击顶点，至少三个点后闭合' : (mapInteractionError || mapModeHintText())"
+              >
+                <strong>{{ boundaryEditing ? '边界编辑' : (mapClickMode === 'waypoint' ? '添加途经点' : '查看位置') }}</strong>
+                <span>{{ boundaryEditing ? '依次点击顶点后闭合' : (mapInteractionError || mapModeHintText()) }}</span>
               </div>
               <div :class="['boundary-policy-status', boundaryStatusPresentation().tone]">
                 <strong>{{ boundaryStatusPresentation().title }}</strong>
@@ -3720,7 +3709,7 @@ async function handleDeleteRoute(route) {
   --route-main-action-height: 38px;
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.15fr) minmax(190px, 0.6fr) minmax(300px, 0.9fr);
-  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto;
+  grid-template-rows: auto minmax(620px, calc(100vh - 170px)) auto auto auto;
   column-gap: 1rem;
   row-gap: 0.45rem;
   height: auto;
@@ -3885,7 +3874,7 @@ async function handleDeleteRoute(route) {
 
 .route-step-5 {
   grid-column: 1 / -1;
-  grid-row: 4;
+  grid-row: 5;
   align-self: start;
   overflow: visible;
 }
@@ -4705,16 +4694,15 @@ async function handleDeleteRoute(route) {
   font-size: 0.72rem;
 }
 
-.map-mode-inline {
+.map-mode-hint {
   display: flex;
-  min-width: 150px;
-  height: 34px;
   min-height: 34px;
+  width: 100%;
   box-sizing: border-box;
-  flex: 1 1 220px;
   align-items: center;
   gap: 0.45rem;
   overflow: hidden;
+  margin-top: 0.55rem;
   padding: 0.35rem 0.55rem;
   border: 1px solid #bcd7ff;
   border-radius: 5px;
@@ -4723,18 +4711,18 @@ async function handleDeleteRoute(route) {
   font-size: 0.72rem;
 }
 
-.map-mode-inline strong {
+.map-mode-hint strong {
   flex: 0 0 auto;
   color: #175cd3;
 }
 
-.map-mode-inline > span {
+.map-mode-hint > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.map-mode-inline.error {
+.map-mode-hint.error {
   border-color: #fda29b;
   color: #b42318;
   background: #fff5f5;
@@ -4763,8 +4751,8 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
-  grid-column: 4;
-  grid-row: 3;
+  grid-column: 1 / span 3;
+  grid-row: 4;
   min-width: 0;
   min-height: 0;
   max-height: 58px;
@@ -5242,18 +5230,6 @@ async function handleDeleteRoute(route) {
   border-bottom: 6px solid transparent;
   border-left: 8px solid #b42318;
   content: '';
-}
-
-.mapping-trace-summary {
-  flex: 0 0 auto;
-  padding: 7px 10px;
-  border: 1px solid #99d5ce;
-  border-radius: 4px;
-  color: #115e59;
-  background: #f0fdfa;
-  font-size: 0.72rem;
-  font-weight: 700;
-  white-space: nowrap;
 }
 
 .map-inspection-list {
@@ -5886,7 +5862,7 @@ async function handleDeleteRoute(route) {
 [data-theme="dark"] .localization-debug-panel,
 [data-theme="dark"] .waypoint-item,
 [data-theme="dark"] .route-item,
-[data-theme="dark"] .map-mode-inline,
+[data-theme="dark"] .map-mode-hint,
 [data-theme="dark"] .initial-pose-panel,
 [data-theme="dark"] .route-save-hints,
 [data-theme="dark"] .map-inspection-row {
@@ -5958,7 +5934,7 @@ async function handleDeleteRoute(route) {
   background: rgba(67, 213, 255, 0.12);
 }
 
-[data-theme="dark"] .map-mode-inline {
+[data-theme="dark"] .map-mode-hint {
   color: var(--text);
   background: rgba(67, 213, 255, 0.1);
 }
@@ -6021,7 +5997,7 @@ async function handleDeleteRoute(route) {
   .map-display-controls,
   .map-click-mode { flex: 0 0 auto; justify-content: flex-start; }
   .map-click-mode button { flex: 0 0 auto; min-width: 82px; }
-  .map-mode-inline { min-width: 140px; flex-basis: 180px; }
+  .map-mode-hint { min-height: 34px; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
   .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
   .waypoint-heading-input input { min-width: 0; }
