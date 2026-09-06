@@ -20,8 +20,13 @@
 | 7 | 已完成（代码/单测） | `dwell_seconds` 在 `arrival_confirmed` 后由 Edge 单调时钟异步执行，并与定位、阻塞语音共同作为下一段放行门；暂停/取消不再误取消已结束的 Nav2 goal。 |
 | 8 | 待现场验证 | 在设备上逐项选择四种组合，读回 action goal 的插件 ID、参数值及规划/控制性能日志，并测量 dwell 误差。 |
 | 9 | 待执行 | 到点确认新鲜位姿/连续多帧、完整 `LegProfile`、恢复仲裁器和统一幂等键。 |
+| 10 | 已完成（代码/构建） | 主动重定位种子按手选点/当前种子 → 可信位姿 → 建图原点 → 原点附近四方向 → 航线/Scan Context 候选执行，并记录每次尝试。 |
+| 11 | 已完成（代码/构建） | NDT 健康且分数 `<=0.01` 时立即采用最优绝对变换，停止剩余初始化尝试并进入 `localized`。 |
 
 本轮明确不合并航点：每个航点完成校正和业务确认后，才以校正后的新鲜位姿生成下一段；`NavigateThroughPoses` 保留为底层能力但不作为默认业务路径。
+
+主动重定位过程通过 `/localization/decision` 的 `global_relocalization` 对象展示：
+`attempt_phase`、`attempt_index/attempt_total`、`best_source`、`best_score`。典型阶段为 `manual_point`、`trusted_pose`、`map_origin`、`origin_nearby`、`route_progressive`；健康 NDT 达到阈值后切换为 `optimal_ndt_applied`。
 
 ## 2. 结论摘要
 

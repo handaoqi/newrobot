@@ -9,6 +9,7 @@ import {
   navigationMapIdentity,
   navigationReadyForMap,
 } from './mapActivationState.js'
+import { initializeProgressiveLocalization } from './progressiveLocalization.js'
 
 const TERMINAL_COMMAND_STATES = new Set([
   'succeeded',
@@ -77,6 +78,7 @@ export async function activateAndRelocalizeMap({
   mapVersion = expectedLegacyMapVersion(mapId),
   sceneScope = 'indoor',
   coordinateMode = 'local_only',
+  waypoints = [],
   onProgress = () => {},
   onCommand = () => {},
   traceId = '',
@@ -109,20 +111,22 @@ export async function activateAndRelocalizeMap({
     }
   }
 
-  onProgress('地图已应用，先快速搜索可信位置与建图原点，失败后自动进入全局搜索')
-  const relocalizeCommand = await sendRobotNavigationCommand(robotId, 'relocalize', {
-    map_id: String(mapId),
-    map_version: mapVersion,
-    seed_source: 'quick_then_global',
-    scene_scope: sceneScope,
-    coordinate_mode: coordinateMode,
-    wait_seconds: 120,
-  }, { traceId })
-  await waitForRobotCommand(robotId, relocalizeCommand, {
-    timeoutMs: 360_000,
-    onProgress: latest => {
-      onProgress(`快速定位/全局回退：${latest.status || 'created'}`)
-      onCommand({ phase: 'localization', command: latest, showCandidates: true })
+  onProgress('地图已应用，正在按统一流程搜索定位候选')
+  await initializeProgressiveLocalization({
+    mapId,
+    robotId,
+    mapVersion,
+    sceneScope,
+    coordinateMode,
+    waypoints,
+    onProgress,
+    onCommand,
+    traceId,
+    existingActivation: activation,
+    dependencies: {
+      activateRouteMap,
+      sendRobotNavigationCommand,
+      waitForRobotCommand,
     },
   })
 

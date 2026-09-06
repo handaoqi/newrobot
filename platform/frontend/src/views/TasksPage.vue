@@ -109,6 +109,7 @@ async function execute(task) {
     await activateAndRelocalizeMap({
       mapId: task.map_id,
       robotId: task.robot,
+      waypoints: task.route_snapshot?.waypoints || task.waypoints || [],
       onProgress: message => { executionProgress.value = message },
     })
     executionProgress.value = '地图与定位已就绪，正在下发巡检任务'

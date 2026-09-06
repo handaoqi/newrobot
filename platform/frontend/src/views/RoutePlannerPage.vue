@@ -58,7 +58,9 @@ import {
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import {
+  buildProgressiveLocalizationPayload,
   initializeProgressiveLocalization,
+  progressiveLocalizationTimeoutMs,
 } from '../services/progressiveLocalization'
 import {
   attemptSeedPose,
@@ -1321,6 +1323,7 @@ async function handleSaveRoute() {
       robotId: savedRoute.robot,
       sceneScope: routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor',
       coordinateMode: selectedMap.value?.coordinate_mode || 'local_only',
+      waypoints: payload.waypoints,
       traceId,
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
@@ -2003,30 +2006,31 @@ async function activeRelocalize() {
   navCommandBusy.value = 'relocalize'
   const traceId = newPlannerTraceId()
   localizationInitState.value = 'waiting_convergence'
-  localizationInitMessage.value = '正在静止搜索定位候选'
+  localizationInitMessage.value = '正在按统一流程搜索定位候选'
   beginLocalizationAttemptSession({ phase: 'localization', commandType: 'nav.relocalize' })
   navError.value = ''
   try {
     const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
     const coordinateMode = selectedMap.value?.coordinate_mode || ''
-    const payload = {
-      seed_source: 'quick_then_global',
-      map_id: selectedMap.value?.id,
-      map_version: selectedMapVersion(),
-      scene_scope: sceneScope,
-      coordinate_mode: coordinateMode,
-      wait_seconds: 120,
-    }
-    if (manualInitialPose.value) {
-      payload.x = Number(manualInitialPose.value.x)
-      payload.y = Number(manualInitialPose.value.y)
-      payload.yaw = Number(manualInitialPose.value.yaw || 0)
-    }
+    const manuallySelected = manualInitialPose.value
+      ? [{
+        x: Number(manualInitialPose.value.x),
+        y: Number(manualInitialPose.value.y),
+        yaw: Number(manualInitialPose.value.yaw || 0),
+      }]
+      : []
+    const payload = buildProgressiveLocalizationPayload({
+      mapId: selectedMap.value?.id,
+      mapVersion: selectedMapVersion(),
+      waypoints: [...manuallySelected, ...waypoints.value],
+      sceneScope,
+      coordinateMode,
+    })
     const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload, { traceId })
     const completed = await waitForRobotCommand(robotId, command, {
-      timeoutMs: 210_000,
+      timeoutMs: progressiveLocalizationTimeoutMs(payload),
       onProgress: latest => {
-        localizationInitMessage.value = `正在静止搜索定位候选 · ${latest.status || 'created'}`
+        localizationInitMessage.value = `正在按原点/航点/全局顺序搜索定位候选 · ${latest.status || 'created'}`
         applyLocalizationAttemptCommand(latest, { phase: 'localization', showCandidates: true })
       },
     })
@@ -2104,6 +2108,7 @@ async function handleActivateSelectedMap() {
       mapVersion: selectedMapVersion(),
       sceneScope: routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value.coordinate_mode || 'local_only',
+      waypoints: waypoints.value,
       traceId,
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
@@ -3284,9 +3289,9 @@ async function handleDeleteRoute(route) {
               <button class="btn btn-sm" :disabled="poseHistory.length === 0" @click="clearPoseHistory">清空尾迹</button>
             </div>
             <div class="localization-algorithm-note">
-              <span><strong>下发地图</strong> 应用地图后先快速搜索，失败才进行全图位置与 360° 航向搜索。</span>
+              <span><strong>下发地图</strong> 应用地图后统一搜索建图原点、原点周边和路线航点，失败才进行全图位置与 360° 航向搜索。</span>
               <span><strong>初始化定位</strong> 室外先验 RTK 固定解，漂移连续小于 0.30 m；否则快速搜索后全局回退。</span>
-              <span><strong>主动重定位</strong> 优先使用手选点、可信位姿和建图原点；NDT 健康且分数低于 0.01 即停止尝试并采用最优解。</span>
+              <span><strong>主动重定位</strong> 按建图原点、原点周边、手选点/路线航点和全局匹配顺序搜索；NDT 健康且分数低于 0.01 即停止尝试并采用最优解。</span>
               <span><i class="legend-relocalization-dot"></i> 紫色标记仅表示已验证并提交成功的重定位位置。</span>
             </div>
             <div v-if="initialPoseMode || manualInitialPose" class="initial-pose-panel">

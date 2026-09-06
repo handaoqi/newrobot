@@ -479,6 +479,10 @@ public:
     get_parameter("init_match_count_threshold", init_match_count_threshold_);
     declare_parameter<float>("init_match_score_threshold", 0.15);
     get_parameter("init_match_score_threshold", init_match_score_threshold_);
+    declare_parameter<float>("init_match_optimal_score_threshold", 0.01f);
+    get_parameter("init_match_optimal_score_threshold", init_match_optimal_score_threshold_);
+    init_match_optimal_score_threshold_ = std::clamp(
+      init_match_optimal_score_threshold_, 0.0001f, init_match_score_threshold_);
     init_match_min_inlier_fraction_ = static_cast<float>(std::clamp(
       declare_parameter<double>("init_match_min_inlier_fraction", 0.50), 0.0, 1.0));
     init_match_stable_xy_m_ = static_cast<float>(std::max(
@@ -834,6 +838,7 @@ private:
     pcl::PointCloud<PointT>::Ptr cloud;
     pcl::PointCloud<PointT>::ConstPtr map;
     Eigen::Matrix4d fallback_seed = Eigen::Matrix4d::Identity();
+    std::vector<std::pair<std::string, Eigen::Matrix4d>> progressive_seeds;
     bool use_scan_context = false;
     bool apply_scan_context = false;
     bool allow_fallback = true;
@@ -852,6 +857,8 @@ private:
     double candidate_rmse_m = 0.0;
     double candidate_overlap = 0.0;
     std::string rejection_reason = "no_candidate";
+    std::string seed_source = "none";
+    int attempts = 0;
   };
 
   localization::StaticIMUInit static_imu_init_;
@@ -867,6 +874,7 @@ private:
   // Initial pose initialization parameters
   int init_match_count_threshold_ = 5;
   float init_match_score_threshold_ = 0.2f;
+  float init_match_optimal_score_threshold_ = 0.01f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
   // A decimated initialization must never count the same previous NDT result
@@ -2711,6 +2719,11 @@ private:
         << "}"
         << ",\"global_relocalization\":{\"mode\":\"" << scan_context_effective_runtime_mode_
         << "\",\"state\":\"" << global_relocalization_state_
+        << "\",\"attempt_phase\":\"" << relocalization_attempt_phase_
+        << "\",\"attempt_index\":" << relocalization_attempt_index_
+        << ",\"attempt_total\":" << relocalization_attempt_total_
+        << ",\"best_source\":\"" << relocalization_best_source_
+        << "\",\"best_score\":" << relocalization_best_score_
         << "\",\"required\":" << (global_search_required_ ? "true" : "false")
         << ",\"candidate_applied\":" << (global_candidate_applied_ ? "true" : "false")
         << ",\"keyframe\":" << global_candidate_keyframe_
@@ -3597,7 +3610,35 @@ private:
         init_result.fitness_score_ < init_match_score_threshold_ &&
         last_ndt_inlier_fraction_ >= init_match_min_inlier_fraction_ && global_seed_ready &&
         seed_correction_ok;
-      if (quality_ok && pose_stable) {
+      const bool optimal_match = init_result.is_converged_ && init_result.transform_.allFinite() &&
+        init_result.fitness_score_ <= init_match_optimal_score_threshold_ &&
+        last_ndt_inlier_fraction_ >= init_match_min_inlier_fraction_ && global_seed_ready;
+      if (optimal_match) {
+        // A very strong NDT observation is already the best available pose;
+        // stop the progressive search immediately and promote this transform
+        // instead of waiting for the normal multi-frame acquisition window.
+        last_init_pos_ = init_result.transform_.block<3, 1>(0, 3);
+        last_init_quat_ = Eigen::Quaternionf(init_result.transform_.block<3, 3>(0, 0));
+        last_init_quat_.normalize();
+        has_set_init_pose_ = true;
+        last_pose_source_ = "ndt_optimal";
+        relocalization_best_source_ = "ndt_optimal";
+        relocalization_best_score_ = init_result.fitness_score_;
+        relocalization_attempt_phase_ = "optimal_ndt_applied";
+        is_init_success_ = true;
+        initialization_verified_ = true;
+        initialization_state_ = "localized";
+        global_search_required_ = false;
+        global_candidate_applied_ = false;
+        init_match_count_ = init_match_count_threshold_;
+        advanceGlobalRelocalizationGeneration("optimal NDT initialization");
+        clearLioMotionAnomaly("optimal NDT initialization");
+        initialized_this_frame = true;
+        localization_state_ = 2;
+        RCLCPP_INFO(get_logger(),
+          "Optimal NDT initialization accepted immediately score=%.6f threshold=%.6f",
+          init_result.fitness_score_, init_match_optimal_score_threshold_);
+      } else if (quality_ok && pose_stable) {
         init_match_count_++;
         initialization_state_ = "validating";
         RCLCPP_INFO(get_logger(),
@@ -3962,6 +4003,11 @@ private:
         last_init_quat_.normalize();
         has_set_init_pose_ = true;
         last_pose_source_ = "runtime_last_valid";
+        relocalization_attempt_phase_ = "trusted_pose";
+        relocalization_attempt_index_ = 0;
+        relocalization_attempt_total_ = 0;
+        relocalization_best_source_ = "trusted_pose";
+        relocalization_best_score_ = -1.0;
         is_init_success_ = false;
         global_search_required_ = false;
         global_candidate_applied_ = false;
@@ -4062,7 +4108,12 @@ private:
       last_init_pos_ = new_pos;
       last_init_quat_ = new_quat;
       has_set_init_pose_ = true;
-      last_pose_source_ = "Callback";   
+      last_pose_source_ = "Callback";
+      relocalization_attempt_phase_ = "manual_point";
+      relocalization_attempt_index_ = 0;
+      relocalization_attempt_total_ = 0;
+      relocalization_best_source_ = "manual_point";
+      relocalization_best_score_ = -1.0;
       pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
       has_trusted_ndt_pose_ = false;
       resetLioAnchor();
@@ -4471,7 +4522,34 @@ private:
       get_logger(), "Starting background global localization generation=%llu",
       static_cast<unsigned long long>(job.generation));
 
-    if (job.use_scan_context) {
+    // Deterministic local progressive search. Operator/manual seed (or the
+    // current recovery seed) wins first, followed by the last trusted pose,
+    // map origin and a small origin neighbourhood. Scan-context route/keyframe
+    // candidates are evaluated only after these bounded seeds fail.
+    relocalization_attempt_phase_ = "progressive_search";
+    relocalization_attempt_total_ = static_cast<int>(job.progressive_seeds.size());
+    relocalization_attempt_index_ = 0;
+    for (const auto & seed : job.progressive_seeds) {
+      ++relocalization_attempt_index_;
+      relocalization_attempt_phase_ = seed.first;
+      RCLCPP_INFO(
+        get_logger(), "Relocalization attempt %d/%d phase=%s seed=[%.3f, %.3f]",
+        relocalization_attempt_index_, relocalization_attempt_total_, seed.first.c_str(),
+        seed.second(0, 3), seed.second(1, 3));
+      Eigen::Matrix4d candidate_pose = Eigen::Matrix4d::Identity();
+      if (runGlobalLocalizationIcp(job, seed.second, candidate_pose)) {
+        result.success = true;
+        result.pose = candidate_pose;
+        result.source = "progressive_" + seed.first;
+        result.seed_source = seed.first;
+        result.attempts = relocalization_attempt_index_;
+        relocalization_best_source_ = seed.first;
+        relocalization_attempt_phase_ = "progressive_success";
+        break;
+      }
+    }
+
+    if (!result.success && job.use_scan_context) {
       std::vector<ScanContextCandidate> candidates;
       {
         std::lock_guard<std::mutex> resource_lock(global_relocalization_resource_mutex_);
@@ -4573,6 +4651,9 @@ private:
             continue;
           }
           result.candidate_accepted = true;
+          result.seed_source = "route_keyframe";
+          result.attempts = relocalization_attempt_index_ + attempt + 1;
+          relocalization_attempt_phase_ = "route_progressive";
           result.rejection_reason = job.apply_scan_context ? "none" : "shadow_not_applied";
           if (!job.apply_scan_context) {
             break;
@@ -4641,6 +4722,44 @@ private:
     job.map = global_map_points_ptr_;
     job.fallback_seed.block<3, 1>(0, 3) = last_init_pos_.cast<double>();
     job.fallback_seed.block<3, 3>(0, 0) = last_init_quat_.toRotationMatrix().cast<double>();
+    auto append_seed = [&job](const std::string & source, const Eigen::Matrix4d & pose) {
+        for (const auto & existing : job.progressive_seeds) {
+          if ((existing.second.block<3, 1>(0, 3) - pose.block<3, 1>(0, 3)).norm() < 0.05) {
+            return;
+          }
+        }
+        job.progressive_seeds.emplace_back(source, pose);
+      };
+    // Priority is intentional: the latest operator seed is the strongest
+    // semantic hint, then a trusted live pose, then the map origin and nearby
+    // offsets before route/keyframe global matching.
+    const bool manual_seed = last_pose_source_ == "Callback";
+    if (manual_seed) {
+      append_seed("manual_point", job.fallback_seed);
+    } else if (has_valid_pose_history_) {
+      append_seed("trusted_pose", job.fallback_seed);
+    } else {
+      append_seed("map_origin", job.fallback_seed);
+    }
+    if (has_valid_pose_history_ && manual_seed) {
+      Eigen::Matrix4d trusted = last_pose_.cast<double>();
+      append_seed("trusted_pose", trusted);
+    }
+    Eigen::Matrix4d origin = Eigen::Matrix4d::Identity();
+    origin.block<3, 1>(0, 3) = Eigen::Vector3d(init_pos_x_, init_pos_y_, init_pos_z_);
+    origin.block<3, 3>(0, 0) = Eigen::Quaterniond(
+      init_ori_w_, init_ori_x_, init_ori_y_, init_ori_z_).normalized().toRotationMatrix();
+    append_seed("map_origin", origin);
+    for (const auto & offset : std::array<std::pair<double, double>, 4>{
+      std::pair<double, double>{1.0, 0.0}, {-1.0, 0.0}, {0.0, 1.0}, {0.0, -1.0}}) {
+      Eigen::Matrix4d nearby = origin;
+      nearby(0, 3) += offset.first;
+      nearby(1, 3) += offset.second;
+      append_seed("origin_nearby", nearby);
+    }
+    relocalization_attempt_phase_ = "queued_progressive_search";
+    relocalization_attempt_index_ = 0;
+    relocalization_attempt_total_ = static_cast<int>(job.progressive_seeds.size());
     job.use_scan_context = scan_context_effective_runtime_mode_ != "disabled";
     job.apply_scan_context = scanContextApplyAllowed(
       scan_context_effective_runtime_mode_, job.generation,
@@ -4746,6 +4865,9 @@ private:
     resetInitializationValidation("validating_global_candidate");
     global_candidate_applied_ = true;
     global_relocalization_state_ = "candidate_applied";
+    relocalization_attempt_phase_ = result->seed_source.empty()
+      ? "route_candidate_applied" : result->seed_source + "_applied";
+    relocalization_best_source_ = result->seed_source.empty() ? result->source : result->seed_source;
     localization_state_ = 1;
     RCLCPP_INFO(
       get_logger(),
@@ -5606,6 +5728,11 @@ private:
         has_set_init_pose_ = false;
         last_init_pos_ = Eigen::Vector3f(init_pos_x_, init_pos_y_, init_pos_z_);
         last_init_quat_ = Eigen::Quaternionf(init_ori_w_, init_ori_x_, init_ori_y_, init_ori_z_);
+        relocalization_attempt_phase_ = "map_origin";
+        relocalization_attempt_index_ = 0;
+        relocalization_attempt_total_ = 0;
+        relocalization_best_source_ = "map_origin";
+        relocalization_best_score_ = -1.0;
         const bool seeded_from_rtk = seedPositionFromGnss(
           get_clock()->now(), "map initialization", true, true);
         global_search_required_ = scan_context_effective_runtime_mode_ != "disabled" &&
@@ -5855,6 +5982,11 @@ private:
   bool global_search_required_ = false;
   bool global_candidate_applied_ = false;
   std::string global_relocalization_state_ = "idle";
+  std::string relocalization_attempt_phase_ = "idle";
+  std::string relocalization_best_source_ = "none";
+  int relocalization_attempt_index_ = 0;
+  int relocalization_attempt_total_ = 0;
+  double relocalization_best_score_ = -1.0;
   int global_candidate_keyframe_ = -1;
   double global_candidate_distance_ = 0.0;
   double global_candidate_yaw_deg_ = 0.0;

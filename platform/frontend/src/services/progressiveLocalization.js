@@ -77,22 +77,28 @@ export async function initializeProgressiveLocalization({
   onCommand = () => {},
   dependencies = {},
   traceId = '',
+  existingActivation = null,
 }) {
   const activateMap = dependencies.activateRouteMap
   const sendCommand = dependencies.sendRobotNavigationCommand
   const waitCommand = dependencies.waitForRobotCommand
-  if (![activateMap, sendCommand, waitCommand].every(item => typeof item === 'function')) {
+  if (![sendCommand, waitCommand].every(item => typeof item === 'function')) {
     throw new Error('渐进定位编排缺少地图激活、命令下发或命令等待实现')
   }
 
-  const activation = await activateMap({
-    mapId,
-    robotId,
-    mapVersion,
-    onProgress,
-    onCommand,
-    traceId,
-  })
+  const activation = existingActivation || await (async () => {
+    if (typeof activateMap !== 'function') {
+      throw new Error('渐进定位编排缺少地图激活实现')
+    }
+    return activateMap({
+      mapId,
+      robotId,
+      mapVersion,
+      onProgress,
+      onCommand,
+      traceId,
+    })
+  })()
 
   let rtkAttempt = null
   if (shouldInitializeFromRtk({ sceneScope, coordinateMode })) {
