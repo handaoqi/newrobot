@@ -84,6 +84,14 @@ export function attemptSeedPose(attempt) {
   return finitePose(attempt?.seedPose || attempt?.seed_pose) || finitePose(attempt)
 }
 
+// Candidate markers represent the pose that was sent to NDT.  The matched
+// pose is an output of verification and can be displaced from the candidate
+// seed, so it must not change which map location the numbered marker denotes.
+export function attemptMarkerPose(attempt) {
+  return attemptSeedPose(attempt)
+    || finitePose(attempt?.matchedPose || attempt?.matched_pose)
+}
+
 function commandResult(command) {
   return command?.result_payload && typeof command.result_payload === 'object'
     ? command.result_payload

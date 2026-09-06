@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  attemptMarkerPose,
   attemptStatusClass,
   ATTEMPT_MARKER_VISIBLE_MS,
   emptyAttemptSession,
@@ -12,6 +13,15 @@ import {
   shouldShowAttemptMarkers,
   withAttemptMarkerExpiry,
 } from '../src/services/localizationAttemptSession.js'
+
+test('candidate marker keeps the numbered seed pose instead of matched output pose', () => {
+  const seed = { x: 0, y: 0, yaw: Math.PI / 2 }
+  const attempt = {
+    seedPose: seed,
+    matchedPose: { x: 1.4, y: -0.8, yaw: 0.1 },
+  }
+  assert.deepEqual(attemptMarkerPose(attempt), seed)
+})
 
 test('command progress snapshots keep candidate order and hide transfer-phase markers', () => {
   const session = localizationAttemptSessionFromCommand({

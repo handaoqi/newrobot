@@ -63,7 +63,7 @@ import {
   progressiveLocalizationTimeoutMs,
 } from '../services/progressiveLocalization'
 import {
-  attemptSeedPose,
+  attemptMarkerPose,
   attemptStatusClass,
   attemptStatusLabel,
   clearStoredAttemptSession,
@@ -1946,7 +1946,7 @@ function relocalizationHeadingStyle(marker) {
 }
 
 function attemptMarkerPosition(attempt) {
-  const pose = attempt?.matchedPose || attemptSeedPose(attempt)
+  const pose = attemptMarkerPose(attempt)
   return pose ? waypointDisplayPosition(pose) : null
 }
 
