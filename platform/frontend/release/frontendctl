@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 VERSION = "v1.0.0"
-MODULES = ["overview", "guard-duty", "remote-control", "remote-development", "scene-visualizer", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
+MODULES = ["guard-duty", "overview", "remote-control", "remote-development", "scene-visualizer", "analytics", "events", "robots", "tasks", "patrol-calendar", "task-execution", "maps", "routes", "zones"]
 RECOMMENDS = {
     "overview": ["robots"], "guard-duty": ["overview", "remote-control", "events", "tasks", "task-execution"],
     "remote-control": ["overview", "guard-duty"], "analytics": ["events"], "events": ["guard-duty", "analytics"],

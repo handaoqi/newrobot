@@ -13,6 +13,7 @@ test('stable module catalog has unique IDs and routes', () => {
   assert.equal(new Set(MODULES.map((item) => item.path)).size, MODULES.length)
   assert.deepEqual(STABLE_MODULE_IDS, defaultRuntimeConfig().enabled_modules)
   assert.equal(defaultHomePath(STABLE_MODULE_IDS), '/dashboard/overview')
+  assert.equal(defaultHomePath(['guard-duty']), '/dashboard/guard-duty')
   for (const module of MODULES) for (const recommendation of module.recommended) assert.ok(STABLE_MODULE_IDS.includes(recommendation))
 })
 
