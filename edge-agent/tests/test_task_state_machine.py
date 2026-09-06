@@ -511,6 +511,21 @@ def test_arrival_within_tolerance_rejects_outdoor_without_fixed_rtk(tmp_path):
         },
     )()
     assert executor._arrival_within_tolerance({"x": 10.0, "y": 10.0}, 0) is False
+
+
+def test_localization_sample_age_is_used_as_arrival_freshness_gate(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    assert executor._localization_sample_fresh({"sample_age_seconds": 0.4}) is True
+    assert executor._localization_sample_fresh({"sample_age_seconds": 1.6}) is False
+    assert executor._localization_sample_fresh({}) is True  # legacy telemetry
+    store.close()
     store.close()
 
 

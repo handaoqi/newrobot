@@ -73,6 +73,9 @@ HOLD_FINAL_POSE_OUTDOOR_TIMEOUT_SECONDS = 0.5
 WAYPOINT_SETTLE_TIMEOUT_SECONDS = 12.0
 # Outdoor clean arrival (no pending correction): brief health check only.
 WAYPOINT_SETTLE_OUTDOOR_TIMEOUT_SECONDS = 2.0
+# A pose older than this may be used for diagnostics, but not to unlock a
+# post-correction arrival transaction.
+ARRIVAL_POSE_MAX_AGE_SECONDS = 1.5
 # Match localization lio_primary.drift_xy_m default; above this, wait for correction.
 WAYPOINT_CORRECTION_DRIFT_M = 0.30
 # After Nav2 "reached", LIO must be this close to the click or we re-approach.
@@ -1152,6 +1155,21 @@ class TaskExecutor:
         payload = diagnostics() if callable(diagnostics) else {}
         nested = (payload or {}).get("decision") if isinstance(payload, dict) else {}
         return nested if isinstance(nested, dict) else {}
+
+    def _localization_sample_fresh(self, decision: dict | None = None) -> bool:
+        """Reject stale localization samples when age metadata is available."""
+        decision = decision if isinstance(decision, dict) else self._localization_decision()
+        age = decision.get("sample_age_seconds")
+        if age is None and isinstance(decision.get("localization"), dict):
+            age = decision["localization"].get("sample_age_seconds")
+        if age is None:
+            # Older Edge/robot versions did not publish age; retain backward
+            # compatibility while still enforcing freshness on new telemetry.
+            return True
+        try:
+            return 0.0 <= float(age) <= ARRIVAL_POSE_MAX_AGE_SECONDS
+        except (TypeError, ValueError):
+            return False
 
     def _rtk_good_for_navigation(self) -> bool:
         decision = self._localization_decision()
@@ -2407,6 +2425,13 @@ class TaskExecutor:
                         stop_motion()
                     time.sleep(0.1)
                     continue
+                if not self._localization_sample_fresh(decision):
+                    LOGGER.warning(
+                        "outdoor waypoint settle blocked by stale localization sample age=%s",
+                        decision.get("sample_age_seconds"),
+                    )
+                    time.sleep(0.1)
+                    continue
                 if self._outdoor_settle_can_continue(decision):
                     return True
                 time.sleep(0.1)
@@ -2422,6 +2447,13 @@ class TaskExecutor:
                 continue
             source = str(decision.get("active_source") or "")
             policy_source_ready = decision.get("policy_source_ready")
+            if not self._localization_sample_fresh(decision):
+                LOGGER.warning(
+                    "waypoint settle blocked by stale localization sample age=%s",
+                    decision.get("sample_age_seconds"),
+                )
+                time.sleep(0.1)
+                continue
             if (
                 self._rtk_good_for_navigation()
                 and source == "rtk_imu"
