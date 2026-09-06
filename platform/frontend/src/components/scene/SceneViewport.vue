@@ -2,9 +2,13 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader.js'
 
-import { assetForClass, nextSemanticZoom, semanticZoomMode } from '../../services/sceneData'
+import {
+  assetForClass, nextSemanticZoom, normalizeSceneAssetCatalog, normalizeSceneAssetInstance,
+  sceneAssetIdForClass, SCENE_ASSET_CATALOG_URL, semanticZoomMode,
+} from '../../services/sceneData'
 
 const props = defineProps({
   manifest: { type: Object, default: null },
@@ -35,6 +39,14 @@ let animationFrame
 let lastStatsAt = performance.now()
 let renderedFrames = 0
 const groups = {}
+const assetLoader = new GLTFLoader()
+const assetModelCache = new Map()
+const assetModelRequests = new Map()
+let assetCatalog = normalizeSceneAssetCatalog(null)
+let assetCatalogUrl = ''
+let assetCatalogRequest = null
+let semanticRenderToken = 0
+let mounted = false
 
 function bounds() {
   const value = props.manifest?.bounds || {}
@@ -64,8 +76,72 @@ function clearGroup(name) {
   if (!group) return
   while (group.children.length) {
     const child = group.children.pop()
-    child.traverse(disposeNode)
+    // GLB instances share geometry and materials with the cache. Dispose
+    // procedural fallbacks here, but keep cached model resources alive.
+    if (!child.userData.sceneAssetInstance) child.traverse(disposeNode)
   }
+}
+
+function catalogUrl() {
+  return props.manifest?.asset_catalog?.url || props.manifest?.asset_catalog_url || SCENE_ASSET_CATALOG_URL
+}
+
+async function loadAssetCatalog() {
+  const url = catalogUrl()
+  if (assetCatalogUrl === url && assetCatalog.assets.length) return assetCatalog
+  if (assetCatalogRequest && assetCatalogUrl === url) return assetCatalogRequest
+  assetCatalogUrl = url
+  assetCatalogRequest = fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } })
+    .then(response => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return response.json()
+    })
+    .then(value => {
+      const normalized = normalizeSceneAssetCatalog(value)
+      if (!normalized.assets.length) throw new Error('目录为空或 schema 不匹配')
+      assetCatalog = normalized
+      return normalized
+    })
+    .catch(error => {
+      assetCatalog = normalizeSceneAssetCatalog(null)
+      emit('error', `场景资产目录加载失败：${error.message}`)
+      return assetCatalog
+    })
+    .finally(() => { assetCatalogRequest = null })
+  await assetCatalogRequest
+  if (mounted) await updateSemanticObjects()
+  return assetCatalog
+}
+
+function applyInstanceTransform(node, item) {
+  node.position.set(item.position.x, item.position.y, item.position.z)
+  node.quaternion.set(item.orientation.x, item.orientation.y, item.orientation.z, item.orientation.w)
+  const scale = item.scale
+  if (Number.isFinite(Number(scale))) node.scale.setScalar(Math.max(.05, Number(scale)))
+  else if (Array.isArray(scale) && scale.length >= 3) node.scale.set(Math.max(.05, Number(scale[0]) || 1), Math.max(.05, Number(scale[1]) || 1), Math.max(.05, Number(scale[2]) || 1))
+  else if (scale && typeof scale === 'object') node.scale.set(Math.max(.05, Number(scale.x) || 1), Math.max(.05, Number(scale.y) || 1), Math.max(.05, Number(scale.z) || 1))
+  node.userData = { ...node.userData, id: item.id, className: item.className, confidence: item.confidence, assetId: item.assetId }
+}
+
+async function loadAssetModel(assetId) {
+  const entry = assetCatalog.byId.get(assetId)
+  if (!entry) return null
+  if (assetModelCache.has(assetId)) return assetModelCache.get(assetId).clone(true)
+  if (!assetModelRequests.has(assetId)) {
+    const request = assetLoader.loadAsync(entry.url)
+      .then(result => {
+        assetModelCache.set(assetId, result.scene)
+        return result.scene
+      })
+      .catch(error => {
+        emit('error', `场景资产 ${assetId} 加载失败：${error.message}`)
+        return null
+      })
+      .finally(() => assetModelRequests.delete(assetId))
+    assetModelRequests.set(assetId, request)
+  }
+  const model = await assetModelRequests.get(assetId)
+  return model?.clone(true) || null
 }
 
 function pointMaterial(size = 0.07, opacity = 1) {
@@ -197,21 +273,24 @@ function primitiveFor(item) {
   return mesh
 }
 
-function updateSemanticObjects() {
+async function updateSemanticObjects() {
+  const token = ++semanticRenderToken
   clearGroup('semantic')
   const all = [...(props.manifest?.static_assets || []), ...props.semanticObjects]
-  all.forEach((item, index) => {
-    const normalized = {
-      id: item.id || `static-${index}`,
-      className: item.class_name || item.className || item.asset || 'unknown',
-      confidence: item.confidence ?? 1,
-      position: item.position || item.pose?.position || { x: 0, y: 0, z: 0 },
-      orientation: item.orientation || item.pose?.orientation,
-      dimensions: item.dimensions || item.scale || { x: 1, y: 1, z: 1 },
-      dynamic: item.dynamic !== false,
+  for (const [index, item] of all.entries()) {
+    const normalized = normalizeSceneAssetInstance(item, index)
+    const assetId = sceneAssetIdForClass(normalized.assetId, assetCatalog) || sceneAssetIdForClass(normalized.className, assetCatalog)
+    const model = await loadAssetModel(assetId)
+    if (!mounted || token !== semanticRenderToken) return
+    if (model) {
+      model.userData.sceneAssetInstance = true
+      applyInstanceTransform(model, { ...normalized, assetId })
+      groups.semantic.add(model)
+    } else {
+      groups.semantic.add(primitiveFor(normalized))
     }
-    groups.semantic.add(primitiveFor(normalized))
-  })
+  }
+  updateVisibility()
 }
 
 function updateVisibility() {
@@ -284,6 +363,7 @@ function animate(now) {
 }
 
 onMounted(() => {
+  mounted = true
   scene = new THREE.Scene()
   scene.background = new THREE.Color('#07111f')
   scene.fog = new THREE.FogExp2('#07111f', 0.006)
@@ -311,11 +391,11 @@ onMounted(() => {
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(host.value)
   host.value.addEventListener('wheel', onWheel, { passive: true })
-  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); updateRobot(); updateSemanticObjects(); updateVisibility(); setCamera(); resize()
+  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateSemanticObjects(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
   animationFrame = requestAnimationFrame(animate)
 })
 
-watch(() => props.manifest, () => { updateOccupancy(); updateSemanticObjects(); updateBoundary(); setCamera(); resize() }, { deep: true })
+watch(() => props.manifest, () => { updateOccupancy(); void updateSemanticObjects(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
 watch(() => props.cloudBuffer, updateCloudBuffer)
 watch(() => props.liveCloud, updateLiveCloud)
 watch(() => props.obstacles, updateObstacles)
@@ -323,7 +403,7 @@ watch(() => props.trail, updateTrail, { deep: true })
 watch(() => props.correction, updateCorrection, { deep: true })
 watch(() => props.robotPose, () => { updateRobot(); if (['dog', 'follow'].includes(props.cameraPreset)) setCamera() }, { deep: true })
 watch(() => props.waypoints, updateRoute, { deep: true })
-watch(() => props.semanticObjects, updateSemanticObjects, { deep: true })
+watch(() => props.semanticObjects, () => { void updateSemanticObjects() }, { deep: true })
 watch(() => props.layers, updateVisibility, { deep: true })
 watch(() => [props.mode, props.cameraPreset], () => {
   zoom.value = props.mode === '3d' ? Math.max(zoom.value, .56) : Math.min(zoom.value, .44)
@@ -331,6 +411,8 @@ watch(() => [props.mode, props.cameraPreset], () => {
 })
 
 onBeforeUnmount(() => {
+  mounted = false
+  semanticRenderToken += 1
   cancelAnimationFrame(animationFrame)
   resizeObserver?.disconnect()
   host.value?.removeEventListener('wheel', onWheel)

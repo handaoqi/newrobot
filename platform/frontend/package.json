@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "generate:scene-assets": "node scripts/generate_scene_assets.mjs",
+    "test:scene-assets": "node scripts/validate_scene_assets.mjs",
     "test": "node --test tests/*.test.js",
     "tablet:capture": "TABLET_CAPTURE=1 playwright test tests/tablet --reporter=line",
     "test:tablet": "playwright test tests/tablet",

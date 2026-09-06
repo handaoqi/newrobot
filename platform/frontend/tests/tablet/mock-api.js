@@ -241,6 +241,20 @@ const mapDetail = {
   origin: [-10, -10, 0],
 }
 
+const mapScene = {
+  schema: 'roamerx.scene-manifest.v1',
+  map_id: 20,
+  name: mapDetail.name,
+  frame_id: 'map',
+  bounds: { min_x: -10, min_y: -10, min_z: -1, max_x: 30, max_y: 20, max_z: 3 },
+  asset_catalog: { schema: 'roamerx.scene-assets.v1', url: '/scene-assets/catalog.json' },
+  cloud: { available: false },
+  static_assets: [
+    { id: 'tree-fixture', asset_id: 'tree.deciduous', position: { x: 8, y: 6, z: 0 }, scale: 1 },
+  ],
+  boundary: [],
+}
+
 function responseFor(pathname, method) {
   const path = pathname.replace(/^\/api/, '')
   if (path === '/auth/login/' && method === 'POST') {
@@ -267,6 +281,7 @@ function responseFor(pathname, method) {
   if (path === '/maps/') return [mapDetail]
   if (path === '/map-sets/') return []
   if (path === '/maps/20/') return mapDetail
+  if (path === '/maps/20/scene/') return mapScene
   if (path === '/maps/20/mapping-trace/') return { samples: [] }
   if (path === '/speech-categories/') return [{ id: 1, name: '现场提醒' }]
   if (path === '/speech-templates/') {

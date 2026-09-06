@@ -14,6 +14,8 @@ from django.conf import settings
 
 SCENE_SCHEMA = "roamerx.scene-manifest.v1"
 SCENE_POINT_CAP = 600_000
+SCENE_ASSET_CATALOG_SCHEMA = "roamerx.scene-assets.v1"
+SCENE_ASSET_CATALOG_URL = "/scene-assets/catalog.json"
 _PCD_NAMES = ("scene_preview.pcd", "map.pcd")
 
 
@@ -146,6 +148,55 @@ def _package_sha256(map_data) -> str:
     return digest.hexdigest()
 
 
+def _finite_number(value, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _vector3(value, default: tuple[float, float, float]) -> dict[str, float]:
+    if isinstance(value, dict):
+        values = [value.get(axis) for axis in ("x", "y", "z")]
+    elif isinstance(value, (list, tuple)):
+        values = list(value[:3])
+    else:
+        values = []
+    return {axis: _finite_number(values[index] if index < len(values) else None, fallback) for index, (axis, fallback) in enumerate(zip(("x", "y", "z"), default))}
+
+
+def _scene_static_assets(scene: dict) -> list[dict]:
+    raw_assets = scene.get("static_assets") if isinstance(scene.get("static_assets"), list) else []
+    assets = []
+    for index, raw in enumerate(raw_assets):
+        if not isinstance(raw, dict):
+            continue
+        asset_id = str(raw.get("asset_id") or raw.get("asset") or raw.get("class_name") or "").strip()
+        if not asset_id:
+            continue
+        item = dict(raw)
+        item.setdefault("id", f"static-{index}")
+        item["asset_id"] = asset_id
+        item["position"] = _vector3(raw.get("position"), (0.0, 0.0, 0.0))
+        if raw.get("orientation") is not None:
+            orientation = raw.get("orientation")
+            if isinstance(orientation, dict):
+                item["orientation"] = {
+                    "x": _finite_number(orientation.get("x"), 0.0),
+                    "y": _finite_number(orientation.get("y"), 0.0),
+                    "z": _finite_number(orientation.get("z"), 0.0),
+                    "w": _finite_number(orientation.get("w"), 1.0),
+                }
+        scale = raw.get("scale")
+        if isinstance(scale, (int, float)) and math.isfinite(float(scale)) and float(scale) > 0:
+            item["scale"] = float(scale)
+        elif isinstance(scale, (dict, list, tuple)):
+            item["scale"] = _vector3(scale, (1.0, 1.0, 1.0)) if isinstance(scale, (dict, list, tuple)) else scale
+        assets.append(item)
+    return assets
+
+
 def scene_cloud_path(map_data, *, max_points: int = SCENE_POINT_CAP) -> tuple[Path, str, int]:
     if not map_data.package_file:
         raise SceneArtifactError("地图没有三维点云包")
@@ -221,6 +272,7 @@ def build_scene_manifest(map_data) -> dict:
             "apply_status": boundary_record.apply_status,
             "safety_margin_m": boundary_record.safety_margin_m,
         }
+    asset_catalog_url = str(scene.get("asset_catalog_url") or SCENE_ASSET_CATALOG_URL)
     return {
         "schema": SCENE_SCHEMA,
         "map_id": map_data.pk,
@@ -237,7 +289,12 @@ def build_scene_manifest(map_data) -> dict:
             "point_cap": SCENE_POINT_CAP,
             "color_mode": str(scene.get("color_mode") or "intensity"),
         },
-        "static_assets": scene.get("static_assets") if isinstance(scene.get("static_assets"), list) else [],
+        "asset_catalog": {
+            "schema": SCENE_ASSET_CATALOG_SCHEMA,
+            "url": asset_catalog_url,
+        },
+        "asset_catalog_url": asset_catalog_url,
+        "static_assets": _scene_static_assets(scene),
         "boundary": boundary,
         "package_checksum": str(description.get("package_sha256") or ""),
     }

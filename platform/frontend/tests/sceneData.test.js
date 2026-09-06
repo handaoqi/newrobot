@@ -3,7 +3,8 @@ import test from 'node:test'
 
 import {
   assetForClass, createTfTree, normalizeSemanticObjects, occupancyGridToPoints,
-  pointCloud2ToArrays, semanticZoomMode, transformPointData, transformPoseTo2D,
+  normalizeSceneAssetCatalog, normalizeSceneAssetInstance, pointCloud2ToArrays,
+  sceneAssetIdForClass, semanticZoomMode, transformPointData, transformPoseTo2D,
 } from '../src/services/sceneData.js'
 
 test('semantic zoom uses hysteresis and known aliases use stable assets', () => {
@@ -11,6 +12,8 @@ test('semantic zoom uses hysteresis and known aliases use stable assets', () => 
   assert.equal(semanticZoomMode('2d', .56), '3d')
   assert.equal(semanticZoomMode('3d', .44), '2d')
   assert.equal(assetForClass('car').key, 'vehicle')
+  assert.equal(assetForClass('tree.deciduous').key, 'tree')
+  assert.equal(assetForClass('road.curve90').key, 'road')
   assert.equal(assetForClass('not-trained').key, 'unknown_obstacle')
 })
 
@@ -52,4 +55,25 @@ test('occupancy and semantic messages become bounded scene primitives', () => {
   const objects = normalizeSemanticObjects({ objects: [{ track_id: 'p1', class_name: 'person', confidence: .9, pose: { position: { x: 1, y: 2, z: 0 } } }] })
   assert.equal(objects[0].id, 'p1')
   assert.equal(objects[0].dimensions.z, 1.7)
+})
+
+test('scene asset catalog resolves stable ids, aliases, and normalized instances', () => {
+  const catalog = normalizeSceneAssetCatalog({
+    schema: 'roamerx.scene-assets.v1',
+    version: 'test',
+    default_asset_by_category: { person: 'person.adult' },
+    assets: [
+      { asset_id: 'person.adult', category: 'person', aliases: ['person', 'pedestrian'], url: '/scene-assets/person.adult.glb' },
+      { asset_id: 'tree.deciduous', category: 'tree', aliases: ['tree'], url: '/scene-assets/tree.deciduous.glb' },
+    ],
+  })
+  assert.equal(sceneAssetIdForClass('pedestrian', catalog), 'person.adult')
+  assert.equal(sceneAssetIdForClass('tree.deciduous', catalog), 'tree.deciduous')
+  assert.equal(sceneAssetIdForClass('person', catalog), 'person.adult')
+  const instance = normalizeSceneAssetInstance({
+    asset_id: 'tree.deciduous', position: { x: 2, y: 3 }, scale: 1.5,
+  })
+  assert.equal(instance.assetId, 'tree.deciduous')
+  assert.deepEqual(instance.position, { x: 2, y: 3, z: 0 })
+  assert.equal(instance.scale, 1.5)
 })

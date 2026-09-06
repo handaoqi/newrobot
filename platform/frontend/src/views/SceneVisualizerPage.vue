@@ -11,7 +11,7 @@ import {
 import { openLiveMessageSource, scanBagMessages } from '../services/rosStream'
 import {
   ASSET_REGISTRY, SCENE_LAYER_DEFAULTS, SCENE_TOPICS, assetForClass,
-  createTfTree, decodeJsonString, localizationProcess, normalizeSemanticObjects,
+  createTfTree, decodeJsonString, localizationProcess, normalizeSceneAssetInstance, normalizeSemanticObjects,
   occupancyGridToPoints, pointCloud2ToArrays, transformPointData, transformPoseTo2D,
 } from '../services/sceneData'
 
@@ -76,7 +76,10 @@ const dataAge = computed(() => {
   return Number.isFinite(stamp) ? Math.max(0, (Date.now() - stamp) / 1000).toFixed(1) : '—'
 })
 const sourceLabel = computed(() => ({ live: '实时机器狗', map: '平台离线地图包', bag: '本地 MCAP' }[sourceMode.value]))
-const visibleObjects = computed(() => semanticObjects.value.map(item => ({ ...item, asset: assetForClass(item.className) })))
+const visibleObjects = computed(() => [
+  ...(manifest.value?.static_assets || []).map((item, index) => normalizeSceneAssetInstance({ ...item, dynamic: false }, index)),
+  ...semanticObjects.value,
+].map(item => ({ ...item, asset: assetForClass(item.className || item.assetId) })))
 const viewerRejection = computed(() => Object.values(viewerStatus.value).filter(Boolean).join('；'))
 const correction = computed(() => {
   const drift = decision.value.ndt_drift

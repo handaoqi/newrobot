@@ -183,3 +183,31 @@ PR 描述必须包含：影响模块、接口/迁移变化、执行过的测试�
 只有在目标模块测试通过、跨模块接口已检查、工作区没有意外文件、差异范围与任务一致时，才报告完成。若缺少依赖、设备、权限或真实环境，应明确报告阻塞点和已完成的静态/单元验证，不擅自扩大权限或改变测试目标。
 
 后续用户补充规则时，优先更新本文件对应章节；新规则必须说明适用范围，避免把某一次故障或单个模块特例扩展成全项目约束。
+
+## 3D 场景通用资产（当前实现）
+
+公园导航低模资产和场景拼接相关代码位于以下目录，后续扩展资产类别、变体或拼接逻辑时优先从这些位置查找：
+
+| 内容 | 源码/运行目录 |
+| --- | --- |
+| GLB 资产与机器可读目录 | `/home/dogrobot/platform/frontend/public/scene-assets/` |
+| 程序化生成器与完整性校验 | `/home/dogrobot/platform/frontend/scripts/generate_scene_assets.mjs`、`/home/dogrobot/platform/frontend/scripts/validate_scene_assets.mjs` |
+| Three.js 场景加载、模型缓存与占位回退 | `/home/dogrobot/platform/frontend/src/components/scene/SceneViewport.vue` |
+| 资产类别、别名、manifest 实例归一化 | `/home/dogrobot/platform/frontend/src/services/sceneData.js` |
+| 场景视角调试页 | `/home/dogrobot/platform/frontend/src/views/SceneVisualizerPage.vue` |
+| 后端 scene manifest 及实例字段归一化 | `/home/dogrobot/platform/backend/monitoring/services/map_scene_service.py` |
+| 场景资产说明 | `/home/dogrobot/platform/docs/scene-assets.md` |
+| 单测、接口测试与静态资源回归 | `/home/dogrobot/platform/frontend/tests/sceneData.test.js`、`/home/dogrobot/platform/frontend/tests/tablet/scene-assets.spec.js`、`/home/dogrobot/platform/backend/monitoring/test_map_scene.py` |
+| 云端发布后的静态资产目录 | `/opt/roamerx/current/frontend/dist/scene-assets/` |
+
+资产目录协议为 `roamerx.scene-assets.v1`，在线调用地址为 `/scene-assets/catalog.json` 和 `/scene-assets/{asset_id}.glb`。资产使用米制、右手坐标系、Z 轴向上；地图实例优先使用 `asset_id`、`position`、`orientation` 和 `scale`，旧 `asset` 字段仍需兼容。
+
+生成和校验命令：
+
+```bash
+cd /home/dogrobot/platform/frontend
+npm run generate:scene-assets
+npm run test:scene-assets
+```
+
+场景页路由为 `/dashboard/tasks/scene-visualizer`。修改资产或 manifest 后，应运行前端单测、前端构建、后端 `monitoring.test_map_scene`，并通过 `platform/scripts/deploy_cloud_platform.sh` 发布；仅查看 GLB 时可使用浏览器 GLTF 查看器拖入本地文件，或访问已发布的 GLB 地址下载后查看。

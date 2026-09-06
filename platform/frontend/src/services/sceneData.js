@@ -17,21 +17,78 @@ export const SCENE_LAYER_DEFAULTS = Object.freeze({
   boundary: true,
 })
 
+export const SCENE_ASSET_CATALOG_SCHEMA = 'roamerx.scene-assets.v1'
+export const SCENE_ASSET_CATALOG_URL = '/scene-assets/catalog.json'
+
 export const ASSET_REGISTRY = Object.freeze({
   person: { label: '行人', aliases: ['pedestrian'], color: '#f59e0b', kind: 'person', dynamic: true },
   bicycle: { label: '自行车', aliases: ['bike', '自行车'], color: '#38bdf8', kind: 'bicycle', dynamic: true },
   vehicle: { label: '车辆', aliases: ['car', 'truck', 'bus', 'motorcycle'], color: '#ef4444', kind: 'vehicle', dynamic: true },
   wall: { label: '墙体', aliases: [], color: '#94a3b8', kind: 'wall', dynamic: false },
   building: { label: '建筑', aliases: [], color: '#64748b', kind: 'building', dynamic: false },
+  tree: { label: '树木', aliases: ['bush', 'shrub', 'conifer', 'pine'], color: '#22c55e', kind: 'tree', dynamic: false },
+  road: { label: '道路', aliases: ['path', 'walkway', 'crossroad', 'intersection'], color: '#64748b', kind: 'road', dynamic: false },
   unknown_obstacle: { label: '未知障碍', aliases: ['unknown'], color: '#a78bfa', kind: 'obstacle', dynamic: true },
 })
 
 export function assetForClass(value) {
   const normalized = String(value || '').trim().toLowerCase()
+  const category = normalized.split('.', 1)[0]
   for (const [key, asset] of Object.entries(ASSET_REGISTRY)) {
-    if (key === normalized || asset.aliases.includes(normalized)) return { key, ...asset }
+    if (key === normalized || key === category || asset.aliases.includes(normalized)) return { key, ...asset }
   }
   return { key: 'unknown_obstacle', ...ASSET_REGISTRY.unknown_obstacle }
+}
+
+export function normalizeSceneAssetCatalog(value) {
+  if (!value || typeof value !== 'object' || value.schema !== SCENE_ASSET_CATALOG_SCHEMA) {
+    return { schema: '', version: '', assets: [], byId: new Map(), byAlias: new Map(), defaultByCategory: new Map() }
+  }
+  const assets = Array.isArray(value.assets)
+    ? value.assets.filter(item => item && typeof item.asset_id === 'string' && typeof item.url === 'string')
+    : []
+  const byId = new Map(assets.map(item => [item.asset_id, item]))
+  const byAlias = new Map()
+  for (const item of assets) {
+    byAlias.set(item.asset_id.toLowerCase(), item.asset_id)
+    for (const alias of Array.isArray(item.aliases) ? item.aliases : []) {
+      if (typeof alias === 'string' && alias.trim()) byAlias.set(alias.trim().toLowerCase(), item.asset_id)
+    }
+  }
+  const defaultByCategory = new Map(Object.entries(value.default_asset_by_category || {}).filter(([category, assetId]) => byId.has(assetId) && category))
+  return { ...value, assets, byId, byAlias, defaultByCategory }
+}
+
+export function sceneAssetIdForClass(value, catalog) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized || !catalog) return null
+  const direct = catalog.byId?.get(normalized)
+  if (direct) return direct.asset_id || direct
+  const alias = catalog.byAlias?.get(normalized)
+  if (alias) return alias
+  const semantic = assetForClass(normalized)
+  return catalog.defaultByCategory?.get(semantic.key === 'unknown_obstacle' ? 'obstacle' : semantic.key) || null
+}
+
+export function normalizeSceneAssetInstance(item, index = 0) {
+  const source = item && typeof item === 'object' ? item : {}
+  const position = source.position || source.pose?.position || {}
+  const orientation = source.orientation || source.pose?.orientation || { x: 0, y: 0, z: 0, w: 1 }
+  const dimensions = source.dimensions || (source.scale && typeof source.scale === 'object' && !Array.isArray(source.scale) ? source.scale : { x: .6, y: .6, z: 1.7 })
+  return {
+    ...source,
+    id: String(source.id || `static-${index}`),
+    assetId: String(source.asset_id || source.asset || source.class_name || source.className || 'unknown'),
+    className: String(source.class_name || source.className || source.asset_id || source.asset || 'unknown'),
+    confidence: Number.isFinite(Number(source.confidence)) ? Number(source.confidence) : 1,
+    position: { x: Number(position.x) || 0, y: Number(position.y) || 0, z: Number(position.z) || 0 },
+    orientation: {
+      x: Number(orientation.x) || 0, y: Number(orientation.y) || 0,
+      z: Number(orientation.z) || 0, w: Number.isFinite(Number(orientation.w)) ? Number(orientation.w) : 1,
+    },
+    dimensions: { x: Math.max(.1, Number(dimensions.x) || .6), y: Math.max(.1, Number(dimensions.y) || .6), z: Math.max(.1, Number(dimensions.z) || 1.7) },
+    dynamic: source.dynamic !== false,
+  }
 }
 
 export function nextSemanticZoom(current, deltaY) {

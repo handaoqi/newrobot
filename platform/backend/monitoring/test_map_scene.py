@@ -59,7 +59,12 @@ class MapSceneApiTests(APITestCase):
         self.assertEqual(response.data["schema"], "roamerx.scene-manifest.v1")
         self.assertEqual(response.data["bounds"]["max_x"], 8.0)
         self.assertTrue(response.data["cloud"]["available"])
+        self.assertEqual(response.data["asset_catalog"]["schema"], "roamerx.scene-assets.v1")
+        self.assertEqual(response.data["asset_catalog"]["url"], "/scene-assets/catalog.json")
+        self.assertEqual(response.data["asset_catalog_url"], "/scene-assets/catalog.json")
         self.assertEqual(response.data["static_assets"][0]["asset"], "wall")
+        self.assertEqual(response.data["static_assets"][0]["asset_id"], "wall")
+        self.assertEqual(response.data["static_assets"][0]["position"], {"x": 1.0, "y": 2.0, "z": 0.0})
         self.assertEqual(response.data["boundary"]["points"][1], [3, 0])
         self.assertEqual(response.data["boundary"]["active_revision"], 1)
 
@@ -81,6 +86,25 @@ class MapSceneApiTests(APITestCase):
         response = self.client.get(f"/api/maps/{self.map.id}/scene/")
         self.assertEqual(response.status_code, 200)
         self.assertFalse(MapNavigationBoundary.objects.filter(map_data=self.map).exists())
+
+    def test_manifest_normalizes_only_valid_static_asset_instances(self):
+        self.map.description = json.dumps({
+            "scene_manifest": {
+                "static_assets": [
+                    {"asset_id": "tree.deciduous", "position": [1, 2, 0], "scale": 1.5},
+                    None,
+                    {"position": {"x": 4, "y": 5}},
+                ],
+            },
+        })
+        self.map.save(update_fields=["description"])
+        self.client.force_authenticate(self.user)
+        response = self.client.get(f"/api/maps/{self.map.id}/scene/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["static_assets"]), 1)
+        self.assertEqual(response.data["static_assets"][0]["asset_id"], "tree.deciduous")
+        self.assertEqual(response.data["static_assets"][0]["position"], {"x": 1.0, "y": 2.0, "z": 0.0})
+        self.assertEqual(response.data["static_assets"][0]["scale"], 1.5)
 
     def test_corrupt_package_returns_diagnostic_error(self):
         broken = MapData.objects.create(name="broken", description=json.dumps({"package_files": ["map.pcd"]}))

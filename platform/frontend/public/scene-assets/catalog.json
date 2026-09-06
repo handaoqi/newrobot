@@ -1,0 +1,751 @@
+{
+  "schema": "roamerx.scene-assets.v1",
+  "version": "2026.09.0",
+  "units": "m",
+  "coordinate_system": "right_handed_z_up",
+  "generated_by": "platform/frontend/scripts/generate_scene_assets.mjs",
+  "default_asset_by_category": {
+    "person": "person.adult",
+    "wall": "wall.straight",
+    "building": "building.kiosk",
+    "vehicle": "vehicle.sedan",
+    "tree": "tree.deciduous",
+    "road": "road.straight"
+  },
+  "assets": [
+    {
+      "asset_id": "person.adult",
+      "category": "person",
+      "label_zh": "成人行人",
+      "aliases": [
+        "person",
+        "pedestrian",
+        "adult"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/person.adult.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.74,
+        "y": 0.36,
+        "z": 1.9
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.37,
+          "y": -0.18,
+          "z": 0
+        },
+        "max": {
+          "x": 0.37,
+          "y": 0.18,
+          "z": 1.9
+        }
+      },
+      "collision": {
+        "type": "capsule",
+        "radius_m": 0.3,
+        "height_m": 1.75
+      },
+      "triangle_count": 140,
+      "byte_size": 18408,
+      "sha256": "1a922623bb9e68a351bc1fa5e4f9980592909910df89a5a962ab42fbe8508afb",
+      "revision": 1
+    },
+    {
+      "asset_id": "person.child",
+      "category": "person",
+      "label_zh": "儿童行人",
+      "aliases": [
+        "child"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/person.child.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.518,
+        "y": 0.252,
+        "z": 1.33
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.259,
+          "y": -0.126,
+          "z": 0
+        },
+        "max": {
+          "x": 0.259,
+          "y": 0.126,
+          "z": 1.33
+        }
+      },
+      "collision": {
+        "type": "capsule",
+        "radius_m": 0.23,
+        "height_m": 1.23
+      },
+      "triangle_count": 140,
+      "byte_size": 18512,
+      "sha256": "fc6d3e887e3a87e82a11fb600d809edcd917fcf0d255ac2c312c512abd5e54a6",
+      "revision": 1
+    },
+    {
+      "asset_id": "person.walking",
+      "category": "person",
+      "label_zh": "行走行人",
+      "aliases": [
+        "walking_person",
+        "walking"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/person.walking.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.984,
+        "y": 0.36,
+        "z": 1.905
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.492,
+          "y": -0.18,
+          "z": -0.005
+        },
+        "max": {
+          "x": 0.492,
+          "y": 0.18,
+          "z": 1.9
+        }
+      },
+      "collision": {
+        "type": "capsule",
+        "radius_m": 0.32,
+        "height_m": 1.75
+      },
+      "triangle_count": 140,
+      "byte_size": 18636,
+      "sha256": "4a889dee3b17493337f2f18476e1dfe8f4ffe0722a56d42a727f0cbb3faf8160",
+      "revision": 1
+    },
+    {
+      "asset_id": "wall.straight",
+      "category": "wall",
+      "label_zh": "直墙",
+      "aliases": [
+        "wall"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/wall.straight.glb",
+      "anchor": "segment_start",
+      "scale_mode": "length_only",
+      "dimensions_m": {
+        "x": 4,
+        "y": 0.2,
+        "z": 2
+      },
+      "bounds_m": {
+        "min": {
+          "x": 0,
+          "y": -0.1,
+          "z": 0
+        },
+        "max": {
+          "x": 4,
+          "y": 0.1,
+          "z": 2
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 4,
+          "y": 0.2,
+          "z": 2
+        }
+      },
+      "triangle_count": 12,
+      "byte_size": 2108,
+      "sha256": "6b5ff622ca23575947d8ddc5254d944a81f16e9547bf1625c1495a6ce6894133",
+      "revision": 1
+    },
+    {
+      "asset_id": "wall.low",
+      "category": "wall",
+      "label_zh": "矮墙",
+      "aliases": [
+        "low_wall"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/wall.low.glb",
+      "anchor": "segment_start",
+      "scale_mode": "length_only",
+      "dimensions_m": {
+        "x": 4,
+        "y": 0.35,
+        "z": 0.8
+      },
+      "bounds_m": {
+        "min": {
+          "x": 0,
+          "y": -0.175,
+          "z": 0
+        },
+        "max": {
+          "x": 4,
+          "y": 0.175,
+          "z": 0.8
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 4,
+          "y": 0.35,
+          "z": 0.8
+        }
+      },
+      "triangle_count": 12,
+      "byte_size": 2132,
+      "sha256": "0e81db230b2f2ee5e2382e2c2ddfbb9512cce2110c719c11dde1282c8162a1ab",
+      "revision": 1
+    },
+    {
+      "asset_id": "wall.corner",
+      "category": "wall",
+      "label_zh": "转角墙",
+      "aliases": [
+        "corner_wall"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/wall.corner.glb",
+      "anchor": "inner_corner",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 2.6,
+        "y": 2.6,
+        "z": 2
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.1,
+          "y": -0.1,
+          "z": 0
+        },
+        "max": {
+          "x": 2.5,
+          "y": 2.5,
+          "z": 2
+        }
+      },
+      "collision": {
+        "type": "box_union",
+        "dimensions_m": {
+          "x": 2.5,
+          "y": 2.5,
+          "z": 2
+        }
+      },
+      "triangle_count": 24,
+      "byte_size": 3948,
+      "sha256": "ce57a963e5a05fe24463477425785adfe714e379c57acbe6b864eac33bf12d10",
+      "revision": 1
+    },
+    {
+      "asset_id": "building.kiosk",
+      "category": "building",
+      "label_zh": "公园小亭",
+      "aliases": [
+        "kiosk",
+        "pavilion"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/building.kiosk.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 4.5,
+        "y": 3.5,
+        "z": 2.555
+      },
+      "bounds_m": {
+        "min": {
+          "x": -2.25,
+          "y": -1.75,
+          "z": 0
+        },
+        "max": {
+          "x": 2.25,
+          "y": 1.75,
+          "z": 2.555
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 4.5,
+          "y": 3.5,
+          "z": 2.73
+        }
+      },
+      "triangle_count": 36,
+      "byte_size": 5860,
+      "sha256": "250eb238d7b61e1f129efe239efcc75dc8d24bb08ab4660203f93e3afb6a5dc0",
+      "revision": 1
+    },
+    {
+      "asset_id": "building.service-room",
+      "category": "building",
+      "label_zh": "服务房",
+      "aliases": [
+        "service_building"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/building.service-room.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 8.4,
+        "y": 5.4,
+        "z": 3.4
+      },
+      "bounds_m": {
+        "min": {
+          "x": -4.2,
+          "y": -2.7,
+          "z": 0
+        },
+        "max": {
+          "x": 4.2,
+          "y": 2.7,
+          "z": 3.4
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 8.4,
+          "y": 5.4,
+          "z": 3.4
+        }
+      },
+      "triangle_count": 36,
+      "byte_size": 5864,
+      "sha256": "5ea90404bb42bcf64fcfcf152fc582e40edc0ffd51268a5188e9ca039956ffc0",
+      "revision": 1
+    },
+    {
+      "asset_id": "building.restroom",
+      "category": "building",
+      "label_zh": "公共卫生间",
+      "aliases": [
+        "restroom",
+        "toilet"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/building.restroom.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 5.4,
+        "y": 4.4,
+        "z": 3.055
+      },
+      "bounds_m": {
+        "min": {
+          "x": -2.7,
+          "y": -2.2,
+          "z": 0
+        },
+        "max": {
+          "x": 2.7,
+          "y": 2.2,
+          "z": 3.055
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 5.4,
+          "y": 4.4,
+          "z": 3.08
+        }
+      },
+      "triangle_count": 48,
+      "byte_size": 7772,
+      "sha256": "3d8d62c86908fcb30b182131c52d2d2a3219ab68a73c852f32b50b2c4d8557fa",
+      "revision": 1
+    },
+    {
+      "asset_id": "vehicle.sedan",
+      "category": "vehicle",
+      "label_zh": "轿车",
+      "aliases": [
+        "car",
+        "sedan"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/vehicle.sedan.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 4.5,
+        "y": 2.5,
+        "z": 1.21
+      },
+      "bounds_m": {
+        "min": {
+          "x": -2.25,
+          "y": -1.25,
+          "z": 0.24
+        },
+        "max": {
+          "x": 2.25,
+          "y": 1.25,
+          "z": 1.45
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 4.5,
+          "y": 1.8,
+          "z": 1.5
+        }
+      },
+      "triangle_count": 184,
+      "byte_size": 17880,
+      "sha256": "33358cf4f6e1ef2d4d6caef46cb60bfddca50c2c4b382c3ca2efd954b7ad2c27",
+      "revision": 1
+    },
+    {
+      "asset_id": "vehicle.van",
+      "category": "vehicle",
+      "label_zh": "面包车",
+      "aliases": [
+        "van",
+        "truck"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/vehicle.van.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 5,
+        "y": 2.7,
+        "z": 2.06
+      },
+      "bounds_m": {
+        "min": {
+          "x": -2.5,
+          "y": -1.35,
+          "z": 0.24
+        },
+        "max": {
+          "x": 2.5,
+          "y": 1.35,
+          "z": 2.3
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 5,
+          "y": 2,
+          "z": 2.2
+        }
+      },
+      "triangle_count": 184,
+      "byte_size": 17808,
+      "sha256": "16795dd011487045f7558809330f69b48814cc8fbffcc967b7edbda939d3e989",
+      "revision": 1
+    },
+    {
+      "asset_id": "vehicle.golf-cart",
+      "category": "vehicle",
+      "label_zh": "电瓶车",
+      "aliases": [
+        "golf_cart",
+        "service_cart"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/vehicle.golf-cart.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 2.8,
+        "y": 1.84,
+        "z": 1.84
+      },
+      "bounds_m": {
+        "min": {
+          "x": -1.4,
+          "y": -0.92,
+          "z": 0.16
+        },
+        "max": {
+          "x": 1.4,
+          "y": 0.92,
+          "z": 2
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 2.8,
+          "y": 1.3,
+          "z": 1.8
+        }
+      },
+      "triangle_count": 208,
+      "byte_size": 21804,
+      "sha256": "42702f27a3a492fa8bd3a3f22621237377a5e60819cf82c5263c41296caa7e62",
+      "revision": 1
+    },
+    {
+      "asset_id": "tree.deciduous",
+      "category": "tree",
+      "label_zh": "乔木",
+      "aliases": [
+        "tree",
+        "deciduous_tree"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/tree.deciduous.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 2.904,
+        "y": 2.7,
+        "z": 4.6
+      },
+      "bounds_m": {
+        "min": {
+          "x": -1.473,
+          "y": -1.35,
+          "z": 0
+        },
+        "max": {
+          "x": 1.431,
+          "y": 1.35,
+          "z": 4.6
+        }
+      },
+      "collision": {
+        "type": "cylinder",
+        "radius_m": 1.35,
+        "height_m": 4.6
+      },
+      "triangle_count": 152,
+      "byte_size": 17812,
+      "sha256": "f894f7c4b65b0fed5f2a7c9db95786303443180b2af2f58a4d707d26451b4643",
+      "revision": 1
+    },
+    {
+      "asset_id": "tree.conifer",
+      "category": "tree",
+      "label_zh": "针叶树",
+      "aliases": [
+        "conifer",
+        "pine"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/tree.conifer.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 2.4,
+        "y": 2.4,
+        "z": 4.725
+      },
+      "bounds_m": {
+        "min": {
+          "x": -1.2,
+          "y": -1.2,
+          "z": 0
+        },
+        "max": {
+          "x": 1.2,
+          "y": 1.2,
+          "z": 4.725
+        }
+      },
+      "collision": {
+        "type": "cylinder",
+        "radius_m": 1.2,
+        "height_m": 4.7
+      },
+      "triangle_count": 80,
+      "byte_size": 10500,
+      "sha256": "ebd792bb4e7274957f138aff0e4cef2996d24de9e71a512d0f4ee73a5e449708",
+      "revision": 1
+    },
+    {
+      "asset_id": "tree.shrub",
+      "category": "tree",
+      "label_zh": "灌木",
+      "aliases": [
+        "shrub",
+        "bush"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/tree.shrub.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 1.768,
+        "y": 1.191,
+        "z": 1.31
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.892,
+          "y": -0.595,
+          "z": 0.005
+        },
+        "max": {
+          "x": 0.875,
+          "y": 0.595,
+          "z": 1.315
+        }
+      },
+      "collision": {
+        "type": "cylinder",
+        "radius_m": 0.7,
+        "height_m": 1.25
+      },
+      "triangle_count": 88,
+      "byte_size": 12028,
+      "sha256": "92e458d56120d5b9960b4dde2faf762e4dcf811af0d18eecae61bbd219725b19",
+      "revision": 1
+    },
+    {
+      "asset_id": "road.straight",
+      "category": "road",
+      "label_zh": "直道路段",
+      "aliases": [
+        "road",
+        "straight_road"
+      ],
+      "role": "navigation_surface",
+      "url": "/scene-assets/road.straight.glb",
+      "anchor": "segment_start",
+      "scale_mode": "length_width",
+      "dimensions_m": {
+        "x": 4,
+        "y": 3,
+        "z": 0.097
+      },
+      "bounds_m": {
+        "min": {
+          "x": 0,
+          "y": -1.5,
+          "z": 0
+        },
+        "max": {
+          "x": 4,
+          "y": 1.5,
+          "z": 0.097
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 4,
+          "y": 3,
+          "z": 0.08
+        }
+      },
+      "triangle_count": 24,
+      "byte_size": 4016,
+      "sha256": "c44fe54eacebd139400d5d8bad6c39836fcfba12cc23d456e6dbc5da2997c863",
+      "revision": 1
+    },
+    {
+      "asset_id": "road.curve90",
+      "category": "road",
+      "label_zh": "九十度弯道",
+      "aliases": [
+        "curved_road",
+        "road_curve"
+      ],
+      "role": "navigation_surface",
+      "url": "/scene-assets/road.curve90.glb",
+      "anchor": "segment_start",
+      "scale_mode": "length_width",
+      "dimensions_m": {
+        "x": 4.25,
+        "y": 4.25,
+        "z": 0
+      },
+      "bounds_m": {
+        "min": {
+          "x": 0,
+          "y": -1.25,
+          "z": 0.04
+        },
+        "max": {
+          "x": 4.25,
+          "y": 3,
+          "z": 0.04
+        }
+      },
+      "collision": {
+        "type": "mesh_bounds",
+        "dimensions_m": {
+          "x": 4.25,
+          "y": 4.25,
+          "z": 0.08
+        }
+      },
+      "triangle_count": 20,
+      "byte_size": 1736,
+      "sha256": "435f1716253a72e16e5f04b52e8b694bab9f24487afa476960cfba569a55ac5d",
+      "revision": 1
+    },
+    {
+      "asset_id": "road.intersection",
+      "category": "road",
+      "label_zh": "十字路口",
+      "aliases": [
+        "intersection",
+        "crossroad"
+      ],
+      "role": "navigation_surface",
+      "url": "/scene-assets/road.intersection.glb",
+      "anchor": "junction_center",
+      "scale_mode": "length_width",
+      "dimensions_m": {
+        "x": 4,
+        "y": 4,
+        "z": 0.102
+      },
+      "bounds_m": {
+        "min": {
+          "x": -2,
+          "y": -2,
+          "z": 0
+        },
+        "max": {
+          "x": 2,
+          "y": 2,
+          "z": 0.102
+        }
+      },
+      "collision": {
+        "type": "box_union",
+        "dimensions_m": {
+          "x": 4,
+          "y": 4,
+          "z": 0.08
+        }
+      },
+      "triangle_count": 48,
+      "byte_size": 7772,
+      "sha256": "d13149dce014d2baa87742dce731ae0b2dfc4d74cf99eaad1bfdf34d82175f04",
+      "revision": 1
+    }
+  ]
+}
