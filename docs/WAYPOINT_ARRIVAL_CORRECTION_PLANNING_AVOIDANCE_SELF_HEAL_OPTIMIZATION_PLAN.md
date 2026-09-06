@@ -282,6 +282,28 @@ Edge 另有障碍和无进展监测：
 - 其余中间点迁移为 `pass_through`；
 - 路线最后一点至少为 `stop_and_confirm`。
 
+### 5.1.1 四种到点策略的实现说明
+
+四种策略均由平台路线归一化后写入航点快照，再经协议校验传给 Edge；Edge 将其写入当前 `LegProfile.arrival_policy`，并按策略决定到点后的状态门控。
+
+| 策略 | 当前执行行为 | 典型用途 |
+| --- | --- | --- |
+| `pass_through` | Nav2 goal 成功后只发布 `waypoint_passed`，不停车、不做静止定位校正、不执行 dwell、语音或航点动作，直接生成下一航点。 | 普通巡检中间点 |
+| `stop_and_confirm` | 停止并确认零速度，切换静止定位策略，等待绝对定位/校正，重新检查航点误差后发布 `waypoint_reached`；随后由 dwell 和阻塞语音共同门控下一段。 | 普通业务停点、历史兼容点、路线末点 |
+| `precision` | 语义上要求比普通停点更严格的 XY/yaw 确认。当前字段已归一化、校验并进入 `LegProfile`，实际严格程度仍主要由 `require_yaw`、末点容差和定位模式控制。 | 窄门、设备操作等精确点 |
+| `dock` | 语义上要求停靠状态确认。当前完整停靠行为由 `context.docking.enabled` 触发，包括低速末段、停靠专用位置/航向容差、goal precision 以及接触/充电回调；仅设置字符串而没有 docking 上下文不会自动启动完整充电流程。 | 充电桩或其他接触式停靠 |
+
+执行时序如下：
+
+```text
+Nav2 goal 成功
+  ├─ pass_through → waypoint_passed → 下一航点
+  └─ 其他策略 → 停车/静止定位 → 校正后位姿复核
+                  → waypoint_reached → dwell/语音门控 → 下一航点
+```
+
+历史路线未提供 `arrival_policy` 时采用 fail-closed 策略：默认 `stop_and_confirm`；有 `dwell_seconds`、语音、动作或 `require_yaw` 的点也自动迁移为 `stop_and_confirm`。`precision` 的独立误差阈值、`dock` 与 docking 上下文强绑定、连续多帧 `arrival_confirmed` 以及动作幂等执行仍属于 P2 后续闭环，不应仅凭字段存在宣称全部完成。
+
 ### 5.2 引入不可变 LegProfile
 
 每个“从当前点到下一点”的路段生成：
