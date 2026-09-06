@@ -218,8 +218,12 @@ let attemptMarkerTimer = null
 let routeLoadSequence = 0
 
 const GLOBAL_CONTROLLER_OPTIONS = [
-  { value: 'theta_star', label: 'Theta*' },
-  { value: 'navfn', label: 'NavFn (A*)' },
+  { value: 'theta_star', label: 'Theta*（ThetaStar）' },
+  { value: 'navfn', label: 'NavFn（A*）' },
+]
+const LOCAL_CONTROLLER_OPTIONS = [
+  { value: 'mppi', label: 'MPPI（FollowPath）' },
+  { value: 'rpp', label: 'RPP（Regulated Pure Pursuit）' },
 ]
 const DEFAULT_GLOBAL_CONTROLLER = 'theta_star'
 
@@ -788,9 +792,8 @@ function normalizeWaypointLocalizationMode(mode) {
 }
 
 function normalizeLocalController(mode) {
-  // RPP is retained as a legacy payload alias; the deployed controller
-  // server only registers FollowPath (MPPI).
-  return 'mppi'
+  const normalized = String(mode || 'mppi').trim().toLowerCase()
+  return normalized === 'rpp' ? 'rpp' : 'mppi'
 }
 
 function normalizeGlobalController(mode) {
@@ -3071,7 +3074,9 @@ async function handleDeleteRoute(route) {
                       <label>
                         <span>局部控制器</span>
                         <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
-                          <option value="mppi">MPPI</option>
+                          <option v-for="option in LOCAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </option>
                         </select>
                       </label>
                       <label>
@@ -3954,10 +3959,10 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-3 .waypoint-list {
-  height: auto;
-  flex: 1 1 auto;
-  min-height: 220px;
-  max-height: none;
+  height: 280px;
+  flex: 0 0 280px;
+  min-height: 280px;
+  max-height: 280px;
   overflow-y: auto;
 }
 
@@ -5881,10 +5886,10 @@ async function handleDeleteRoute(route) {
   }
 
   .route-step-3 .waypoint-list {
-    flex: 0 0 auto;
-    height: auto;
-    min-height: 0;
-    max-height: none;
+    flex: 0 0 280px;
+    height: 280px;
+    min-height: 280px;
+    max-height: 280px;
   }
 
   .status-grid,

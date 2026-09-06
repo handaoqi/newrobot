@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：分阶段实施中（本轮已完成 P0 单航点边界、P1 算法插件注册；到点事务/恢复仲裁仍待后续阶段）。
+- 状态：分阶段实施中（已完成 P0 单航点边界、真实算法插件注册、页面到运行选择链路及真实 dwell；新鲜位姿到点事务/恢复仲裁仍待后续阶段）。
 - 适用范围：平台路径配置、边缘任务执行器、定位节点、Nav2 导航栈、状态展示与语音播报。
 - 目标：把“到点、校正、转向、下一段规划、避障、自愈”收敛成可验证的单一状态机，消除航点漏报、重复播报、错误跳点、配置名实不符以及多套恢复流程互相抢占等问题。
 - 本文同时记录实施状态；未标记为“已完成”的项目仍不可视为生产闭环。
@@ -15,22 +15,25 @@
 | 2 | 已完成 | Nav2 planner 注册 `ThetaStar` 与 `NavFn`；`NavFn.use_astar=true` 对应 A*，ThetaStar 对 NavFn 路径做栅格视线松弛。 |
 | 3 | 已完成 | Nav2 controller 注册 `FollowPath`（MPPI）与 `RPP`（Regulated Pure Pursuit）两个独立插件。 |
 | 4 | 已完成 | Edge selector 映射 `theta_star→ThetaStar`、`navfn→NavFn`、`mppi→FollowPath`、`rpp→RPP`，并下发对应参数。 |
-| 5 | 已完成（静态/构建） | Python selector 单测、XML/YAML 解析与两个 ROS 包编译安装已通过；真实运行时 selector 读回需在设备上执行。 |
-| 6 | 待执行 | 到点确认新鲜位姿/连续多帧、完整 `LegProfile`、恢复仲裁器、dwell 和统一幂等键。 |
+| 5 | 已完成（构建安装验证） | 默认单点/多点行为树接入 `PlannerSelector` 和 `ControllerSelector`，不再硬编码 `GridBased/FollowPath`；`navigo_bt_navigator` 已定向构建并安装通过。 |
+| 6 | 已完成（代码/静态验证） | 路径规划页、路线序列化、任务快照和 Edge 协议统一保留四个真实选项；全局算法参数应用失败会阻止选择器发布和发车。 |
+| 7 | 已完成（代码/单测） | `dwell_seconds` 在 `arrival_confirmed` 后由 Edge 单调时钟异步执行，并与定位、阻塞语音共同作为下一段放行门；暂停/取消不再误取消已结束的 Nav2 goal。 |
+| 8 | 待现场验证 | 在设备上逐项选择四种组合，读回 action goal 的插件 ID、参数值及规划/控制性能日志，并测量 dwell 误差。 |
+| 9 | 待执行 | 到点确认新鲜位姿/连续多帧、完整 `LegProfile`、恢复仲裁器和统一幂等键。 |
 
 本轮明确不合并航点：每个航点完成校正和业务确认后，才以校正后的新鲜位姿生成下一段；`NavigateThroughPoses` 保留为底层能力但不作为默认业务路径。
 
 ## 2. 结论摘要
 
-当前系统的主体链路已经形成：平台保存路线快照，Edge 按路线分批，下发 Nav2 action；Nav2 以 1 Hz 生成全局路径、MPPI 以 20 Hz 跟踪，局部代价地图和 Collision Monitor 负责近场障碍；每个需要停留的批次结束后，Edge 停车、切换静止定位策略、等待校正、播报，再朝下一点转向并重新下发目标。
+当前系统的主体链路已经形成：平台保存路线快照，Edge 按单航点段下发 Nav2 action；Nav2 以 1 Hz 运行已选全局规划器，由已选 MPPI/RPP 局部控制器跟踪，局部代价地图和 Collision Monitor 负责近场障碍；每段结束后，Edge 停车、切换静止定位策略、等待校正，并行门控停留与阻塞播报，再朝下一点转向并重新下发目标。
 
 需要优先处理的不是继续放宽到点阈值，而是统一以下语义和所有权：
 
 1. “经过航点”与“确认到达航点”必须分开。Nav2 在半径 1.0 m 内移除中间点，只能代表通过，不应触发要求停车、校正、动作或播报的到点事件。
 2. 到点确认必须使用定位校正完成后的新鲜位姿，并要求连续稳定样本，不能使用校正前或上一航点遗留的位姿。
-3. 每一段路线必须绑定不可变的“段配置”，配置变化即切批；目前只按部分属性切批，会使批次中间的规划器、控制器或避障设置被忽略。
-4. 页面中的 `theta_star/navfn` 与实际 Nav2 行为不一致；当前只有 NavFn 插件，所谓切换实质是同一插件的 Dijkstra/A* 参数切换。MPPI/RPP 也不存在真实的双插件切换。
-5. `avoidance_to_next=false` 不能同时关闭最后一道碰撞急停。动态绕行、减速和硬急停应拆成三个独立安全层。
+3. 每一段路线必须绑定不可变的“段配置”。当前已经按单航点下发并逐段应用控制器/规划器，但仍缺少原子 capability 校验、完整读回和回滚。
+4. 页面、任务快照、Edge 和 Nav2 已统一为 `theta_star→ThetaStar`、`navfn→NavFn(A*)`、`mppi→FollowPath(MPPI)`、`rpp→RPP`；仍需完成设备运行时读回验收。
+5. 已将 Collision Monitor 硬急停从 `avoidance_to_next` 中剥离并强制保持开启；后续仍需把动态绕行、减速和硬急停表达成显式的三层配置模型。
 6. Nav2 行为树恢复与 Edge 自愈需要一个恢复仲裁器，确保任一时刻只有一个恢复动作拥有控制权。
 7. 配置下发必须有能力协商、应用确认和读回校验，失败时不能带着旧配置继续导航。
 
@@ -48,7 +51,7 @@
 | `map_point_number` / `waypoint_id` | 页面点号和持久标识 | 语音、执行索引和显示点号容易混用 |
 | `x/y/yaw` | 地图坐标和方向 | 中间点可能使用路径方向覆盖点击 yaw |
 | `require_yaw` | 是否严格要求目标方向 | Nav2 默认 yaw 容差实际为 3.14 rad，仅要求时才使用 0.25 rad |
-| `dwell_seconds` | 到点停留时间 | 当前只影响切批，Nav2 实际仍使用全局固定 200 ms 等待 |
+| `dwell_seconds` | 到点停留时间 | Edge 已在到点确认后以单调时钟异步计时，并与定位/阻塞语音共同门控下一段；仍需现场测量误差 |
 | `actions` | 如 `snapshot` | 已进入快照，但未找到完整的动作执行闭环 |
 | `localization_mode` | `ndt`、`rtk`、`ukf` | 能影响静止/运动定位策略，应纳入段配置边界 |
 | `local_controller` | `mppi` 或 `rpp` | 分别映射 `FollowPath`（MPPI）和 `RPP` 插件 |
@@ -66,7 +69,7 @@
   → Edge 计算本批次终点
   → 设置定位/规划/控制/避障参数
   → 单点：FollowWaypoints（当前默认每个航点独立发送）
-  → Nav2 全局规划与 MPPI 局部跟踪
+  → Nav2 使用已选全局规划器和局部控制器运行
   → 批次终点停车并等待定位校正
   → Edge 检查到点距离
   → 生成 waypoint_reached、动作和语音事件
@@ -89,7 +92,7 @@
 
 当前实现已取消普通室内连续点的默认合并；每个航点独立 action，避免定位校正、恢复和控制器配置跨点失效。`NavigateThroughPoses` 仍可由底层接口支持，但不参与本计划的默认业务执行。
 
-当前缺口：批次不会因为 `global_controller`、`local_controller` 或 `avoidance_to_next` 变化而必然切分。配置只在批次发送前应用，所以批次中间航点的配置可能从未生效。
+当前每个航点都是独立 action，因此 `global_controller`、`local_controller` 和 `avoidance_to_next` 会在每段发车前重新应用。剩余缺口是尚未把这些字段封装成不可变 `LegProfile`，也没有以单个原子接口完成 capability 校验、参数读回和失败回滚。
 
 ### 3.4 当前到点判定是四层叠加
 
@@ -158,45 +161,46 @@ desired_yaw = atan2(next_y - corrected_y, next_x - corrected_x)
 
 #### 全局规划
 
-Nav2 当前仅注册：
+Nav2 当前注册两个独立规划器：
 
 ```yaml
-planner_plugins: ["GridBased"]
-GridBased:
+planner_plugins: ["ThetaStar", "NavFn"]
+ThetaStar:
+  plugin: "navigo_navfn_planner/ThetaStarPlanner"
+NavFn:
   plugin: "navigo_navfn_planner/NavfnPlanner"
 ```
 
-行为树也固定使用 `planner_id="GridBased"`，没有真正使用 Planner Selector。
+默认单点和多点行为树通过 `/planner_selector` 获取 `selected_planner`，并把它传入 `ComputePathToPose` / `ComputePathThroughPoses`，默认值为 `ThetaStar`。
 
-Edge 所谓全局规划切换实际为：
+端到端映射为：
 
-| 页面值 | 当前实际配置 | 真实算法 |
+| 页面值 | Nav2 plugin ID | 真实算法/参数 |
 | --- | --- | --- |
-| `theta_star` | `GridBased.use_astar=false` | NavFn/Dijkstra |
-| `navfn` | `GridBased.use_astar=true` | NavFn/A* |
+| `theta_star` | `ThetaStar` | 栅格路径 + 视线松弛的 Theta* 规划器 |
+| `navfn` | `NavFn` | `NavFn.use_astar=true` 的 A* 规划 |
 
-系统并未加载真正的 Theta* 插件。因此这是高优先级的名实错误，页面、任务快照和运行日志会给出错误认知。
+Edge 先写入并读回对应参数，再发布 selector；写入失败抛出 `GLOBAL_CONTROLLER_FAILED`，不得带着旧算法继续发车。设备验收还需从规划性能日志确认实际 `planner_id`。
 
 全局规划频率为 1 Hz。室外配置可优先直线路径并允许失败回退，室内以栅格规划为主。全局代价地图以静态地图和膨胀为主，实时激光障碍主要在局部层处理。
 
 #### 局部控制
 
-当前只注册 MPPI `FollowPath`，控制频率 20 Hz，预测域为 `56 × 0.05 = 2.8 s`，采样批量 1000，常规上限约 `vx=0.30 m/s`、`wz=0.35 rad/s`。接近终点还有较慢的速度配置。
+Nav2 注册 `FollowPath`（MPPI）和 `RPP`（Regulated Pure Pursuit）两个独立控制器。默认单点和多点行为树通过 `/controller_selector` 把 `selected_controller` 传给 `FollowPath` action，默认值为 `FollowPath`。
 
-`rpp` 只是兼容别名，仍会归一化为 MPPI，不是实际插件切换。因此前端不应继续展示无法兑现的本地控制器选择，除非真正注册第二插件并接入 Controller Selector。
+MPPI 控制频率 20 Hz，预测域为 `56 × 0.05 = 2.8 s`，采样批量 1000，常规上限约 `vx=0.30 m/s`、`wz=0.35 rad/s`；RPP 使用确定性的前视点/曲率调速参数。页面保存的 `mppi/rpp` 会原样进入任务快照，并分别发布 `FollowPath/RPP`，不再把 RPP 静默降级成 MPPI。
 
 ### 3.8 当前避障
 
 局部滚动代价地图约 8 m × 8 m、0.05 m 分辨率、5 Hz 更新，使用 `/laser_scan`，障碍标记约 3 m、清除射线约 4 m。MPPI 的 CostCritic 根据局部代价图绕行；Collision Monitor 位于速度输出链路末端，负责近场减速和硬停。
 
-当前 `avoidance_to_next=false` 会同时关闭：
+当前 `avoidance_to_next=false` 会关闭：
 
 - 局部障碍层；
 - MPPI CostCritic；
 - Collision Monitor 减速区；
-- Collision Monitor 急停区。
 
-这把“允许不绕行”和“允许撞上障碍”混成了一个开关，必须拆分。
+Collision Monitor 的 `PolygonStop.enabled` 已固定为 `true`，不会再随普通避障开关关闭。后续仍应把这三层状态纳入显式 `LegProfile` 和运行时读回，避免隐藏的组合状态。
 
 ### 3.9 当前自愈
 
@@ -298,7 +302,7 @@ OR LegProfile(current) != LegProfile(next)
 
 ### 5.3 修复停留与动作语义
 
-- `dwell_seconds` 由 Edge 在 `arrival_confirmed` 后执行，使用单调时钟，误差目标不超过 ±0.2 秒；不要依赖全局固定 200 ms 的 Waypoint Follower 等待。
+- 已完成：`dwell_seconds` 由 Edge 在 `arrival_confirmed` 后执行，使用单调时钟异步等待，并与定位和阻塞语音共同门控下一段；不再依赖全局固定 200 ms 的 Waypoint Follower 等待。现场误差目标仍为 ±0.2 秒。
 - `actions` 必须有执行器注册表、超时、幂等键、成功/失败策略和状态事件；无法识别的动作在任务开始前拒绝，不要运行中忽略。
 - 语音增加 `speech_mode=blocking|non_blocking|disabled`，优先按航点配置，路线级配置只提供默认值。
 
@@ -425,9 +429,9 @@ LIO 主定位模式对短时 NDT/VGICP 延迟应使用健康状态迟滞：
 
 ## 9. 规划器和控制器真实切换
 
-### 9.1 P0 推荐方案：先修正名称
+### 9.1 历史过渡方案（已被真实多插件实现取代）
 
-在未引入新插件前，把全局算法公开值改为：
+早期曾考虑在未引入新插件前，把全局算法公开值改为：
 
 - `dijkstra` → `GridBased.use_astar=false`；
 - `astar` → `GridBased.use_astar=true`。
@@ -438,18 +442,18 @@ LIO 主定位模式对短时 NDT/VGICP 延迟应使用健康状态迟滞：
 - 旧 `navfn` 按当前真实行为迁移为 `astar`；
 - 页面明确显示“NavFn Dijkstra / NavFn A*”。
 
-本地控制器只显示 `mppi`，保留 `rpp` 仅作输入兼容并在日志中警告迁移，不继续让用户误以为已切换插件。
+该方案不再执行：当前已经具备独立 `ThetaStar/NavFn` 和 `FollowPath/RPP` 插件，继续把 RPP 归一化为 MPPI 反而会制造页面、快照与运行不一致。
 
-### 9.2 后续真正多插件方案
+### 9.2 当前真实多插件方案
 
-如果确实需要 Theta* 和 RPP：
+当前实施状态：
 
-1. 在 Nav2 参数中注册独立插件 ID；
-2. 行为树接入 Planner Selector 和 Controller Selector；
-3. Edge 从 Nav2 获取 capability 列表；
-4. 平台只显示机器人当前版本支持的能力；
-5. action 下发前选择插件并获得确认；
-6. 不可用时任务预检失败，禁止静默退回默认算法。
+1. 已在 Nav2 参数中注册四个独立插件 ID；
+2. 已让默认行为树接入 Planner Selector 和 Controller Selector；
+3. 已统一页面值、任务快照、Edge 映射和 Nav2 插件 ID；
+4. 已使全局算法参数写入失败时阻止 selector 发布和 action 下发；
+5. 待实现 Edge 从 Nav2 获取 capability 列表并让平台按机器人版本动态显示；
+6. 待实现完整配置原子应用/读回/回滚，不可用时任务预检失败。
 
 配置应用建议封装为单个 `ApplyNavigationProfile(profile_id, generation)` 服务，内部原子校验并返回实际值，代替多次独立参数调用。失败时回滚上一已知安全配置。
 
@@ -554,12 +558,12 @@ budget
 
 ### P1：正确性收口
 
-- 修正 `theta_star/navfn` 的名实问题，先公开真实的 Dijkstra/A*。
-- 前端暂时只公开 MPPI。
+- 已完成：注册并公开真实 `ThetaStar/NavFn(A*)` 与 `MPPI/RPP`，打通平台、协议、Edge selector 和默认行为树。
+- 已完成：取消 RPP→MPPI 静默替换；全局算法参数写入失败时禁止发送 action。
 - 按完整 LegProfile 切批。
-- 实现真实 `dwell_seconds`。
-- Collision Monitor 硬急停从普通避障开关中剥离并保持默认开启。
-- 配置应用失败时禁止发送 action。
+- 已完成：实现真实 `dwell_seconds`，等待期间保持可暂停、取消且不会重复下发已到达航点。
+- 已完成：Collision Monitor 硬急停从普通避障开关中剥离并保持默认开启。
+- 待完成：局部控制器、避障和速度参数也纳入原子读回；任一配置应用失败时统一禁止发送 action。
 
 ### P2：到点与校正事务
 
@@ -583,11 +587,11 @@ budget
 - 对后退和侧移增加后方/足迹/边界/路径验证。
 - 用有限恢复预算替换无界静默重试。
 
-### P5：多插件能力（可选）
+### P5：多插件能力协商与现场验收
 
-- 经实测确有收益后再引入真正 Theta*、RPP 或其他插件。
-- 行为树接入 selector，平台依据 capability 动态显示。
-- 对插件切换做独立回归，禁止在同一 action 中途切换。
+- 已引入真正 ThetaStar、NavFn、MPPI 和 RPP，并让默认行为树接入 selector。
+- 平台依据 capability 动态显示仍待实现；现阶段选项与本版本静态注册能力一致。
+- 对四种组合做独立现场回归，禁止在同一 action 中途切换。
 
 ### P6：灰度发布
 
@@ -665,7 +669,7 @@ budget
 - 不要在配置调用异常后记录日志并继续发车。
 - 不要让 Edge 与 Nav2 同时执行旋转、后退或重定位。
 - 不要为了停靠方便而关闭全程碰撞硬急停。
-- 不要继续向用户暴露实际没有加载的 Theta* 或 RPP。
+- 不要向用户暴露机器人当前版本未加载或 capability 未确认的算法；当前版本已静态注册 ThetaStar、NavFn、MPPI 和 RPP，仍需运行时读回验收。
 - 不要依靠可变循环索引生成航点播报和完成事件。
 
 ## 18. 完成定义

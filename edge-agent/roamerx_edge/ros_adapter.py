@@ -2784,18 +2784,18 @@ class RosAdapter(Node):
         if normalized == self._active_global_controller:
             return
         plugin_id = global_controller_plugin_id(normalized)
-        self._publish_nav_selector(self._planner_selector_pub, plugin_id)
         planner_params = {
             f"{plugin_id}.use_astar": normalized == "navfn",
         }
-        try:
-            self._set_remote_parameters(
-                "/planner_server",
-                planner_params,
-                code="GLOBAL_CONTROLLER_FAILED",
-            )
-        except ProtocolError:
-            LOGGER.warning("unable to apply %s planner profile", normalized)
+        # Apply and verify the algorithm parameters before publishing the
+        # selector.  A failed write must not silently run a different planner
+        # than the one saved and displayed by the platform.
+        self._set_remote_parameters(
+            "/planner_server",
+            planner_params,
+            code="GLOBAL_CONTROLLER_FAILED",
+        )
+        self._publish_nav_selector(self._planner_selector_pub, plugin_id)
         self._active_global_controller = normalized
         LOGGER.info("global controller set to %s (%s)", normalized, plugin_id)
 
@@ -2968,16 +2968,11 @@ class RosAdapter(Node):
         )
         if getattr(self, "_outdoor_planner_profile", None) == use_outdoor_profile:
             return
-        # Keep this helper safe for lightweight test doubles and older restored
-        # adapters that predate the controller-selection fields.
-        # Older adapters used Nav2's GridBased plugin as the implicit profile;
-        # preserve that behavior when the selection field is absent.
+        # The default must also be a registered planner.  Falling back to the
+        # removed GridBased id makes a profile write fail while the UI still
+        # reports Theta*, so normalize an empty selection to ThetaStar.
         raw_controller = getattr(self, "_active_global_controller", None)
-        plugin_id = (
-            global_controller_plugin_id(normalize_global_controller(raw_controller))
-            if raw_controller is not None
-            else "GridBased"
-        )
+        plugin_id = global_controller_plugin_id(normalize_global_controller(raw_controller))
         params = (
             {
                 f"{plugin_id}.allow_straight_line_fallback": True,
@@ -2991,19 +2986,13 @@ class RosAdapter(Node):
                 f"{plugin_id}.tolerance": 0.5,
             }
         )
-        try:
-            self._set_remote_parameters(
-                "/planner_server",
-                params,
-                code="WAYPOINT_PROFILE_FAILED",
-                attempts=2,
-            )
-            self._outdoor_planner_profile = use_outdoor_profile
-        except ProtocolError:
-            LOGGER.warning(
-                "%s planner profile was not applied",
-                "outdoor RTK" if use_outdoor_profile else "indoor occupancy",
-            )
+        self._set_remote_parameters(
+            "/planner_server",
+            params,
+            code="WAYPOINT_PROFILE_FAILED",
+            attempts=2,
+        )
+        self._outdoor_planner_profile = use_outdoor_profile
 
     def set_goal_precision(self, *, enabled: bool) -> None:
         """Select the tight pose tolerances used only for the dock contact point."""

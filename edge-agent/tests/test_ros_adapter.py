@@ -937,9 +937,9 @@ def test_planner_profile_restores_indoor_defaults_and_enables_outdoor_rtk():
     assert calls[-1] == (
         "/planner_server",
         {
-            "GridBased.allow_straight_line_fallback": False,
-            "GridBased.prefer_straight_line": False,
-            "GridBased.tolerance": 0.5,
+            "ThetaStar.allow_straight_line_fallback": False,
+            "ThetaStar.prefer_straight_line": False,
+            "ThetaStar.tolerance": 0.5,
         },
     )
 
@@ -947,14 +947,59 @@ def test_planner_profile_restores_indoor_defaults_and_enables_outdoor_rtk():
     assert calls[-1] == (
         "/planner_server",
         {
-            "GridBased.allow_straight_line_fallback": True,
-            "GridBased.prefer_straight_line": True,
-            "GridBased.tolerance": 2.0,
+            "ThetaStar.allow_straight_line_fallback": True,
+            "ThetaStar.prefer_straight_line": True,
+            "ThetaStar.tolerance": 2.0,
         },
     )
     before = len(calls)
     adapter.apply_outdoor_gps_profile(outdoor=True)
     assert len(calls) == before
+
+
+def test_global_controller_applies_verified_algorithm_before_publishing_selector():
+    adapter = object.__new__(RosAdapter)
+    adapter._active_global_controller = None
+    adapter._planner_selector_pub = object()
+    order = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: order.append(
+        ("parameters", node, dict(values), kwargs["code"])
+    )
+    adapter._publish_nav_selector = lambda publisher, plugin_id: order.append(
+        ("selector", publisher, plugin_id)
+    )
+
+    adapter.set_global_controller("navfn")
+
+    assert order == [
+        (
+            "parameters",
+            "/planner_server",
+            {"NavFn.use_astar": True},
+            "GLOBAL_CONTROLLER_FAILED",
+        ),
+        ("selector", adapter._planner_selector_pub, "NavFn"),
+    ]
+    assert adapter._active_global_controller == "navfn"
+
+
+def test_global_controller_parameter_failure_does_not_publish_or_cache_selection():
+    adapter = object.__new__(RosAdapter)
+    adapter._active_global_controller = None
+    adapter._planner_selector_pub = object()
+    published = []
+
+    def reject_parameters(*_args, **_kwargs):
+        raise ProtocolError("GLOBAL_CONTROLLER_FAILED", "readback mismatch")
+
+    adapter._set_remote_parameters = reject_parameters
+    adapter._publish_nav_selector = lambda *_args: published.append(True)
+
+    with pytest.raises(ProtocolError, match="readback mismatch"):
+        adapter.set_global_controller("theta_star")
+
+    assert published == []
+    assert adapter._active_global_controller is None
 
 
 def test_waypoint_profile_skips_identical_rewrite(monkeypatch):

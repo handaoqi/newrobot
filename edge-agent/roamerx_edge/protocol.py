@@ -176,6 +176,13 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("avoidance_to_next", "require_yaw"):
                 if field in waypoint and not isinstance(waypoint[field], bool):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
+            if "local_controller" in waypoint:
+                mode = str(waypoint["local_controller"]).lower()
+                if mode not in {"mppi", "rpp"}:
+                    raise ProtocolError(
+                        "INVALID_MESSAGE",
+                        "waypoint local_controller must be mppi or rpp",
+                    )
             if "global_controller" in waypoint:
                 mode = str(waypoint["global_controller"]).lower()
                 if mode not in {"theta_star", "navfn"}:

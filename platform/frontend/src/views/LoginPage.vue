@@ -19,7 +19,7 @@ async function submit() {
     const data = await login(form)
     localStorage.setItem('inspection_token', data.token)
     localStorage.setItem('inspection_user', JSON.stringify(data.user))
-    router.push('/dashboard/overview')
+    router.push('/')
   } catch (error) {
     errorMessage.value = error.message
   } finally {

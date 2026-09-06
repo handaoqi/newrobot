@@ -277,7 +277,7 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         if "local_controller" in waypoint:
             mode = str(waypoint["local_controller"]).lower()
             if mode not in {"rpp", "mppi"}:
-                raise ProtocolError("INVALID_MESSAGE", "waypoint local_controller must be mppi (rpp is a legacy alias)")
+                raise ProtocolError("INVALID_MESSAGE", "waypoint local_controller must be mppi or rpp")
         if "global_controller" in waypoint:
             mode = str(waypoint["global_controller"]).lower()
             if mode not in {"theta_star", "navfn"}:

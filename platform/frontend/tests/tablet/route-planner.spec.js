@@ -14,6 +14,15 @@ test('saved route hydrates waypoint details and keeps per-waypoint global contro
   await expect(page.locator('.waypoint-details').first()).toBeVisible()
   await expect(page.locator('.waypoint-load-error')).toHaveCount(0)
 
+  const firstWaypoint = waypointItems.first()
+  const waypointList = page.locator('.waypoint-list')
+  const fixedListHeight = await waypointList.evaluate(element => element.getBoundingClientRect().height)
+  await firstWaypoint.locator('.waypoint-expand-toggle').click()
+  await expect(firstWaypoint.locator('.waypoint-details')).toHaveCount(0)
+  await expect.poll(() => waypointList.evaluate(element => element.getBoundingClientRect().height)).toBe(fixedListHeight)
+  await firstWaypoint.locator('.waypoint-expand-toggle').click()
+  await expect(firstWaypoint.locator('.waypoint-details')).toBeVisible()
+
   const waypointControllers = waypointItems.locator('label').filter({ hasText: '全局规划器' }).locator('select')
   await expect(waypointControllers.nth(0)).toHaveValue('theta_star')
   await expect(waypointControllers.nth(1)).toHaveValue('navfn')

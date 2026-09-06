@@ -8,7 +8,7 @@ const router = useRouter()
 const module = computed(() => getModule(String(route.query.moduleId || '')))
 
 function goHome() {
-  router.push('/dashboard/overview')
+  router.push('/')
 }
 </script>
 

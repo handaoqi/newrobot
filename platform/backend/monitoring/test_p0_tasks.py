@@ -119,17 +119,17 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(execution.route_snapshot["waypoints"][0]["global_controller"], "theta_star")
         self.assertEqual(execution.route_snapshot["waypoints"][1]["global_controller"], "navfn")
 
-    def test_route_snapshot_migrates_legacy_rpp_to_registered_mppi(self):
+    def test_route_snapshot_preserves_registered_rpp(self):
         self.route.waypoints = [{"x": 1, "y": 2, "yaw": 0, "local_controller": "rpp"}]
         self.route.save(update_fields=["waypoints", "updated_at"])
         execution = TaskExecutionService.create_execution(self.task, self.user)
-        self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "mppi")
+        self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "rpp")
 
-    def test_route_representation_exposes_registered_controller_for_legacy_points(self):
+    def test_route_representation_exposes_registered_controllers(self):
         self.route.global_controller = "navfn"
         self.route.waypoints = [[1, 2], {"x": 3, "y": 4, "local_controller": "rpp"}]
         data = PatrolRouteSerializer(self.route).data
-        self.assertEqual([point["local_controller"] for point in data["waypoints"]], ["mppi", "mppi"])
+        self.assertEqual([point["local_controller"] for point in data["waypoints"]], ["mppi", "rpp"])
         self.assertEqual([point["global_controller"] for point in data["waypoints"]], ["navfn", "navfn"])
 
     def test_route_rejects_invalid_waypoint_global_controller(self):

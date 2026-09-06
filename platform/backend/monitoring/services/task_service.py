@@ -48,6 +48,11 @@ def _normalize_global_controller(value: object | None) -> str:
     return normalized if normalized in {"theta_star", "navfn"} else "theta_star"
 
 
+def _normalize_local_controller(value: object | None) -> str:
+    normalized = str(value or "mppi").strip().lower()
+    return normalized if normalized in {"mppi", "rpp"} else "mppi"
+
+
 def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
     normalized = []
     names = route.waypoint_names or []
@@ -71,7 +76,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_template_name = str(raw.get("speech_template_name") or "")
             speech_text = str(raw.get("speech_text") or "")
             localization_mode = str(raw.get("localization_mode") or "ndt").lower()
-            local_controller = str(raw.get("local_controller") or "mppi").lower()
+            local_controller = _normalize_local_controller(raw.get("local_controller"))
             global_controller = _normalize_global_controller(
                 raw.get("global_controller") or route_global_controller
             )
@@ -106,9 +111,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             "dwell_seconds": round(dwell_seconds, 1),
                 "actions": actions,
                 "localization_mode": localization_mode if localization_mode in {"ndt", "rtk", "ukf"} else "ndt",
-                # RPP is a legacy route value. The deployed navigo stack only
-                # registers FollowPath (MPPI), so old routes remain executable.
-                "local_controller": "mppi" if local_controller in {"rpp", "mppi"} else "mppi",
+                "local_controller": local_controller,
                 "global_controller": global_controller,
                 "avoidance_to_next": avoidance_to_next,
                 "require_yaw": require_yaw,

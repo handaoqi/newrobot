@@ -320,6 +320,10 @@ class TaskExecutor:
         self._speech_waiting_index: int | None = None
         self._speech_wait_finished = False
         self._speech_wait_thread: threading.Thread | None = None
+        self._dwell_waiting_index: int | None = None
+        self._dwell_wait_finished = False
+        self._dwell_wait_stop: threading.Event | None = None
+        self._dwell_wait_thread: threading.Thread | None = None
         self._waypoint_localization_ready_index: int | None = None
         self._arrival_retry_counts: dict[int, int] = {}
         raw = store.load_active_task_context()
@@ -330,6 +334,7 @@ class TaskExecutor:
             self._persist()
 
     def stop(self) -> None:
+        self._cancel_waypoint_dwell()
         self._stop_obstacle_monitor()
         self._stop_task_rosbag()
         heading_thread = self._departure_heading_thread
@@ -786,8 +791,8 @@ class TaskExecutor:
             # reached waypoint's speech. Cancelling in that window targets a
             # stale goal handle and, more importantly, recovery must not
             # dispatch the same waypoint for a second time.
-            waiting_for_speech = self._speech_waiting_index is not None
-            cancelled = waiting_for_speech or self._cancel_active_navigation()
+            waiting_at_waypoint = self._waiting_waypoint_index() is not None
+            cancelled = waiting_at_waypoint or self._cancel_active_navigation()
             self.navigation.stop_motion()
             if not cancelled:
                 # A cancel acknowledgement can time out while Nav2 is already
@@ -830,7 +835,7 @@ class TaskExecutor:
                 # Automatic RTK recovery often cancels Nav2 after the task has
                 # already been marked running again. Re-dispatch the pending
                 # goal instead of leaving the dog standing with no Nav2 action.
-                if self._speech_waiting_index is not None:
+                if self._waiting_waypoint_index() is not None:
                     self._paused_for_localization = False
                     self._paused_localization_reason = None
                     return
@@ -856,19 +861,15 @@ class TaskExecutor:
                 code="LOCALIZATION_RECOVERED",
                 message="localization is stable; resuming from the pending waypoint",
             )
-            if self._speech_waiting_index is not None:
-                reached_index = self._speech_waiting_index
-                speech_finished = self._speech_wait_finished
+            waiting_index = self._waiting_waypoint_index()
+            if waiting_index is not None:
+                reached_index = waiting_index
                 self._waypoint_localization_ready_index = reached_index
                 self.context.state = "running"
                 self.context.state_version += 1
                 self._persist()
                 self._emit("task.resumed")
-                if speech_finished:
-                    self._speech_waiting_index = None
-                    self._speech_wait_finished = False
-                    self._waypoint_localization_ready_index = None
-                    self._continue_after_waypoint(reached_index)
+                self._maybe_continue_after_waypoint(reached_index)
                 return
             # Absolute-correction pauses happen after Nav2 already accepted the
             # waypoint. Indoor: re-cruising the same click only weaves; advance.
@@ -932,6 +933,7 @@ class TaskExecutor:
     def prepare_task_start(self, envelope: MessageEnvelope) -> None:
         """Persist an accepted task before its command acknowledgement is sent."""
         with self._lock:
+            self._cancel_waypoint_dwell()
             command = envelope.payload["command"]
             route = dict(command["route_snapshot"])
             route.setdefault("map", dict(command.get("map") or {}))
@@ -983,6 +985,8 @@ class TaskExecutor:
             self._last_localization_policy = None
             self._speech_waiting_index = None
             self._speech_wait_finished = False
+            self._dwell_waiting_index = None
+            self._dwell_wait_finished = False
             self._waypoint_localization_ready_index = None
             self._arrival_retry_counts = {}
             self._persist()
@@ -2507,10 +2511,10 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.pausing")
-            waiting_for_speech = self._speech_waiting_index is not None
+            waiting_at_waypoint = self._waiting_waypoint_index() is not None
             if (
                 previous_state != "accepted"
-                and not waiting_for_speech
+                and not waiting_at_waypoint
                 and not self._cancel_active_navigation()
             ):
                 raise ProtocolError("NAVIGATION_CANCEL_FAILED", "Nav2 action cancel failed")
@@ -2565,24 +2569,27 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.resuming")
-            if self._speech_waiting_index is not None:
-                reached_index = self._speech_waiting_index
-                speech_finished = self._speech_wait_finished
+            waiting_index = self._waiting_waypoint_index()
+            if waiting_index is not None:
+                reached_index = waiting_index
                 self._waypoint_localization_ready_index = reached_index
                 self.context.state = "running"
                 self.context.state_version += 1
                 self._persist()
                 self._emit("task.resumed")
-                if speech_finished:
-                    self._speech_waiting_index = None
-                    self._speech_wait_finished = False
-                    self._waypoint_localization_ready_index = None
-                    self._continue_after_waypoint(reached_index)
+                self._maybe_continue_after_waypoint(reached_index)
                 return {
                     "final_task_state": "running",
                     "state_version": self.context.state_version,
                     "resume_from_waypoint_index": reached_index,
-                    "waiting_for_waypoint_speech": not speech_finished,
+                    "waiting_for_waypoint_speech": (
+                        self._speech_waiting_index == reached_index
+                        and not self._speech_wait_finished
+                    ),
+                    "waiting_for_waypoint_dwell": (
+                        self._dwell_waiting_index == reached_index
+                        and not self._dwell_wait_finished
+                    ),
                 }
             self._send_from(resume_index)
             return {
@@ -2594,6 +2601,7 @@ class TaskExecutor:
     def force_exit(self, execution_id: str) -> dict:
         """Idempotently clear any local motion task, regardless of its state."""
         with self._lock:
+            self._cancel_waypoint_dwell()
             self._stop_obstacle_monitor()
             self._stop_task_rosbag()
             context = self.context
@@ -2647,11 +2655,17 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.cancelling")
-            if previous_state != "paused" and not self._cancel_active_navigation():
+            waiting_at_waypoint = self._waiting_waypoint_index() is not None
+            if (
+                previous_state != "paused"
+                and not waiting_at_waypoint
+                and not self._cancel_active_navigation()
+            ):
                 raise ProtocolError("NAVIGATION_CANCEL_FAILED", "Nav2 action cancel failed")
             if not self.navigation.is_robot_stopped():
                 raise ProtocolError("ROBOT_NOT_STOPPED", "robot speed did not reach stop threshold")
             self._stop_task_rosbag()
+            self._cancel_waypoint_dwell()
             self._restore_navigation_profile()
             self.context.state = "cancelled"
             self.context.state_version += 1
@@ -2793,7 +2807,7 @@ class TaskExecutor:
                         LOGGER.exception("failed to restore profile after late final approach")
                 return
             for progress in progress_updates:
-                self.event_callback("task.progress", progress, "")
+                self.event_callback("task.progress", progress, self._event_trace_id())
 
     def _build_progress_locked(
         self,
@@ -2984,15 +2998,8 @@ class TaskExecutor:
                     milestone="waypoint_reached",
                     completed_waypoints=reached_index + 1,
                 )
-                if speech_blocks:
-                    if self._speech_wait_finished:
-                        self._speech_waiting_index = None
-                        self._speech_wait_finished = False
-                        self._waypoint_localization_ready_index = None
-                        self._continue_after_waypoint(reached_index)
-                    return
-                self._waypoint_localization_ready_index = None
-                self._continue_after_waypoint(reached_index)
+                self._start_waypoint_dwell(reached_index)
+                self._maybe_continue_after_waypoint(reached_index)
             elif status == "cancelled":
                 if self._expected_recovery_cancels > 0:
                     self._expected_recovery_cancels -= 1
@@ -3231,6 +3238,93 @@ class TaskExecutor:
         )
         self._speech_wait_thread.start()
 
+    def _waiting_waypoint_index(self) -> int | None:
+        if self._speech_waiting_index is not None:
+            return self._speech_waiting_index
+        return self._dwell_waiting_index
+
+    def _cancel_waypoint_dwell(self) -> None:
+        stop = self._dwell_wait_stop
+        self._dwell_wait_stop = None
+        self._dwell_wait_thread = None
+        self._dwell_waiting_index = None
+        self._dwell_wait_finished = False
+        if stop is not None:
+            stop.set()
+
+    def _start_waypoint_dwell(self, waypoint_index: int) -> bool:
+        if not self.context:
+            return False
+        waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
+        try:
+            duration = max(0.0, float(waypoint.get("dwell_seconds") or 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        self._cancel_waypoint_dwell()
+        if duration <= 0.0:
+            return False
+        execution_id = self.context.task_execution_id
+        stop = threading.Event()
+        self._dwell_wait_stop = stop
+        self._dwell_waiting_index = waypoint_index
+        self._dwell_wait_finished = False
+        LOGGER.info(
+            "waypoint %d dwell started duration=%.1fs",
+            waypoint_index,
+            duration,
+        )
+
+        def _wait() -> None:
+            if stop.wait(duration):
+                return
+            with self._lock:
+                if (
+                    stop is not self._dwell_wait_stop
+                    or not self.context
+                    or self.context.task_execution_id != execution_id
+                    or self._dwell_waiting_index != waypoint_index
+                ):
+                    return
+                self._dwell_wait_finished = True
+                LOGGER.info("waypoint %d dwell finished", waypoint_index)
+                self._maybe_continue_after_waypoint(waypoint_index)
+
+        thread = threading.Thread(
+            target=_wait,
+            daemon=True,
+            name=f"waypoint-dwell-{waypoint_index}",
+        )
+        self._dwell_wait_thread = thread
+        thread.start()
+        return True
+
+    def _maybe_continue_after_waypoint(self, waypoint_index: int) -> bool:
+        if not self.context or self.context.state != "running":
+            return False
+        if self._waypoint_localization_ready_index != waypoint_index:
+            return False
+        if (
+            self._speech_waiting_index == waypoint_index
+            and not self._speech_wait_finished
+        ):
+            return False
+        if (
+            self._dwell_waiting_index == waypoint_index
+            and not self._dwell_wait_finished
+        ):
+            return False
+        if self._speech_waiting_index == waypoint_index:
+            self._speech_waiting_index = None
+            self._speech_wait_finished = False
+        if self._dwell_waiting_index == waypoint_index:
+            self._dwell_waiting_index = None
+            self._dwell_wait_finished = False
+            self._dwell_wait_stop = None
+            self._dwell_wait_thread = None
+        self._waypoint_localization_ready_index = None
+        self._continue_after_waypoint(waypoint_index)
+        return True
+
     def _complete_waypoint_speech_wait(
         self,
         execution_id: str,
@@ -3256,23 +3350,18 @@ class TaskExecutor:
         if self.context.state != "running":
             return
         self._speech_wait_finished = True
-        if self._waypoint_localization_ready_index != waypoint_index:
+        if not self._maybe_continue_after_waypoint(waypoint_index):
             LOGGER.warning(
-                "waypoint %d speech %s before localization settled; will continue after ready",
+                "waypoint %d speech %s while another arrival gate is pending",
                 waypoint_index,
                 reason,
             )
-            return
-        self._speech_waiting_index = None
-        self._speech_wait_finished = False
-        self._waypoint_localization_ready_index = None
         if reason != "finished":
             LOGGER.warning(
                 "waypoint %d speech %s; treating as success and continuing navigation",
                 waypoint_index,
                 reason,
             )
-        self._continue_after_waypoint(waypoint_index)
 
     def _wait_for_waypoint_speech(self, execution_id: str, waypoint_index: int) -> None:
         path = self._waypoint_speech_status_path(waypoint_index)
@@ -3519,7 +3608,7 @@ class TaskExecutor:
                 "nav_stack_retry": True,
                 "reported_at": now_iso(),
             },
-            "",
+            self._event_trace_id(),
         )
         delay = self.navigation_dispatch_retry_seconds
         LOGGER.warning(
@@ -3714,6 +3803,7 @@ class TaskExecutor:
         if not self.context:
             return
         self._clear_nav_dispatch_retry()
+        self._cancel_waypoint_dwell()
         self._invalidate_nav_results()
         self._stop_task_rosbag()
         self._navigation_prepared = False

@@ -18,6 +18,11 @@ test('stable module catalog has unique IDs and routes', () => {
 
 test('catalog contains no hard dependencies and navigation follows enabled modules', () => {
   assert.ok(MODULES.every((module) => !module.dependencies || module.dependencies.length === 0))
+  const primaryItems = navigationItems(['guard-duty', 'overview'])
+  assert.deepEqual(primaryItems.map(({ label, path, moduleId }) => ({ label, path, moduleId })), [
+    { label: '保安值守', path: '/dashboard/guard-duty', moduleId: 'guard-duty' },
+    { label: '监测中心', path: '/dashboard/overview', moduleId: 'overview' },
+  ])
   const items = navigationItems(['overview', 'tasks', 'maps'])
   assert.deepEqual(items.map((item) => item.moduleId), ['overview', 'tasks'])
   assert.deepEqual(items[1].children.map((item) => item.moduleId), ['tasks', 'maps'])

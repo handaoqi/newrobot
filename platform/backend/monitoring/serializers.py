@@ -1053,10 +1053,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             else:
                 normalized_waypoints.append(point)
                 continue
-            # RPP was stored by the old UI, but is not registered by the
-            # deployed navigo controller server. Expose the actual fallback
-            # so the route page and API agree with the execution snapshot.
-            normalized["local_controller"] = "mppi"
+            waypoint_local_controller = str(
+                normalized.get("local_controller") or "mppi"
+            ).lower()
+            normalized["local_controller"] = (
+                waypoint_local_controller
+                if waypoint_local_controller in {"mppi", "rpp"}
+                else "mppi"
+            )
             waypoint_global_controller = str(
                 normalized.get("global_controller") or route_global_controller
             ).lower()
@@ -1112,7 +1116,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             and str(point.get("local_controller") or "mppi").lower() not in {"rpp", "mppi"}
         ]
         if invalid_local_controllers:
-            raise serializers.ValidationError("途经点局部控制器当前只能使用 MPPI")
+            raise serializers.ValidationError("途经点局部控制器只能是 MPPI 或 RPP")
         invalid_global_controllers = [
             point.get("global_controller")
             for point in value

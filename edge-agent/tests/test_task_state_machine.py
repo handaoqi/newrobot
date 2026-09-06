@@ -210,7 +210,11 @@ def ids(batch):
 def drive_patrol(nav, *, until_ids=None, until_state=None, executor=None, steps=40):
     """Advance patrol goals/spins until a sent batch or task state matches."""
     for _ in range(steps):
-        if until_ids is not None and nav.sent and ids(nav.sent[-1]) == until_ids:
+        if (
+            until_ids is not None
+            and nav.sent
+            and (ids(nav.sent[-1]) == until_ids or ids(nav.sent[-1]) == until_ids[-1:])
+        ):
             return
         if (
             executor is not None
@@ -1062,7 +1066,7 @@ def test_round_trip_keeps_running_after_outbound_through_poses_succeed(tmp_path)
 
     assert executor.context.state == "running"
     assert "task.completed" not in [event[0] for event in events]
-    assert ids(nav.sent[-1])[0] == "wp-4"
+    assert ids(nav.sent[-1])[0] == "wp-5"
     store.close()
 
 
@@ -1182,7 +1186,7 @@ def test_reverse_redispatch_does_not_skip_later_waypoints(tmp_path):
     executor._send_from(1)
     assert executor.context.current_waypoint_index == 1
     assert len(nav.sent) > before
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-1"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
     store.close()
 
@@ -1666,7 +1670,7 @@ def test_localization_recovery_clears_stale_departure_heading(tmp_path):
     assert executor._departure_cruise_index is None
     assert nav.cancelled > before_cancelled
     assert len(nav.sent) > before_sent
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     store.close()
 
 
@@ -1741,7 +1745,7 @@ def test_waypoint_speech_blocks_next_navigation_until_playback_finishes(tmp_path
         if nav.sent and ids(nav.sent[-1])[:1] == ["wp-2"]:
             break
         time.sleep(0.01)
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
     store.close()
 
@@ -1773,7 +1777,7 @@ def test_waypoint_speech_does_not_block_when_block_navigation_disabled(tmp_path)
         not waypoint.get("speech_template_id")
         for waypoint in executor.context.route_snapshot["waypoints"]
     )
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
     assert executor._speech_waiting_index is None
     assert executor.context.state == "running"
     store.close()
@@ -1807,7 +1811,7 @@ def test_waypoint_speech_timeout_continues_navigation_when_blocking(tmp_path):
         executor._speech_wait_thread.join(timeout=2)
     _await_departure_heading(executor)
     assert executor.context.state == "running"
-    assert ids(nav.sent[-1]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
     store.close()
 
@@ -1834,8 +1838,9 @@ def test_localization_recovery_during_final_speech_does_not_redispatch_waypoint(
     )
 
     executor.start_task(envelope)
-    # Indoor through-poses keep the speech waypoint as the last pose of one goal.
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    # Each speech waypoint is its own single-pose goal.
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
     before_sent = len(nav.sent)
     nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=float(final.get("yaw") or 0.0))
     nav.result("succeeded", "", {"missed_waypoints": []})
@@ -1889,7 +1894,8 @@ def test_localization_recovery_after_final_speech_finishes_completes_without_red
     )
 
     executor.start_task(envelope)
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
     nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=float(final.get("yaw") or 0.0))
     nav.result("succeeded", "", {"missed_waypoints": []})
     if executor._speech_waiting_index is None and nav.result is not None:
@@ -2077,7 +2083,7 @@ def test_map_set_task_skips_segments_before_nearest_waypoint(tmp_path):
 
     assert coordinator.activated == [coordinator.build_segments(executor.context.route_snapshot)[1]]
     assert executor.context.current_segment_index == 1
-    assert ids(nav.sent[0]) == ["wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-2"]
     store.close()
 
 
@@ -2133,7 +2139,7 @@ def test_localization_loss_cancel_timeout_stays_paused_and_auto_resumes(tmp_path
     nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
     executor.on_localization_recovered()
     assert executor.context.state == "running"
-    assert ids(nav.sent[-1]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[-1]) == ["wp-1"]
     recovery_event = next(event for event in reversed(events) if event[0] == "task.resuming")
     assert recovery_event[1]["reason_code"] == "LOCALIZATION_RECOVERED"
     store.close()
@@ -2182,10 +2188,44 @@ def test_navigation_success_finishes_start_command(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
     drive_patrol(nav, until_state="completed", executor=executor)
     assert executor.context.state == "completed"
     assert results[0][1] == "succeeded"
+    store.close()
+
+
+def test_waypoint_dwell_delays_next_goal_without_blocking_result_callback(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["waypoints"][0]["dwell_seconds"] = 0.15
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
+
+    started = time.monotonic()
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    callback_elapsed = time.monotonic() - started
+
+    assert callback_elapsed < 0.1
+    assert ids(nav.sent[-1]) == ["wp-1"]
+    assert any(
+        event[0] == "task.progress" and event[1].get("milestone") == "waypoint_reached"
+        for event in events
+    )
+    deadline = started + 1.0
+    while len(nav.sent) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    assert time.monotonic() - started >= 0.14
+    executor.stop()
     store.close()
 
 
@@ -2320,9 +2360,8 @@ def test_pass_through_waypoints_use_travel_heading(tmp_path):
     )
     executor.start_task(command("task.start"))
     sent = nav.sent[0]
-    assert ids(sent) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(sent) == ["wp-1"]
     assert abs(sent[0]["yaw"] - atan2(1.0, 1.0)) < 1e-6
-    assert abs(sent[1]["yaw"] - atan2(1.0, 1.0)) < 1e-6
     store.close()
 
 
@@ -2369,10 +2408,8 @@ def test_patrol_nav2_goal_uses_straightened_corridor(tmp_path):
     )
     executor.start_task(envelope)
     sent = nav.sent[0]
-    assert ids(sent) == ["wp-1", "wp-2", "wp-3", "wp-4"]
+    assert ids(sent) == ["wp-1"]
     assert sent[0]["y"] == 0.0
-    assert hypot(sent[1]["x"] - 10.0, sent[1]["y"]) < 0.05
-    assert hypot(sent[2]["x"] - 20.0, sent[2]["y"]) < 0.05
     store.close()
 
 
@@ -2388,17 +2425,14 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
         start_result_callback=lambda *args: results.append(args),
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
-    nav.feedback(2, 0.8)
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    nav.feedback(0, 0.8)
     assert nav.waypoint_profiles[-1][2] is True
     assert nav.live_profiles[-1] is True
     # Stay far from the final waypoint so the post-check fails.
     nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
     nav.result("succeeded", "", {"missed_waypoints": []})
-    # Finish any departure spin before the final post-check.
-    if executor.context.state == "running" and nav.result is not None:
-        nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
-        nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.stop_commands >= 1
     assert executor.context.state == "failed"
     assert results[0][1] == "failed"
@@ -2417,7 +2451,8 @@ def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
             start_result_callback=lambda *args: None,
         )
         executor.start_task(command("task.start"))
-        assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+        assert ids(nav.sent[0]) == ["wp-1"]
+        drive_patrol(nav, until_ids=["wp-3"], executor=executor)
         final = executor.context.route_snapshot["waypoints"][-1]
         nav.pose = SimpleNamespace(
             x=float(final["x"]) + distance,
@@ -2431,7 +2466,7 @@ def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
         store.close()
 
 
-def test_indoor_patrol_dispatches_through_poses(tmp_path):
+def test_indoor_patrol_dispatches_single_waypoint_goals(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -2441,7 +2476,7 @@ def test_indoor_patrol_dispatches_through_poses(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(command("task.start"))
-    assert ids(nav.sent[0]) == ["wp-1", "wp-2", "wp-3"]
+    assert ids(nav.sent[0]) == ["wp-1"]
     store.close()
 
 

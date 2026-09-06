@@ -8,8 +8,8 @@
 export const CORE_MODULES = Object.freeze(['auth', 'shell', 'theme'])
 
 const productionDefinitions = [
-  { id: 'overview', title: '监测中心', path: '/dashboard/overview', component: () => import('../views/DashboardOverview.vue'), recommended: ['robots'] },
   { id: 'guard-duty', title: '保安值守', path: '/dashboard/guard-duty', component: () => import('../views/GuardDutyPage.vue'), recommended: ['overview', 'remote-control', 'events', 'tasks', 'task-execution'] },
+  { id: 'overview', title: '监测中心', path: '/dashboard/overview', component: () => import('../views/DashboardOverview.vue'), recommended: ['robots'] },
   { id: 'remote-control', title: '远程控制', path: '/dashboard/remote-control', component: () => import('../views/RemoteControlPage.vue'), recommended: ['overview', 'guard-duty'] },
   { id: 'remote-development', title: '远程 AI 开发', path: '/dashboard/remote-development', component: () => import('../views/RemoteDevelopmentPage.vue'), recommended: [] },
   { id: 'analytics', title: '统计分析', path: '/dashboard/analytics', component: () => import('../views/AnalyticsPage.vue'), recommended: ['events'] },
@@ -62,7 +62,12 @@ export function defaultModuleIds() {
 
 export function defaultHomePath(enabledIds = STABLE_MODULE_IDS) {
   const enabled = new Set(enabledIds)
-  return MODULES.find((module) => enabled.has(module.id))?.path || '/dashboard/overview'
+  // Keep the established landing page independent from the visual menu order.
+  return ['overview', 'guard-duty']
+    .map((id) => MODULE_BY_ID[id])
+    .find((module) => module && enabled.has(module.id))?.path
+    || MODULES.find((module) => enabled.has(module.id))?.path
+    || '/dashboard/overview'
 }
 
 export function navigationItems(enabledIds = STABLE_MODULE_IDS) {
