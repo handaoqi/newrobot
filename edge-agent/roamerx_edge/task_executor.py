@@ -23,6 +23,7 @@ from .map_package_finalize import load_map_manifest
 from .protocol import MessageEnvelope, ProtocolError, now_iso
 from .localization_recovery import select_recovery_seed
 from .recovery_arbiter import RecoveryArbiter
+from .leg_profile import LegProfile
 
 
 LOGGER = logging.getLogger(__name__)
@@ -318,6 +319,8 @@ class TaskExecutor:
         self._segment_avoidance_enabled = True
         self._dispatched_count = 0
         self._nav_goal_generation = 0
+        self._leg_generation = 0
+        self._active_leg_profile: LegProfile | None = None
         self._patrol_final_approach_applied = False
         self._last_target_index = -1
         self._last_reached_index = -1
@@ -2006,6 +2009,7 @@ class TaskExecutor:
         )
         self._patrol_final_approach_applied = initial_final_approach
         self._bypass_active = False
+        self._leg_generation += 1
         self._apply_navigation_profile(
             index,
             force_final=(
@@ -2034,6 +2038,8 @@ class TaskExecutor:
                     point.get("map_point_number", int(point.get("sequence", 0)) + 1)
                     for point in waypoints[index:]
                 ],
+                "leg_generation": self._leg_generation,
+                "leg_profile": self._active_leg_profile.__dict__ if self._active_leg_profile else None,
             },
         )
         self.on_feedback(0, milestone="target_dispatched")
@@ -3518,6 +3524,7 @@ class TaskExecutor:
             precision_goal = waypoint_index == final_index
         patrol_final = (not self._is_docking_task()) and waypoint_index == len(waypoints) - 1
         require_yaw = bool(target.get("require_yaw", False)) or precision_goal
+        arrival_policy = self._arrival_policy(target, waypoint_index)
         final_approach = patrol_final or precision_goal
         if force_require_yaw is not None:
             require_yaw = bool(force_require_yaw) or precision_goal
@@ -3526,6 +3533,23 @@ class TaskExecutor:
         self._segment_avoidance_enabled = avoid_obstacles
         outdoor_profile = self._outdoor_navigation_profile()
         local_controller = str(target.get("local_controller") or "mppi")
+        leg_profile = LegProfile(
+            localization_mode=str(target.get("localization_mode") or "ndt"),
+            global_planner_id=str(target.get("global_controller") or self.context.route_snapshot.get("global_controller") or "theta_star"),
+            local_controller_id=local_controller,
+            detour_enabled=avoid_obstacles,
+            arrival_policy=arrival_policy,
+        )
+        if leg_profile != self._active_leg_profile:
+            LOGGER.info("applying leg profile generation=%s profile=%s", self._leg_generation + 1, leg_profile)
+            self._active_leg_profile = leg_profile
+        safety_setter = getattr(self.navigation, "set_safety_profile", None)
+        if callable(safety_setter):
+            safety_setter(
+                detour_enabled=leg_profile.detour_enabled,
+                collision_slowdown_enabled=leg_profile.collision_slowdown_enabled,
+                collision_stop_enabled=leg_profile.collision_stop_enabled,
+            )
         global_setter = getattr(self.navigation, "set_global_controller", None)
         if callable(global_setter):
             global_setter(
