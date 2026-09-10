@@ -2,6 +2,7 @@ import { API_BASE, listCache, request } from './api/client.js'
 
 export { API_BASE, listCache, request }
 const ROBOT_LIST_TIMEOUT_MS = 8_000
+const NAVIGATION_STATUS_SUMMARY_TIMEOUT_MS = 8_000
 
 function summaryPath(path) {
   return `${path}${path.includes('?') ? '&' : '?'}view=summary`
@@ -406,8 +407,12 @@ export async function fetchRobotMappingStatus(robotId, { signal } = {}) {
   return request(`/robots/${robotId}/mapping/status/`, { signal })
 }
 
-export async function fetchRobotNavigationStatus(robotId, { signal } = {}) {
-  return request(`/robots/${robotId}/navigation/status/`, { signal })
+export async function fetchRobotNavigationStatus(robotId, { signal, summary = false } = {}) {
+  const query = summary ? '?view=summary' : ''
+  return request(`/robots/${robotId}/navigation/status/${query}`, {
+    signal,
+    ...(summary ? { timeoutMs: NAVIGATION_STATUS_SUMMARY_TIMEOUT_MS } : {}),
+  })
 }
 
 export async function fetchRobotSystemLogs(robotId, filters = {}) {

@@ -606,7 +606,7 @@ async function refreshRobot() {
 async function refreshLocalizationStatus({ sync = true } = {}) {
   if (!latestRobot.value?.id) return null
   try {
-    const result = await fetchRobotNavigationStatus(latestRobot.value.id)
+    const result = await fetchRobotNavigationStatus(latestRobot.value.id, { summary: true })
     navigationStatus.value = result
     if (sync) syncLocalizationState(result)
     return result
@@ -1013,7 +1013,7 @@ async function ensureLoopNavigationReady(onProgress = () => {}) {
   }
   const mapVersion = expectedLegacyMapVersion(mapId)
   const result = await ensureGuardDutyLoopNavigationReady({
-    fetchStatus: () => fetchRobotNavigationStatus(robot.id),
+    fetchStatus: () => fetchRobotNavigationStatus(robot.id, { summary: true }),
     isReady: (status) => navigationReadyForMap(status, mapId, mapVersion),
     repair: async ({ onProgress: repairProgress }) => {
       const outcome = await activateAndRelocalizeMap({
@@ -1096,7 +1096,7 @@ async function runLoopCycle() {
         try {
           repairGate = await waitForGuardDutyLoopRepair({
             isBusy: () => loopNavRepairBusy && loopActive.value,
-            fetchStatus: () => fetchRobotNavigationStatus(latestRobot.value.id),
+            fetchStatus: () => fetchRobotNavigationStatus(latestRobot.value.id, { summary: true }),
             isReady: (status) => navigationReadyForMap(
               status,
               loopTargetMapId(),

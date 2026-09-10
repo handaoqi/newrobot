@@ -1,6 +1,6 @@
 import { createTTLCache } from '../cache.js'
 
-export const API_BASE = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/, '')
+export const API_BASE = (import.meta.env?.VITE_API_BASE || '/api').replace(/\/$/, '')
 export const listCache = createTTLCache({ ttlMs: 30_000 })
 
 export async function request(path, options = {}) {

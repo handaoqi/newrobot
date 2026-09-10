@@ -3203,18 +3203,85 @@ class RobotNavigationStatusView(APIView):
     """查询机器狗导航栈状态和最近导航控制命令。"""
     permission_classes = [permissions.AllowAny]
 
+    @staticmethod
+    def _summary_status(latest):
+        """Return only fields needed by readiness polling and guard duty.
+
+        The full telemetry serializer includes diagnostics, sensor snapshots,
+        power-service state, and other large JSON fields.  Loop transitions
+        poll this endpoint repeatedly, so returning those fields (plus a large
+        relocalization result) makes a simple readiness check fragile on weak
+        links.
+        """
+        if latest is None:
+            return None
+        quality = latest.localization_quality or {}
+        quality_keys = (
+            "localization_fresh",
+            "localization_sample_age_seconds",
+            "localization_sampled_at",
+            "sampled_at",
+            "has_converged",
+            "matching_error",
+        )
+        navigation = (latest.raw_payload or {}).get("navigation") or {}
+        navigation_keys = (
+            "requested_planar_speed_mps",
+            "actual_planar_speed_mps",
+            "requested_turn_speed_rps",
+            "actual_turn_speed_rps",
+            "requested_velocity_sample_age_seconds",
+            "actual_velocity_sample_age_seconds",
+            "localized_speed_mps",
+        )
+        return {
+            "state_version": latest.state_version,
+            "sampled_at": latest.sampled_at,
+            "received_at": latest.received_at,
+            "frame_id": latest.frame_id,
+            "map_id": latest.map_id,
+            "map_version": latest.map_version,
+            "current_map": {
+                "map_id": latest.map_id,
+                "map_version": latest.map_version,
+            },
+            "x": latest.x,
+            "y": latest.y,
+            "z": latest.z,
+            "yaw": latest.yaw,
+            "speed_mps": latest.speed_mps,
+            "localization_status": latest.localization_status,
+            "localization_source_status": latest.localization_source_status,
+            "localization_quality": {
+                key: quality[key] for key in quality_keys if key in quality
+            },
+            "navigation": {
+                key: navigation[key] for key in navigation_keys if key in navigation
+            },
+            "ros_ready": latest.ros_ready,
+            "nav_ready": latest.nav_ready,
+            "emergency_stop": latest.emergency_stop,
+            "control_mode": latest.control_mode,
+            "task_execution_id": (
+                str(latest.task_execution_id) if latest.task_execution_id else None
+            ),
+        }
+
     def get(self, request, robot_id):
         robot = get_object_or_404(Robot, pk=robot_id)
         latest = RobotStatusLatest.objects.filter(robot=robot).first()
+        summary = request.query_params.get("view") == "summary"
         command = robot.remote_commands.filter(
             command_type__in=[
                 "nav.start", "nav.restart", "nav.recover", "nav.stop",
                 "nav.initial_pose", "nav.relocalize",
             ]
         ).order_by("-issued_at").first()
-        localization_command = robot.remote_commands.filter(
-            command_type__in=["nav.initial_pose", "nav.relocalize"]
-        ).order_by("-issued_at").first()
+        localization_command = None
+        if not summary:
+            localization_command = robot.remote_commands.filter(
+                command_type__in=["nav.initial_pose", "nav.relocalize"]
+            ).order_by("-issued_at").first()
         current_boundary = (
             MapNavigationBoundary.objects.filter(map_data_id=robot.current_map_id).first()
             if str(robot.current_map_id or "").isdigit()
@@ -3250,7 +3317,11 @@ class RobotNavigationStatusView(APIView):
                 "localization_status": robot.localization_status,
                 "ros_ready": robot.ros_ready,
                 "nav_ready": robot.nav_ready,
-                "status": RobotStatusSerializer(latest).data if latest else None,
+                "status": (
+                    self._summary_status(latest)
+                    if summary
+                    else (RobotStatusSerializer(latest).data if latest else None)
+                ),
                 "command": _command_payload(command),
                 "localization_command": _command_payload(localization_command, include_result=True),
                 "navigation_boundary": {
