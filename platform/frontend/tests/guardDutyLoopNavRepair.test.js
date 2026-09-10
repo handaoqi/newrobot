@@ -2,22 +2,32 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  DEFAULT_LOOP_REST_SECONDS,
   LOOP_FAILURE_RETRY_MS,
   ensureGuardDutyLoopNavigationReady,
   guardDutyLoopRepairFailureMessage,
   isTransientNavigationFetchError,
   loopRestMilliseconds,
+  restoreLoopRestSeconds,
   waitForGuardDutyLoopRepair,
 } from '../src/services/guardDutyLoopNavRepair.js'
 
-test('normal rest uses configured minutes', () => {
-  assert.equal(loopRestMilliseconds(5), 5 * 60 * 1000)
+test('normal rest uses configured seconds', () => {
+  assert.equal(loopRestMilliseconds(10), 10_000)
   assert.equal(loopRestMilliseconds(0), 0)
 })
 
+test('rest defaults to ten seconds and does not reinterpret legacy minutes', () => {
+  assert.equal(DEFAULT_LOOP_REST_SECONDS, 10)
+  assert.equal(restoreLoopRestSeconds({}), 10)
+  assert.equal(restoreLoopRestSeconds({ restMinutes: 1 }), 10)
+  assert.equal(restoreLoopRestSeconds({ restSeconds: 25 }), 25)
+  assert.equal(restoreLoopRestSeconds({ restSeconds: -1 }), 10)
+})
+
 test('failed start/repair uses a short retry capped by configured rest', () => {
-  assert.equal(loopRestMilliseconds(10, { shortRetry: true }), LOOP_FAILURE_RETRY_MS)
-  assert.equal(loopRestMilliseconds(0.5, { shortRetry: true }), 30_000)
+  assert.equal(loopRestMilliseconds(120, { shortRetry: true }), LOOP_FAILURE_RETRY_MS)
+  assert.equal(loopRestMilliseconds(30, { shortRetry: true }), 30_000)
   assert.equal(loopRestMilliseconds(0, { shortRetry: true }), LOOP_FAILURE_RETRY_MS)
 })
 

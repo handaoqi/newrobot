@@ -51,9 +51,11 @@ import {
 } from '../utils/guardDutyLowBattery'
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import {
+  DEFAULT_LOOP_REST_SECONDS,
   ensureGuardDutyLoopNavigationReady,
   guardDutyLoopRepairFailureMessage,
   loopRestMilliseconds,
+  restoreLoopRestSeconds,
   waitForGuardDutyLoopRepair,
 } from '../services/guardDutyLoopNavRepair'
 import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
@@ -103,7 +105,7 @@ const trajectoryExecutionId = ref('')
 const mapImageRef = ref(null)
 const imageReadyTick = ref(0)
 const loopDurationMinutes = ref(60)
-const loopRestMinutes = ref(1)
+const loopRestSeconds = ref(DEFAULT_LOOP_REST_SECONDS)
 const loopActive = ref(false)
 const loopState = ref('idle')
 const loopStartedAt = ref(0)
@@ -845,7 +847,7 @@ function persistLoopState() {
   if (!key) return
   localStorage.setItem(key, JSON.stringify({
     durationMinutes: Number(loopDurationMinutes.value),
-    restMinutes: Number(loopRestMinutes.value),
+    restSeconds: Number(loopRestSeconds.value),
     active: loopActive.value,
     state: loopState.value,
     startedAt: loopStartedAt.value,
@@ -867,7 +869,9 @@ function restoreLoopState(robotId) {
   try {
     const saved = JSON.parse(localStorage.getItem(key) || '{}')
     loopDurationMinutes.value = Number(saved.durationMinutes) > 0 ? Number(saved.durationMinutes) : 60
-    loopRestMinutes.value = Number(saved.restMinutes) >= 0 ? Number(saved.restMinutes) : 1
+    // The old restMinutes value is intentionally not reused: after the unit
+    // change, existing browsers must receive the new 10-second default too.
+    loopRestSeconds.value = restoreLoopRestSeconds(saved)
     loopStartedAt.value = Number(saved.startedAt || 0)
     loopEndsAt.value = Number(saved.endsAt || 0)
     loopStoppedAt.value = Number(saved.stoppedAt || 0)
@@ -1037,12 +1041,12 @@ async function captureLoopDistance() {
 }
 
 function scheduleNextLoopRound(message = '', { shortRetry = false } = {}) {
-  const restMilliseconds = loopRestMilliseconds(loopRestMinutes.value, { shortRetry })
+  const restMilliseconds = loopRestMilliseconds(loopRestSeconds.value, { shortRetry })
   loopState.value = 'resting'
   loopRestUntil.value = Date.now() + restMilliseconds
   const defaultMessage = shortRetry
     ? `启动或导航维护失败，${Math.round(restMilliseconds / 1000)} 秒后重试`
-    : `第 ${loopRounds.value} 轮完成，休息 ${loopRestMinutes.value} 分钟`
+    : `第 ${loopRounds.value} 轮完成，休息 ${loopRestSeconds.value} 秒`
   loopMessage.value = message || defaultMessage
   persistLoopState()
   // Use the rest window to bring Nav2 / localization back instead of idle waiting.
@@ -1251,7 +1255,7 @@ async function toggleLoop() {
     return
   }
   const duration = Number(loopDurationMinutes.value)
-  const rest = Number(loopRestMinutes.value)
+  const rest = Number(loopRestSeconds.value)
   if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(rest) || rest < 0) {
     showToast('请填写正确的循环时长和休息时间', { variant: 'alert' })
     return
@@ -1587,8 +1591,8 @@ watch(playUrlKey, () => {
                   <input v-model.number="loopDurationMinutes" type="number" min="1" step="1" :disabled="loopActive" @change="persistLoopState" />
                 </label>
                 <label>
-                  <span>每轮休息（分钟）</span>
-                  <input v-model.number="loopRestMinutes" type="number" min="0" step="1" :disabled="loopActive" @change="persistLoopState" />
+                  <span>每轮休息（秒）</span>
+                  <input v-model.number="loopRestSeconds" type="number" min="0" step="1" :disabled="loopActive" @change="persistLoopState" />
                 </label>
               </div>
               <div class="guard-countdown-clock">

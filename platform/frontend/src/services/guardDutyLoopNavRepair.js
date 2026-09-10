@@ -1,5 +1,6 @@
 /** Short backoff after a failed next-round start or nav repair. */
 export const LOOP_FAILURE_RETRY_MS = 60_000
+export const DEFAULT_LOOP_REST_SECONDS = 10
 export const LOOP_REPAIR_SETTLE_TIMEOUT_MS = 5_000
 export const NAV_STATUS_FETCH_ATTEMPTS = 3
 export const NAV_STATUS_FETCH_RETRY_MS = 750
@@ -48,15 +49,20 @@ export function guardDutyLoopRepairFailureMessage(error, { duringRest = false } 
 
 /**
  * Resolve how long the guard-duty loop should rest.
- * Normal round gaps use the operator-configured minutes. Start/repair failures
+ * Normal round gaps use the operator-configured seconds. Start/repair failures
  * use a short retry so the dog is not idle for another full rest window while
  * Nav2 or localization is down.
  */
-export function loopRestMilliseconds(restMinutes, { shortRetry = false } = {}) {
-  const configured = Math.max(0, Number(restMinutes || 0) * 60 * 1000)
+export function loopRestMilliseconds(restSeconds, { shortRetry = false } = {}) {
+  const configured = Math.max(0, Number(restSeconds || 0) * 1000)
   if (!shortRetry) return configured
   if (configured > 0) return Math.min(LOOP_FAILURE_RETRY_MS, configured)
   return LOOP_FAILURE_RETRY_MS
+}
+
+export function restoreLoopRestSeconds(saved) {
+  const value = Number(saved?.restSeconds)
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_LOOP_REST_SECONDS
 }
 
 /**
