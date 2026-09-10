@@ -473,6 +473,186 @@ def test_waypoint_correction_transaction_is_idempotent_and_required(tmp_path):
     store.close()
 
 
+def test_waypoint_correction_reuses_matching_live_transaction(tmp_path):
+    class TransactionNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.correction_requests = []
+
+        def control_localization_correction(self, transaction_id, mode, command="start"):
+            self.correction_requests.append((transaction_id, mode, command))
+            return {"accepted": False, "status": "busy"}
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = TransactionNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        task_execution_id="task-7",
+        current_waypoint_index=3,
+        route_snapshot={"map": {}, "waypoints": []},
+    )
+    nav.localization_state = {
+        "one_shot_correction": {
+            "transaction_id": "task-7:waypoint:3:correction:1",
+            "mode": "ndt",
+            "status": "waiting_source",
+        }
+    }
+    executor._correction_generation = 2
+
+    assert executor._start_waypoint_localization_correction(
+        {"localization_mode": "ndt"}, 3
+    )
+    assert executor._active_correction_transaction_id.endswith(":correction:1")
+    assert executor._correction_generation == 2
+    assert nav.correction_requests == []
+    store.close()
+
+
+def test_waypoint_correction_adopts_matching_transaction_after_busy_race(tmp_path):
+    class RacingNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.correction_requests = []
+            self.decision_calls = 0
+
+        def localization_decision(self):
+            self.decision_calls += 1
+            if self.decision_calls == 1:
+                return {}
+            return {
+                "one_shot_correction": {
+                    "transaction_id": "task-7:waypoint:3:correction:1",
+                    "mode": "ndt",
+                    "status": "waiting_source",
+                }
+            }
+
+        def control_localization_correction(self, transaction_id, mode, command="start"):
+            self.correction_requests.append((transaction_id, mode, command))
+            return {"accepted": False, "status": "busy"}
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = RacingNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        task_execution_id="task-7",
+        current_waypoint_index=3,
+        route_snapshot={"map": {}, "waypoints": []},
+    )
+    executor._correction_generation = 2
+
+    assert executor._start_waypoint_localization_correction(
+        {"localization_mode": "ndt"}, 3
+    )
+    assert nav.correction_requests == [
+        ("task-7:waypoint:3:correction:2", "ndt", "start")
+    ]
+    assert executor._active_correction_transaction_id.endswith(":correction:1")
+    store.close()
+
+
+def test_manual_resume_keeps_required_correction_paused_without_redispatch(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    executor.context.state = "paused"
+    executor.context.current_waypoint_index = 0
+    executor._paused_for_localization = True
+    executor._paused_localization_reason = "absolute_required"
+    executor._active_correction_transaction_id = (
+        f"{execution_id}:waypoint:0:correction:1"
+    )
+    executor._active_correction_mode = "ndt"
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "absolute_stable": True,
+        "policy_source_ready": False,
+        "ndt_score": 1.298,
+        "ndt_inlier_fraction": 0.0,
+        "one_shot_correction": {
+            "transaction_id": executor._active_correction_transaction_id,
+            "mode": "ndt",
+            "status": "waiting_source",
+        },
+    }
+    sent_before = len(nav.sent)
+
+    result = executor.resume_task(execution_id, 0)
+
+    assert result["final_task_state"] == "paused"
+    assert result["resume_blocked"] is True
+    assert "NDT" in result["reason_message"]
+    assert len(nav.sent) == sent_before
+    assert executor._active_correction_transaction_id.endswith(":correction:1")
+    assert events[-1][1]["reason_code"] == "ABSOLUTE_LOCALIZATION_REQUIRED"
+    thread = executor._absolute_pause_watch_thread
+    executor._cancel_absolute_localization_resume_watch()
+    if thread is not None:
+        thread.join(timeout=1.0)
+    store.close()
+
+
+def test_waiting_ndt_waypoint_correction_requests_stationary_relocalization(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    requests = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        localization_recovery_callback=requests.append,
+    )
+    executor.context = SimpleNamespace(state="paused")
+    executor._paused_for_localization = True
+    executor._active_correction_transaction_id = "task-7:waypoint:0:correction:1"
+    executor._active_correction_mode = "ndt"
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "lio_healthy": True,
+        "policy_source_ready": False,
+        "one_shot_correction": {
+            "transaction_id": executor._active_correction_transaction_id,
+            "mode": "ndt",
+            "status": "waiting_source",
+            "reason": "waiting_for_eligible_anchor_observation",
+        },
+    }
+
+    executor._arm_absolute_localization_resume_watch()
+    deadline = time.time() + 2.0
+    while not requests and time.time() < deadline:
+        time.sleep(0.02)
+    thread = executor._absolute_pause_watch_thread
+    executor._cancel_absolute_localization_resume_watch()
+    if thread is not None:
+        thread.join(timeout=1.0)
+
+    assert requests == ["ndt_waypoint_correction_unavailable"]
+    store.close()
+
+
 def test_outdoor_waypoint_arrival_accepts_fast_lio_without_rtk_absolute_gate(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -1627,6 +1807,38 @@ def test_absolute_localization_pause_reapproaches_when_outdoor_rtk_off_click(tmp
     store.close()
 
 
+def test_absolute_localization_pause_rechecks_indoor_xy_after_relocalization(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    executor.context.current_waypoint_index = 0
+    executor.context.state = "paused"
+    executor._paused_for_localization = True
+    executor._paused_localization_reason = "absolute_required"
+    first = executor.context.route_snapshot["waypoints"][0]
+    nav.pose = SimpleNamespace(
+        x=float(first["x"]) + 0.8,
+        y=float(first["y"]),
+        yaw=float(first.get("yaw") or 0.0),
+    )
+    sent_before = len(nav.sent)
+
+    executor.on_localization_recovered()
+
+    assert executor.context.state == "running"
+    assert executor.context.current_waypoint_index == 0
+    assert len(nav.sent) == sent_before + 1
+    assert ids(nav.sent[-1]) == ["wp-1"]
+    assert executor._arrival_retry_counts[0] == 1
+    store.close()
+
+
 def test_outdoor_absolute_pause_does_not_resume_without_rtk(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -2201,16 +2413,20 @@ def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
     assert any(command[2] < 0.0 for command in nav.teleop)
     assert any(event[0] == "task.arrival_heading_aligning" for event in events)
     assert any(event[0] == "task.arrival_heading_aligned" for event in events)
-    # The configured yaw is authoritative. Translation during that pure-yaw
-    # maneuver must not re-dispatch wp-1; the state machine faces and departs
-    # toward wp-2 directly.
-    assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 1
+    # A pure-yaw command translated the quadruped outside the click tolerance,
+    # so the old pre-turn arrival is rejected and wp-1 is approached once more.
+    assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 2
+    nav.pose = SimpleNamespace(
+        x=float(first["x"]), y=float(first["y"]), yaw=float(first["yaw"])
+    )
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    _await_departure_heading(executor)
     assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
     store.close()
 
 
-def test_final_configured_heading_accepts_pre_turn_xy_without_reapproach(tmp_path):
+def test_final_configured_heading_reapproaches_after_turn_translation(tmp_path):
     from math import pi
 
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -2241,8 +2457,15 @@ def test_final_configured_heading_accepts_pre_turn_xy_without_reapproach(tmp_pat
     nav.result("succeeded", "", {"missed_waypoints": []})
     _await_departure_heading(executor)
 
+    assert executor.context.state == "running"
+    assert len(nav.sent) == 2
+    nav.pose = SimpleNamespace(
+        x=float(final["x"]), y=float(final["y"]), yaw=float(final["yaw"])
+    )
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
     assert executor.context.state == "completed"
-    assert len(nav.sent) == 1
+    assert len(nav.sent) == 2
     assert results[-1][1] == "succeeded"
     store.close()
 

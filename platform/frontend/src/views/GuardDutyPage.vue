@@ -75,7 +75,7 @@ import {
   guardDutySpeedTitle,
   isLatestTrajectoryResponse,
 } from '../utils/guardDutySpeed'
-import { guardDutyPauseReason } from '../utils/guardDutyPauseReason'
+import { guardDutyExecutionReason } from '../utils/guardDutyPauseReason'
 
 const overview = ref(null)
 const robots = ref([])
@@ -184,7 +184,7 @@ const currentExecutionRound = computed(() => {
   if (!execution.value?.id) return 0
   return Math.max(1, Number(execution.value.round_number || 1))
 })
-const pauseReason = computed(() => guardDutyPauseReason(execution.value))
+const executionReason = computed(() => guardDutyExecutionReason(execution.value))
 const waypointStates = computed(() => guardDutyWaypointStates(
   displayRouteWaypoints.value,
   waypointMilestones.value,
@@ -1487,8 +1487,8 @@ watch(playUrlKey, () => {
               <small :title="formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at)">
                 {{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}
               </small>
-              <small v-if="pauseReason" class="guard-task-pause-reason" :title="pauseReason">
-                暂停原因：{{ pauseReason }}
+              <small v-if="executionReason" class="guard-task-pause-reason" :title="executionReason.text">
+                {{ executionReason.label }}：{{ executionReason.text }}
               </small>
             </div>
             <div class="guard-task-actions">
@@ -1562,7 +1562,9 @@ watch(playUrlKey, () => {
               <div class="guard-runtime-status"><span>当前状态</span><strong>{{ guardRuntimeStatus }}</strong></div>
             </div>
             <p class="guard-loop-message">{{ loopMessage }}</p>
-            <p v-if="pauseReason" class="guard-pause-reason">暂停原因：{{ pauseReason }}</p>
+            <p v-if="executionReason" class="guard-pause-reason">
+              {{ executionReason.label }}：{{ executionReason.text }}
+            </p>
           </section>
         </section>
 

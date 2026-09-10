@@ -171,7 +171,7 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(execution.state, "dispatching")
 
     @override_settings(TASK_START_ACK_TIMEOUT_SECONDS=60)
-    def test_unacknowledged_task_start_times_out_before_task_duration(self):
+    def test_unacknowledged_task_start_waits_for_edge_reconciliation(self):
         execution = TaskExecutionService.create_execution(self.task, self.user)
         command = CommandService.create(execution, "task.start", self.user)
         RemoteCommand.objects.filter(pk=command.pk).update(
@@ -184,7 +184,12 @@ class TaskExecutionTests(TestCase):
         command.refresh_from_db()
         execution.refresh_from_db()
         self.assertEqual(command.status, "timed_out")
-        self.assertEqual(execution.state, "timed_out")
+        self.assertEqual(command.error_code, "COMMAND_TIMED_OUT")
+        self.assertIn("等待 Edge 状态对账", command.error_message)
+        self.assertEqual(execution.state, "interrupted")
+        self.assertEqual(execution.failure_code, "COMMAND_TIMED_OUT")
+        with self.assertRaises(TaskStateError):
+            TaskExecutionService.create_execution(self.task, self.user)
 
     def test_low_battery_docking_episode_creates_exactly_one_return_task(self):
         self.route.waypoints = [[1, 2, 0], [2, 3, 0.5]]

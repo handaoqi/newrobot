@@ -144,13 +144,39 @@ class CommandService:
     def mark_timeout(command: RemoteCommand) -> None:
         if command.status in {"succeeded", "failed", "cancelled", "rejected", "timed_out", "expired"}:
             return
+        previous_status = command.status
         command.status = "timed_out"
         command.error_code = "COMMAND_TIMED_OUT"
+        if command.command_type == "task.start":
+            command.error_message = (
+                "启动指令确认超时，等待 Edge 状态对账或强制退出"
+                if previous_status in {"created", "published"}
+                else "中心等待任务完成超时，等待 Edge 状态对账或强制退出"
+            )
         command.finished_at = timezone.now()
-        command.save(update_fields=["status", "error_code", "finished_at", "updated_at"])
+        command.save(update_fields=[
+            "status", "error_code", "error_message", "finished_at", "updated_at",
+        ])
         CommandEvent.objects.create(command=command, event_type="timeout", source="center")
         if command.task_execution_id and command.task_execution.state in TaskExecution.ACTIVE_STATES:
             try:
+                if command.command_type == "task.start":
+                    # A center-side timer cannot prove that Edge stopped the
+                    # physical task. Keep the execution active and block a new
+                    # task until Edge sync or an explicit force-exit resolves it.
+                    if command.task_execution.state != "interrupted":
+                        TaskExecutionService.transition(
+                            command.task_execution,
+                            "interrupted",
+                            event_type="task.start.timeout_pending_edge",
+                            reason_code="COMMAND_TIMED_OUT",
+                            reason_message=command.error_message,
+                            payload={
+                                "command_id": str(command.id),
+                                "previous_command_status": previous_status,
+                            },
+                        )
+                    return
                 if command.command_type == "task.pause":
                     if command.task_execution.state == "pausing":
                         TaskExecutionService.transition(

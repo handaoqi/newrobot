@@ -17,8 +17,8 @@ class TaskStateError(ValueError):
 
 
 ALLOWED_TRANSITIONS = {
-    "created": {"dispatching", "pausing", "resuming", "cancelling", "cancelled"},
-    "dispatching": {"accepted", "pausing", "resuming", "cancelling", "cancelled", "rejected", "timed_out"},
+    "created": {"dispatching", "pausing", "resuming", "cancelling", "cancelled", "interrupted"},
+    "dispatching": {"accepted", "pausing", "resuming", "cancelling", "cancelled", "rejected", "timed_out", "interrupted"},
     # MQTT delivery can make the final Result overtake task.started.
     # Edge Result is authoritative, so terminal reconciliation is legal here.
     "accepted": {"running", "pausing", "resuming", "cancelling", "completed", "cancelled", "failed", "timed_out", "interrupted"},
@@ -359,6 +359,76 @@ class TaskExecutionService:
             reason_code=reason_code,
             reason_message=reason_message,
             payload=payload or {},
+        )
+        return locked
+
+    @staticmethod
+    @transaction.atomic
+    def reconcile_edge_active_after_center_timeout(
+        execution: TaskExecution,
+        target: str,
+        *,
+        edge_state_version: int,
+        reason_code: str = "",
+        reason_message: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> TaskExecution:
+        """Restore the authoritative active Edge state after a center-only timeout.
+
+        COMMAND_TIMED_OUT says only that the center stopped waiting. It does not
+        prove the physical task stopped, so a later sync from the same Edge task
+        must be allowed to repair both legacy ``timed_out`` rows and the newer
+        ``interrupted`` holding state without decreasing the state version.
+        """
+        locked = TaskExecution.objects.select_for_update().get(pk=execution.pk)
+        if (
+            locked.state not in {"timed_out", "interrupted"}
+            or locked.failure_code != "COMMAND_TIMED_OUT"
+            or target not in TaskExecution.ACTIVE_STATES
+            or target in {"created", "dispatching"}
+        ):
+            raise TaskStateError("TASK_TIMEOUT_NOT_RECONCILABLE")
+        next_version = max(locked.state_version + 1, int(edge_state_version) + 1)
+        recovered_code = reason_code or (
+            "EDGE_SYNC_PAUSED" if target == "paused" else "EDGE_SYNC_ACTIVE"
+        )
+        recovered_message = reason_message or (
+            "云边状态对账：设备端任务已暂停"
+            if target == "paused"
+            else f"云边状态对账：设备端任务仍处于 {target} 状态"
+        )
+        previous_cloud_state = locked.state
+        locked.state = target
+        locked.state_version = next_version
+        locked.finished_at = None
+        locked.last_edge_event_at = timezone.now()
+        locked.failure_code = recovered_code
+        locked.failure_message = recovered_message
+        if target == "paused":
+            locked.paused_at = timezone.now()
+        locked.save(update_fields=[
+            "state",
+            "state_version",
+            "finished_at",
+            "last_edge_event_at",
+            "failure_code",
+            "failure_message",
+            "paused_at",
+            "updated_at",
+        ])
+        TaskExecutionEvent.objects.create(
+            task_execution=locked,
+            state=target,
+            state_version=next_version,
+            event_type="task.sync_center_timeout_reconciled",
+            occurred_at=timezone.now(),
+            reason_code=recovered_code,
+            reason_message=recovered_message,
+            payload={
+                **(payload or {}),
+                "previous_cloud_state": previous_cloud_state,
+                "edge_state_version": int(edge_state_version),
+            },
         )
         return locked
 

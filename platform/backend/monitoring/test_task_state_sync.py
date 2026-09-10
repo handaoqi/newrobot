@@ -87,3 +87,80 @@ class ActiveTaskStateSyncTests(TestCase):
         self.assertEqual(self.execution.state_version, 3)
         self.assertEqual(result["action"], "hold")
         self.assertIs(result["state_reconciled"], False)
+
+    def test_active_edge_repairs_legacy_center_only_timeout(self):
+        self.execution = TaskExecutionService.transition(
+            self.execution,
+            "timed_out",
+            event_type="task.start.timeout",
+            state_version=27,
+            reason_code="COMMAND_TIMED_OUT",
+            reason_message="Edge Agent 未在超时时间内确认或完成指令",
+        )
+
+        result = handle_mqtt_message(
+            f"robots/{self.robot.code}/sync/state",
+            self.envelope(
+                "paused",
+                26,
+                local_task_reason_code="ABSOLUTE_LOCALIZATION_REQUIRED",
+                local_task_reason_message="等待 NDT 重定位",
+            ),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, "paused")
+        self.assertEqual(self.execution.state_version, 28)
+        self.assertIsNone(self.execution.finished_at)
+        self.assertEqual(self.execution.failure_code, "ABSOLUTE_LOCALIZATION_REQUIRED")
+        self.assertEqual(result["action"], "report_only")
+        self.assertIs(result["state_reconciled"], True)
+        self.assertIs(result["center_timeout_recovered"], True)
+        self.assertEqual(result["expected_task_state"], "paused")
+        self.assertEqual(result["expected_state_version"], 28)
+        event = TaskExecutionEvent.objects.get(
+            task_execution=self.execution,
+            event_type="task.sync_center_timeout_reconciled",
+        )
+        self.assertEqual(event.payload["previous_cloud_state"], "timed_out")
+        self.assertEqual(event.payload["edge_state_version"], 26)
+
+    def test_real_edge_timeout_is_not_reopened_by_stale_active_state(self):
+        self.execution = TaskExecutionService.transition(
+            self.execution,
+            "timed_out",
+            event_type="task.timed_out",
+            state_version=4,
+            reason_code="TASK_MAX_DURATION_EXCEEDED",
+            reason_message="设备确认任务已超时",
+        )
+
+        result = handle_mqtt_message(
+            f"robots/{self.robot.code}/sync/state",
+            self.envelope("paused", 3),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, "timed_out")
+        self.assertEqual(result["action"], "hold")
+        self.assertIs(result["center_timeout_recovered"], False)
+
+    def test_matching_interrupted_state_does_not_increment_on_every_sync(self):
+        self.execution = TaskExecutionService.transition(
+            self.execution,
+            "interrupted",
+            event_type="task.start.timeout_pending_edge",
+            state_version=4,
+            reason_code="COMMAND_TIMED_OUT",
+            reason_message="等待 Edge 状态对账",
+        )
+
+        result = handle_mqtt_message(
+            f"robots/{self.robot.code}/sync/state",
+            self.envelope("interrupted", 4),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state_version, 4)
+        self.assertEqual(result["action"], "continue")
+        self.assertIs(result["center_timeout_recovered"], False)

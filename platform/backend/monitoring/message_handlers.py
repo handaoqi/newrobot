@@ -648,7 +648,8 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
             boundary.save(update_fields=["active_revision", "active_payload", "apply_status", "apply_error", "updated_at"])
     execution = command.task_execution
     if execution:
-        final_state = command.result_payload.get("final_task_state")
+        result_payload = command.result_payload or {}
+        final_state = result_payload.get("final_task_state")
         if not final_state and terminal_status in {"failed", "timed_out", "expired"}:
             if command.command_type == "task.pause":
                 # A late pause failure must never overwrite a newer resume.
@@ -679,20 +680,21 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
             else:
                 final_state = "timed_out" if command.error_code in {"COMMAND_EXPIRED", "COMMAND_TIMED_OUT"} else "failed"
         if final_state and final_state != execution.state:
+            reason_code = command.error_code or result_payload.get("reason_code") or ""
+            reason_message = command.error_message or result_payload.get("reason_message") or ""
             execution = TaskExecutionService.transition(
                 execution,
                 final_state,
                 event_type="command.result",
                 state_version=max(
-                    int(command.result_payload.get("state_version") or 0),
+                    int(result_payload.get("state_version") or 0),
                     execution.state_version + 1,
                 ),
                 occurred_at=command.finished_at,
-                reason_code=command.error_code,
-                reason_message=command.error_message,
+                reason_code=reason_code,
+                reason_message=reason_message,
                 payload=payload,
             )
-        result_payload = command.result_payload or {}
         progress_fields = []
         if "completed_waypoints" in result_payload:
             execution.completed_waypoints = int(result_payload["completed_waypoints"])
@@ -991,8 +993,42 @@ def _handle_sync(
             local_version = 0
         reconciled = False
         terminal_reconciled = False
+        center_timeout_recovered = False
         if (
-            execution.state in TaskExecution.ACTIVE_STATES
+            execution.state in {"timed_out", "interrupted"}
+            and execution.failure_code == "COMMAND_TIMED_OUT"
+            and local_state in TaskExecution.ACTIVE_STATES
+            and local_state not in {"created", "dispatching"}
+            and local_state != execution.state
+        ):
+            reason_code = str(payload.get("local_task_reason_code") or "")
+            reason_message = str(payload.get("local_task_reason_message") or "")
+            try:
+                execution = TaskExecutionService.reconcile_edge_active_after_center_timeout(
+                    execution,
+                    local_state,
+                    edge_state_version=local_version,
+                    reason_code=reason_code,
+                    reason_message=reason_message,
+                    payload={
+                        "source": "edge_sync",
+                        "local_task_state": local_state,
+                        "local_task_state_version": local_version,
+                        "outbox_pending": payload.get("outbox_pending"),
+                    },
+                )
+            except TaskStateError:
+                pass
+            else:
+                realtime_publisher.publish_task_event(
+                    str(execution.id),
+                    TaskExecutionSerializer(execution).data,
+                )
+                reconciled = True
+                center_timeout_recovered = True
+        if (
+            not reconciled
+            and execution.state in TaskExecution.ACTIVE_STATES
             and local_state in {state for state, _label in TaskExecution.STATE_CHOICES}
             and local_state != execution.state
             and local_version > execution.state_version
@@ -1051,6 +1087,7 @@ def _handle_sync(
             "last_accepted_trajectory_seq": last_point.seq if last_point else -1,
             "state_reconciled": reconciled,
             "terminal_reconciled": reconciled and terminal_reconciled,
+            "center_timeout_recovered": center_timeout_recovered,
         }
     if publish_response:
         publish_response(

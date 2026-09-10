@@ -349,6 +349,8 @@ class PatrolTaskSerializer(serializers.ModelSerializer):
             "id": str(execution.id),
             "state": execution.state,
             "state_version": execution.state_version,
+            "failure_code": execution.failure_code,
+            "failure_message": execution.failure_message,
             "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
             "round_number": execution.round_number,
             "created_at": execution.created_at,

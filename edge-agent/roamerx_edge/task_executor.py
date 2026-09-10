@@ -286,6 +286,7 @@ class TaskExecutor:
         waypoint_speech=None,
         rosbag_recorder=None,
         docking_arrived_handler=None,
+        localization_recovery_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store
         self.navigation = navigation
@@ -305,16 +306,17 @@ class TaskExecutor:
         self.waypoint_speech = waypoint_speech
         self.rosbag_recorder = rosbag_recorder
         self.docking_arrived_handler = docking_arrived_handler
+        self.localization_recovery_callback = localization_recovery_callback
         self._rosbag_state: dict = {}
         self._segments = []
         self._lock = threading.RLock()
         self._goal_offset = 0
         self._departure_heading_index: int | None = None
         self._departure_heading_completed_index: int | None = None
-        # Set after a waypoint's requested final yaw has been satisfied.  A
-        # quadruped may translate while executing a pure-yaw command, so this
-        # also records that the pre-turn XY arrival remains accepted.  It must
-        # not suppress the following-leg turn.
+        # Set after a waypoint's requested final yaw has been satisfied.  The
+        # post-turn path must still re-check XY because a quadruped can
+        # translate while executing a nominally pure-yaw command.  It must not
+        # suppress the following-leg turn.
         self._arrival_heading_completed_index: int | None = None
         # When set, a successful in-place turn should cruise to this waypoint
         # instead of running the post-arrival absolute-localization path.
@@ -444,6 +446,7 @@ class TaskExecutor:
         return True
 
     def stop(self) -> None:
+        dwell_thread = self._dwell_wait_thread
         self._cancel_waypoint_localization_correction()
         self._cancel_waypoint_dwell()
         self._stop_obstacle_monitor()
@@ -462,6 +465,12 @@ class TaskExecutor:
             self._blocked_retry_timer.cancel()
             self._blocked_retry_timer = None
         self._clear_nav_dispatch_retry()
+        if (
+            dwell_thread is not None
+            and dwell_thread.is_alive()
+            and dwell_thread is not threading.current_thread()
+        ):
+            dwell_thread.join(timeout=1.0)
 
     def _obstacle_monitor_enabled(self) -> bool:
         return bool(
@@ -986,6 +995,48 @@ class TaskExecutor:
             point["round_number"] = self.context.round_number
             return point
 
+    def restore_paused_localization_recovery(self) -> bool:
+        """Reconnect a persisted pause to its live one-shot correction.
+
+        Edge restarts do not restart the localization node, so an NDT
+        transaction can still be waiting in ROS while only its in-memory Edge
+        ownership flags were lost. Re-adopt only a transaction whose id belongs
+        to this exact execution and waypoint; an ordinary operator pause remains
+        untouched. Do not arm automatic resume here: center reconciliation must
+        run first, and process restart must never start physical motion.
+        """
+        with self._lock:
+            if not self.context or self.context.state != "paused":
+                return False
+            decision = self._localization_decision()
+            transaction = decision.get("one_shot_correction")
+            if not isinstance(transaction, dict):
+                return False
+            transaction_id = str(transaction.get("transaction_id") or "")
+            expected_prefix = (
+                f"{self.context.task_execution_id}:waypoint:"
+                f"{self.context.current_waypoint_index}:correction:"
+            )
+            status = str(transaction.get("status") or "")
+            if not transaction_id.startswith(expected_prefix) or status not in {
+                "waiting_source",
+                "smoothing",
+                "completed",
+            }:
+                return False
+            self._active_correction_transaction_id = transaction_id
+            self._active_correction_mode = waypoint_localization_mode(
+                transaction.get("mode")
+            )
+            self._paused_for_localization = True
+            self._paused_localization_reason = "absolute_required"
+            LOGGER.info(
+                "restored paused waypoint localization transaction id=%s status=%s",
+                transaction_id,
+                status,
+            )
+            return True
+
     def on_localization_lost(self) -> None:
         """Pause active navigation when localization is continuously lost."""
         with self._lock:
@@ -1112,16 +1163,18 @@ class TaskExecutor:
                 self._maybe_continue_after_waypoint(reached_index)
                 return
             # Absolute-correction pauses happen after Nav2 already accepted the
-            # waypoint. Indoor: re-cruising the same click only weaves; advance.
-            # Outdoor: LIO "arrived" is not enough. If RTK is still off the
-            # click, stay on this waypoint (especially the last one) instead of
-            # skipping ahead and later claiming the route is complete.
+            # waypoint, but relocalization can move the map pose materially.
+            # Re-check the click in both indoor and outdoor modes before
+            # advancing so a corrected pose cannot turn a stale arrival into a
+            # skipped waypoint.
             if pause_reason == "absolute_required":
                 self.context.state = "running"
                 self.context.state_version += 1
                 self._persist()
                 self._emit("task.resumed")
-                if self._outdoor_arrival_confirmed(resume_index):
+                points = self.context.route_snapshot.get("waypoints") or []
+                waypoint = points[resume_index] if resume_index < len(points) else None
+                if waypoint and self._arrival_within_tolerance(waypoint, resume_index):
                     LOGGER.info(
                         "absolute localization pause cleared at waypoint %s; continuing to next leg",
                         resume_index,
@@ -1130,12 +1183,16 @@ class TaskExecutor:
                     return
                 LOGGER.info(
                     "absolute localization pause cleared at waypoint %s but "
-                    "outdoor pose is still off-click; re-approaching",
+                    "the corrected pose is still off-click; re-approaching",
                     resume_index,
                 )
                 self._navigation_prepared = False
                 self._clear_departure_heading(cancel_navigation=True)
-                self._send_from(resume_index)
+                if not self._reapproach_rejected_arrival(resume_index):
+                    self._emit_safe_hold(
+                        "PHYSICAL_REAPPROACH_EXHAUSTED",
+                        "重定位后仍未到达当前航点，进入安全保持",
+                    )
                 return
             self._clear_departure_heading(cancel_navigation=True)
             self._navigation_prepared = False
@@ -1168,6 +1225,42 @@ class TaskExecutor:
             self._persist()
             self.store.clear_task_context(execution_id, expected_state)
             self.context = None
+            return True
+
+    def reconcile_center_state_version(
+        self,
+        execution_id: str,
+        expected_state: str | None,
+        expected_version: int | None,
+    ) -> bool:
+        """Adopt a newer center version when both sides already agree on state.
+
+        Center may advance its version while repairing a center-only timeout.
+        Persisting that version locally prevents the next legitimate Edge event
+        from being discarded as stale. This method never changes task state or
+        starts motion.
+        """
+        with self._lock:
+            if (
+                not self.context
+                or self.context.task_execution_id != execution_id
+                or self.context.state != expected_state
+            ):
+                return False
+            try:
+                version = int(expected_version)
+            except (TypeError, ValueError):
+                return False
+            if version <= self.context.state_version:
+                return False
+            self.context.state_version = version
+            self._persist()
+            LOGGER.info(
+                "adopted reconciled center task version execution=%s state=%s version=%d",
+                execution_id,
+                expected_state,
+                version,
+            )
             return True
 
     def prepare_task_start(self, envelope: MessageEnvelope) -> None:
@@ -2452,6 +2545,22 @@ class TaskExecutor:
             self._active_correction_mode = None
             return True
         mode = waypoint_localization_mode(waypoint.get("localization_mode"))
+        decision = self._localization_decision()
+        existing = self._matching_waypoint_correction(
+            decision,
+            waypoint,
+            reached_index,
+            statuses={"waiting_source", "smoothing"},
+        )
+        if existing is not None:
+            self._adopt_waypoint_correction(existing, mode)
+            LOGGER.info(
+                "reusing live waypoint correction transaction id=%s mode=%s status=%s",
+                self._active_correction_transaction_id,
+                mode,
+                existing.get("status"),
+            )
+            return True
         transaction_id = (
             f"{self.context.task_execution_id}:waypoint:{reached_index}:"
             f"correction:{self._correction_generation}"
@@ -2461,6 +2570,22 @@ class TaskExecutor:
         result = requester(transaction_id, mode, "start") or {}
         accepted = bool(result.get("accepted"))
         if not accepted:
+            if str(result.get("status") or "") == "busy":
+                existing = self._matching_waypoint_correction(
+                    self._localization_decision(),
+                    waypoint,
+                    reached_index,
+                    statuses={"waiting_source", "smoothing"},
+                )
+                if existing is not None:
+                    self._adopt_waypoint_correction(existing, mode)
+                    LOGGER.warning(
+                        "waypoint correction request raced with live transaction; "
+                        "adopted id=%s status=%s",
+                        self._active_correction_transaction_id,
+                        existing.get("status"),
+                    )
+                    return True
             LOGGER.warning(
                 "waypoint correction transaction not accepted yet id=%s mode=%s status=%s",
                 transaction_id,
@@ -2469,11 +2594,70 @@ class TaskExecutor:
             )
         return accepted
 
+    def _matching_waypoint_correction(
+        self,
+        decision: dict,
+        waypoint: dict,
+        reached_index: int,
+        *,
+        statuses: set[str],
+    ) -> dict | None:
+        """Return a live correction owned by this execution and waypoint."""
+        if not self.context:
+            return None
+        transaction = decision.get("one_shot_correction")
+        if not isinstance(transaction, dict):
+            return None
+        transaction_id = str(transaction.get("transaction_id") or "")
+        expected_prefix = (
+            f"{self.context.task_execution_id}:waypoint:{reached_index}:correction:"
+        )
+        if not transaction_id.startswith(expected_prefix):
+            return None
+        if str(transaction.get("status") or "") not in statuses:
+            return None
+        requested_mode = waypoint_localization_mode(waypoint.get("localization_mode"))
+        reported_mode = str(transaction.get("mode") or "").strip().lower()
+        if reported_mode and waypoint_localization_mode(reported_mode) != requested_mode:
+            return None
+        return transaction
+
+    def _adopt_waypoint_correction(self, transaction: dict, mode: str) -> None:
+        transaction_id = str(transaction.get("transaction_id") or "")
+        self._active_correction_transaction_id = transaction_id
+        self._active_correction_mode = mode
+        try:
+            generation = int(transaction_id.rsplit(":correction:", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            return
+        self._correction_generation = max(self._correction_generation, generation)
+
     def _retry_waypoint_localization_correction(self, decision: dict) -> None:
         transaction_id = self._active_correction_transaction_id
         mode = self._active_correction_mode
         if not transaction_id or not mode:
             return
+        if self.context:
+            route_snapshot = getattr(self.context, "route_snapshot", {}) or {}
+            points = route_snapshot.get("waypoints") or []
+            reached_index = int(getattr(self.context, "current_waypoint_index", 0))
+            if 0 <= reached_index < len(points):
+                existing = self._matching_waypoint_correction(
+                    decision,
+                    points[reached_index],
+                    reached_index,
+                    statuses={"waiting_source", "smoothing"},
+                )
+                if existing is not None and str(
+                    existing.get("transaction_id") or ""
+                ) != transaction_id:
+                    self._adopt_waypoint_correction(existing, mode)
+                    LOGGER.warning(
+                        "reconciled waypoint correction ownership to id=%s status=%s",
+                        self._active_correction_transaction_id,
+                        existing.get("status"),
+                    )
+                    return
         transaction = decision.get("one_shot_correction")
         if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
             if str(transaction.get("status") or "") in {
@@ -2484,7 +2668,37 @@ class TaskExecutor:
                 return
         requester = getattr(self.navigation, "control_localization_correction", None)
         if callable(requester):
-            requester(transaction_id, mode, "start")
+            result = requester(transaction_id, mode, "start") or {}
+            if str(result.get("status") or "") == "busy" and self.context:
+                route_snapshot = getattr(self.context, "route_snapshot", {}) or {}
+                points = route_snapshot.get("waypoints") or []
+                reached_index = int(getattr(self.context, "current_waypoint_index", 0))
+                if 0 <= reached_index < len(points):
+                    existing = self._matching_waypoint_correction(
+                        self._localization_decision(),
+                        points[reached_index],
+                        reached_index,
+                        statuses={"waiting_source", "smoothing"},
+                    )
+                    if existing is not None:
+                        self._adopt_waypoint_correction(existing, mode)
+
+    def _absolute_localization_wait_message(self, decision: dict) -> str:
+        if self._active_correction_mode != "ndt":
+            return "FAST-LIO 已到达航点，正在等待所配置的绝对定位校正源"
+        score = decision.get("ndt_score")
+        inlier = decision.get("ndt_inlier_fraction")
+        details = []
+        try:
+            details.append(f"匹配分数 {float(score):.3f}/0.500")
+        except (TypeError, ValueError):
+            pass
+        try:
+            details.append(f"内点率 {float(inlier) * 100:.1f}%")
+        except (TypeError, ValueError):
+            pass
+        suffix = f"（{'，'.join(details)}）" if details else ""
+        return f"FAST-LIO 已到达航点，NDT 暂无合格匹配{suffix}，正在静止重定位"
 
     def _waypoint_correction_completed(self, decision: dict) -> bool | None:
         transaction_id = self._active_correction_transaction_id
@@ -2874,7 +3088,10 @@ class TaskExecutor:
         self._absolute_pause_watch_stop = stop
 
         def _loop() -> None:
+            recovery_requested = False
+            started_at = time.monotonic()
             while not stop.wait(0.5):
+                request_recovery = False
                 with self._lock:
                     if (
                         not self.context
@@ -2891,6 +3108,19 @@ class TaskExecutor:
                             and decision.get("lio_healthy", True)
                             and self._localization_sample_fresh(decision)
                         )
+                        transaction = decision.get("one_shot_correction")
+                        request_recovery = bool(
+                            not ready
+                            and not recovery_requested
+                            and self._active_correction_mode == "ndt"
+                            and isinstance(transaction, dict)
+                            and str(transaction.get("transaction_id") or "")
+                            == self._active_correction_transaction_id
+                            and str(transaction.get("status") or "")
+                            == "waiting_source"
+                        )
+                        if request_recovery:
+                            recovery_requested = True
                     else:
                         outdoor = self._outdoor_navigation_profile()
                         if outdoor:
@@ -2903,7 +3133,36 @@ class TaskExecutor:
                                 and str(decision.get("active_source") or "")
                                 in {"lio_imu", "rtk_imu", "ndt_imu"}
                             )
+                if request_recovery:
+                    callback = self.localization_recovery_callback
+                    if callable(callback):
+                        LOGGER.warning(
+                            "waypoint NDT correction has no eligible match; "
+                            "requesting bounded stationary relocalization"
+                        )
+                        try:
+                            callback("ndt_waypoint_correction_unavailable")
+                        except Exception:
+                            LOGGER.exception(
+                                "unable to start waypoint NDT relocalization recovery"
+                            )
+                            recovery_requested = False
+                    else:
+                        LOGGER.warning(
+                            "waypoint NDT correction is waiting for a source but "
+                            "no relocalization recovery callback is configured"
+                        )
                 if not ready:
+                    if (
+                        time.monotonic() - started_at
+                        >= ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS
+                    ):
+                        LOGGER.error(
+                            "absolute localization did not recover within %.0fs; "
+                            "task remains safely paused",
+                            ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS,
+                        )
+                        return
                     continue
                 LOGGER.info(
                     "absolute localization pause cleared (source=%s rtk=%s); resuming task",
@@ -3136,9 +3395,6 @@ class TaskExecutor:
 
     def resume_task(self, execution_id: str, resume_index: int) -> dict:
         with self._lock:
-            self._paused_for_localization = False
-            self._paused_localization_reason = None
-            self._cancel_absolute_localization_resume_watch()
             self._assert_execution(execution_id)
             if self.context.state == "running":
                 return {"final_task_state": "running", "state_version": self.context.state_version, "resume_from_waypoint_index": self.context.current_waypoint_index}
@@ -3146,6 +3402,56 @@ class TaskExecutor:
                 raise ProtocolError("INVALID_TASK_STATE", f"cannot resume from {self.context.state}")
             if resume_index != self.context.current_waypoint_index:
                 raise ProtocolError("TASK_CONTEXT_MISMATCH", "resume index does not match persisted context")
+            if (
+                self.context.state == "paused"
+                and self._paused_for_localization
+                and self._paused_localization_reason == "absolute_required"
+            ):
+                points = self.context.route_snapshot.get("waypoints") or []
+                waypoint = points[resume_index] if 0 <= resume_index < len(points) else None
+                decision = self._localization_decision()
+                if waypoint is not None:
+                    existing = self._matching_waypoint_correction(
+                        decision,
+                        waypoint,
+                        resume_index,
+                        statuses={"waiting_source", "smoothing", "completed"},
+                    )
+                    if existing is not None:
+                        self._adopt_waypoint_correction(
+                            existing,
+                            waypoint_localization_mode(waypoint.get("localization_mode")),
+                        )
+                if self._absolute_localization_ready(timeout_seconds=0.0):
+                    self.on_localization_recovered()
+                    return {
+                        "final_task_state": self.context.state if self.context else "completed",
+                        "state_version": self.context.state_version if self.context else 0,
+                        "resume_from_waypoint_index": resume_index,
+                    }
+                # Operator acknowledgement must not bypass a required anchor
+                # or replace its in-flight transaction. The recovery watcher
+                # owns stationary relocalization and resumes automatically.
+                self.context.state_version += 1
+                self._persist()
+                message = self._absolute_localization_wait_message(decision)
+                self._emit(
+                    "task.paused",
+                    code="ABSOLUTE_LOCALIZATION_REQUIRED",
+                    message=message,
+                )
+                self._arm_absolute_localization_resume_watch()
+                return {
+                    "final_task_state": "paused",
+                    "state_version": self.context.state_version,
+                    "resume_from_waypoint_index": resume_index,
+                    "resume_blocked": True,
+                    "reason_code": "ABSOLUTE_LOCALIZATION_REQUIRED",
+                    "reason_message": message,
+                }
+            self._paused_for_localization = False
+            self._paused_localization_reason = None
+            self._cancel_absolute_localization_resume_watch()
             self.context.state = "resuming"
             self.context.state_version += 1
             self._persist()
@@ -3615,25 +3921,24 @@ class TaskExecutor:
                     self._emit(
                         "task.paused",
                         code="ABSOLUTE_LOCALIZATION_REQUIRED",
-                        message="waypoint reached by FAST-LIO; waiting for the requested correction source",
+                        message=self._absolute_localization_wait_message(
+                            self._localization_decision()
+                        ),
                     )
                     self._arm_absolute_localization_resume_watch()
                     return
                 self._correction_completed_at_mono = time.monotonic()
-                # Correction finished (or was unnecessary). Before a final
-                # yaw turn, XY has already passed the arrival gate. A
-                # quadruped can translate while executing a pure-yaw command;
-                # once that requested heading is confirmed, accept the
-                # original XY arrival and continue toward the next waypoint
-                # instead of entering a turn/re-approach loop.
-                if arrival_heading_completed:
-                    self._arrival_retry_counts.pop(reached_index, None)
-                    LOGGER.info(
-                        "waypoint %d configured heading completed; preserving "
-                        "the pre-turn XY arrival without re-approach",
-                        reached_index,
-                    )
-                elif not self._arrival_within_tolerance(reached_waypoint, reached_index):
+                # Correction finished (or was unnecessary). Re-check XY even
+                # after a successful final-yaw turn: the quadruped can translate
+                # during a nominally pure rotation, and the old pre-turn arrival
+                # must not be carried forward as proof that it is still here.
+                if not self._arrival_within_tolerance(reached_waypoint, reached_index):
+                    if arrival_heading_completed:
+                        LOGGER.warning(
+                            "waypoint %d moved outside the click tolerance during "
+                            "arrival heading alignment; re-approaching",
+                            reached_index,
+                        )
                     outdoor = self._outdoor_navigation_profile()
                     rtk_usable = self._rtk_position_good_for_navigation()
                     decision = self._localization_decision()
@@ -3648,6 +3953,12 @@ class TaskExecutor:
                         )
                         return
                     if self._reapproach_rejected_arrival(reached_index):
+                        return
+                    if arrival_heading_completed:
+                        self._emit_safe_hold(
+                            "PHYSICAL_REAPPROACH_EXHAUSTED",
+                            "目标朝向对准后位置偏移且到点重试耗尽，进入安全保持",
+                        )
                         return
                     if outdoor and self._is_last_route_waypoint(reached_index):
                         LOGGER.error(
@@ -3775,9 +4086,6 @@ class TaskExecutor:
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
-            configured_heading_completed = (
-                self._arrival_heading_completed_index == reached_index
-            )
             self._active_correction_transaction_id = None
             self._active_correction_mode = None
             if self._departure_heading_completed_index == reached_index:
@@ -3806,14 +4114,7 @@ class TaskExecutor:
                         return
                 self._send_from(next_waypoint_index)
                 return
-            # The final XY pose was accepted before the configured terminal
-            # heading turn. Do not fail the task because that pure-yaw maneuver
-            # translated the quadruped; docking retains its strict pose gate.
-            pose_error = (
-                None
-                if configured_heading_completed and not self._is_docking_task()
-                else self._final_pose_error()
-            )
+            pose_error = self._final_pose_error()
             self._arrival_heading_completed_index = None
             self._restore_navigation_profile()
             if pose_error:
@@ -4000,7 +4301,6 @@ class TaskExecutor:
     def _cancel_waypoint_dwell(self) -> None:
         stop = self._dwell_wait_stop
         self._dwell_wait_stop = None
-        self._dwell_wait_thread = None
         self._dwell_waiting_index = None
         self._dwell_wait_finished = False
         if stop is not None:
@@ -4029,19 +4329,24 @@ class TaskExecutor:
         )
 
         def _wait() -> None:
-            if stop.wait(duration):
-                return
-            with self._lock:
-                if (
-                    stop is not self._dwell_wait_stop
-                    or not self.context
-                    or self.context.task_execution_id != execution_id
-                    or self._dwell_waiting_index != waypoint_index
-                ):
+            try:
+                if stop.wait(duration):
                     return
-                self._dwell_wait_finished = True
-                LOGGER.info("waypoint %d dwell finished", waypoint_index)
-                self._maybe_continue_after_waypoint(waypoint_index)
+                with self._lock:
+                    if (
+                        stop is not self._dwell_wait_stop
+                        or not self.context
+                        or self.context.task_execution_id != execution_id
+                        or self._dwell_waiting_index != waypoint_index
+                    ):
+                        return
+                    self._dwell_wait_finished = True
+                    LOGGER.info("waypoint %d dwell finished", waypoint_index)
+                    self._maybe_continue_after_waypoint(waypoint_index)
+            finally:
+                with self._lock:
+                    if self._dwell_wait_thread is threading.current_thread():
+                        self._dwell_wait_thread = None
 
         thread = threading.Thread(
             target=_wait,
@@ -4074,7 +4379,6 @@ class TaskExecutor:
             self._dwell_waiting_index = None
             self._dwell_wait_finished = False
             self._dwell_wait_stop = None
-            self._dwell_wait_thread = None
         self._waypoint_localization_ready_index = None
         self._active_correction_transaction_id = None
         self._active_correction_mode = None

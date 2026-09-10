@@ -112,6 +112,7 @@ class EdgeAgentApplication:
             obstacle_speech=config.obstacle_speech,
             waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,
+            localization_recovery_callback=self._handle_task_localization_loss,
         )
         set_log_context_provider = getattr(navigation, "set_log_context_provider", None)
         if callable(set_log_context_provider):
@@ -206,6 +207,7 @@ class EdgeAgentApplication:
         self.mqtt.connect()
         if not self.mqtt.wait_connected(15):
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
+        self.task_executor.restore_paused_localization_recovery()
         self.task_executor.report_startup_interruption()
         self.system_telemetry.poll()
         self.charge_control_adapter.observe_power(self.telemetry.latest_power())
@@ -406,6 +408,11 @@ class EdgeAgentApplication:
             self.trajectory.handle_ack(payload)
         elif message_type == "sync.response":
             action = payload.get("action")
+            self.task_executor.reconcile_center_state_version(
+                str(payload.get("task_execution_id") or ""),
+                payload.get("expected_task_state"),
+                payload.get("expected_state_version"),
+            )
             if action == "cancel" and self.task_executor.context:
                 try:
                     self.task_executor.cancel_task(self.task_executor.context.task_execution_id)

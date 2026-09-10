@@ -205,6 +205,62 @@ class MessageHandlerTests(TestCase):
         self.execution.refresh_from_db()
         self.assertEqual(self.execution.state, "resuming")
 
+    def test_blocked_resume_persists_edge_pause_reason(self):
+        TaskExecutionService.transition(
+            self.execution,
+            "accepted",
+            event_type="test.accepted",
+            state_version=2,
+        )
+        TaskExecutionService.transition(
+            self.execution,
+            "running",
+            event_type="test.running",
+            state_version=3,
+        )
+        TaskExecutionService.transition(
+            self.execution,
+            "paused",
+            event_type="test.paused",
+            state_version=4,
+        )
+        self.execution.refresh_from_db()
+        resume_command = CommandService.create(self.execution, "task.resume")
+        reason_message = "FAST-LIO 已到达航点，NDT 校正源尚未就绪"
+        result = self.envelope(
+            "command.result",
+            {
+                "command_id": str(resume_command.id),
+                "task_execution_id": str(self.execution.id),
+                "status": "succeeded",
+                "started_at": timezone.now().isoformat(),
+                "finished_at": timezone.now().isoformat(),
+                "error_code": None,
+                "error_message": None,
+                "result": {
+                    "final_task_state": "paused",
+                    "state_version": 5,
+                    "resume_blocked": True,
+                    "reason_code": "ABSOLUTE_LOCALIZATION_REQUIRED",
+                    "reason_message": reason_message,
+                },
+            },
+            sequence=3,
+        )
+
+        handle_mqtt_message("robots/rx-001/commands/x/result", result)
+
+        self.execution.refresh_from_db()
+        event = TaskExecutionEvent.objects.get(
+            task_execution=self.execution,
+            event_type="command.result",
+        )
+        self.assertEqual(self.execution.state, "paused")
+        self.assertEqual(self.execution.failure_code, "ABSOLUTE_LOCALIZATION_REQUIRED")
+        self.assertEqual(self.execution.failure_message, reason_message)
+        self.assertEqual(event.reason_code, "ABSOLUTE_LOCALIZATION_REQUIRED")
+        self.assertEqual(event.reason_message, reason_message)
+
     def test_duplicate_and_stale_messages_do_not_regress(self):
         message_id = uuid.uuid4()
         progress = self.envelope(
