@@ -67,6 +67,7 @@ import {
 import {
   calculateTrajectoryDistance,
   displayedGuardDutyDistance,
+  guardDutyTrajectoryCaptureState,
 } from '../utils/guardDutyDistance'
 import {
   guardDutySpeedLabel,
@@ -970,8 +971,14 @@ async function captureLoopDistance() {
   // the cloud. Always refresh here so the first capture cannot freeze 0 m.
   await refreshExecutionVisual()
   const distance = calculateTrajectoryDistance(trajectory.value)
-  if (trajectory.value.length < 2 && distance <= 0) {
-    loopMessage.value = '本轮轨迹数据同步中，稍后重试'
+  const captureState = guardDutyTrajectoryCaptureState({
+    execution: execution.value,
+    points: trajectory.value,
+    distance,
+  })
+  if (!captureState.ready) {
+    const retrySeconds = Math.max(1, Math.ceil(captureState.retryAfterMilliseconds / 1000))
+    loopMessage.value = `本轮轨迹数据同步中，最多等待 ${retrySeconds} 秒`
     persistLoopState()
     return false
   }

@@ -1,3 +1,5 @@
+export const LOOP_TRAJECTORY_SYNC_GRACE_MS = 15_000
+
 export function calculateTrajectoryDistance(points = []) {
   let distance = 0
   for (let index = 1; index < points.length; index += 1) {
@@ -8,6 +10,39 @@ export function calculateTrajectoryDistance(points = []) {
     if (Number.isFinite(segment) && segment >= 0 && segment <= 10) distance += segment
   }
   return distance
+}
+
+export function guardDutyTrajectoryCaptureState({
+  execution = null,
+  points = [],
+  distance = 0,
+  now = Date.now(),
+  graceMilliseconds = LOOP_TRAJECTORY_SYNC_GRACE_MS,
+} = {}) {
+  const pointCount = Array.isArray(points) ? points.length : 0
+  const numericDistance = Number(distance)
+  if (pointCount >= 2 || (Number.isFinite(numericDistance) && numericDistance > 0)) {
+    return { ready: true, reason: 'trajectory_ready', retryAfterMilliseconds: 0 }
+  }
+
+  // A task rejected during startup cannot ever produce trajectory samples.
+  // Treat it as a zero-distance round instead of presenting an endless sync.
+  if (!execution?.started_at) {
+    return { ready: true, reason: 'execution_not_started', retryAfterMilliseconds: 0 }
+  }
+
+  const terminalTimestamp = Date.parse(
+    execution.finished_at || execution.updated_at || execution.created_at || '',
+  )
+  if (!Number.isFinite(terminalTimestamp)) {
+    return { ready: true, reason: 'terminal_time_unavailable', retryAfterMilliseconds: 0 }
+  }
+
+  const safeGrace = Math.max(0, Number(graceMilliseconds) || 0)
+  const retryAfterMilliseconds = Math.max(0, terminalTimestamp + safeGrace - Number(now))
+  return retryAfterMilliseconds > 0
+    ? { ready: false, reason: 'sync_pending', retryAfterMilliseconds }
+    : { ready: true, reason: 'sync_grace_expired', retryAfterMilliseconds: 0 }
 }
 
 export function displayedGuardDutyDistance({
