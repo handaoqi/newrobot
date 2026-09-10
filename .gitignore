@@ -69,6 +69,9 @@ known_hosts*
 # not reproducible project sources.
 /platform/frontend/*.tmp.mjs
 /runtime/roamerx-build-quarantine-*/
+# Temporary Livox SDK source/build workspace. The reproducible source patch is
+# tracked under robot/patches instead.
+/runtime/livox-sdk2-system-spdlog/
 /vscode:/
 /vscode-remote:/
 /roamerx-platform-docker-validation-*.tar.gz
