@@ -3281,10 +3281,10 @@ async function handleDeleteRoute(route) {
                   <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
                 </label>
                 <div class="waypoint-actions">
-                  <button class="btn btn-primary route-main-action" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+                  <button class="btn btn-primary route-main-action route-save-action" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
                     保存路线
                   </button>
-                  <button class="btn btn-secondary" @click="handleCreateRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+                  <button class="btn btn-secondary route-save-action" @click="handleCreateRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
                     新建路线
                   </button>
                   <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
@@ -4393,6 +4393,13 @@ async function handleDeleteRoute(route) {
 
 .waypoint-actions .btn {
   width: 100%;
+}
+
+.waypoint-actions .route-save-action {
+  min-width: 0;
+  padding-inline: 0.35rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
 }
 
 .status-grid {
