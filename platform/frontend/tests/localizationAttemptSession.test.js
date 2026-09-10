@@ -5,12 +5,14 @@ import {
   attemptMarkerPose,
   attemptStatusClass,
   ATTEMPT_MARKER_VISIBLE_MS,
+  beginStoredAttemptSession,
   emptyAttemptSession,
   formatAttemptPose,
   localizationAttemptTimeline,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   shouldShowAttemptMarkers,
+  updateStoredAttemptSession,
   withAttemptMarkerExpiry,
 } from '../src/services/localizationAttemptSession.js'
 
@@ -79,6 +81,52 @@ test('new operations start from an empty session and accepted status uses a dist
   assert.equal(attemptStatusClass('accepted'), 'accepted')
   assert.equal(attemptStatusClass('verifying'), 'active')
   assert.equal(attemptStatusClass('rejected'), 'failed')
+})
+
+test('non-planner pages can refresh the shared route-planner attempt session', () => {
+  const values = new Map()
+  const previousStorage = globalThis.sessionStorage
+  globalThis.sessionStorage = {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key),
+  }
+  try {
+    const started = beginStoredAttemptSession(7, {
+      phase: 'transfer',
+      commandType: 'map.activate',
+    })
+    assert.equal(started.phase, 'transfer')
+    assert.equal(started.attempts.length, 0)
+
+    updateStoredAttemptSession(7, {
+      id: 'map-command',
+      command_type: 'map.activate',
+      status: 'succeeded',
+      started_at: '2026-09-11T00:00:00.000Z',
+      finished_at: '2026-09-11T00:00:01.000Z',
+    }, { phase: 'transfer', showCandidates: false })
+    const localized = updateStoredAttemptSession(7, {
+      id: 'relocalize-command',
+      command_type: 'nav.relocalize',
+      status: 'executing',
+      started_at: '2026-09-11T00:00:02.000Z',
+      result_payload: {
+        localization_attempts: {
+          state: 'running',
+          attempts: [{ index: 1, status: 'verifying', x: 1, y: 2, yaw: 0.3 }],
+        },
+      },
+    }, { phase: 'localization', showCandidates: true })
+
+    assert.equal(localized.commandId, 'relocalize-command')
+    assert.equal(localized.attempts.length, 1)
+    assert.equal(localized.timelineHistory[0].key, 'map_transfer')
+    assert.equal(localized.timelineHistory[0].status, 'done')
+  } finally {
+    if (previousStorage === undefined) delete globalThis.sessionStorage
+    else globalThis.sessionStorage = previousStorage
+  }
 })
 
 test('localization timeline exposes ordered stages and every candidate result', () => {

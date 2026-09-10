@@ -59,6 +59,12 @@ import {
 import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
 import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
 import {
+  LOCALIZATION_ATTEMPT_COMMAND_TYPES,
+  beginStoredAttemptSession,
+  readStoredAttemptSession,
+  updateStoredAttemptSession,
+} from '../services/localizationAttemptSession'
+import {
   activeGuardDutyTarget,
   guardDutyExecutionWaypointPlan,
   guardDutyRouteState,
@@ -611,7 +617,36 @@ async function refreshRobot() {
 async function refreshLocalizationStatus({ sync = true } = {}) {
   if (!latestRobot.value?.id) return null
   try {
-    const result = await fetchRobotNavigationStatus(latestRobot.value.id, { summary: true })
+    const robotId = latestRobot.value.id
+    let result = await fetchRobotNavigationStatus(robotId, { summary: true })
+    const command = result?.command
+    const storedAttempt = readStoredAttemptSession(robotId)
+    const localizationCommand = LOCALIZATION_ATTEMPT_COMMAND_TYPES.has(command?.command_type)
+    const commandIsActive = activeCommandStatuses.has(command?.status)
+    const storedHasTerminalSnapshot = String(storedAttempt?.commandId || '') === String(command?.id || '')
+      && Boolean(storedAttempt?.commandFinishedAt)
+    // Manual initialization and loop repair already stream every command
+    // snapshot. For task self-healing or commands started elsewhere, fetch
+    // the detailed payload only while it can add fresh attempt information.
+    if (
+      localizationCommand
+      && !localizationBusy.value
+      && !loopNavRepairBusy
+      && (commandIsActive || !storedHasTerminalSnapshot)
+    ) {
+      try {
+        const detailed = await fetchRobotNavigationStatus(robotId)
+        if (detailed?.localization_command) {
+          updateStoredAttemptSession(robotId, detailed.localization_command, {
+            phase: 'localization',
+            showCandidates: true,
+          })
+        }
+        result = detailed
+      } catch {
+        // Keep the compact status usable; the next poll retries attempt sync.
+      }
+    }
     navigationStatus.value = result
     if (sync) syncLocalizationState(result)
     return result
@@ -685,6 +720,7 @@ async function initializeLocalization() {
   try {
     const mapId = presetTask.value?.map_id || routeData.value?.map_data
     if (!mapId) throw new Error('没有可初始化的地图，请先为值守任务配置路线地图')
+    beginStoredAttemptSession(robot.id, { phase: 'transfer', commandType: 'map.activate' })
     if (String(mapData.value?.id || '') !== String(mapId)) {
       mapData.value = await fetchMapDetail(mapId)
     }
@@ -697,6 +733,7 @@ async function initializeLocalization() {
       coordinateMode: mapData.value?.coordinate_mode || '',
       waypoints: routeData.value?.waypoints || [],
       onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => updateStoredAttemptSession(robot.id, event.command, event),
       dependencies: {
         activateRouteMap,
         sendRobotNavigationCommand,
@@ -731,6 +768,12 @@ async function initializeLocalization() {
     throw new Error('初始化超时，未检测到定位收敛或导航栈就绪')
   } catch (error) {
     if (runId !== localizationRunId) return
+    if (error?.command) {
+      updateStoredAttemptSession(robot.id, error.command, {
+        phase: error.command.command_type === 'map.activate' ? 'transfer' : 'localization',
+        showCandidates: error.command.command_type !== 'map.activate',
+      })
+    }
     localizationInitState.value = 'failed'
     localizationInitMessage.value = error.message || '定位初始化失败'
     showToast(localizationInitMessage.value, { variant: 'alert' })
@@ -1021,14 +1064,26 @@ async function ensureLoopNavigationReady(onProgress = () => {}) {
     fetchStatus: () => fetchRobotNavigationStatus(robot.id, { summary: true }),
     isReady: (status) => navigationReadyForMap(status, mapId, mapVersion),
     repair: async ({ onProgress: repairProgress }) => {
-      const outcome = await activateAndRelocalizeMap({
-        mapId,
-        robotId: robot.id,
-        mapVersion,
-        waypoints: routeWaypoints.value,
-        onProgress: repairProgress,
-      })
-      return outcome.navigationStatus
+      beginStoredAttemptSession(robot.id, { phase: 'transfer', commandType: 'map.activate' })
+      try {
+        const outcome = await activateAndRelocalizeMap({
+          mapId,
+          robotId: robot.id,
+          mapVersion,
+          waypoints: routeWaypoints.value,
+          onProgress: repairProgress,
+          onCommand: event => updateStoredAttemptSession(robot.id, event.command, event),
+        })
+        return outcome.navigationStatus
+      } catch (error) {
+        if (error?.command) {
+          updateStoredAttemptSession(robot.id, error.command, {
+            phase: error.command.command_type === 'map.activate' ? 'transfer' : 'localization',
+            showCandidates: error.command.command_type !== 'map.activate',
+          })
+        }
+        throw error
+      }
     },
     onProgress,
   })

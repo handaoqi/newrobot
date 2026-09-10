@@ -580,3 +580,27 @@ export function clearStoredAttemptSession(robotId) {
   if (typeof sessionStorage === 'undefined' || !robotId) return
   sessionStorage.removeItem(localizationAttemptStorageKey(robotId))
 }
+
+/**
+ * Start a localization operation in the shared route-planner attempt slot.
+ * Other pages use this slot so returning to the route planner never renders
+ * the previous operation while a new map transfer/localization is underway.
+ */
+export function beginStoredAttemptSession(robotId, options = {}) {
+  if (!robotId) return null
+  const session = emptyAttemptSession(options)
+  writeStoredAttemptSession(robotId, session)
+  return session
+}
+
+/** Persist a command snapshot while retaining stages emitted by earlier commands. */
+export function updateStoredAttemptSession(robotId, command, extras = {}) {
+  if (!robotId || !command) return null
+  const previous = readStoredAttemptSession(robotId)
+  const session = localizationAttemptSessionFromCommand(command, {
+    ...extras,
+    timelineHistory: previous ? localizationAttemptTimeline(previous) : [],
+  })
+  if (session) writeStoredAttemptSession(robotId, session)
+  return session
+}

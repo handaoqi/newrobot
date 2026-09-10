@@ -1975,8 +1975,10 @@ function maybeRegisterAttemptRelocalizationMarker(session) {
 
 function applyLocalizationAttemptCommand(command, extras = {}) {
   if (!command) return
-  const timelineHistory = localizationAttemptSession.value
-    ? localizationAttemptTimeline(localizationAttemptSession.value)
+  const robotId = selectedRobot.value?.id
+  const previousSession = localizationAttemptSession.value || readStoredAttemptSession(robotId)
+  const timelineHistory = previousSession
+    ? localizationAttemptTimeline(previousSession)
     : []
   const session = localizationAttemptSessionFromCommand(command, {
     ...extras,
@@ -1984,7 +1986,6 @@ function applyLocalizationAttemptCommand(command, extras = {}) {
   })
   if (!session) return
   localizationAttemptSession.value = session
-  const robotId = selectedRobot.value?.id
   if (robotId) writeStoredAttemptSession(robotId, session)
   maybeRegisterAttemptRelocalizationMarker(session)
   scheduleAttemptMarkerRefresh(session)
