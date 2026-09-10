@@ -32,7 +32,7 @@
 - `/laser_scan` 每帧遍历全部点并重复计算 `sin/cos`；
 - `/status` 正常帧也复制完整预测标签和误差数组。
 
-这些工作运行在共享 ROS executor 与 telemetry 锁上，造成回调争用。完整建图 SLAM 并不是 edge-agent CPU 的根因，不能通过停止导航必需的 LIO 前端来规避。
+这些工作运行在共享 ROS executor 与 telemetry 锁上，造成回调争用。完整 SLAM 建图后端并不是 edge-agent CPU 的根因，不能通过停止导航必需的 FAST-LIO 里程计前端来规避。
 
 ### 2.2 视觉
 
@@ -133,7 +133,7 @@ CPUExecutionProvider
 
 ## 4. 导航与建图进程边界
 
-静态导航验收时完整 Nav2、定位、避障和 LIO 前端同时运行，未发送运动目标。
+本计划中的“导航阶段完整运行”专指完整的导航与定位链路，并不表示完整 SLAM 建图后端仍在运行。静态导航验收时，Nav2、地图定位、避障和 FAST-LIO 里程计前端同时运行，未发送运动目标。
 
 `/lio_odometry` 参数实测：
 
@@ -147,7 +147,7 @@ publish.world_points_en=false
 
 `/odom/lio_odom` 由 `/lio_odometry` 单一发布，实测约 10.00 Hz，并由 `/localization` 消费。`planner_server`、`controller_server`、`bt_navigator` 和 `collision_monitor` 均存在。完整 `roamerx-mapping.service` 保持 inactive/disabled。
 
-因此导航阶段保留的是 FAST-LIO 里程计前端，不是完整建图后端。地图保存后可停止完整建图进程，但任何回滚均不得停止 `/lio_odometry`。
+因此导航阶段的进程边界是“完整导航与定位链路 + FAST-LIO 里程计前端”，而不是完整 SLAM 建图进程。地图保存后停止全局优化、关键帧记录和地图发布等建图后端，但任何回滚均不得停止导航定位必需的 `/lio_odometry`。
 
 ## 5. 现场验收结果
 
@@ -207,4 +207,4 @@ roamerx-mapping.service     inactive / disabled
 - [x] 完成 IMU、里程计、激光、匹配状态的 latest-only/限频策略；
 - [x] 加入 callback group 隔离、队列覆盖指标和 telemetry 快照计时；
 - [x] 完成自动化回归、服务重启和静态导航满载验收；
-- [x] 保持完整建图退出、LIO 前端与 `/odom/lio_odom` 运行。
+- [x] 确认完整 SLAM 建图服务退出，仅保留 FAST-LIO 里程计前端与 `/odom/lio_odom` 运行。
