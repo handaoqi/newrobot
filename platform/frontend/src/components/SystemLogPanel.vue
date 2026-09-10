@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   fetchRobotSystemLogs,
-  openRobotSystemLogStream,
   startRobotDebugLogSession,
   stopRobotDebugLogSession,
 } from '../services/api'
@@ -24,11 +23,8 @@ const selected = ref(null)
 const levels = ref(['INFO', 'WARNING', 'ERROR'])
 const moduleFilter = ref('')
 const keyword = ref('')
-const paused = ref(false)
 const viewMode = ref('raw')
-const streamConnected = ref(false)
 const selectedTrace = ref('')
-const oldestCursor = ref('')
 const loading = ref(false)
 const error = ref('')
 const cursor = ref('')
@@ -42,9 +38,6 @@ const canDebug = computed(() => {
     return false
   }
 })
-let pollTimer = null
-let streamController = null
-let streamRetryTimer = null
 let clockTimer = window.setInterval(() => { nowTick.value = Date.now() }, 1000)
 
 const warningCount = computed(() => logs.value.filter(item => item.level === 'WARNING').length)
@@ -65,7 +58,7 @@ function params(incremental = true) {
     map_id: props.mapId || '',
     trace_id: selectedTrace.value,
     after_cursor: incremental ? cursor.value : '',
-    limit: 200,
+    limit: 10,
   }
 }
 
@@ -82,29 +75,19 @@ const traceGroups = computed(() => {
   return [...groups.values()].sort((a, b) => new Date(b.last) - new Date(a.last))
 })
 
-function insertLog(item) {
-  if (!item?.id || logs.value.some(row => row.id === item.id)) return
-  logs.value = [item, ...logs.value].slice(0, 500)
-  if (item.level === 'ERROR') {
-    open.value = true
-    selected.value = item
-  }
-}
-
 async function refresh({ reset = false } = {}) {
-  if (!props.robotId || loading.value || paused.value) return
+  if (!props.robotId || loading.value) return
   loading.value = true
   error.value = ''
   try {
     const response = await fetchRobotSystemLogs(props.robotId, params(!reset))
     const incoming = response.results || []
-    if (reset) logs.value = incoming
+    if (reset) logs.value = incoming.slice(0, 10)
     else {
       const known = new Set(logs.value.map(item => item.id))
-      logs.value = [...incoming.filter(item => !known.has(item.id)), ...logs.value].slice(0, 500)
+      logs.value = [...incoming.filter(item => !known.has(item.id)), ...logs.value].slice(0, 10)
     }
     if (response.cursor) cursor.value = response.cursor
-    if (response.oldest_cursor) oldestCursor.value = response.oldest_cursor
     debugSession.value = response.debug_session || null
   } catch (cause) {
     error.value = cause.message || '系统日志获取失败'
@@ -113,67 +96,13 @@ async function refresh({ reset = false } = {}) {
   }
 }
 
-async function startStream() {
-  if (!props.robotId) return
-  streamController?.abort()
-  streamController = new AbortController()
-  try {
-    const response = await openRobotSystemLogStream(props.robotId, params(true), { signal: streamController.signal })
-    if (!response.ok || !response.body) throw new Error('日志实时连接失败')
-    streamConnected.value = true
-    if (pollTimer) { window.clearInterval(pollTimer); pollTimer = null }
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) throw new Error('日志实时连接已关闭')
-      buffer += decoder.decode(value, { stream: true })
-      const blocks = buffer.split('\n\n')
-      buffer = blocks.pop() || ''
-      for (const block of blocks) {
-        const eventId = block.split('\n').find(line => line.startsWith('id: '))?.slice(4).trim()
-        const data = block.split('\n').filter(line => line.startsWith('data: ')).map(line => line.slice(6)).join('\n')
-        if (!data || data === '{}') continue
-        try {
-          const item = JSON.parse(data)
-          insertLog(item)
-          if (eventId) cursor.value = eventId
-        } catch { /* malformed event is ignored; REST remains available */ }
-      }
-    }
-  } catch (cause) {
-    if (streamController?.signal.aborted) return
-    streamConnected.value = false
-    error.value = cause.message || '日志实时连接失败'
-    if (!pollTimer && props.robotId) pollTimer = window.setInterval(() => refresh(), 2000)
-    if (streamRetryTimer) window.clearTimeout(streamRetryTimer)
-    streamRetryTimer = window.setTimeout(startStream, 5000)
-  }
+function refreshLogs() {
+  refresh({ reset: true })
 }
 
 function restartPolling() {
-  if (pollTimer) window.clearInterval(pollTimer)
-  streamController?.abort()
-  if (streamRetryTimer) window.clearTimeout(streamRetryTimer)
-  streamConnected.value = false
   cursor.value = ''
-  oldestCursor.value = ''
   logs.value = []
-  if (props.robotId) {
-    refresh({ reset: true })
-    startStream()
-  }
-}
-
-async function loadEarlier() {
-  if (!props.robotId || !oldestCursor.value) return
-  try {
-    const response = await fetchRobotSystemLogs(props.robotId, { ...params(false), before_cursor: oldestCursor.value, after_cursor: '' })
-    const known = new Set(logs.value.map(item => item.id))
-    logs.value = [...logs.value, ...(response.results || []).filter(item => !known.has(item.id))].slice(-500)
-    if (response.oldest_cursor) oldestCursor.value = response.oldest_cursor
-  } catch (cause) { error.value = cause.message || '历史日志获取失败' }
 }
 
 function selectTrace(trace) {
@@ -231,9 +160,6 @@ watch(keyword, () => {
   keywordTimer = window.setTimeout(restartPolling, 300)
 })
 onBeforeUnmount(() => {
-  if (pollTimer) window.clearInterval(pollTimer)
-  streamController?.abort()
-  if (streamRetryTimer) window.clearTimeout(streamRetryTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   if (keywordTimer) window.clearTimeout(keywordTimer)
 })
@@ -254,7 +180,7 @@ onBeforeUnmount(() => {
         <div class="view-filters">
           <button type="button" class="btn btn-sm" :class="{ active: viewMode === 'flow' }" @click="viewMode = 'flow'">流程</button>
           <button type="button" class="btn btn-sm" :class="{ active: viewMode === 'raw' }" @click="viewMode = 'raw'">原始日志</button>
-          <span class="stream-state">{{ streamConnected ? '实时连接' : '轮询补偿' }}</span>
+          <span class="stream-state">仅手动刷新 · 最新10条</span>
         </div>
         <div class="level-filters">
           <button v-for="level in ['DEBUG', 'INFO', 'WARNING', 'ERROR']" v-if="canDebug || level !== 'DEBUG'" :key="level" type="button" :class="['level-chip', level.toLowerCase(), { active: levels.includes(level) }]" @click="toggleLevel(level)">{{ level }}</button>
@@ -264,7 +190,7 @@ onBeforeUnmount(() => {
           <option v-for="item in MODULES" :key="item[0]" :value="item[0]">{{ item[1] }}</option>
         </select>
         <input v-model="keyword" placeholder="事件码 / 摘要 / 来源" />
-        <button type="button" class="btn btn-sm" @click="paused = !paused">{{ paused ? '继续追踪' : '暂停滚动' }}</button>
+        <button type="button" class="btn btn-sm" :disabled="loading || !robotId" @click="refreshLogs">刷新记录</button>
         <select v-if="canDebug" v-model.number="debugMinutes" :disabled="!!debugSession">
           <option :value="5">5分钟</option><option :value="15">15分钟</option><option :value="30">30分钟</option>
         </select>
@@ -285,7 +211,6 @@ onBeforeUnmount(() => {
           <div><code>{{ item.event_code }}</code><strong>{{ item.message }}</strong><i v-if="item.repeat_count > 1">×{{ item.repeat_count }}</i></div>
         </button>
         <div v-if="!logs.length && !loading" class="system-log-empty">当前筛选条件下暂无日志</div>
-        <button v-if="oldestCursor" type="button" class="load-earlier" @click="loadEarlier">加载更早日志</button>
       </div>
       <aside v-if="selected" class="system-log-detail">
         <button type="button" aria-label="关闭详情" @click="selected = null">×</button>
