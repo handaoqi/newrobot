@@ -10,7 +10,8 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from bike_bot.detector import parse_yolo_predictions
+from bike_bot.config import ModelConfig
+from bike_bot.detector import CPU_PROVIDER, CUDA_PROVIDER, YoloDetector, parse_yolo_predictions
 
 
 def _parse(predictions, **overrides):
@@ -95,3 +96,28 @@ def test_unknown_class_id_falls_back_to_index() -> None:
 
     assert len(detections) == 1
     assert detections[0].label == "2"
+
+
+class _FakeOrt:
+    def __init__(self, providers):
+        self._providers = providers
+
+    def get_available_providers(self):
+        return list(self._providers)
+
+
+def test_cpu_fallback_provider_requires_explicit_permission() -> None:
+    detector = object.__new__(YoloDetector)
+    detector.model_config = ModelConfig(path="model.onnx", allow_cpu_fallback=False)
+
+    with pytest.raises(RuntimeError, match="allow_cpu_fallback is false"):
+        detector._cuda_cpu_providers(_FakeOrt([CPU_PROVIDER]))
+
+
+def test_cuda_provider_remains_available_when_cpu_fallback_is_disabled() -> None:
+    detector = object.__new__(YoloDetector)
+    detector.model_config = ModelConfig(path="model.onnx", allow_cpu_fallback=False)
+
+    assert detector._cuda_cpu_providers(_FakeOrt([CUDA_PROVIDER, CPU_PROVIDER])) == [
+        CUDA_PROVIDER
+    ]

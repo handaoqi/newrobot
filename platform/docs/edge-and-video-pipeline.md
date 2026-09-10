@@ -141,7 +141,8 @@ model:
   device: ""
   tensorrt_enabled: true
   tensorrt_fp16: true
-  tensorrt_engine_cache_path: data/trt-cache/yolo11n
+  tensorrt_engine_cache_path: /home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n
+  allow_cpu_fallback: true
   classes:
     - "bicycle"
     - "bike"
@@ -152,6 +153,7 @@ model:
 
 - 现场 `bot-version-test` 默认 `onnxruntime`，优先 `TensorrtExecutionProvider` FP16，失败则回退 CUDA/CPU。
 - `tensorrt_enabled: false` 可关掉 TensorRT，不必改代码。
+- `allow_cpu_fallback` 显式决定 GPU 不可用时是否允许 CPU 兜底。
 - `device` 只对 Ultralytics 后端有效。
 - 检测和直播仍是两条链：直播保持 `video_codec=copy`，检测框不画进 RTMP。
 - `classes` 用于筛选目标类别。

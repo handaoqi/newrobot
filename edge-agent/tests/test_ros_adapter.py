@@ -15,7 +15,7 @@ class FakeTelemetry:
         self.decision = decision or {}
         self.scan_samples = 0
 
-    def on_scan_matching_status(self, _msg):
+    def on_scan_matching_status(self, _msg, *, include_predictions=True):
         self.scan_samples += 1
 
     def on_localization(self, _msg):

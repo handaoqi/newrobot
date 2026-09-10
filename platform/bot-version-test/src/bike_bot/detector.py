@@ -358,6 +358,11 @@ class YoloDetector:
                 session = self._onnxruntime_session_with_fallback(ort, session_options)
             self.inference_providers = list(session.get_providers())
             self._onnx_providers_label = ",".join(self.inference_providers)
+            if not self.gpu_inference_active and not self.model_config.allow_cpu_fallback:
+                raise RuntimeError(
+                    "GPU inference is unavailable and model.allow_cpu_fallback is false; "
+                    f"active providers={self.inference_providers}"
+                )
             if (
                 self.model_config.tensorrt_enabled
                 and TENSORRT_PROVIDER not in session.get_providers()
@@ -399,7 +404,12 @@ class YoloDetector:
         providers: list[str] = []
         if CUDA_PROVIDER in available:
             providers.append(CUDA_PROVIDER)
-        providers.append(CPU_PROVIDER)
+        if self.model_config.allow_cpu_fallback:
+            providers.append(CPU_PROVIDER)
+        if not providers:
+            raise RuntimeError(
+                "no CUDA provider is available and model.allow_cpu_fallback is false"
+            )
         return providers
 
     def _onnxruntime_providers(self, ort) -> list:

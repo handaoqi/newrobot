@@ -255,15 +255,15 @@ class TelemetryCollector:
             else:
                 self.safety_state.localization_normal_since_monotonic = 0.0
 
-    def on_scan_matching_status(self, msg) -> None:
+    def on_scan_matching_status(self, msg, *, include_predictions: bool = True) -> None:
         translation = getattr(getattr(msg, "relative_pose", None), "translation", None)
         relative_translation_m = None
         if translation is not None:
             relative_translation_m = (
                 float(translation.x) ** 2 + float(translation.y) ** 2 + float(translation.z) ** 2
             ) ** 0.5
-        labels = list(getattr(msg, "prediction_labels", []) or [])
-        errors = list(getattr(msg, "prediction_errors", []) or [])
+        labels = list(getattr(msg, "prediction_labels", []) or []) if include_predictions else []
+        errors = list(getattr(msg, "prediction_errors", []) or []) if include_predictions else []
         prediction_errors = []
         for label, error in zip(labels, errors):
             error_translation = getattr(error, "translation", None)

@@ -45,7 +45,9 @@ model:
   device: ""
   tensorrt_enabled: true
   tensorrt_fp16: true
-  tensorrt_engine_cache_path: data/trt-cache/yolo11n
+  tensorrt_engine_cache_path: /home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n
+  # Keep true for service continuity; false makes provider degradation fail closed.
+  allow_cpu_fallback: true
   classes: [person, bicycle]
 
 detection:

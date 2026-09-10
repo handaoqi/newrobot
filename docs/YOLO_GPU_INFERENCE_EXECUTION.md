@@ -73,21 +73,21 @@ python3 -m pytest -q tests/test_detector_parse.py
 已完成。
 
 - 默认 provider：TensorRT FP16 → CUDA → CPU。
-- 配置开关：`model.tensorrt_enabled`（默认 true）、`tensorrt_fp16`、`tensorrt_engine_cache_path`。
+- 配置开关：`model.tensorrt_enabled`（默认 true）、`tensorrt_fp16`、`tensorrt_engine_cache_path`、`allow_cpu_fallback`。
 - 编 engine 失败会打 error 并回退 CUDA/CPU。
-- `runtime/nx-edge/conf/bike-bot.yaml` 因权限未能写入新字段；`ModelConfig` 默认值已打开 TensorRT，现场不改 yaml 也会走 TRT。回滚时在 yaml 加 `tensorrt_enabled: false` 后重启。
-- 计划中的 `/home/dogrobot/runtime/nx-edge/data/cache/roamerx/yolo11n` 对服务用户不可写。缓存改为工作目录下 `data/trt-cache/yolo11n`（`platform/.gitignore` 已忽略 `bot-version-test/data/`）。
+- 现场 `runtime/nx-edge/conf/bike-bot.yaml` 已显式写入 TensorRT、FP16、固定缓存路径和 CPU fallback 策略。
+- 缓存已迁移到运行时数据盘 `/home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n`，并由安装脚本在服务启动前预热。
 
 启动日志：
 
 ```text
-2026-08-22 21:21:18 loading TensorRT engine cache=data/trt-cache/yolo11n fp16=True
+2026-09-10 23:38:35 loading TensorRT engine cache=/home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n fp16=True
 2026-08-22 21:21:21 loaded ONNX ... providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'] tensorrt_enabled=True
 ```
 
 首次 `session.run` 编 engine 约 349s，写出：
 
-`data/trt-cache/yolo11n/TensorrtExecutionProvider_TRTKernel_graph_main_graph_*_fp16_sm87.engine`（约 8MB）
+`/home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n/TensorrtExecutionProvider_TRTKernel_graph_main_graph_*_fp16_sm87.engine`（约 8MB）
 
 ### P3 检测输入缩小
 
@@ -127,8 +127,13 @@ CPU 仍约 109%，因为检测从 2.5fps 提到 ~15fps，1080p letterbox/画框�
 tensorrt_enabled: false
 ```
 
-然后 `sudo systemctl restart roamerx-bike-bot`。向量化后处理可保留。损坏的 engine 可删：
+然后 `sudo systemctl restart roamerx-bike-bot`。向量化后处理可保留。需要重建 engine 时，先备份旧缓存，再运行预热脚本：
 
 ```bash
-rm -rf /home/dogrobot/platform/bot-version-test/data/trt-cache/yolo11n
+mv /home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n \
+  /home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n.backup
+PYTHONPATH=/home/dogrobot/platform/bot-version-test/src \
+  /home/dogrobot/runtime/nx-edge/data/vision/venv/bin/python \
+  /home/dogrobot/platform/bot-version-test/tools/prewarm_vision_runtime.py \
+  --config /home/dogrobot/runtime/nx-edge/conf/bike-bot.yaml --runs 2
 ```

@@ -153,6 +153,31 @@ def test_direct_odometry_samples_keep_source_and_frame_details(monkeypatch):
     assert snapshot["child_frame_id"] == "body"
 
 
+def test_scan_matching_summary_can_skip_prediction_arrays():
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+    message = SimpleNamespace(
+        has_converged=True,
+        matching_error=0.1,
+        inlier_fraction=0.9,
+        relative_pose=SimpleNamespace(
+            translation=SimpleNamespace(x=0.1, y=0.2, z=0.0)
+        ),
+        prediction_labels=[SimpleNamespace(data="constant_velocity")],
+        prediction_errors=[SimpleNamespace(
+            translation=SimpleNamespace(x=1.0, y=0.0, z=0.0)
+        )],
+    )
+
+    collector.on_scan_matching_status(message, include_predictions=False)
+    quality = collector.build_status_snapshot()["localization"]["quality"]
+
+    assert quality["matching_error"] == 0.1
+    assert quality["prediction_errors"] == []
+
+
 def test_rtk_raw_details_and_cross_sensor_time_diagnostics(monkeypatch):
     now = {"value": 100.0}
     monkeypatch.setattr("roamerx_edge.telemetry_collector.time.time", lambda: now["value"])

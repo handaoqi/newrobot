@@ -10,7 +10,13 @@ import time
 from collections import deque
 from typing import Callable
 
-from .config import MappingConfig, RosConfig, SafetyConfig
+from .callback_performance import CallbackPerformanceMonitor
+from .config import (
+    MappingConfig,
+    RosCallbackOptimizationConfig,
+    RosConfig,
+    SafetyConfig,
+)
 from .imu_cross_check import ImuCrossCheck, ImuCrossCheckConfig
 from .localization_recovery import planar_distance_m
 from .navigation_controllers import (
@@ -89,6 +95,7 @@ try:
     from action_msgs.srv import CancelGoal
     from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -137,6 +144,7 @@ class RosAdapter(Node):
         mapping_config: MappingConfig | None = None,
         imu_cross_check_config: ImuCrossCheckConfig | None = None,
         structured_logs=None,
+        callback_optimization_config: RosCallbackOptimizationConfig | None = None,
     ) -> None:
         if not ROS_AVAILABLE:
             raise RuntimeError("ROS2 Python packages are not available")
@@ -162,6 +170,28 @@ class RosAdapter(Node):
         self._trusted_pose_frozen = False
         self._attempt_progress_cb: Callable | None = None
         self.structured_logs = structured_logs
+        self._callback_optimization = (
+            callback_optimization_config or RosCallbackOptimizationConfig()
+        )
+        self._callback_performance = CallbackPerformanceMonitor()
+        self._control_callback_group = MutuallyExclusiveCallbackGroup()
+        self._telemetry_callback_group = MutuallyExclusiveCallbackGroup()
+        self._latest_odometry = None
+        self._odometry_sequence = 0
+        self._odometry_consumed_sequence = 0
+        self._latest_scan = None
+        self._scan_sequence = 0
+        self._scan_consumed_sequence = 0
+        self._scan_geometry_key = None
+        self._scan_geometry: list[tuple[int, float, float]] = []
+        self._latest_lidar_imu = None
+        self._lidar_imu_sequence = 0
+        self._lidar_imu_consumed_sequence = 0
+        self._latest_body_imu = None
+        self._body_imu_sequence = 0
+        self._body_imu_consumed_sequence = 0
+        self._last_scan_matching_detail_monotonic = 0.0
+        self._last_scan_matching_signature = None
         self._log_context_provider: Callable | None = None
         self._localization_sample_condition = threading.Condition()
         self._localization_sample_sequence = 0
@@ -237,16 +267,27 @@ class RosAdapter(Node):
             ros_config.localization_topic,
             self._on_localization,
             10,
+            callback_group=self._control_callback_group,
         )
         self.create_subscription(
             Odometry,
             ros_config.odometry_topic,
             self._on_odometry,
             20,
+            callback_group=self._telemetry_callback_group,
         )
-        self.create_subscription(Twist, ros_config.cmd_vel_raw_topic, self._on_cmd_vel_raw, 10)
-        self.create_subscription(Twist, ros_config.cmd_vel_topic, self._on_cmd_vel, 10)
-        self.create_subscription(LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(
+            Twist, ros_config.cmd_vel_raw_topic, self._on_cmd_vel_raw, 10,
+            callback_group=self._control_callback_group,
+        )
+        self.create_subscription(
+            Twist, ros_config.cmd_vel_topic, self._on_cmd_vel, 10,
+            callback_group=self._control_callback_group,
+        )
+        self.create_subscription(
+            LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data,
+            callback_group=self._control_callback_group,
+        )
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
         self.create_subscription(String, "/planner/performance", self._on_planner_performance, 10)
@@ -292,6 +333,7 @@ class RosAdapter(Node):
                 ros_config.scan_matching_status_topic,
                 self._on_scan_matching_status,
                 qos_profile_sensor_data,
+                callback_group=self._control_callback_group,
             )
         elif ros_config.scan_matching_status_topic:
             LOGGER.warning(
@@ -324,6 +366,65 @@ class RosAdapter(Node):
         self._planner_selector_pub = self.create_publisher(String, "/planner_selector", goal_yaw_qos)
         self.create_subscription(String, "/robot_motion_state", self._on_robot_motion_state, 10)
         self.create_subscription(Path, "/plan", self._on_global_plan, 10)
+        self._install_callback_timers()
+
+    @staticmethod
+    def _timer_period(rate_hz: float) -> float:
+        return 1.0 / max(0.1, float(rate_hz))
+
+    def _install_callback_timers(self) -> None:
+        config = self._callback_optimization
+        if config.enabled:
+            self.create_timer(
+                self._timer_period(config.odometry_telemetry_rate_hz),
+                self._consume_latest_odometry,
+                callback_group=self._telemetry_callback_group,
+            )
+            self.create_timer(
+                self._timer_period(config.scan_processing_rate_hz),
+                self._consume_latest_scan,
+                callback_group=self._control_callback_group,
+            )
+            if self._imu_cross_check.config.enabled:
+                self.create_timer(
+                    self._timer_period(config.imu_sample_rate_hz),
+                    self._consume_latest_imu,
+                    callback_group=self._telemetry_callback_group,
+                )
+        if config.metrics_enabled:
+            self.create_timer(
+                max(1.0, float(config.metrics_interval_seconds)),
+                self._log_callback_performance,
+                callback_group=self._telemetry_callback_group,
+            )
+
+    def _latest_queue_depth(self) -> int:
+        return sum((
+            getattr(self, "_odometry_sequence", 0) > getattr(self, "_odometry_consumed_sequence", 0),
+            getattr(self, "_scan_sequence", 0) > getattr(self, "_scan_consumed_sequence", 0),
+            getattr(self, "_lidar_imu_sequence", 0) > getattr(self, "_lidar_imu_consumed_sequence", 0),
+            getattr(self, "_body_imu_sequence", 0) > getattr(self, "_body_imu_consumed_sequence", 0),
+        ))
+
+    def _callback_optimization_enabled(self) -> bool:
+        return bool(getattr(getattr(self, "_callback_optimization", None), "enabled", False))
+
+    def _callback_metrics_enabled(self) -> bool:
+        return bool(
+            getattr(getattr(self, "_callback_optimization", None), "metrics_enabled", False)
+        )
+
+    def record_callback_performance(self, name: str, duration_seconds: float) -> None:
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                name,
+                duration_seconds,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _log_callback_performance(self) -> None:
+        summary = self._callback_performance.snapshot_and_reset()
+        LOGGER.info("edge_callback_perf %s", json.dumps(summary, sort_keys=True))
 
     def _on_global_plan(self, msg) -> None:
         points = []
@@ -563,6 +664,39 @@ class RosAdapter(Node):
         return self._rtk_origin_cache.snapshot()
 
     def _on_odometry(self, msg) -> None:
+        started = time.perf_counter()
+        dropped = 0
+        optimization_enabled = self._callback_optimization_enabled()
+        if optimization_enabled:
+            dropped = int(self._odometry_sequence > self._odometry_consumed_sequence)
+            self._odometry_sequence += 1
+            self._latest_odometry = msg
+        else:
+            self._process_odometry(msg)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "odometry_callback",
+                time.perf_counter() - started,
+                processed=not optimization_enabled,
+                dropped=dropped,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _consume_latest_odometry(self) -> None:
+        if self._odometry_sequence <= self._odometry_consumed_sequence:
+            return
+        msg = self._latest_odometry
+        self._odometry_consumed_sequence = self._odometry_sequence
+        started = time.perf_counter()
+        self._process_odometry(msg)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "odometry_processing",
+                time.perf_counter() - started,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _process_odometry(self, msg) -> None:
         stamp = getattr(getattr(msg, "header", None), "stamp", None)
         stamp_seconds = 0.0
         if stamp is not None:
@@ -731,13 +865,41 @@ class RosAdapter(Node):
             self._localization_recovery_pending = False
 
     def _on_scan_matching_status(self, msg) -> None:
+        started = time.perf_counter()
         LOGGER.debug(
             "scan matching status: converged=%s matching_error=%.3f inlier_fraction=%.3f",
             bool(getattr(msg, "has_converged", False)),
             float(getattr(msg, "matching_error", 0.0)),
             float(getattr(msg, "inlier_fraction", 0.0)),
         )
-        self.telemetry.on_scan_matching_status(msg)
+        score = float(getattr(msg, "matching_error", float("inf")))
+        converged = bool(getattr(msg, "has_converged", False))
+        healthy = converged and math.isfinite(score) and (
+            score < self.safety_config.ndt_failure_score
+        )
+        signature = (converged, healthy)
+        now_monotonic = time.monotonic()
+        optimization = getattr(
+            self, "_callback_optimization", RosCallbackOptimizationConfig()
+        )
+        include_predictions = bool(
+            not healthy
+            or signature != getattr(self, "_last_scan_matching_signature", None)
+            or now_monotonic - getattr(self, "_last_scan_matching_detail_monotonic", 0.0)
+            >= max(
+                1.0,
+                float(
+                    optimization.scan_matching_full_detail_interval_seconds
+                ),
+            )
+        )
+        self.telemetry.on_scan_matching_status(
+            msg,
+            include_predictions=include_predictions,
+        )
+        self._last_scan_matching_signature = signature
+        if include_predictions:
+            self._last_scan_matching_detail_monotonic = now_monotonic
         scan_condition = getattr(self, "_scan_match_condition", None)
         if scan_condition is not None:
             with scan_condition:
@@ -758,6 +920,7 @@ class RosAdapter(Node):
         if self._rtk_is_navigation_pose_source() or self._rtk_fixed_solution_available():
             self._ndt_failure_count = 0
             self._ndt_failure_notified = False
+            self._record_scan_matching_performance(started)
             return
         decision = self.telemetry.localization_decision()
         correction_policy = str(decision.get("correction_policy") or "ndt").lower()
@@ -773,14 +936,12 @@ class RosAdapter(Node):
             # auxiliary candidate and its degradation must not pause motion.
             self._ndt_failure_count = 0
             self._ndt_failure_notified = False
+            self._record_scan_matching_performance(started)
             return
-        score = float(getattr(msg, "matching_error", float("inf")))
-        healthy = bool(getattr(msg, "has_converged", False)) and math.isfinite(score) and (
-            score < self.safety_config.ndt_failure_score
-        )
         if healthy:
             self._ndt_failure_count = 0
             self._ndt_failure_notified = False
+            self._record_scan_matching_performance(started)
             return
         self._ndt_failure_count += 1
         if (
@@ -796,6 +957,15 @@ class RosAdapter(Node):
                 daemon=True,
                 name="ndt-failure-handler",
             ).start()
+        self._record_scan_matching_performance(started)
+
+    def _record_scan_matching_performance(self, started: float) -> None:
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "scan_matching_callback",
+                time.perf_counter() - started,
+                queue_depth=self._latest_queue_depth(),
+            )
 
     def _localization_decision(self) -> dict:
         getter = getattr(self.telemetry, "localization_decision", None)
@@ -894,15 +1064,69 @@ class RosAdapter(Node):
         self._actual_velocity_updated_monotonic = time.monotonic()
 
     def _on_scan(self, scan) -> None:
+        started = time.perf_counter()
+        dropped = 0
+        optimization_enabled = self._callback_optimization_enabled()
+        if optimization_enabled:
+            dropped = int(
+                getattr(self, "_scan_sequence", 0)
+                > getattr(self, "_scan_consumed_sequence", 0)
+            )
+            self._scan_sequence = getattr(self, "_scan_sequence", 0) + 1
+            self._latest_scan = scan
+        else:
+            self._process_scan(scan)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "scan_callback",
+                time.perf_counter() - started,
+                processed=not optimization_enabled,
+                dropped=dropped,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _consume_latest_scan(self) -> None:
+        if self._scan_sequence <= self._scan_consumed_sequence:
+            return
+        scan = self._latest_scan
+        self._scan_consumed_sequence = self._scan_sequence
+        started = time.perf_counter()
+        self._process_scan(scan)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "scan_processing",
+                time.perf_counter() - started,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _scan_geometry_for(self, scan) -> list[tuple[int, float, float]]:
+        key = (
+            len(scan.ranges),
+            round(float(scan.angle_min), 12),
+            round(float(scan.angle_increment), 12),
+        )
+        if key != getattr(self, "_scan_geometry_key", None):
+            geometry = []
+            for index in range(len(scan.ranges)):
+                angle = scan.angle_min + index * scan.angle_increment
+                cosine = math.cos(angle)
+                if cosine <= 0.0:
+                    continue
+                geometry.append((index, cosine, math.sin(angle)))
+            self._scan_geometry_key = key
+            self._scan_geometry = geometry
+        return getattr(self, "_scan_geometry", [])
+
+    def _process_scan(self, scan) -> None:
         nearest = None
         left = None
         right = None
-        for index, distance in enumerate(scan.ranges):
+        for index, cosine, sine in self._scan_geometry_for(scan):
+            distance = scan.ranges[index]
             if not math.isfinite(distance) or distance < scan.range_min:
                 continue
-            angle = scan.angle_min + index * scan.angle_increment
-            x = distance * math.cos(angle)
-            y = distance * math.sin(angle)
+            x = distance * cosine
+            y = distance * sine
             if distance <= 0.9 and x >= 0.18 and abs(y) <= 0.35:
                 nearest = distance if nearest is None else min(nearest, distance)
             if 0.20 <= x <= 2.5 and 0.40 <= y <= 2.0:
@@ -923,7 +1147,8 @@ class RosAdapter(Node):
         if not config.enabled:
             return
         self.create_subscription(
-            Imu, config.lidar_imu_topic, self._on_lidar_imu, qos_profile_sensor_data
+            Imu, config.lidar_imu_topic, self._on_lidar_imu, qos_profile_sensor_data,
+            callback_group=self._telemetry_callback_group,
         )
         if HighLevelRobotState is None:
             LOGGER.warning(
@@ -936,12 +1161,66 @@ class RosAdapter(Node):
             config.robot_state_topic,
             self._on_high_level_robot_state,
             qos_profile_sensor_data,
+            callback_group=self._telemetry_callback_group,
         )
 
     def _on_lidar_imu(self, msg) -> None:
         # Also the evaluation trigger: this feed runs at 200 Hz and is always
         # present, so driving the comparison from here is what lets a missing
         # 3588 stream be reported as absent rather than simply going quiet.
+        started = time.perf_counter()
+        dropped = 0
+        optimization_enabled = self._callback_optimization_enabled()
+        if optimization_enabled:
+            dropped = int(self._lidar_imu_sequence > self._lidar_imu_consumed_sequence)
+            self._lidar_imu_sequence += 1
+            self._latest_lidar_imu = msg
+        else:
+            self._process_lidar_imu(msg)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "imu_callback",
+                time.perf_counter() - started,
+                processed=not optimization_enabled,
+                dropped=dropped,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _on_high_level_robot_state(self, msg) -> None:
+        started = time.perf_counter()
+        dropped = 0
+        optimization_enabled = self._callback_optimization_enabled()
+        if optimization_enabled:
+            dropped = int(self._body_imu_sequence > self._body_imu_consumed_sequence)
+            self._body_imu_sequence += 1
+            self._latest_body_imu = msg
+        else:
+            self._process_body_imu(msg)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "imu_callback",
+                time.perf_counter() - started,
+                processed=not optimization_enabled,
+                dropped=dropped,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _consume_latest_imu(self) -> None:
+        started = time.perf_counter()
+        if self._body_imu_sequence > self._body_imu_consumed_sequence:
+            self._body_imu_consumed_sequence = self._body_imu_sequence
+            self._process_body_imu(self._latest_body_imu)
+        if self._lidar_imu_sequence > self._lidar_imu_consumed_sequence:
+            self._lidar_imu_consumed_sequence = self._lidar_imu_sequence
+            self._process_lidar_imu(self._latest_lidar_imu)
+        if self._callback_metrics_enabled():
+            self._callback_performance.record(
+                "imu_processing",
+                time.perf_counter() - started,
+                queue_depth=self._latest_queue_depth(),
+            )
+
+    def _process_lidar_imu(self, msg) -> None:
         gyro = msg.angular_velocity
         now = time.monotonic()
         with self._imu_cross_check_lock:
@@ -951,7 +1230,7 @@ class RosAdapter(Node):
             report = self._imu_cross_check.evaluate(now)
         self._publish_imu_cross_check(report)
 
-    def _on_high_level_robot_state(self, msg) -> None:
+    def _process_body_imu(self, msg) -> None:
         gyro = msg.gyro
         with self._imu_cross_check_lock:
             self._imu_cross_check.add_body_gyro(time.monotonic(), gyro.x, gyro.y, gyro.z)

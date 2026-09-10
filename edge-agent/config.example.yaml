@@ -22,6 +22,16 @@ ros:
   battery_topic: ""
   follow_waypoints_action: "/follow_waypoints"
 
+ros_callback_optimization:
+  # One switch restores the historical direct-in-callback processing path.
+  enabled: true
+  metrics_enabled: true
+  metrics_interval_seconds: 10
+  imu_sample_rate_hz: 25
+  odometry_telemetry_rate_hz: 10
+  scan_processing_rate_hz: 10
+  scan_matching_full_detail_interval_seconds: 10
+
 telemetry:
   status_interval_seconds: 2
   heartbeat_interval_seconds: 10

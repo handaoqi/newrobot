@@ -5,6 +5,8 @@ readonly ORT_VERSION="1.23.0"
 readonly ORT_INDEX="https://pypi.jetson-ai-lab.io/jp6/cu126"
 readonly NUMPY_VERSION="1.26.4"
 readonly VISION_VENV="${ROAMERX_VISION_VENV:-/home/dogrobot/runtime/nx-edge/data/vision/venv}"
+readonly VISION_PROJECT_ROOT="${ROAMERX_VISION_PROJECT_ROOT:-/home/dogrobot/platform/bot-version-test}"
+readonly VISION_CONFIG="${ROAMERX_VISION_CONFIG:-/home/dogrobot/runtime/nx-edge/conf/bike-bot.yaml}"
 
 if [[ "$(uname -m)" != "aarch64" ]]; then
   echo "This installer is only for Jetson aarch64 devices." >&2
@@ -35,5 +37,15 @@ if "GStreamer:                   YES" not in cv2.getBuildInformation():
     raise SystemExit("OpenCV GStreamer support is unavailable")
 print(f"opencv={cv2.__version__} path={Path(cv2.__file__).resolve()} gstreamer=yes")
 PY
+
+if [[ -f "${VISION_PROJECT_ROOT}/tools/prewarm_vision_runtime.py" && -f "${VISION_CONFIG}" ]]; then
+  echo "Prewarming TensorRT engine before service startup..."
+  PYTHONNOUSERSITE=1 PYTHONPATH="${VISION_PROJECT_ROOT}/src" \
+    "${VISION_VENV}/bin/python" \
+    "${VISION_PROJECT_ROOT}/tools/prewarm_vision_runtime.py" \
+    --config "${VISION_CONFIG}" --runs 2
+else
+  echo "Skipping TensorRT prewarm: project or config is unavailable." >&2
+fi
 
 echo "Vision runtime ready: ${VISION_VENV}"

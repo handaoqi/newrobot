@@ -43,6 +43,17 @@ class RosConfig:
 
 
 @dataclass
+class RosCallbackOptimizationConfig:
+    enabled: bool = True
+    metrics_enabled: bool = True
+    metrics_interval_seconds: float = 10.0
+    imu_sample_rate_hz: float = 25.0
+    odometry_telemetry_rate_hz: float = 10.0
+    scan_processing_rate_hz: float = 10.0
+    scan_matching_full_detail_interval_seconds: float = 10.0
+
+
+@dataclass
 class TelemetryConfig:
     status_interval_seconds: float = 2
     heartbeat_interval_seconds: float = 10
@@ -375,6 +386,9 @@ class EdgeConfig:
     # Defaulted so existing constructions of EdgeConfig keep working; the
     # cross-check is pure monitoring and has no required configuration.
     imu_cross_check: ImuCrossCheckConfig = field(default_factory=ImuCrossCheckConfig)
+    ros_callback_optimization: RosCallbackOptimizationConfig = field(
+        default_factory=RosCallbackOptimizationConfig
+    )
 
     @classmethod
     def load(cls, path: str | Path) -> "EdgeConfig":
@@ -398,4 +412,7 @@ class EdgeConfig:
             power_mode=PowerModeConfig(**raw.get("power_mode", {})),
             audio_control=AudioControlConfig(**raw.get("audio_control", {})),
             imu_cross_check=ImuCrossCheckConfig(**raw.get("imu_cross_check", {})),
+            ros_callback_optimization=RosCallbackOptimizationConfig(
+                **raw.get("ros_callback_optimization", {})
+            ),
         )

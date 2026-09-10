@@ -86,6 +86,7 @@ class EdgeAgentApplication:
                 config.mapping,
                 config.imu_cross_check,
                 self.structured_logs,
+                config.ros_callback_optimization,
             )
             self.ros_runtime = RosRuntime(navigation)
         self.navigation = navigation
@@ -432,9 +433,16 @@ class EdgeAgentApplication:
                 else:
                     self.navigation.wait_until_ready(timeout_seconds=0.5)
                 context = self.task_executor.context
+                snapshot_started = time.perf_counter()
                 snapshot = self.telemetry.build_status_snapshot(
                     context.task_execution_id if context and self.task_executor.has_active_task() else None
                 )
+                record_performance = getattr(self.navigation, "record_callback_performance", None)
+                if callable(record_performance):
+                    record_performance(
+                        "telemetry_snapshot",
+                        time.perf_counter() - snapshot_started,
+                    )
                 mapping_status["odometry"] = dict((snapshot.get("sensors") or {}).get("odometry") or {})
                 snapshot["current_map"] = self._current_map_payload()
                 snapshot["map_set"] = self.map_set_coordinator.status()

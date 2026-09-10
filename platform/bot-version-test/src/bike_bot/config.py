@@ -76,7 +76,8 @@ class ModelConfig:
     classes: list[str] | None = None
     tensorrt_enabled: bool = True
     tensorrt_fp16: bool = True
-    tensorrt_engine_cache_path: str = "data/trt-cache/yolo11n"
+    tensorrt_engine_cache_path: str = "/home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n"
+    allow_cpu_fallback: bool = True
 
 
 @dataclass
@@ -243,5 +244,12 @@ class AppConfig:
         if cache_path:
             try:
                 Path(cache_path).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        if self.person_model and self.person_model.tensorrt_engine_cache_path:
+            try:
+                Path(self.person_model.tensorrt_engine_cache_path).mkdir(
+                    parents=True, exist_ok=True
+                )
             except OSError:
                 pass
