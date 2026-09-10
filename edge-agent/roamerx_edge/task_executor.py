@@ -311,8 +311,10 @@ class TaskExecutor:
         self._goal_offset = 0
         self._departure_heading_index: int | None = None
         self._departure_heading_completed_index: int | None = None
-        # Set only while a waypoint's requested final yaw is being satisfied
-        # after its XY arrival.  It must not suppress the following-leg turn.
+        # Set after a waypoint's requested final yaw has been satisfied.  A
+        # quadruped may translate while executing a pure-yaw command, so this
+        # also records that the pre-turn XY arrival remains accepted.  It must
+        # not suppress the following-leg turn.
         self._arrival_heading_completed_index: int | None = None
         # When set, a successful in-place turn should cruise to this waypoint
         # instead of running the post-arrival absolute-localization path.
@@ -3476,11 +3478,9 @@ class TaskExecutor:
                         reached_index,
                     )
                 arrival_heading_completed = self._arrival_heading_completed_index == reached_index
-                if arrival_heading_completed:
-                    # The teleop worker re-enters this callback once, after
-                    # it has stopped at the requested final yaw.
-                    self._arrival_heading_completed_index = None
-                elif self._use_teleop_arrival_heading(reached_waypoint, reached_index):
+                if not arrival_heading_completed and self._use_teleop_arrival_heading(
+                    reached_waypoint, reached_index
+                ):
                     pose = self.navigation.latest_pose() if self.navigation else None
                     error = None
                     if pose is not None:
@@ -3557,10 +3557,20 @@ class TaskExecutor:
                     self._arm_absolute_localization_resume_watch()
                     return
                 self._correction_completed_at_mono = time.monotonic()
-                # Correction finished (or was unnecessary). Verify the dog is
-                # actually at the click in LIO and outdoor RTK. A drifted LIO
-                # "arrival" must re-approach; missing/unusable RTK must pause.
-                if not self._arrival_within_tolerance(reached_waypoint, reached_index):
+                # Correction finished (or was unnecessary). Before a final
+                # yaw turn, XY has already passed the arrival gate. A
+                # quadruped can translate while executing a pure-yaw command;
+                # once that requested heading is confirmed, accept the
+                # original XY arrival and continue toward the next waypoint
+                # instead of entering a turn/re-approach loop.
+                if arrival_heading_completed:
+                    self._arrival_retry_counts.pop(reached_index, None)
+                    LOGGER.info(
+                        "waypoint %d configured heading completed; preserving "
+                        "the pre-turn XY arrival without re-approach",
+                        reached_index,
+                    )
+                elif not self._arrival_within_tolerance(reached_waypoint, reached_index):
                     outdoor = self._outdoor_navigation_profile()
                     rtk_usable = self._rtk_position_good_for_navigation()
                     decision = self._localization_decision()
@@ -3702,6 +3712,9 @@ class TaskExecutor:
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
+            configured_heading_completed = (
+                self._arrival_heading_completed_index == reached_index
+            )
             self._active_correction_transaction_id = None
             self._active_correction_mode = None
             if self._departure_heading_completed_index == reached_index:
@@ -3714,6 +3727,7 @@ class TaskExecutor:
             self._persist()
             total_waypoints = len(self.context.route_snapshot["waypoints"])
             if next_waypoint_index < total_waypoints:
+                self._arrival_heading_completed_index = None
                 if self._segments:
                     current_segment = self._segments[self.context.current_segment_index]
                     if next_waypoint_index >= current_segment.end_index:
@@ -3729,7 +3743,15 @@ class TaskExecutor:
                         return
                 self._send_from(next_waypoint_index)
                 return
-            pose_error = self._final_pose_error()
+            # The final XY pose was accepted before the configured terminal
+            # heading turn. Do not fail the task because that pure-yaw maneuver
+            # translated the quadruped; docking retains its strict pose gate.
+            pose_error = (
+                None
+                if configured_heading_completed and not self._is_docking_task()
+                else self._final_pose_error()
+            )
+            self._arrival_heading_completed_index = None
             self._restore_navigation_profile()
             if pose_error:
                 self._fail(*pose_error)

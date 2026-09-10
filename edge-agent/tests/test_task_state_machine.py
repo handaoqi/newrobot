@@ -2124,6 +2124,14 @@ def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
     # requested yaw. Its profile must not ask RPP to weave toward that yaw.
     assert nav.waypoint_profiles[0] == (True, False, True)
     nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]), yaw=pi)
+    original_teleop_velocity = nav.teleop_velocity
+
+    def drifting_teleop_velocity(vx=0.0, vy=0.0, yaw_rate=0.0):
+        original_teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        if abs(float(yaw_rate)) > 1e-6:
+            nav.pose.x = float(first["x"]) + 0.8
+
+    nav.teleop_velocity = drifting_teleop_velocity
     nav.result("succeeded", "", {"missed_waypoints": []})
 
     deadline = time.time() + 2.0
@@ -2142,7 +2150,49 @@ def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
     assert any(command[2] < 0.0 for command in nav.teleop)
     assert any(event[0] == "task.arrival_heading_aligning" for event in events)
     assert any(event[0] == "task.arrival_heading_aligned" for event in events)
+    # The configured yaw is authoritative. Translation during that pure-yaw
+    # maneuver must not re-dispatch wp-1; the state machine faces and departs
+    # toward wp-2 directly.
+    assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 1
+    assert ids(nav.sent[-1]) == ["wp-2"]
     executor.stop()
+    store.close()
+
+
+def test_final_configured_heading_accepts_pre_turn_xy_without_reapproach(tmp_path):
+    from math import pi
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    results = []
+    envelope = command("task.start")
+    final = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    final["require_yaw"] = True
+    final["yaw"] = 0.0
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [final]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=pi)
+    original_teleop_velocity = nav.teleop_velocity
+
+    def drifting_teleop_velocity(vx=0.0, vy=0.0, yaw_rate=0.0):
+        original_teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        if abs(float(yaw_rate)) > 1e-6:
+            nav.pose.x = float(final["x"]) + 0.8
+
+    nav.teleop_velocity = drifting_teleop_velocity
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    _await_departure_heading(executor)
+
+    assert executor.context.state == "completed"
+    assert len(nav.sent) == 1
+    assert results[-1][1] == "succeeded"
     store.close()
 
 
