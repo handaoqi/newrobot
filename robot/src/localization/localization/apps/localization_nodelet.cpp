@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <optional>
+#include <iterator>
 #include <thread>
 
 #include <rclcpp/rclcpp.hpp>
@@ -62,10 +63,12 @@
 #include <localization/global_relocalization_policy.hpp>
 #include <localization/lio_motion_guard.hpp>
 #include <localization/rtk_primary_policy.hpp>
+#include <localization/anchor_ukf.hpp>
 
 #include <localization/msg/scan_matching_status.hpp>
 #include <robots_dog_msgs/srv/load_map.hpp>
 #include <robots_dog_msgs/srv/localization_state.hpp>
+#include <robots_dog_msgs/srv/control_localization_correction.hpp>
 #include <robots_dog_msgs/msg/localization.hpp>
 #include <robots_dog_msgs/msg/uni_rtk_pvh.hpp>
 
@@ -337,7 +340,7 @@ public:
     // LIO anchor correction, even when LIO has drifted farther than
     // max_correction_jump_m. Instantaneous RTK source jumps still reject.
     rtk_trust_stable_window_s_ = std::max(
-      0.5, declare_parameter<double>("lio_primary.rtk_trust.stable_window_seconds", 3.0));
+      0.5, declare_parameter<double>("lio_primary.rtk_trust.stable_window_seconds", 1.0));
     rtk_trust_stable_span_m_ = static_cast<float>(std::max(
       0.05, declare_parameter<double>("lio_primary.rtk_trust.stable_span_m", 0.35)));
     rtk_trusted_correction_translation_rate_mps_ = static_cast<float>(std::max(
@@ -350,7 +353,7 @@ public:
         "lio_primary.rtk_trust.trusted_correction_rotation_rate_degps", 30.0)
         * M_PI / 180.0));
     prefer_fixed_rtk_for_correction_ = declare_parameter<bool>(
-      "lio_primary.rtk_trust.prefer_fixed_for_correction", true);
+      "lio_primary.rtk_trust.prefer_fixed_for_correction", false);
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -422,6 +425,12 @@ public:
     bridge_max_horizontal_sigma_m_ = declare_parameter<double>("source_arbiter.max_horizontal_sigma_m", 0.8);
     bridge_max_yaw_sigma_rad_ = declare_parameter<double>("source_arbiter.max_yaw_sigma_deg", 15.0) * M_PI / 180.0;
     bridge_translation_variance_per_m_ = declare_parameter<double>("source_arbiter.odom_translation_variance_per_m", 0.0025);
+    anchor_yaw_variance_per_rad_ = std::max(
+      0.0, declare_parameter<double>("lio_primary.anchor_ukf.yaw_variance_per_rad", 0.01));
+    lio_pose_history_seconds_ = std::max(
+      0.5, declare_parameter<double>("lio_primary.anchor_ukf.pose_history_seconds", 2.0));
+    lio_observation_sync_tolerance_s_ = std::max(
+      0.01, declare_parameter<double>("lio_primary.anchor_ukf.sync_tolerance_seconds", 0.20));
     bridge_max_odom_speed_mps_ = declare_parameter<double>("source_arbiter.max_odom_speed_mps", 1.5);
     bridge_max_odom_yaw_rate_rps_ = declare_parameter<double>("source_arbiter.max_odom_yaw_rate_rps", 2.0);
     absolute_recovery_samples_ = static_cast<int>(std::max<int64_t>(
@@ -449,7 +458,15 @@ public:
     // Outdoor default: FAST-LIO stays the continuous pose; fixed RTK XY (and
     // optional heading) correct intermittently. Enabling prefer_fixed_rtk still
     // requires sustained dual-antenna heading before GPS drives the pose.
-    prefer_fixed_rtk_ = declare_parameter<bool>("source_arbiter.prefer_fixed_rtk", false);
+    const bool requested_rtk_primary =
+      declare_parameter<bool>("source_arbiter.prefer_fixed_rtk", false);
+    prefer_fixed_rtk_ = false;
+    if (requested_rtk_primary) {
+      RCLCPP_WARN(
+        get_logger(),
+        "source_arbiter.prefer_fixed_rtk is deprecated and ignored; "
+        "FAST-LIO remains the only continuous navigation source");
+    }
     rtk_primary_promote_samples_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("source_arbiter.rtk_primary_promote_samples", 20)));
     rtk_primary_demote_samples_ = static_cast<int>(std::max<int64_t>(
@@ -748,6 +765,11 @@ public:
     localization_policy_sub_ = create_subscription<std_msgs::msg::String>(
       "/localization/policy", 10,
       std::bind(&HdlLocalizationNode::localization_policy_callback, this, std::placeholders::_1));
+    control_localization_correction_service_ =
+      create_service<robots_dog_msgs::srv::ControlLocalizationCorrection>(
+        "/localization/control_correction",
+        std::bind(&HdlLocalizationNode::control_localization_correction_callback, this,
+          std::placeholders::_1, std::placeholders::_2));
     localization_decision_pub_ = create_publisher<std_msgs::msg::String>("/localization/decision", 10);
 
     localization_lidar_info_timer_ = this->create_wall_timer(
@@ -1122,6 +1144,17 @@ private:
     }
   };
 
+  struct OneShotCorrection {
+    bool active = false;
+    std::string transaction_id;
+    CorrectionPolicyMode mode = CorrectionPolicyMode::ndt;
+    std::string status = "idle";
+    std::string selected_source = "none";
+    std::string reason = "none";
+    int64_t started_steady_ns = 0;
+    int64_t completed_steady_ns = 0;
+  };
+
   // Shared 0.30 m / 3-frame / no-jump gate for NDT/VGICP and RTK while LIO is
   // the indoor primary observation. Neither source is fused every UKF frame.
   // RTK may additionally use trust_stable_source so a fixed, self-consistent
@@ -1192,10 +1225,35 @@ private:
     if (!msg) {
       return;
     }
-    std::lock_guard<std::mutex> lock(lio_odom_mutex_);
-    latest_lio_odom_ = *msg;
-    latest_lio_odom_stamp_ = rclcpp::Time(msg->header.stamp);
-    has_lio_odom_ = true;
+    const Eigen::Isometry3f next_pose = poseFromOdometry(*msg);
+    double translation_m = 0.0;
+    double rotation_rad = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+      if (has_anchor_prediction_lio_pose_) {
+        const Eigen::Isometry3f delta = anchor_prediction_lio_pose_.inverse() * next_pose;
+        translation_m = delta.translation().head<2>().norm();
+        rotation_rad = Eigen::Quaternionf::Identity().angularDistance(
+          Eigen::Quaternionf(delta.rotation()).normalized());
+      }
+      anchor_prediction_lio_pose_ = next_pose;
+      has_anchor_prediction_lio_pose_ = next_pose.matrix().allFinite();
+      latest_lio_odom_ = *msg;
+      latest_lio_odom_stamp_ = rclcpp::Time(msg->header.stamp);
+      has_lio_odom_ = true;
+      lio_pose_history_.push_back({latest_lio_odom_stamp_.nanoseconds(), next_pose});
+      const int64_t horizon = latest_lio_odom_stamp_.nanoseconds() -
+        static_cast<int64_t>(lio_pose_history_seconds_ * 1.0e9);
+      while (lio_pose_history_.size() > 2 && lio_pose_history_.front().stamp_ns < horizon) {
+        lio_pose_history_.pop_front();
+      }
+    }
+    if (translation_m > 0.0 || rotation_rad > 0.0) {
+      std::lock_guard<std::mutex> anchor_lock(anchor_ukf_mutex_);
+      anchor_ukf_.predict(
+        translation_m, rotation_rad,
+        bridge_translation_variance_per_m_, anchor_yaw_variance_per_rad_);
+    }
   }
 
   bool lioOdomFresh(const rclcpp::Time& stamp) const {
@@ -1211,7 +1269,7 @@ private:
   }
 
   void resetLioAnchor() {
-    lio_anchor_valid_ = false;
+    lio_anchor_valid_.store(false);
     lio_has_previous_pose_ = false;
     lio_stable_frame_count_ = 0;
     lio_corrected_this_frame_ = false;
@@ -1219,6 +1277,10 @@ private:
     lio_correction_cooldown_gate_.reset();
     ndt_drift_gate_.reset();
     rtk_drift_gate_.reset();
+    {
+      std::lock_guard<std::mutex> anchor_lock(anchor_ukf_mutex_);
+      anchor_ukf_.clear();
+    }
   }
 
   bool currentLioPose(
@@ -1257,6 +1319,59 @@ private:
     return pose.matrix().allFinite();
   }
 
+  bool lioPoseAt(const rclcpp::Time& stamp, Eigen::Isometry3f& pose) const {
+    std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+    if (lio_pose_history_.empty()) {
+      return false;
+    }
+    const int64_t target = stamp.nanoseconds();
+    if (target <= 0) {
+      pose = lio_pose_history_.back().pose;
+      return pose.matrix().allFinite();
+    }
+    auto upper = std::lower_bound(
+      lio_pose_history_.begin(), lio_pose_history_.end(), target,
+      [](const StampedLioPose& item, int64_t value) { return item.stamp_ns < value; });
+    if (upper == lio_pose_history_.begin()) {
+      if (std::fabs(static_cast<double>(upper->stamp_ns - target)) * 1.0e-9 >
+          lio_observation_sync_tolerance_s_) {
+        return false;
+      }
+      pose = upper->pose;
+      return pose.matrix().allFinite();
+    }
+    if (upper == lio_pose_history_.end()) {
+      const auto& latest = lio_pose_history_.back();
+      if (std::fabs(static_cast<double>(target - latest.stamp_ns)) * 1.0e-9 >
+          lio_observation_sync_tolerance_s_) {
+        return false;
+      }
+      pose = latest.pose;
+      return pose.matrix().allFinite();
+    }
+    const auto& after = *upper;
+    const auto& before = *std::prev(upper);
+    const double span = static_cast<double>(after.stamp_ns - before.stamp_ns);
+    if (span <= 0.0) {
+      pose = before.pose;
+      return pose.matrix().allFinite();
+    }
+    const double ratio = std::clamp(
+      static_cast<double>(target - before.stamp_ns) / span, 0.0, 1.0);
+    pose = Eigen::Isometry3f::Identity();
+    pose.translation() = before.pose.translation() + static_cast<float>(ratio) *
+      (after.pose.translation() - before.pose.translation());
+    Eigen::Quaternionf before_q(before.pose.rotation());
+    Eigen::Quaternionf after_q(after.pose.rotation());
+    before_q.normalize();
+    after_q.normalize();
+    if (before_q.coeffs().dot(after_q.coeffs()) < 0.0f) {
+      after_q.coeffs() *= -1.0f;
+    }
+    pose.linear() = before_q.slerp(static_cast<float>(ratio), after_q).normalized().toRotationMatrix();
+    return pose.matrix().allFinite();
+  }
+
   void reanchorLioToUkf() {
     Eigen::Isometry3f T_lio = Eigen::Isometry3f::Identity();
     rclcpp::Time odom_stamp{0, 0, RCL_ROS_TIME};
@@ -1265,11 +1380,80 @@ private:
       resetLioAnchor();
       return;
     }
-    lio_map_T_lio_ = Eigen::Isometry3f(pose_estimator->matrix()) * T_lio.inverse();
+    const Eigen::Isometry3f anchor =
+      Eigen::Isometry3f(pose_estimator->matrix()) * T_lio.inverse();
+    {
+      std::lock_guard<std::mutex> anchor_lock(lio_anchor_mutex_);
+      lio_map_T_lio_ = anchor;
+    }
     previous_lio_pose_ = T_lio;
     previous_lio_pose_stamp_ = odom_stamp;
-    lio_anchor_valid_ = lio_map_T_lio_.matrix().allFinite();
-    lio_has_previous_pose_ = lio_anchor_valid_;
+    lio_anchor_valid_.store(anchor.matrix().allFinite());
+    lio_has_previous_pose_ = lio_anchor_valid_.load();
+    if (lio_anchor_valid_.load()) {
+      const double yaw = std::atan2(anchor.rotation()(1, 0), anchor.rotation()(0, 0));
+      std::lock_guard<std::mutex> anchor_filter_lock(anchor_ukf_mutex_);
+      anchor_ukf_.reset(
+        Eigen::Vector3d(anchor.translation().x(), anchor.translation().y(), yaw),
+        Eigen::Vector3d(
+          lio_correct_xy_variance_, lio_correct_xy_variance_,
+          lio_correct_orientation_variance_));
+    }
+  }
+
+  Eigen::Isometry3f mapToLioAnchorSnapshot() const {
+    std::lock_guard<std::mutex> lock(lio_anchor_mutex_);
+    return lio_map_T_lio_;
+  }
+
+  Eigen::Isometry3f fusePlanarAnchorObservation(
+      const Eigen::Isometry3f& measured_map_T_lio,
+      const CorrectionNoise& noise,
+      const char* source) {
+    const Eigen::Isometry3f current = mapToLioAnchorSnapshot();
+    const double measured_yaw = std::atan2(
+      measured_map_T_lio.rotation()(1, 0), measured_map_T_lio.rotation()(0, 0));
+    AnchorObservation observation;
+    observation.value = Eigen::Vector3d(
+      measured_map_T_lio.translation().x(), measured_map_T_lio.translation().y(),
+      measured_yaw);
+    observation.variance = Eigen::Vector3d(
+      std::max(1.0e-9f, noise.horizontal_variance),
+      std::max(1.0e-9f, noise.horizontal_variance),
+      std::max(1.0e-9f, noise.orientation_variance));
+    observation.source = source ? source : "unknown";
+
+    Eigen::Vector3d fused;
+    {
+      std::lock_guard<std::mutex> lock(anchor_ukf_mutex_);
+      if (!anchor_ukf_.initialized()) {
+        const double current_yaw = std::atan2(
+          current.rotation()(1, 0), current.rotation()(0, 0));
+        anchor_ukf_.reset(
+          Eigen::Vector3d(current.translation().x(), current.translation().y(), current_yaw),
+          Eigen::Vector3d(
+            lio_correct_xy_variance_, lio_correct_xy_variance_,
+            lio_correct_orientation_variance_));
+      }
+      const AnchorUpdateResult update = anchor_ukf_.update(observation);
+      if (!update.accepted) {
+        return current;
+      }
+      last_anchor_innovation_ = update.innovation;
+      last_anchor_gain_ = update.gain;
+      last_anchor_observation_source_ = observation.source;
+      fused = anchor_ukf_.value();
+    }
+
+    Eigen::Isometry3f target = current;
+    target.translation().x() = static_cast<float>(fused.x());
+    target.translation().y() = static_cast<float>(fused.y());
+    const float current_yaw = std::atan2(current.rotation()(1, 0), current.rotation()(0, 0));
+    const float yaw_delta = static_cast<float>(wrapAnchorYaw(fused.z() - current_yaw));
+    target.linear() =
+      Eigen::AngleAxisf(yaw_delta, Eigen::Vector3f::UnitZ()).toRotationMatrix() *
+      current.rotation();
+    return target;
   }
 
   bool rtkPositionGoodForNavigation(const RtkObservation& observation) const {
@@ -1302,21 +1486,6 @@ private:
 
   void latchLioMotionAnomaly(const LioMotionGuardResult& result) {
     if (lio_motion_anomaly_active_) {
-      return;
-    }
-    const RtkObservation rtk = currentRtkObservation(get_clock()->now());
-    if (withinRtkPrimaryHandoffSuppress() || rtkPositionGoodForNavigation(rtk)) {
-      // Outdoor fixed RTK XY can re-anchor LIO. Freezing the pose on a yaw-step
-      // during dual-antenna flicker cancels Nav2 while GPS is still centimetre-grade.
-      RCLCPP_WARN(
-        get_logger(),
-        "Rejecting FAST-LIO frame (%s yaw_step=%.1fdeg) without latching anomaly; "
-        "RTK XY fixed=%s handoff_suppress=%s",
-        result.reason.c_str(),
-        result.yaw_step_rad * 180.0 / M_PI,
-        rtkPositionGoodForNavigation(rtk) ? "yes" : "no",
-        withinRtkPrimaryHandoffSuppress() ? "yes" : "no");
-      resetLioAnchor();
       return;
     }
     lio_motion_anomaly_active_ = true;
@@ -1411,23 +1580,26 @@ private:
       float rotation_rate_radps = -1.0f,
       bool bypass_cooldown = false) {
     const std::int64_t steady_now_ns = steadyNowNanoseconds();
-    if (!lio_anchor_valid_ || pending_lio_correction_.active ||
+    if (!lio_anchor_valid_.load() || pending_lio_correction_.active ||
         (!bypass_cooldown && !lio_correction_cooldown_gate_.canStart(steady_now_ns)) ||
         !target_map_T_base.matrix().allFinite()) {
       return false;
     }
     Eigen::Isometry3f current_lio_T_base = Eigen::Isometry3f::Identity();
-    if (!currentLioPose(current_lio_T_base)) {
+    if (!lioPoseAt(stamp, current_lio_T_base)) {
+      return false;
+    }
+    const Eigen::Isometry3f measured_map_T_lio =
+      target_map_T_base * current_lio_T_base.inverse();
+    if (!measured_map_T_lio.matrix().allFinite()) {
       return false;
     }
     const Eigen::Isometry3f target_map_T_lio =
-      target_map_T_base * current_lio_T_base.inverse();
-    if (!target_map_T_lio.matrix().allFinite()) {
-      return false;
-    }
+      fusePlanarAnchorObservation(measured_map_T_lio, noise, source);
+    const Eigen::Isometry3f current_map_T_lio = mapToLioAnchorSnapshot();
     const Eigen::Vector3f translation_delta =
-      target_map_T_lio.translation() - lio_map_T_lio_.translation();
-    Eigen::Quaternionf current_orientation(lio_map_T_lio_.rotation());
+      target_map_T_lio.translation() - current_map_T_lio.translation();
+    Eigen::Quaternionf current_orientation(current_map_T_lio.rotation());
     Eigen::Quaternionf target_orientation(target_map_T_lio.rotation());
     current_orientation.normalize();
     target_orientation.normalize();
@@ -1458,7 +1630,7 @@ private:
   }
 
   bool advancePendingLioCorrection(const rclcpp::Time& stamp) {
-    if (!pending_lio_correction_.active || !lio_anchor_valid_) {
+    if (!pending_lio_correction_.active || !lio_anchor_valid_.load()) {
       return false;
     }
     double dt = 0.10;
@@ -1472,6 +1644,7 @@ private:
     dt = std::clamp(dt, 0.02, 0.25);
     pending_lio_correction_.last_update_stamp_ns = stamp.nanoseconds();
 
+    std::lock_guard<std::mutex> anchor_lock(lio_anchor_mutex_);
     const Eigen::Vector3f current_translation = lio_map_T_lio_.translation();
     const Eigen::Vector3f target_translation =
       pending_lio_correction_.target_map_T_lio.translation();
@@ -1525,6 +1698,12 @@ private:
       pending_lio_correction_.active = false;
       last_correction_completed_steady_ns_ = steadyNowNanoseconds();
       lio_correction_cooldown_gate_.markCompleted(last_correction_completed_steady_ns_);
+      if (one_shot_correction_.active && one_shot_correction_.status == "smoothing") {
+        one_shot_correction_.active = false;
+        one_shot_correction_.status = "completed";
+        one_shot_correction_.reason = "anchor_update_completed";
+        one_shot_correction_.completed_steady_ns = last_correction_completed_steady_ns_;
+      }
     }
     // The current frame contains part of the queued global correction even if
     // this step completed it. Its dynamic covariance must still be applied.
@@ -1571,9 +1750,9 @@ private:
         return false;
       }
     }
-    if (!lio_anchor_valid_) {
+    if (!lio_anchor_valid_.load()) {
       reanchorLioToUkf();
-      if (!lio_anchor_valid_) {
+      if (!lio_anchor_valid_.load()) {
         return false;
       }
       RCLCPP_INFO(get_logger(),
@@ -1589,7 +1768,7 @@ private:
       orientation_variance = std::max(
         orientation_variance, pending_lio_correction_.noise.orientation_variance);
     }
-    const Eigen::Isometry3f T_map = lio_map_T_lio_ * T_lio;
+    const Eigen::Isometry3f T_map = mapToLioAnchorSnapshot() * T_lio;
     if (!T_map.matrix().allFinite()) {
       resetLioAnchor();
       return false;
@@ -1670,7 +1849,8 @@ private:
       float residual_yaw,
       int64_t sample_stamp_ns,
       bool trust_stable_source = false,
-      bool ignore_lio_residual_cap = false) {
+      bool ignore_lio_residual_cap = false,
+      bool force_correction = false) {
     if (sample_stamp_ns != 0 && sample_stamp_ns == gate.last_stamp_ns) {
       if (gate.consecutive > 0 && gate.consecutive < lio_drift_hysteresis_frames_) {
         return AuxiliaryGateStatus::pending;
@@ -1757,7 +1937,7 @@ private:
       }
     }
 
-    if (!drifted) {
+    if (!drifted && !force_correction) {
       gate.resetConsecutive();
       if (residual_xy <= lio_rearm_xy_m_ &&
           residual_yaw <= 0.5f * lio_drift_yaw_rad_) {
@@ -1767,14 +1947,9 @@ private:
       return AuxiliaryGateStatus::reject;
     }
 
-    // Fixed RTK may re-correct after a prior latch whenever LIO drifts again.
-    // The latch still blocks one-shot NDT/VGICP absolute corrections.
-    if (gate.correction_latched && !trust_stable_source && !ignore_lio_residual_cap) {
+    if (gate.correction_latched && !force_correction) {
       gate.last_decision = "single_correction_latched";
       return AuxiliaryGateStatus::reject;
-    }
-    if (gate.correction_latched && (trust_stable_source || ignore_lio_residual_cap)) {
-      gate.correction_latched = false;
     }
 
     // Large LIO↔RTK residual may only be applied after the RTK stream itself
@@ -1829,7 +2004,8 @@ private:
   }
 
   bool maybeCorrectLioDrift(
-      const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp) {
+      const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp,
+      bool force_correction = false) {
     lio_corrected_this_frame_ = false;
     if (!pose_estimator || pending_lio_correction_.active ||
         !match.is_converged_ || !match.transform_.allFinite() ||
@@ -1864,12 +2040,12 @@ private:
         drift_yaw * 180.0 / M_PI,
         lio_max_correction_yaw_rad_ * 180.0 / M_PI);
     }
-    const bool drifted = drift_xy >= lio_drift_xy_m_ ||
+    const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       ndt_drift_gate_, "NDT/VGICP", true, drifted, ndt_position,
       correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
-      stamp.nanoseconds());
+      stamp.nanoseconds(), false, false, force_correction);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "LIO/map drift pending correction: xy=%.3fm yaw=%.1fdeg frames=%d/%d score=%.3f",
@@ -1891,7 +2067,8 @@ private:
       noise.orientation_variance = lio_orientation_variance_;
     }
     if (!scheduleLioAnchorCorrection(
-          target_map_T_base, noise, "NDT/VGICP", stamp)) {
+          target_map_T_base, noise, "NDT/VGICP", stamp,
+          -1.0f, -1.0f, force_correction)) {
       ndt_drift_gate_.resetConsecutive();
       ndt_drift_gate_.last_decision = "correction_schedule_rejected";
       return false;
@@ -1899,6 +2076,11 @@ private:
     ndt_drift_gate_.markCorrected();
     rtk_drift_gate_.resetConsecutive();
     lio_corrected_this_frame_ = true;
+    if (force_correction && one_shot_correction_.active) {
+      one_shot_correction_.status = "smoothing";
+      one_shot_correction_.selected_source = "ndt_vgicp";
+      one_shot_correction_.reason = "accepted_ndt_anchor_observation";
+    }
     RCLCPP_WARN(get_logger(),
       "NDT/VGICP queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg score=%.3f "
       "inlier=%.3f Rxy=%.4f Ryaw=%.5f method=%s heading=%s",
@@ -1909,7 +2091,8 @@ private:
     return true;
   }
 
-  bool maybeCorrectRtkDrift(const RtkObservation& observation) {
+  bool maybeCorrectRtkDrift(
+      const RtkObservation& observation, bool force_correction = false) {
     if (observation.stamp_ns <= 0 ||
         observation.stamp_ns == last_rtk_aux_observation_stamp_ns_) {
       return false;
@@ -1932,11 +2115,16 @@ private:
     }
     const bool rtk_self_stable = quality_ok && updateRtkSelfStability(
       rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
-    // Lost/stationary recovery still requires the 1s no-drift window.
-    // During navigation, a fixed RTK solution is trusted immediately for pose
-    // regulation (instantaneous RTK jumps are still rejected above).
     const bool trust_rtk = rtk_self_stable ||
-      (motion_phase_ == "moving" && quality_ok);
+      (!force_correction && motion_phase_ == "moving" && quality_ok);
+    if (force_correction && quality_ok && !rtk_self_stable) {
+      rtk_drift_gate_.last_decision = "awaiting_rtk_self_stable";
+      if (force_correction && one_shot_correction_.active) {
+        one_shot_correction_.status = "waiting_source";
+        one_shot_correction_.reason = "waiting_for_fixed_rtk_stability_window";
+      }
+      return false;
+    }
     if (!pose_estimator || lio_corrected_this_frame_ ||
         pending_lio_correction_.active) {
       if (lio_corrected_this_frame_) {
@@ -1974,7 +2162,7 @@ private:
         drift_yaw * 180.0 / M_PI,
         lio_max_correction_yaw_rad_ * 180.0 / M_PI);
     }
-    const bool drifted = drift_xy >= lio_drift_xy_m_ ||
+    const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const Eigen::Vector2f correction_xy =
       rtk_position.head<2>() - ukf_position.head<2>();
@@ -1983,7 +2171,8 @@ private:
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       rtk_drift_gate_, "RTK", quality_ok, drifted, rtk_position,
       correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
-      observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/quality_ok);
+      observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/quality_ok,
+      force_correction);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "LIO/RTK drift pending correction: xy=%.3fm yaw=%.1fdeg frames=%d/%d "
@@ -2022,7 +2211,8 @@ private:
     if (!scheduleLioAnchorCorrection(
           target_map_T_base, noise, "RTK",
           timeOnStampClock(observation.stamp_ns, get_clock()->now()),
-          translation_rate, rotation_rate, /*bypass_cooldown=*/trust_rtk)) {
+          translation_rate, rotation_rate,
+          /*bypass_cooldown=*/trust_rtk || force_correction)) {
       rtk_drift_gate_.resetConsecutive();
       rtk_drift_gate_.last_decision = "correction_schedule_rejected";
       return false;
@@ -2031,6 +2221,11 @@ private:
     ndt_drift_gate_.resetConsecutive();
     rtk_position_fused_this_frame_ = true;
     lio_corrected_this_frame_ = true;
+    if (force_correction && one_shot_correction_.active) {
+      one_shot_correction_.status = "smoothing";
+      one_shot_correction_.selected_source = "rtk";
+      one_shot_correction_.reason = "accepted_fixed_rtk_anchor_observation";
+    }
     last_rtk_map_position_ = rtk_position;
     RCLCPP_WARN(get_logger(),
       "RTK queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg quality=%s "
@@ -2104,6 +2299,7 @@ private:
     // keeps future callers from accidentally scheduling a stale or partial
     // RTK sample while the robot is at a waypoint.
     return observation.usable && observation.quality == "fixed" &&
+      observation.heading_usable &&
       observation.position.allFinite() &&
       std::isfinite(observation.horizontal_std_m) &&
       observation.horizontal_std_m <= gnss_max_horizontal_std_ &&
@@ -2119,56 +2315,29 @@ private:
     const bool ndt_fresh = last_ndt_healthy_ && last_ndt_update_time_.nanoseconds() > 0 &&
       std::fabs((stamp - last_ndt_update_time_).seconds()) <= 1.0;
     const bool rtk_ready = rtkCorrectionQualityOk(observation);
-    policy_source_ready_ = preferred_correction_mode_ == CorrectionPolicyMode::ndt
+    const bool force_correction = one_shot_correction_.active;
+    const CorrectionPolicyMode effective_mode = force_correction
+      ? one_shot_correction_.mode : preferred_correction_mode_;
+    policy_source_ready_ = effective_mode == CorrectionPolicyMode::ndt
       ? ndt_fresh
-      : preferred_correction_mode_ == CorrectionPolicyMode::rtk
+      : effective_mode == CorrectionPolicyMode::rtk
         ? rtk_ready
         : (ndt_fresh || rtk_ready);
 
-    if (!lio_anchor_valid_ || pending_lio_correction_.active) {
+    if (!lio_anchor_valid_.load() || pending_lio_correction_.active) {
       last_correction_candidate_source_ = "none";
       last_correction_selection_reason_ = pending_lio_correction_.active
         ? "correction_already_active" : "lio_anchor_unavailable";
       return;
     }
 
-    // UKF mode samples both auxiliary sources on the same NDT scheduling
-    // cycle. This gives both sources the same three-frame evidence cadence and
-    // prevents a faster RTK topic from winning solely because of its rate.
-    if (preferred_correction_mode_ == CorrectionPolicyMode::ukf && !match) {
-      return;
-    }
-
     CorrectionCandidateSummary ndt;
-    if (match && correctionPolicyAllowsNdt(preferred_correction_mode_)) {
+    if (match && correctionPolicyAllowsNdt(effective_mode)) {
       ndt = ndtCorrectionCandidate(*match, ndt_quality_ok, stamp);
     }
     CorrectionCandidateSummary rtk;
-    if (correctionPolicyAllowsRtk(preferred_correction_mode_)) {
+    if (correctionPolicyAllowsRtk(effective_mode)) {
       rtk = rtkCorrectionCandidate(observation);
-    }
-
-    if (preferred_correction_mode_ == CorrectionPolicyMode::ukf &&
-        ndt.eligible && rtk.eligible && !prefer_fixed_rtk_for_correction_) {
-      const auto conflict_check = selectCorrectionSource(
-        preferred_correction_mode_, ndt, rtk,
-        lio_drift_xy_m_, lio_drift_yaw_rad_,
-        lio_drift_xy_m_, lio_drift_yaw_rad_,
-        prefer_fixed_rtk_for_correction_);
-      if (conflict_check.source == CorrectionSource::conflict) {
-        ndt_drift_gate_.resetConsecutive();
-        rtk_drift_gate_.resetConsecutive();
-        ndt_drift_gate_.last_decision = "ukf_source_conflict";
-        rtk_drift_gate_.last_decision = "ukf_source_conflict";
-        policy_source_ready_ = false;
-        last_correction_candidate_source_ = "conflict";
-        last_correction_selection_reason_ = conflict_check.reason;
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "UKF auxiliary conflict: NDT/VGICP and RTK differ by more than %.2fm or %.1fdeg",
-          lio_drift_xy_m_, lio_drift_yaw_rad_ * 180.0 / M_PI);
-        return;
-      }
     }
 
     const bool ndt_drifted = ndt.eligible &&
@@ -2179,17 +2348,19 @@ private:
 
     // Low-drift observations still pass through the existing gate so a prior
     // one-shot correction can re-arm only after returning to the safe band.
-    if (ndt.eligible && !ndt_drifted) {
+    if (ndt.eligible && !ndt_drifted && !force_correction) {
       maybeCorrectLioDrift(*match, stamp);
     }
-    if (rtk.eligible && !rtk_drifted) {
+    if (rtk.eligible && !rtk_drifted && !force_correction) {
       maybeCorrectRtkDrift(observation);
     }
 
-    ndt.eligible = ndt_drifted;
-    rtk.eligible = rtk_drifted;
+    ndt.eligible = ndt.eligible && (force_correction || ndt_drifted) &&
+      (force_correction || !ndt_drift_gate_.correction_latched);
+    rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
+      (force_correction || !rtk_drift_gate_.correction_latched);
     const CorrectionSelection selection = selectCorrectionSource(
-      preferred_correction_mode_, ndt, rtk,
+      effective_mode, ndt, rtk,
       lio_drift_xy_m_, lio_drift_yaw_rad_,
       lio_drift_xy_m_, lio_drift_yaw_rad_,
       prefer_fixed_rtk_for_correction_);
@@ -2199,10 +2370,10 @@ private:
     bool corrected = false;
     if (selection.source == CorrectionSource::ndt && match) {
       rtk_drift_gate_.resetConsecutive();
-      corrected = maybeCorrectLioDrift(*match, stamp);
+      corrected = maybeCorrectLioDrift(*match, stamp, force_correction);
     } else if (selection.source == CorrectionSource::rtk) {
       ndt_drift_gate_.resetConsecutive();
-      corrected = maybeCorrectRtkDrift(observation);
+      corrected = maybeCorrectRtkDrift(observation, force_correction);
     } else {
       if (match && !ndt_quality_ok) {
         ndt_drift_gate_.resetConsecutive();
@@ -2212,16 +2383,103 @@ private:
         rtk_drift_gate_.resetConsecutive();
         rtk_drift_gate_.last_decision = "quality_rejected";
       }
+      if (force_correction) {
+        one_shot_correction_.status = "waiting_source";
+        one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
+      }
     }
     if (corrected) {
-      // One accepted auxiliary correction closes the epoch for both sources.
-      // Each source must independently return to the re-arm band before a new
-      // NDT/RTK correction can be considered.
-      ndt_drift_gate_.correction_latched = true;
-      rtk_drift_gate_.correction_latched = true;
+      // Each source owns its own drift-episode latch. In UKF mode this lets a
+      // second independently valid source update the same anchor on a later
+      // low-rate cycle; the anchor covariance provides the adaptive blend.
       ndt_drift_gate_.resetConsecutive();
       rtk_drift_gate_.resetConsecutive();
     }
+  }
+
+  void control_localization_correction_callback(
+      const std::shared_ptr<robots_dog_msgs::srv::ControlLocalizationCorrection::Request> request,
+      std::shared_ptr<robots_dog_msgs::srv::ControlLocalizationCorrection::Response> response) {
+    std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+    response->transaction_id = request ? request->transaction_id : "";
+    if (!request || request->transaction_id.empty()) {
+      response->accepted = false;
+      response->status = "failed";
+      response->message = "transaction_id is required";
+      return;
+    }
+    using Request = robots_dog_msgs::srv::ControlLocalizationCorrection::Request;
+    if (request->command == Request::COMMAND_CANCEL) {
+      if (one_shot_correction_.transaction_id != request->transaction_id) {
+        response->accepted = false;
+        response->status = "not_found";
+        response->message = "correction transaction does not exist";
+        return;
+      }
+      one_shot_correction_.active = false;
+      one_shot_correction_.status = "cancelled";
+      one_shot_correction_.reason = "cancelled_by_owner";
+      if (pending_lio_correction_.active) {
+        pending_lio_correction_.reset();
+        const Eigen::Isometry3f current_anchor = mapToLioAnchorSnapshot();
+        const double current_yaw = std::atan2(
+          current_anchor.rotation()(1, 0), current_anchor.rotation()(0, 0));
+        std::lock_guard<std::mutex> anchor_filter_lock(anchor_ukf_mutex_);
+        anchor_ukf_.reset(
+          Eigen::Vector3d(
+            current_anchor.translation().x(), current_anchor.translation().y(), current_yaw),
+          Eigen::Vector3d(
+            lio_correct_xy_variance_, lio_correct_xy_variance_,
+            lio_correct_orientation_variance_));
+      }
+      response->accepted = true;
+      response->status = one_shot_correction_.status;
+      response->message = "correction transaction cancelled";
+      return;
+    }
+    if (request->command != Request::COMMAND_START) {
+      response->accepted = false;
+      response->status = "failed";
+      response->message = "unsupported correction command";
+      return;
+    }
+    if (one_shot_correction_.transaction_id == request->transaction_id) {
+      response->accepted = true;
+      response->status = one_shot_correction_.status;
+      response->message = "idempotent correction transaction replay";
+      return;
+    }
+    if (one_shot_correction_.active || pending_lio_correction_.active) {
+      response->accepted = false;
+      response->status = "busy";
+      response->message = "another correction transaction is active";
+      return;
+    }
+    CorrectionPolicyMode mode;
+    if (request->mode == Request::MODE_NDT) {
+      mode = CorrectionPolicyMode::ndt;
+    } else if (request->mode == Request::MODE_RTK) {
+      mode = CorrectionPolicyMode::rtk;
+    } else if (request->mode == Request::MODE_UKF) {
+      mode = CorrectionPolicyMode::ukf;
+    } else {
+      response->accepted = false;
+      response->status = "failed";
+      response->message = "mode must be NDT, RTK, or UKF";
+      return;
+    }
+    one_shot_correction_ = OneShotCorrection{};
+    one_shot_correction_.active = true;
+    one_shot_correction_.transaction_id = request->transaction_id;
+    one_shot_correction_.mode = mode;
+    one_shot_correction_.status = "waiting_source";
+    one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
+    one_shot_correction_.started_steady_ns = steadyNowNanoseconds();
+    ndt_drift_gate_.reset();
+    rtk_drift_gate_.reset();
+    response->accepted = true;
+    response->status = one_shot_correction_.status;
+    response->message = "one-shot correction transaction started";
   }
 
   void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
@@ -2596,12 +2854,27 @@ private:
       rtk.orientation.toRotationMatrix()(0, 0));
     const bool rtk_heading_available = rtk_position_available && rtk.heading_usable &&
       std::isfinite(rtk_map_yaw);
+    Eigen::Vector3d anchor_covariance = Eigen::Vector3d::Zero();
+    Eigen::Vector3d anchor_innovation = Eigen::Vector3d::Zero();
+    Eigen::Vector3d anchor_gain = Eigen::Vector3d::Zero();
+    std::string anchor_observation_source = "none";
+    bool anchor_filter_initialized = false;
+    {
+      std::lock_guard<std::mutex> lock(anchor_ukf_mutex_);
+      anchor_filter_initialized = anchor_ukf_.initialized();
+      if (anchor_filter_initialized) {
+        anchor_covariance = anchor_ukf_.covariance().diagonal();
+      }
+      anchor_innovation = last_anchor_innovation_;
+      anchor_gain = last_anchor_gain_;
+      anchor_observation_source = last_anchor_observation_source_;
+    }
     Eigen::Vector3f lio_map_position = Eigen::Vector3f::Zero();
     bool lio_map_position_available = false;
-    if (lio_anchor_valid_) {
+    if (lio_anchor_valid_.load()) {
       Eigen::Isometry3f lio_T_base = Eigen::Isometry3f::Identity();
       if (currentLioPose(lio_T_base)) {
-        const Eigen::Isometry3f map_T_base = lio_map_T_lio_ * lio_T_base;
+        const Eigen::Isometry3f map_T_base = mapToLioAnchorSnapshot() * lio_T_base;
         if (map_T_base.matrix().allFinite()) {
           lio_map_position = map_T_base.translation();
           lio_map_position_available = true;
@@ -2652,7 +2925,26 @@ private:
         << "\",\"policy_source_ready\":" << (policy_source_ready_ ? "true" : "false")
         << ",\"correction_candidate_source\":\"" << last_correction_candidate_source_
         << "\",\"correction_selection_reason\":\"" << last_correction_selection_reason_
-        << "\",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
+        << "\",\"anchor_filter\":{\"initialized\":"
+        << (anchor_filter_initialized ? "true" : "false")
+        << ",\"source\":\"" << anchor_observation_source
+        << "\",\"variance_x\":" << anchor_covariance.x()
+        << ",\"variance_y\":" << anchor_covariance.y()
+        << ",\"variance_yaw\":" << anchor_covariance.z()
+        << ",\"innovation_x\":" << anchor_innovation.x()
+        << ",\"innovation_y\":" << anchor_innovation.y()
+        << ",\"innovation_yaw\":" << anchor_innovation.z()
+        << ",\"gain_x\":" << anchor_gain.x()
+        << ",\"gain_y\":" << anchor_gain.y()
+        << ",\"gain_yaw\":" << anchor_gain.z() << "}"
+        << ",\"one_shot_correction\":{\"active\":"
+        << (one_shot_correction_.active ? "true" : "false")
+        << ",\"transaction_id\":\"" << one_shot_correction_.transaction_id
+        << "\",\"mode\":\"" << correctionPolicyModeName(one_shot_correction_.mode)
+        << "\",\"status\":\"" << one_shot_correction_.status
+        << "\",\"selected_source\":\"" << one_shot_correction_.selected_source
+        << "\",\"reason\":\"" << one_shot_correction_.reason << "\"}"
+        << ",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
         << ",\"rtk_good_for_navigation\":" << (rtkGoodForNavigation(rtk) ? "true" : "false")
         << ",\"rtk_position_good_for_navigation\":"
         << (rtkPositionGoodForNavigation(rtk) ? "true" : "false")
@@ -2664,7 +2956,7 @@ private:
         << ((enable_lio_primary_ && !rtk_auto_primary_latched_) ? "true" : "false")
         << ",\"lio_healthy\":"
         << (lioOdomFresh(stamp) && !lio_motion_anomaly_active_ ? "true" : "false")
-        << ",\"lio_anchored\":" << (lio_anchor_valid_ ? "true" : "false")
+        << ",\"lio_anchored\":" << (lio_anchor_valid_.load() ? "true" : "false")
         << ",\"lio_motion_anomaly\":" << (lio_motion_anomaly_active_ ? "true" : "false")
         << ",\"lio_motion_anomaly_reason\":\"" << lio_motion_anomaly_reason_ << "\""
         << ",\"lio_yaw_step_deg\":" << lio_motion_anomaly_yaw_step_rad_ * 180.0 / M_PI
@@ -3060,7 +3352,7 @@ private:
         prefer_fixed_rtk_ ? "absolute seed pending RTK-primary promotion" : "absolute seed (LIO remains continuous)",
         reason, last_init_pos_.x(), last_init_pos_.y(), seeded_yaw * 180.0 / M_PI,
         rtk.heading_usable ? "rtk" : "missing",
-        lio_anchor_valid_ ? "aligned" : "pending");
+        lio_anchor_valid_.load() ? "aligned" : "pending");
       return true;
     }
     has_trusted_ndt_pose_ = false;
@@ -3791,14 +4083,7 @@ private:
     // make a centimetre-grade fix look stale (|lidar-gnss| > max_age), unlatch
     // skip, run open-sky NDT, and pause the patrol task.
     updateRtkAutoPrimary(currentRtkObservation(latestGnssStamp(frame_stamp)), frame_stamp);
-    // Only a latched fixed-RTK + heading solution pauses LiDAR matching.
-    // A route waypoint that merely prefers rtk, or a float/usable position
-    // without a valid heading, must keep NDT available as the fallback.
-    const bool rtk_primary = rtkPrimaryShouldDrive(
-      source_arbiter_enable_, bridge_active_, rtk_auto_primary_latched_);
-    if (rtk_primary) {
-      resetLioAnchor();
-    }
+    const bool rtk_primary = false;
     const bool lio_primary = enable_lio_primary_ && is_init_success_ &&
       has_trusted_ndt_pose_ && !rtk_primary && !bridge_active_ &&
       !lio_motion_anomaly_active_ &&
@@ -3821,17 +4106,9 @@ private:
     // Obstacle extraction remains on the independent 10 Hz laser scan chain.
     // Scan matching is reduced to 2 Hz while moving and restored to every
     // LiDAR frame while stationary or during initialization.
-    // Outdoor fixed RTK already provides absolute XY (and trusted heading when
-    // self-stable). Running NDT+VGICP every few frames while LIO is stable
-    // burns ~0.5s/callback and can fight the RTK seed with a wrong yaw.
-    // Keep matching for init/recovery and when RTK is not fixed.
-    const bool outdoor_rtk_fixed =
-      rtk_observation.usable && rtk_observation.quality == "fixed";
-    const bool skip_match_for_outdoor_rtk =
-      enable_lio_primary_ && outdoor_rtk_fixed && is_init_success_ &&
-      schedule_input.lio_stable;
-    const bool run_ndt =
-      work_decision.run_ndt && !rtk_primary && !skip_match_for_outdoor_rtk;
+    // NDT remains the low-rate map-consistency observation even when RTK is
+    // fixed. RTK never pauses FAST-LIO or suppresses this independent check.
+    const bool run_ndt = work_decision.run_ndt && !rtk_primary;
     perf.run_ndt = run_ndt;
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
     std::optional<PoseEstimator::MatchResult> current_match_result;
@@ -3911,14 +4188,7 @@ private:
       // A stale FAST-LIO stream is a localization outage, not permission for
       // NDT or RTK to become a second continuous odometry source. Keep scan
       // matching alive for diagnostics/relocalization, but do not drive UKF.
-      if (lio_motion_anomaly_active_) {
-        active_source_ = "unavailable";
-      } else if (startBridge(rclcpp::Time(stamp))) {
-        bridge_pose_valid = !has_odom_delta || applyBridgeDelta(
-          odom_delta, odom_delta_dt_s, odom_time_monotonic, rclcpp::Time(stamp));
-      } else {
-        active_source_ = "unavailable";
-      }
+      active_source_ = "unavailable";
     } else if (last_ndt_healthy_) {
       absolute_pose_valid = true;
       active_source_ = "ndt_imu";
@@ -5529,6 +5799,23 @@ private:
             return;
         }  
 
+        // FAST-LIO is the only continuous motion source. Publish every timer
+        // tick from the latest local pose and the slowly changing map->lio
+        // anchor, independently of the lower-rate NDT point-cloud callback.
+        if (enable_lio_primary_ && lio_anchor_valid_.load() &&
+            !lio_motion_anomaly_active_) {
+            const rclcpp::Time now = this->get_clock()->now();
+            Eigen::Isometry3f lio_pose = Eigen::Isometry3f::Identity();
+            if (lioOdomFresh(now) && currentLioPose(lio_pose)) {
+                const Eigen::Matrix4f map_pose =
+                    (mapToLioAnchorSnapshot() * lio_pose).matrix();
+                publish_odometry(now, map_pose);
+                active_source_ = "lio_imu";
+                return;
+            }
+            active_source_ = "unavailable";
+        }
+
         if (is_extrapolating_) {
             if (has_valid_pose_history_) {
                 // A matching failure is different from missing sensor data: keep
@@ -5786,6 +6073,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              rtk_initial_pose_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              global_relocalize_service_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr                                reinitialize_global_localization_service_;
+  rclcpp::Service<robots_dog_msgs::srv::ControlLocalizationCorrection>::SharedPtr control_localization_correction_service_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
 
@@ -5881,6 +6169,7 @@ private:
   double bridge_max_horizontal_sigma_m_ = 0.8;
   double bridge_max_yaw_sigma_rad_ = 15.0 * M_PI / 180.0;
   double bridge_translation_variance_per_m_ = 0.0025;
+  double anchor_yaw_variance_per_rad_ = 0.01;
   double bridge_max_odom_speed_mps_ = 1.5;
   double bridge_max_odom_yaw_rate_rps_ = 2.0;
   int absolute_recovery_samples_ = 3;
@@ -6066,13 +6355,13 @@ private:
   float lio_suppressed_covariance_scale_ = 100.0f;
   float lio_max_correction_jump_m_ = 1.50f;
   float lio_max_correction_yaw_rad_ = 30.0f * static_cast<float>(M_PI) / 180.0f;
-  double rtk_trust_stable_window_s_ = 3.0;
+  double rtk_trust_stable_window_s_ = 1.0;
   float rtk_trust_stable_span_m_ = 0.35f;
   float rtk_trusted_correction_translation_rate_mps_ = 1.0f;
   float rtk_trusted_correction_rotation_rate_radps_ =
     30.0f * static_cast<float>(M_PI) / 180.0f;
   bool rtk_self_stable_ = false;
-  bool prefer_fixed_rtk_for_correction_ = true;
+  bool prefer_fixed_rtk_for_correction_ = false;
   std::deque<RtkStabilitySample> rtk_stability_window_;
   float lio_correct_xy_variance_ = 0.010f;
   float lio_correct_z_variance_ = 0.020f;
@@ -6095,11 +6384,20 @@ private:
   std::int64_t last_correction_started_steady_ns_ = 0;
   std::int64_t last_correction_completed_steady_ns_ = 0;
   std::string last_correction_source_ = "none";
+  struct StampedLioPose {
+    int64_t stamp_ns = 0;
+    Eigen::Isometry3f pose = Eigen::Isometry3f::Identity();
+  };
   mutable std::mutex lio_odom_mutex_;
   nav_msgs::msg::Odometry latest_lio_odom_;
   rclcpp::Time latest_lio_odom_stamp_{0, 0, RCL_ROS_TIME};
   bool has_lio_odom_ = false;
-  bool lio_anchor_valid_ = false;
+  std::deque<StampedLioPose> lio_pose_history_;
+  double lio_pose_history_seconds_ = 2.0;
+  double lio_observation_sync_tolerance_s_ = 0.20;
+  Eigen::Isometry3f anchor_prediction_lio_pose_ = Eigen::Isometry3f::Identity();
+  bool has_anchor_prediction_lio_pose_ = false;
+  std::atomic<bool> lio_anchor_valid_{false};
   bool lio_has_previous_pose_ = false;
   bool lio_corrected_this_frame_ = false;
   PendingLioCorrection pending_lio_correction_;
@@ -6110,6 +6408,13 @@ private:
   float last_correction_quality_penalty_ = 0.0f;
   AuxiliaryDriftGate ndt_drift_gate_;
   AuxiliaryDriftGate rtk_drift_gate_;
+  mutable std::mutex lio_anchor_mutex_;
+  mutable std::mutex anchor_ukf_mutex_;
+  AnchorUkf anchor_ukf_;
+  Eigen::Vector3d last_anchor_innovation_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d last_anchor_gain_ = Eigen::Vector3d::Zero();
+  std::string last_anchor_observation_source_ = "none";
+  OneShotCorrection one_shot_correction_;
   Eigen::Isometry3f lio_map_T_lio_ = Eigen::Isometry3f::Identity();
   Eigen::Isometry3f previous_lio_pose_ = Eigen::Isometry3f::Identity();
   rclcpp::Time previous_lio_pose_stamp_{0, 0, RCL_ROS_TIME};

@@ -50,13 +50,13 @@ TEST(CorrectionPolicy, UkfSelectsLowerVarianceAndUsesFreshnessAsTieBreaker) {
     CorrectionSource::rtk);
 }
 
-TEST(CorrectionPolicy, UkfRejectsConflictingSources) {
+TEST(CorrectionPolicy, UkfKeepsUsingIndividuallyValidConflictingSources) {
   const auto ndt = candidate(0.0, 0.01, 10);
-  const auto rtk = candidate(0.31, 0.01, 20);
+  const auto rtk = candidate(3.1, 0.02, 20);
   const auto selection = selectCorrectionSource(
     CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1);
-  EXPECT_EQ(selection.source, CorrectionSource::conflict);
-  EXPECT_EQ(selection.reason, "ukf_source_conflict");
+  EXPECT_EQ(selection.source, CorrectionSource::ndt);
+  EXPECT_EQ(selection.reason, "ukf_ndt_lower_variance");
 }
 
 
@@ -65,7 +65,7 @@ TEST(CorrectionPolicy, PreferFixedRtkWinsEvenOnConflictOrLowerVariance) {
   auto rtk = candidate(1.0, 0.05, 20);
   const auto conflict_without = selectCorrectionSource(
     CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, false);
-  EXPECT_EQ(conflict_without.source, CorrectionSource::conflict);
+  EXPECT_EQ(conflict_without.source, CorrectionSource::ndt);
 
   const auto preferred = selectCorrectionSource(
     CorrectionPolicyMode::ukf, ndt, rtk, 0.3, 0.1, 0.3, 0.1, true);

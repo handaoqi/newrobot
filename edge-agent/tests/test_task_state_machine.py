@@ -410,6 +410,52 @@ def test_waypoint_arrival_requires_requested_correction_source_ready(tmp_path):
     store.close()
 
 
+def test_waypoint_correction_transaction_is_idempotent_and_required(tmp_path):
+    class TransactionNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.correction_requests = []
+
+        def control_localization_correction(self, transaction_id, mode, command="start"):
+            self.correction_requests.append((transaction_id, mode, command))
+            return {"accepted": True, "transaction_id": transaction_id, "status": "waiting_source"}
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = TransactionNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = SimpleNamespace(
+        task_execution_id="task-7",
+        route_snapshot={"map": {}, "waypoints": []},
+    )
+    executor._correction_generation = 2
+
+    assert executor._start_waypoint_localization_correction(
+        {"localization_mode": "ukf"}, 3
+    )
+    transaction_id = executor._active_correction_transaction_id
+    assert nav.correction_requests == [(transaction_id, "ukf", "start")]
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "one_shot_correction": {
+            "transaction_id": transaction_id,
+            "status": "waiting_source",
+        },
+    }
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is False
+    nav.localization_state["one_shot_correction"]["status"] = "completed"
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+
+    executor._cancel_waypoint_localization_correction()
+    assert nav.correction_requests[-1] == (transaction_id, "ukf", "cancel")
+    store.close()
+
+
 def test_outdoor_waypoint_arrival_accepts_fast_lio_without_rtk_absolute_gate(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -601,7 +647,7 @@ def test_outdoor_reverse_skip_requires_rtk_agreement(tmp_path):
     store.close()
 
 
-def test_outdoor_stationary_policy_overrides_ukf_to_rtk(tmp_path):
+def test_outdoor_stationary_policy_preserves_configured_ukf_mode(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -626,7 +672,7 @@ def test_outdoor_stationary_policy_overrides_ukf_to_rtk(tmp_path):
         {"x": 1.0, "y": 2.0, "localization_mode": "ukf"},
         "stationary",
     )
-    assert nav.localization_policies[-1] == ("rtk", "stationary")
+    assert nav.localization_policies[-1] == ("ukf", "stationary")
     store.close()
 
 

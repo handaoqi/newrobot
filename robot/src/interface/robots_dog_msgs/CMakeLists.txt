@@ -90,6 +90,7 @@ set(srv_files
         "srv/MappingType.srv"
         "srv/UseMapType.srv"
         "srv/SetLocalizationType.srv"
+        "srv/ControlLocalizationCorrection.srv"
 )
 
 set(action_files

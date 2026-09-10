@@ -60,7 +60,7 @@ BYPASS_FORWARD_M = 0.5
 BYPASS_MIN_SIDE_CLEARANCE_M = 0.8
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
-DEPARTURE_HEADING_ALIGN_RAD = 0.35  # ~20 deg (compat / completion sample)
+DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
 # A waypoint explicitly marked require_yaw previously let RPP chase the final
 # orientation while still following the path.  Keep its original, stricter
 # goal-checker tolerance when handing that orientation to the stationary turn.
@@ -72,7 +72,7 @@ DEPARTURE_HEADING_INPLACE_RAD = 1.047  # ~60 deg
 DEPARTURE_HEADING_TIMEOUT_SECONDS = 20.0
 DEPARTURE_HEADING_TELEOP_YAW_RATE = 0.40
 DEPARTURE_HEADING_TELEOP_PERIOD_SECONDS = 0.10
-DEPARTURE_HEADING_STABLE_SAMPLES = 2
+DEPARTURE_HEADING_STABLE_SAMPLES = 3
 # Quadruped coast after Nav2 reports goal reached; wait before measuring pose.
 HOLD_FINAL_POSE_TIMEOUT_SECONDS = 3.0
 # Outdoor patrol: a short coast check is enough; the long indoor wait burned
@@ -231,6 +231,9 @@ class NavigationAdapter(Protocol):
     def set_localization_policy(self, source: str, phase: str) -> dict: ...
     def localization_decision(self) -> dict: ...
     def localization_diagnostics(self) -> dict: ...
+    def control_localization_correction(
+        self, transaction_id: str, mode: str, command: str = "start"
+    ) -> dict: ...
     def set_goal_precision(self, *, enabled: bool) -> None: ...
     def set_waypoint_profile(
         self,
@@ -337,6 +340,8 @@ class TaskExecutor:
         self._emitted_event_keys: set[str] = set()
         self._correction_generation = 0
         self._correction_completed_at_mono: float | None = None
+        self._active_correction_transaction_id: str | None = None
+        self._active_correction_mode: str | None = None
         self._expected_recovery_cancels = 0
         self._bypass_active = False
         self._task_started_at = None
@@ -437,6 +442,7 @@ class TaskExecutor:
         return True
 
     def stop(self) -> None:
+        self._cancel_waypoint_localization_correction()
         self._cancel_waypoint_dwell()
         self._stop_obstacle_monitor()
         self._stop_task_rosbag()
@@ -1186,6 +1192,8 @@ class TaskExecutor:
             self._recovery_arbiter.force_release()
             self._correction_generation = 0
             self._correction_completed_at_mono = None
+            self._active_correction_transaction_id = None
+            self._active_correction_mode = None
             self._leg_generation = 0
             self._active_leg_profile = None
             self._persist()
@@ -1693,8 +1701,8 @@ class TaskExecutor:
                     "waypoint position reached but final heading did not align in time",
                 )
                 return
-            LOGGER.warning(
-                "departure heading timed out after %.1fs (%s); continuing without in-place align "
+            LOGGER.error(
+                "departure heading timed out after %.1fs (%s); parking task "
                 "(reached=%s cruise=%s)",
                 DEPARTURE_HEADING_TIMEOUT_SECONDS,
                 mode,
@@ -1702,13 +1710,15 @@ class TaskExecutor:
                 cruise_index,
             )
             self._clear_departure_heading(cancel_navigation=True)
-            if cruise_index is not None:
-                self._dispatch_navigation(cruise_index)
-                return
-            if reached_index is not None:
-                self._departure_heading_completed_index = reached_index
-                # Re-enter the post-arrival path without another spin.
-                self._continue_after_waypoint(reached_index)
+            self.navigation.stop_motion()
+            self.context.state = "paused"
+            self.context.state_version += 1
+            self._persist()
+            self._emit(
+                "task.paused",
+                code="DEPARTURE_HEADING_ALIGNMENT_REQUIRED",
+                message="departure heading did not align; robot remains parked",
+            )
 
     def _complete_departure_heading_locked(
         self, reached_index: int | None, cruise_index: int | None
@@ -2294,7 +2304,13 @@ class TaskExecutor:
             ),
             force_require_yaw=require_yaw_stop,
         )
-        self._set_localization_policy(batch[0], "moving")
+        # The reached point owns both its departure correction and the
+        # following leg. Before any point has been reached, the first target
+        # owns the initial leg.
+        policy_waypoint = batch[0]
+        if self._last_reached_index == index - 1 and index > 0:
+            policy_waypoint = waypoints[index - 1]
+        self._set_localization_policy(policy_waypoint, "moving")
         self._goal_offset = index
         self._dispatched_count = len(batch)
         accepted = self.navigation.send_waypoints(batch, self.on_feedback, self._bind_nav_result())
@@ -2354,19 +2370,84 @@ class TaskExecutor:
             return
         mode = waypoint_localization_mode(waypoint.get("localization_mode"))
         phase = "moving" if str(phase).lower() == "moving" else "stationary"
-        # Outdoor stops must pull LIO with RTK. Route points often store UKF,
-        # which can enter NDT/RTK conflict and apply neither correction.
-        if phase == "stationary" and self._outdoor_navigation_profile() and mode != "rtk":
-            LOGGER.info(
-                "outdoor stationary localization override %s -> rtk",
-                mode,
-            )
-            mode = "rtk"
         policy = (mode, phase)
         if policy == self._last_localization_policy:
             return
         setter(mode, phase)
         self._last_localization_policy = policy
+
+    def _start_waypoint_localization_correction(
+        self, waypoint: dict, reached_index: int
+    ) -> bool:
+        requester = getattr(self.navigation, "control_localization_correction", None)
+        if not callable(requester):
+            # Keep non-ROS test and simulation adapters compatible. Production
+            # RosAdapter always exposes the transaction service.
+            self._active_correction_transaction_id = None
+            self._active_correction_mode = None
+            return True
+        mode = waypoint_localization_mode(waypoint.get("localization_mode"))
+        transaction_id = (
+            f"{self.context.task_execution_id}:waypoint:{reached_index}:"
+            f"correction:{self._correction_generation}"
+        )
+        self._active_correction_transaction_id = transaction_id
+        self._active_correction_mode = mode
+        result = requester(transaction_id, mode, "start") or {}
+        accepted = bool(result.get("accepted"))
+        if not accepted:
+            LOGGER.warning(
+                "waypoint correction transaction not accepted yet id=%s mode=%s status=%s",
+                transaction_id,
+                mode,
+                result.get("status"),
+            )
+        return accepted
+
+    def _retry_waypoint_localization_correction(self, decision: dict) -> None:
+        transaction_id = self._active_correction_transaction_id
+        mode = self._active_correction_mode
+        if not transaction_id or not mode:
+            return
+        transaction = decision.get("one_shot_correction")
+        if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
+            if str(transaction.get("status") or "") in {
+                "waiting_source",
+                "smoothing",
+                "completed",
+            }:
+                return
+        requester = getattr(self.navigation, "control_localization_correction", None)
+        if callable(requester):
+            requester(transaction_id, mode, "start")
+
+    def _waypoint_correction_completed(self, decision: dict) -> bool | None:
+        transaction_id = self._active_correction_transaction_id
+        if not transaction_id:
+            return None
+        transaction = decision.get("one_shot_correction")
+        if not isinstance(transaction, dict):
+            return False
+        return (
+            str(transaction.get("transaction_id") or "") == transaction_id
+            and str(transaction.get("status") or "") == "completed"
+        )
+
+    def _cancel_waypoint_localization_correction(self) -> None:
+        transaction_id = self._active_correction_transaction_id
+        mode = self._active_correction_mode
+        self._active_correction_transaction_id = None
+        self._active_correction_mode = None
+        requester = getattr(self.navigation, "control_localization_correction", None)
+        if transaction_id and mode and callable(requester):
+            try:
+                requester(transaction_id, mode, "cancel")
+            except Exception:
+                LOGGER.warning(
+                    "failed to cancel localization correction transaction %s",
+                    transaction_id,
+                    exc_info=True,
+                )
 
     def _needs_stationary_correction(self, decision: dict) -> bool:
         """True when a stopped robot still has correctable absolute drift."""
@@ -2728,14 +2809,7 @@ class TaskExecutor:
         self._absolute_pause_watch_stop = stop
 
         def _loop() -> None:
-            deadline = time.monotonic() + ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS
             while not stop.wait(0.5):
-                if time.monotonic() > deadline:
-                    LOGGER.warning(
-                        "absolute localization resume watch timed out after %.0fs",
-                        ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS,
-                    )
-                    return
                 with self._lock:
                     if (
                         not self.context
@@ -2744,17 +2818,26 @@ class TaskExecutor:
                     ):
                         return
                     decision = self._localization_decision()
-                    outdoor = self._outdoor_navigation_profile()
-                    if outdoor:
-                        ready = self._outdoor_absolute_pause_can_resume(decision)
-                    else:
-                        ready = (
-                            not bool(decision.get("lio_motion_anomaly"))
-                            and not bool(decision.get("correction_smoothing_active"))
-                            and bool(decision.get("absolute_stable"))
-                            and str(decision.get("active_source") or "")
-                            in {"lio_imu", "rtk_imu", "ndt_imu"}
+                    transaction_completed = self._waypoint_correction_completed(decision)
+                    if transaction_completed is not None:
+                        self._retry_waypoint_localization_correction(decision)
+                        ready = bool(
+                            transaction_completed
+                            and decision.get("lio_healthy", True)
+                            and self._localization_sample_fresh(decision)
                         )
+                    else:
+                        outdoor = self._outdoor_navigation_profile()
+                        if outdoor:
+                            ready = self._outdoor_absolute_pause_can_resume(decision)
+                        else:
+                            ready = (
+                                not bool(decision.get("lio_motion_anomaly"))
+                                and not bool(decision.get("correction_smoothing_active"))
+                                and bool(decision.get("absolute_stable"))
+                                and str(decision.get("active_source") or "")
+                                in {"lio_imu", "rtk_imu", "ndt_imu"}
+                            )
                 if not ready:
                     continue
                 LOGGER.info(
@@ -2794,6 +2877,19 @@ class TaskExecutor:
                     decision.get("lio_motion_anomaly_reason") or "unknown",
                 )
                 return False
+            transaction_completed = self._waypoint_correction_completed(decision)
+            if transaction_completed is not None:
+                if (
+                    transaction_completed
+                    and bool(decision.get("lio_healthy", True))
+                    and self._localization_sample_fresh(decision)
+                ):
+                    return True
+                stop_motion = getattr(self.navigation, "stop_motion", None)
+                if callable(stop_motion):
+                    stop_motion()
+                time.sleep(0.1)
+                continue
             correction_active = bool(decision.get("correction_smoothing_active", False))
             needs_correction = self._needs_stationary_correction(decision)
             if outdoor:
@@ -3071,6 +3167,7 @@ class TaskExecutor:
             if self.context.state not in {"running", "paused", "pausing", "resuming", "interrupted"}:
                 raise ProtocolError("INVALID_TASK_STATE", f"cannot cancel from {self.context.state}")
             previous_state = self.context.state
+            self._cancel_waypoint_localization_correction()
             self.context.state = "cancelling"
             self.context.state_version += 1
             self._persist()
@@ -3426,6 +3523,9 @@ class TaskExecutor:
                     extra={"correction_generation": self._correction_generation},
                 )
                 self._set_localization_policy(reached_waypoint, "stationary")
+                self._start_waypoint_localization_correction(
+                    reached_waypoint, reached_index
+                )
                 speech_configured = (
                     self._waypoint_speech_enabled()
                     and bool(reached_waypoint.get("speech_template_id"))
@@ -3602,6 +3702,8 @@ class TaskExecutor:
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
+            self._active_correction_transaction_id = None
+            self._active_correction_mode = None
             if self._departure_heading_completed_index == reached_index:
                 self._departure_heading_completed_index = None
             elif self._departure_heading_index is None and self._dispatch_departure_heading(reached_index):
@@ -3881,6 +3983,8 @@ class TaskExecutor:
             self._dwell_wait_stop = None
             self._dwell_wait_thread = None
         self._waypoint_localization_ready_index = None
+        self._active_correction_transaction_id = None
+        self._active_correction_mode = None
         self._continue_after_waypoint(waypoint_index)
         return True
 
@@ -4467,6 +4571,7 @@ class TaskExecutor:
     def _fail(self, code: str, message: str) -> None:
         if not self.context:
             return
+        self._cancel_waypoint_localization_correction()
         self._clear_nav_dispatch_retry()
         self._cancel_waypoint_dwell()
         self._invalidate_nav_results()

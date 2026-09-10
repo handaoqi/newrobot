@@ -123,13 +123,12 @@ inline CorrectionSelection selectCorrectionSource(
     return {CorrectionSource::rtk, "ukf_prefer_fixed_rtk"};
   }
 
-  const double disagreement_xy = std::hypot(ndt.x - rtk.x, ndt.y - rtk.y);
-  const double disagreement_yaw = ndt.yaw_valid && rtk.yaw_valid
-    ? std::fabs(std::atan2(std::sin(ndt.yaw - rtk.yaw), std::cos(ndt.yaw - rtk.yaw)))
-    : 0.0;
-  if (disagreement_xy > conflict_xy_m || disagreement_yaw > conflict_yaw_rad) {
-    return {CorrectionSource::conflict, "ukf_source_conflict"};
-  }
+  // UKF mode deliberately does not reject two individually valid sources
+  // merely because they disagree. Their source-specific freshness, quality
+  // and jump gates run before this selector; the anchor filter then weights
+  // accepted observations by their covariance.
+  (void)conflict_xy_m;
+  (void)conflict_yaw_rad;
 
   const double ndt_metric = correctionCandidateMetric(ndt, drift_xy_m, drift_yaw_rad);
   const double rtk_metric = correctionCandidateMetric(rtk, drift_xy_m, drift_yaw_rad);

@@ -133,6 +133,14 @@ except ImportError:
     # being upgraded or repaired.
     ScanMatchingStatus = None
 
+try:
+    if ROS_AVAILABLE:
+        from robots_dog_msgs.srv import ControlLocalizationCorrection
+    else:
+        ControlLocalizationCorrection = None
+except ImportError:
+    ControlLocalizationCorrection = None
+
 
 class RosAdapter(Node):
     def __init__(
@@ -350,6 +358,13 @@ class RosAdapter(Node):
         self._global_relocalize_client = self.create_client(
             Trigger, "/localization/global_relocalize"
         )
+        self._localization_correction_client = (
+            self.create_client(
+                ControlLocalizationCorrection, "/localization/control_correction"
+            )
+            if ControlLocalizationCorrection is not None
+            else None
+        )
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self._teleop_cmd_vel_pub = self.create_publisher(Twist, "/teleop_cmd_vel", 10)
         self._teleop_action_pub = self.create_publisher(String, "/teleop_action", 10)
@@ -458,16 +473,6 @@ class RosAdapter(Node):
             self._lio_motion_anomaly_notified = False
             return
 
-        # Fixed outdoor RTK XY is enough to keep the task moving. Dual-antenna
-        # heading flicker often produces a one-frame LIO yaw step during the
-        # RTK↔LIO handoff; that must not pause Nav2.
-        if self._rtk_fixed_solution_available() or self._rtk_is_good_for_navigation():
-            LOGGER.info(
-                "lio motion anomaly ignored while outdoor RTK position is fixed "
-                "(reason=%s)",
-                payload.get("lio_motion_anomaly_reason") or "unknown",
-            )
-            return
         if (
             self._lio_motion_anomaly_notified
             or not self._localization_failure_cb
@@ -731,6 +736,55 @@ class RosAdapter(Node):
     def localization_diagnostics(self) -> dict:
         return self.telemetry.localization_diagnostics()
 
+    def control_localization_correction(
+        self,
+        transaction_id: str,
+        mode: str,
+        command: str = "start",
+        timeout_seconds: float = 2.0,
+    ) -> dict:
+        client = self._localization_correction_client
+        if client is None:
+            return {
+                "accepted": False,
+                "status": "unavailable",
+                "message": "ControlLocalizationCorrection interface is unavailable",
+            }
+        if not client.wait_for_service(timeout_sec=max(0.0, timeout_seconds)):
+            return {
+                "accepted": False,
+                "status": "unavailable",
+                "message": "/localization/control_correction is unavailable",
+            }
+        request = ControlLocalizationCorrection.Request()
+        request.transaction_id = str(transaction_id)
+        request.command = (
+            request.COMMAND_CANCEL if str(command).lower() == "cancel" else request.COMMAND_START
+        )
+        normalized_mode = str(mode).lower()
+        request.mode = {
+            "rtk": request.MODE_RTK,
+            "ukf": request.MODE_UKF,
+        }.get(normalized_mode, request.MODE_NDT)
+        future = client.call_async(request)
+        completed = threading.Event()
+        future.add_done_callback(lambda _: completed.set())
+        if not completed.wait(timeout=max(0.0, timeout_seconds)):
+            return {"accepted": False, "status": "timeout", "message": "service timeout"}
+        if future.exception() is not None:
+            return {
+                "accepted": False,
+                "status": "failed",
+                "message": str(future.exception()),
+            }
+        response = future.result()
+        return {
+            "accepted": bool(response.accepted),
+            "transaction_id": str(response.transaction_id),
+            "status": str(response.status),
+            "message": str(response.message),
+        }
+
     def prepare_for_navigation(self, timeout_seconds: float = 12.0) -> bool:
         """Stand the robot and wait for the SDK bridge to confirm it is stable."""
         self._robot_standing_event.clear()
@@ -923,6 +977,16 @@ class RosAdapter(Node):
             self._record_scan_matching_performance(started)
             return
         decision = self.telemetry.localization_decision()
+        if (
+            decision.get("active_source") == "lio_imu"
+            and decision.get("lio_healthy") is True
+        ):
+            # NDT is a consistency/anchor observer. Its loss alone does not
+            # invalidate healthy FAST-LIO motion; a stopped waypoint whose
+            # policy requires NDT remains parked by the correction transaction.
+            self._ndt_failure_count = 0
+            self._ndt_failure_notified = False
+            return
         correction_policy = str(decision.get("correction_policy") or "ndt").lower()
         if (
             decision.get("active_source") == "lio_imu"

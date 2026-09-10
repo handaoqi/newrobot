@@ -65,15 +65,14 @@ localization:
       # RTK source jumps (>max_correction_jump_m) are untrusted.
       # Self-stable fixed RTK also trusts dual-antenna heading (bypasses the
       # 30 deg yaw gate) so XY-only corrections cannot leave a yaw death spiral.
-      # While navigating, fixed RTK is preferred over NDT for pose regulation.
+      # RTK and NDT remain anchor observations; neither becomes the continuous pose.
       rtk_trust:
         stable_window_seconds: 1.0
         stable_span_m: 0.35
         trusted_correction_translation_rate_mps: 1.0
         trusted_correction_rotation_rate_degps: 30.0
-        # Prefer fixed RTK over NDT whenever both are eligible (lost recovery
-        # and in-motion navigation pose regulation).
-        prefer_fixed_for_correction: true
+        # UKF mode weights independently valid RTK/NDT observations by covariance.
+        prefer_fixed_for_correction: false
       correct_xy_variance: 0.010
       correct_z_variance: 0.020
       correct_orientation_variance: 0.001
@@ -160,14 +159,10 @@ localization:
 
     source_arbiter:
       enable: true
-      # Outdoor navigation: fixed RTK XY + dual-antenna heading drives Nav2
-      # when both stay good for ~2s. FAST-LIO/NDT remains the fallback if
-      # GPS or heading drops. LIO-only path following is too easy to walk
-      # off an RTK-aligned map when scan matching cannot re-anchor.
-      prefer_fixed_rtk: true
-      # When prefer_fixed_rtk is enabled, require ~2s of fixed+heading before
-      # promoting and ~0.8s of loss before demoting, then suppress LIO yaw-step
-      # false positives during the handoff.
+      # FAST-LIO is the only continuous pose source indoors and outdoors.
+      # RTK and NDT may update only the low-frequency map->lio anchor.
+      prefer_fixed_rtk: false
+      # Legacy handoff parameters remain for configuration compatibility.
       rtk_primary_promote_samples: 20
       rtk_primary_demote_samples: 8
       rtk_primary_handoff_suppress_seconds: 2.5

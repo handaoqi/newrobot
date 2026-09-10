@@ -173,7 +173,7 @@ def test_recovery_skips_rtk_reseed_when_gps_pose_is_already_driving(monkeypatch)
     assert application._localization_recovery_lock.acquire(blocking=False)
 
 
-def test_localization_loss_ignored_while_outdoor_rtk_xy_is_fixed(monkeypatch):
+def test_lio_motion_anomaly_stops_even_while_outdoor_rtk_xy_is_fixed():
     application = object.__new__(EdgeAgentApplication)
     application.task_executor = IdleTaskExecutor()
     application.navigation = SimpleNamespace(
@@ -187,15 +187,15 @@ def test_localization_loss_ignored_while_outdoor_rtk_xy_is_fixed(monkeypatch):
         }
     )
     application._localization_alert_notified = False
-
-    def unexpected_thread(**_kwargs):
-        raise AssertionError("fixed RTK XY must not pause the task for LIO recovery")
-
-    monkeypatch.setattr(app_module.threading, "Thread", unexpected_thread)
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(current_map_id="map-1", current_map_version="v1")
+    )
+    application._emit_localization_alert = lambda *_args, **_kwargs: None
+    application._mapping_blocks_auto_relocalize = lambda: True
 
     application._handle_task_localization_loss("lio_motion_anomaly")
 
-    assert application.task_executor.loss_notifications == 0
+    assert application.task_executor.loss_notifications == 1
 
 
 def test_localization_loss_ignored_while_outdoor_rtk_is_good(monkeypatch):

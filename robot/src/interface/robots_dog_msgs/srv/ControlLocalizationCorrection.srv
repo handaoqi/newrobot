@@ -1,0 +1,13 @@
+uint8 COMMAND_START=1
+uint8 COMMAND_CANCEL=2
+uint8 MODE_NDT=1
+uint8 MODE_RTK=2
+uint8 MODE_UKF=3
+uint8 command
+uint8 mode
+string transaction_id
+---
+bool accepted
+string transaction_id
+string status
+string message

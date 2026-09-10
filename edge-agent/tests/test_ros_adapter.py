@@ -58,7 +58,7 @@ def test_lio_motion_anomaly_bypasses_localization_loss_debounce():
     assert adapter._localization_recovery_armed is True
 
 
-def test_lio_motion_anomaly_ignored_when_rtk_xy_is_fixed():
+def test_lio_motion_anomaly_stops_navigation_even_when_rtk_xy_is_fixed():
     adapter = object.__new__(RosAdapter)
     adapter.telemetry = FakeTelemetry()
     adapter._lio_motion_anomaly_notified = False
@@ -77,9 +77,9 @@ def test_lio_motion_anomaly_ignored_when_rtk_xy_is_fixed():
     adapter._on_localization_decision(message)
     adapter._on_localization_decision(message)
 
-    assert not triggered.wait(0.2)
-    assert adapter._localization_recovery_armed is False
-    assert adapter._lio_motion_anomaly_notified is False
+    assert triggered.wait(0.2)
+    assert adapter._localization_recovery_armed is True
+    assert adapter._lio_motion_anomaly_notified is True
 
 
 def test_fresh_normal_streak_requires_consecutive_successes():

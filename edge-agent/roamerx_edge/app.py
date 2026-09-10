@@ -958,12 +958,15 @@ class EdgeAgentApplication:
                 "localization transition ignored by auto recovery while an operator request is active"
             )
             return
-        # Open-sky NDT often fails while centimetre-grade RTK is already the
-        # pose. Dual-antenna heading can also flicker while fixed XY remains
-        # good; pausing here cancels Nav2 and freezes outdoor patrols.
-        if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
+        # NDT is a low-rate consistency observer, so losing only NDT while an
+        # absolute RTK anchor remains healthy is warning-only. FAST-LIO loss
+        # or motion anomaly is never masked by RTK: RTK is not a continuous
+        # navigation source in the anchor architecture.
+        if str(reason).startswith("ndt") and (
+            self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation()
+        ):
             LOGGER.info(
-                "localization transition %s ignored while outdoor RTK position is fixed",
+                "NDT health transition %s ignored while RTK anchor is fixed",
                 reason,
             )
             return

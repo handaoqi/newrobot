@@ -22,6 +22,7 @@ find_package(nav_msgs REQUIRED)
 find_package(ndt_omp REQUIRED)
 find_package(fast_gicp REQUIRED)
 find_package(robots_dog_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 find_package(PCL 1.7 REQUIRED)
 include_directories(${PCL_INCLUDE_DIRS})
@@ -207,6 +208,13 @@ if(BUILD_TESTING)
   target_include_directories(correction_policy_test PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+  ament_add_gtest(anchor_ukf_test
+    test/anchor_ukf_test.cpp
+  )
+  target_include_directories(anchor_ukf_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(anchor_ukf_test Eigen3::Eigen)
   ament_add_gtest(rtk_primary_policy_test
     test/rtk_primary_policy_test.cpp
   )
