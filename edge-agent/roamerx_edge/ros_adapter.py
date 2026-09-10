@@ -95,7 +95,7 @@ try:
     from action_msgs.srv import CancelGoal
     from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
-    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -184,6 +184,13 @@ class RosAdapter(Node):
         self._callback_performance = CallbackPerformanceMonitor()
         self._control_callback_group = MutuallyExclusiveCallbackGroup()
         self._telemetry_callback_group = MutuallyExclusiveCallbackGroup()
+        # Action result callbacks enter TaskExecutor and may wait for its state
+        # lock while an obstacle-recovery worker is making synchronous ROS
+        # requests.  Keeping Nav2 action and service responses in reentrant,
+        # dedicated groups prevents one blocked result callback from starving
+        # cancel, lifecycle, or parameter futures on this node.
+        self._nav_action_callback_group = ReentrantCallbackGroup()
+        self._nav_service_callback_group = ReentrantCallbackGroup()
         self._latest_odometry = None
         self._odometry_sequence = 0
         self._odometry_consumed_sequence = 0
@@ -347,11 +354,21 @@ class RosAdapter(Node):
             LOGGER.warning(
                 "localization ScanMatchingStatus message is unavailable; quality telemetry subscription is disabled"
             )
-        self._action_client = ActionClient(self, FollowWaypoints, ros_config.follow_waypoints_action)
+        self._action_client = ActionClient(
+            self,
+            FollowWaypoints,
+            ros_config.follow_waypoints_action,
+            callback_group=self._nav_action_callback_group,
+        )
         through_poses_action = getattr(
             ros_config, "navigate_through_poses_action", "/navigate_through_poses"
         )
-        self._through_poses_client = ActionClient(self, NavigateThroughPoses, through_poses_action)
+        self._through_poses_client = ActionClient(
+            self,
+            NavigateThroughPoses,
+            through_poses_action,
+            callback_group=self._nav_action_callback_group,
+        )
         self._through_poses_action = through_poses_action
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
         self._rtk_initial_pose_client = self.create_client(Trigger, "/localization/seed_from_rtk")
@@ -1438,7 +1455,11 @@ class RosAdapter(Node):
         return False
 
     def _lifecycle_node_is_active(self, node_name: str) -> bool:
-        client = self.create_client(GetState, f"{node_name}/get_state")
+        client = self.create_client(
+            GetState,
+            f"{node_name}/get_state",
+            callback_group=self._nav_service_callback_group,
+        )
         try:
             if not client.wait_for_service(timeout_sec=0.25):
                 return False
@@ -3166,7 +3187,9 @@ class RosAdapter(Node):
             LOGGER.warning("nav2_msgs ClearEntireCostmap is unavailable")
             return False
         client = self.create_client(
-            ClearEntireCostmap, "/local_costmap/clear_entirely_local_costmap"
+            ClearEntireCostmap,
+            "/local_costmap/clear_entirely_local_costmap",
+            callback_group=self._nav_service_callback_group,
         )
         try:
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 0.5)):
@@ -3191,7 +3214,10 @@ class RosAdapter(Node):
             # local handle is gone while Nav2 continues executing the goal.
             # A default CancelGoal request cancels every goal on this action.
             client = self.create_client(
-                CancelGoal, f"{self._nav_cancel_action}/_action/cancel_goal")
+                CancelGoal,
+                f"{self._nav_cancel_action}/_action/cancel_goal",
+                callback_group=self._nav_service_callback_group,
+            )
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 2.0)):
                 self.destroy_client(client)
                 LOGGER.error("%s cancel service is unavailable", self._nav_cancel_action)
@@ -3712,7 +3738,11 @@ class RosAdapter(Node):
             raise ProtocolError(code, "ROS get_parameters unavailable")
         last_error = ""
         for _ in range(max(1, attempts)):
-            client = self.create_client(GetParameters, f"{node_name}/get_parameters")
+            client = self.create_client(
+                GetParameters,
+                f"{node_name}/get_parameters",
+                callback_group=self._nav_service_callback_group,
+            )
             try:
                 if not client.wait_for_service(timeout_sec=0.35):
                     last_error = f"{node_name} get_parameters service is unavailable"
@@ -3780,7 +3810,11 @@ class RosAdapter(Node):
         last_error = ""
         service_missing = False
         for _ in range(max(1, attempts)):
-            client = self.create_client(SetParameters, f"{node_name}/set_parameters")
+            client = self.create_client(
+                SetParameters,
+                f"{node_name}/set_parameters",
+                callback_group=self._nav_service_callback_group,
+            )
             try:
                 if not client.wait_for_service(timeout_sec=0.25):
                     last_error = f"{node_name} parameter service is unavailable"

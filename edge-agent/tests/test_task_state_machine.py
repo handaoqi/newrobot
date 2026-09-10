@@ -2,10 +2,11 @@ from types import SimpleNamespace
 from math import atan2, hypot
 import hashlib
 import json
+import threading
 import time
 
 from roamerx_edge.local_store import LocalStore
-from roamerx_edge.protocol import decode_message
+from roamerx_edge.protocol import ProtocolError, decode_message
 from roamerx_edge.task_executor import TaskExecutor, straighten_pass_through_waypoints
 
 
@@ -144,6 +145,22 @@ class FakeBlockedNavigation(FakeNavigation):
             "left_clearance_m": 2.4,
             "right_clearance_m": 0.3,
         }
+
+
+class FakeProfileTimeoutNavigation(FakeBlockedNavigation):
+    def __init__(self):
+        super().__init__()
+        self.fail_profile_apply = False
+        self.profile_attempts = []
+
+    def apply_navigation_profile(self, **kwargs):
+        self.profile_attempts.append(kwargs)
+        if self.fail_profile_apply:
+            raise ProtocolError(
+                "NAV_PROFILE_APPLY_FAILED",
+                "/planner_server get_parameters timed out",
+            )
+        return kwargs
 
 
 class FakeCollisionLimitedNavigation(FakeNavigation):
@@ -2899,6 +2916,75 @@ def test_obstacle_bypass_via_advances_toward_goal_when_heading_is_reversed(tmp_p
     store.close()
 
 
+def test_obstacle_bypass_profile_timeout_still_dispatches_via(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeProfileTimeoutNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    previous_profile = executor._active_leg_profile
+    sent_before = len(nav.sent)
+    nav.fail_profile_apply = True
+
+    executor._dispatch_bypass_via(
+        {
+            "x": 4.0,
+            "y": 3.0,
+            "yaw": 0.0,
+            "waypoint_id": "bypass-1",
+            "map_point_number": 2,
+        }
+    )
+
+    assert len(nav.sent) == sent_before + 1
+    assert nav.sent[-1][0]["waypoint_id"] == "bypass-1"
+    assert executor.context.state == "running"
+    assert executor._active_leg_profile == previous_profile
+    assert executor._recovery_arbiter.snapshot()["owner"] == "NONE"
+    executor.stop()
+    store.close()
+
+
+def test_obstacle_monitor_loop_survives_iteration_failure(tmp_path):
+    class StopAfterTwoIterations:
+        def __init__(self):
+            self.waits = 0
+            self.stopped = False
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return self.stopped or self.waits > 2
+
+        def set(self):
+            self.stopped = True
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    calls = []
+
+    def evaluate():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("transient monitor failure")
+
+    executor._obstacle_monitor_stop = StopAfterTwoIterations()
+    executor._evaluate_obstacle_progress = evaluate
+    executor._obstacle_monitor_loop()
+
+    assert len(calls) == 2
+    executor.stop()
+    store.close()
+
+
 def test_send_from_faces_next_waypoint_before_cruise_when_heading_is_wrong(tmp_path):
     from math import pi
 
@@ -3056,6 +3142,69 @@ def test_obstacle_reverse_cancel_does_not_stop_running_task(tmp_path):
     executor._evaluate_obstacle_progress()
     executor._evaluate_obstacle_progress()  # reverse + redispatch
     nav.result("cancelled")
+    assert executor.context.state == "running"
+    executor.stop()
+    store.close()
+
+
+def test_obstacle_monitor_does_not_hold_task_lock_during_cancel_callback(tmp_path):
+    class ConcurrentCancelNavigation(FakeBlockedNavigation):
+        def __init__(self):
+            super().__init__()
+            self.cancel_callback_completed_while_waiting = False
+
+        def cancel_navigation(self, timeout_seconds=5):
+            self.cancelled += 1
+            completed = threading.Event()
+
+            def deliver_result():
+                self.result("cancelled")
+                completed.set()
+
+            callback_thread = threading.Thread(target=deliver_result, daemon=True)
+            callback_thread.start()
+            self.cancel_callback_completed_while_waiting = completed.wait(0.5)
+            callback_thread.join(timeout=1.0)
+            return self.cancel_callback_completed_while_waiting
+
+    class RunOneMonitorIteration:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return self.waits > 1
+
+        def set(self):
+            self.waits = 2
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = ConcurrentCancelNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            no_progress_seconds=0.0,
+            min_progress_m=0.08,
+            obstacle_max_distance_m=0.9,
+            reverse_speed_mps=0.12,
+            reverse_duration_seconds=0.2,
+        ),
+    )
+    executor._start_obstacle_monitor = lambda: None
+    executor.start_task(command("task.start"))
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    executor._obstacle_monitor_stop = RunOneMonitorIteration()
+
+    executor._obstacle_monitor_loop()
+
+    assert nav.cancel_callback_completed_while_waiting
+    assert executor._expected_recovery_cancels == 0
     assert executor.context.state == "running"
     executor.stop()
     store.close()
