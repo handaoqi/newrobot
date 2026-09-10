@@ -1161,6 +1161,8 @@ def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
     adapter._actual_lateral_command = 0.0
     adapter._raw_turn_command = 0.0
     adapter._actual_turn_command = 0.0
+    adapter._raw_velocity_updated_monotonic = time.monotonic()
+    adapter._actual_velocity_updated_monotonic = time.monotonic()
     adapter._latest_speed = 0.0
     adapter._front_obstacle_distance_m = None
     adapter._left_clearance_m = None
@@ -1174,7 +1176,11 @@ def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
         SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=3.0, y=4.0))),
     ]))
 
-    fresh = adapter.obstacle_monitor_snapshot()["global_plan"]
+    snapshot = adapter.obstacle_monitor_snapshot()
+    assert snapshot["requested_velocity_sample_age_seconds"] is not None
+    assert snapshot["actual_velocity_sample_age_seconds"] is not None
+    assert snapshot["actual_velocity_sample_age_seconds"] < 0.1
+    fresh = snapshot["global_plan"]
     assert fresh["updated"] is True
     assert fresh["points"] == [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}]
 

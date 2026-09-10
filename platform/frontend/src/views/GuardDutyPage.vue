@@ -68,6 +68,12 @@ import {
   calculateTrajectoryDistance,
   displayedGuardDutyDistance,
 } from '../utils/guardDutyDistance'
+import {
+  guardDutySpeedLabel,
+  guardDutySpeedReading,
+  guardDutySpeedTitle,
+  isLatestTrajectoryResponse,
+} from '../utils/guardDutySpeed'
 
 const overview = ref(null)
 const robots = ref([])
@@ -129,6 +135,7 @@ let liveMediaRecorder = null
 let liveRecordingStream = null
 let liveRecordingTimer = null
 let liveRecordingChunks = []
+let trajectoryRequestGeneration = 0
 
 const failedCommandStatuses = new Set(['rejected', 'failed', 'cancelled', 'timed_out', 'expired'])
 const activeCommandStatuses = new Set(['created', 'published', 'accepted', 'executing'])
@@ -191,7 +198,14 @@ const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
   mapData.value?.id,
 ))
 const currentExecutionDistance = computed(() => calculateTrajectoryDistance(trajectory.value))
-const currentMovementSpeed = computed(() => calculateCurrentSpeed(trajectory.value))
+const currentMovementSpeed = computed(() => guardDutySpeedReading({
+  executionState: execution.value?.state,
+  navigationStatus: navigationStatus.value,
+  trajectory: trajectory.value,
+  nowMs: nowMs.value,
+}))
+const currentMovementSpeedLabel = computed(() => guardDutySpeedLabel(currentMovementSpeed.value))
+const currentMovementSpeedTitle = computed(() => guardDutySpeedTitle(currentMovementSpeed.value))
 const displayedTotalDistance = computed(() => {
   return displayedGuardDutyDistance({
     currentDistance: currentExecutionDistance.value,
@@ -349,25 +363,6 @@ function formatDuration(milliseconds) {
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
   return [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':')
-}
-
-function calculateCurrentSpeed(points) {
-  if (!['running', 'resuming'].includes(execution.value?.state) || points.length < 2) return 0
-  const current = points[points.length - 1]
-  const currentTime = new Date(current.sampled_at || current.received_at || '').getTime()
-  if (!Number.isFinite(currentTime) || nowMs.value - currentTime > 5000) return 0
-  for (let index = points.length - 2; index >= 0; index -= 1) {
-    const previous = points[index]
-    const previousTime = new Date(previous.sampled_at || previous.received_at || '').getTime()
-    const elapsedSeconds = (currentTime - previousTime) / 1000
-    if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 0.2) continue
-    if (previous.map_id && current.map_id && String(previous.map_id) !== String(current.map_id)) return 0
-    const distance = Math.hypot(Number(current.x) - Number(previous.x), Number(current.y) - Number(previous.y))
-    if (!Number.isFinite(distance) || distance > 10) return 0
-    const speed = distance / elapsedSeconds
-    return speed < 0.01 ? 0 : Math.min(speed, 5)
-  }
-  return 0
 }
 
 function fullUrl(relativeUrl) {
@@ -635,9 +630,16 @@ async function refreshGuardState() {
 
 async function refreshExecutionVisual() {
   const executionId = execution.value?.id
+  const requestGeneration = ++trajectoryRequestGeneration
   try {
     if (executionId) {
       const track = await fetchTaskTrajectory(executionId)
+      if (!isLatestTrajectoryResponse({
+        requestGeneration,
+        latestGeneration: trajectoryRequestGeneration,
+        requestedExecutionId: executionId,
+        currentExecutionId: execution.value?.id,
+      })) return
       trajectory.value = track.points || []
       trajectoryExecutionId.value = String(executionId)
     }
@@ -921,6 +923,7 @@ async function launchTask({ fromLoop = false } = {}) {
       loopSessionId: fromLoop ? loopSessionId.value : null,
       roundNumber: requestedRound,
     })
+    trajectoryRequestGeneration += 1
     trajectory.value = []
     trajectoryExecutionId.value = String(execution.value.id)
     if (fromLoop) {
@@ -1386,6 +1389,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  trajectoryRequestGeneration += 1
   localizationRunId += 1
   window.clearInterval(refreshTimer)
   window.clearInterval(executionTimer)
@@ -1533,7 +1537,12 @@ watch(playUrlKey, () => {
             <div class="guard-runtime-grid">
               <div><span>累计计时</span><strong>{{ formatDuration(elapsedMilliseconds) }}</strong></div>
               <div><span>行走距离</span><strong>{{ displayedTotalDistance.toFixed(1) }} m</strong></div>
-              <div><span>当前速度</span><strong>{{ currentMovementSpeed.toFixed(2) }} m/s</strong></div>
+              <div>
+                <span>当前速度</span>
+                <strong :class="{ 'is-data-stale': !currentMovementSpeed.available }" :title="currentMovementSpeedTitle">
+                  {{ currentMovementSpeedLabel }}
+                </strong>
+              </div>
               <div><span>执行轮次</span><strong>{{ loopRounds }} 轮</strong></div>
               <div class="guard-runtime-status"><span>当前状态</span><strong>{{ guardRuntimeStatus }}</strong></div>
             </div>
@@ -1791,6 +1800,7 @@ watch(playUrlKey, () => {
 .guard-runtime-grid > div:nth-last-child(-n + 2) { border-bottom: 0; }
 .guard-runtime-grid span { color: #72838e; font-size: 11px; }
 .guard-runtime-grid strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.guard-runtime-grid strong.is-data-stale { color: #c57a12; }
 .guard-loop-message { margin: 0; color: #657681; font-size: 12px; line-height: 1.5; }
 .guard-map-panel { --guard-waypoint-idle: #2563eb; --guard-waypoint-target: #e79a18; --guard-waypoint-reached: #159a63; padding: 16px; }
 .guard-map-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -1912,6 +1922,7 @@ watch(playUrlKey, () => {
   border-color: var(--line);
 }
 :global([data-theme="dark"] .guard-page .guard-runtime-grid) { background: rgba(255, 255, 255, .02); }
+:global([data-theme="dark"] .guard-page .guard-runtime-grid strong.is-data-stale) { color: #ffd58a; }
 :global([data-theme="dark"] .guard-page .guard-current-target) {
   border-left-color: var(--warning);
   background: rgba(255, 196, 92, .12);

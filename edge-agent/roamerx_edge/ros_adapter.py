@@ -191,6 +191,8 @@ class RosAdapter(Node):
         self._actual_lateral_command = 0.0
         self._raw_turn_command = 0.0
         self._actual_turn_command = 0.0
+        self._raw_velocity_updated_monotonic = 0.0
+        self._actual_velocity_updated_monotonic = 0.0
         self._front_obstacle_distance_m = None
         self._left_clearance_m = None
         self._right_clearance_m = None
@@ -883,11 +885,13 @@ class RosAdapter(Node):
         self._raw_forward_command = float(msg.linear.x)
         self._raw_lateral_command = float(msg.linear.y)
         self._raw_turn_command = float(msg.angular.z)
+        self._raw_velocity_updated_monotonic = time.monotonic()
 
     def _on_cmd_vel(self, msg) -> None:
         self._actual_forward_command = float(msg.linear.x)
         self._actual_lateral_command = float(msg.linear.y)
         self._actual_turn_command = float(msg.angular.z)
+        self._actual_velocity_updated_monotonic = time.monotonic()
 
     def _on_scan(self, scan) -> None:
         nearest = None
@@ -984,9 +988,20 @@ class RosAdapter(Node):
 
     def obstacle_monitor_snapshot(self) -> dict:
         """Navigation demand and filtered front-scan state for task recovery."""
+        now_monotonic = time.monotonic()
         plan_age = (
-            max(0.0, time.monotonic() - self._global_plan_updated_monotonic)
+            max(0.0, now_monotonic - self._global_plan_updated_monotonic)
             if self._global_plan_updated_monotonic
+            else None
+        )
+        requested_velocity_age = (
+            max(0.0, now_monotonic - self._raw_velocity_updated_monotonic)
+            if self._raw_velocity_updated_monotonic
+            else None
+        )
+        actual_velocity_age = (
+            max(0.0, now_monotonic - self._actual_velocity_updated_monotonic)
+            if self._actual_velocity_updated_monotonic
             else None
         )
         plan_fresh = bool(
@@ -1001,6 +1016,12 @@ class RosAdapter(Node):
             "actual_planar_speed_mps": math.hypot(self._actual_forward_command, self._actual_lateral_command),
             "requested_turn_speed_rps": self._raw_turn_command,
             "actual_turn_speed_rps": self._actual_turn_command,
+            "requested_velocity_sample_age_seconds": (
+                round(requested_velocity_age, 3) if requested_velocity_age is not None else None
+            ),
+            "actual_velocity_sample_age_seconds": (
+                round(actual_velocity_age, 3) if actual_velocity_age is not None else None
+            ),
             "localized_speed_mps": self._latest_speed,
             "front_obstacle_distance_m": self._front_obstacle_distance_m,
             "left_clearance_m": self._left_clearance_m,
@@ -2845,6 +2866,13 @@ class RosAdapter(Node):
     def stop_motion(self) -> None:
         """Publish an explicit zero command after a navigation goal is cancelled."""
         zero = Twist()
+        # Keep the diagnostic speed source consistent with the command that is
+        # being published.  The local subscription normally observes this too,
+        # but updating eagerly avoids one stale non-zero status frame.
+        self._actual_forward_command = 0.0
+        self._actual_lateral_command = 0.0
+        self._actual_turn_command = 0.0
+        self._actual_velocity_updated_monotonic = time.monotonic()
         # Keep the zero command alive long enough to cover one controller and
         # collision-monitor cycle.  Repeating is safe and makes this operation
         # idempotent when completion/cancel/recovery paths race.
