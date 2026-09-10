@@ -1146,6 +1146,19 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
+        if "name" in attrs:
+            name = str(attrs.get("name") or "").strip()
+            if not name:
+                raise serializers.ValidationError({"name": "路线名称不能为空"})
+            attrs["name"] = name
+            duplicate_query = PatrolRoute.objects.filter(name=name)
+            if self.instance is not None:
+                duplicate_query = duplicate_query.exclude(pk=self.instance.pk)
+            if duplicate_query.exists():
+                raise serializers.ValidationError({
+                    "code": "ROUTE_NAME_EXISTS",
+                    "detail": "路线名称已存在，请修改名称后再新建",
+                })
         map_data = attrs.get("map_data") or getattr(self.instance, "map_data", None)
         waypoints = attrs.get("waypoints")
         if waypoints is None and self.instance is not None:

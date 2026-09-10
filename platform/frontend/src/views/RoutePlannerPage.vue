@@ -235,6 +235,7 @@ const ARRIVAL_POLICY_OPTIONS = [
   { value: 'dock', label: '停靠确认' },
 ]
 const DEFAULT_GLOBAL_CONTROLLER = 'theta_star'
+const NEW_ROUTE_SELECTION = '__new__'
 
 const routeForm = ref({
   name: '',
@@ -554,8 +555,35 @@ function toggleAllWaypoints() {
 }
 
 async function handleRouteSelect(routeId) {
+  if (routeId === NEW_ROUTE_SELECTION) {
+    startNewRouteEditor()
+    return
+  }
   const route = routes.value.find(item => String(item.id) === String(routeId))
   if (route) await handleLoadRoute(route)
+}
+
+function startNewRouteEditor() {
+  stopDrill(false)
+  routeLoadSequence += 1
+  routeLoading.value = false
+  routeLoadError.value = ''
+  selectedRoute.value = null
+  lastExecution.value = null
+  taskMapExecution.value = null
+  taskMapTrajectory.value = []
+  routeForm.value = {
+    ...routeForm.value,
+    name: '',
+    description: '',
+    map_data: selectedMap.value?.id || routeForm.value.map_data || null,
+    map_set: null,
+  }
+  waypoints.value = []
+  waypointNames.value = []
+  resetWaypointExpansion()
+  resetWaypointYawEditors()
+  resetDrillTimelineView()
 }
 
 function toggleRouteList() {
@@ -819,6 +847,12 @@ function normalizeArrivalPolicy(value, point = {}) {
   return 'stop_and_confirm'
 }
 
+function normalizeSpeechMode(value, point = {}) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['blocking', 'non_blocking', 'disabled'].includes(normalized)) return normalized
+  return point.speech_template_id ? 'blocking' : 'disabled'
+}
+
 function setWaypointArrivalPolicy(index, policy) {
   waypoints.value[index] = {
     ...waypoints.value[index],
@@ -911,7 +945,13 @@ async function executeSingleGoal(index) {
 }
 
 function setWaypointBoolean(index, field, value) {
-  waypoints.value[index] = { ...waypoints.value[index], [field]: Boolean(value) }
+  const next = { ...waypoints.value[index], [field]: Boolean(value) }
+  if (field === 'avoidance_to_next') {
+    next.detour_enabled = Boolean(value)
+    next.collision_slowdown_enabled = Boolean(value)
+    next.collision_stop_enabled = true
+  }
+  waypoints.value[index] = next
 }
 
 function setWaypointDwell(index, value) {
@@ -1289,20 +1329,9 @@ async function startDrill() {
   }
 }
 
-async function handleSaveRoute() {
-  if (!selectedMap.value || waypoints.value.length === 0) {
-    alert('请选择地图并添加途经点')
-    return
-  }
-  const pendingYawIndex = waypointYawConfirmed.value.findIndex(confirmed => !confirmed)
-  if (pendingYawIndex >= 0) {
-    alert(`请先确认点${pendingYawIndex + 1}的方向`)
-    return
-  }
-
-  const traceId = newPlannerTraceId()
-  const payload = {
-    name: routeForm.value.name || `路线-${new Date().toLocaleString()}`,
+function buildRoutePayload() {
+  return {
+    name: String(routeForm.value.name || '').trim(),
     map_data: selectedMap.value.id,
     map_set: routeForm.value.map_set || null,
     robot: routeForm.value.robot || selectedMap.value.robot || 1,
@@ -1316,14 +1345,45 @@ async function handleSaveRoute() {
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
     scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
-    // Keep the legacy route-level field for older consumers; actual planner
-    // selection is carried by each waypoint below.
     global_controller: DEFAULT_GLOBAL_CONTROLLER,
   }
+}
+
+function validateRouteDraft({ createOnly = false } = {}) {
+  if (!selectedMap.value || waypoints.value.length === 0) {
+    alert('请选择地图并添加途经点')
+    return false
+  }
+  const pendingYawIndex = waypointYawConfirmed.value.findIndex(confirmed => !confirmed)
+  if (pendingYawIndex >= 0) {
+    alert(`请先确认点${pendingYawIndex + 1}的方向`)
+    return false
+  }
+  const name = String(routeForm.value.name || '').trim()
+  if (!name) {
+    alert('请输入路线名称')
+    return false
+  }
+  const duplicate = routes.value.find(route => (
+    String(route.name || '').trim() === name
+    && (createOnly || !selectedRoute.value?.id || String(route.id) !== String(selectedRoute.value.id))
+  ))
+  if (duplicate) {
+    alert('路线名称已存在，请修改名称后再新建')
+    return false
+  }
+  return true
+}
+
+async function persistRoute({ createOnly = false } = {}) {
+  if (!validateRouteDraft({ createOnly })) return
+
+  const traceId = newPlannerTraceId()
+  const payload = buildRoutePayload()
 
   let savedRoute
   try {
-    savedRoute = selectedRoute.value?.id
+    savedRoute = !createOnly && selectedRoute.value?.id
       ? await updateRoute(selectedRoute.value.id, payload, { traceId })
       : await createRoute(payload, { traceId })
     await loadData()
@@ -1331,7 +1391,10 @@ async function handleSaveRoute() {
     await handleLoadRoute(savedSummary || savedRoute)
   } catch (error) {
     console.error('保存失败:', error)
-    alert('保存失败')
+    const errorCode = Array.isArray(error?.payload?.code) ? error.payload.code[0] : error?.payload?.code
+    alert(errorCode === 'ROUTE_NAME_EXISTS'
+      ? '路线名称已存在，请修改名称后再新建'
+      : (error.message || '保存失败'))
     return
   }
 
@@ -1364,6 +1427,14 @@ async function handleSaveRoute() {
     navCommandBusy.value = ''
     await refreshNavigationStatus()
   }
+}
+
+async function handleSaveRoute() {
+  await persistRoute({ createOnly: false })
+}
+
+async function handleCreateRoute() {
+  await persistRoute({ createOnly: true })
 }
 
 async function handleLoadRoute(route) {
@@ -1476,8 +1547,12 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     global_controller: normalizeGlobalController(point.global_controller || DEFAULT_GLOBAL_CONTROLLER),
     arrival_policy: normalizeArrivalPolicy(point.arrival_policy, point),
     avoidance_to_next: point.avoidance_to_next !== false,
+    detour_enabled: point.detour_enabled !== false && point.avoidance_to_next !== false,
+    collision_slowdown_enabled: point.collision_slowdown_enabled !== false && point.avoidance_to_next !== false,
+    collision_stop_enabled: point.collision_stop_enabled !== false,
     require_yaw: point.require_yaw === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
+    speech_mode: normalizeSpeechMode(point.speech_mode, point),
   }
   const normalized = {
     x: Number(point.x),
@@ -1532,8 +1607,12 @@ function withWaypointYaw(points) {
       global_controller: normalizeGlobalController(current.global_controller || DEFAULT_GLOBAL_CONTROLLER),
       arrival_policy: normalizeArrivalPolicy(current.arrival_policy, current),
       avoidance_to_next: current.avoidance_to_next !== false,
+      detour_enabled: current.detour_enabled !== false && current.avoidance_to_next !== false,
+      collision_slowdown_enabled: current.collision_slowdown_enabled !== false && current.avoidance_to_next !== false,
+      collision_stop_enabled: current.collision_stop_enabled !== false,
       require_yaw: current.require_yaw === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
+      speech_mode: normalizeSpeechMode(current.speech_mode, current),
       speech_text: current.speech_text || '',
     }
   })
@@ -2949,8 +3028,13 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     local_controller: 'mppi',
     global_controller: DEFAULT_GLOBAL_CONTROLLER,
     avoidance_to_next: true,
+    detour_enabled: true,
+    collision_slowdown_enabled: true,
+    collision_stop_enabled: true,
     require_yaw: false,
     dwell_seconds: 0,
+    arrival_policy: 'stop_and_confirm',
+    speech_mode: 'disabled',
   }
 }
 
@@ -3136,7 +3220,18 @@ async function handleDeleteRoute(route) {
                       </label>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
-                        <span>到下个点避障</span>
+                        <span>到下个点避障（绕行+减速；硬急停始终开启）</span>
+                      </label>
+                      <label>
+                        <span>语音模式</span>
+                        <select
+                          :value="point.speech_mode || (point.speech_template_id ? 'blocking' : 'disabled')"
+                          @change="waypoints[index] = { ...point, speech_mode: $event.target.value }"
+                        >
+                          <option value="blocking">阻塞下一段</option>
+                          <option value="non_blocking">非阻塞</option>
+                          <option value="disabled">关闭</option>
+                        </select>
                       </label>
                       <label>
                         <span>局部控制器</span>
@@ -3188,6 +3283,9 @@ async function handleDeleteRoute(route) {
                 <div class="waypoint-actions">
                   <button class="btn btn-primary route-main-action" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
                     保存路线
+                  </button>
+                  <button class="btn btn-secondary" @click="handleCreateRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
+                    新建路线
                   </button>
                   <button class="btn btn-sm btn-danger" @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
                 </div>
@@ -3249,8 +3347,8 @@ async function handleDeleteRoute(route) {
 
           <div class="panel-section route-step-panel route-step-4">
             <div class="route-step-content route-select-content">
-              <select class="route-selector" :value="selectedRoute?.id || ''" @change="handleRouteSelect($event.target.value)">
-                <option value="">请选择已保存路线</option>
+              <select class="route-selector" :value="selectedRoute?.id || NEW_ROUTE_SELECTION" @change="handleRouteSelect($event.target.value)">
+                <option :value="NEW_ROUTE_SELECTION">新建或选择已保存线路</option>
                 <option v-for="route in routes" :key="route.id" :value="route.id">
                   {{ route.name }}（{{ route.waypoint_count }} 个途经点）{{ routeExecutionOptionText(route) }}
                 </option>
@@ -3841,7 +3939,13 @@ async function handleDeleteRoute(route) {
 }
 
 .route-waypoint-column {
-  display: contents;
+  display: flex;
+  grid-column: 4;
+  grid-row: 2 / span 2;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0.45rem;
 }
 
 .route-config-panel {
@@ -3971,10 +4075,11 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-3 {
-  grid-column: 4;
-  grid-row: 2;
+  grid-column: auto;
+  grid-row: auto;
+  flex: 0 0 auto;
   align-self: stretch;
-  min-height: 620px;
+  min-height: 0;
   height: auto;
   max-height: none;
   overflow: hidden;
@@ -4042,10 +4147,10 @@ async function handleDeleteRoute(route) {
 
 .route-step-3 .route-step-content {
   display: flex;
-  flex: 1;
+  flex: 0 0 auto;
   flex-direction: column;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .route-step-3 .waypoint-list {
@@ -4057,7 +4162,7 @@ async function handleDeleteRoute(route) {
 }
 
 .route-step-3 .route-description-under-waypoints {
-  margin-top: auto;
+  margin-top: 0.65rem;
   margin-bottom: 0;
 }
 
@@ -4281,7 +4386,7 @@ async function handleDeleteRoute(route) {
 
 .waypoint-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.5rem;
   margin-top: 0.5rem;
 }
@@ -4916,13 +5021,14 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel {
   display: flex;
-  grid-column: 4;
-  grid-row: 3;
+  grid-column: auto;
+  grid-row: auto;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  max-height: 58px;
+  max-height: none;
   box-sizing: border-box;
-  align-self: start;
+  align-self: stretch;
   padding: 0.85rem;
   border: 1px solid #fed7aa;
   border-radius: 12px;
@@ -4933,7 +5039,7 @@ async function handleDeleteRoute(route) {
 
 .drill-timeline-panel.open {
   min-height: 280px;
-  max-height: 520px;
+  max-height: none;
 }
 
 .drill-timeline-actions {
@@ -6059,6 +6165,16 @@ async function handleDeleteRoute(route) {
   .route-step-3 {
     min-height: 0;
     max-height: none;
+  }
+
+  .route-waypoint-column .route-timeline-column {
+    flex: 0 0 auto;
+    align-self: start;
+    max-height: 58px;
+  }
+
+  .route-waypoint-column .route-timeline-column.open {
+    max-height: 420px;
   }
 
   .route-step-3 .route-step-content {

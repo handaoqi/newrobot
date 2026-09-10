@@ -3941,7 +3941,13 @@ class PatrolRouteListView(APIView):
     def post(self, request):
         serializer = PatrolRouteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        route = serializer.save()
+        try:
+            route = serializer.save()
+        except IntegrityError:
+            return Response(
+                {"code": "ROUTE_NAME_EXISTS", "detail": "路线名称已存在，请修改名称后再新建"},
+                status=status.HTTP_409_CONFLICT,
+            )
         emit_center_log(
             robot=route.robot, level="INFO", module="waypoint", event_code="route.created",
             message=f"路线“{route.name}”已创建",
@@ -3969,7 +3975,13 @@ class PatrolRouteDetailView(APIView):
             before = list(route.waypoints or [])
             serializer = PatrolRouteSerializer(route, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
-            route = serializer.save()
+            try:
+                route = serializer.save()
+            except IntegrityError:
+                return Response(
+                    {"code": "ROUTE_NAME_EXISTS", "detail": "路线名称已存在，请修改名称后再新建"},
+                    status=status.HTTP_409_CONFLICT,
+                )
             emit_center_log(
                 robot=route.robot, level="INFO", module="waypoint", event_code="route.waypoints_updated",
                 message=f"路线“{route.name}”航点配置已更新",

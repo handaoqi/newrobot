@@ -72,7 +72,7 @@ test('saving a route prepares its map, localization and navigation stack', () =>
     new URL('../src/views/RoutePlannerPage.vue', import.meta.url),
   ), 'utf8')
   const saveHandler = source.match(
-    /async function handleSaveRoute\(\) \{([\s\S]*?)\n\}\n\nasync function handleLoadRoute/,
+    /async function persistRoute\(\{ createOnly = false \} = \{\}\) \{([\s\S]*?)\n\}\n\nasync function handleSaveRoute/,
   )?.[1] || ''
 
   assert.match(saveHandler, /await activateAndRelocalizeMap\(/)

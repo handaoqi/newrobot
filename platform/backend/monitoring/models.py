@@ -672,7 +672,7 @@ class MapSetMember(BaseTimestampModel):
 
 class PatrolRoute(BaseTimestampModel):
     """巡逻路线模型"""
-    name = models.CharField(max_length=128, verbose_name="路线名称")
+    name = models.CharField(max_length=128, unique=True, verbose_name="路线名称")
     map_data = models.ForeignKey(MapData, on_delete=models.CASCADE, verbose_name="关联地图", related_name="routes")
     map_set = models.ForeignKey(MapSet, on_delete=models.SET_NULL, null=True, blank=True, related_name="routes")
     robot = models.ForeignKey(Robot, on_delete=models.CASCADE, verbose_name="关联机器人", related_name="routes")
