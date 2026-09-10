@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from .message_handlers import handle_mqtt_message
 from .models import (
+    InboundMessage,
     InspectionEvent,
     MapData,
     PatrolRoute,
@@ -17,8 +18,10 @@ from .models import (
     SpeechTemplate,
     TaskExecution,
     TaskExecutionEvent,
+    TrajectoryBatchReceipt,
     TrajectoryPoint,
 )
+from .protocol import ProtocolError
 from .services.command_service import CommandService
 from .services.task_service import TaskExecutionService
 
@@ -270,6 +273,7 @@ class MessageHandlerTests(TestCase):
                 "speech_template_id": template.id,
                 "speech_template_name": template.name,
                 "speech_text": template.text,
+                "speech_mode": "blocking",
             }
         )
         self.execution.route_snapshot = snapshot
@@ -361,6 +365,7 @@ class MessageHandlerTests(TestCase):
                 "speech_template_id": template.id,
                 "speech_template_name": template.name,
                 "speech_text": template.text,
+                "speech_mode": "blocking",
             }
         )
         self.execution.route_snapshot = snapshot
@@ -435,6 +440,138 @@ class MessageHandlerTests(TestCase):
         duplicate = self.envelope("trajectory.batch", payload, sequence=2)
         handle_mqtt_message("robots/rx-001/telemetry/trajectory", duplicate)
         self.assertEqual(TrajectoryPoint.objects.count(), 2)
+
+    def test_trajectory_ack_is_published_after_commit(self):
+        payload = {
+            "task_execution_id": str(self.execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(uuid.uuid4()),
+            "first_seq": 0,
+            "last_seq": 0,
+            "points": [
+                {
+                    "seq": 0,
+                    "sampled_at": timezone.now().isoformat(),
+                    "x": 1.0,
+                    "y": 2.0,
+                    "yaw": 0.0,
+                    "speed_mps": 0.2,
+                    "localization_status": "normal",
+                },
+            ],
+        }
+        published = []
+        with self.captureOnCommitCallbacks(execute=True):
+            handle_mqtt_message(
+                "robots/rx-001/telemetry/trajectory",
+                self.envelope("trajectory.batch", payload),
+                lambda topic, message, qos, retain: published.append((topic, message)),
+            )
+
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0][0], "robots/rx-001/sync/state")
+        self.assertTrue(published[0][1]["payload"]["accepted"])
+
+    def test_trajectory_batch_skips_inbound_audit_table(self):
+        payload = {
+            "task_execution_id": str(self.execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(uuid.uuid4()),
+            "first_seq": 0,
+            "last_seq": 0,
+            "points": [
+                {
+                    "seq": 0,
+                    "sampled_at": timezone.now().isoformat(),
+                    "x": 1.0,
+                    "y": 2.0,
+                    "yaw": 0.0,
+                    "speed_mps": 0.2,
+                    "localization_status": "normal",
+                },
+            ],
+        }
+        handle_mqtt_message("robots/rx-001/telemetry/trajectory", self.envelope("trajectory.batch", payload))
+        self.assertEqual(TrajectoryPoint.objects.count(), 1)
+        self.assertEqual(TrajectoryBatchReceipt.objects.count(), 1)
+        self.assertFalse(InboundMessage.objects.filter(message_type="trajectory.batch").exists())
+
+    def test_unknown_task_execution_does_not_record_inbound_or_points(self):
+        payload = {
+            "task_execution_id": str(uuid.uuid4()),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(uuid.uuid4()),
+            "first_seq": 0,
+            "last_seq": 0,
+            "points": [
+                {
+                    "seq": 0,
+                    "sampled_at": timezone.now().isoformat(),
+                    "x": 1.0,
+                    "y": 2.0,
+                    "yaw": 0.0,
+                    "speed_mps": 0.2,
+                    "localization_status": "normal",
+                },
+            ],
+        }
+        with self.assertRaises(ProtocolError) as ctx:
+            handle_mqtt_message("robots/rx-001/telemetry/trajectory", self.envelope("trajectory.batch", payload))
+        self.assertEqual(ctx.exception.code, "UNKNOWN_TASK_EXECUTION")
+        self.assertEqual(TrajectoryPoint.objects.count(), 0)
+        self.assertEqual(TrajectoryBatchReceipt.objects.count(), 0)
+        self.assertEqual(InboundMessage.objects.count(), 0)
+
+    def test_unknown_command_persists_failed_inbound_after_rollback(self):
+        ack = self.envelope(
+            "command.ack",
+            {
+                "command_id": str(uuid.uuid4()),
+                "task_execution_id": str(self.execution.id),
+                "ack": "accepted",
+                "acknowledged_at": timezone.now().isoformat(),
+                "reason_code": None,
+                "reason_message": None,
+                "duplicate": False,
+                "edge_state_version": 2,
+            },
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+        self.assertEqual(ctx.exception.code, "UNKNOWN_COMMAND")
+        inbound = InboundMessage.objects.get()
+        self.assertEqual(inbound.process_status, "failed")
+        self.assertIn("command not found", inbound.error_message)
+
+    def test_processed_inbound_integrity_error_is_treated_as_duplicate(self):
+        from django.db import IntegrityError
+
+        ack = self.envelope(
+            "command.ack",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "ack": "accepted",
+                "acknowledged_at": timezone.now().isoformat(),
+                "reason_code": None,
+                "reason_message": None,
+                "duplicate": False,
+                "edge_state_version": 2,
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+        with patch(
+            "monitoring.message_handlers.InboundMessage.objects.get_or_create",
+            side_effect=IntegrityError("UNIQUE constraint failed"),
+        ):
+            result = handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+        self.assertEqual(result["duplicate"], True)
 
     def test_bicycle_alert_event_id_is_idempotent(self):
         event_id = str(uuid.uuid4())

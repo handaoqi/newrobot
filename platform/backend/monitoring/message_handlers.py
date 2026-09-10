@@ -30,6 +30,7 @@ from .services.alert_service import AlertService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services.telemetry_service import TelemetryService
 from .services.system_log_service import emit_center_log, ingest_batch
+from .services.sqlite_retry import is_sqlite_lock_error, with_sqlite_lock_retry
 from .services import tts_service
 from .services.alert_skill_service import resolve_alert_template
 
@@ -65,6 +66,8 @@ def _queue_waypoint_speech(
     if waypoint_index < 0 or waypoint_index >= len(waypoints):
         return None
     waypoint = waypoints[waypoint_index]
+    if str(waypoint.get("speech_mode") or "").strip().lower() == "disabled":
+        return None
     template_id = waypoint.get("speech_template_id")
     if not template_id:
         return None
@@ -135,6 +138,7 @@ def _queue_mapping_divergence_speech(robot: Robot, payload: dict):
             "text": MAPPING_DIVERGED_SPEECH,
             "source": "mapping_divergence_speech",
             "dual_output": True,
+            "allow_single_fallback": True,
             "content_type": "audio/mpeg",
             "tts_cache_hit": cache_hit,
             "mapping_session_id": session_id,
@@ -182,6 +186,7 @@ def _queue_low_battery_alert_speech(robot: Robot, payload: dict):
             "source": "low_battery_alert_speech",
             "alert_skill": "low_battery_return_charge",
             "dual_output": True,
+            "allow_single_fallback": True,
             "priority": "critical",
             "content_type": "audio/mpeg",
             "tts_cache_hit": cache_hit,
@@ -237,6 +242,7 @@ def _queue_obstacle_speech(execution: TaskExecution, robot: Robot, payload: dict
             "source": "patrol_obstacle_speech",
             "alert_skill": skill_key,
             "dual_output": True,
+            "allow_single_fallback": True,
             "content_type": "audio/mpeg",
             "tts_cache_hit": cache_hit,
             "task_execution_id": str(execution.id),
@@ -257,25 +263,54 @@ def _event_time(payload: dict, *keys: str):
     return timezone.now()
 
 
+def _inbound_defaults(topic: str, envelope: MessageEnvelope, robot: Robot) -> dict:
+    return {
+        "robot": robot,
+        "session_id": uuid.UUID(envelope.session_id),
+        "message_type": envelope.message_type,
+        "sequence": envelope.sequence,
+        "topic": topic,
+        "raw_payload": envelope.raw,
+    }
+
+
 def _record_inbound(topic: str, envelope: MessageEnvelope, robot: Robot) -> tuple[InboundMessage, bool]:
     try:
-        message, created = InboundMessage.objects.get_or_create(
-            message_id=envelope.message_id,
-            defaults={
-                "robot": robot,
-                "session_id": uuid.UUID(envelope.session_id),
-                "message_type": envelope.message_type,
-                "sequence": envelope.sequence,
-                "topic": topic,
-                "raw_payload": envelope.raw,
-            },
-        )
+        try:
+            return InboundMessage.objects.get_or_create(
+                message_id=envelope.message_id,
+                defaults=_inbound_defaults(topic, envelope, robot),
+            )
+        except IntegrityError:
+            return InboundMessage.objects.get(message_id=envelope.message_id), False
     except ValueError as exc:
         raise ProtocolError("INVALID_MESSAGE", "session_id must be UUID for Edge uplink") from exc
-    return message, created
 
 
-def handle_mqtt_message(
+def _persist_inbound_failure(
+    topic: str,
+    envelope: MessageEnvelope,
+    robot: Robot,
+    exc: BaseException,
+) -> None:
+    """Commit a failed audit row after the processing transaction rolled back."""
+
+    try:
+        with transaction.atomic():
+            InboundMessage.objects.update_or_create(
+                message_id=envelope.message_id,
+                defaults={
+                    **_inbound_defaults(topic, envelope, robot),
+                    "process_status": "failed",
+                    "error_message": str(exc),
+                    "processed_at": timezone.now(),
+                },
+            )
+    except Exception:
+        LOGGER.exception("failed to persist inbound failure message_id=%s", envelope.message_id)
+
+
+def _handle_mqtt_message_once(
     topic: str,
     raw_payload: bytes | str | dict,
     publish_response: ResponsePublisher | None = None,
@@ -285,22 +320,38 @@ def handle_mqtt_message(
     if robot is None:
         raise ProtocolError("UNKNOWN_ROBOT", f"unknown robot: {envelope.robot_id}")
 
-    with transaction.atomic():
-        inbound, created = _record_inbound(topic, envelope, robot)
-        if not created:
-            return {"duplicate": True, "message_id": str(envelope.message_id)}
-        try:
+    # Trajectory batches already have TrajectoryBatchReceipt for idempotency.
+    # Writing the full point list into InboundMessage first holds the SQLite
+    # writer lock and is the usual reason points never land.
+    if envelope.message_type == "trajectory.batch":
+        return _handle_trajectory(envelope, robot, publish_response)
+
+    try:
+        with transaction.atomic():
+            inbound, created = _record_inbound(topic, envelope, robot)
+            if not created and inbound.process_status == "processed":
+                return {"duplicate": True, "message_id": str(envelope.message_id)}
             result = _dispatch(envelope, robot, publish_response)
             inbound.process_status = "processed"
             inbound.processed_at = timezone.now()
-            inbound.save(update_fields=["process_status", "processed_at"])
+            inbound.error_message = ""
+            inbound.save(update_fields=["process_status", "processed_at", "error_message"])
             return result
-        except Exception as exc:
-            inbound.process_status = "failed"
-            inbound.error_message = str(exc)
-            inbound.processed_at = timezone.now()
-            inbound.save(update_fields=["process_status", "error_message", "processed_at"])
-            raise
+    except Exception as exc:
+        if not is_sqlite_lock_error(exc):
+            _persist_inbound_failure(topic, envelope, robot, exc)
+        raise
+
+
+def handle_mqtt_message(
+    topic: str,
+    raw_payload: bytes | str | dict,
+    publish_response: ResponsePublisher | None = None,
+) -> dict:
+    return with_sqlite_lock_retry(
+        lambda: _handle_mqtt_message_once(topic, raw_payload, publish_response),
+        label=f"MQTT {topic}",
+    )
 
 
 def _dispatch(
@@ -680,6 +731,60 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
             {"type": "obstacle_speech", "payload": payload, "audio_command_id": command.id if command else None},
         )
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
+    if envelope.message_type in {
+        "task.arrival_pending_settle",
+        "task.arrival_correcting",
+        "task.recovery_active",
+        "task.waypoint_actions",
+    }:
+        realtime_publisher.publish_task_event(
+            str(execution.id),
+            {"type": envelope.message_type.removeprefix("task."), "payload": payload},
+        )
+        emit_center_log(
+            robot=robot,
+            level="INFO",
+            module="navigation",
+            event_code=envelope.message_type,
+            message=str(payload.get("reason_message") or envelope.message_type),
+            data=payload,
+            task_execution=execution,
+            dedupe_seconds=2,
+        )
+        return {"state": execution.state, "state_version": execution.state_version}
+    if envelope.message_type == "task.safe_hold":
+        incoming_version = int(payload.get("state_version") or execution.state_version + 1)
+        if incoming_version > execution.state_version and execution.state not in {
+            "paused", "failed", "cancelled", "completed",
+        }:
+            try:
+                execution = TaskExecutionService.transition(
+                    execution,
+                    "paused",
+                    event_type="task.safe_hold",
+                    state_version=incoming_version,
+                    occurred_at=_event_time(payload, "occurred_at", "reported_at"),
+                    message_id=envelope.message_id,
+                    reason_code=payload.get("reason_code") or "SAFE_HOLD",
+                    reason_message=payload.get("reason_message") or "安全保持",
+                    payload=payload,
+                )
+            except TaskStateError:
+                pass
+        realtime_publisher.publish_task_event(
+            str(execution.id),
+            {"type": "safe_hold", "payload": payload},
+        )
+        emit_center_log(
+            robot=robot,
+            level="WARNING",
+            module="navigation",
+            event_code="task.safe_hold",
+            message=str(payload.get("reason_message") or "安全保持"),
+            data=payload,
+            task_execution=execution,
+        )
+        return {"state": execution.state, "state_version": execution.state_version}
     if envelope.message_type == "task.round_started":
         execution.round_number = max(execution.round_number, int(payload.get("round_number") or execution.round_number))
         execution.state_version = max(execution.state_version, int(payload.get("state_version") or execution.state_version))
@@ -689,7 +794,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
     if envelope.message_type == "task.progress":
         execution = TaskExecutionService.apply_progress(execution, payload)
         milestone = str(payload.get("milestone") or "")
-        if milestone in {"target_dispatched", "waypoint_reached"} and execution.state_version == int(payload["state_version"]):
+        if milestone in {"target_dispatched", "waypoint_reached", "arrival_confirmed", "waypoint_passed"} and execution.state_version == int(payload["state_version"]):
             TaskExecutionEvent.objects.get_or_create(
                 task_execution=execution,
                 state_version=execution.state_version,
@@ -701,7 +806,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
                     "payload": payload,
                 },
             )
-        if milestone == "waypoint_reached":
+        if milestone in {"waypoint_reached", "arrival_confirmed"}:
             waypoint = payload.get("waypoint") or {}
             _queue_waypoint_speech(
                 execution,
@@ -731,11 +836,11 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
                 raise
     if envelope.message_type == "task.progress":
         milestone = str(payload.get("milestone") or "progress")
-        module = "waypoint" if milestone == "waypoint_reached" else "navigation"
+        module = "waypoint" if milestone in {"waypoint_reached", "arrival_confirmed"} else "navigation"
         emit_center_log(
             robot=robot, level="INFO", module=module,
             event_code=f"{module}.{milestone}",
-            message="航点已到达" if milestone == "waypoint_reached" else "导航任务进度更新",
+            message="航点已到达" if milestone in {"waypoint_reached", "arrival_confirmed"} else "导航任务进度更新",
             data=payload, task_execution=execution,
             waypoint_index=(
                 payload.get("execution_waypoint_index")
@@ -759,6 +864,17 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
     return {"state": execution.state, "state_version": execution.state_version}
 
 
+def _trajectory_result(receipt: TrajectoryBatchReceipt, *, duplicate: bool) -> dict:
+    return {
+        "task_execution_id": str(receipt.task_execution_id),
+        "batch_id": str(receipt.batch_id),
+        "accepted_first_seq": receipt.first_seq,
+        "accepted_last_seq": receipt.last_seq,
+        "duplicate": duplicate,
+        "accepted": True,
+    }
+
+
 def _handle_trajectory(
     envelope: MessageEnvelope,
     robot: Robot,
@@ -766,58 +882,64 @@ def _handle_trajectory(
 ) -> dict:
     payload = envelope.payload
     batch_id = uuid.UUID(str(payload["batch_id"]))
-    existing = TrajectoryBatchReceipt.objects.filter(batch_id=batch_id).first()
-    if existing:
-        result = {
-            "task_execution_id": str(existing.task_execution_id),
-            "batch_id": str(existing.batch_id),
-            "accepted_first_seq": existing.first_seq,
-            "accepted_last_seq": existing.last_seq,
-            "duplicate": True,
-        }
-        _publish_trajectory_ack(robot, envelope, result, publish_response)
-        return result
-    try:
-        execution = TaskExecution.objects.get(pk=payload["task_execution_id"], robot=robot)
-    except TaskExecution.DoesNotExist as exc:
-        raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
-    points = [
-        TrajectoryPoint(
-            robot=robot,
-            task_execution=execution,
-            seq=point["seq"],
-            sampled_at=point["sampled_at"],
-            frame_id=payload.get("frame_id", "map"),
-            map_id=payload.get("map_id", ""),
-            map_version=payload.get("map_version", ""),
-            x=point["x"],
-            y=point["y"],
-            yaw=point["yaw"],
-            speed_mps=point.get("speed_mps"),
-            localization_status=point["localization_status"],
-            batch_id=batch_id,
+    with transaction.atomic():
+        existing = TrajectoryBatchReceipt.objects.filter(batch_id=batch_id).first()
+        if existing:
+            result = _trajectory_result(existing, duplicate=True)
+            transaction.on_commit(
+                lambda: _publish_trajectory_ack(robot, envelope, result, publish_response)
+            )
+            return result
+        try:
+            execution = TaskExecution.objects.get(pk=payload["task_execution_id"], robot=robot)
+        except TaskExecution.DoesNotExist as exc:
+            raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
+        points = [
+            TrajectoryPoint(
+                robot=robot,
+                task_execution=execution,
+                seq=point["seq"],
+                sampled_at=point["sampled_at"],
+                frame_id=payload.get("frame_id", "map"),
+                map_id=payload.get("map_id", ""),
+                map_version=payload.get("map_version", ""),
+                x=point["x"],
+                y=point["y"],
+                yaw=point["yaw"],
+                speed_mps=point.get("speed_mps"),
+                localization_status=point["localization_status"],
+                batch_id=batch_id,
+            )
+            for point in payload["points"]
+        ]
+        try:
+            with transaction.atomic():
+                TrajectoryPoint.objects.bulk_create(points, ignore_conflicts=True)
+                receipt = TrajectoryBatchReceipt.objects.create(
+                    batch_id=batch_id,
+                    robot=robot,
+                    task_execution=execution,
+                    first_seq=payload["first_seq"],
+                    last_seq=payload["last_seq"],
+                    point_count=len(points),
+                )
+                duplicate = False
+        except IntegrityError:
+            receipt = TrajectoryBatchReceipt.objects.filter(batch_id=batch_id).first()
+            if receipt is None:
+                raise
+            duplicate = True
+        result = _trajectory_result(receipt, duplicate=duplicate)
+        transaction.on_commit(
+            lambda: _publish_trajectory_ack(robot, envelope, result, publish_response)
         )
-        for point in payload["points"]
-    ]
-    TrajectoryPoint.objects.bulk_create(points, ignore_conflicts=True)
-    receipt = TrajectoryBatchReceipt.objects.create(
-        batch_id=batch_id,
-        robot=robot,
-        task_execution=execution,
-        first_seq=payload["first_seq"],
-        last_seq=payload["last_seq"],
-        point_count=len(points),
-    )
-    result = {
-        "task_execution_id": str(execution.id),
-        "batch_id": str(receipt.batch_id),
-        "accepted_first_seq": receipt.first_seq,
-        "accepted_last_seq": receipt.last_seq,
-        "duplicate": False,
-    }
-    _publish_trajectory_ack(robot, envelope, result, publish_response)
-    realtime_publisher.publish_task_event(str(execution.id), {"type": "trajectory.updated", **result})
-    return result
+        if not duplicate:
+            transaction.on_commit(
+                lambda: realtime_publisher.publish_task_event(
+                    str(execution.id), {"type": "trajectory.updated", **result}
+                )
+            )
+        return result
 
 
 def _publish_trajectory_ack(

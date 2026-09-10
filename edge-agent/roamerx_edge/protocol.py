@@ -173,13 +173,17 @@ def validate_command(envelope: MessageEnvelope) -> None:
             for field in ("x", "y", "yaw"):
                 if isinstance(waypoint.get(field), bool) or not isinstance(waypoint.get(field), (int, float)):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be numeric")
-            for field in ("avoidance_to_next", "require_yaw"):
+            for field in ("avoidance_to_next", "require_yaw", "detour_enabled", "collision_slowdown_enabled", "collision_stop_enabled"):
                 if field in waypoint and not isinstance(waypoint[field], bool):
                     raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
             if "arrival_policy" in waypoint and str(waypoint["arrival_policy"]).lower() not in {
                 "pass_through", "stop_and_confirm", "precision", "dock",
             }:
                 raise ProtocolError("INVALID_MESSAGE", "waypoint arrival_policy is invalid")
+            if "speech_mode" in waypoint and str(waypoint["speech_mode"]).lower() not in {
+                "blocking", "non_blocking", "disabled",
+            }:
+                raise ProtocolError("INVALID_MESSAGE", "waypoint speech_mode is invalid")
             if "local_controller" in waypoint:
                 mode = str(waypoint["local_controller"]).lower()
                 if mode not in {"mppi", "rpp"}:

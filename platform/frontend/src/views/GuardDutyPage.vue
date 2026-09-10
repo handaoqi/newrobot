@@ -52,7 +52,9 @@ import {
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import {
   ensureGuardDutyLoopNavigationReady,
+  guardDutyLoopRepairFailureMessage,
   loopRestMilliseconds,
+  waitForGuardDutyLoopRepair,
 } from '../services/guardDutyLoopNavRepair'
 import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
 import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
@@ -62,6 +64,10 @@ import {
   guardDutyRouteState,
   guardDutyWaypointStates,
 } from '../utils/guardDutyWaypointState'
+import {
+  calculateTrajectoryDistance,
+  displayedGuardDutyDistance,
+} from '../utils/guardDutyDistance'
 
 const overview = ref(null)
 const robots = ref([])
@@ -187,10 +193,17 @@ const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
 const currentExecutionDistance = computed(() => calculateTrajectoryDistance(trajectory.value))
 const currentMovementSpeed = computed(() => calculateCurrentSpeed(trajectory.value))
 const displayedTotalDistance = computed(() => {
-  const counted = loopCountedExecutionIds.value.includes(String(execution.value?.id || ''))
-  if (!loopStartedAt.value) return currentExecutionDistance.value
-  const currentBelongsToLoop = String(execution.value?.id || '') === String(loopCurrentExecutionId.value || '')
-  return loopAccumulatedDistance.value + (currentBelongsToLoop && !counted ? currentExecutionDistance.value : 0)
+  return displayedGuardDutyDistance({
+    currentDistance: currentExecutionDistance.value,
+    currentExecutionId: execution.value?.id,
+    executionLoopSessionId: execution.value?.loop_session_id,
+    loopStartedAt: loopStartedAt.value,
+    loopSessionId: loopSessionId.value,
+    loopActive: loopActive.value,
+    loopAccumulatedDistance: loopAccumulatedDistance.value,
+    loopCountedExecutionIds: loopCountedExecutionIds.value,
+    loopCurrentExecutionId: loopCurrentExecutionId.value,
+  })
 })
 const elapsedMilliseconds = computed(() => {
   if (loopStartedAt.value) {
@@ -336,18 +349,6 @@ function formatDuration(milliseconds) {
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
   return [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':')
-}
-
-function calculateTrajectoryDistance(points) {
-  let distance = 0
-  for (let index = 1; index < points.length; index += 1) {
-    const previous = points[index - 1]
-    const current = points[index]
-    if (previous.map_id && current.map_id && String(previous.map_id) !== String(current.map_id)) continue
-    const segment = Math.hypot(Number(current.x) - Number(previous.x), Number(current.y) - Number(previous.y))
-    if (Number.isFinite(segment) && segment >= 0 && segment <= 10) distance += segment
-  }
-  return distance
 }
 
 function calculateCurrentSpeed(points) {
@@ -514,15 +515,26 @@ async function chooseRobot(robotId) {
 }
 
 async function load() {
-  const [overviewResult, robotResult, taskResult] = await Promise.all([
-    fetchOverview(),
+  // The overview endpoint also loads the large event summary and can take
+  // several seconds. It must not delay task/trajectory restoration, otherwise
+  // the page shows its default 0 m state while the real execution is already
+  // available from the lighter endpoints.
+  const overviewPromise = fetchOverview()
+    .then((result) => {
+      overview.value = result
+      return result
+    })
+    .catch((error) => {
+      console.warn('值守概览刷新失败:', error)
+      return null
+    })
+  const [robotResult, taskResult] = await Promise.all([
     fetchRobots(),
     fetchPatrolTasks(),
   ])
-  overview.value = overviewResult
   robots.value = robotResult
   tasks.value = taskResult
-  const robotId = overviewResult.latest_robot?.id || robotResult[0]?.id
+  const robotId = robotResult[0]?.id
   if (robotId && selectedRobot.value?.id !== robotId) await chooseRobot(robotId)
   const availableTasks = guardDutyTaskOptions(taskResult, robotId)
   if (!availableTasks.some((task) => String(task.id) === String(selectedTaskId.value))) {
@@ -532,6 +544,7 @@ async function load() {
   reconcileLowBatteryState()
   await restoreExecution(taskResult, robotId)
   await refreshExecutionVisual()
+  void overviewPromise
 }
 
 function startExecutionPolling() {
@@ -896,7 +909,7 @@ async function launchTask({ fromLoop = false } = {}) {
         return null
       }
     } catch (error) {
-      showToast(error.message || '定位或导航栈未就绪，本轮稍后重试', { variant: 'alert' })
+      showToast(guardDutyLoopRepairFailureMessage(error), { variant: 'alert' })
       return null
     }
   }
@@ -949,11 +962,20 @@ async function startTask() {
 
 async function captureLoopDistance() {
   const executionId = String(loopCurrentExecutionId.value || '')
-  if (!executionId || loopCountedExecutionIds.value.includes(executionId)) return
-  if (String(trajectoryExecutionId.value) !== executionId) await refreshExecutionVisual()
-  loopAccumulatedDistance.value += calculateTrajectoryDistance(trajectory.value)
+  if (!executionId || loopCountedExecutionIds.value.includes(executionId)) return true
+  // The task can become terminal before the last trajectory batches arrive at
+  // the cloud. Always refresh here so the first capture cannot freeze 0 m.
+  await refreshExecutionVisual()
+  const distance = calculateTrajectoryDistance(trajectory.value)
+  if (trajectory.value.length < 2 && distance <= 0) {
+    loopMessage.value = '本轮轨迹数据同步中，稍后重试'
+    persistLoopState()
+    return false
+  }
+  loopAccumulatedDistance.value += distance
   loopCountedExecutionIds.value = [...loopCountedExecutionIds.value, executionId].slice(-100)
   persistLoopState()
+  return true
 }
 
 function scheduleNextLoopRound(message = '', { shortRetry = false } = {}) {
@@ -1024,7 +1046,7 @@ async function startLoopRestNavigationRepair() {
   } catch (error) {
     if (token !== loopNavRepairToken || !loopActive.value) return
     if (loopState.value === 'resting') {
-      loopMessage.value = `轮次休息维护失败：${error.message || '请检查导航栈'}，休息结束后将重试`
+      loopMessage.value = guardDutyLoopRepairFailureMessage(error, { duringRest: true })
       persistLoopState()
     }
   } finally {
@@ -1049,7 +1071,7 @@ async function runLoopCycle() {
         persistLoopState()
         return
       }
-      await captureLoopDistance()
+      if (!await captureLoopDistance()) return
       finishLoop('循环巡检已按设定时长完成')
       return
     }
@@ -1059,9 +1081,42 @@ async function runLoopCycle() {
       loopState.value = 'starting'
       loopMessage.value = '休息结束，正在确认导航/定位就绪'
       persistLoopState()
-      while (loopNavRepairBusy && loopActive.value) {
-        await sleep(500)
+      if (loopNavRepairBusy) {
+        let repairGate
+        try {
+          repairGate = await waitForGuardDutyLoopRepair({
+            isBusy: () => loopNavRepairBusy && loopActive.value,
+            fetchStatus: () => fetchRobotNavigationStatus(latestRobot.value.id),
+            isReady: (status) => navigationReadyForMap(
+              status,
+              loopTargetMapId(),
+              expectedLegacyMapVersion(loopTargetMapId()),
+            ),
+            onProgress: (message) => {
+              if (loopActive.value) loopMessage.value = message
+            },
+          })
+        } catch (error) {
+          if (loopActive.value) {
+            scheduleNextLoopRound(guardDutyLoopRepairFailureMessage(error), { shortRetry: true })
+          }
+          return
+        }
         if (!loopActive.value) return
+        if (repairGate.status) {
+          navigationStatus.value = repairGate.status
+          syncLocalizationState(repairGate.status)
+        }
+        if (!repairGate.ok) {
+          scheduleNextLoopRound('导航维护仍在执行，短间隔后重新检查', { shortRetry: true })
+          return
+        }
+        if (repairGate.supersede) {
+          // The device is already ready; detach the stale page-side repair
+          // promise so it cannot keep the loop in `starting`.
+          loopNavRepairToken += 1
+          loopNavRepairBusy = false
+        }
       }
       try {
         const readiness = await ensureLoopNavigationReady((message) => {
@@ -1077,10 +1132,7 @@ async function runLoopCycle() {
         }
       } catch (error) {
         if (loopActive.value) {
-          scheduleNextLoopRound(
-            `导航栈修复失败：${error.message || '未知错误'}，短间隔后重试`,
-            { shortRetry: true },
-          )
+          scheduleNextLoopRound(guardDutyLoopRepairFailureMessage(error), { shortRetry: true })
         }
         return
       }
@@ -1097,7 +1149,7 @@ async function runLoopCycle() {
     }
 
     if (loopCurrentExecutionId.value && String(execution.value?.id || '') === String(loopCurrentExecutionId.value)) {
-      await captureLoopDistance()
+      if (!await captureLoopDistance()) return
       scheduleNextLoopRound(execution.value?.state === 'completed'
         ? `第 ${loopRounds.value} 轮完成，进入休息并维护导航栈`
         : `第 ${loopRounds.value} 轮已结束，休息中维护导航栈后继续`)

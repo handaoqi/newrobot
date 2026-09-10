@@ -48,6 +48,7 @@ class TelemetryConfig:
     heartbeat_interval_seconds: float = 10
     trajectory_flush_seconds: float = 5
     trajectory_batch_size: int = 20
+    trajectory_replay_batch_size: int = 20
     system_probe_interval_seconds: float = 10
     cooling_system_probe_interval_seconds: float = 15
     system_probe_stale_seconds: float = 30

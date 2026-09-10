@@ -227,7 +227,8 @@ class EdgeMqttClient:
         sent = 0
         if not self._connected.is_set():
             return sent
-        for row in self.store.list_pending_outbox():
+        limit = max(1, int(getattr(self.config.telemetry, "trajectory_replay_batch_size", 20)))
+        for row in self.store.list_pending_outbox(limit=limit):
             info = self.client.publish(
                 row["topic"],
                 encode_message(row["payload"]),

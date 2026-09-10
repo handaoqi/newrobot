@@ -17,6 +17,14 @@ GLOBAL_CONTROLLER_PLUGIN_IDS = {
     "navfn": "NavFn",
 }
 
+# Page/API combinations that this robot build statically registers.
+SUPPORTED_NAVIGATION_COMBOS = (
+    ("theta_star", "mppi"),
+    ("theta_star", "rpp"),
+    ("navfn", "mppi"),
+    ("navfn", "rpp"),
+)
+
 
 def normalize_local_controller(value: object | None) -> str:
     normalized = str(value or DEFAULT_LOCAL_CONTROLLER).strip().lower()
@@ -34,3 +42,17 @@ def local_controller_plugin_id(value: object | None) -> str:
 
 def global_controller_plugin_id(value: object | None) -> str:
     return GLOBAL_CONTROLLER_PLUGIN_IDS[normalize_global_controller(value)]
+
+
+def navigation_capabilities() -> dict:
+    """Static capability report for the plugins registered in navigo_params."""
+    return {
+        "global_controllers": sorted(GLOBAL_CONTROLLERS),
+        "local_controllers": sorted(LOCAL_CONTROLLERS),
+        "global_plugin_ids": dict(GLOBAL_CONTROLLER_PLUGIN_IDS),
+        "local_plugin_ids": dict(LOCAL_CONTROLLER_PLUGIN_IDS),
+        "supported_combos": [
+            {"global_controller": global_name, "local_controller": local_name}
+            for global_name, local_name in SUPPORTED_NAVIGATION_COMBOS
+        ],
+    }

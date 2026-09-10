@@ -97,12 +97,20 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 raw.get("global_controller") or route_global_controller
             )
             avoidance_to_next = bool(raw.get("avoidance_to_next", True))
+            detour_enabled = bool(raw.get("detour_enabled", avoidance_to_next))
+            collision_slowdown_enabled = bool(
+                raw.get("collision_slowdown_enabled", avoidance_to_next)
+            )
+            collision_stop_enabled = bool(raw.get("collision_stop_enabled", True))
             require_yaw = bool(raw.get("require_yaw", False))
             arrival_policy = _normalize_arrival_policy(
                 raw.get("arrival_policy"), dwell_seconds=dwell_seconds,
                 require_yaw=require_yaw, actions=actions,
                 is_last=index == len(route.waypoints or []) - 1,
             )
+            speech_mode = str(raw.get("speech_mode") or "").strip().lower()
+            if speech_mode not in {"blocking", "non_blocking", "disabled"}:
+                speech_mode = "blocking" if speech_template_id not in (None, "") else "disabled"
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
             x, y = raw[0], raw[1]
             yaw = raw[2] if len(raw) >= 3 else 0.0
@@ -118,7 +126,11 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             local_controller = "mppi"
             global_controller = route_global_controller
             avoidance_to_next = True
+            detour_enabled = True
+            collision_slowdown_enabled = True
+            collision_stop_enabled = True
             require_yaw = False
+            speech_mode = "disabled"
             arrival_policy = _normalize_arrival_policy(
                 None, dwell_seconds=0, require_yaw=False, actions=[],
                 is_last=index == len(route.waypoints or []) - 1,
@@ -139,8 +151,12 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "local_controller": local_controller,
                 "global_controller": global_controller,
                 "avoidance_to_next": avoidance_to_next,
+                "detour_enabled": detour_enabled,
+                "collision_slowdown_enabled": collision_slowdown_enabled,
+                "collision_stop_enabled": collision_stop_enabled,
                 "require_yaw": require_yaw,
                 "arrival_policy": arrival_policy,
+                "speech_mode": speech_mode,
             }
         if speech_template_id not in (None, ""):
             waypoint.update(

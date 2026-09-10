@@ -13,6 +13,7 @@ class LegProfile:
     detour_enabled: bool
     collision_slowdown_enabled: bool = True
     collision_stop_enabled: bool = True
+    speed_profile: str = "cruise"
     goal_checker_id: str = "general_goal_checker"
     arrival_policy: str = "stop_and_confirm"
 

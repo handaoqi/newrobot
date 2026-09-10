@@ -97,6 +97,11 @@ UPLINK_MESSAGE_TYPES = {
     "task.failed",
     "task.cancelled",
     "task.interrupted",
+    "task.arrival_pending_settle",
+    "task.arrival_correcting",
+    "task.recovery_active",
+    "task.safe_hold",
+    "task.waypoint_actions",
     "alert.event",
     "system.log.batch",
     "sync.request",
@@ -271,13 +276,17 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         for coordinate in ("x", "y", "yaw"):
             if isinstance(waypoint.get(coordinate), bool) or not isinstance(waypoint.get(coordinate), (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {coordinate} must be numeric")
-        for field in ("avoidance_to_next", "require_yaw"):
+        for field in ("avoidance_to_next", "require_yaw", "detour_enabled", "collision_slowdown_enabled", "collision_stop_enabled"):
             if field in waypoint and not isinstance(waypoint[field], bool):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
         if "arrival_policy" in waypoint and str(waypoint["arrival_policy"]).lower() not in {
             "pass_through", "stop_and_confirm", "precision", "dock",
         }:
             raise ProtocolError("INVALID_MESSAGE", "waypoint arrival_policy is invalid")
+        if "speech_mode" in waypoint and str(waypoint["speech_mode"]).lower() not in {
+            "blocking", "non_blocking", "disabled",
+        }:
+            raise ProtocolError("INVALID_MESSAGE", "waypoint speech_mode is invalid")
         if "local_controller" in waypoint:
             mode = str(waypoint["local_controller"]).lower()
             if mode not in {"rpp", "mppi"}:

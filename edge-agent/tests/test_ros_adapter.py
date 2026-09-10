@@ -851,6 +851,8 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
 
     final = follow_path_patrol_params(final_approach=True, local_obstacles=False)
     assert final["FollowPath.vx_max"] == 0.15
+    assert final["FollowPath.vx_min"] == 0.0
+    assert final["FollowPath.wz_max"] == 0.35
     assert final["FollowPath.PathAlignCritic.enabled"] is True
     assert final["FollowPath.PathAlignCritic.use_path_orientations"] is False
     assert final["FollowPath.PreferForwardCritic.enabled"] is False
@@ -938,7 +940,9 @@ def test_final_approach_follow_path_is_applied_before_costmap_timeout(monkeypatc
     assert order[0][2]["FollowPath.GoalCritic.enabled"] is True
     costmap_calls = [item for item in order if item[0] != "/controller_server"]
     assert costmap_calls
-    assert all(item[1] == 1 for item in costmap_calls)
+    # Safety profile uses a short retry budget; failures are swallowed so the
+    # FollowPath write still wins the race against slow costmap services.
+    assert all(item[1] <= 2 for item in costmap_calls)
 
 
 def test_live_final_approach_skips_costmaps_and_retries_controller_once(monkeypatch):

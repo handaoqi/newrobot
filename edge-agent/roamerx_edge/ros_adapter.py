@@ -42,8 +42,11 @@ def follow_path_patrol_params(
     approach slows down so the DiffDrive turning radius fits the 0.35 m window.
     """
     vx_max = 0.15 if final_approach else 0.30
-    vx_min = -0.15 if final_approach else -0.12
-    wz_max = 0.50 if final_approach else 0.35
+    # Do not back away from a terminal click or make a high-rate orbit while
+    # the goal checker is settling.  Reverse and large yaw corrections are
+    # reserved for the explicit recovery controller.
+    vx_min = 0.0 if final_approach else -0.12
+    wz_max = 0.35 if final_approach else 0.35
     return {
         "FollowPath.vx_max": vx_max,
         "FollowPath.vx_min": vx_min,
@@ -94,12 +97,13 @@ try:
     from std_msgs.msg import Bool, String
     from std_srvs.srv import Trigger
     from rcl_interfaces.msg import Parameter as ParameterMessage, ParameterType, ParameterValue
-    from rcl_interfaces.srv import SetParameters
+    from rcl_interfaces.srv import GetParameters, SetParameters
 
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
     Node = object
+    GetParameters = None  # type: ignore
 
 try:
     if ROS_AVAILABLE:
@@ -2841,7 +2845,10 @@ class RosAdapter(Node):
     def stop_motion(self) -> None:
         """Publish an explicit zero command after a navigation goal is cancelled."""
         zero = Twist()
-        for _ in range(5):
+        # Keep the zero command alive long enough to cover one controller and
+        # collision-monitor cycle.  Repeating is safe and makes this operation
+        # idempotent when completion/cancel/recovery paths race.
+        for _ in range(10):
             self._cmd_vel_pub.publish(zero)
             time.sleep(0.05)
 
@@ -2907,6 +2914,209 @@ class RosAdapter(Node):
             "docking fine-control=%s vx=[%s,%s] wz_max=%s",
             final_approach, vx_min, vx_max, wz_max,
         )
+
+    def set_safety_profile(
+        self,
+        *,
+        detour_enabled: bool,
+        collision_slowdown_enabled: bool = True,
+        collision_stop_enabled: bool = True,
+    ) -> None:
+        """Apply the three-layer avoidance model with fail-closed hard-stop policy.
+
+        ``collision_stop_enabled`` is forced on for ordinary legs. Docking may
+        request a temporary exception elsewhere under a separate audited path.
+        """
+        stop_enabled = True
+        if not collision_stop_enabled:
+            LOGGER.warning(
+                "collision_stop_enabled=false requested; keeping PolygonStop enabled"
+            )
+        signature = (
+            bool(detour_enabled),
+            bool(collision_slowdown_enabled),
+            bool(stop_enabled),
+        )
+        if signature == getattr(self, "_safety_profile_signature", None):
+            return
+        for node_name, parameter_name, value in (
+            ("/local_costmap/local_costmap", "obstacle_layer.enabled", bool(detour_enabled)),
+            ("/collision_monitor", "PolygonSlow.enabled", bool(collision_slowdown_enabled)),
+            ("/collision_monitor", "PolygonStop.enabled", stop_enabled),
+        ):
+            self._set_remote_parameters(
+                node_name,
+                {parameter_name: value},
+                code="SAFETY_PROFILE_FAILED",
+                attempts=2,
+            )
+        self._safety_profile_signature = signature
+        LOGGER.info(
+            "safety profile detour=%s slowdown=%s stop=%s",
+            detour_enabled,
+            collision_slowdown_enabled,
+            stop_enabled,
+        )
+
+    def list_navigation_capabilities(self) -> dict:
+        """Return the planner/controller plugins this Edge build knows how to drive."""
+        from .navigation_controllers import navigation_capabilities
+
+        caps = navigation_capabilities()
+        try:
+            planner_plugins = self._get_remote_parameters("/planner_server", ["planner_plugins"]).get(
+                "planner_plugins"
+            )
+            controller_plugins = self._get_remote_parameters(
+                "/controller_server", ["controller_plugins"]
+            ).get("controller_plugins")
+        except ProtocolError:
+            planner_plugins = None
+            controller_plugins = None
+        caps = dict(caps)
+        caps["runtime_planner_plugins"] = planner_plugins
+        caps["runtime_controller_plugins"] = controller_plugins
+        return caps
+
+    def apply_navigation_profile(
+        self,
+        *,
+        generation: int,
+        global_controller: str,
+        local_controller: str = "mppi",
+        detour_enabled: bool = True,
+        collision_slowdown_enabled: bool = True,
+        collision_stop_enabled: bool = True,
+        require_yaw: bool = False,
+        final_approach: bool = False,
+        outdoor: bool | None = None,
+        live: bool = False,
+    ) -> dict:
+        """Atomically apply a leg profile, read it back, and roll back on failure."""
+        previous = copy.deepcopy(getattr(self, "_last_good_navigation_profile", None))
+        normalized_global = normalize_global_controller(global_controller)
+        normalized_local = normalize_local_controller(local_controller)
+        global_plugin = global_controller_plugin_id(normalized_global)
+        local_plugin = local_controller_plugin_id(normalized_local)
+        use_outdoor = (
+            self._rtk_is_navigation_pose_source() if outdoor is None else bool(outdoor)
+        )
+        try:
+            self.set_global_controller(normalized_global)
+            expected_astar = normalized_global == "navfn"
+            planner_readback = self._get_remote_parameters(
+                "/planner_server",
+                [f"{global_plugin}.use_astar"],
+            )
+            actual_astar = planner_readback.get(f"{global_plugin}.use_astar")
+            if actual_astar is not None and bool(actual_astar) != expected_astar:
+                raise ProtocolError(
+                    "NAV_PROFILE_READBACK_FAILED",
+                    f"{global_plugin}.use_astar readback={actual_astar} expected={expected_astar}",
+                )
+
+            self.set_safety_profile(
+                detour_enabled=detour_enabled,
+                collision_slowdown_enabled=collision_slowdown_enabled,
+                collision_stop_enabled=collision_stop_enabled,
+            )
+            safety_readback = self._get_remote_parameters(
+                "/local_costmap/local_costmap",
+                ["obstacle_layer.enabled"],
+            )
+            slow_readback = self._get_remote_parameters(
+                "/collision_monitor",
+                ["PolygonSlow.enabled", "PolygonStop.enabled"],
+            )
+            if safety_readback.get("obstacle_layer.enabled") is not None and bool(
+                safety_readback["obstacle_layer.enabled"]
+            ) != bool(detour_enabled):
+                raise ProtocolError(
+                    "NAV_PROFILE_READBACK_FAILED",
+                    "obstacle_layer.enabled readback mismatch",
+                )
+            if slow_readback.get("PolygonSlow.enabled") is not None and bool(
+                slow_readback["PolygonSlow.enabled"]
+            ) != bool(collision_slowdown_enabled):
+                raise ProtocolError(
+                    "NAV_PROFILE_READBACK_FAILED",
+                    "PolygonSlow.enabled readback mismatch",
+                )
+            if slow_readback.get("PolygonStop.enabled") is False:
+                raise ProtocolError(
+                    "NAV_PROFILE_READBACK_FAILED",
+                    "PolygonStop.enabled must remain true",
+                )
+
+            self.set_waypoint_profile(
+                avoid_obstacles=detour_enabled,
+                require_yaw=require_yaw,
+                final_approach=final_approach,
+                live=live,
+                outdoor=use_outdoor,
+                local_controller=normalized_local,
+            )
+            self.set_local_controller(normalized_local)
+            self.apply_outdoor_gps_profile(outdoor=use_outdoor)
+
+            applied = {
+                "generation": int(generation),
+                "global_controller": normalized_global,
+                "global_plugin_id": global_plugin,
+                "local_controller": normalized_local,
+                "local_plugin_id": local_plugin,
+                "detour_enabled": bool(detour_enabled),
+                "collision_slowdown_enabled": bool(collision_slowdown_enabled),
+                "collision_stop_enabled": True,
+                "require_yaw": bool(require_yaw),
+                "final_approach": bool(final_approach),
+                "outdoor": bool(use_outdoor),
+                "readback": {
+                    "planner_use_astar": actual_astar,
+                    "obstacle_layer.enabled": safety_readback.get("obstacle_layer.enabled"),
+                    "PolygonSlow.enabled": slow_readback.get("PolygonSlow.enabled"),
+                    "PolygonStop.enabled": slow_readback.get("PolygonStop.enabled"),
+                },
+            }
+            self._last_good_navigation_profile = copy.deepcopy(applied)
+            LOGGER.info(
+                "navigation profile applied generation=%s global=%s(%s) local=%s(%s)",
+                generation,
+                normalized_global,
+                global_plugin,
+                normalized_local,
+                local_plugin,
+            )
+            return applied
+        except ProtocolError:
+            if previous is not None:
+                try:
+                    self._restore_navigation_profile(previous)
+                    LOGGER.warning(
+                        "rolled back navigation profile to generation=%s after apply failure",
+                        previous.get("generation"),
+                    )
+                except Exception:
+                    LOGGER.exception("navigation profile rollback failed")
+            raise
+
+    def _restore_navigation_profile(self, snapshot: dict) -> None:
+        self.set_global_controller(str(snapshot.get("global_controller") or "theta_star"))
+        self.set_safety_profile(
+            detour_enabled=bool(snapshot.get("detour_enabled", True)),
+            collision_slowdown_enabled=bool(snapshot.get("collision_slowdown_enabled", True)),
+            collision_stop_enabled=True,
+        )
+        self.set_waypoint_profile(
+            avoid_obstacles=bool(snapshot.get("detour_enabled", True)),
+            require_yaw=bool(snapshot.get("require_yaw", False)),
+            final_approach=bool(snapshot.get("final_approach", False)),
+            outdoor=bool(snapshot.get("outdoor", False)),
+            local_controller=str(snapshot.get("local_controller") or "mppi"),
+        )
+        self.set_local_controller(str(snapshot.get("local_controller") or "mppi"))
+        self.apply_outdoor_gps_profile(outdoor=bool(snapshot.get("outdoor", False)))
+        self._last_good_navigation_profile = copy.deepcopy(snapshot)
 
     def set_waypoint_profile(
         self,
@@ -3003,31 +3213,25 @@ class RosAdapter(Node):
             except ProtocolError:
                 LOGGER.warning("unable to apply RPP waypoint speed profile")
         if not live:
-            for node_name, parameter_name, value in (
-                ("/local_costmap/local_costmap", "obstacle_layer.enabled", local_obstacles),
-                ("/collision_monitor", "PolygonStop.enabled", True),
-                ("/collision_monitor", "PolygonSlow.enabled", local_obstacles),
-            ):
-                try:
-                    self._set_remote_parameters(
-                        node_name,
-                        {parameter_name: value},
-                        code="WAYPOINT_PROFILE_FAILED",
-                        attempts=1,
-                    )
-                except ProtocolError:
-                    LOGGER.warning(
-                        "unable to set %s on %s; keeping the FollowPath profile",
-                        parameter_name,
-                        node_name,
-                    )
-                    continue
+            # Prefer the explicit three-layer safety API. CostCritic still tracks
+            # avoid_obstacles via FollowPath params above.
+            try:
+                self.set_safety_profile(
+                    detour_enabled=local_obstacles,
+                    collision_slowdown_enabled=local_obstacles,
+                    collision_stop_enabled=True,
+                )
+            except ProtocolError:
+                LOGGER.warning(
+                    "unable to apply safety profile; keeping previous collision layers"
+                )
         if not live:
             self._waypoint_profile_signature = signature
         else:
             # Live final-approach writes only the controller; clear the cache so
             # the next full profile apply refreshes costmaps if needed.
             self._waypoint_profile_signature = None
+            self._safety_profile_signature = None
         LOGGER.info(
             "waypoint profile local=%s outdoor=%s final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s cost_weight=%s",
             normalize_local_controller(local_controller),
@@ -3121,6 +3325,70 @@ class RosAdapter(Node):
         store = getattr(self, "_remote_param_unavailable_until", None) or {}
         until = store.get(node_name)
         return until is not None and time.monotonic() < until
+
+    def _get_remote_parameters(
+        self,
+        node_name: str,
+        names: list[str],
+        *,
+        code: str = "NAV_PROFILE_READBACK_FAILED",
+        attempts: int = 3,
+    ) -> dict[str, bool | int | float | list | None]:
+        """Read Nav2 parameters through the ROS get_parameters service."""
+        if not names:
+            return {}
+        if not ROS_AVAILABLE or GetParameters is None:
+            raise ProtocolError(code, "ROS get_parameters unavailable")
+        last_error = ""
+        for _ in range(max(1, attempts)):
+            client = self.create_client(GetParameters, f"{node_name}/get_parameters")
+            try:
+                if not client.wait_for_service(timeout_sec=0.35):
+                    last_error = f"{node_name} get_parameters service is unavailable"
+                    continue
+                request = GetParameters.Request()
+                request.names = list(names)
+                future = client.call_async(request)
+                completed = threading.Event()
+                future.add_done_callback(lambda _: completed.set())
+                if not completed.wait(timeout=1.0):
+                    last_error = f"{node_name} get_parameters timed out"
+                    continue
+                response = future.result()
+                values = getattr(response, "values", None) or []
+                result: dict[str, bool | int | float | list | None] = {}
+                for name, value in zip(names, values):
+                    result[name] = self._parameter_value_to_python(value)
+                return result
+            except Exception as exc:
+                last_error = str(exc)
+            finally:
+                self.destroy_client(client)
+            time.sleep(0.05)
+        raise ProtocolError(code, last_error or f"unable to get parameters on {node_name}")
+
+    @staticmethod
+    def _parameter_value_to_python(value) -> bool | int | float | list | str | None:
+        if value is None:
+            return None
+        value_type = int(getattr(value, "type", 0) or 0)
+        if value_type == ParameterType.PARAMETER_BOOL:
+            return bool(value.bool_value)
+        if value_type == ParameterType.PARAMETER_INTEGER:
+            return int(value.integer_value)
+        if value_type == ParameterType.PARAMETER_DOUBLE:
+            return float(value.double_value)
+        if value_type == ParameterType.PARAMETER_STRING:
+            return str(value.string_value)
+        if value_type == ParameterType.PARAMETER_BOOL_ARRAY:
+            return list(value.bool_array_value)
+        if value_type == ParameterType.PARAMETER_INTEGER_ARRAY:
+            return list(value.integer_array_value)
+        if value_type == ParameterType.PARAMETER_DOUBLE_ARRAY:
+            return list(value.double_array_value)
+        if value_type == ParameterType.PARAMETER_STRING_ARRAY:
+            return list(value.string_array_value)
+        return None
 
     def _set_remote_parameters(
         self,

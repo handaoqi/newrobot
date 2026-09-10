@@ -529,6 +529,42 @@ def test_localization_sample_age_is_used_as_arrival_freshness_gate(tmp_path):
     store.close()
 
 
+def test_arrival_confirmation_requires_consecutive_fresh_samples(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
+    nav.localization_state = {"sample_age_seconds": 0.2}
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    waypoint = {"x": 1.0, "y": 2.0, "yaw": 0.0, "arrival_policy": "stop_and_confirm"}
+    assert executor._arrival_pose_is_stable(waypoint, 0) is True
+    nav.localization_state["sample_age_seconds"] = 2.0
+    assert executor._arrival_pose_is_stable(waypoint, 0) is False
+    store.close()
+
+
+def test_precision_arrival_requires_tight_xy_and_yaw(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {"sample_age_seconds": 0.1}
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    waypoint = {"x": 1.0, "y": 2.0, "yaw": 0.0, "arrival_policy": "precision"}
+    nav.pose = SimpleNamespace(x=1.2, y=2.0, yaw=0.0)
+    assert executor._arrival_pose_is_stable(waypoint, 0) is False
+    nav.pose = SimpleNamespace(x=1.05, y=2.02, yaw=0.1)
+    assert executor._arrival_pose_is_stable(waypoint, 0) is True
+    store.close()
+
+
 def test_outdoor_reverse_skip_requires_rtk_agreement(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -817,6 +853,26 @@ def test_startup_skips_seed_when_already_on_fixed_rtk(tmp_path):
     executor.initialize_before_navigation()
     assert nav.rtk_calls == 0
     assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    store.close()
+
+
+def test_dock_arrival_policy_requires_docking_context(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["waypoints"][0]["arrival_policy"] = "dock"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    try:
+        executor.prepare_task_start(envelope)
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "DOCKING_CONTEXT_REQUIRED"
+    else:
+        raise AssertionError("dock policy must not start without docking context")
     store.close()
 
 
@@ -1109,6 +1165,33 @@ def test_loop_execution_reverses_when_uniquely_at_route_end(tmp_path):
     ]
     assert executor.context.current_waypoint_index == 1
     assert ids(nav.sent[0]) == ["wp-2"]
+    store.close()
+
+
+def test_loop_round_dispatches_first_leg_without_heading_worker(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["loop_execution"] = True
+    envelope.payload["command"]["loop_total"] = 2
+
+    executor.start_task(envelope)
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    nav.pose = SimpleNamespace(x=3.0, y=4.0, yaw=0.0)
+    assert nav.result is not None
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    # Completing the first round must immediately create the next Nav2 goal;
+    # it must not wait for an optional departure-heading thread.
+    assert executor.context.round_number == 2
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    assert executor._departure_heading_thread is None
+    executor.stop()
     store.close()
 
 
@@ -2445,9 +2528,19 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     nav.feedback(0, 0.8)
     assert nav.waypoint_profiles[-1][2] is True
     assert nav.live_profiles[-1] is True
-    # Stay far from the final waypoint so the post-check fails.
-    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    final = executor.context.route_snapshot["waypoints"][-1]
+    face = atan2(float(final["y"]) - 2.0, float(final["x"]) - 1.0)
+    # Stay far from the final waypoint so indoor click checks re-approach,
+    # then the final-pose gate fails once retries are exhausted.
+    for _ in range(6):
+        if executor.context.state == "failed":
+            break
+        nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=face)
+        if executor._departure_heading_thread is not None:
+            _await_departure_heading(executor)
+        if nav.result is None:
+            break
+        nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.stop_commands >= 1
     assert executor.context.state == "failed"
     assert results[0][1] == "failed"
@@ -2469,13 +2562,18 @@ def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
         assert ids(nav.sent[0]) == ["wp-1"]
         drive_patrol(nav, until_ids=["wp-3"], executor=executor)
         final = executor.context.route_snapshot["waypoints"][-1]
-        nav.pose = SimpleNamespace(
-            x=float(final["x"]) + distance,
-            y=float(final["y"]),
-            yaw=float(final.get("yaw") or 0.0),
-        )
-        nav.result("succeeded", "", {"missed_waypoints": []})
-        if executor.context.state == "running" and nav.result is not None:
+        for _ in range(6):
+            if executor.context.state == expected_state:
+                break
+            nav.pose = SimpleNamespace(
+                x=float(final["x"]) + distance,
+                y=float(final["y"]),
+                yaw=float(final.get("yaw") or 0.0),
+            )
+            if executor._departure_heading_thread is not None:
+                _await_departure_heading(executor)
+            if nav.result is None:
+                break
             nav.result("succeeded", "", {"missed_waypoints": []})
         assert executor.context.state == expected_state
         store.close()

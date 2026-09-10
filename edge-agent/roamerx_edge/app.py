@@ -226,6 +226,7 @@ class EdgeAgentApplication:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.trajectory.flush_active()
         self.person_follow_controller.stop("edge_shutdown")
         self.task_executor.stop()
         for thread in self._threads:
@@ -478,6 +479,9 @@ class EdgeAgentApplication:
             try:
                 context = self.task_executor.context
                 pose = self.telemetry.latest_pose()
+                if context and context.state in self.task_executor.TERMINAL_STATES:
+                    self.trajectory.flush_active()
+                    continue
                 if not context or context.state != "running" or not pose:
                     continue
                 message = self.trajectory.sample(
@@ -974,9 +978,20 @@ class EdgeAgentApplication:
             return
         if not self._localization_recovery_lock.acquire(blocking=False):
             return
+        lease = None
+        acquire = getattr(self.task_executor, "acquire_recovery", None)
+        if callable(acquire):
+            lease = acquire("EDGE_LOCALIZATION", reason)
+            if lease is None:
+                LOGGER.warning(
+                    "localization recovery skipped; recovery ownership unavailable: %s",
+                    getattr(self.task_executor, "recovery_snapshot", lambda: {})(),
+                )
+                self._localization_recovery_lock.release()
+                return
         threading.Thread(
             target=self._recover_task_localization,
-            args=(reason,),
+            args=(reason, lease),
             daemon=True,
             name="task-localization-restart",
         ).start()
@@ -1197,7 +1212,7 @@ class EdgeAgentApplication:
         LOGGER.info("automatic recovery accepted a fixed RTK pose")
         return True
 
-    def _recover_task_localization(self, reason: str = "localization_lost") -> None:
+    def _recover_task_localization(self, reason: str = "localization_lost", lease=None) -> None:
         try:
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
@@ -1385,6 +1400,9 @@ class EdgeAgentApplication:
                 self.telemetry.on_localization_recovery(None)
             except Exception:
                 LOGGER.exception("failed to clear localization recovery state")
+            release = getattr(self.task_executor, "release_recovery", None)
+            if callable(release):
+                release(lease)
             self._localization_recovery_lock.release()
 
 

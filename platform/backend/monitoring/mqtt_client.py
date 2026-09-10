@@ -5,6 +5,7 @@ import logging
 import ssl
 import threading
 import time
+import uuid
 from typing import Any
 
 from django.conf import settings
@@ -96,6 +97,14 @@ class PlatformMqttClient:
             else:
                 handle_mqtt_message(message.topic, message.payload, self.publish_json)
         except ProtocolError as exc:
+            # A trajectory referencing a task that is absent from the center
+            # can never succeed on replay.  Return a drop ACK so one stale
+            # batch cannot hold the whole edge outbox at its head.
+            if message.topic.endswith("/telemetry/trajectory") and exc.code in {
+                "INVALID_MESSAGE",
+                "UNKNOWN_TASK_EXECUTION",
+            }:
+                self._publish_trajectory_rejection(message.topic, message.payload, exc)
             # A malformed telemetry batch must not turn into thousands of tracebacks.
             now = time.monotonic()
             last_reported = self._last_protocol_error_at.get(message.topic, 0.0)
@@ -104,6 +113,38 @@ class PlatformMqttClient:
                 self._last_protocol_error_at[message.topic] = now
         except Exception:
             LOGGER.exception("failed to process device message topic=%s", message.topic)
+
+    def _publish_trajectory_rejection(self, topic: str, raw_payload: bytes, error: ProtocolError) -> None:
+        """Tell Edge to drop a permanently invalid trajectory batch."""
+        try:
+            envelope = json.loads(raw_payload.decode("utf-8"))
+            payload = envelope.get("payload") or {}
+            batch_id = payload.get("batch_id")
+            if not batch_id:
+                return
+            robot_code = topic.split("/")[1]
+            self.publish_json(
+                f"robots/{robot_code}/sync/state",
+                {
+                    "protocol_version": "1.0",
+                    "message_id": str(uuid.uuid4()),
+                    "message_type": "trajectory.ack",
+                    "robot_id": robot_code,
+                    "session_id": "center",
+                    "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "trace_id": envelope.get("trace_id", ""),
+                    "payload": {
+                        "batch_id": batch_id,
+                        "task_execution_id": payload.get("task_execution_id"),
+                        "accepted": False,
+                        "reason_code": error.code,
+                        "reason_message": error.message,
+                    },
+                },
+                qos=1,
+            )
+        except Exception:
+            LOGGER.exception("failed to publish trajectory rejection topic=%s", topic)
 
     def publish_json(self, topic: str, payload: dict[str, Any], qos: int = 1, retain: bool = False) -> None:
         info = self.client.publish(
