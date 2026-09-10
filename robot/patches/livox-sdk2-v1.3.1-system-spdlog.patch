@@ -1,0 +1,76 @@
+diff --git a/sdk_core/CMakeLists.txt b/sdk_core/CMakeLists.txt
+index 15e960d..4128411 100644
+--- a/sdk_core/CMakeLists.txt
++++ b/sdk_core/CMakeLists.txt
+@@ -6,6 +6,13 @@ set(SDK_LIBRARY_SHARED livox_lidar_sdk_shared)
+ add_library(${SDK_LIBRARY_STATIC} STATIC "")
+ add_library(${SDK_LIBRARY_SHARED} SHARED "")
+
++# ROS 2 itself uses the distribution spdlog shared library.  Building the
++# Livox SDK against its vendored, header-only copy exports a second set of weak
++# spdlog symbols into the same process.  The dynamic linker may then construct
++# a logger with one ABI and destroy it with the other, which crashes during
++# LivoxLidarSdkUninit().  Use the same compiled spdlog implementation as ROS.
++find_package(spdlog REQUIRED)
++
+ set(LIVOX_SDK_MAJOR_VERSION "0")
+ set(LIVOX_SDK_MINOR_VERSION "0")
+ set(LIVOX_SDK_PATCH_VERSION "2")
+@@ -49,4 +56,6 @@ set(LIVOX_PUBLIC_INCLUDE_DIR
+         ../include
+         )
+
++list(REMOVE_ITEM LIVOX_PRIVATE_INCLUDE_DIR ../3rdparty/spdlog)
++
+ target_include_directories(
+@@ -136,6 +145,9 @@ target_sources(${SDK_LIBRARY_SHARED}
+         ${LIVOX_SOURCES}
+         )
+
++target_link_libraries(${SDK_LIBRARY_STATIC} PRIVATE spdlog::spdlog)
++target_link_libraries(${SDK_LIBRARY_SHARED} PRIVATE spdlog::spdlog)
++
+ install(TARGETS ${SDK_LIBRARY_STATIC} ${SDK_LIBRARY_SHARED}
+         PUBLIC_HEADER DESTINATION include
+         ARCHIVE DESTINATION lib
+diff --git a/sdk_core/base/logging.cpp b/sdk_core/base/logging.cpp
+index 4fdd7b0..c7606da 100644
+--- a/sdk_core/base/logging.cpp
++++ b/sdk_core/base/logging.cpp
+@@ -29,9 +29,7 @@ bool is_save_log_file = false;
+ bool is_console_log_enable = true;
+
+ void InitLogger() {
+-
+-  if (spdlog::get("console") != nullptr) {
+-    logger = spdlog::get("console");
++  if (logger != nullptr) {
+     return;
+   }
+
+@@ -48,12 +46,20 @@ void InitLogger() {
+     sinkList.push_back(rotateSink);
+   }
+
+-  logger = std::make_shared<spdlog::logger>("console", begin(sinkList), end(sinkList));
+-  spdlog::register_logger(logger);
++  // Keep the SDK logger private.  Registering the generic name "console"
++  // aliases the SDK lifetime to ROS/application loggers in the process-wide
++  // spdlog registry.
++  logger = std::make_shared<spdlog::logger>(
++      "livox_sdk2_internal", begin(sinkList), end(sinkList));
+   logger->set_level(spdlog::level::debug);
+   logger->flush_on(spdlog::level::debug);
+ }
+
+ void UninitLogger() {
+-  spdlog::drop_all();
+-}
+\ No newline at end of file
++  // Destroy only the logger owned by this SDK.  drop_all() also clears ROS's
++  // default logger and creates a shutdown race with other executor threads.
++  if (logger != nullptr) {
++    logger->flush();
++    logger.reset();
++  }
++}

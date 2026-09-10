@@ -19,8 +19,13 @@ kill_matching() {
   fi
 }
 
-kill_matching "/opt/ros/humble/bin/ros2 launch livox_driver lidar.launch.py"
-kill_matching "/livox_driver/livox_driver_node"
+# Stop the child first so its ROS launch parent can reap it.  Killing the
+# launch process first can leave livox_driver_node as a transient zombie;
+# ensure_mapping_sensors.sh would then mistake that zombie for a live driver.
+# Anchor both expressions to argv[0] so `pgrep -f` cannot match the caller just
+# because its command line contains one of these commands.
+kill_matching '^/opt/robot-driver/install/livox_driver/lib/livox_driver/livox_driver_node($| )'
+kill_matching '^/usr/bin/python3 /opt/ros/humble/bin/ros2 launch livox_driver lidar\.launch\.py($| )'
 sleep 1
 
 "${SCRIPT_DIR}/ensure_navigation_sensors.sh"

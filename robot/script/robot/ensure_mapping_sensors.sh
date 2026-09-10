@@ -29,7 +29,8 @@ if ! pgrep -x rmw_zenohd >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! pgrep -f 'livox_driver_node' >/dev/null 2>&1; then
+if ! pgrep -f '^/opt/robot-driver/install/livox_driver/lib/livox_driver/livox_driver_node($| )' \
+    >/dev/null 2>&1; then
   echo "Starting Livox LiDAR/IMU driver..."
   setsid ros2 launch livox_driver lidar.launch.py >/tmp/livox.log 2>&1 < /dev/null &
 fi
