@@ -1,3 +1,5 @@
+import sqlite3
+
 from roamerx_edge.local_store import LocalStore
 
 
@@ -23,6 +25,49 @@ def test_sqlite_restart_recovery(tmp_path):
     assert second.load_active_task_context()["state"] == "running"
     assert second.outbox_count() == 1
     second.close()
+
+
+def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
+    path = tmp_path / "legacy-edge.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE task_context (
+            task_execution_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            state_version INTEGER NOT NULL,
+            route_snapshot_json TEXT NOT NULL,
+            current_waypoint_index INTEGER NOT NULL DEFAULT 0,
+            start_command_id TEXT,
+            record_rosbag INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = LocalStore(str(path))
+    store.save_task_context(
+        {
+            "task_execution_id": "exec-post-arrival",
+            "state": "paused",
+            "state_version": 7,
+            "route_snapshot": {"waypoints": [{"sequence": 0}]},
+            "current_waypoint_index": 0,
+            "start_command_id": "cmd-1",
+            "post_arrival_waypoint_index": 0,
+            "post_arrival_stage": "xy_adjusting",
+            "arrival_side_effects_started": True,
+        }
+    )
+
+    restored = store.load_active_task_context()
+
+    assert restored["post_arrival_waypoint_index"] == 0
+    assert restored["post_arrival_stage"] == "xy_adjusting"
+    assert restored["arrival_side_effects_started"] is True
+    store.close()
 
 
 def test_trajectory_sequence_persists(tmp_path):

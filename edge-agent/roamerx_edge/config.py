@@ -120,11 +120,16 @@ class SafetyConfig:
     final_waypoint_tolerance_m: float = 0.45
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
+    # Deprecated as an initial-distance limit. Retained as a fallback rolling
+    # clearance lookahead for older deployed configuration files.
     arrival_adjust_max_distance_m: float = 0.50
+    arrival_adjust_clearance_lookahead_m: float | None = None
     arrival_adjust_speed_mps: float = 0.08
     arrival_adjust_yaw_rate_rps: float = 0.10
+    # Deprecated: post-arrival adjustment has no total convergence timeout.
     arrival_adjust_timeout_seconds: float = 8.0
     arrival_adjust_scan_max_age_seconds: float = 0.50
+    arrival_adjust_safety_grace_seconds: float = 2.0
 
 
 @dataclass

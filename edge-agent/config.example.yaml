@@ -68,6 +68,13 @@ safety:
   # Used only at the final docking contact waypoint.
   docking_goal_tolerance_m: 0.08
   docking_goal_yaw_tolerance_rad: 0.0872665
+  # Final-yaw XY adjustment has no distance/time cap. These settings retain a
+  # rolling safety corridor and allow brief scan/localization recovery.
+  arrival_adjust_clearance_lookahead_m: 0.50
+  arrival_adjust_speed_mps: 0.08
+  arrival_adjust_yaw_rate_rps: 0.10
+  arrival_adjust_scan_max_age_seconds: 0.50
+  arrival_adjust_safety_grace_seconds: 2.0
 
 obstacle_speech:
   enabled: true

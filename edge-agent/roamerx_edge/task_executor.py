@@ -277,6 +277,9 @@ class TaskContext:
     loop_total: int = 1
     loop_base_waypoints: list[dict] | None = None
     trace_id: str = ""
+    post_arrival_waypoint_index: int | None = None
+    post_arrival_stage: str = ""
+    arrival_side_effects_started: bool = False
 
 
 class TaskExecutor:
@@ -293,10 +296,12 @@ class TaskExecutor:
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         arrival_adjust_max_distance_m: float = 0.50,
+        arrival_adjust_clearance_lookahead_m: float | None = None,
         arrival_adjust_speed_mps: float = 0.08,
         arrival_adjust_yaw_rate_rps: float = 0.10,
         arrival_adjust_timeout_seconds: float = 8.0,
         arrival_adjust_scan_max_age_seconds: float = 0.50,
+        arrival_adjust_safety_grace_seconds: float = 2.0,
         standup_confirmation_timeout_seconds: float = 12.0,
         navigation_dispatch_retry_seconds: float = NAV_DISPATCH_RETRY_DEFAULT_SECONDS,
         navigation_dispatch_retry_budget_seconds: float = 300.0,
@@ -314,12 +319,28 @@ class TaskExecutor:
         self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
         self.docking_goal_tolerance_m = docking_goal_tolerance_m
         self.docking_goal_yaw_tolerance_rad = docking_goal_yaw_tolerance_rad
-        self.arrival_adjust_max_distance_m = max(0.0, float(arrival_adjust_max_distance_m))
+        # Keep the legacy max-distance setting loadable, but use it only as the
+        # rolling scan lookahead when the new explicit setting is absent. Final
+        # yaw recovery no longer has an initial-distance gate.
+        legacy_lookahead = max(0.05, float(arrival_adjust_max_distance_m))
+        self.arrival_adjust_clearance_lookahead_m = max(
+            0.05,
+            float(
+                arrival_adjust_clearance_lookahead_m
+                if arrival_adjust_clearance_lookahead_m is not None
+                else legacy_lookahead
+            ),
+        )
         self.arrival_adjust_speed_mps = max(0.01, float(arrival_adjust_speed_mps))
         self.arrival_adjust_yaw_rate_rps = max(0.01, float(arrival_adjust_yaw_rate_rps))
-        self.arrival_adjust_timeout_seconds = max(0.5, float(arrival_adjust_timeout_seconds))
+        # Accepted for configuration compatibility. Post-arrival convergence
+        # now runs until it succeeds or a safety/task condition stops it.
+        self.arrival_adjust_timeout_seconds = max(0.0, float(arrival_adjust_timeout_seconds))
         self.arrival_adjust_scan_max_age_seconds = max(
             0.05, float(arrival_adjust_scan_max_age_seconds)
+        )
+        self.arrival_adjust_safety_grace_seconds = max(
+            0.0, float(arrival_adjust_safety_grace_seconds)
         )
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
         self.navigation_dispatch_retry_seconds = max(0.5, float(navigation_dispatch_retry_seconds))
@@ -407,6 +428,11 @@ class TaskExecutor:
         self._arrival_retry_counts: dict[int, int] = {}
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
+        if self.context and self.context.post_arrival_waypoint_index is not None:
+            reached = int(self.context.post_arrival_waypoint_index)
+            self._last_target_index = max(self._last_target_index, reached)
+            if self.context.arrival_side_effects_started:
+                self._last_reached_index = max(self._last_reached_index, reached)
         if self.context and self.context.state != "paused":
             self.context.state = "interrupted"
             self.context.state_version += 1
@@ -1129,7 +1155,7 @@ class TaskExecutor:
 
             # Drop any in-flight pre-leg spin so a late Nav2 success cannot
             # cruise to a stale index after recovery redispatches.
-            self._cancel_arrival_adjustment(reset_state=True)
+            self._cancel_arrival_adjustment(reset_state=False)
             self._arrival_convergence_attempts.pop(
                 self.context.current_waypoint_index, None
             )
@@ -1163,6 +1189,11 @@ class TaskExecutor:
                 # Automatic RTK recovery often cancels Nav2 after the task has
                 # already been marked running again. Re-dispatch the pending
                 # goal instead of leaving the dog standing with no Nav2 action.
+                if self._post_arrival_active(resume_index):
+                    self._paused_for_localization = False
+                    self._paused_localization_reason = None
+                    self._resume_post_arrival(resume_index)
+                    return
                 if self._waiting_waypoint_index() is not None:
                     self._paused_for_localization = False
                     self._paused_localization_reason = None
@@ -1189,6 +1220,13 @@ class TaskExecutor:
                 code="LOCALIZATION_RECOVERED",
                 message="localization is stable; resuming from the pending waypoint",
             )
+            if self._post_arrival_active(resume_index):
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                self._resume_post_arrival(resume_index)
+                return
             waiting_index = self._waiting_waypoint_index()
             if waiting_index is not None and pause_reason != "absolute_required":
                 reached_index = waiting_index
@@ -1209,6 +1247,9 @@ class TaskExecutor:
                 self.context.state_version += 1
                 self._persist()
                 self._emit("task.resumed")
+                if self._post_arrival_active(resume_index):
+                    self._resume_post_arrival(resume_index)
+                    return
                 points = self.context.route_snapshot.get("waypoints") or []
                 waypoint = points[resume_index] if resume_index < len(points) else None
                 if waypoint and self._arrival_xy_within_policy_tolerance(
@@ -2207,6 +2248,9 @@ class TaskExecutor:
                     # check. Re-enter normal post-arrival confirmation once.
                     self._departure_heading_completed_index = None
                     self._arrival_heading_completed_index = reached_index
+                    self._set_post_arrival_stage(
+                        reached_index, "heading_aligned"
+                    )
                     self._emit_idempotent(
                         "task.arrival_heading_aligned",
                         event_type_key="arrival_heading_aligned",
@@ -3017,9 +3061,19 @@ class TaskExecutor:
             required * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS * 4,
         )
         stable = 0
+        last_sample_marker = None
         while time.monotonic() <= deadline:
             decision = self._localization_decision()
             pose = self.navigation.latest_pose()
+            sample_marker = getattr(pose, "sampled_at", None) if pose is not None else None
+            if sample_marker is None and isinstance(decision.get("localization"), dict):
+                sample_marker = decision["localization"].get("sampled_at")
+            if sample_marker is None:
+                sample_marker = decision.get("sampled_at")
+            if sample_marker is not None and sample_marker == last_sample_marker:
+                time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
+                continue
+            last_sample_marker = sample_marker
             fresh = self._localization_sample_fresh(decision)
             valid = pose is not None and self._arrival_pose_within_combined_tolerance(
                 waypoint, reached_index
@@ -3105,6 +3159,146 @@ class TaskExecutor:
             and self._arrival_within_tolerance(waypoint, reached_index)
         )
 
+    def _arrival_xy_is_stable(self, waypoint: dict, reached_index: int) -> bool:
+        """Confirm corrected XY over consecutive fresh localization samples."""
+        deadline = time.monotonic() + max(
+            0.5,
+            ARRIVAL_CONFIRMATION_FRAMES
+            * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS
+            * 4,
+        )
+        stable = 0
+        last_sample_marker = None
+        while time.monotonic() <= deadline:
+            decision = self._localization_decision()
+            pose = self.navigation.latest_pose() if self.navigation else None
+            sample_marker = getattr(pose, "sampled_at", None) if pose is not None else None
+            if sample_marker is None and isinstance(decision.get("localization"), dict):
+                sample_marker = decision["localization"].get("sampled_at")
+            if sample_marker is None:
+                sample_marker = decision.get("sampled_at")
+            if sample_marker is not None and sample_marker == last_sample_marker:
+                time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
+                continue
+            last_sample_marker = sample_marker
+            if self._localization_sample_fresh(
+                decision
+            ) and self._arrival_xy_within_policy_tolerance(
+                waypoint, reached_index
+            ):
+                stable += 1
+                if stable >= ARRIVAL_CONFIRMATION_FRAMES:
+                    return True
+            else:
+                stable = 0
+            time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
+        LOGGER.warning(
+            "waypoint %d corrected XY was not stable: %d/%d fresh frames",
+            reached_index,
+            stable,
+            ARRIVAL_CONFIRMATION_FRAMES,
+        )
+        return False
+
+    def _post_arrival_active(self, waypoint_index: int | None = None) -> bool:
+        if not self.context or not self.context.post_arrival_stage:
+            return False
+        active_index = self.context.post_arrival_waypoint_index
+        return waypoint_index is None or active_index == waypoint_index
+
+    def _set_post_arrival_stage(self, waypoint_index: int, stage: str) -> None:
+        if not self.context:
+            return
+        self.context.post_arrival_waypoint_index = waypoint_index
+        self.context.post_arrival_stage = stage
+        self._persist()
+
+    def _clear_post_arrival_state(self) -> None:
+        if not self.context:
+            return
+        self.context.post_arrival_waypoint_index = None
+        self.context.post_arrival_stage = ""
+        self.context.arrival_side_effects_started = False
+
+    def _start_arrival_side_effects(
+        self, waypoint_index: int, waypoint: dict
+    ) -> None:
+        """Publish business arrival and start all arrival-owned side effects once."""
+        if not self.context or self.context.arrival_side_effects_started:
+            return
+        speech_configured = (
+            self._waypoint_speech_enabled()
+            and bool(waypoint.get("speech_template_id"))
+            and self._waypoint_speech_mode(waypoint) != "disabled"
+        )
+        if speech_configured and self._waypoint_speech_blocks_navigation(waypoint):
+            self._clear_waypoint_speech_status(waypoint_index)
+            self._start_waypoint_speech_wait(waypoint_index)
+        self.on_feedback(
+            waypoint_index - self._goal_offset,
+            0.0,
+            milestone="waypoint_reached",
+            completed_waypoints=waypoint_index + 1,
+        )
+        self._run_waypoint_actions(waypoint_index, waypoint)
+        self._start_waypoint_dwell(waypoint_index)
+        self.context.arrival_side_effects_started = True
+        self._persist()
+
+    def _restore_arrival_side_effect_gates(
+        self, waypoint_index: int, waypoint: dict
+    ) -> None:
+        """Reattach blocking waits after a paused process was restarted."""
+        if not self.context or not self.context.arrival_side_effects_started:
+            self._start_arrival_side_effects(waypoint_index, waypoint)
+            return
+        speech_configured = (
+            self._waypoint_speech_enabled()
+            and bool(waypoint.get("speech_template_id"))
+            and self._waypoint_speech_blocks_navigation(waypoint)
+        )
+        if (
+            speech_configured
+            and self._speech_waiting_index != waypoint_index
+            and not self._speech_wait_finished
+        ):
+            # Do not clear the durable playback result on restore.
+            self._start_waypoint_speech_wait(waypoint_index)
+        if (
+            float(waypoint.get("dwell_seconds") or 0.0) > 0.0
+            and self._dwell_waiting_index != waypoint_index
+        ):
+            # Conservatively restart the dwell duration; leaving early after a
+            # restart is worse than holding the already-reached waypoint longer.
+            self._start_waypoint_dwell(waypoint_index)
+
+    def _resume_post_arrival(self, waypoint_index: int) -> bool:
+        """Continue post-arrival yaw/XY work without redispatching Nav2."""
+        if not self.context or not self._post_arrival_active(waypoint_index):
+            return False
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if waypoint_index < 0 or waypoint_index >= len(waypoints):
+            return False
+        waypoint = waypoints[waypoint_index]
+        stage = self.context.post_arrival_stage
+        self._arrival_correction_completed_index = waypoint_index
+        if stage in {"heading_aligned", "xy_adjusting", "post_arrival_ready"}:
+            self._arrival_heading_completed_index = waypoint_index
+        self._goal_offset = waypoint_index
+        self._dispatched_count = 1
+        self._last_target_index = max(self._last_target_index, waypoint_index)
+        if self.context.arrival_side_effects_started:
+            self._last_reached_index = max(self._last_reached_index, waypoint_index)
+        self._restore_arrival_side_effect_gates(waypoint_index, waypoint)
+        if stage == "post_arrival_ready":
+            self._waypoint_localization_ready_index = waypoint_index
+            self._maybe_continue_after_waypoint(waypoint_index)
+        else:
+            self.on_navigation_result(
+                "succeeded", generation=self._nav_goal_generation
+            )
+        return True
+
     def _emit_arrival_stage(
         self, reached_index: int, stage: str, message: str
     ) -> None:
@@ -3136,7 +3330,7 @@ class TaskExecutor:
         if policy == "dock" and self._is_docking_task():
             return False
         distance, _ = self._arrival_pose_errors(waypoint, reached_index)
-        if distance is None or distance > self.arrival_adjust_max_distance_m:
+        if distance is None:
             return False
         velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
         clearance = getattr(self.navigation, "directional_clearance", None)
@@ -3146,6 +3340,7 @@ class TaskExecutor:
             return self._arrival_adjustment_index == reached_index
         self._arrival_adjustment_stop = threading.Event()
         self._arrival_adjustment_index = reached_index
+        self._set_post_arrival_stage(reached_index, "xy_adjusting")
         self._emit_arrival_stage(
             reached_index,
             "heading_preserving_adjustment",
@@ -3167,12 +3362,24 @@ class TaskExecutor:
         velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
         clearance = getattr(self.navigation, "directional_clearance", None)
         stop_event = self._arrival_adjustment_stop
-        deadline = time.monotonic() + self.arrival_adjust_timeout_seconds
         stable = 0
         failure_message = ""
         succeeded = False
+        cancelled_by_state = False
+        transient_reason = ""
+        transient_started_at: float | None = None
+
+        def _transient_expired(reason: str) -> bool:
+            nonlocal transient_reason, transient_started_at
+            now = time.monotonic()
+            transient_reason = reason
+            if transient_started_at is None:
+                transient_started_at = now
+            return now - transient_started_at >= self.arrival_adjust_safety_grace_seconds
+
         try:
-            while not stop_event.is_set() and time.monotonic() <= deadline:
+            while not stop_event.is_set():
+                wait_for_safety = False
                 with self._lock:
                     if (
                         not self.context
@@ -3180,68 +3387,116 @@ class TaskExecutor:
                         or self.context.current_waypoint_index != reached_index
                         or self._arrival_adjustment_index != reached_index
                     ):
-                        failure_message = "任务状态已变化，终止到点微调"
+                        cancelled_by_state = True
                         break
                     decision = self._localization_decision()
-                    if (
-                        not self._localization_sample_fresh(decision)
-                        or bool(decision.get("lio_motion_anomaly"))
-                        or bool(decision.get("correction_smoothing_active"))
-                    ):
-                        failure_message = "定位数据不新鲜或定位校正未稳定"
-                        break
-                    pose = self.navigation.latest_pose()
-                    if pose is None:
-                        failure_message = "无法读取机器人位姿"
-                        break
-                    try:
-                        dx = float(waypoint["x"]) - float(pose.x)
-                        dy = float(waypoint["y"]) - float(pose.y)
-                        yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
-                        target_yaw = float(waypoint.get("yaw") or 0.0)
-                    except (AttributeError, KeyError, TypeError, ValueError):
-                        failure_message = "航点或机器人位姿无效"
-                        break
-                    distance = hypot(dx, dy)
-                    yaw_error = self._heading_error_rad(target_yaw, yaw)
-                    xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
-                        waypoint, reached_index
-                    )
-                    yaw_ok = yaw_tolerance is None or abs(yaw_error) <= yaw_tolerance
-                    if distance <= xy_tolerance and yaw_ok:
-                        stable += 1
-                        if stable >= ARRIVAL_ADJUST_STABLE_SAMPLES:
-                            succeeded = True
+                    localization_reason = ""
+                    if not self._localization_sample_fresh(decision):
+                        localization_reason = "localization_stale"
+                    elif bool(decision.get("lio_motion_anomaly")):
+                        localization_reason = "lio_motion_anomaly"
+                    elif bool(decision.get("correction_smoothing_active")):
+                        localization_reason = "correction_smoothing"
+                    if localization_reason:
+                        velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+                        if _transient_expired(localization_reason):
+                            failure_message = (
+                                "到点微调等待定位恢复超过"
+                                f"{self.arrival_adjust_safety_grace_seconds:.1f}秒"
+                                f"（{localization_reason}）"
+                            )
                             break
+                        wait_for_safety = True
+                    if wait_for_safety:
+                        pass
                     else:
-                        stable = 0
-                    body_x = cos(yaw) * dx + sin(yaw) * dy
-                    body_y = -sin(yaw) * dx + cos(yaw) * dy
-                    if distance > xy_tolerance:
-                        speed = min(self.arrival_adjust_speed_mps, max(0.03, distance * 0.35))
-                        vx = speed * body_x / max(distance, 1e-6)
-                        vy = speed * body_y / max(distance, 1e-6)
+                        pose = self.navigation.latest_pose()
+                        if pose is None:
+                            velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+                            if _transient_expired("pose_unavailable"):
+                                failure_message = (
+                                    "到点微调等待机器人位姿超过"
+                                    f"{self.arrival_adjust_safety_grace_seconds:.1f}秒"
+                                )
+                                break
+                            wait_for_safety = True
+                    if wait_for_safety:
+                        pass
                     else:
-                        vx = vy = 0.0
-                    yaw_rate = max(
-                        -self.arrival_adjust_yaw_rate_rps,
-                        min(self.arrival_adjust_yaw_rate_rps, yaw_error * 0.8),
-                    )
-                    observation = clearance(
-                        vx,
-                        vy,
-                        min(self.arrival_adjust_max_distance_m, distance + 0.05),
-                        max_scan_age_seconds=self.arrival_adjust_scan_max_age_seconds,
-                    ) or {}
-                    if not bool(observation.get("clear")):
-                        reason = str(observation.get("reason") or "unknown")
-                        failure_message = f"到点微调方向不安全（{reason}）"
-                        break
-                    velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+                        try:
+                            dx = float(waypoint["x"]) - float(pose.x)
+                            dy = float(waypoint["y"]) - float(pose.y)
+                            yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
+                            target_yaw = float(waypoint.get("yaw") or 0.0)
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+                            if _transient_expired("pose_invalid"):
+                                failure_message = (
+                                    "到点微调等待有效位姿超过"
+                                    f"{self.arrival_adjust_safety_grace_seconds:.1f}秒"
+                                )
+                                break
+                            wait_for_safety = True
+                    if wait_for_safety:
+                        pass
+                    else:
+                        distance = hypot(dx, dy)
+                        yaw_error = self._heading_error_rad(target_yaw, yaw)
+                        xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
+                            waypoint, reached_index
+                        )
+                        yaw_ok = yaw_tolerance is None or abs(yaw_error) <= yaw_tolerance
+                        if distance <= xy_tolerance and yaw_ok:
+                            stable += 1
+                            if stable >= ARRIVAL_ADJUST_STABLE_SAMPLES:
+                                succeeded = True
+                                break
+                        else:
+                            stable = 0
+                        body_x = cos(yaw) * dx + sin(yaw) * dy
+                        body_y = -sin(yaw) * dx + cos(yaw) * dy
+                        if distance > xy_tolerance:
+                            speed = min(
+                                self.arrival_adjust_speed_mps,
+                                max(0.03, distance * 0.35),
+                            )
+                            vx = speed * body_x / max(distance, 1e-6)
+                            vy = speed * body_y / max(distance, 1e-6)
+                        else:
+                            vx = vy = 0.0
+                        yaw_rate = max(
+                            -self.arrival_adjust_yaw_rate_rps,
+                            min(self.arrival_adjust_yaw_rate_rps, yaw_error * 0.8),
+                        )
+                        observation = clearance(
+                            vx,
+                            vy,
+                            min(
+                                self.arrival_adjust_clearance_lookahead_m,
+                                distance + 0.05,
+                            ),
+                            max_scan_age_seconds=self.arrival_adjust_scan_max_age_seconds,
+                        ) or {}
+                        if not bool(observation.get("clear")):
+                            reason = str(observation.get("reason") or "unknown")
+                            velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+                            if reason == "scan_stale":
+                                if _transient_expired(reason):
+                                    failure_message = (
+                                        "到点微调等待新鲜扫描超过"
+                                        f"{self.arrival_adjust_safety_grace_seconds:.1f}秒"
+                                    )
+                                    break
+                                wait_for_safety = True
+                            else:
+                                failure_message = f"到点微调方向不安全（{reason}）"
+                                break
+                        else:
+                            transient_reason = ""
+                            transient_started_at = None
+                            velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
                 if stop_event.wait(ARRIVAL_ADJUST_PERIOD_SECONDS):
                     break
-            if not succeeded and not failure_message and not stop_event.is_set():
-                failure_message = "到点位姿在限定时间内未同时收敛"
         except Exception:
             LOGGER.exception("arrival heading-preserving adjustment failed")
             failure_message = "到点微调执行异常"
@@ -3252,11 +3507,17 @@ class TaskExecutor:
             except Exception:
                 LOGGER.warning("failed to zero arrival adjustment velocity", exc_info=True)
         with self._lock:
-            if self._arrival_adjustment_index != reached_index:
+            if (
+                self._arrival_adjustment_stop is not stop_event
+                or self._arrival_adjustment_index != reached_index
+            ):
                 return
             self._arrival_adjustment_index = None
             self._arrival_adjustment_thread = None
+            if cancelled_by_state or stop_event.is_set():
+                return
             if succeeded:
+                self._set_post_arrival_stage(reached_index, "post_arrival_ready")
                 self.on_navigation_result("succeeded", generation=generation)
                 return
             self._emit_safe_hold(
@@ -3603,6 +3864,7 @@ class TaskExecutor:
             self._assert_execution(execution_id)
             self._clear_nav_dispatch_retry()
             self._stop_obstacle_monitor()
+            self._cancel_arrival_adjustment(reset_state=False)
             if self.context.state == "paused":
                 return {"final_task_state": "paused", "state_version": self.context.state_version, "robot_stopped": True}
             if self.context.state not in {"accepted", "running", "pausing", "resuming", "interrupted"}:
@@ -3650,9 +3912,13 @@ class TaskExecutor:
             self._last_obstacle_seen_at = None
             self._obstacle_progress_anchor = None
             self._obstacle_progress_anchor_at = None
-            self._send_from(self.context.current_waypoint_index)
+            waypoint_index = self.context.current_waypoint_index
+            if self._post_arrival_active(waypoint_index):
+                self._resume_post_arrival(waypoint_index)
+            else:
+                self._send_from(waypoint_index)
             return {"final_task_state": "running", "resumed_forward": True,
-                    "waypoint_index": self.context.current_waypoint_index}
+                    "waypoint_index": waypoint_index}
 
     def resume_task(self, execution_id: str, resume_index: int) -> dict:
         with self._lock:
@@ -3717,6 +3983,18 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.resuming")
+            if self._post_arrival_active(resume_index):
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                self._resume_post_arrival(resume_index)
+                return {
+                    "final_task_state": self.context.state,
+                    "state_version": self.context.state_version,
+                    "resume_from_waypoint_index": resume_index,
+                    "post_arrival_stage": self.context.post_arrival_stage,
+                }
             waiting_index = self._waiting_waypoint_index()
             if waiting_index is not None:
                 reached_index = waiting_index
@@ -4099,7 +4377,7 @@ class TaskExecutor:
                     "task.arrival_pending_settle",
                     event_type_key="arrival_pending_settle",
                     waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
-                    message="目标点已到达，等待停车稳定",
+                    message="Nav2已到目标附近，等待停车稳定",
                 )
                 if not self._hold_final_pose():
                     LOGGER.warning(
@@ -4129,18 +4407,6 @@ class TaskExecutor:
                     self._start_waypoint_localization_correction(
                         reached_waypoint, reached_index
                     )
-                    speech_configured = (
-                        self._waypoint_speech_enabled()
-                        and bool(reached_waypoint.get("speech_template_id"))
-                        and self._waypoint_speech_mode(reached_waypoint) != "disabled"
-                    )
-                    speech_blocks = speech_configured and self._waypoint_speech_blocks_navigation(
-                        reached_waypoint
-                    )
-                    if speech_blocks:
-                        self._clear_waypoint_speech_status(reached_index)
-                        self._waypoint_localization_ready_index = None
-                        self._start_waypoint_speech_wait(reached_index)
                     if not self._absolute_localization_ready():
                         self.navigation.stop_motion()
                         self._restore_navigation_profile()
@@ -4162,12 +4428,13 @@ class TaskExecutor:
                     self._correction_completed_at_mono = time.monotonic()
                     self._arrival_correction_completed_index = reached_index
 
+                if not self._post_arrival_active(reached_index):
                     # Position approach is deliberately before final yaw. A
                     # Nav2 re-approach invalidates both stage latches.
                     self._emit_arrival_stage(
                         reached_index, "position_approach", "正在按校正后位置确认航点"
                     )
-                    if not self._arrival_xy_within_policy_tolerance(
+                    if not self._arrival_xy_is_stable(
                         reached_waypoint, reached_index
                     ):
                         outdoor = self._outdoor_navigation_profile()
@@ -4189,6 +4456,14 @@ class TaskExecutor:
                         )
                         return
                     self._arrival_retry_counts.pop(reached_index, None)
+                    self._set_post_arrival_stage(reached_index, "xy_reached")
+                    self._start_arrival_side_effects(
+                        reached_index, reached_waypoint
+                    )
+                else:
+                    self._restore_arrival_side_effect_gates(
+                        reached_index, reached_waypoint
+                    )
 
                 arrival_heading_completed = (
                     self._arrival_heading_completed_index == reached_index
@@ -4216,6 +4491,9 @@ class TaskExecutor:
                             )
                             return
                         self._arrival_convergence_attempts[reached_index] = attempts + 1
+                        self._set_post_arrival_stage(
+                            reached_index, "heading_pending"
+                        )
                         self._emit_arrival_stage(
                             reached_index, "heading_alignment", "位置确认完成，正在调整最终航向"
                         )
@@ -4239,6 +4517,9 @@ class TaskExecutor:
                     else:
                         self._arrival_heading_completed_index = reached_index
                         arrival_heading_completed = True
+                        self._set_post_arrival_stage(
+                            reached_index, "heading_aligned"
+                        )
 
                 self._emit_arrival_stage(
                     reached_index, "pose_verification", "正在同时验收航点位置和最终航向"
@@ -4260,7 +4541,7 @@ class TaskExecutor:
                             return
                         self._emit_safe_hold(
                             "ARRIVAL_POSE_CONVERGENCE_FAILED",
-                            "最终航向后位置偏移超过安全微调范围或安全条件不满足",
+                            "到达后微调能力不可用或当前位姿无效",
                         )
                         return
                     self._emit_safe_hold(
@@ -4281,15 +4562,10 @@ class TaskExecutor:
                         message="到点位姿未连续满足新鲜度和策略精度要求，等待重新确认",
                     )
                     return
-                self._waypoint_localization_ready_index = reached_index
-                self._run_waypoint_actions(reached_index, reached_waypoint)
-                self.on_feedback(
-                    reached_index - self._goal_offset,
-                    0.0,
-                    milestone="arrival_confirmed",
-                    completed_waypoints=reached_index + 1,
+                self._set_post_arrival_stage(
+                    reached_index, "post_arrival_ready"
                 )
-                self._start_waypoint_dwell(reached_index)
+                self._waypoint_localization_ready_index = reached_index
                 self._maybe_continue_after_waypoint(reached_index)
             elif status == "cancelled":
                 if self._expected_recovery_cancels > 0:
@@ -4300,6 +4576,28 @@ class TaskExecutor:
                     LOGGER.info("ignoring Nav2 cancel while obstacle recovery is in progress")
                     return
                 if self.context.state == "running":
+                    waypoint_index = self.context.current_waypoint_index
+                    if self._post_arrival_active(waypoint_index):
+                        adjustment_active = bool(
+                            self._arrival_adjustment_thread
+                            and self._arrival_adjustment_thread.is_alive()
+                        )
+                        heading_active = bool(
+                            self._departure_heading_thread
+                            and self._departure_heading_thread.is_alive()
+                        )
+                        if adjustment_active or heading_active:
+                            LOGGER.info(
+                                "ignoring Nav2 cancel during waypoint %s post-arrival processing",
+                                waypoint_index,
+                            )
+                        else:
+                            LOGGER.warning(
+                                "Nav2 cancelled after waypoint %s was reached; resuming post-arrival processing",
+                                waypoint_index,
+                            )
+                            self._resume_post_arrival(waypoint_index)
+                        return
                     # FollowPath/BT recovery can cancel a child goal. Keep the
                     # task alive and put a goal back on the current waypoint.
                     LOGGER.warning(
@@ -4388,6 +4686,7 @@ class TaskExecutor:
             elif self._departure_heading_index is None and self._dispatch_departure_heading(reached_index):
                 return
             next_waypoint_index = reached_index + 1
+            self._clear_post_arrival_state()
             self.context.current_waypoint_index = next_waypoint_index
             self.context.state_version += 1
             self._persist()

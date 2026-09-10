@@ -40,6 +40,9 @@ class LocalStore:
                     current_waypoint_index INTEGER NOT NULL DEFAULT 0,
                     start_command_id TEXT,
                     record_rosbag INTEGER NOT NULL DEFAULT 0,
+                    post_arrival_waypoint_index INTEGER,
+                    post_arrival_stage TEXT NOT NULL DEFAULT '',
+                    arrival_side_effects_started INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
@@ -68,6 +71,18 @@ class LocalStore:
             if "record_rosbag" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN record_rosbag INTEGER NOT NULL DEFAULT 0"
+                )
+            if "post_arrival_waypoint_index" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN post_arrival_waypoint_index INTEGER"
+                )
+            if "post_arrival_stage" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN post_arrival_stage TEXT NOT NULL DEFAULT ''"
+                )
+            if "arrival_side_effects_started" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_side_effects_started INTEGER NOT NULL DEFAULT 0"
                 )
             self._prune_trajectory_outbox_locked()
 
@@ -143,8 +158,10 @@ class LocalStore:
                 """
                 INSERT INTO task_context(
                     task_execution_id, state, state_version, route_snapshot_json,
-                    current_waypoint_index, start_command_id, record_rosbag
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    current_waypoint_index, start_command_id, record_rosbag,
+                    post_arrival_waypoint_index, post_arrival_stage,
+                    arrival_side_effects_started
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_execution_id) DO UPDATE SET
                     state=excluded.state,
                     state_version=excluded.state_version,
@@ -152,6 +169,9 @@ class LocalStore:
                     current_waypoint_index=excluded.current_waypoint_index,
                     start_command_id=excluded.start_command_id,
                     record_rosbag=excluded.record_rosbag,
+                    post_arrival_waypoint_index=excluded.post_arrival_waypoint_index,
+                    post_arrival_stage=excluded.post_arrival_stage,
+                    arrival_side_effects_started=excluded.arrival_side_effects_started,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -162,6 +182,9 @@ class LocalStore:
                     context.get("current_waypoint_index", 0),
                     context.get("start_command_id"),
                     int(bool(context.get("record_rosbag", False))),
+                    context.get("post_arrival_waypoint_index"),
+                    str(context.get("post_arrival_stage") or ""),
+                    int(bool(context.get("arrival_side_effects_started", False))),
                 ),
             )
 
@@ -183,6 +206,9 @@ class LocalStore:
             "current_waypoint_index": row["current_waypoint_index"],
             "start_command_id": row["start_command_id"],
             "record_rosbag": bool(row["record_rosbag"]),
+            "post_arrival_waypoint_index": row["post_arrival_waypoint_index"],
+            "post_arrival_stage": str(row["post_arrival_stage"] or ""),
+            "arrival_side_effects_started": bool(row["arrival_side_effects_started"]),
         }
 
     def clear_task_context(self, task_execution_id: str, final_state: str) -> None:
