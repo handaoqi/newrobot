@@ -5,12 +5,15 @@ import ConfigurationErrorPage from '../views/ConfigurationErrorPage.vue'
 import LoginPage from '../views/LoginPage.vue'
 import ModuleNotInstalledPage from '../views/ModuleNotInstalledPage.vue'
 import NotFoundPage from '../views/NotFoundPage.vue'
+import PageLoadErrorPage from '../views/PageLoadErrorPage.vue'
 import { MODULES } from '../modules/index.js'
 import { loadRuntimeConfig, homePathForConfig } from '../services/runtimeConfig.js'
+import { claimAssetLoadRetry, clearAssetLoadRetry, isAssetLoadError } from '../services/assetLoadRecovery.js'
 
 const routes = [
   { path: '/login', name: 'login', component: LoginPage },
   { path: '/configuration-error', name: 'configuration-error', component: ConfigurationErrorPage },
+  { path: '/page-load-error', name: 'page-load-error', component: PageLoadErrorPage },
   {
     path: '/dashboard',
     component: DashboardLayout,
@@ -33,7 +36,13 @@ const router = createRouter({ history: createWebHistory(), routes })
 let runtimeConfigPromise = null
 
 function readConfig() {
-  if (!runtimeConfigPromise) runtimeConfigPromise = loadRuntimeConfig()
+  if (!runtimeConfigPromise) {
+    runtimeConfigPromise = loadRuntimeConfig().catch((error) => {
+      // Do not keep a transient network failure cached for the whole session.
+      runtimeConfigPromise = null
+      throw error
+    })
+  }
   return runtimeConfigPromise
 }
 
@@ -60,9 +69,23 @@ router.beforeEach(async (to) => {
   return true
 })
 
+router.afterEach((to, _from, failure) => {
+  if (!failure && to.name !== 'page-load-error') clearAssetLoadRetry()
+})
+
 router.onError((error, to) => {
-  if (to?.name !== 'configuration-error') {
-    router.push({ name: 'configuration-error', query: { message: `页面加载失败：${error?.message || '未知错误'}` } })
+  if (isAssetLoadError(error)) {
+    if (claimAssetLoadRetry() && typeof window !== 'undefined' && typeof window.location?.reload === 'function') {
+      window.location.reload()
+      return
+    }
+    if (to?.name !== 'page-load-error') {
+      router.replace({ name: 'page-load-error', query: { message: '页面资源加载失败，可能是页面版本已更新，请刷新页面后重试。' } })
+    }
+    return
+  }
+  if (to?.name !== 'page-load-error') {
+    router.replace({ name: 'page-load-error', query: { message: `页面加载失败：${error?.message || '未知错误'}` } })
   }
 })
 

@@ -252,3 +252,62 @@ def test_outdoor_rtk_anchor_applies_metre_scale_xy_correction(tmp_path):
     assert summary["inertial_smoothing_guard"]["measurements"]["max_xy_correction_m"] == pytest.approx(
         math.hypot(7 * 0.275, 7 * 0.225), abs=1e-4
     )
+
+
+def test_outdoor_rtk_heading_turn_allows_adjacent_yaw_correction(tmp_path):
+    raw = [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.4, 0.0, math.radians(16.0)),
+        (2, 11.0, 0.8, 0.1, math.radians(32.0)),
+    ]
+    optimized = [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.42, 0.0, math.radians(16.0 - 6.5)),
+        (2, 11.0, 0.83, 0.1, math.radians(32.0 - 6.4)),
+    ]
+    _write_trajectory(tmp_path / "trajectory_raw.csv", raw)
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", optimized)
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 8,
+        "lio_between_factor_count": 2,
+        "imu_factor_count": 2,
+        "rtk_position_factor_count": 3,
+        "rtk_heading_factor_count": 3,
+        "error_before": 20.0,
+        "error_after": 2.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="outdoor")
+    guard = summary["inertial_smoothing_guard"]
+
+    assert guard["limits"]["max_adjacent_yaw_step_deg"] == 10.0
+    assert guard["measurements"]["max_adjacent_yaw_step_deg"] == pytest.approx(6.5, abs=0.05)
+    assert "max_adjacent_yaw_step_deg_above_limit" not in guard["reasons"]
+    assert summary["applied"] is True
+
+
+def test_outdoor_rtk_rejects_discontinuous_adjacent_yaw_correction(tmp_path):
+    raw = [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.4, 0.0, math.radians(16.0)),
+    ]
+    optimized = [
+        (0, 10.0, 0.0, 0.0, 0.0),
+        (1, 10.5, 0.42, 0.0, math.radians(16.0 - 12.0)),
+    ]
+    _write_trajectory(tmp_path / "trajectory_raw.csv", raw)
+    _write_trajectory(tmp_path / "trajectory_optimized.csv", optimized)
+    (tmp_path / "trajectory_covariance.json").write_text(json.dumps({
+        "factor_count": 5,
+        "lio_between_factor_count": 1,
+        "imu_factor_count": 1,
+        "rtk_position_factor_count": 2,
+        "error_before": 10.0,
+        "error_after": 1.0,
+    }))
+
+    summary = build_optimization_summary(tmp_path, mapping_type="outdoor")
+
+    assert summary["applied"] is False
+    assert summary["stage"] == "quality_rejected"
+    assert "max_adjacent_yaw_step_deg_above_limit" in summary["inertial_smoothing_guard"]["reasons"]

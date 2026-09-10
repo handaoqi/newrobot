@@ -47,22 +47,26 @@ test('saved route hydrates waypoint details and keeps per-waypoint global contro
   ])
 })
 
-test('keyframes and drill record share a row while navigation test stays below them', async ({ page }, testInfo) => {
+test('drill record follows the compact waypoint panel and aligns with keyframes', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'Run the desktop grid regression once in Chromium')
   await installTabletMocks(page, { authenticated: true, mapThumbnailUrl: '/images/map.png' })
 
   await page.goto('/dashboard/tasks/routes')
 
   const keyframes = page.locator('.route-keyframe-row')
+  const waypointPanel = page.locator('.route-step-3')
   const timeline = page.locator('.route-timeline-column')
   const navigationTest = page.locator('.route-step-5')
   await expect(keyframes).toBeVisible()
   await expect(timeline).toBeVisible()
   await expect(navigationTest).toBeVisible()
 
-  const positions = await Promise.all([keyframes, timeline, navigationTest].map(async locator => locator.boundingBox()))
-  expect(Math.abs(positions[0].y - positions[1].y)).toBeLessThanOrEqual(2)
-  expect(positions[2].y).toBeGreaterThan(positions[0].y + positions[0].height)
+  const positions = await Promise.all([waypointPanel, keyframes, timeline, navigationTest].map(async locator => locator.boundingBox()))
+  const [waypointBox, keyframeBox, timelineBox, navigationBox] = positions
+  expect(timelineBox.y).toBeGreaterThanOrEqual(waypointBox.y + waypointBox.height)
+  expect(timelineBox.y - (waypointBox.y + waypointBox.height)).toBeLessThanOrEqual(10)
+  expect(Math.abs(timelineBox.y + timelineBox.height - (keyframeBox.y + keyframeBox.height))).toBeLessThanOrEqual(2)
+  expect(navigationBox.y).toBeGreaterThan(Math.max(keyframeBox.y + keyframeBox.height, timelineBox.y + timelineBox.height))
 
   const toolbar = page.locator('.map-toolbar')
   await expect(toolbar).toBeVisible()

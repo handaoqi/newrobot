@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  assetForClass, createTfTree, normalizeSemanticObjects, occupancyGridToPoints,
+  assetForClass, createTfTree, filterDynamicSceneObjects, filterStaticSceneAssets, isRobotMoving,
+  inferStaticSceneAssets, mapPointToWgs84, normalizeSemanticObjects, occupancyGridToPoints,
   normalizeSceneAssetCatalog, normalizeSceneAssetInstance, pointCloud2ToArrays,
   sceneAssetIdForClass, semanticZoomMode, transformPointData, transformPoseTo2D,
 } from '../src/services/sceneData.js'
@@ -76,4 +77,53 @@ test('scene asset catalog resolves stable ids, aliases, and normalized instances
   assert.equal(instance.assetId, 'tree.deciduous')
   assert.deepEqual(instance.position, { x: 2, y: 3, z: 0 })
   assert.equal(instance.scale, 1.5)
+})
+
+test('scene modes keep static assets separate from motion-gated objects', () => {
+  const items = [
+    { asset_id: 'wall.straight' },
+    { asset_id: 'building.kiosk' },
+    { class_name: 'tree' },
+    { class_name: 'road' },
+    { class_name: 'person' },
+    { class_name: 'vehicle' },
+    { class_name: 'unknown_obstacle' },
+  ]
+  assert.deepEqual(filterStaticSceneAssets(items).map(item => item.asset_id || item.class_name), [
+    'wall.straight', 'building.kiosk', 'tree', 'road',
+  ])
+  assert.deepEqual(filterDynamicSceneObjects(items).map(item => item.class_name), [])
+  assert.deepEqual(filterDynamicSceneObjects(items, { robotMoving: true }).map(item => item.class_name), ['person', 'vehicle'])
+  assert.equal(isRobotMoving({ speed_mps: .05 }), false)
+  assert.equal(isRobotMoving({ speed_mps: .051 }), true)
+})
+
+test('point-cloud preview infers conservative static GLB instances', () => {
+  const points = []
+  for (let x = 4; x < 5.8; x += .25) for (let y = 4; y < 5.8; y += .25) for (let z = 0; z < 4.5; z += .35) points.push(x, y, z)
+  for (let x = 12; x < 14.4; x += .25) for (let y = 1; y < 3.4; y += .25) for (let z = 0; z < 3.5; z += .3) points.push(x, y, z)
+  for (let x = 0; x < 20; x += .4) for (let y = 8; y < 10; y += .4) points.push(x, y, 0)
+  const result = inferStaticSceneAssets(new Float32Array(points))
+  assert.equal(result.source, 'point_cloud_heuristic')
+  assert.equal(result.status, 'generated')
+  assert.ok(result.assets.some(item => item.class_name === 'tree' && item.asset_id === 'tree.deciduous'))
+  assert.ok(result.assets.some(item => item.class_name === 'building' && item.asset_id === 'building.kiosk'))
+  assert.ok(result.assets.some(item => item.class_name === 'road' && item.asset_id === 'road.straight'))
+  assert.ok(result.assets.every(item => !['person', 'vehicle', 'bicycle'].includes(item.class_name)))
+})
+
+test('map coordinates transform through the stored ENU-to-map alignment', () => {
+  const geo = {
+    available: true,
+    origin_latitude: 39.9,
+    origin_longitude: 116.4,
+    map_offset_x: 1.25,
+    map_offset_y: -.75,
+    enu_to_map_yaw: 0,
+  }
+  const point = mapPointToWgs84({ x: 1.25, y: -.75 }, geo)
+  assert.ok(Math.abs(point.latitude - 39.9) < 1e-10)
+  assert.ok(Math.abs(point.longitude - 116.4) < 1e-10)
+  const north = mapPointToWgs84({ x: 1.25, y: 99.25 }, geo)
+  assert.ok(north.latitude > point.latitude)
 })

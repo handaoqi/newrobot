@@ -6,8 +6,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader.js'
 
 import {
-  assetForClass, nextSemanticZoom, normalizeSceneAssetCatalog, normalizeSceneAssetInstance,
-  sceneAssetIdForClass, SCENE_ASSET_CATALOG_URL, semanticZoomMode,
+  assetForClass, filterStaticSceneAssets, isDynamicSceneObject, nextSemanticZoom,
+  normalizeSceneAssetCatalog, normalizeSceneAssetInstance, sceneAssetIdForClass,
+  SCENE_ASSET_CATALOG_URL, semanticZoomMode,
 } from '../../services/sceneData'
 
 const props = defineProps({
@@ -19,12 +20,14 @@ const props = defineProps({
   correction: { type: Object, default: null },
   robotPose: { type: Object, default: null },
   waypoints: { type: Array, default: () => [] },
-  semanticObjects: { type: Array, default: () => [] },
+  staticAssets: { type: Array, default: () => [] },
+  dynamicObjects: { type: Array, default: () => [] },
   layers: { type: Object, required: true },
   mode: { type: String, default: '2d' },
+  mapMode: { type: String, default: 'scene' },
   cameraPreset: { type: String, default: 'overview' },
 })
-const emit = defineEmits(['mode-change', 'stats', 'error'])
+const emit = defineEmits(['mode-change', 'stats', 'error', 'asset-inference'])
 
 const host = ref(null)
 const zoom = ref(props.mode === '3d' ? 0.75 : 0.25)
@@ -109,7 +112,7 @@ async function loadAssetCatalog() {
     })
     .finally(() => { assetCatalogRequest = null })
   await assetCatalogRequest
-  if (mounted) await updateSemanticObjects()
+  if (mounted) await updateAssetGroups()
   return assetCatalog
 }
 
@@ -150,14 +153,25 @@ function pointMaterial(size = 0.07, opacity = 1) {
 
 function updateCloudBuffer() {
   clearGroup('globalCloud')
-  if (!props.cloudBuffer) return
+  if (!props.cloudBuffer) {
+    emit('asset-inference', { assets: [], pointCount: 0, source: 'semantic_artifact', status: props.manifest?.semantic_build?.status || 'no_cloud' })
+    return
+  }
   try {
     const points = new PCDLoader().parse(props.cloudBuffer, '')
     points.material.size = 0.07
     points.material.vertexColors = Boolean(points.geometry.getAttribute('color'))
     if (!points.material.vertexColors) points.material.color.set('#5bb8ff')
     groups.globalCloud.add(points)
+    const position = points.geometry.getAttribute('position')
+    emit('asset-inference', {
+      assets: filterStaticSceneAssets(props.staticAssets),
+      pointCount: position?.count || 0,
+      source: 'semantic_artifact',
+      status: props.manifest?.semantic_build?.status || 'unavailable',
+    })
   } catch (error) {
+    emit('asset-inference', { assets: [], pointCount: 0, source: 'semantic_artifact', status: 'parse_error' })
     emit('error', `三维地图解析失败：${error.message}`)
   }
 }
@@ -273,28 +287,37 @@ function primitiveFor(item) {
   return mesh
 }
 
-async function updateSemanticObjects() {
+async function updateAssetGroups() {
   const token = ++semanticRenderToken
-  clearGroup('semantic')
-  const all = [...(props.manifest?.static_assets || []), ...props.semanticObjects]
-  for (const [index, item] of all.entries()) {
-    const normalized = normalizeSceneAssetInstance(item, index)
-    const assetId = sceneAssetIdForClass(normalized.assetId, assetCatalog) || sceneAssetIdForClass(normalized.className, assetCatalog)
-    const model = await loadAssetModel(assetId)
-    if (!mounted || token !== semanticRenderToken) return
-    if (model) {
-      model.userData.sceneAssetInstance = true
-      applyInstanceTransform(model, { ...normalized, assetId })
-      groups.semantic.add(model)
-    } else {
-      groups.semantic.add(primitiveFor(normalized))
+  const staticItems = filterStaticSceneAssets(props.staticAssets)
+  const groupSpecs = [
+    { name: 'staticAssets', items: staticItems, dynamic: false },
+    { name: 'dynamicObjects', items: props.dynamicObjects.filter(isDynamicSceneObject), dynamic: true },
+  ]
+  for (const { name, items, dynamic } of groupSpecs) {
+    clearGroup(name)
+    for (const [index, item] of items.entries()) {
+      const normalized = normalizeSceneAssetInstance({ ...item, dynamic }, index)
+      const assetId = sceneAssetIdForClass(normalized.assetId, assetCatalog) || sceneAssetIdForClass(normalized.className, assetCatalog)
+      const model = await loadAssetModel(assetId)
+      if (!mounted || token !== semanticRenderToken) return
+      if (model) {
+        model.userData.sceneAssetInstance = true
+        applyInstanceTransform(model, { ...normalized, assetId })
+        groups[name].add(model)
+      } else {
+        groups[name].add(primitiveFor(normalized))
+      }
     }
   }
   updateVisibility()
 }
 
 function updateVisibility() {
-  for (const [name, group] of Object.entries(groups)) group.visible = props.layers[name] !== false
+  for (const [name, group] of Object.entries(groups)) {
+    const streetBlock = props.mapMode === 'street-block'
+    group.visible = props.layers[name] !== false && !(streetBlock && name === 'globalCloud')
+  }
 }
 
 function setCamera(mode = props.mode) {
@@ -382,7 +405,7 @@ onMounted(() => {
   const directional = new THREE.DirectionalLight('#ffffff', 2.2)
   directional.position.set(6, -4, 10)
   scene.add(directional)
-  for (const name of ['occupancy', 'globalCloud', 'localCloud', 'obstacles', 'route', 'trail', 'corrections', 'boundary', 'robot', 'semantic']) {
+  for (const name of ['occupancy', 'globalCloud', 'localCloud', 'obstacles', 'route', 'trail', 'corrections', 'boundary', 'robot', 'staticAssets', 'dynamicObjects']) {
     groups[name] = new THREE.Group(); groups[name].name = name; scene.add(groups[name])
   }
   const grid = new THREE.GridHelper(60, 60, '#284c68', '#173044')
@@ -391,11 +414,11 @@ onMounted(() => {
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(host.value)
   host.value.addEventListener('wheel', onWheel, { passive: true })
-  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateSemanticObjects(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
+  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateAssetGroups(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
   animationFrame = requestAnimationFrame(animate)
 })
 
-watch(() => props.manifest, () => { updateOccupancy(); void updateSemanticObjects(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
+watch(() => props.manifest, () => { updateOccupancy(); void updateAssetGroups(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
 watch(() => props.cloudBuffer, updateCloudBuffer)
 watch(() => props.liveCloud, updateLiveCloud)
 watch(() => props.obstacles, updateObstacles)
@@ -403,7 +426,9 @@ watch(() => props.trail, updateTrail, { deep: true })
 watch(() => props.correction, updateCorrection, { deep: true })
 watch(() => props.robotPose, () => { updateRobot(); if (['dog', 'follow'].includes(props.cameraPreset)) setCamera() }, { deep: true })
 watch(() => props.waypoints, updateRoute, { deep: true })
-watch(() => props.semanticObjects, () => { void updateSemanticObjects() }, { deep: true })
+watch(() => props.staticAssets, () => { void updateAssetGroups() }, { deep: true })
+watch(() => props.dynamicObjects, () => { void updateAssetGroups() }, { deep: true })
+watch(() => props.mapMode, () => { void updateAssetGroups(); updateVisibility() })
 watch(() => props.layers, updateVisibility, { deep: true })
 watch(() => [props.mode, props.cameraPreset], () => {
   zoom.value = props.mode === '3d' ? Math.max(zoom.value, .56) : Math.min(zoom.value, .44)

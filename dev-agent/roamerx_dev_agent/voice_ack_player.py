@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import logging
+import fcntl
 import os
 import shlex
 import subprocess
 import threading
+from pathlib import Path
 
 from .config import VoiceConfig
 
 LOGGER = logging.getLogger(__name__)
+
+NX_AUDIO_LOCK_PATH = Path("/tmp/roamerx-nx-speaker.lock")
+VOICE_ACK_PID_PATH = Path("/tmp/roamerx-dev-voice-ack.pid")
 
 
 class VoiceAckPlayer:
@@ -18,6 +23,7 @@ class VoiceAckPlayer:
         self.config = config
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
+        self._audio_lease = None
 
     def play(self, audio_url: str) -> None:
         if not audio_url.startswith(("http://", "https://")):
@@ -25,9 +31,34 @@ class VoiceAckPlayer:
         with self._lock:
             if self._process and self._process.poll() is None:
                 self._process.terminate()
+                try:
+                    self._process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+            self._release_audio_lease()
+            lease = None
+            if self.config.capture_mode == "local_alsa":
+                lease = NX_AUDIO_LOCK_PATH.open("a+")
+                try:
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lease.close()
+                    LOGGER.info("voice acknowledgement skipped because alert audio owns the NX speaker")
+                    return
             command, options = self._command(audio_url)
-            self._process = subprocess.Popen(command, **options)
-        threading.Thread(target=self._wait, daemon=True, name="dev-voice-ack").start()
+            try:
+                process = subprocess.Popen(command, **options)
+            except Exception:
+                if lease is not None:
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+                    lease.close()
+                raise
+            self._process = process
+            self._audio_lease = lease
+            if lease is not None:
+                VOICE_ACK_PID_PATH.write_text(str(process.pid), encoding="utf-8")
+        threading.Thread(target=self._wait, args=(process,), daemon=True, name="dev-voice-ack").start()
 
     def _command(self, audio_url: str) -> tuple[list[str], dict]:
         options = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE, "text": True}
@@ -52,13 +83,9 @@ class VoiceAckPlayer:
             "-i", self.config.identity_file, f"{self.config.user}@{self.config.host}", command,
         ], options
 
-    def _wait(self) -> None:
-        with self._lock:
-            process = self._process
-        if not process:
-            return
+    def _wait(self, process: subprocess.Popen) -> None:
         try:
-            stderr = process.communicate(timeout=720)[1]
+            stderr = process.communicate(timeout=60)[1]
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
@@ -66,9 +93,27 @@ class VoiceAckPlayer:
             except subprocess.TimeoutExpired:
                 process.kill()
                 stderr = process.communicate()[1]
-            LOGGER.warning("voice acknowledgement playback exceeded 12 minutes: %s", stderr[-500:])
-            return
-        if process.returncode:
-            LOGGER.warning("voice acknowledgement playback failed: %s", stderr[-500:])
+            LOGGER.warning("voice acknowledgement playback exceeded 60 seconds: %s", stderr[-500:])
         else:
-            LOGGER.info("voice acknowledgement playback finished")
+            if process.returncode:
+                LOGGER.warning("voice acknowledgement playback failed: %s", stderr[-500:])
+            else:
+                LOGGER.info("voice acknowledgement playback finished")
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None
+                    self._release_audio_lease()
+
+    def _release_audio_lease(self) -> None:
+        lease = self._audio_lease
+        self._audio_lease = None
+        if lease is not None:
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+            finally:
+                lease.close()
+        try:
+            VOICE_ACK_PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("failed to remove voice acknowledgement pid file", exc_info=True)

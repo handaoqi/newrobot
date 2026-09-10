@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import SceneViewport from '../components/scene/SceneViewport.vue'
+import AmapSatelliteViewport from '../components/scene/AmapSatelliteViewport.vue'
 import SystemLogPanel from '../components/SystemLogPanel.vue'
 import {
   fetchMapScene, fetchMapSceneCloud, fetchMapSummaries, fetchRobotNavigationStatus,
@@ -10,8 +11,9 @@ import {
 } from '../services/api'
 import { openLiveMessageSource, scanBagMessages } from '../services/rosStream'
 import {
-  ASSET_REGISTRY, SCENE_LAYER_DEFAULTS, SCENE_TOPICS, assetForClass,
-  createTfTree, decodeJsonString, localizationProcess, normalizeSceneAssetInstance, normalizeSemanticObjects,
+  ASSET_REGISTRY, SCENE_LAYER_DEFAULTS, SCENE_MAP_MODES, SCENE_TOPICS, assetForClass,
+  createTfTree, decodeJsonString, filterDynamicSceneObjects, filterStaticSceneAssets, isRobotMoving,
+  localizationProcess, normalizeSceneAssetInstance, normalizeSemanticObjects,
   occupancyGridToPoints, pointCloud2ToArrays, transformPointData, transformPoseTo2D,
 } from '../services/sceneData'
 
@@ -26,6 +28,7 @@ const selectedRouteId = ref('')
 const liveUrl = ref(localStorage.getItem(LIVE_URL_KEY) || `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/foxglove/ws`)
 const manifest = ref(null)
 const cloudBuffer = ref(null)
+const assetInference = ref({ status: 'unavailable', pointCount: 0, source: 'semantic_artifact' })
 const liveCloud = ref(null)
 const obstacles = ref(null)
 const streamPose = ref(null)
@@ -43,6 +46,7 @@ const sceneLoading = ref(false)
 const error = ref('')
 const connectionState = ref('idle')
 const viewMode = ref('2d')
+const mapMode = ref('scene')
 const cameraPreset = ref('overview')
 const panel = ref('localization')
 const layers = reactive({ ...SCENE_LAYER_DEFAULTS })
@@ -76,9 +80,16 @@ const dataAge = computed(() => {
   return Number.isFinite(stamp) ? Math.max(0, (Date.now() - stamp) / 1000).toFixed(1) : '—'
 })
 const sourceLabel = computed(() => ({ live: '实时机器狗', map: '平台离线地图包', bag: '本地 MCAP' }[sourceMode.value]))
+const staticAssets = computed(() => filterStaticSceneAssets(manifest.value?.static_assets || []))
+const viewportStaticAssets = computed(() => staticAssets.value)
+const robotMoving = computed(() => isRobotMoving({
+  ...status.value,
+  speed_mps: Number.isFinite(Number(status.value.speed_mps)) ? status.value.speed_mps : streamPose.value?.speed_mps,
+}))
+const dynamicObjects = computed(() => filterDynamicSceneObjects(semanticObjects.value, { robotMoving: robotMoving.value }))
 const visibleObjects = computed(() => [
-  ...(manifest.value?.static_assets || []).map((item, index) => normalizeSceneAssetInstance({ ...item, dynamic: false }, index)),
-  ...semanticObjects.value,
+  ...viewportStaticAssets.value.map((item, index) => normalizeSceneAssetInstance({ ...item, dynamic: false }, index)),
+  ...dynamicObjects.value,
 ].map(item => ({ ...item, asset: assetForClass(item.className || item.assetId) })))
 const viewerRejection = computed(() => Object.values(viewerStatus.value).filter(Boolean).join('；'))
 const correction = computed(() => {
@@ -125,14 +136,14 @@ function consumeCostmap(message) {
 function semanticObjectsInMap(message, at) {
   const matrix = mapTransformFor(message)
   if (!matrix) {
-    viewerStatus.value = { ...viewerStatus.value, semantic: `语义对象 tf_missing:${message?.header?.frame_id || 'unknown'}→map` }
+    viewerStatus.value = { ...viewerStatus.value, dynamicObjects: `语义对象 tf_missing:${message?.header?.frame_id || 'unknown'}→map` }
     return []
   }
   const items = normalizeSemanticObjects(message, at).map(item => {
     const pose = transformPoseTo2D(item.position, item.orientation, matrix)
     return pose ? { ...item, position: { x: pose.x, y: pose.y, z: pose.z }, orientation: { x: 0, y: 0, z: Math.sin(pose.yaw / 2), w: Math.cos(pose.yaw / 2) } } : item
   })
-  const { semantic: _cleared, ...remaining } = viewerStatus.value
+  const { dynamicObjects: _cleared, ...remaining } = viewerStatus.value
   viewerStatus.value = remaining
   return items
 }
@@ -142,7 +153,11 @@ function poseFromOdometry(message) {
   if (!pose) return null
   const matrix = mapTransformFor(message)
   if (!matrix) return null
-  return transformPoseTo2D(pose.position, pose.orientation, matrix)
+  const normalized = transformPoseTo2D(pose.position, pose.orientation, matrix)
+  if (!normalized) return null
+  const linear = message?.twist?.twist?.linear
+  const speed = Math.hypot(Number(linear?.x) || 0, Number(linear?.y) || 0, Number(linear?.z) || 0)
+  return { ...normalized, speed_mps: Number.isFinite(speed) ? speed : null }
 }
 
 function number(value, digits = 2, suffix = '') {
@@ -184,6 +199,7 @@ async function loadCatalogs() {
 async function loadScene() {
   cloudBuffer.value = null
   manifest.value = null
+  assetInference.value = { status: 'unavailable', pointCount: 0, source: 'semantic_artifact' }
   if (!selectedMapId.value) return
   sceneLoading.value = true
   try {
@@ -294,6 +310,20 @@ function selectCamera(preset) {
   if (preset === 'dog') viewMode.value = '3d'
 }
 
+function selectMapMode(mode) {
+  mapMode.value = mode
+  if (mode === 'satellite') {
+    viewMode.value = '2d'
+    cameraPreset.value = 'overview'
+  } else if (mode === 'street-block') {
+    viewMode.value = '3d'
+  }
+}
+
+function handleAssetInference(result) {
+  assetInference.value = result || { status: 'unavailable', pointCount: 0, source: 'semantic_artifact' }
+}
+
 async function openBag(event) {
   const file = event.target.files?.[0]
   event.target.value = ''
@@ -396,20 +426,24 @@ onBeforeUnmount(() => {
       <label>机器人<select v-model="selectedRobotId"><option v-for="robot in robots" :key="robot.id" :value="String(robot.id)">{{ robot.code }} · {{ robot.name }}</option></select></label>
       <label>世界/场景地图<select v-model="selectedMapId"><option v-for="map in maps" :key="map.id" :value="String(map.id)">{{ map.active ? '● ' : '' }}{{ map.name }}</option></select></label>
       <label>巡检路线<select v-model="selectedRouteId"><option value="">不叠加路线</option><option v-for="route in routes.filter(item => String(item.map_data) === String(selectedMapId))" :key="route.id" :value="String(route.id)">{{ route.name }}</option></select></label>
+      <div class="map-mode-picker" aria-label="地图模式"><span>地图模式</span><div class="map-mode-buttons"><button v-for="(label, mode) in SCENE_MAP_MODES" :key="mode" type="button" :class="{ active: mapMode === mode }" @click="selectMapMode(mode)">{{ label }}</button></div></div>
       <div class="runtime-state"><i :class="statusTone(connectionState)"></i><strong>{{ sourceLabel }}</strong><span>{{ sourceMode === 'live' ? `${dataAge}s 前` : sourceMode === 'bag' ? bagName || '未选文件' : '静态' }}</span></div>
     </section>
 
     <section class="scene-workspace">
       <article class="viewport-card">
         <div class="viewport-toolbar">
-          <div class="segmented"><button :class="{ active: viewMode === '2d' }" @click="viewMode = '2d'">2D</button><button :class="{ active: viewMode === '3d' }" @click="viewMode = '3d'">3D</button><span>滚轮/双指自动切换</span></div>
-          <div class="segmented"><button v-for="item in [['overview','俯视'],['follow','跟随'],['dog','机器狗视角']]" :key="item[0]" :class="{ active: cameraPreset === item[0] }" @click="selectCamera(item[0])">{{ item[1] }}</button></div>
+          <div v-if="mapMode !== 'satellite'" class="segmented"><button :class="{ active: viewMode === '2d' }" @click="viewMode = '2d'">2D</button><button :class="{ active: viewMode === '3d' }" @click="viewMode = '3d'">3D</button><span>滚轮/双指自动切换</span></div>
+          <div v-if="mapMode !== 'satellite'" class="segmented"><button v-for="item in [['overview','俯视'],['follow','跟随'],['dog','机器狗视角']]" :key="item[0]" :class="{ active: cameraPreset === item[0] }" @click="selectCamera(item[0])">{{ item[1] }}</button></div>
+          <span v-if="mapMode === 'street-block'" class="mode-hint">点云识别 → GLB静态资产拼接 · 实时目标</span>
+          <span v-else-if="mapMode === 'satellite'" class="mode-hint">高德卫星来源</span>
           <span class="render-stats">{{ renderStats.fps }} FPS · {{ renderStats.points.toLocaleString() }} 点</span>
         </div>
         <div class="viewport-wrap">
-          <SceneViewport :manifest="manifest" :cloud-buffer="cloudBuffer" :live-cloud="liveCloud" :obstacles="obstacles" :trail="trail" :correction="correction" :robot-pose="robotPose" :waypoints="routeWaypoints" :semantic-objects="semanticObjects" :layers="layers" :mode="viewMode" :camera-preset="cameraPreset" @mode-change="viewMode = $event" @stats="renderStats = $event" @error="error = $event" />
+          <SceneViewport v-if="mapMode !== 'satellite'" :manifest="manifest" :cloud-buffer="cloudBuffer" :live-cloud="liveCloud" :obstacles="obstacles" :trail="trail" :correction="correction" :robot-pose="robotPose" :waypoints="routeWaypoints" :static-assets="viewportStaticAssets" :dynamic-objects="dynamicObjects" :layers="layers" :mode="viewMode" :map-mode="mapMode" :camera-preset="cameraPreset" @mode-change="viewMode = $event" @stats="renderStats = $event" @error="error = $event" @asset-inference="handleAssetInference" />
+          <AmapSatelliteViewport v-else :geo-reference="manifest?.geo_reference" :robot-pose="robotPose" :trail="trail" :waypoints="routeWaypoints" />
           <div v-if="loading || sceneLoading" class="scene-loading">{{ loading ? '正在加载设备与地图…' : '正在生成/加载三维点云预览…' }}</div>
-          <div class="scene-legend"><span><i class="robot"></i>机器狗</span><span><i class="route"></i>规划路线</span><span><i class="cloud"></i>局部点云</span><span><i class="object"></i>识别资产</span></div>
+          <div class="scene-legend"><span><i class="robot"></i>机器狗</span><span><i class="route"></i>规划路线</span><span><i class="cloud"></i>局部点云</span><span><i class="object"></i>{{ mapMode === 'street-block' ? '街区静态/实时资产' : '识别资产' }}</span></div>
         </div>
         <div v-if="sourceMode === 'bag'" class="bag-timeline"><strong>{{ bagName || '请选择MCAP' }}</strong><input v-model.number="bagTime" type="range" min="0" :max="bagDuration || 1" step="0.1" :disabled="!bagDuration"/><span>{{ number(bagTime,1,'s') }} / {{ number(bagDuration,1,'s') }}</span><small v-if="bagProgress < 1">解析 {{ Math.round(bagProgress * 100) }}%</small></div>
       </article>
@@ -460,13 +494,17 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div v-else class="diagnostic-body">
-          <h3>场景图层</h3>
-          <div class="layer-list"><label v-for="(_, key) in layers" :key="key"><input v-model="layers[key]" type="checkbox"/><span>{{ {occupancy:'2D占据图',globalCloud:'3D伪彩地图',localCloud:'实时局部点云',obstacles:'障碍物',route:'路线/航点',trail:'定位尾迹',corrections:'融合校正',semantic:'语义资产',boundary:'导航边界'}[key] }}</span></label></div>
+          <div v-else class="diagnostic-body">
+            <h3>场景图层</h3>
+          <div class="layer-list"><label v-for="(_, key) in layers" :key="key"><input v-model="layers[key]" type="checkbox"/><span>{{ {occupancy:'2D占据图',globalCloud:'3D伪彩地图',localCloud:'实时局部点云',obstacles:'障碍物',route:'路线/航点',trail:'定位尾迹',corrections:'融合校正',staticAssets:'街区静态资产',dynamicObjects:'实时行人车辆',boundary:'导航边界'}[key] }}</span></label></div>
           <div class="readonly-note boundary-note">边界仅用于可视化核对：草稿 v{{ manifest?.boundary?.revision || 0 }} / 生效 v{{ manifest?.boundary?.active_revision || 0 }} · {{ manifest?.boundary?.apply_status || '未配置' }}。编辑、校验和发布请到<a href="/dashboard/tasks/routes">路径规划</a>。</div>
           <h3>基础资产与当前识别</h3>
+          <div v-if="mapMode === 'street-block'" class="readonly-note asset-inference-note">
+            静态资产 {{ viewportStaticAssets.length }} 个 · {{ manifest?.semantic_build?.status === 'ready' ? '高置信度语义清单' : manifest?.semantic_build?.status === 'processing' ? '语义识别处理中' : '未生成可靠语义模型' }}<span v-if="assetInference.pointCount"> · {{ assetInference.pointCount.toLocaleString() }} 点</span>
+          </div>
           <div class="asset-grid"><span v-for="(asset,key) in ASSET_REGISTRY" :key="key"><i :style="{background:asset.color}"></i>{{ asset.label }}</span></div>
-          <div class="object-list"><article v-for="item in visibleObjects" :key="item.id"><i :style="{background:item.asset.color}"></i><div><strong>{{ item.asset.label }} · {{ item.id }}</strong><small>{{ number(item.position.x) }}, {{ number(item.position.y) }}, {{ number(item.position.z) }} · {{ number(item.confidence * 100,0,'%') }}</small></div></article><p v-if="!visibleObjects.length" class="empty">尚未收到经过标定和点云验证的三维目标；不会用二维框伪造地图坐标。</p></div>
+          <div class="readonly-note motion-note">实时动态目标：{{ robotMoving ? `机器狗运动中（${number(status.speed_mps,2,' m/s')}）` : '机器狗停止或速度未知，已清空行人车辆' }}</div>
+          <div class="object-list"><article v-for="item in visibleObjects" :key="item.id"><i :style="{background:item.asset.color}"></i><div><strong>{{ item.asset.label }} · {{ item.id }}</strong><small>{{ number(item.position.x) }}, {{ number(item.position.y) }}, {{ number(item.position.z) }} · {{ number(item.confidence * 100,0,'%') }}</small></div></article><p v-if="!visibleObjects.length" class="empty">尚未收到符合当前模式约束的三维目标；不会用二维框伪造地图坐标。</p></div>
           <small v-if="personDetections?.detections?.length" class="projection-pending">收到 {{ personDetections.detections.length }} 个二维YOLO框，等待 `/perception/semantic_objects` 三维投影。</small>
         </div>
       </aside>
@@ -483,12 +521,12 @@ onBeforeUnmount(() => {
 .scene-head h2 { margin: 2px 0 0; font-size: 24px; }.scene-head p { margin: 5px 0 0; color: var(--muted); }.eyebrow { color: var(--cyan)!important; font-size: 11px; font-weight: 800; letter-spacing: .12em; }
 .source-tabs,.segmented { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-soft); }.source-tabs button,.segmented button { border: 0; border-radius: 8px; padding: 8px 11px; color: var(--muted); background: transparent; cursor: pointer; }.source-tabs button.active,.segmented button.active { color: #fff; background: #087aa0; }.segmented span { padding: 0 6px; color: var(--muted); font-size: 11px; }
 .error-banner { display: flex; justify-content: space-between; padding: 10px 13px; border: 1px solid #dc6060; border-radius: 10px; color: #ffb3b3; background: #351318; }.error-banner button { border: 0; color: inherit; background: transparent; font-size: 18px; }
-.control-bar { display: grid; grid-template-columns: repeat(3,minmax(180px,1fr)) auto; gap: 10px; align-items: end; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }.control-bar label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }.control-bar select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--input-bg); }.runtime-state { display: grid; grid-template-columns: auto auto; gap: 2px 7px; align-items: center; min-width: 130px; }.runtime-state i { grid-row: 1 / 3; width: 9px; height: 9px; border-radius: 50%; background: #eab308; }.runtime-state i.ok { background: #22c55e; }.runtime-state i.bad { background: #ef4444; }.runtime-state span { color: var(--muted); font-size: 11px; }
-.scene-workspace { display: grid; grid-template-columns: minmax(0,1.75fr) minmax(350px,.75fr); gap: 14px; min-height: min(720px,calc(100vh - 250px)); }.viewport-card,.diagnostic-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); }.viewport-card { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }.viewport-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }.render-stats { margin-left: auto; color: var(--muted); font: 11px ui-monospace,monospace; }.viewport-wrap { position: relative; min-height: 0; background: #07111f; }.scene-loading { position: absolute; inset: 0; display: grid; place-content: center; color: #d9edff; background: rgba(4,12,23,.72); backdrop-filter: blur(4px); }.scene-legend { position: absolute; left: 12px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 10px; padding: 7px 9px; border: 1px solid #29415a; border-radius: 9px; color: #dbeafe; background: rgba(5,15,28,.82); font-size: 10px; pointer-events: none; }.scene-legend span { display: flex; gap: 5px; align-items: center; }.scene-legend i { width: 12px; height: 3px; }.scene-legend .robot { background:#22d3ee }.scene-legend .route { background:#38bdf8 }.scene-legend .cloud { background:#7dd3fc }.scene-legend .object { background:#f59e0b }
+.control-bar { display: grid; grid-template-columns: repeat(3,minmax(150px,1fr)) minmax(280px,1.4fr) auto; gap: 10px; align-items: end; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }.control-bar label,.map-mode-picker { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }.control-bar select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--input-bg); }.map-mode-buttons { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }.map-mode-buttons button { flex: 1; min-width: 0; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; white-space: nowrap; }.map-mode-buttons button.active { color: #fff; background: #087aa0; }.runtime-state { display: grid; grid-template-columns: auto auto; gap: 2px 7px; align-items: center; min-width: 130px; }.runtime-state i { grid-row: 1 / 3; width: 9px; height: 9px; border-radius: 50%; background: #eab308; }.runtime-state i.ok { background: #22c55e; }.runtime-state i.bad { background: #ef4444; }.runtime-state span { color: var(--muted); font-size: 11px; }
+.scene-workspace { display: grid; grid-template-columns: minmax(0,1.75fr) minmax(350px,.75fr); gap: 14px; min-height: min(720px,calc(100vh - 250px)); }.viewport-card,.diagnostic-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); }.viewport-card { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }.viewport-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }.mode-hint { color: var(--muted); font-size: 11px; }.render-stats { margin-left: auto; color: var(--muted); font: 11px ui-monospace,monospace; }.viewport-wrap { position: relative; min-height: 0; background: #07111f; }.scene-loading { position: absolute; inset: 0; display: grid; place-content: center; color: #d9edff; background: rgba(4,12,23,.72); backdrop-filter: blur(4px); }.scene-legend { position: absolute; left: 12px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 10px; padding: 7px 9px; border: 1px solid #29415a; border-radius: 9px; color: #dbeafe; background: rgba(5,15,28,.82); font-size: 10px; pointer-events: none; }.scene-legend span { display: flex; gap: 5px; align-items: center; }.scene-legend i { width: 12px; height: 3px; }.scene-legend .robot { background:#22d3ee }.scene-legend .route { background:#38bdf8 }.scene-legend .cloud { background:#7dd3fc }.scene-legend .object { background:#f59e0b }
 .bag-timeline { display: grid; grid-template-columns: auto minmax(120px,1fr) auto auto; gap: 9px; align-items: center; padding: 9px 12px; border-top: 1px solid var(--line); font-size: 11px; }.bag-timeline input { width: 100%; }
 .diagnostic-card { display: grid; grid-template-rows: auto minmax(0,1fr); }.diagnostic-tabs { display: grid; grid-template-columns: repeat(4,1fr); border-bottom: 1px solid var(--line); }.diagnostic-tabs button { min-width: 0; padding: 12px 4px; border: 0; border-bottom: 2px solid transparent; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }.diagnostic-tabs button.active { color: var(--cyan); border-bottom-color: var(--cyan); background: var(--panel-soft); }.diagnostic-body { min-height: 0; padding: 14px; overflow: auto; }.diagnostic-body h3 { margin: 17px 0 8px; font-size: 13px; }.process-list { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }.process-step { display: grid; grid-template-columns: auto 1fr; gap: 2px 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.process-step i { grid-row: 1/3; width: 8px; height: 8px; margin-top: 3px; border-radius: 50%; background: #94a3b8; }.process-step span,.process-step strong { font-size: 10px; }.process-step strong { color: var(--muted); }.process-step.ok i{background:#22c55e}.process-step.active i{background:#38bdf8}.process-step.warning i{background:#ef4444}
 .metric-list { margin: 0; }.metric-list div { display: grid; grid-template-columns: minmax(110px,.8fr) minmax(0,1.2fr); gap: 10px; padding: 7px 2px; border-bottom: 1px solid var(--line); font-size: 11px; }.metric-list dt { color: var(--muted); }.metric-list dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-family: ui-monospace,monospace; }.ok{color:#22c55e!important}.warn{color:#eab308!important}.bad{color:#ef4444!important}.fusion-flow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; padding: 9px; border: 1px solid #245b72; border-radius: 9px; background: rgba(8,122,160,.09); font-size: 10px; }.fusion-flow span,.fusion-flow strong { padding: 5px; border-radius: 6px; background: var(--panel-soft); }.fusion-flow b { color: var(--cyan); }.readonly-note { padding: 8px 10px; border-left: 3px solid #38bdf8; color: var(--muted); background: var(--panel-soft); font-size: 11px; }.waypoint-list { display: grid; gap: 7px; }.waypoint-list article { padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.waypoint-list header { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 7px; font-size: 11px; }.waypoint-list header b { display:grid;place-content:center;width:20px;height:20px;border-radius:50%;color:#fff;background:#087aa0 }.waypoint-list header span { color: var(--muted); font-family:ui-monospace,monospace }.waypoint-list article>div { display:flex;flex-wrap:wrap;gap:5px;margin-top:7px }.waypoint-list article>div span { padding:3px 5px;border-radius:5px;color:var(--muted);background:var(--panel-soft);font-size:9px }
-.boundary-note { margin-top:10px;line-height:1.55 }.boundary-note a { margin-left:3px;color:var(--cyan) }
+.boundary-note { margin-top:10px;line-height:1.55 }.boundary-note a { margin-left:3px;color:var(--cyan) }.motion-note { margin-top:10px;line-height:1.45 }
 .layer-list { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.layer-list label { display:flex;gap:7px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px;font-size:10px }.asset-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.asset-grid span { display:flex;gap:7px;align-items:center;font-size:10px }.asset-grid i,.object-list i { width:9px;height:9px;border-radius:2px }.object-list { display:grid;gap:6px;margin-top:12px }.object-list article { display:flex;gap:8px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px }.object-list div { display:grid;gap:2px }.object-list strong,.object-list small { font-size:10px }.object-list small,.empty,.projection-pending { color:var(--muted) }.empty { font-size:11px;line-height:1.5 }.projection-pending { display:block;margin-top:9px;font-size:10px }.file-picker { position:absolute;width:1px;height:1px;opacity:0;pointer-events:none }
 @media (max-width: 1250px) { .scene-workspace { grid-template-columns: minmax(0,1.35fr) minmax(330px,.85fr); }.control-bar { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 900px) { .scene-head { align-items:stretch;flex-direction:column }.source-tabs { align-self:flex-start }.scene-workspace { grid-template-columns:1fr;min-height:0 }.viewport-wrap { min-height:430px }.diagnostic-card { max-height:600px }.control-bar { grid-template-columns:1fr 1fr }.runtime-state { grid-column:1/-1 } }

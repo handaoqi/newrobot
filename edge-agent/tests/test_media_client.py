@@ -15,6 +15,7 @@ def test_upload_map_package_uses_configured_timeout(tmp_path, monkeypatch):
 
     def fake_post(*_args, **kwargs):
         seen["timeout"] = kwargs["timeout"]
+        seen["proxies"] = kwargs.get("proxies")
         response = requests.Response()
         response.status_code = 200
         response._content = b'{"id": 1}'
@@ -29,6 +30,7 @@ def test_upload_map_package_uses_configured_timeout(tmp_path, monkeypatch):
 
     assert client.upload_map_package(str(package), {"map_name": "indoor"}) == {"id": 1}
     assert seen["timeout"] == (30, 1800)
+    assert seen["proxies"] == {"http": None, "https": None}
 
 
 def test_upload_map_package_timeout_becomes_protocol_error(tmp_path, monkeypatch):

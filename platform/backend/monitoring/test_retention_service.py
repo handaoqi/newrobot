@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 
 from .models import InboundMessage, Robot, SystemLog
-from .services.retention_service import InboundMessageRetentionService, SystemLogRetentionService
+from .services.retention_service import (
+    InboundMessageRetentionService,
+    SystemLogRetentionService,
+    weekly_cleanup_due,
+)
 
 
 @override_settings(
     INBOUND_MESSAGE_RETENTION_DAYS=30,
     INBOUND_MESSAGE_FAILED_RETENTION_DAYS=180,
     INBOUND_MESSAGE_CLEANUP_BATCH_SIZE=2,
+    INBOUND_MESSAGE_STALE_PENDING_DAYS=7,
 )
 class InboundMessageRetentionTests(TestCase):
     def setUp(self):
@@ -70,6 +77,32 @@ class InboundMessageRetentionTests(TestCase):
         self.assertEqual(result.processed_deleted, 1)
         self.assertTrue(InboundMessage.objects.filter(pk=old_message.pk).exists())
 
+    def test_prune_until_done_drains_all_eligible_batches(self):
+        for _ in range(5):
+            self.message(status="processed", age_days=31)
+
+        result, batches = InboundMessageRetentionService.prune_until_done(
+            now=self.now,
+            expire_stale_pending=False,
+            checkpoint=False,
+        )
+
+        self.assertEqual(result.processed_deleted, 5)
+        self.assertGreaterEqual(batches, 3)
+        self.assertFalse(InboundMessage.objects.filter(process_status="processed").exists())
+
+    def test_expire_stale_pending_marks_old_rows_failed(self):
+        stale = self.message(status="pending", age_days=8)
+        fresh = self.message(status="pending", age_days=1)
+
+        count = InboundMessageRetentionService.expire_stale_pending(now=self.now)
+
+        self.assertEqual(count, 1)
+        stale.refresh_from_db()
+        fresh.refresh_from_db()
+        self.assertEqual(stale.process_status, "failed")
+        self.assertEqual(fresh.process_status, "pending")
+
 
 @override_settings(
     SYSTEM_LOG_DEBUG_RETENTION_DAYS=7,
@@ -102,3 +135,30 @@ class SystemLogRetentionTests(TestCase):
         self.assertEqual((result.debug_deleted, result.info_deleted, result.warning_error_deleted), (1, 1, 1))
         self.assertFalse(SystemLog.objects.filter(pk__in=[old_debug.pk, old_info.pk, old_error.pk]).exists())
         self.assertEqual(SystemLog.objects.filter(pk__in=[new_debug.pk, new_info.pk, new_warning.pk]).count(), 3)
+
+
+@override_settings(
+    INBOUND_MESSAGE_WEEKLY_CLEANUP_ENABLED=True,
+    INBOUND_MESSAGE_WEEKLY_CLEANUP_WEEKDAY=0,
+    INBOUND_MESSAGE_WEEKLY_CLEANUP_HOUR=3,
+    INBOUND_MESSAGE_WEEKLY_CLEANUP_GRACE_HOURS=24,
+)
+class WeeklyCleanupDueTests(SimpleTestCase):
+    tz = ZoneInfo("Asia/Shanghai")
+
+    def test_due_on_monday_after_scheduled_hour(self):
+        now = datetime(2026, 9, 7, 4, 0, tzinfo=self.tz)
+        self.assertTrue(weekly_cleanup_due(now=now, last_run=None))
+
+    def test_not_due_before_scheduled_hour(self):
+        now = datetime(2026, 9, 7, 2, 59, tzinfo=self.tz)
+        self.assertFalse(weekly_cleanup_due(now=now, last_run=None))
+
+    def test_not_due_after_grace_window(self):
+        now = datetime(2026, 9, 8, 4, 1, tzinfo=self.tz)
+        self.assertFalse(weekly_cleanup_due(now=now, last_run=None))
+
+    def test_not_due_when_already_run_this_slot(self):
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=self.tz)
+        last = datetime(2026, 9, 7, 3, 5, tzinfo=self.tz)
+        self.assertFalse(weekly_cleanup_due(now=now, last_run=last))

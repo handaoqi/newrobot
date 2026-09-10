@@ -6,6 +6,7 @@ import AppToast from '../components/AppToast.vue'
 import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
 import { useToast } from '../composables/useToast'
 import { useMappingAlerts } from '../composables/useMappingAlerts'
+import { audioPreviewResultLabel, waitForAudioPreview } from '../services/audioPreviewState'
 import { resolveBatteryPercent } from '../utils/battery'
 import {
   API_BASE,
@@ -18,6 +19,7 @@ import {
   fetchOverview,
   fetchRecordedAudios,
   fetchRobotDetail,
+  fetchRobotCommand,
   fetchRobotPersonDetections,
   fetchRobots,
   fetchRobotStatus,
@@ -273,10 +275,16 @@ async function previewBoundAlertSkill(skill) {
   if (!robot?.id || !skill.template_id || alertSkillPreviewing.value || alertSkillHasUnsavedChanges(skill)) return
   alertSkillPreviewing.value = skill.skill_key
   try {
-    await previewAlertSkill(skill.skill_key, robot.id)
-    showToast(`${skill.display_name}双音响试播已下发`)
+    const preview = await previewAlertSkill(skill.skill_key, robot.id)
+    const command = await waitForAudioPreview({
+      initialCommand: preview?.command,
+      robotId: robot.id,
+      fetchCommand: fetchRobotCommand,
+    })
+    const resultLabel = audioPreviewResultLabel(command)
+    showToast(`${skill.display_name}：${resultLabel}`)
   } catch (error) {
-    showToast(error.message || '双音响试播下发失败')
+    showToast(error.message || '告警试播失败')
   } finally {
     alertSkillPreviewing.value = ''
   }

@@ -2,6 +2,7 @@
 import { nextTick, onMounted, ref, computed, watch } from 'vue'
 import { useAsyncPoller } from '../composables/useAsyncPoller'
 import {
+  canRetryFailedMappingSave,
   hasActiveMappingWorkflow,
   isActiveMappingState,
 } from '../utils/mappingWorkflowState'
@@ -889,11 +890,17 @@ const displayMappingState = computed(() => {
   }
   return mappingState.value
 })
+const canRetrySave = computed(() => canRetryFailedMappingSave({
+  commandType: mappingStatus.value?.command_type,
+  commandStatus: commandStatus.value,
+  uploadedMapId: completedUploadMapId.value,
+  failureStepKey: isError.value ? failureStepKey.value : '',
+}))
 const canSaveMapping = computed(() => (
   !mappingCommandInFlight.value && (
     slamDiverged.value
     || (mappingState.value === 'mapping' && readyForSave.value)
-    || (isError.value && ['mapping', 'saving'].includes(failureStepKey.value))
+    || canRetrySave.value
   )
 ))
 const canCancelMapping = computed(() => (
@@ -2456,7 +2463,7 @@ async function saveCleaner() {
             {{ isError && failureStepKey === 'ready_to_map' ? '重试确认并开始建图' : (isOutdoorMapping ? '确认航向稳定，开始建图' : '确认检查通过，开始建图') }}
           </button>
           <button class="btn btn-primary" :disabled="mappingBusy || !selectedRobot || !canSaveMapping" @click="handleSaveMapping">
-            {{ slamDiverged ? '停止并生成救援地图' : (isError && ['mapping', 'saving'].includes(failureStepKey) ? '重试停止并保存地图' : '停止并保存地图') }}
+            {{ slamDiverged ? '停止并生成救援地图' : (canRetrySave ? '重试停止并保存地图' : '停止并保存地图') }}
           </button>
           <button class="btn btn-sm" :disabled="!canCancelMapping" @click="handleCancelMapping">
             取消建图
@@ -2475,6 +2482,7 @@ async function saveCleaner() {
           <strong>室外建图状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
           <span v-if="failureCode">错误码：{{ failureCode }}</span>
           <span>失败信息：{{ failureMessage }}</span>
+          <span v-if="canRetrySave">本地地图已经导出，请点「重试停止并保存地图」，不要重新走场。也可以点页面上方「从机器人同步」。</span>
         </div>
         <div v-else-if="isError" class="mapping-error mapping-error-indoor">
           <strong>室内建图状态机停止：第 {{ failureStepIndex >= 0 ? failureStepIndex + 1 : '?' }} 步「{{ failureStepLabel }}」失败</strong>
@@ -2490,6 +2498,7 @@ async function saveCleaner() {
           class="mapping-error"
         >
           上次命令失败: {{ mappingStatus.last_command_error_message }}
+          <span v-if="canRetrySave">本地地图已经导出，请点「重试停止并保存地图」，不要重新走场。也可以点页面上方「从机器人同步」。</span>
         </div>
 
         <div class="mapping-guide">

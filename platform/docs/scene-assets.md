@@ -46,3 +46,11 @@ npm run test:scene-assets
 ```
 
 生成器位于 `scripts/generate_scene_assets.mjs`，每次生成会更新 GLB、catalog 中的文件大小、三角面数和 SHA-256。前端场景视角调试页会优先加载 GLB；资产目录或单个 GLB 不可用时回退到程序化占位几何。
+
+## 场景视角地图模式
+
+场景视角调试页提供“点云场景”“卫星地图”“街区模式”三种地图模式。卫星地图读取 `GET /scene-map-config.json` 中的高德 JS API 配置，并使用地图 manifest 的锁定 GNSS 原点定位；没有有效原点、Key 或卫星来源时显示“无可用来源”，不会使用默认坐标。
+
+街区模式只读取经过机器人端点云语义处理生成的 `scene_semantics.json`，并要求静态实例置信度不低于 0.80；没有可靠清单时保留原始点云并显示“未生成可靠语义模型”，不会在浏览器中按网格配额猜测类别。结果通过 `POST /api/maps/{map_id}/scene-semantics/` 上传，也可以随地图包以 `scene_semantics.json` 作为小型 sidecar 携带。行人、车辆和自行车只来自实时三维语义对象，且机器狗速度不超过 `0.05 m/s` 或速度未知时会清空，不会写入静态地图。
+
+部署环境可将 `public/scene-map-config.json` 中的空配置替换为高德 Web JS API Key 与安全密钥。高德配置和安全密钥不应写入版本库。

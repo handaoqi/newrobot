@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  canRetryFailedMappingSave,
   hasActiveMappingWorkflow,
   isActiveMappingState,
 } from '../src/utils/mappingWorkflowState.js'
@@ -47,5 +48,23 @@ test('configuration step disables cancellation after workflow cleanup', () => {
     commandStatus: 'succeeded',
     processAlive: false,
     originState: 'idle',
+  }), false)
+})
+
+test('failed save still offers retry after the workflow returns to idle', () => {
+  assert.equal(canRetryFailedMappingSave({
+    commandType: 'mapping.save',
+    commandStatus: 'failed',
+    failureStepKey: 'idle',
+  }), true)
+  assert.equal(canRetryFailedMappingSave({
+    commandType: 'mapping.save',
+    commandStatus: 'failed',
+    failureStepKey: 'optimizing',
+  }), true)
+  assert.equal(canRetryFailedMappingSave({
+    commandType: 'mapping.save',
+    commandStatus: 'succeeded',
+    uploadedMapId: '12',
   }), false)
 })

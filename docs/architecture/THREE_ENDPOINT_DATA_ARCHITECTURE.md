@@ -100,7 +100,7 @@ Edge 五张表初始均为空，不创建默认任务、假定位或默认地图
 | `monitoring_taskexecutionevent` | 任务事件、定位丢失点和恢复结果 |
 | `monitoring_remotecommand` | 新命令协议生命周期 |
 | `monitoring_commandevent` | 命令发布、接受、执行和结束事件 |
-| `monitoring_inboundmessage` | MQTT 入站消息去重与处理状态 |
+| `monitoring_inboundmessage` | MQTT 入站消息去重与处理状态；`trajectory.batch` 不写入此表 |
 | `monitoring_robotstatuslatest` | 每台机器人最新状态快照 |
 | `monitoring_trajectorypoint` | 任务逐点定位轨迹 |
 | `monitoring_trajectorybatchreceipt` | 轨迹批次幂等回执 |
@@ -135,7 +135,7 @@ Edge 五张表初始均为空，不创建默认任务、假定位或默认地图
 ## 6. 一致性原则
 
 1. 云平台是任务和命令审计的最终事实源，Edge 只保留恢复执行所需的最小副本。
-2. `message_id`、命令 ID、任务 ID 和轨迹序号负责跨端幂等，禁止用时间戳代替主键。
+2. `message_id`、命令 ID、任务 ID 和轨迹序号负责跨端幂等，禁止用时间戳代替主键。轨迹批次另外用 `batch_id` 作为云端回执主键；Edge 只有在 `accepted`/`duplicate` 或永久 `INVALID_MESSAGE` 拒绝时才从 outbox 删除该批次。
 3. 地图 ID 与版本必须同时上报；定位丢失事件必须保存对应地图和最后可信位姿。
 4. 云平台数据库不能复制到 Edge，Edge 数据库也不能作为云端业务恢复源。
 5. 3588 厂商配置、egg 和 MCU 参数属于设备镜像边界，不写入 Django 或 Edge SQLite。

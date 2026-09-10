@@ -34,6 +34,19 @@ export function isActiveMappingState(mappingState) {
   return ACTIVE_MAPPING_STATES.has(mappingState)
 }
 
+export function canRetryFailedMappingSave({
+  commandType = '',
+  commandStatus = 'idle',
+  uploadedMapId = '',
+  failureStepKey = '',
+} = {}) {
+  if (uploadedMapId) return false
+  if (['mapping', 'saving', 'optimizing', 'packaging', 'uploading'].includes(failureStepKey)) {
+    return true
+  }
+  return commandType === 'mapping.save' && ['failed', 'rejected', 'timed_out'].includes(commandStatus)
+}
+
 export function hasActiveMappingWorkflow({
   mappingState = 'idle',
   commandStatus = 'idle',

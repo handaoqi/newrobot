@@ -15,3 +15,16 @@ test('published scene asset package serves its catalog and every GLB', async ({ 
     expect(body.byteLength, entry.asset_id).toBe(Number(entry.byte_size))
   }
 })
+
+test('scene map runtime config exposes the satellite integration contract', async ({ request }) => {
+  const response = await request.get('/scene-map-config.json')
+  expect(response.ok()).toBe(true)
+  const config = await response.json()
+  expect(config.schema).toBe('roamerx.scene-map-config.v1')
+  expect(config.amap).toEqual(expect.objectContaining({
+    enabled: expect.any(Boolean),
+    key: expect.any(String),
+    securityJsCode: expect.any(String),
+    version: expect.any(String),
+  }))
+})

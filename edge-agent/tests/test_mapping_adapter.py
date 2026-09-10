@@ -1,6 +1,7 @@
 import json
 import hashlib
 import math
+import os
 import subprocess
 import threading
 import time
@@ -187,7 +188,7 @@ def test_outdoor_finalize_fails_when_rtk_xy_is_not_applied(tmp_path, monkeypatch
         "use_gps": True,
         "auto_activation_allowed": False,
         "fallback_error": "optimized trajectory rejected: max_xy_correction_m_above_limit",
-        "factors": {"rtk_position": 8},
+        "factors": {"rtk_position": 0},
         "corrections": [],
     })
     monkeypatch.setattr(adapter, "_call_ros_service", lambda *_args, **_kwargs: None)
@@ -197,6 +198,40 @@ def test_outdoor_finalize_fails_when_rtk_xy_is_not_applied(tmp_path, monkeypatch
         adapter._finalize_session_package(session_dir, {"scene_scope": "outdoor"})
     assert error.value.code == "MAP_OPTIMIZATION_FAILED"
     assert "RTK XY" in str(error.value)
+
+
+def test_outdoor_finalize_fails_quality_rejected_without_rtk_prefix(tmp_path, monkeypatch):
+    session_dir = tmp_path / "20260907_133000_001"
+    session_dir.mkdir()
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession("session", "map", "", "saving", "now", "now")
+    monkeypatch.setattr(mapping_adapter_module, "finalize_map_package", lambda *_args, **_kwargs: {
+        "keyframe_count": 8,
+        "loop_status": "no_valid_loop",
+        "loop_closure_count": 0,
+        "loop_candidate_count": 0,
+        "completeness": "complete",
+    })
+    monkeypatch.setattr(mapping_adapter_module, "build_optimization_summary", lambda *_args, **_kwargs: {
+        "stage": "quality_rejected",
+        "success": True,
+        "applied": False,
+        "candidate_applied": True,
+        "trajectory_source": "raw",
+        "use_gps": True,
+        "auto_activation_allowed": False,
+        "fallback_error": "optimized trajectory rejected: max_adjacent_yaw_step_deg_above_limit",
+        "factors": {"rtk_position": 8},
+        "corrections": [],
+    })
+    monkeypatch.setattr(adapter, "_call_ros_service", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "_snapshot_raw_map_products", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ProtocolError) as error:
+        adapter._finalize_session_package(session_dir, {"scene_scope": "outdoor"})
+    assert error.value.code == "MAP_OPTIMIZATION_FAILED"
+    assert "max_adjacent_yaw_step_deg_above_limit" in str(error.value)
+    assert "RTK XY" not in str(error.value)
 
 
 def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch):
@@ -225,6 +260,43 @@ def test_finalize_calls_global_graph_without_loop_closure(tmp_path, monkeypatch)
     manifest = adapter._finalize_session_package(session_dir, {})
 
     assert calls == [("/slam/global_optimize", "std_srvs/srv/Trigger", "{}")]
+    assert manifest["trajectory_source"] == "optimized"
+
+
+def test_finalize_reuses_existing_gtsam_when_slam_is_down(tmp_path, monkeypatch):
+    session_dir = tmp_path / "20260907_133100_001"
+    session_dir.mkdir()
+    (session_dir / "trajectory_optimized.csv").write_text(
+        "index,timestamp,world_x,world_y,world_z,world_qx,world_qy,world_qz,world_qw\n"
+    )
+    (session_dir / "trajectory_covariance.json").write_text("{}")
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession("session", "map", "", "saving", "now", "now")
+    calls = []
+    monkeypatch.setattr(adapter, "_is_mapping_unit_active", lambda: False)
+    monkeypatch.setattr(adapter, "_find_slam_process_pids", lambda: [])
+    monkeypatch.setattr(mapping_adapter_module, "finalize_map_package", lambda *_args, **_kwargs: {
+        "keyframe_count": 8,
+        "loop_status": "no_valid_loop",
+        "loop_closure_count": 0,
+        "loop_candidate_count": 0,
+        "completeness": "complete",
+    })
+    monkeypatch.setattr(mapping_adapter_module, "build_optimization_summary", lambda *_args, **_kwargs: {
+        "stage": "no_valid_loop",
+        "success": True,
+        "applied": True,
+        "trajectory_source": "optimized",
+        "use_gps": True,
+        "auto_activation_allowed": True,
+        "factors": {"rtk_position": 8},
+        "corrections": [],
+    })
+    monkeypatch.setattr(adapter, "_call_ros_service", lambda *args: calls.append(args))
+
+    manifest = adapter._finalize_session_package(session_dir, {"scene_scope": "outdoor"})
+
+    assert calls == []
     assert manifest["trajectory_source"] == "optimized"
 
 
@@ -261,6 +333,40 @@ def test_mapping_deployment_hash_mismatch_blocks_start(tmp_path):
     with pytest.raises(ProtocolError, match="SHA256") as error:
         adapter._verify_mapping_deployment()
     assert error.value.code == "MAPPING_DEPLOYMENT_MISMATCH"
+
+
+def test_mapping_adapter_source_hash_refresh_allows_start(tmp_path):
+    slam_binary = tmp_path / "mapping"
+    slam_params = tmp_path / "config.yaml"
+    slam_binary.write_bytes(b"binary-v1")
+    slam_params.write_text("config-v1")
+    adapter = make_adapter(
+        tmp_path,
+        slam_binary=str(slam_binary),
+        slam_params_file=str(slam_params),
+        slam_command="exec test-mapping --params test-config",
+        deployment_manifest=str(tmp_path / "deployment.json"),
+        deployment_manifest_required=True,
+    )
+    mapping_adapter_path = Path(mapping_adapter_module.__file__).resolve()
+    digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    (tmp_path / "deployment.json").write_text(json.dumps({
+        "configuration": {
+            "mapping_unit": "",
+            "slam_command": adapter.config.slam_command,
+        },
+        "artifacts": {
+            "slam_binary": {"path": str(slam_binary), "sha256": digest(slam_binary)},
+            "slam_params_file": {"path": str(slam_params), "sha256": digest(slam_params)},
+            "mapping_adapter": {"path": str(mapping_adapter_path), "sha256": "0" * 64},
+        },
+    }))
+
+    adapter._verify_mapping_deployment()
+
+    stored = json.loads((tmp_path / "deployment.json").read_text())
+    assert stored["artifacts"]["mapping_adapter"]["sha256"] == digest(mapping_adapter_path)
+    assert stored["artifacts"]["mapping_adapter"]["size_bytes"] == mapping_adapter_path.stat().st_size
 
 
 def test_outdoor_runtime_uses_locked_origin_and_records_hash(tmp_path):
@@ -391,18 +497,42 @@ def test_slam_warmup_does_not_enable_formal_capture(tmp_path, monkeypatch):
     assert calls == ["stop_nav", "sensors", "slam", ("state", 7)]
 
 
-def test_outdoor_warmup_requires_locked_origin(tmp_path):
+def test_outdoor_warmup_without_origin_prepares_sensors(tmp_path, monkeypatch):
     adapter = make_adapter(tmp_path)
+    calls = []
+    monkeypatch.setattr(adapter, "_is_mapping_unit_active", lambda: False)
+    monkeypatch.setattr(adapter, "_find_slam_process_pids", lambda: [])
+    monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda **_kwargs: calls.append("stop_nav"))
+    monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors"))
+    monkeypatch.setattr(adapter, "_ensure_origin_odometry", lambda: calls.append("odom"))
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "state": adapter.session.state,
+        "origin": adapter._origin_monitor.status(),
+    })
+
+    result = adapter.start_slam_warmup({"map_name": "outside", "mapping_type": "outdoor"})
+
+    assert result["state"] == "origin_waiting"
+    assert result["origin"]["origin_status"] == "ready"
+    assert calls == ["stop_nav", "sensors", "odom"]
+
+
+def test_outdoor_warmup_waits_when_origin_lock_is_in_progress(tmp_path):
+    adapter = make_adapter(tmp_path)
+    adapter._origin_monitor._status["origin_status"] = "waiting_fix"
 
     with pytest.raises(ProtocolError) as error:
         adapter.start_slam_warmup({"map_name": "outside", "mapping_type": "outdoor"})
 
     assert error.value.code == "MAPPING_ORIGIN_REQUIRED"
+    assert "锁定中" in str(error.value)
 
 
 def test_outdoor_start_can_prepare_sensors_before_origin_lock(tmp_path, monkeypatch):
     adapter = make_adapter(tmp_path)
     calls = []
+    monkeypatch.setattr(adapter, "_is_mapping_unit_active", lambda: False)
+    monkeypatch.setattr(adapter, "_find_slam_process_pids", lambda: [])
     monkeypatch.setattr(adapter, "_stop_conflicting_navigation_stack", lambda **_kwargs: calls.append("stop_nav"))
     monkeypatch.setattr(adapter, "_ensure_mapping_sensors", lambda: calls.append("sensors"))
     monkeypatch.setattr(adapter, "_ensure_origin_odometry", lambda: calls.append("odom"))
@@ -1529,3 +1659,111 @@ def test_mapping_readiness_reports_dual_antenna_heading_lock():
 
     assert readiness["state"] == "ready"
     assert "双天线锁定" in readiness["message"]
+
+
+def _write_complete_map(session: Path, *, origin_session_id: str = "", indoor: bool = False) -> None:
+    session.mkdir(parents=True, exist_ok=True)
+    (session / "map.yaml").write_text("resolution: 0.05\n")
+    (session / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    (session / "save_progress.json").write_text(
+        json.dumps(
+            {
+                "stage": "completed",
+                "keyframe_count": 2,
+                "written_keyframes": 2,
+                "mapping_capture_enabled": True,
+                "updated_at_unix": time.time(),
+                "slam_health": {"state": "healthy", "imu_initialized": True},
+                "rtk_alignment": {
+                    "locked": not indoor,
+                    "origin_session_id": origin_session_id,
+                    "fusion_enabled": not indoor,
+                },
+            }
+        )
+    )
+    if not indoor:
+        (session / "gnss_origin.yaml").write_text(
+            "alignment_locked: 1\n"
+            "rtk_enabled: true\n"
+            f"origin_lock_session_id: {origin_session_id}\n"
+            "origin_latitude: 39.97\n"
+            "origin_longitude: 116.44\n"
+            "origin_altitude: 39.7\n"
+        )
+
+
+def test_outdoor_wait_keeps_current_origin_session_when_newer_indoor_export_exists(tmp_path):
+    origin_id = "origin-session"
+    outdoor = tmp_path / "20260907_110731_464"
+    indoor = tmp_path / "20260904_165243_865"
+    _write_complete_map(outdoor, origin_session_id=origin_id)
+    time.sleep(0.05)
+    _write_complete_map(indoor, indoor=True)
+    indoor_mtime = time.time() + 10
+    os.utime(indoor / "map.yaml", (indoor_mtime, indoor_mtime))
+    os.utime(indoor / "map.pgm", (indoor_mtime, indoor_mtime))
+
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession(
+        "mapping-session", "2号地图", "", "saving", "now", "now",
+        scene_scope="outdoor", mapping_type="outdoor", origin_session_id=origin_id,
+    )
+
+    found = adapter._wait_for_complete_map_dir(min_mtime=indoor_mtime - 1, preferred_dir=outdoor)
+
+    assert found == outdoor
+    assert adapter._find_latest_session_dir(require_complete=True, min_mtime=indoor_mtime - 1) == indoor
+    assert adapter._find_current_complete_export() == outdoor
+
+
+def test_outdoor_save_reuses_complete_export_instead_of_restarting_slam(tmp_path, monkeypatch):
+    origin_id = "origin-session"
+    outdoor = tmp_path / "20260907_110731_464"
+    indoor = tmp_path / "20260904_165243_865"
+    _write_complete_map(outdoor, origin_session_id=origin_id)
+    _write_complete_map(indoor, indoor=True)
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession(
+        "mapping-session", "2号地图", "", "mapping", "now", "now",
+        scene_scope="outdoor", mapping_type="outdoor", origin_session_id=origin_id,
+    )
+    slam_calls = []
+    monkeypatch.setattr(adapter, "_call_map_state", lambda data: slam_calls.append(data))
+    monkeypatch.setattr(adapter, "_finalize_session_package", lambda work_dir, command: {"scene_scope": "outdoor"})
+    monkeypatch.setattr(adapter, "_start_post_save_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "_cleanup", lambda: None)
+
+    result = adapter._save_active_mapping({"upload": False, "package": False, "stop_process": False})
+
+    assert slam_calls == []
+    assert adapter.session.state == "saving"
+    assert "upload_result" not in result
+
+
+def test_outdoor_recoverable_dir_ignores_unrelated_incomplete_leftovers(tmp_path):
+    leftover = tmp_path / "20260904_165243_865"
+    leftover_keyframes = leftover / "keyframes"
+    leftover_keyframes.mkdir(parents=True)
+    (leftover_keyframes / "keyframes.csv").write_text("index,stamp,x,y,z,point_count\n")
+    (leftover / "save_progress.json").write_text(json.dumps({"stage": "failed", "recoverable": True}))
+
+    current = tmp_path / "20260907_110731_464"
+    current_keyframes = current / "keyframes"
+    current_keyframes.mkdir(parents=True)
+    (current_keyframes / "keyframes.csv").write_text("index,stamp,x,y,z,point_count\n")
+    (current / "save_progress.json").write_text(
+        json.dumps({
+            "stage": "failed",
+            "recoverable": True,
+            "rtk_alignment": {"origin_session_id": "origin-session"},
+        })
+    )
+
+    adapter = make_adapter(tmp_path)
+    adapter.session = MappingSession(
+        "mapping-session", "2号地图", "", "saving", "now", "now",
+        scene_scope="outdoor", mapping_type="outdoor", origin_session_id="origin-session",
+    )
+
+    assert adapter._find_latest_recoverable_dir() == current

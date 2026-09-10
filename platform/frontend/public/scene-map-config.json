@@ -1,0 +1,9 @@
+{
+  "schema": "roamerx.scene-map-config.v1",
+  "amap": {
+    "enabled": false,
+    "key": "",
+    "securityJsCode": "",
+    "version": "2.0"
+  }
+}

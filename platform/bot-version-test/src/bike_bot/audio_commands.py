@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import logging
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -22,6 +25,9 @@ import paramiko
 from .config import AppConfig
 
 LOGGER = logging.getLogger(__name__)
+
+NX_AUDIO_LOCK_PATH = Path("/tmp/roamerx-nx-speaker.lock")
+DEV_VOICE_ACK_PID_PATH = Path("/tmp/roamerx-dev-voice-ack.pid")
 
 ALERT_AUDIO_FILTER = (
     "highpass=f=220,"
@@ -34,6 +40,23 @@ ALERT_AUDIO_FILTER = (
 
 class PlaybackSuperseded(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PlaybackOutcome:
+    player: str
+    playback_mode: str
+    active_outputs: tuple[str, ...]
+    unavailable_outputs: dict[str, str] = field(default_factory=dict)
+
+    def as_response_payload(self) -> dict:
+        return {
+            "player": self.player,
+            "playback_mode": self.playback_mode,
+            "active_outputs": list(self.active_outputs),
+            "unavailable_outputs": self.unavailable_outputs,
+            "degraded": self.playback_mode != "dual",
+        }
 
 
 class AudioCommandClient:
@@ -151,12 +174,12 @@ class AudioCommandClient:
                 "vision_bicycle_auto",
                 "patrol_obstacle_speech",
             }
-            player = self._play_audio(
+            playback = self._play_audio(
                 local_path,
                 cancel_event,
                 alert_mode=alert_mode,
                 dual_output=bool(payload.get("dual_output", alert_mode)),
-                allow_single_fallback=not bool(payload.get("preview")),
+                allow_single_fallback=bool(payload.get("allow_single_fallback", True)),
             )
             if cancel_event.is_set():
                 raise PlaybackSuperseded("replaced during playback")
@@ -164,7 +187,12 @@ class AudioCommandClient:
             self.report(
                 command_id,
                 "finished",
-                {"audio_url": audio_url, "local_path": str(local_path), "player": player, "started_at": started},
+                {
+                    "audio_url": audio_url,
+                    "local_path": str(local_path),
+                    "started_at": started,
+                    **playback.as_response_payload(),
+                },
                 "",
             )
         except PlaybackSuperseded as exc:
@@ -307,18 +335,29 @@ class AudioCommandClient:
         alert_mode: bool = False,
         dual_output: bool = False,
         allow_single_fallback: bool = True,
-    ) -> str:
+    ) -> PlaybackOutcome:
         cancel_event = cancel_event or threading.Event()
         if self.config.audio_playback.remote_host:
-            if alert_mode and dual_output:
+            if dual_output:
                 return self._play_audio_dual(
                     local_path,
                     cancel_event,
                     allow_single_fallback=allow_single_fallback,
                 )
-            return self._play_audio_remote(local_path, cancel_event, alert_mode=alert_mode)
+            try:
+                player = self._play_audio_remote(local_path, cancel_event, alert_mode=alert_mode)
+                return PlaybackOutcome(player, "single_3588", ("3588",))
+            except PlaybackSuperseded:
+                raise
+            except Exception as exc:
+                if cancel_event.is_set():
+                    raise PlaybackSuperseded("replaced while switching to NX playback") from exc
+                LOGGER.warning("3588 audio unavailable; falling back to NX speaker: %s", exc)
+                player = self._play_audio_local(local_path, cancel_event, alert_mode=alert_mode)
+                return PlaybackOutcome(player, "single_nx", ("nx",), {"3588": str(exc)})
 
-        return self._play_audio_local(local_path, cancel_event, alert_mode=alert_mode)
+        player = self._play_audio_local(local_path, cancel_event, alert_mode=alert_mode)
+        return PlaybackOutcome(player, "single_nx", ("nx",))
 
     def _play_audio_dual(
         self,
@@ -326,18 +365,53 @@ class AudioCommandClient:
         cancel_event: threading.Event,
         *,
         allow_single_fallback: bool,
-    ) -> str:
+    ) -> PlaybackOutcome:
         if not self.config.audio_playback.sync_enabled:
-            return self._play_audio_dual_legacy(local_path, cancel_event)
+            return self._play_audio_dual_legacy(
+                local_path,
+                cancel_event,
+                allow_single_fallback=allow_single_fallback,
+            )
         return self._play_audio_dual_scheduled(
             local_path,
             cancel_event,
             allow_single_fallback=allow_single_fallback,
         )
 
-    def _play_audio_dual_legacy(self, local_path: Path, cancel_event: threading.Event) -> str:
+    def _play_audio_dual_legacy(
+        self,
+        local_path: Path,
+        cancel_event: threading.Event,
+        *,
+        allow_single_fallback: bool,
+    ) -> PlaybackOutcome:
+        unavailable: dict[str, str] = {}
+        try:
+            self._local_audio_endpoint()
+        except Exception as exc:
+            unavailable["nx"] = str(exc)
+        try:
+            client = self._connect_remote()
+            try:
+                self._remote_audio_endpoints(client)
+            finally:
+                client.close()
+        except Exception as exc:
+            unavailable["3588"] = str(exc)
+
+        if unavailable:
+            if not allow_single_fallback:
+                raise RuntimeError(self._format_unavailable_outputs(unavailable))
+            if "nx" not in unavailable:
+                player = self._play_audio_local(local_path, cancel_event, alert_mode=True)
+                return PlaybackOutcome(player, "single_nx", ("nx",), unavailable)
+            if "3588" not in unavailable:
+                player = self._play_audio_remote(local_path, cancel_event, alert_mode=True)
+                return PlaybackOutcome(player, "single_3588", ("3588",), unavailable)
+            raise RuntimeError(self._format_unavailable_outputs(unavailable))
+
         results: dict[str, str] = {}
-        errors: list[BaseException] = []
+        errors: dict[str, BaseException] = {}
         remote_ready = threading.Event()
         remote_done = threading.Event()
         start_playback = threading.Event()
@@ -350,7 +424,7 @@ class AudioCommandClient:
                     raise PlaybackSuperseded("replaced before dual playback")
                 results["nx"] = self._play_audio_local(local_path, cancel_event, alert_mode=True)
             except BaseException as exc:
-                errors.append(exc)
+                errors["nx"] = exc
 
         def play_remote() -> None:
             try:
@@ -362,7 +436,7 @@ class AudioCommandClient:
                     start_event=start_playback,
                 )
             except BaseException as exc:
-                errors.append(exc)
+                errors["3588"] = exc
             finally:
                 remote_done.set()
 
@@ -373,20 +447,38 @@ class AudioCommandClient:
         while not remote_ready.wait(timeout=0.1) and not remote_done.is_set():
             if cancel_event.is_set():
                 break
-        if not remote_ready.is_set() and not errors:
-            errors.append(RuntimeError("3588 audio did not become ready"))
+        if not remote_ready.is_set() and "3588" not in errors:
+            errors["3588"] = RuntimeError("3588 audio did not become ready")
         start_playback.set()
         local_thread.join(timeout=130)
         remote_thread.join(timeout=130)
         if local_thread.is_alive():
-            errors.append(RuntimeError("NX audio playback timed out"))
+            errors["nx"] = RuntimeError("NX audio playback timed out")
         if remote_thread.is_alive():
-            errors.append(RuntimeError("3588 audio playback timed out"))
+            errors["3588"] = RuntimeError("3588 audio playback timed out")
         if errors:
-            if any(isinstance(error, PlaybackSuperseded) for error in errors):
+            if any(isinstance(error, PlaybackSuperseded) for error in errors.values()):
                 raise PlaybackSuperseded("replaced during dual-speaker playback")
-            raise RuntimeError("dual-speaker playback failed: " + "; ".join(str(error) for error in errors))
-        return f"dual(nx={results.get('nx')},3588={results.get('3588')})"
+            unavailable = {name: str(error) for name, error in errors.items()}
+            if allow_single_fallback and len(results) == 1:
+                output = next(iter(results))
+                LOGGER.warning(
+                    "dual audio degraded to %s: %s",
+                    output,
+                    self._format_unavailable_outputs(unavailable),
+                )
+                return PlaybackOutcome(
+                    results[output],
+                    f"single_{output}",
+                    (output,),
+                    unavailable,
+                )
+            raise RuntimeError("dual-speaker playback failed: " + self._format_unavailable_outputs(unavailable))
+        return PlaybackOutcome(
+            f"dual(nx={results.get('nx')},3588={results.get('3588')})",
+            "dual",
+            ("nx", "3588"),
+        )
 
     def _play_audio_dual_scheduled(
         self,
@@ -394,25 +486,70 @@ class AudioCommandClient:
         cancel_event: threading.Event,
         *,
         allow_single_fallback: bool,
-    ) -> str:
+    ) -> PlaybackOutcome:
 
-        pcm_path = self._prepare_sync_pcm(local_path, cancel_event)
         remote_path = f"{self.config.audio_playback.remote_temp_dir.rstrip('/')}/roamerx-sync-{os.getpid()}.wav"
         remote_helper = f"{self.config.audio_playback.remote_temp_dir.rstrip('/')}/roamerx-sync-audio-player.py"
         local_process: subprocess.Popen | None = None
-        client = self._connect_remote()
+        client = None
         remote_stdin = remote_stdout = remote_stderr = None
         remote_sink = ""
         local_ready = threading.Event()
         remote_ready = threading.Event()
         ready_lines: dict[str, str] = {}
-        try:
-            self._assert_synchronized_clocks(client)
-            remote_device, remote_sink = self._remote_audio_endpoints(client)
-            local_device = self.config.audio_playback.local_alsa_device or self._detect_usb_audio_device()
-            if not local_device:
-                raise RuntimeError("NX USB audio device is unavailable")
 
+        unavailable: dict[str, str] = {}
+        try:
+            local_device = self._local_audio_endpoint()
+        except Exception as exc:
+            local_device = ""
+            unavailable["nx"] = str(exc)
+
+        # Probe the remote side before converting/copying audio.  The 3588
+        # installation may be reachable over SSH while its configured USB
+        # sink is absent; in that case NX must still be able to announce.
+        try:
+            client = self._connect_remote()
+            remote_device, remote_sink = self._remote_audio_endpoints(client)
+            if local_device:
+                self._assert_synchronized_clocks(client)
+        except PlaybackSuperseded:
+            if client is not None:
+                client.close()
+            raise
+        except Exception as exc:
+            if client is not None:
+                client.close()
+                client = None
+            unavailable["3588"] = str(exc)
+
+        if unavailable:
+            if not allow_single_fallback:
+                raise RuntimeError(self._format_unavailable_outputs(unavailable))
+            if cancel_event.is_set():
+                raise PlaybackSuperseded("replaced while choosing available audio output")
+            if "nx" not in unavailable:
+                LOGGER.warning("3588 synchronized audio unavailable; using NX speaker: %s", unavailable["3588"])
+                player = self._play_audio_local(local_path, cancel_event, alert_mode=True)
+                return PlaybackOutcome(player, "single_nx", ("nx",), unavailable)
+            if "3588" not in unavailable:
+                if client is not None:
+                    client.close()
+                    client = None
+                LOGGER.warning("NX audio unavailable; using 3588 speaker: %s", unavailable["nx"])
+                player = self._play_audio_remote(local_path, cancel_event, alert_mode=True)
+                return PlaybackOutcome(player, "single_3588", ("3588",), unavailable)
+            raise RuntimeError(self._format_unavailable_outputs(unavailable))
+
+        nx_audio_lease = self._acquire_nx_audio_lease(cancel_event)
+        try:
+            pcm_path = self._prepare_sync_pcm(local_path, cancel_event)
+        except Exception:
+            if client is not None:
+                client.close()
+            self._release_nx_audio_lease(nx_audio_lease)
+            raise
+        try:
             helper_path = Path(__file__).with_name("sync_audio_player.py")
             sftp = client.open_sftp()
             try:
@@ -501,32 +638,52 @@ class AudioCommandClient:
             remote_output = remote_stdout.read().decode("utf-8", errors="replace").strip() if remote_ok else ""
             local_error = local_process.stderr.read().strip() if nx_ok else ready_lines.get("nx", "")
             remote_error = remote_stderr.read().decode("utf-8", errors="replace").strip() if remote_ok else ready_lines.get("3588", "")
+            playback_errors: dict[str, str] = {}
             if nx_ok and local_process.returncode != 0:
-                raise RuntimeError(f"NX synchronized playback failed: {local_error}")
+                playback_errors["nx"] = f"NX synchronized playback failed: {local_error}"
             if remote_ok and remote_stdout.channel.recv_exit_status() != 0:
-                raise RuntimeError(f"3588 synchronized playback failed: {remote_error}")
+                playback_errors["3588"] = f"3588 synchronized playback failed: {remote_error}"
+            successful_outputs = [output for output in active_outputs if output not in playback_errors]
+            if playback_errors:
+                if not allow_single_fallback or not successful_outputs:
+                    raise RuntimeError(self._format_unavailable_outputs(playback_errors))
+                unavailable.update(playback_errors)
+                active_outputs = successful_outputs
 
             starts = self._parse_sync_starts({"nx": local_output, "3588": remote_output})
             skew_ms = abs(starts["nx"] - starts["3588"]) / 1_000_000 if len(starts) == 2 else None
-            mode = "dual" if len(active_outputs) == 2 else f"fallback-{active_outputs[0]}"
+            mode = "dual" if len(active_outputs) == 2 else f"single_{active_outputs[0]}"
             LOGGER.info("synchronized audio mode=%s trigger_skew_ms=%s", mode, skew_ms)
-            return f"scheduled-{mode}(trigger_skew_ms={skew_ms if skew_ms is not None else 'n/a'})"
+            return PlaybackOutcome(
+                f"scheduled-{mode}(trigger_skew_ms={skew_ms if skew_ms is not None else 'n/a'})",
+                mode,
+                tuple(active_outputs),
+                unavailable or {
+                    output: ready_lines.get(output, "readiness timeout")
+                    for output in ("nx", "3588")
+                    if output not in active_outputs
+                },
+            )
         finally:
-            if local_process is not None:
-                self._clear_processes(cancel_event, [local_process])
-                if local_process.poll() is None:
-                    local_process.terminate()
             try:
-                if remote_sink:
-                    self._remote_command(client, self._pulse_command(f"pactl suspend-sink {shlex.quote(remote_sink)} 0"), check=False)
-                self._remote_command(
-                    client,
-                    f"rm -f {shlex.quote(remote_path)} {shlex.quote(remote_helper)} {shlex.quote(self._remote_pidfile())}",
-                    check=False,
-                )
+                if local_process is not None:
+                    self._clear_processes(cancel_event, [local_process])
+                    if local_process.poll() is None:
+                        local_process.terminate()
+                try:
+                    if remote_sink:
+                        self._remote_command(client, self._pulse_command(f"pactl suspend-sink {shlex.quote(remote_sink)} 0"), check=False)
+                    self._remote_command(
+                        client,
+                        f"rm -f {shlex.quote(remote_path)} {shlex.quote(remote_helper)} {shlex.quote(self._remote_pidfile())}",
+                        check=False,
+                    )
+                finally:
+                    if client is not None:
+                        client.close()
+                    pcm_path.unlink(missing_ok=True)
             finally:
-                client.close()
-                pcm_path.unlink(missing_ok=True)
+                self._release_nx_audio_lease(nx_audio_lease)
 
     def _prepare_sync_pcm(self, local_path: Path, cancel_event: threading.Event) -> Path:
         with tempfile.NamedTemporaryFile(prefix="sync-audio-", suffix=".wav", dir=self.cache_dir, delete=False) as tmp:
@@ -586,11 +743,12 @@ class AudioCommandClient:
         _, cards_stdout, _ = client.exec_command("cat /proc/asound/cards", timeout=5)
         cards = cards_stdout.read().decode("utf-8", errors="replace")
         match = re.search(r"^\s*\d+\s+\[([^\]]+)\].*USB-Audio", cards, flags=re.MULTILINE)
-        device = self.config.audio_playback.remote_alsa_device or (
-            f"hw:CARD={match.group(1).strip()},DEV=0" if match else ""
-        )
+        configured_device = self.config.audio_playback.remote_alsa_device
+        device = configured_device or (f"hw:CARD={match.group(1).strip()},DEV=0" if match else "")
         if not device:
             raise RuntimeError("3588 USB ALSA device is unavailable")
+        if configured_device and not self._alsa_device_is_usb(configured_device, cards):
+            raise RuntimeError(f"3588 configured USB ALSA device is unavailable: {configured_device}")
         _, sinks_stdout, _ = client.exec_command(self._pulse_command("pactl list short sinks"), timeout=5)
         sinks = [
             fields[1]
@@ -599,7 +757,42 @@ class AudioCommandClient:
         ]
         configured = self.config.audio_playback.pulse_sink
         sink = configured if configured in sinks else next((item for item in sinks if "usb-" in item.lower()), "")
+        if not sink:
+            raise RuntimeError("3588 USB audio sink is unavailable")
         return device, sink
+
+    def _local_audio_endpoint(self) -> str:
+        try:
+            cards = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            raise RuntimeError(f"NX ALSA device list is unavailable: {exc}") from exc
+        configured_device = self.config.audio_playback.local_alsa_device
+        if configured_device:
+            if not self._alsa_device_is_usb(configured_device, cards):
+                raise RuntimeError(f"NX configured USB ALSA device is unavailable: {configured_device}")
+            return configured_device
+        detected = self._detect_usb_audio_device()
+        if not detected:
+            raise RuntimeError("NX USB audio device is unavailable")
+        return detected
+
+    @staticmethod
+    def _alsa_device_is_usb(device: str, cards: str) -> bool:
+        match = re.search(r"CARD=([^,]+)", device)
+        if not match:
+            return False
+        card_name = re.escape(match.group(1).strip())
+        return bool(
+            re.search(
+                rf"^\s*\d+\s+\[\s*{card_name}\s*\].*USB-Audio",
+                cards,
+                flags=re.MULTILINE,
+            )
+        )
+
+    @staticmethod
+    def _format_unavailable_outputs(unavailable: dict[str, str]) -> str:
+        return "; ".join(f"{name}={reason}" for name, reason in unavailable.items())
 
     def _pulse_command(self, command: str) -> str:
         prefix = f"PULSE_SERVER={shlex.quote(self.config.audio_playback.pulse_server)} " if self.config.audio_playback.pulse_server else ""
@@ -630,10 +823,35 @@ class AudioCommandClient:
         *,
         alert_mode: bool = False,
     ) -> str:
+        lease = self._acquire_nx_audio_lease(cancel_event)
+        try:
+            return self._play_audio_local_unlocked(
+                local_path,
+                cancel_event,
+                alert_mode=alert_mode,
+            )
+        finally:
+            self._release_nx_audio_lease(lease)
 
-        usb_device = self._detect_usb_audio_device()
+    def _play_audio_local_unlocked(
+        self,
+        local_path: Path,
+        cancel_event: threading.Event,
+        *,
+        alert_mode: bool = False,
+    ) -> str:
+
+        usb_device = self.config.audio_playback.local_alsa_device or self._detect_usb_audio_device()
         system_ffplay = Path("/usr/bin/ffplay")
-        if usb_device and system_ffplay.exists():
+        try:
+            ffmpeg_executable = self._ffmpeg_executable()
+        except RuntimeError:
+            ffmpeg_executable = ""
+        # Prefer the explicit ALSA pipeline below when it is available.  On
+        # NX, ffplay/SDL can keep an audio-only process alive even after the
+        # file has finished, which blocks the command worker and makes later
+        # announcements appear silent.
+        if usb_device and system_ffplay.exists() and not (ffmpeg_executable and shutil.which("aplay")):
             if alert_mode and shutil.which("amixer"):
                 card_match = re.search(r"CARD=([^,]+)", usb_device)
                 if card_match:
@@ -671,7 +889,7 @@ class AudioCommandClient:
                 if process.poll() is None:
                     process.terminate()
 
-        ffmpeg_available = bool(shutil.which("ffmpeg"))
+        ffmpeg_available = bool(ffmpeg_executable)
         aplay_available = bool(shutil.which("aplay"))
         if usb_device and ffmpeg_available and aplay_available:
             LOGGER.info("playing audio through USB ALSA device %s: %s", usb_device, local_path)
@@ -684,7 +902,7 @@ class AudioCommandClient:
                         timeout=5,
                     )
             ffmpeg_command = [
-                "ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(local_path), "-vn",
+                ffmpeg_executable, "-nostdin", "-loglevel", "error", "-i", str(local_path), "-vn",
             ]
             if alert_mode:
                 ffmpeg_command.extend(["-af", ALERT_AUDIO_FILTER])
@@ -767,6 +985,47 @@ class AudioCommandClient:
                         process.terminate()
                 return name
         raise RuntimeError("no supported audio player found: ffplay, mpg123, or aplay")
+
+    def _acquire_nx_audio_lease(self, cancel_event: threading.Event):
+        lease = NX_AUDIO_LOCK_PATH.open("a+")
+        deadline = time.monotonic() + 5.0
+        voice_ack_stopped = False
+        while True:
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lease
+            except BlockingIOError:
+                if not voice_ack_stopped:
+                    voice_ack_stopped = self._stop_dev_voice_ack()
+                if cancel_event.wait(0.05):
+                    lease.close()
+                    raise PlaybackSuperseded("replaced while waiting for NX audio device")
+                if time.monotonic() >= deadline:
+                    lease.close()
+                    raise RuntimeError("NX USB audio device remained busy after waiting 5 seconds")
+
+    @staticmethod
+    def _release_nx_audio_lease(lease) -> None:
+        try:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+        finally:
+            lease.close()
+
+    @staticmethod
+    def _stop_dev_voice_ack() -> bool:
+        try:
+            pid = int(DEV_VOICE_ACK_PID_PATH.read_text(encoding="utf-8").strip())
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+            parent_pid = int(stat_fields[3])
+            parent_cmdline = Path(f"/proc/{parent_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            if "/usr/bin/ffplay" not in cmdline or "run_dev_agent.py" not in parent_cmdline:
+                return False
+            LOGGER.info("preempting dev voice acknowledgement pid=%s for alert playback", pid)
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+            return False
 
     def _remote_pidfile(self) -> str:
         safe_code = re.sub(r"[^A-Za-z0-9_.-]", "_", self.config.robot.code)

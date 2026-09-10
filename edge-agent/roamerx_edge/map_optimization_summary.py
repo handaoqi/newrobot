@@ -182,7 +182,10 @@ def build_optimization_summary(
         "max_yaw_correction_deg": 15.0 if outdoor_rtk else 3.0,
         "max_adjacent_xy_step_m": 0.50 if outdoor_rtk else 0.15,
         "max_adjacent_xy_correction_rate_mps": 1.00 if outdoor_rtk else 0.35,
-        "max_adjacent_yaw_step_deg": 5.0 if outdoor_rtk else 1.0,
+        # Outdoor RTK heading can catch LIO yaw by several degrees in one 0.5 s
+        # keyframe during a turn. Field outdoor saves hit 5.3–6.6 deg here;
+        # 5.0 was rejecting otherwise valid GNSS-anchored maps.
+        "max_adjacent_yaw_step_deg": 10.0 if outdoor_rtk else 1.0,
     }
     inertial_measurements = {
         "lio_between_coverage": round(lio_coverage, 4),

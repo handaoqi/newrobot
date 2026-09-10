@@ -70,11 +70,12 @@ if "$DEPLOY_FRONTEND"; then
       --output "$prepared_lichtblick_index"
   fi
   echo "[deploy] Syncing frontend dist..."
-  # Publish the build as a mirror so stale content-hashed bundles cannot be
-  # selected by an old cached index or left behind after a build changes.
-  # The Lichtblick tree is published separately below. Keep it out of this
-  # mirror so a large bundle sync cannot leave /foxglove/ temporarily missing.
-  rsync -a --delete --exclude='foxglove/' "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
+  # Keep old content-hashed bundles during live deployment. Existing browser
+  # tabs can still be running an older index and need those files until the
+  # tab refreshes. index.html and modules.json are overwritten normally, while
+  # obsolete hashed assets are harmless and provide the required transition
+  # window between releases. The Lichtblick tree is published separately below.
+  rsync -a --exclude='foxglove/' "$PROJECT_DIR/frontend/dist/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/"
   if [[ -d "$LOCAL_LICHTBLICK_DIST" ]]; then
     echo "[deploy] Syncing Lichtblick bundle..."
     rsync -a --delete "$LOCAL_LICHTBLICK_DIST/" "$CLOUD_HOST:$REMOTE_ROOT/frontend/dist/foxglove/"

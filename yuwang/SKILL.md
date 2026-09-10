@@ -211,3 +211,58 @@ npm run test:scene-assets
 ```
 
 场景页路由为 `/dashboard/tasks/scene-visualizer`。修改资产或 manifest 后，应运行前端单测、前端构建、后端 `monitoring.test_map_scene`，并通过 `platform/scripts/deploy_cloud_platform.sh` 发布；仅查看 GLB 时可使用浏览器 GLTF 查看器拖入本地文件，或访问已发布的 GLB 地址下载后查看。
+
+## 街区模式点云语义推理部署记录（待后续实现）
+
+当前街区模式的识别链路只完成了结果接入，尚未部署真正的点云模型推理器和模型权重。Edge Agent 的 `mapping.scene_semantics` 命令只读取并校验本地 `scene_semantics.json`，不会自行生成语义类别；没有该文件时必须返回 `unavailable`，不得用浏览器网格配额猜测并生成 GLB。
+
+目标链路：
+
+```text
+keyframes/scan_*.pcd + keyframes/keyframes.csv
+  -> Orin 点云语义推理器
+  -> scene_semantics.json
+  -> Edge Agent 上传
+  -> 平台 scene manifest
+  -> 街区模式加载静态 GLB
+```
+
+部署约束：
+
+- 训练在外部 GPU 工作站完成，机器人只做 ONNX/TensorRT FP16 推理；当前机器人是 `aarch64`，已有 `onnxruntime` 和 `numpy`，但默认 Python 环境未确认可用 TensorRT GPU 模块。
+- 模型建议使用轻量 RandLA-Net，并用太阳宫公园点云少量标注微调。输入约定为 `N×5`：局部 XYZ、强度、离地高度；输出约定为 7 类：`road`、`tree`、`building`、`wall`、`natural_ground`、`low_vegetation`、`other`。
+- 推理器应计算地面、法向量和局部几何特征，利用关键帧位姿转换到 `map` 坐标，并进行至少 3 个关键帧的概率融合；静态实例置信度低于 `0.80` 时不生成 GLB。
+- 推理器建议安装在 `/home/dogrobot/edge-agent/roamerx_edge/scene_semantic_runner.py`，模型放在 `/home/dogrobot/runtime/nx-edge/install/models/scene/`，不得把模型缓存、地图、rosbag 或密钥提交到 Git。
+- 任务应在地图保存后异步、低优先级运行；导航或建图开始时暂停，不得阻塞地图保存和真实机器人安全流程。
+
+运行时配置预留：
+
+```yaml
+scene_semantics:
+  enabled: true
+  model_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/randla_park_v1.onnx"
+  engine_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/randla_park_v1_fp16.engine"
+  map_root: "/home/dogrobot/runtime/nx-edge/data/jszr/map"
+  confidence_threshold: 0.80
+  min_support_frames: 3
+  voxel_size_m: 0.10
+```
+
+结果协议为 `roamerx.scene-semantics.v1`，至少包含 `map_sha256`、`model_version`、`instances`；实例包含 `id`、`asset_id`、`class_name`、`position`、`orientation`、`scale`、`confidence` 和 `support_frames`。行人、车辆、自行车只允许来自实时语义目标，不写入静态结果。
+
+已实现的接口：
+
+- 机器人/操作端触发：`POST /api/robots/{robot_id}/mapping/scene-semantics/`，请求体包含 `map_id` 和可选 `map_dir`。
+- Edge Agent 上传：`POST /api/maps/{map_id}/scene-semantics/`，使用设备凭证或用户认证；服务端校验 schema、机器人归属、地图校验和与实例数量。
+- 地图包可以携带 `scene_semantics.json` sidecar；平台 scene manifest 返回 `semantic_build.status`、`model_version`、`revision` 和高置信度静态资产。
+
+部署前检查：
+
+```bash
+uname -m
+python3 -c "import onnxruntime, numpy; print(onnxruntime.__version__)"
+find /home/dogrobot/runtime/nx-edge/data/jszr/map -path '*/keyframes/scan_*.pcd' -type f | head
+systemctl is-active roamerx-edge-agent.service
+```
+
+部署完成后，先对 3–5 张代表性地图做空间留出验证，再启用街区模式模型展示。验证重点是静态实例准确率、墙体/建筑混淆率、低置信度拒识率、推理耗时和导航任务期间的资源隔离。

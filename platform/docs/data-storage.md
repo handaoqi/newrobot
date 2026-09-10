@@ -287,6 +287,12 @@ PLATFORM_OPERATOR_PASSWORD='<strong-password>' python manage.py initialize_platf
 
 ## 9. 数据清理建议
 
+生产环境不要删除整库。MQTT 入站审计表由 `run_patrol_scheduler` 按保留窗口清理：已处理/忽略报文默认 30 天，失败报文 180 天；卡住超过 7 天的 `pending` 行在周任务中标为失败。调度器每小时删除一小批，并在每周一 03:00（`Asia/Shanghai`）循环删除直到没有过期行或达到 10 分钟预算，随后对 SQLite 做 `WAL` checkpoint。手工排空可执行：
+
+```bash
+python manage.py prune_inbound_messages --until-done --expire-stale-pending
+```
+
 开发演示时可删除：
 
 ```text

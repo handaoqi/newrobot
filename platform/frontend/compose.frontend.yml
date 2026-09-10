@@ -9,6 +9,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${ROAMERX_FRONTEND_CONFIG:-./modules.json}:/usr/share/nginx/html/modules.json:ro
+      - ${ROAMERX_SCENE_MAP_CONFIG:-./scene-map-config.json}:/usr/share/nginx/html/scene-map-config.json:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz | grep -q '\"status\":\"ok\"'"]
       interval: 10s

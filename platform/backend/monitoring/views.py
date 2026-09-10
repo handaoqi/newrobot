@@ -203,6 +203,7 @@ def queue_bicycle_departure_speech(request, robot: Robot, detection: dict, event
                 "source": "vision_bicycle_auto",
                 "alert_skill": "bicycle_alert",
                 "dual_output": True,
+                "allow_single_fallback": True,
                 "content_type": "audio/mpeg",
                 "tts_cache_hit": cache_hit,
                 "inspection_event_id": str(event.event_id),
@@ -1327,6 +1328,17 @@ class RobotRemoteCommandDetailView(APIView):
         return Response(RemoteCommandSerializer(command).data)
 
 
+class RobotAudioCommandDetailView(APIView):
+    def get(self, request, robot_id, command_id):
+        command = get_object_or_404(
+            RobotCommand,
+            id=command_id,
+            robot_id=robot_id,
+            action="play_audio",
+        )
+        return Response(RobotCommandSerializer(command).data)
+
+
 class RobotAudioRecordingCommandView(APIView):
     MAX_AUDIO_SIZE = 10 * 1024 * 1024
     EXTENSION_BY_TYPE = {
@@ -1540,6 +1552,7 @@ class AlertSkillPreviewView(APIView):
                 "source": "dashboard_alert_skill_preview",
                 "alert_skill": binding.skill_key,
                 "dual_output": True,
+                "allow_single_fallback": True,
                 "content_type": "audio/mpeg",
                 "tts_cache_hit": cache_hit,
                 "preview": True,
@@ -2700,6 +2713,43 @@ class MapDataSceneView(APIView):
         return Response(build_scene_manifest(map_data))
 
 
+class MapDataSceneSemanticsView(APIView):
+    """Receive a small, versioned static-scene result from the edge agent."""
+
+    permission_classes = [IsAuthenticatedOrDeviceCredential]
+
+    def post(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        if getattr(request, "device_robot", None) is not None and map_data.robot_id != request.device_robot.id:
+            return Response({"detail": "设备凭证与地图所属机器人不匹配"}, status=status.HTTP_403_FORBIDDEN)
+        payload = request.data.get("scene_semantics", request.data)
+        if not isinstance(payload, dict) or payload.get("schema") != "roamerx.scene-semantics.v1":
+            return Response({"detail": "scene_semantics.schema 必须是 roamerx.scene-semantics.v1"}, status=status.HTTP_400_BAD_REQUEST)
+        expected_checksum = _parse_map_description(map_data).get("package_sha256", "")
+        received_checksum = str(payload.get("map_sha256") or "")
+        if expected_checksum and received_checksum and expected_checksum != received_checksum:
+            return Response({"detail": "语义结果与当前地图包校验和不匹配"}, status=status.HTTP_409_CONFLICT)
+        instances = payload.get("instances")
+        if not isinstance(instances, list) or len(instances) > 5000:
+            return Response({"detail": "instances 必须是长度不超过 5000 的数组"}, status=status.HTTP_400_BAD_REQUEST)
+        description = _parse_map_description(map_data)
+        scene = description.get("scene_manifest") if isinstance(description.get("scene_manifest"), dict) else {}
+        normalized = dict(payload)
+        previous_semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
+        try:
+            previous_revision = int(previous_semantics.get("revision") or 0)
+        except (TypeError, ValueError):
+            previous_revision = 0
+        normalized["revision"] = str(previous_revision + 1)
+        normalized["status"] = "ready"
+        scene["scene_semantics"] = normalized
+        scene["static_assets"] = instances
+        description["scene_manifest"] = scene
+        map_data.description = json.dumps(description, ensure_ascii=False)
+        map_data.save(update_fields=["description", "updated_at"])
+        return Response(build_scene_manifest(map_data), status=status.HTTP_200_OK)
+
+
 class MapDataSceneCloudView(APIView):
     """Serve a bounded point-cloud preview with cache and byte-range support."""
 
@@ -3015,6 +3065,22 @@ class RobotMappingStartView(RobotMappingCommandView):
 
 class RobotMappingOriginStatusView(RobotMappingStatusView):
     """Origin status is part of the unified mapping snapshot; keep a focused REST alias."""
+
+
+class RobotMappingSceneSemanticsView(RobotMappingCommandView):
+    command_type = "mapping.scene_semantics"
+    expiry_seconds = 1800
+
+    def build_payload(self, request, robot: Robot) -> dict:
+        map_id = request.data.get("map_id")
+        if not str(map_id or "").isdigit():
+            raise ValidationError({"map_id": "必须提供有效地图 ID"})
+        map_data = get_object_or_404(MapData, pk=map_id, robot=robot)
+        return {
+            "map_id": str(map_data.id),
+            "map_dir": request.data.get("map_dir", ""),
+            "force": bool(request.data.get("force", False)),
+        }
 
 
 class RobotMappingOriginStartView(RobotMappingCommandView):
@@ -3760,7 +3826,7 @@ class DeviceMapUploadView(APIView):
             with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
                 package_names = archive.namelist()
                 for name in archive.namelist():
-                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json", "map_manifest.json", "trajectory_raw.csv", "trajectory_optimized.csv", "recording_manifest.yaml"}:
+                    if name in {"map.yaml", "map.pgm", "map_preview.png", "preview.png", "gnss_origin.yaml", "map.txt", "mapping_trace.json", "map_manifest.json", "scene_semantics.json", "trajectory_raw.csv", "trajectory_optimized.csv", "recording_manifest.yaml"}:
                         extracted[name] = archive.read(name)
                     elif name == "map_set/map_set_manifest.json":
                         map_set_manifest = json.loads(archive.read(name).decode("utf-8"))
@@ -3784,6 +3850,14 @@ class DeviceMapUploadView(APIView):
                     map_manifest = parsed_manifest
             except (UnicodeDecodeError, json.JSONDecodeError):
                 pass
+        scene_semantics = {}
+        if extracted.get("scene_semantics.json"):
+            try:
+                candidate = json.loads(extracted["scene_semantics.json"].decode("utf-8"))
+                if isinstance(candidate, dict) and candidate.get("schema") == "roamerx.scene-semantics.v1":
+                    scene_semantics = candidate
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
         if map_manifest.get("completeness") == "complete" and "map.pcd" not in package_names:
             return Response(
                 {"detail": "完整地图包必须包含 map.pcd，当前上传包无法用于三维 NDT 导航"},
@@ -3802,6 +3876,7 @@ class DeviceMapUploadView(APIView):
             "image": yaml_metadata.get("image", ""),
             "gnss_origin_yaml": extracted.get("gnss_origin.yaml", b"").decode("utf-8", errors="ignore")[:16384],
             "map_manifest": map_manifest,
+            "scene_manifest": {"scene_semantics": scene_semantics} if scene_semantics else {},
             "coordinate_mode": map_manifest.get("coordinate_mode") or metadata.get("coordinate_mode", ""),
             "scene_scope": map_manifest.get("scene_scope") or metadata.get("scene_scope", ""),
             "localization_mode": map_manifest.get("localization_mode") or metadata.get("localization_mode", ""),

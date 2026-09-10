@@ -113,6 +113,37 @@ class AudioCommandChainTests(APITestCase):
         self.assertEqual(response.data["status"], "succeeded")
         self.assertEqual(response.data["result_payload"]["volume"], 64)
 
+    def test_operator_can_poll_audio_playback_result(self):
+        command = RobotCommand.objects.create(
+            robot=self.robot,
+            action="play_audio",
+            status="finished",
+            payload={"audio_url": "https://platform.example/audio/notice.wav"},
+            response_payload={
+                "playback_mode": "single_nx",
+                "active_outputs": ["nx"],
+                "unavailable_outputs": {"3588": "USB audio sink is unavailable"},
+            },
+        )
+
+        response = self.web_client.get(f"/api/robots/{self.robot.id}/commands/{command.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "finished")
+        self.assertEqual(response.data["response_payload"]["playback_mode"], "single_nx")
+
+    def test_audio_playback_result_is_scoped_to_robot(self):
+        other_robot = Robot.objects.create(code="AUDIO-TEST-02", name="另一台机器人")
+        command = RobotCommand.objects.create(
+            robot=other_robot,
+            action="play_audio",
+            payload={"audio_url": "https://platform.example/audio/notice.wav"},
+        )
+
+        response = self.web_client.get(f"/api/robots/{self.robot.id}/commands/{command.id}/")
+
+        self.assertEqual(response.status_code, 404)
+
     def test_poll_returns_newest_audio_and_supersedes_older_queue(self):
         older = RobotCommand.objects.create(
             robot=self.robot,

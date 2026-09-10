@@ -25,6 +25,7 @@ docker save "${image}" -o "${package_dir}/frontend-image.tar"
 
 cp "${frontend_dir}/compose.frontend.yml" "${package_dir}/compose.frontend.yml"
 cp "${frontend_dir}/modules.json" "${package_dir}/modules.json"
+cp "${frontend_dir}/public/scene-map-config.json" "${package_dir}/scene-map-config.json"
 cp "${frontend_dir}/release/frontendctl" "${package_dir}/frontendctl"
 cp "${frontend_dir}/release/README.md" "${package_dir}/README.md"
 cp "${frontend_dir}/release/nginx/"* "${package_dir}/nginx/"

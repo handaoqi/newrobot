@@ -36,7 +36,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
     "corsheaders",
-    "monitoring",
+    "monitoring.apps.MonitoringConfig",
 ]
 
 MIDDLEWARE = [
@@ -91,7 +91,11 @@ else:
             # task dispatch and scheduler updates.  Give a SQLite writer time
             # to acquire the lock instead of failing a robot command at the
             # default five-second timeout.
-            "OPTIONS": {"timeout": 30},
+            "OPTIONS": {
+                "timeout": max(1, int(os.getenv("SQLITE_BUSY_TIMEOUT_SECONDS", "30"))),
+                "transaction_mode": "IMMEDIATE",
+            },
+            "CONN_MAX_AGE": int(os.getenv("SQLITE_CONN_MAX_AGE", "60")),
         }
     }
 
@@ -148,10 +152,27 @@ INBOUND_MESSAGE_FAILED_RETENTION_DAYS = int(os.getenv("INBOUND_MESSAGE_FAILED_RE
 SYSTEM_LOG_DEBUG_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_DEBUG_RETENTION_DAYS", "7"))
 SYSTEM_LOG_INFO_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_INFO_RETENTION_DAYS", "30"))
 SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS", "180"))
-SYSTEM_LOG_CLEANUP_BATCH_SIZE = int(os.getenv("SYSTEM_LOG_CLEANUP_BATCH_SIZE", "2000"))
-INBOUND_MESSAGE_CLEANUP_BATCH_SIZE = max(1, int(os.getenv("INBOUND_MESSAGE_CLEANUP_BATCH_SIZE", "2000")))
+SYSTEM_LOG_CLEANUP_BATCH_SIZE = max(1, int(os.getenv("SYSTEM_LOG_CLEANUP_BATCH_SIZE", "500")))
+INBOUND_MESSAGE_CLEANUP_BATCH_SIZE = max(1, int(os.getenv("INBOUND_MESSAGE_CLEANUP_BATCH_SIZE", "500")))
 INBOUND_MESSAGE_CLEANUP_INTERVAL_SECONDS = max(
     60, int(os.getenv("INBOUND_MESSAGE_CLEANUP_INTERVAL_SECONDS", "3600"))
+)
+INBOUND_MESSAGE_STALE_PENDING_DAYS = max(0, int(os.getenv("INBOUND_MESSAGE_STALE_PENDING_DAYS", "7")))
+INBOUND_MESSAGE_WEEKLY_CLEANUP_ENABLED = os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_ENABLED", "true").lower() == "true"
+INBOUND_MESSAGE_WEEKLY_CLEANUP_WEEKDAY = int(os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_WEEKDAY", "0")) % 7
+INBOUND_MESSAGE_WEEKLY_CLEANUP_HOUR = min(23, max(0, int(os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_HOUR", "3"))))
+INBOUND_MESSAGE_WEEKLY_CLEANUP_GRACE_HOURS = max(
+    1, int(os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_GRACE_HOURS", "24"))
+)
+INBOUND_MESSAGE_WEEKLY_CLEANUP_MAX_BATCHES = max(
+    1, int(os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_MAX_BATCHES", "10000"))
+)
+INBOUND_MESSAGE_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS = max(
+    30, int(os.getenv("INBOUND_MESSAGE_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS", "600"))
+)
+SQLITE_LOCK_RETRY_ATTEMPTS = max(1, int(os.getenv("SQLITE_LOCK_RETRY_ATTEMPTS", "4")))
+SQLITE_LOCK_RETRY_BACKOFF_SECONDS = max(
+    0.0, float(os.getenv("SQLITE_LOCK_RETRY_BACKOFF_SECONDS", "0.25"))
 )
 
 # Validation recordings and results are large immutable blobs. Production uses

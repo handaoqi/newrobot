@@ -2042,7 +2042,9 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     nav.result("succeeded", "", {"missed_waypoints": []})
     _await_departure_heading(executor)
     assert ids(nav.sent[-1]) == ["wp-2"]
-    assert nav.waypoint_profiles[-1] == (False, True, True)
+    # require_yaw is enforced with a stationary arrival turn, not by RPP
+    # while it tracks the approach path.
+    assert nav.waypoint_profiles[-1] == (False, False, True)
     nav.pose = SimpleNamespace(x=float(points[1]["x"]), y=float(points[1]["y"]), yaw=0.0)
     nav.result("succeeded", "", {"missed_waypoints": []})
     _await_departure_heading(executor)
@@ -2051,6 +2053,49 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     assert nav.waypoint_profiles[-1] == (True, False, False)
     nav.feedback(0, 0.6)
     assert nav.waypoint_profiles[-1] == (True, False, True)
+    executor.stop()
+    store.close()
+
+
+def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
+    from math import pi
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    first = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    first["require_yaw"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.start_task(envelope)
+    # Nav2 may finish the XY click while the body still faces away from the
+    # requested yaw. Its profile must not ask RPP to weave toward that yaw.
+    assert nav.waypoint_profiles[0] == (True, False, True)
+    nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]), yaw=pi)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    deadline = time.time() + 2.0
+    while (
+        executor._departure_heading_mode != "teleop"
+        and time.time() < deadline
+    ):
+        time.sleep(0.02)
+    assert executor._departure_heading_mode == "teleop"
+    assert executor._departure_heading_is_arrival is True
+    assert nav.cancelled == 0
+    _await_departure_heading(executor)
+    # The following-leg turn may run after arrival confirmation, so the final
+    # fake pose can face the next leg. Negative yaw commands prove the arrival
+    # controller first turned back toward this waypoint's yaw.
+    assert any(command[2] < 0.0 for command in nav.teleop)
+    assert any(event[0] == "task.arrival_heading_aligning" for event in events)
+    assert any(event[0] == "task.arrival_heading_aligned" for event in events)
     executor.stop()
     store.close()
 

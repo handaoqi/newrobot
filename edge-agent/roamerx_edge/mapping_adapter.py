@@ -384,7 +384,23 @@ class MappingAdapter:
             raise ProtocolError("MAPPING_TYPE_REQUIRED", "mapping type cannot change inside an active workflow")
         origin_status = self._origin_monitor.status()
         if mapping_type == "outdoor" and origin_status.get("origin_status") != "locked":
-            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor mapping requires a valid locked ENU origin")
+            current = str(origin_status.get("origin_status") or "idle")
+            if current in {"waiting_fix", "quality_holding"}:
+                raise ProtocolError(
+                    "MAPPING_ORIGIN_REQUIRED",
+                    "室外原点还在锁定中，请等待位置 FIX 和质量窗口完成后再启动 SLAM",
+                )
+            LOGGER.warning(
+                "outdoor slam_start received without a locked ENU origin (status=%s); "
+                "starting sensor preparation instead of SLAM warmup",
+                current,
+            )
+            command = dict(command)
+            command["prepare_only"] = True
+            command["mapping_type"] = "outdoor"
+            if normalize_text(command.get("scene_scope"), "outdoor") == "indoor":
+                command["scene_scope"] = "outdoor"
+            return self.start_origin_lock(command)
         if mapping_type == "outdoor":
             locked_at = float((origin_status.get("origin") or {}).get("locked_at_unix") or 0)
             if locked_at and time.time() - locked_at > self.config.origin_lock_ttl_seconds:
@@ -501,7 +517,7 @@ class MappingAdapter:
                 return self._save_active_mapping(command)
             # 同步模式：无活跃建图会话时，直接打包最近已有的地图文件并上传
             LOGGER.info("save_mapping called without active session — treating as sync")
-            session_dir = complete_dir
+            session_dir = self._find_current_complete_export() or complete_dir
             if not session_dir:
                 raise ProtocolError("NO_MAP_FILES", "no previous complete mapping output found")
             work_dir = session_dir
@@ -516,11 +532,19 @@ class MappingAdapter:
             return result
 
         if not self._any_slam_process_alive:
-            LOGGER.warning(
-                "Mapping session %s has no SLAM process; restarting for persistent-keyframe recovery",
-                self.session.session_id,
-            )
-            self._ensure_slam_process()
+            existing = self._find_current_complete_export()
+            if existing is None:
+                LOGGER.warning(
+                    "Mapping session %s has no SLAM process; restarting for persistent-keyframe recovery",
+                    self.session.session_id,
+                )
+                self._ensure_slam_process()
+            else:
+                LOGGER.warning(
+                    "Mapping session %s has no SLAM process, packaging existing export %s",
+                    self.session.session_id,
+                    existing,
+                )
         return self._save_active_mapping(command)
 
     def optimize_historical_map(self, command: dict, source_dir: Path) -> dict:
@@ -579,17 +603,64 @@ class MappingAdapter:
             LOGGER.exception("offline map optimization failed for %s", source_dir)
             raise ProtocolError("MAP_OFFLINE_OPTIMIZATION_FAILED", str(exc)) from exc
 
+    def build_scene_semantics(self, command: dict) -> dict:
+        """Publish a locally generated scene_semantics.json sidecar.
+
+        The actual model runner is intentionally external to the mapping
+        process: it can be upgraded independently on Orin and must never
+        interfere with map saving or navigation. This command validates and
+        uploads its small, versioned output once the runner has produced it.
+        """
+        source_value = command.get("map_dir") or self._find_latest_session_dir(require_complete=True)
+        source_dir = Path(source_value).expanduser() if source_value else None
+        if source_dir is None or not source_dir.is_dir():
+            raise ProtocolError("SCENE_SEMANTIC_MAP_MISSING", "没有可用于语义处理的本地完整地图")
+        sidecar = source_dir / "scene_semantics.json"
+        if not sidecar.is_file():
+            return {
+                "status": "unavailable",
+                "reason": "scene_semantics.json 不存在；请先运行 Orin 点云模型推理器",
+                "map_dir": str(source_dir),
+            }
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProtocolError("SCENE_SEMANTIC_INVALID", f"语义结果文件无法读取: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != "roamerx.scene-semantics.v1":
+            raise ProtocolError("SCENE_SEMANTIC_INVALID", "语义结果 schema 不正确")
+        instances = payload.get("instances")
+        if not isinstance(instances, list) or len(instances) > 5000:
+            raise ProtocolError("SCENE_SEMANTIC_INVALID", "语义结果 instances 数量无效")
+        map_id = command.get("map_id") or command.get("source_map_id")
+        upload_result = None
+        if map_id:
+            upload_result = self.media_client.upload_scene_semantics(map_id, payload)
+        return {
+            "status": "ready" if upload_result else "validated",
+            "map_id": str(map_id or ""),
+            "map_dir": str(source_dir),
+            "model_version": str(payload.get("model_version") or ""),
+            "instance_count": len(instances),
+            "upload_result": upload_result,
+        }
+
     def _save_active_mapping(self, command: dict) -> dict:
         saved_mapping_type = (
             self.session.mapping_type
             if self.session and self.session.mapping_type in {"indoor", "outdoor"}
             else self._mapping_type
         )
-        progress_dir = self._find_latest_progress_dir()
+        preferred_dir = self._find_current_mapping_dir()
+        existing_complete = self._find_current_complete_export()
+        progress_dir = preferred_dir or self._find_latest_progress_dir()
         progress = self._read_save_progress(progress_dir)
-        readiness = self._mapping_readiness(progress, self._any_slam_process_alive)
-        if not readiness["ready_for_save"]:
-            self._set_state(self.session.state if self._any_slam_process_alive and self.session else "failed")
+        slam_alive = self._any_slam_process_alive
+        readiness = self._mapping_readiness(progress, slam_alive)
+        skip_slam_save = existing_complete is not None and (
+            not slam_alive or str(self._read_save_progress(existing_complete).get("stage") or "") == "completed"
+        )
+        if not skip_slam_save and not readiness["ready_for_save"]:
+            self._set_state(self.session.state if slam_alive and self.session else "failed")
             raise ProtocolError("MAPPING_NOT_READY", readiness["message"])
 
         # The diagnostic bag captures sensor input while the robot is mapping;
@@ -600,21 +671,24 @@ class MappingAdapter:
         should_upload = bool(command.get("upload", True))
         should_package = bool(command.get("package", should_upload))
         should_stop = bool(command.get("stop_process", True))
-        try:
-            self._call_map_state(self.config.save_data)
-        except ProtocolError:
-            self._set_state("mapping" if self._any_slam_process_alive else "failed")
-            progress_dir = self._find_latest_progress_dir()
-            progress = self._read_save_progress(progress_dir)
-            if (
-                progress_dir
-                and (
-                    progress.get("error_code") == "SLAM_DIVERGED"
-                    or progress.get("slam_health", {}).get("state") == "diverged"
-                )
-            ):
-                return self._rescue_diverged_mapping(command, progress_dir)
-            raise
+        if skip_slam_save:
+            LOGGER.info("Reusing completed mapping export at %s instead of invoking SLAM save", existing_complete)
+        else:
+            try:
+                self._call_map_state(self.config.save_data)
+            except ProtocolError:
+                self._set_state("mapping" if self._any_slam_process_alive else "failed")
+                progress_dir = preferred_dir or self._find_latest_progress_dir()
+                progress = self._read_save_progress(progress_dir)
+                if (
+                    progress_dir
+                    and (
+                        progress.get("error_code") == "SLAM_DIVERGED"
+                        or progress.get("slam_health", {}).get("state") == "diverged"
+                    )
+                ):
+                    return self._rescue_diverged_mapping(command, progress_dir)
+                raise
         # Past this point the save service has returned, so the map is already on
         # disk and SLAM has nothing left to do.  Every step below can raise, and
         # letting one of them escape used to leak the mapping node: it kept a core
@@ -623,9 +697,12 @@ class MappingAdapter:
         # Export failures must not cost the operator the next mapping run.
         try:
             # SLAM writes yaml/pgm asynchronously after the save service returns.
-            # Wait for an output touched after this save command instead of falling
-            # back to an older complete map directory.
-            work_dir = self._wait_for_complete_map_dir(save_started_at)
+            # Wait for this session's export. A newer leftover indoor directory
+            # must not steal outdoor packaging.
+            work_dir = existing_complete if skip_slam_save else self._wait_for_complete_map_dir(
+                save_started_at,
+                preferred_dir=preferred_dir,
+            )
             self._validate_map_files(work_dir)
             self._finalize_session_package(work_dir, command)
             result = self.status()
@@ -1496,6 +1573,7 @@ class MappingAdapter:
                 raise ProtocolError(
                     "MAPPING_DEPLOYMENT_MISMATCH", "Edge Agent version differs from deployment manifest"
                 )
+        refresh_adapter = False
         for name, configured_path in required.items():
             record = artifacts.get(name) or {}
             recorded_path = Path(str(record.get("path") or "")).expanduser()
@@ -1505,11 +1583,52 @@ class MappingAdapter:
                     "MAPPING_DEPLOYMENT_MISMATCH", f"{name} path does not match deployed artifact"
                 )
             actual_hash = self._sha256_file(configured_path)
-            if not expected_hash or actual_hash != expected_hash:
-                raise ProtocolError(
-                    "MAPPING_DEPLOYMENT_MISMATCH", f"{name} SHA256 does not match deployment manifest"
-                )
+            if expected_hash and actual_hash == expected_hash:
+                continue
+            # This NX runs Edge Agent from the Git checkout. A local edit of
+            # mapping_adapter.py is the deployed code; refresh that fingerprint
+            # instead of blocking mapping after every source change.
+            if name == "mapping_adapter":
+                refresh_adapter = True
+                continue
+            raise ProtocolError(
+                "MAPPING_DEPLOYMENT_MISMATCH",
+                f"{name} SHA256 does not match deployment manifest; "
+                "rebuild/install that artifact then run "
+                "python3 /home/dogrobot/edge-agent/tools/write_mapping_deployment_manifest.py",
+            )
+        if refresh_adapter:
+            self._refresh_mapping_adapter_fingerprint(manifest_path, manifest, required["mapping_adapter"])
         return manifest
+
+    def _refresh_mapping_adapter_fingerprint(
+        self,
+        manifest_path: Path,
+        manifest: dict,
+        adapter_path: Path,
+    ) -> None:
+        artifacts = dict(manifest.get("artifacts") or {})
+        artifacts["mapping_adapter"] = {
+            "path": str(adapter_path),
+            "size_bytes": adapter_path.stat().st_size,
+            "sha256": self._sha256_file(adapter_path),
+        }
+        payload = dict(manifest)
+        payload["artifacts"] = artifacts
+        payload["generated_at_unix"] = round(time.time(), 3)
+        try:
+            _atomic_write_text(
+                manifest_path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except OSError as exc:
+            raise ProtocolError(
+                "MAPPING_DEPLOYMENT_MISMATCH",
+                "mapping_adapter SHA256 does not match deployment manifest and "
+                f"could not refresh {manifest_path}: {exc}. Run "
+                "python3 /home/dogrobot/edge-agent/tools/write_mapping_deployment_manifest.py",
+            ) from exc
+        LOGGER.warning("Refreshed mapping_adapter fingerprint in %s after local source change", manifest_path)
 
     def _start_slam_subprocess(self) -> None:
         command = self._shell_prefix() + self.config.slam_command
@@ -1734,6 +1853,7 @@ class MappingAdapter:
         *,
         require_complete: bool = False,
         min_mtime: float | None = None,
+        current_session_only: bool = False,
     ) -> Path | None:
         """Find the most recent SLAM output directory.
 
@@ -1751,10 +1871,97 @@ class MappingAdapter:
                 continue
             if min_mtime is not None and self._latest_file_mtime(entry) < min_mtime:
                 continue
+            if current_session_only and not self._export_matches_current_session(entry):
+                continue
+            dirs.append(entry)
+        return max(dirs, key=self._latest_file_mtime) if dirs else None
+
+    def _gnss_origin_payload(self, base: Path | None) -> dict:
+        if not base:
+            return {}
+        path = base / "gnss_origin.yaml"
+        if not path.is_file():
+            return {}
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _export_origin_session_id(self, base: Path | None) -> str:
+        origin = self._gnss_origin_payload(base)
+        session_id = str(origin.get("origin_lock_session_id") or "")
+        if session_id:
+            return session_id
+        alignment = (self._read_save_progress(base).get("rtk_alignment") or {})
+        return str(alignment.get("origin_session_id") or "")
+
+    def _current_origin_session_id(self) -> str:
+        if self.session and self.session.origin_session_id:
+            return str(self.session.origin_session_id)
+        origin = self._origin_monitor.status().get("origin") or {}
+        return str(origin.get("origin_lock_session_id") or "")
+
+    def _current_mapping_type(self) -> str:
+        if self.session and self.session.mapping_type in {"indoor", "outdoor"}:
+            return self.session.mapping_type
+        return self._mapping_type if self._mapping_type in {"indoor", "outdoor"} else "indoor"
+
+    def _export_matches_current_session(self, base: Path | None) -> bool:
+        if not base or not base.is_dir():
+            return False
+        if self._current_mapping_type() != "outdoor":
+            return True
+        current_id = self._current_origin_session_id()
+        export_id = self._export_origin_session_id(base)
+        if current_id:
+            return bool(export_id) and export_id == current_id
+        return bool(self._gnss_origin_payload(base))
+
+    def _is_complete_export(self, base: Path | None) -> bool:
+        if not base or not self._has_required_files(base):
+            return False
+        progress = self._read_save_progress(base)
+        if progress.get("error_code") == "SLAM_DIVERGED" or (progress.get("slam_health") or {}).get("state") == "diverged":
+            return False
+        if self._current_mapping_type() == "outdoor" and not self._gnss_origin_payload(base):
+            return False
+        return self._export_matches_current_session(base)
+
+    def _find_current_mapping_dir(self) -> Path | None:
+        if not self.map_dir.exists():
+            return None
+        candidates = []
+        for entry in self.map_dir.iterdir():
+            if not self._is_session_dir(entry) or not (entry / "save_progress.json").exists():
+                continue
+            if not self._export_matches_current_session(entry):
+                continue
+            candidates.append(entry)
+        if not candidates:
+            return None
+        capturing = [
+            entry for entry in candidates
+            if bool(self._read_save_progress(entry).get("mapping_capture_enabled"))
+        ]
+        return max(capturing or candidates, key=self._latest_file_mtime)
+
+    def _find_current_complete_export(self, min_mtime: float | None = None) -> Path | None:
+        if not self.map_dir.exists():
+            return None
+        dirs = []
+        for entry in self.map_dir.iterdir():
+            if not self._is_session_dir(entry) or not self._is_complete_export(entry):
+                continue
+            if min_mtime is not None and self._latest_file_mtime(entry) < min_mtime:
+                continue
             dirs.append(entry)
         return max(dirs, key=self._latest_file_mtime) if dirs else None
 
     def _find_latest_progress_dir(self) -> Path | None:
+        current = self._find_current_mapping_dir()
+        if current:
+            return current
         if not self.map_dir.exists():
             return None
         dirs = [
@@ -1779,6 +1986,7 @@ class MappingAdapter:
                 and progress.get("slam_health", {}).get("state") != "diverged"
                 and (entry / "keyframes" / "keyframes.csv").exists()
                 and not self._has_required_files(entry)
+                and self._export_matches_current_session(entry)
             ):
                 candidates.append(entry)
         return max(candidates, key=self._latest_file_mtime) if candidates else None
@@ -1857,28 +2065,45 @@ class MappingAdapter:
         except OSError:
             LOGGER.exception("failed to mark mapping progress completed: %s", path)
 
-    def _wait_for_complete_map_dir(self, min_mtime: float | None = None) -> Path:
+    def _wait_for_complete_map_dir(
+        self,
+        min_mtime: float | None = None,
+        preferred_dir: Path | None = None,
+    ) -> Path:
         deadline = time.monotonic() + max(
             self.SAVE_OUTPUT_TIMEOUT_SECONDS,
             int(self.config.save_wait_seconds),
         )
         last_missing: list[str] = []
         while time.monotonic() < deadline:
-            session_dir = self._find_latest_session_dir(require_complete=True, min_mtime=min_mtime)
+            if preferred_dir and self._is_complete_export(preferred_dir):
+                return preferred_dir
+            session_dir = self._find_current_complete_export(min_mtime=min_mtime)
             if session_dir:
                 return session_dir
-            latest = self._find_latest_session_dir()
+            # Outdoor retries must keep the current origin session even when a
+            # leftover indoor export was rewritten after this save started.
+            if self._current_mapping_type() == "outdoor":
+                session_dir = self._find_current_complete_export()
+                if session_dir:
+                    return session_dir
+            latest = preferred_dir or self._find_current_mapping_dir() or self._find_latest_session_dir()
             base = latest or self.map_dir
             progress = self._read_save_progress(latest)
+            matches_current = latest is None or self._export_matches_current_session(latest)
             if (
                 progress.get("stage") == "failed"
                 and self._latest_file_mtime(base) >= (min_mtime or 0)
+                and matches_current
             ):
                 raise ProtocolError(
                     "MAPPING_SAVE_FAILED",
                     str(progress.get("error") or "SLAM map export failed"),
                 )
             last_missing = self._missing_required_files(base)
+            if self._current_mapping_type() == "outdoor" and "gnss_origin.yaml" not in last_missing:
+                if not (base / "gnss_origin.yaml").exists():
+                    last_missing.append("gnss_origin.yaml")
             time.sleep(1)
         raise ProtocolError("MAPPING_FILES_MISSING", f"missing map files: {', '.join(last_missing or self.REQUIRED_FILES)}")
 
@@ -1941,11 +2166,21 @@ class MappingAdapter:
             })
             if self.session:
                 self._set_state("optimizing")
+            optimized_exists = (
+                (work_dir / "trajectory_optimized.csv").is_file()
+                and (work_dir / "trajectory_covariance.json").is_file()
+            )
             try:
-                self._call_ros_service("/slam/global_optimize", "std_srvs/srv/Trigger", "{}")
-                refreshed = self._read_json(work_dir / "map_manifest.json")
-                if refreshed:
-                    manifest = refreshed
+                if not self._any_slam_process_alive and optimized_exists:
+                    LOGGER.info(
+                        "SLAM is not running; reusing existing GTSAM output in %s",
+                        work_dir,
+                    )
+                else:
+                    self._call_ros_service("/slam/global_optimize", "std_srvs/srv/Trigger", "{}")
+                    refreshed = self._read_json(work_dir / "map_manifest.json")
+                    if refreshed:
+                        manifest = refreshed
             except ProtocolError as exc:
                 fallback_error = str(exc)
                 if scene_scope != "indoor":
@@ -1968,13 +2203,21 @@ class MappingAdapter:
         )
         if scene_scope != "indoor":
             rtk_count = int((summary.get("factors") or {}).get("rtk_position") or 0)
-            if not summary.get("applied") or rtk_count <= 0:
+            if rtk_count <= 0:
                 raise ProtocolError(
                     "MAP_OPTIMIZATION_FAILED",
                     "outdoor GTSAM must apply RTK XY to the saved map: "
                     + str(
                         summary.get("fallback_error")
                         or f"applied={summary.get('applied')} rtk_position={rtk_count}"
+                    ),
+                )
+            if not summary.get("applied"):
+                raise ProtocolError(
+                    "MAP_OPTIMIZATION_FAILED",
+                    str(
+                        summary.get("fallback_error")
+                        or "outdoor optimized trajectory was rejected"
                     ),
                 )
         if summary.get("candidate_applied") and not summary.get("applied"):
@@ -2125,8 +2368,19 @@ class MappingAdapter:
         if not self.session or self.session.mapping_type != "outdoor":
             return
         exported_path = work_dir / "gnss_origin.yaml"
-        if not self._origin_file.is_file() or not exported_path.is_file():
-            raise ProtocolError("MAPPING_ORIGIN_REQUIRED", "outdoor map export is missing locked GNSS origin metadata")
+        if not self._origin_file.is_file():
+            raise ProtocolError(
+                "MAPPING_ORIGIN_REQUIRED",
+                f"locked gnss_origin.yaml is missing: {self._origin_file}",
+            )
+        if not exported_path.is_file():
+            if self._export_matches_current_session(work_dir):
+                shutil.copy2(self._origin_file, exported_path)
+            else:
+                raise ProtocolError(
+                    "MAPPING_ORIGIN_REQUIRED",
+                    f"outdoor map export is missing locked GNSS origin metadata: {exported_path}",
+                )
         try:
             locked = yaml.safe_load(self._origin_file.read_text(encoding="utf-8")) or {}
             exported = yaml.safe_load(exported_path.read_text(encoding="utf-8")) or {}
@@ -2365,6 +2619,7 @@ class MappingAdapter:
             "gnss_origin.yaml",
             "mapping_trace.json",
             "map_manifest.json",
+            "scene_semantics.json",
             "recording_manifest.yaml",
             "trajectory_raw.csv",
             "trajectory_optimized.csv",

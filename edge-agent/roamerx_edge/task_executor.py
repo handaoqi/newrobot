@@ -61,6 +61,10 @@ BYPASS_MIN_SIDE_CLEARANCE_M = 0.8
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.35  # ~20 deg (compat / completion sample)
+# A waypoint explicitly marked require_yaw previously let RPP chase the final
+# orientation while still following the path.  Keep its original, stricter
+# goal-checker tolerance when handing that orientation to the stationary turn.
+ARRIVAL_HEADING_ALIGN_RAD = 0.25  # ~14 deg
 DEPARTURE_HEADING_INPLACE_RAD = 1.047  # ~60 deg
 # Nav2 require_yaw weaves on large heading changes (typical 180deg loop
 # turns). Spin with teleop yaw instead, indoors and outdoors. Abort and
@@ -304,6 +308,9 @@ class TaskExecutor:
         self._goal_offset = 0
         self._departure_heading_index: int | None = None
         self._departure_heading_completed_index: int | None = None
+        # Set only while a waypoint's requested final yaw is being satisfied
+        # after its XY arrival.  It must not suppress the following-leg turn.
+        self._arrival_heading_completed_index: int | None = None
         # When set, a successful in-place turn should cruise to this waypoint
         # instead of running the post-arrival absolute-localization path.
         self._departure_cruise_index: int | None = None
@@ -311,6 +318,8 @@ class TaskExecutor:
         self._departure_heading_cancel = threading.Event()
         self._departure_heading_thread: threading.Thread | None = None
         self._departure_heading_mode: str | None = None
+        self._departure_heading_is_arrival = False
+        self._departure_heading_tolerance_rad = DEPARTURE_HEADING_ALIGN_RAD
         self._absolute_pause_watch_stop: threading.Event | None = None
         self._absolute_pause_watch_thread: threading.Thread | None = None
         self._last_progress_emit_at: float | None = None
@@ -1603,7 +1612,10 @@ class TaskExecutor:
         self._departure_heading_index = None
         self._departure_cruise_index = None
         self._departure_heading_completed_index = None
+        self._arrival_heading_completed_index = None
         self._departure_heading_mode = None
+        self._departure_heading_is_arrival = False
+        self._departure_heading_tolerance_rad = DEPARTURE_HEADING_ALIGN_RAD
         self._departure_heading_thread = None
         if not had_departure:
             return
@@ -1668,6 +1680,19 @@ class TaskExecutor:
             cruise_index = self._departure_cruise_index
             reached_index = self._departure_heading_index
             mode = self._departure_heading_mode or "nav2"
+            is_arrival = self._departure_heading_is_arrival
+            if is_arrival:
+                LOGGER.error(
+                    "arrival heading timed out after %.1fs (%s); keeping the yaw requirement",
+                    DEPARTURE_HEADING_TIMEOUT_SECONDS,
+                    mode,
+                )
+                self._clear_departure_heading(cancel_navigation=True)
+                self._fail(
+                    "ARRIVAL_HEADING_TIMEOUT",
+                    "waypoint position reached but final heading did not align in time",
+                )
+                return
             LOGGER.warning(
                 "departure heading timed out after %.1fs (%s); continuing without in-place align "
                 "(reached=%s cruise=%s)",
@@ -1694,6 +1719,8 @@ class TaskExecutor:
         self._departure_heading_index = None
         self._departure_cruise_index = None
         self._departure_heading_mode = None
+        self._departure_heading_is_arrival = False
+        self._departure_heading_tolerance_rad = DEPARTURE_HEADING_ALIGN_RAD
         self._restore_navigation_profile()
         if cruise_index is not None:
             LOGGER.info(
@@ -1709,6 +1736,20 @@ class TaskExecutor:
         """Nav2 require_yaw weaves on 180deg turns; spin with teleop yaw instead."""
         return callable(getattr(self.navigation, "teleop_velocity", None))
 
+    def _use_teleop_arrival_heading(self, waypoint: dict, waypoint_index: int) -> bool:
+        """Whether this waypoint's final yaw is handled after XY arrival.
+
+        Docking retains Nav2's precision-goal ownership.  Pass-through points
+        intentionally have no stationary arrival phase, so they cannot ask for
+        an independent final turn.
+        """
+        return bool(
+            not self._is_docking_task()
+            and bool(waypoint.get("require_yaw", False))
+            and self._arrival_policy(waypoint, waypoint_index) != "pass_through"
+            and self._use_teleop_departure_heading()
+        )
+
     def _start_departure_heading(
         self,
         *,
@@ -1717,7 +1758,24 @@ class TaskExecutor:
         cruise_index: int | None,
         profile_waypoint: dict,
         error_rad: float | None = None,
+        arrival_heading: bool = False,
+        tolerance_rad: float = DEPARTURE_HEADING_ALIGN_RAD,
     ) -> bool:
+        # At a waypoint Nav2 has already completed the XY goal.  Do not send
+        # another Nav2 goal just to rotate: RPP uses path geometry here and can
+        # orbit the click.  The direct yaw controller is stationary instead.
+        if arrival_heading:
+            if not self._use_teleop_departure_heading():
+                return False
+            return self._start_teleop_departure_heading(
+                desired_yaw=desired_yaw,
+                reached_index=reached_index,
+                cruise_index=cruise_index,
+                error_rad=error_rad,
+                arrival_heading=True,
+                tolerance_rad=tolerance_rad,
+                cancel_navigation=False,
+            )
         if self._use_teleop_departure_heading():
             return self._start_teleop_departure_heading(
                 desired_yaw=desired_yaw,
@@ -1796,31 +1854,41 @@ class TaskExecutor:
         reached_index: int,
         cruise_index: int | None,
         error_rad: float | None = None,
+        arrival_heading: bool = False,
+        tolerance_rad: float = DEPARTURE_HEADING_ALIGN_RAD,
+        cancel_navigation: bool = True,
     ) -> bool:
-        try:
-            self._cancel_active_navigation(timeout_seconds=2.0)
-        except Exception:
-            LOGGER.warning(
-                "failed to cancel navigation before teleop departure heading",
-                exc_info=True,
-            )
+        if cancel_navigation:
+            try:
+                self._cancel_active_navigation(timeout_seconds=2.0)
+            except Exception:
+                LOGGER.warning(
+                    "failed to cancel navigation before teleop departure heading",
+                    exc_info=True,
+                )
         self._departure_heading_cancel.clear()
         self._departure_heading_index = reached_index
         self._departure_cruise_index = cruise_index
         self._departure_heading_mode = "teleop"
+        self._departure_heading_is_arrival = arrival_heading
+        self._departure_heading_tolerance_rad = max(0.01, float(tolerance_rad))
         self._goal_offset, self._dispatched_count = reached_index, 1
         self._arm_departure_heading_timeout()
-        self.on_feedback(0, milestone="departure_heading_dispatched")
+        self.on_feedback(
+            0,
+            milestone=("arrival_heading_dispatched" if arrival_heading else "departure_heading_dispatched"),
+        )
         thread = threading.Thread(
             target=self._teleop_departure_heading_worker,
-            args=(desired_yaw, reached_index, cruise_index),
+            args=(desired_yaw, reached_index, cruise_index, arrival_heading),
             daemon=True,
             name="departure-heading-teleop",
         )
         self._departure_heading_thread = thread
         thread.start()
         LOGGER.info(
-            "teleop departure heading toward %s yaw=%.3f (error=%.1fdeg)",
+            "teleop %s heading toward %s yaw=%.3f (error=%.1fdeg)",
+            "arrival" if arrival_heading else "departure",
             f"waypoint {cruise_index}" if cruise_index is not None else f"index {reached_index}",
             desired_yaw,
             abs(error_rad or 0.0) * 180.0 / pi,
@@ -1832,6 +1900,7 @@ class TaskExecutor:
         desired_yaw: float,
         reached_index: int,
         cruise_index: int | None,
+        arrival_heading: bool,
     ) -> None:
         velocity = getattr(self.navigation, "teleop_velocity", None)
         stop = getattr(self.navigation, "stop_motion", None)
@@ -1848,6 +1917,7 @@ class TaskExecutor:
                         self._departure_heading_mode != "teleop"
                         or self._departure_heading_index != reached_index
                         or self._departure_cruise_index != cruise_index
+                        or self._departure_heading_is_arrival != arrival_heading
                     ):
                         return
                 pose = self.navigation.latest_pose() if self.navigation else None
@@ -1862,7 +1932,7 @@ class TaskExecutor:
                         return
                     continue
                 error = self._heading_error_rad(desired_yaw, yaw)
-                if abs(error) <= DEPARTURE_HEADING_ALIGN_RAD:
+                if abs(error) <= self._departure_heading_tolerance_rad:
                     stable += 1
                     if stable >= DEPARTURE_HEADING_STABLE_SAMPLES:
                         aligned = True
@@ -1902,7 +1972,25 @@ class TaskExecutor:
                     self._departure_heading_mode != "teleop"
                     or self._departure_heading_index != reached_index
                     or self._departure_cruise_index != cruise_index
+                    or self._departure_heading_is_arrival != arrival_heading
                 ):
+                    return
+                if arrival_heading:
+                    self._complete_departure_heading_locked(reached_index, None)
+                    # A completed arrival yaw must not be mistaken for a
+                    # departure turn: the next leg still gets its own heading
+                    # check. Re-enter normal post-arrival confirmation once.
+                    self._departure_heading_completed_index = None
+                    self._arrival_heading_completed_index = reached_index
+                    self._emit_idempotent(
+                        "task.arrival_heading_aligned",
+                        event_type_key="arrival_heading_aligned",
+                        waypoint_id=str(reached_index),
+                        message="已原地对准目标朝向",
+                    )
+                    self.on_navigation_result(
+                        "succeeded", generation=self._nav_goal_generation
+                    )
                     return
                 if cruise_index is not None:
                     self._complete_departure_heading_locked(reached_index, cruise_index)
@@ -3290,6 +3378,40 @@ class TaskExecutor:
                         "continuing with stationary localization policy",
                         reached_index,
                     )
+                arrival_heading_completed = self._arrival_heading_completed_index == reached_index
+                if arrival_heading_completed:
+                    # The teleop worker re-enters this callback once, after
+                    # it has stopped at the requested final yaw.
+                    self._arrival_heading_completed_index = None
+                elif self._use_teleop_arrival_heading(reached_waypoint, reached_index):
+                    pose = self.navigation.latest_pose() if self.navigation else None
+                    error = None
+                    if pose is not None:
+                        try:
+                            error = self._heading_error_rad(
+                                float(reached_waypoint["yaw"]),
+                                float(getattr(pose, "yaw", 0.0) or 0.0),
+                            )
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            error = None
+                    if error is None or abs(error) > ARRIVAL_HEADING_ALIGN_RAD:
+                        self._emit_idempotent(
+                            "task.arrival_heading_aligning",
+                            event_type_key="arrival_heading_aligning",
+                            waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
+                            message="目标点已到达，原地对准朝向",
+                            extra={"target_yaw": reached_waypoint.get("yaw")},
+                        )
+                        if self._start_departure_heading(
+                            desired_yaw=float(reached_waypoint["yaw"]),
+                            reached_index=reached_index,
+                            cruise_index=None,
+                            profile_waypoint=reached_waypoint,
+                            error_rad=error,
+                            arrival_heading=True,
+                            tolerance_rad=ARRIVAL_HEADING_ALIGN_RAD,
+                        ):
+                            return
                 # Confirm this click while standing. Face the next leg in
                 # _continue_after_waypoint only after arrival is accepted.
                 # Turning first makes zero-motion fail, outdoor RTK look
@@ -3930,6 +4052,13 @@ class TaskExecutor:
         final_approach = patrol_final or precision_goal
         if force_require_yaw is not None:
             require_yaw = bool(force_require_yaw) or precision_goal
+        # Do not ask RPP to solve the final orientation while it is still
+        # tracking a path.  Patrol require_yaw is enforced immediately after
+        # XY arrival by the direct, stationary teleop turn in
+        # on_navigation_result.  If teleop is unavailable we retain Nav2's
+        # original yaw-goal behavior as the compatibility fallback.
+        if self._use_teleop_arrival_heading(target, waypoint_index):
+            require_yaw = False
         if force_final is not None:
             final_approach = bool(force_final) or precision_goal
         self._segment_avoidance_enabled = avoid_obstacles

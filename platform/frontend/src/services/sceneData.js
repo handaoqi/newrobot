@@ -13,9 +13,21 @@ export const SCENE_LAYER_DEFAULTS = Object.freeze({
   route: true,
   trail: true,
   corrections: true,
-  semantic: true,
+  staticAssets: true,
+  dynamicObjects: true,
   boundary: true,
 })
+
+export const SCENE_MAP_MODES = Object.freeze({
+  scene: '点云场景',
+  satellite: '卫星地图',
+  'street-block': '街区模式',
+})
+
+export const SCENE_STATIC_ASSET_CATEGORIES = Object.freeze(['wall', 'building', 'tree', 'road'])
+export const SCENE_DYNAMIC_OBJECT_CATEGORIES = Object.freeze(['person', 'vehicle', 'bicycle'])
+export const SCENE_DYNAMIC_SPEED_THRESHOLD_MPS = 0.05
+export const EARTH_RADIUS_M = 6378137
 
 export const SCENE_ASSET_CATALOG_SCHEMA = 'roamerx.scene-assets.v1'
 export const SCENE_ASSET_CATALOG_URL = '/scene-assets/catalog.json'
@@ -38,6 +50,230 @@ export function assetForClass(value) {
     if (key === normalized || key === category || asset.aliases.includes(normalized)) return { key, ...asset }
   }
   return { key: 'unknown_obstacle', ...ASSET_REGISTRY.unknown_obstacle }
+}
+
+function sceneCategory(value) {
+  return assetForClass(value).key
+}
+
+export function isStaticSceneAsset(value) {
+  return SCENE_STATIC_ASSET_CATEGORIES.includes(sceneCategory(
+    value?.class_name || value?.className || value?.asset_id || value?.asset,
+  ))
+}
+
+export function isDynamicSceneObject(value) {
+  return SCENE_DYNAMIC_OBJECT_CATEGORIES.includes(sceneCategory(
+    value?.class_name || value?.className || value?.asset_id || value?.asset,
+  ))
+}
+
+export function filterStaticSceneAssets(items) {
+  return (Array.isArray(items) ? items : []).filter(isStaticSceneAsset)
+}
+
+export function filterDynamicSceneObjects(items, { robotMoving = false } = {}) {
+  if (!robotMoving) return []
+  return (Array.isArray(items) ? items : []).filter(isDynamicSceneObject)
+}
+
+function percentile(values, ratio) {
+  if (!values.length) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  return sorted[Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio)))]
+}
+
+function inferredAssetScale(category, width, depth, height) {
+  if (category === 'wall') return [Math.max(.25, width / 4), Math.max(.5, depth / .2), Math.max(.25, height / 2)]
+  if (category === 'building') return [Math.max(.25, width / 4.5), Math.max(.25, depth / 3.5), Math.max(.25, height / 2.555)]
+  if (category === 'tree') return [Math.max(.2, width / 2.904), Math.max(.2, depth / 2.7), Math.max(.2, height / 4.6)]
+  if (category === 'road') return [Math.max(.25, width / 4), Math.max(.25, depth / 3), 1]
+  return undefined
+}
+
+function addInferenceCandidate(candidates, category, cell, ground) {
+  const width = Math.max(.2, cell.maxX - cell.minX)
+  const depth = Math.max(.2, cell.maxY - cell.minY)
+  const height = Math.max(.1, cell.maxZ - Math.max(ground, cell.minZ))
+  const centerX = (cell.minX + cell.maxX) / 2
+  const centerY = (cell.minY + cell.maxY) / 2
+  const score = Math.max(.2, Math.min(.98, cell.confidence))
+  const item = {
+    id: `pcd-${category}-${cell.key}`,
+    asset_id: category === 'wall' ? 'wall.straight' : category === 'building' ? 'building.kiosk' : category === 'tree' ? 'tree.deciduous' : 'road.straight',
+    class_name: category,
+    confidence: score,
+    source: 'point_cloud_heuristic',
+    position: { x: centerX, y: centerY, z: ground },
+    dimensions: { x: width, y: depth, z: height },
+    scale: inferredAssetScale(category, width, depth, height),
+  }
+  if (category === 'wall') {
+    const alongX = width >= depth
+    item.position = { x: alongX ? cell.minX : centerX, y: alongX ? centerY : cell.minY, z: ground }
+    item.orientation = { x: 0, y: 0, z: alongX ? 0 : Math.sin(Math.PI / 4), w: alongX ? 1 : Math.cos(Math.PI / 4) }
+    item.dimensions = { x: alongX ? width : depth, y: alongX ? depth : width, z: height }
+    item.scale = inferredAssetScale('wall', item.dimensions.x, item.dimensions.y, height)
+  }
+  if (category === 'road') {
+    const alongX = width >= depth
+    item.position = { x: alongX ? cell.minX : centerX, y: alongX ? centerY : cell.minY, z: ground + .01 }
+    item.orientation = { x: 0, y: 0, z: alongX ? 0 : Math.sin(Math.PI / 4), w: alongX ? 1 : Math.cos(Math.PI / 4) }
+    item.dimensions = { x: alongX ? width : depth, y: alongX ? depth : width, z: .1 }
+    item.scale = inferredAssetScale('road', item.dimensions.x, item.dimensions.y, .1)
+  }
+  candidates.push(item)
+}
+
+function suppressInferenceCandidates(candidates, minimumDistance) {
+  const selected = []
+  for (const candidate of candidates.sort((left, right) => right.confidence - left.confidence)) {
+    const distance = minimumDistance[candidate.class_name] || 1.5
+    if (selected.every(item => item.class_name !== candidate.class_name || Math.hypot(item.position.x - candidate.position.x, item.position.y - candidate.position.y) >= distance)) selected.push(candidate)
+  }
+  return selected
+}
+
+function balanceInferenceCandidates(candidates, maxAssets) {
+  const categoryOrder = ['building', 'wall', 'tree', 'road']
+  const categoryCaps = {
+    building: Math.max(8, Math.floor(maxAssets * .2)),
+    wall: Math.max(12, Math.floor(maxAssets * .3)),
+    tree: Math.max(20, Math.floor(maxAssets * .4)),
+    road: Math.max(8, Math.floor(maxAssets * .1)),
+  }
+  const selected = []
+  const used = new Set()
+  for (const category of categoryOrder) {
+    let count = 0
+    for (const candidate of candidates) {
+      if (candidate.class_name !== category || count >= categoryCaps[category] || used.has(candidate.id)) continue
+      selected.push(candidate); used.add(candidate.id); count += 1
+    }
+  }
+  if (selected.length < maxAssets) for (const candidate of candidates) {
+    if (selected.length >= maxAssets) break
+    if (!used.has(candidate.id)) { selected.push(candidate); used.add(candidate.id) }
+  }
+  return selected.slice(0, maxAssets)
+}
+
+/**
+ * Produce deliberately conservative static scene instances from sampled PCD XYZ values.
+ * This is a lightweight preview classifier, not a replacement for a trained semantic model.
+ */
+export function inferStaticSceneAssets(positions, { cellSize = 2.5, maxAssets = 96 } = {}) {
+  const values = positions instanceof Float32Array || positions instanceof Float64Array ? positions : Array.isArray(positions) ? positions : []
+  const pointCount = Math.floor(values.length / 3)
+  if (pointCount < 12) return { assets: [], pointCount, source: 'point_cloud_heuristic', status: 'insufficient_points' }
+
+  const heights = []
+  const heightStride = Math.max(1, Math.ceil(pointCount / 20_000))
+  for (let index = 0; index < pointCount; index += heightStride) {
+    const z = Number(values[index * 3 + 2])
+    if (Number.isFinite(z)) heights.push(z)
+  }
+  if (heights.length < 12) return { assets: [], pointCount, source: 'point_cloud_heuristic', status: 'invalid_points' }
+  const ground = percentile(heights, .12)
+  const cells = new Map()
+  const keyFor = (x, y) => `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`
+  for (let index = 0; index < pointCount; index += 1) {
+    const x = Number(values[index * 3]); const y = Number(values[index * 3 + 1]); const z = Number(values[index * 3 + 2])
+    if (![x, y, z].every(Number.isFinite)) continue
+    const key = keyFor(x, y)
+    const cell = cells.get(key) || {
+      key, ix: Math.floor(x / cellSize), iy: Math.floor(y / cellSize), count: 0,
+      minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity,
+      highCount: 0, groundCount: 0,
+    }
+    cell.count += 1
+    cell.minX = Math.min(cell.minX, x); cell.maxX = Math.max(cell.maxX, x)
+    cell.minY = Math.min(cell.minY, y); cell.maxY = Math.max(cell.maxY, y)
+    cell.minZ = Math.min(cell.minZ, z); cell.maxZ = Math.max(cell.maxZ, z)
+    if (z >= ground + 1.2) cell.highCount += 1
+    if (z <= ground + .45) cell.groundCount += 1
+    cells.set(key, cell)
+  }
+
+  const candidates = []
+  for (const cell of cells.values()) {
+    if (cell.count < 8) continue
+    const width = Math.max(.2, cell.maxX - cell.minX)
+    const depth = Math.max(.2, cell.maxY - cell.minY)
+    const height = cell.maxZ - Math.max(ground, cell.minZ)
+    const highRatio = cell.highCount / cell.count
+    const groundRatio = cell.groundCount / cell.count
+    const compact = Math.max(width, depth) <= cellSize * 1.02
+    const elongated = Math.max(width, depth) / Math.max(.2, Math.min(width, depth)) >= 1.8
+    if (height >= 2.2 && highRatio >= .22 && compact && Math.min(width, depth) >= .45) {
+      cell.confidence = .52 + Math.min(.35, highRatio * .35 + Math.max(0, height - 2.2) * .025)
+      addInferenceCandidate(candidates, 'tree', cell, ground)
+    } else if (height >= 2.6 && highRatio >= .28 && cell.count >= 14) {
+      cell.confidence = .55 + Math.min(.34, highRatio * .25 + Math.max(0, height - 2.6) * .025)
+      addInferenceCandidate(candidates, 'building', cell, ground)
+    } else if (height >= .9 && highRatio >= .12 && cell.count >= 10 && (elongated || width >= 1.2 || depth >= 1.2)) {
+      cell.confidence = .42 + Math.min(.3, highRatio * .3 + Math.max(0, height - .9) * .03)
+      addInferenceCandidate(candidates, 'wall', cell, ground)
+    }
+    cell.isGround = groundRatio >= .58 && height <= .75 && cell.count >= 8
+  }
+
+  // A road is emitted only for a long, narrow, connected run of flat cells; broad ground is left untouched.
+  const visited = new Set()
+  for (const start of cells.values()) {
+    if (!start.isGround || visited.has(start.key)) continue
+    const component = []; const queue = [start]; visited.add(start.key)
+    while (queue.length) {
+      const current = queue.shift(); component.push(current)
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const next = cells.get(`${current.ix + dx}:${current.iy + dy}`)
+        if (next?.isGround && !visited.has(next.key)) { visited.add(next.key); queue.push(next) }
+      }
+    }
+    const minX = Math.min(...component.map(item => item.minX)); const maxX = Math.max(...component.map(item => item.maxX))
+    const minY = Math.min(...component.map(item => item.minY)); const maxY = Math.max(...component.map(item => item.maxY))
+    const width = maxX - minX; const depth = maxY - minY
+    const long = Math.max(width, depth); const narrow = Math.min(width, depth)
+    if (component.length < 4 || long < cellSize * 3 || long / Math.max(.5, narrow) < 1.8 || narrow > cellSize * 3) continue
+    const segments = Math.min(8, Math.max(1, Math.ceil(long / 4)))
+    for (let segment = 0; segment < segments; segment += 1) {
+      const alongX = width >= depth
+      const segmentWidth = long / segments
+      const cell = { key: `${start.key}-${segment}`, minX: alongX ? minX + segment * segmentWidth : minX, maxX: alongX ? minX + (segment + 1) * segmentWidth : maxX, minY: alongX ? minY : minY + segment * segmentWidth, maxY: alongX ? maxY : minY + (segment + 1) * segmentWidth, minZ: ground, maxZ: ground + .1, confidence: .48 }
+      addInferenceCandidate(candidates, 'road', cell, ground)
+    }
+  }
+
+  const assets = balanceInferenceCandidates(suppressInferenceCandidates(candidates, { tree: 2.2, building: 4.5, wall: 3.2, road: 3.5 }), maxAssets)
+  return { assets, pointCount, source: 'point_cloud_heuristic', status: assets.length ? 'generated' : 'no_static_structure' }
+}
+
+export function isRobotMoving(status, threshold = SCENE_DYNAMIC_SPEED_THRESHOLD_MPS) {
+  const speed = Number(status?.speed_mps)
+  return Number.isFinite(speed) && speed > threshold
+}
+
+export function mapPointToWgs84(point, geoReference) {
+  if (!geoReference?.available) return null
+  const latitude = Number(geoReference.origin_latitude)
+  const longitude = Number(geoReference.origin_longitude)
+  const offsetX = Number(geoReference.map_offset_x) || 0
+  const offsetY = Number(geoReference.map_offset_y) || 0
+  const yaw = Number(geoReference.enu_to_map_yaw) || 0
+  const x = Number(point?.x)
+  const y = Number(point?.y)
+  if (![latitude, longitude, x, y].every(Number.isFinite)) return null
+  const latitudeRad = latitude * Math.PI / 180
+  const cosine = Math.cos(yaw)
+  const sine = Math.sin(yaw)
+  const mapX = x - offsetX
+  const mapY = y - offsetY
+  const east = cosine * mapX + sine * mapY
+  const north = -sine * mapX + cosine * mapY
+  return {
+    latitude: latitude + north / EARTH_RADIUS_M * 180 / Math.PI,
+    longitude: longitude + east / (EARTH_RADIUS_M * Math.max(0.1, Math.cos(latitudeRad))) * 180 / Math.PI,
+  }
 }
 
 export function normalizeSceneAssetCatalog(value) {

@@ -73,6 +73,7 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(command.payload["alert_skill"], "avoidance")
         self.assertEqual(command.payload["audio_name"], "试播模板")
         self.assertTrue(command.payload["dual_output"])
+        self.assertTrue(command.payload["allow_single_fallback"])
         self.assertTrue(command.payload["preview"])
         synthesize_speech.assert_called_once_with("双音响试播内容")
 

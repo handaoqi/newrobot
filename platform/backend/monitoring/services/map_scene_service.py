@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from django.conf import settings
+import yaml
 
 
 SCENE_SCHEMA = "roamerx.scene-manifest.v1"
@@ -17,6 +18,8 @@ SCENE_POINT_CAP = 600_000
 SCENE_ASSET_CATALOG_SCHEMA = "roamerx.scene-assets.v1"
 SCENE_ASSET_CATALOG_URL = "/scene-assets/catalog.json"
 _PCD_NAMES = ("scene_preview.pcd", "map.pcd")
+_STATIC_ASSET_CATEGORIES = frozenset(("wall", "building", "tree", "road"))
+SCENE_SEMANTICS_SCHEMA = "roamerx.scene-semantics.v1"
 
 
 class SceneArtifactError(ValueError):
@@ -168,12 +171,22 @@ def _vector3(value, default: tuple[float, float, float]) -> dict[str, float]:
 
 def _scene_static_assets(scene: dict) -> list[dict]:
     raw_assets = scene.get("static_assets") if isinstance(scene.get("static_assets"), list) else []
+    semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
+    semantic_assets = semantics.get("schema") == SCENE_SEMANTICS_SCHEMA
+    if semantic_assets:
+        raw_assets = semantics.get("instances") if isinstance(semantics.get("instances"), list) else []
     assets = []
     for index, raw in enumerate(raw_assets):
         if not isinstance(raw, dict):
             continue
         asset_id = str(raw.get("asset_id") or raw.get("asset") or raw.get("class_name") or "").strip()
         if not asset_id:
+            continue
+        category = asset_id.lower().split(".", 1)[0]
+        if category not in _STATIC_ASSET_CATEGORIES:
+            continue
+        confidence = _finite_number(raw.get("confidence"), 1.0)
+        if (semantic_assets and confidence < 0.8) or str(raw.get("review_state") or "generated") == "rejected":
             continue
         item = dict(raw)
         item.setdefault("id", f"static-{index}")
@@ -195,6 +208,52 @@ def _scene_static_assets(scene: dict) -> list[dict]:
             item["scale"] = _vector3(scale, (1.0, 1.0, 1.0)) if isinstance(scale, (dict, list, tuple)) else scale
         assets.append(item)
     return assets
+
+
+def _scene_geo_reference(description: dict) -> dict:
+    unavailable = {
+        "available": False,
+        "reason": "gnss_origin_unavailable",
+    }
+    raw_origin = description.get("gnss_origin_yaml") if isinstance(description, dict) else ""
+    if not raw_origin:
+        return unavailable
+    try:
+        origin = yaml.safe_load(raw_origin)
+    except yaml.YAMLError:
+        return unavailable
+    if not isinstance(origin, dict):
+        return unavailable
+    locked = origin.get("alignment_locked")
+    if locked not in (True, 1, "1", "true", "True") and str(origin.get("rtk_enabled") or "").lower() != "true":
+        return unavailable
+    try:
+        latitude = float(origin.get("origin_latitude"))
+        longitude = float(origin.get("origin_longitude"))
+    except (TypeError, ValueError):
+        return unavailable
+    if not math.isfinite(latitude) or not math.isfinite(longitude) or abs(latitude) < 1e-7 or abs(longitude) < 1e-7:
+        return unavailable
+
+    def finite(value, default=0.0):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if math.isfinite(parsed) else default
+
+    return {
+        "available": True,
+        "datum": str(origin.get("datum") or "WGS84"),
+        "origin_latitude": latitude,
+        "origin_longitude": longitude,
+        "origin_altitude": finite(origin.get("origin_altitude"), 0.0),
+        "map_offset_x": finite(origin.get("map_offset_x")),
+        "map_offset_y": finite(origin.get("map_offset_y")),
+        "map_offset_z": finite(origin.get("map_offset_z")),
+        "enu_to_map_yaw": finite(origin.get("enu_to_map_yaw")),
+        "reason": None,
+    }
 
 
 def scene_cloud_path(map_data, *, max_points: int = SCENE_POINT_CAP) -> tuple[Path, str, int]:
@@ -273,6 +332,8 @@ def build_scene_manifest(map_data) -> dict:
             "safety_margin_m": boundary_record.safety_margin_m,
         }
     asset_catalog_url = str(scene.get("asset_catalog_url") or SCENE_ASSET_CATALOG_URL)
+    semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
+    semantic_status = str(semantics.get("status") or ("ready" if _scene_static_assets(scene) else "unavailable"))
     return {
         "schema": SCENE_SCHEMA,
         "map_id": map_data.pk,
@@ -295,6 +356,15 @@ def build_scene_manifest(map_data) -> dict:
         },
         "asset_catalog_url": asset_catalog_url,
         "static_assets": _scene_static_assets(scene),
+        "semantic_build": {
+            "schema": str(semantics.get("schema") or SCENE_SEMANTICS_SCHEMA),
+            "status": semantic_status,
+            "model_version": str(semantics.get("model_version") or ""),
+            "revision": str(semantics.get("revision") or ""),
+            "map_sha256": str(semantics.get("map_sha256") or ""),
+            "message": str(semantics.get("message") or ""),
+        },
+        "geo_reference": _scene_geo_reference(description),
         "boundary": boundary,
         "package_checksum": str(description.get("package_sha256") or ""),
     }
