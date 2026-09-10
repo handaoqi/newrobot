@@ -2,6 +2,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from roamerx_edge.app import EdgeAgentApplication
+from roamerx_edge.local_store import LocalStore
+from roamerx_edge.task_executor import TaskExecutor
 
 
 def _application():
@@ -66,3 +68,29 @@ def test_heartbeat_repeats_task_state_sync():
 
     app.mqtt.publish_presence.assert_called_once()
     app._publish_sync_request.assert_called_once()
+
+
+def test_restart_preserves_an_already_stopped_paused_task(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    store.save_task_context({
+        "task_execution_id": "execution-paused",
+        "state": "paused",
+        "state_version": 11,
+        "route_snapshot": {"waypoints": [{"x": 1.0, "y": 2.0}]},
+        "current_waypoint_index": 0,
+        "start_command_id": "command-1",
+    })
+    results = []
+
+    executor = TaskExecutor(
+        store,
+        SimpleNamespace(),
+        event_callback=lambda *_args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.report_startup_interruption()
+
+    assert executor.context.state == "paused"
+    assert executor.context.state_version == 11
+    assert results == []
+    store.close()

@@ -374,7 +374,7 @@ class TaskExecutor:
         self._arrival_retry_counts: dict[int, int] = {}
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
-        if self.context:
+        if self.context and self.context.state != "paused":
             self.context.state = "interrupted"
             self.context.state_version += 1
             self._persist()
