@@ -9,9 +9,10 @@ User=dogrobot
 Group=robot
 WorkingDirectory=/home/dogrobot/platform/bot-version-test
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONPATH=/home/dogrobot/platform/bot-version-test/src
 Environment=BIKE_BOT_DEVICE_ID=ZSL-1A-07
-ExecStart=/usr/bin/python3 /home/dogrobot/platform/bot-version-test/run_edge.py --config /home/dogrobot/runtime/nx-edge/conf/bike-bot.yaml
+ExecStart=/home/dogrobot/runtime/nx-edge/data/vision/venv/bin/python /home/dogrobot/platform/bot-version-test/run_edge.py --config /home/dogrobot/runtime/nx-edge/conf/bike-bot.yaml
 Restart=always
 RestartSec=5
 IOSchedulingPriority=7

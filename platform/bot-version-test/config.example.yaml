@@ -20,6 +20,12 @@ video:
   open_timeout_seconds: 8
   read_timeout_seconds: 8
   reconnect_interval_seconds: 3
+  # auto prefers Jetson nvv4l2decoder for RTSP, then falls back to FFmpeg.
+  capture_backend: auto
+  rtsp_codec: h264
+  rtsp_latency_ms: 150
+  # A value of 3 outputs every third decoded frame (about 10 FPS for 30 FPS input).
+  hardware_decode_drop_frame_interval: 3
 
 stream:
   enable: true

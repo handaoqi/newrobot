@@ -32,6 +32,10 @@ class VideoConfig:
     open_timeout_seconds: int = 8
     read_timeout_seconds: int = 8
     reconnect_interval_seconds: int = 3
+    capture_backend: str = "auto"
+    rtsp_codec: str = "h264"
+    rtsp_latency_ms: int = 150
+    hardware_decode_drop_frame_interval: int = 3
 
 
 @dataclass

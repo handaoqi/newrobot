@@ -1,5 +1,14 @@
 # edge-agent 与视觉推理 CPU 性能优化计划
 
+## 2026-09-10 视觉链路执行结果
+
+- 视觉服务已切换到独立环境 `/home/dogrobot/runtime/nx-edge/data/vision/venv`，避免用户目录中的 CPU 版 ONNX Runtime 覆盖 Jetson GPU 版。
+- 实际 Provider 为 `TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider`；预热后 `session_run` 约 11–12 ms。
+- RTSP 使用 GStreamer `nvv4l2decoder` 硬件解码，失败时自动回退 OpenCV FFmpeg。
+- 常规采样和检测稳定为 2.00 Hz；人员跟随保持 5 Hz；告警确认 3 帧、冷却 10 秒。
+- 同机实测：视觉 Python 进程由 78.51% CPU 降至 20.40%（60 秒窗口）；包含视频直推 FFmpeg 后约 21.85%，达到不高于 35% 的目标。
+- CPU-only 回退仍可运行，但会写入 `CRITICAL vision_provider_degraded` 并将运行状态持续保持为 `warning`。
+
 更新时间：2026-09-06
 
 ## 1. 目标与范围

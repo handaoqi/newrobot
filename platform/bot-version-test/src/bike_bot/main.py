@@ -248,6 +248,7 @@ class LatestFrameCapture:
         reader_failures = 0
         reader_read_seconds = 0.0
         reader_max_read_seconds = 0.0
+        scheduled_sample_rate_hz = 0.0
 
         try:
             while not self.stop_event.is_set() and not self._reader_stop_event.is_set():
@@ -268,7 +269,15 @@ class LatestFrameCapture:
                         self.stop_event.wait(self.detector.config.video.reconnect_interval_seconds)
                         continue
 
-                    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                    capture_backend = ""
+                    try:
+                        capture_backend = capture.getBackendName().upper()
+                    except cv2.error:
+                        pass
+                    # OpenCV 4.5 on Jetson tears down a running GStreamer
+                    # pipeline when CAP_PROP_BUFFERSIZE is set.  The appsink
+                    # already enforces a one-frame latest-frame buffer.
+                    if hasattr(cv2, "CAP_PROP_BUFFERSIZE") and capture_backend != "GSTREAMER":
                         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
                     capture_width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
@@ -279,7 +288,7 @@ class LatestFrameCapture:
                     LOGGER.info(
                         "edge_perf video_source_opened source=%s capture_fps=%.2f capture_width=%.0f "
                         "capture_height=%.0f configured_width=%d configured_height=%d rtsp_transport=%s "
-                        "latest_frame_mode=true",
+                        "capture_backend=%s latest_frame_mode=true",
                         self.detector.config.video.source,
                         source_fps,
                         capture_width,
@@ -287,6 +296,7 @@ class LatestFrameCapture:
                         self.detector.config.video.width,
                         self.detector.config.video.height,
                         self.detector.config.video.rtsp_transport,
+                        capture_backend or "unknown",
                     )
                     reader_started_at = time.perf_counter()
                     next_sample_at = 0.0
@@ -295,6 +305,7 @@ class LatestFrameCapture:
                     reader_failures = 0
                     reader_read_seconds = 0.0
                     reader_max_read_seconds = 0.0
+                    scheduled_sample_rate_hz = 0.0
 
                 read_started_at = time.perf_counter()
                 ok = capture.grab()
@@ -319,6 +330,9 @@ class LatestFrameCapture:
                 reader_max_read_seconds = max(reader_max_read_seconds, read_seconds)
                 with self._condition:
                     sample_rate_hz = self._sample_rate_hz
+                if sample_rate_hz != scheduled_sample_rate_hz:
+                    next_sample_at = 0.0
+                    scheduled_sample_rate_hz = sample_rate_hz
                 if sample_rate_hz > 0.0 and read_at < next_sample_at:
                     continue
                 retrieve_started_at = time.perf_counter()
@@ -334,7 +348,17 @@ class LatestFrameCapture:
                 reader_frames += 1
                 reader_read_seconds += retrieve_seconds
                 reader_max_read_seconds = max(reader_max_read_seconds, read_seconds + retrieve_seconds)
-                next_sample_at = read_at + (1.0 / sample_rate_hz if sample_rate_hz > 0.0 else 0.0)
+                if sample_rate_hz > 0.0:
+                    sample_interval = 1.0 / sample_rate_hz
+                    if next_sample_at <= 0.0:
+                        next_sample_at = read_at + sample_interval
+                    else:
+                        next_sample_at += sample_interval
+                        if next_sample_at <= read_at:
+                            skipped = int((read_at - next_sample_at) // sample_interval) + 1
+                            next_sample_at += skipped * sample_interval
+                else:
+                    next_sample_at = read_at
                 with self._condition:
                     self._frame_id = source_frame_id
                     self._frame = frame
@@ -689,6 +713,14 @@ def main() -> None:
     except Exception:
         LOGGER.exception("model load failed, detection disabled")
         detector = None
+        runtime_state.set_degraded("vision_model_unavailable")
+    else:
+        if not detector.gpu_inference_active:
+            runtime_state.set_degraded("vision_cpu_fallback")
+            LOGGER.critical(
+                "vision runtime degraded: CPU fallback active providers=%s; detection remains rate limited",
+                detector.inference_providers,
+            )
     person_detector = None
     if config.person_model is not None:
         try:

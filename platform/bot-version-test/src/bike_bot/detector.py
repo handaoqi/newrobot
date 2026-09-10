@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 
 from .alert_policy import BicycleAlertPolicy
-from .config import AppConfig, ModelConfig
+from .config import AppConfig, ModelConfig, VideoConfig
 from .models import BoundingBox, DetectionPayload, now_iso
 from .tracking import IoUTracker, TrackedObject, TrackingDetection
 
@@ -21,6 +21,30 @@ LOGGER = logging.getLogger(__name__)
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 TENSORRT_PROVIDER = "TensorrtExecutionProvider"
+
+
+def _gstreamer_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_gstreamer_rtsp_pipeline(config: VideoConfig) -> str:
+    codec = str(config.rtsp_codec).strip().lower()
+    if codec not in {"h264", "h265", "hevc"}:
+        raise ValueError(f"unsupported RTSP codec for hardware decoding: {config.rtsp_codec}")
+    is_h265 = codec in {"h265", "hevc"}
+    depay = "rtph265depay" if is_h265 else "rtph264depay"
+    parser = "h265parse" if is_h265 else "h264parse"
+    transport = "tcp" if str(config.rtsp_transport).lower() == "tcp" else "udp"
+    drop_interval = min(30, max(0, int(config.hardware_decode_drop_frame_interval)))
+    return (
+        f'rtspsrc location="{_gstreamer_escape(str(config.source))}" '
+        f"protocols={transport} latency={max(0, int(config.rtsp_latency_ms))} drop-on-latency=true ! "
+        f"{depay} ! {parser} ! nvv4l2decoder enable-max-performance=true "
+        f"drop-frame-interval={drop_interval} ! nvvidconv ! "
+        f"video/x-raw,format=BGRx,width={int(config.width)},height={int(config.height)} ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
 
 
 def letterbox(frame, image_size: int) -> tuple[Any, float, int, int]:
@@ -264,6 +288,9 @@ class YoloDetector:
         self.model_backend = self._resolve_backend(self.model_config.backend, self.model_config.path)
         self.last_timing = InferenceTiming()
         self._onnx_providers_label = ""
+        self.inference_providers: list[str] = []
+        self.onnxruntime_path = ""
+        self.onnxruntime_version = ""
         self.model = self._load_model()
         self.snapshot_manager = SnapshotManager(
             config.snapshot.directory,
@@ -306,6 +333,9 @@ class YoloDetector:
         if self.model_backend == "onnxruntime":
             import onnxruntime as ort
 
+            self.onnxruntime_path = str(Path(ort.__file__).resolve())
+            self.onnxruntime_version = str(ort.__version__)
+
             session_options = ort.SessionOptions()
             session_options.intra_op_num_threads = 2
             session_options.inter_op_num_threads = 1
@@ -326,7 +356,8 @@ class YoloDetector:
                     providers,
                 )
                 session = self._onnxruntime_session_with_fallback(ort, session_options)
-            self._onnx_providers_label = ",".join(session.get_providers())
+            self.inference_providers = list(session.get_providers())
+            self._onnx_providers_label = ",".join(self.inference_providers)
             if (
                 self.model_config.tensorrt_enabled
                 and TENSORRT_PROVIDER not in session.get_providers()
@@ -336,12 +367,23 @@ class YoloDetector:
                     session.get_providers(),
                 )
             LOGGER.info(
-                "loaded ONNX model with onnxruntime: %s providers=%s tensorrt_enabled=%s cache=%s",
+                "loaded ONNX model with onnxruntime: %s ort_version=%s ort_path=%s providers=%s "
+                "tensorrt_enabled=%s cache=%s",
                 self.model_config.path,
-                session.get_providers(),
+                self.onnxruntime_version,
+                self.onnxruntime_path,
+                self.inference_providers,
                 self.model_config.tensorrt_enabled,
                 self.model_config.tensorrt_engine_cache_path,
             )
+            if not self.gpu_inference_active:
+                LOGGER.critical(
+                    "vision_provider_degraded reason=gpu_provider_unavailable providers=%s "
+                    "ort_version=%s ort_path=%s",
+                    self.inference_providers,
+                    self.onnxruntime_version,
+                    self.onnxruntime_path,
+                )
             return session
 
         if self.model_backend == "ultralytics":
@@ -409,9 +451,48 @@ class YoloDetector:
             providers=self._cuda_cpu_providers(ort),
         )
 
+    @property
+    def gpu_inference_active(self) -> bool:
+        return any(
+            provider in {TENSORRT_PROVIDER, CUDA_PROVIDER}
+            for provider in self.inference_providers
+        )
+
+    def _open_gstreamer_capture(self) -> cv2.VideoCapture | None:
+        try:
+            pipeline = build_gstreamer_rtsp_pipeline(self.config.video)
+        except ValueError as exc:
+            LOGGER.error("hardware RTSP pipeline is unavailable: %s", exc)
+            return None
+        LOGGER.info(
+            "opening RTSP with NVIDIA hardware decoding codec=%s latency_ms=%d "
+            "drop_frame_interval=%d",
+            self.config.video.rtsp_codec,
+            self.config.video.rtsp_latency_ms,
+            self.config.video.hardware_decode_drop_frame_interval,
+        )
+        capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if capture.isOpened():
+            LOGGER.info("RTSP capture backend active: gstreamer-nvv4l2decoder")
+            return capture
+        capture.release()
+        LOGGER.error("NVIDIA hardware RTSP capture failed; falling back to OpenCV FFmpeg")
+        return None
+
     def open_capture(self) -> cv2.VideoCapture:
         source = self.config.video.source
         if isinstance(source, str) and source.startswith("rtsp://"):
+            capture_backend = str(self.config.video.capture_backend).strip().lower()
+            if capture_backend not in {"auto", "gstreamer", "ffmpeg"}:
+                LOGGER.error(
+                    "unknown capture backend=%s; using auto",
+                    self.config.video.capture_backend,
+                )
+                capture_backend = "auto"
+            if capture_backend in {"auto", "gstreamer"}:
+                capture = self._open_gstreamer_capture()
+                if capture is not None:
+                    return capture
             transport = self.config.video.rtsp_transport
             open_timeout_us = self.config.video.open_timeout_seconds * 1_000_000
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (

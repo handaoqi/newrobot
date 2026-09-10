@@ -18,3 +18,21 @@ def test_limiter_uses_start_to_start_deadline_without_catchup() -> None:
     assert limiter.delay_seconds(10.5) == 0.0
     limiter.mark_started(12.0, 5.0)
     assert round(limiter.delay_seconds(12.1), 6) == 0.1
+
+
+def test_limiter_preserves_period_after_small_input_delay() -> None:
+    limiter = InferenceRateLimiter()
+    limiter.mark_started(10.0, 2.0)
+
+    limiter.mark_started(10.6, 2.0)
+
+    assert round(limiter.delay_seconds(10.6), 6) == 0.4
+
+
+def test_limiter_skips_missed_slots_without_bursting() -> None:
+    limiter = InferenceRateLimiter()
+    limiter.mark_started(10.0, 2.0)
+
+    limiter.mark_started(12.2, 2.0)
+
+    assert round(limiter.delay_seconds(12.2), 6) == 0.3

@@ -34,6 +34,22 @@ class RuntimeState:
             network_type=config.runtime.network_type,
         )
         self._runtime = RuntimeInfo(mode=config.runtime.mode, status=config.runtime.status)
+        self._requested_runtime_status = config.runtime.status
+        self._degraded_reasons: set[str] = set()
+
+    def _apply_runtime_status(self) -> None:
+        if self._degraded_reasons and self._requested_runtime_status == "online":
+            self._runtime.status = "warning"
+        else:
+            self._runtime.status = self._requested_runtime_status
+
+    def set_degraded(self, reason: str, active: bool = True) -> None:
+        with self._lock:
+            if active:
+                self._degraded_reasons.add(reason)
+            else:
+                self._degraded_reasons.discard(reason)
+            self._apply_runtime_status()
 
     def snapshot(self) -> RuntimeSnapshot:
         with self._lock:
@@ -71,6 +87,7 @@ class RuntimeState:
             if network_type is not None:
                 self._network.network_type = network_type
             if runtime_status is not None:
-                self._runtime.status = runtime_status
+                self._requested_runtime_status = runtime_status
+                self._apply_runtime_status()
             if runtime_mode is not None:
                 self._runtime.mode = runtime_mode

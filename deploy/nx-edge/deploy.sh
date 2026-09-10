@@ -76,6 +76,8 @@ fi
 if "$BUILD"; then remote_exec "cd '$ROBOT_PROJECT_DIR' && ./build.sh all"; fi
 
 if "$INSTALL_SERVICE"; then
+  rsync -a "$REPO_ROOT/platform/deploy/install_jetson_onnxruntime.sh" "$(target_path /tmp/roamerx-install-vision-runtime.sh)"
+  remote_exec "chmod 0755 /tmp/roamerx-install-vision-runtime.sh && /tmp/roamerx-install-vision-runtime.sh"
   systemd_sources=(
     edge-agent/systemd/roamerx-edge-agent.service
     edge-agent/systemd/roamerx-teleop-bridge.service
