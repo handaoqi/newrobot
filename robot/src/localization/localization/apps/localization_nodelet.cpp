@@ -4322,11 +4322,18 @@ private:
       last_confidence_update_time_ = points_msg->header.stamp;
     }
     publishLocalizationDecision(rclcpp::Time(stamp));
-    publish_odometry(
-      points_msg->header.stamp,
-      (absolute_pose_valid || bridge_pose_valid)
-        ? pose_estimator->matrix()
-        : (has_valid_pose_history_ ? last_pose_ : pose_estimator->matrix()));
+    // In FAST-LIO-primary mode the timer is the sole continuous output path:
+    // map_T_base(t) = map_T_lio(anchor) * lio_T_base(t).  Publishing the NDT
+    // estimator here as well would interleave a second pose stream on the same
+    // topic and reintroduce jumps at scan-matching frequency.  Legacy mode
+    // retains the callback-driven publication behavior.
+    if (!enable_lio_primary_) {
+      publish_odometry(
+        points_msg->header.stamp,
+        (absolute_pose_valid || bridge_pose_valid)
+          ? pose_estimator->matrix()
+          : (has_valid_pose_history_ ? last_pose_ : pose_estimator->matrix()));
+    }
     syncLidarOdometryImuAnchor();
     perf.stage_ms[kOutput] = std::chrono::duration<double, std::milli>(
       SteadyClock::now() - output_start).count();
