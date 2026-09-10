@@ -26,6 +26,13 @@ test('maps a reason code and hides pause copy while running', () => {
   assert.equal(guardDutyPauseReason({ state: 'running', failure_message: 'stale reason' }), '')
 })
 
+test('maps arrival pose convergence safe hold', () => {
+  assert.equal(guardDutyPauseReason({
+    state: 'paused',
+    failure_code: 'ARRIVAL_POSE_CONVERGENCE_FAILED',
+  }), '航点位置与最终航向无法同时安全收敛，设备已停车')
+})
+
 test('shows a localized rejection reason from the execution', () => {
   assert.deepEqual(guardDutyExecutionReason({
     state: 'rejected',

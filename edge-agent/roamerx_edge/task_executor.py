@@ -108,6 +108,9 @@ ARRIVAL_ACCEPT_RTK_M = 1.5
 REVERSE_SKIP_LIO_RTK_DRIFT_M = 0.50
 # How many times to re-dispatch the same waypoint after a rejected arrival.
 WAYPOINT_ARRIVAL_RETRY_MAX = 2
+ARRIVAL_CONVERGENCE_MAX_ATTEMPTS = 2
+ARRIVAL_ADJUST_PERIOD_SECONDS = 0.10
+ARRIVAL_ADJUST_STABLE_SAMPLES = 3
 # How long ABSOLUTE_LOCALIZATION_REQUIRED may wait before giving up the watch.
 ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS = 120.0
 # Patrol redispatches after a rejected FollowWaypoints goal. Keep this short —
@@ -246,6 +249,17 @@ class NavigationAdapter(Protocol):
         local_controller: str = "mppi",
     ) -> None: ...
     def set_global_controller(self, mode: str) -> None: ...
+    def arrival_adjust_velocity(
+        self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0
+    ) -> dict: ...
+    def directional_clearance(
+        self,
+        vx: float,
+        vy: float,
+        travel_distance_m: float,
+        *,
+        max_scan_age_seconds: float = 0.5,
+    ) -> dict: ...
 
 
 @dataclass
@@ -278,6 +292,11 @@ class TaskExecutor:
         final_waypoint_tolerance_m: float = 0.45,
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
+        arrival_adjust_max_distance_m: float = 0.50,
+        arrival_adjust_speed_mps: float = 0.08,
+        arrival_adjust_yaw_rate_rps: float = 0.10,
+        arrival_adjust_timeout_seconds: float = 8.0,
+        arrival_adjust_scan_max_age_seconds: float = 0.50,
         standup_confirmation_timeout_seconds: float = 12.0,
         navigation_dispatch_retry_seconds: float = NAV_DISPATCH_RETRY_DEFAULT_SECONDS,
         navigation_dispatch_retry_budget_seconds: float = 300.0,
@@ -295,6 +314,13 @@ class TaskExecutor:
         self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
         self.docking_goal_tolerance_m = docking_goal_tolerance_m
         self.docking_goal_yaw_tolerance_rad = docking_goal_yaw_tolerance_rad
+        self.arrival_adjust_max_distance_m = max(0.0, float(arrival_adjust_max_distance_m))
+        self.arrival_adjust_speed_mps = max(0.01, float(arrival_adjust_speed_mps))
+        self.arrival_adjust_yaw_rate_rps = max(0.01, float(arrival_adjust_yaw_rate_rps))
+        self.arrival_adjust_timeout_seconds = max(0.5, float(arrival_adjust_timeout_seconds))
+        self.arrival_adjust_scan_max_age_seconds = max(
+            0.05, float(arrival_adjust_scan_max_age_seconds)
+        )
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
         self.navigation_dispatch_retry_seconds = max(0.5, float(navigation_dispatch_retry_seconds))
         self.navigation_dispatch_retry_budget_seconds = max(
@@ -318,6 +344,11 @@ class TaskExecutor:
         # translate while executing a nominally pure-yaw command.  It must not
         # suppress the following-leg turn.
         self._arrival_heading_completed_index: int | None = None
+        self._arrival_correction_completed_index: int | None = None
+        self._arrival_convergence_attempts: dict[int, int] = {}
+        self._arrival_adjustment_index: int | None = None
+        self._arrival_adjustment_stop = threading.Event()
+        self._arrival_adjustment_thread: threading.Thread | None = None
         # When set, a successful in-place turn should cruise to this waypoint
         # instead of running the post-arrival absolute-localization path.
         self._departure_cruise_index: int | None = None
@@ -400,6 +431,7 @@ class TaskExecutor:
     def _emit_safe_hold(self, code: str, message: str) -> None:
         if not self.context:
             return
+        self._cancel_arrival_adjustment()
         self.navigation.stop_motion()
         self._restore_navigation_profile()
         if self.context.state not in self.TERMINAL_STATES | {"paused"}:
@@ -448,6 +480,7 @@ class TaskExecutor:
     def stop(self) -> None:
         dwell_thread = self._dwell_wait_thread
         self._cancel_waypoint_localization_correction()
+        self._cancel_arrival_adjustment(reset_state=True)
         self._cancel_waypoint_dwell()
         self._stop_obstacle_monitor()
         self._stop_task_rosbag()
@@ -1096,6 +1129,10 @@ class TaskExecutor:
 
             # Drop any in-flight pre-leg spin so a late Nav2 success cannot
             # cruise to a stale index after recovery redispatches.
+            self._cancel_arrival_adjustment(reset_state=True)
+            self._arrival_convergence_attempts.pop(
+                self.context.current_waypoint_index, None
+            )
             self._clear_departure_heading(cancel_navigation=False)
             self._paused_for_localization = True
             self._paused_localization_reason = "lost"
@@ -1153,7 +1190,7 @@ class TaskExecutor:
                 message="localization is stable; resuming from the pending waypoint",
             )
             waiting_index = self._waiting_waypoint_index()
-            if waiting_index is not None:
+            if waiting_index is not None and pause_reason != "absolute_required":
                 reached_index = waiting_index
                 self._waypoint_localization_ready_index = reached_index
                 self.context.state = "running"
@@ -1174,12 +1211,20 @@ class TaskExecutor:
                 self._emit("task.resumed")
                 points = self.context.route_snapshot.get("waypoints") or []
                 waypoint = points[resume_index] if resume_index < len(points) else None
-                if waypoint and self._arrival_within_tolerance(waypoint, resume_index):
+                if waypoint and self._arrival_xy_within_policy_tolerance(
+                    waypoint, resume_index
+                ):
                     LOGGER.info(
-                        "absolute localization pause cleared at waypoint %s; continuing to next leg",
+                        "absolute localization pause cleared at waypoint %s; continuing arrival convergence",
                         resume_index,
                     )
-                    self._continue_after_waypoint(resume_index)
+                    self._arrival_correction_completed_index = resume_index
+                    self._correction_completed_at_mono = time.monotonic()
+                    self._goal_offset = resume_index
+                    self._dispatched_count = 1
+                    self.on_navigation_result(
+                        "succeeded", generation=self._nav_goal_generation
+                    )
                     return
                 LOGGER.info(
                     "absolute localization pause cleared at waypoint %s but "
@@ -1344,6 +1389,10 @@ class TaskExecutor:
             self._dwell_wait_finished = False
             self._waypoint_localization_ready_index = None
             self._arrival_retry_counts = {}
+            self._arrival_correction_completed_index = None
+            self._arrival_heading_completed_index = None
+            self._arrival_convergence_attempts = {}
+            self._cancel_arrival_adjustment()
             self._emitted_event_keys.clear()
             self._action_registry.reset()
             self._recovery_arbiter.reset_budget()
@@ -1854,9 +1903,17 @@ class TaskExecutor:
                     mode,
                 )
                 self._clear_departure_heading(cancel_navigation=True)
-                self._fail(
-                    "ARRIVAL_HEADING_TIMEOUT",
-                    "waypoint position reached but final heading did not align in time",
+                attempts = int(
+                    self._arrival_convergence_attempts.get(int(reached_index or 0), 0)
+                )
+                if reached_index is not None and attempts < ARRIVAL_CONVERGENCE_MAX_ATTEMPTS:
+                    self.on_navigation_result(
+                        "succeeded", generation=self._nav_goal_generation
+                    )
+                    return
+                self._emit_safe_hold(
+                    "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                    "最终航向两次调整仍未完成，机器人保持停车",
                 )
                 return
             LOGGER.error(
@@ -2964,32 +3021,9 @@ class TaskExecutor:
             decision = self._localization_decision()
             pose = self.navigation.latest_pose()
             fresh = self._localization_sample_fresh(decision)
-            valid = pose is not None
-            if valid and policy in {"precision", "dock"}:
-                try:
-                    click = _waypoint_xy(waypoint)
-                    distance = hypot(float(pose.x) - click[0], float(pose.y) - click[1]) if click else float("inf")
-                    tolerance = (
-                        self.docking_goal_tolerance_m
-                        if policy == "dock" and self._is_docking_task()
-                        else PRECISION_ARRIVAL_TOLERANCE_M
-                    )
-                    valid = distance <= tolerance
-                    if valid and (policy == "precision" or self._is_docking_task()):
-                        yaw_error = abs(
-                            atan2(
-                                sin(float(pose.yaw) - float(waypoint.get("yaw") or 0.0)),
-                                cos(float(pose.yaw) - float(waypoint.get("yaw") or 0.0)),
-                            )
-                        )
-                        yaw_tolerance = (
-                            self.docking_goal_yaw_tolerance_rad
-                            if policy == "dock" and self._is_docking_task()
-                            else PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
-                        )
-                        valid = yaw_error <= yaw_tolerance
-                except (AttributeError, KeyError, TypeError, ValueError):
-                    valid = False
+            valid = pose is not None and self._arrival_pose_within_combined_tolerance(
+                waypoint, reached_index
+            )
             if fresh and valid:
                 stable += 1
                 if stable >= required:
@@ -3004,6 +3038,231 @@ class TaskExecutor:
             required,
         )
         return False
+
+    def _arrival_pose_tolerances(
+        self, waypoint: dict, reached_index: int
+    ) -> tuple[float, float | None]:
+        policy = self._arrival_policy(waypoint, reached_index)
+        if self._is_docking_task() and policy != "dock":
+            # Staging points in a docking task are owned by the dedicated
+            # docking sequence; only its final dock point gets the tight gate.
+            return float("inf"), None
+        if policy == "dock" and self._is_docking_task():
+            return self.docking_goal_tolerance_m, self.docking_goal_yaw_tolerance_rad
+        if policy == "precision":
+            return PRECISION_ARRIVAL_TOLERANCE_M, PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
+        yaw_tolerance = (
+            ARRIVAL_HEADING_ALIGN_RAD if bool(waypoint.get("require_yaw", False)) else None
+        )
+        return self.final_waypoint_tolerance_m, yaw_tolerance
+
+    def _arrival_pose_errors(
+        self, waypoint: dict, reached_index: int
+    ) -> tuple[float | None, float | None]:
+        pose = self.navigation.latest_pose() if self.navigation else None
+        click = _waypoint_xy(waypoint)
+        if pose is None or click is None:
+            return None, None
+        try:
+            distance = hypot(float(pose.x) - click[0], float(pose.y) - click[1])
+        except (AttributeError, TypeError, ValueError):
+            return None, None
+        _, yaw_tolerance = self._arrival_pose_tolerances(waypoint, reached_index)
+        if yaw_tolerance is None:
+            return distance, None
+        try:
+            yaw_error = abs(
+                self._heading_error_rad(
+                    float(waypoint.get("yaw") or 0.0),
+                    float(getattr(pose, "yaw", 0.0) or 0.0),
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            yaw_error = None
+        return distance, yaw_error
+
+    def _arrival_pose_within_combined_tolerance(
+        self, waypoint: dict, reached_index: int
+    ) -> bool:
+        distance, yaw_error = self._arrival_pose_errors(waypoint, reached_index)
+        xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
+            waypoint, reached_index
+        )
+        if distance is None or distance > xy_tolerance:
+            return False
+        if yaw_tolerance is not None and (yaw_error is None or yaw_error > yaw_tolerance):
+            return False
+        return self._arrival_within_tolerance(waypoint, reached_index)
+
+    def _arrival_xy_within_policy_tolerance(
+        self, waypoint: dict, reached_index: int
+    ) -> bool:
+        distance, _ = self._arrival_pose_errors(waypoint, reached_index)
+        xy_tolerance, _ = self._arrival_pose_tolerances(waypoint, reached_index)
+        return bool(
+            distance is not None
+            and distance <= xy_tolerance
+            and self._arrival_within_tolerance(waypoint, reached_index)
+        )
+
+    def _emit_arrival_stage(
+        self, reached_index: int, stage: str, message: str
+    ) -> None:
+        self._emit_idempotent(
+            "task.recovery_active",
+            event_type_key=f"arrival_{stage}",
+            waypoint_id=str(reached_index),
+            code="ARRIVAL_POSE_CONVERGENCE",
+            message=message,
+            extra={"arrival_stage": stage},
+        )
+
+    def _cancel_arrival_adjustment(self, *, reset_state: bool = False) -> None:
+        self._arrival_adjustment_stop.set()
+        velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
+        if callable(velocity):
+            try:
+                velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+            except Exception:
+                LOGGER.warning("failed to stop arrival fine adjustment", exc_info=True)
+        self._arrival_adjustment_index = None
+        self._arrival_adjustment_thread = None
+        if reset_state:
+            self._arrival_correction_completed_index = None
+            self._arrival_heading_completed_index = None
+
+    def _start_arrival_adjustment(self, waypoint: dict, reached_index: int) -> bool:
+        policy = self._arrival_policy(waypoint, reached_index)
+        if policy == "dock" and self._is_docking_task():
+            return False
+        distance, _ = self._arrival_pose_errors(waypoint, reached_index)
+        if distance is None or distance > self.arrival_adjust_max_distance_m:
+            return False
+        velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
+        clearance = getattr(self.navigation, "directional_clearance", None)
+        if not callable(velocity) or not callable(clearance):
+            return False
+        if self._arrival_adjustment_thread and self._arrival_adjustment_thread.is_alive():
+            return self._arrival_adjustment_index == reached_index
+        self._arrival_adjustment_stop = threading.Event()
+        self._arrival_adjustment_index = reached_index
+        self._emit_arrival_stage(
+            reached_index,
+            "heading_preserving_adjustment",
+            "最终航向后位置轻微偏移，正在保持目标航向微调",
+        )
+        thread = threading.Thread(
+            target=self._arrival_adjustment_worker,
+            args=(dict(waypoint), reached_index, self._nav_goal_generation),
+            daemon=True,
+            name="arrival-heading-preserving-adjustment",
+        )
+        self._arrival_adjustment_thread = thread
+        thread.start()
+        return True
+
+    def _arrival_adjustment_worker(
+        self, waypoint: dict, reached_index: int, generation: int
+    ) -> None:
+        velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
+        clearance = getattr(self.navigation, "directional_clearance", None)
+        stop_event = self._arrival_adjustment_stop
+        deadline = time.monotonic() + self.arrival_adjust_timeout_seconds
+        stable = 0
+        failure_message = ""
+        succeeded = False
+        try:
+            while not stop_event.is_set() and time.monotonic() <= deadline:
+                with self._lock:
+                    if (
+                        not self.context
+                        or self.context.state != "running"
+                        or self.context.current_waypoint_index != reached_index
+                        or self._arrival_adjustment_index != reached_index
+                    ):
+                        failure_message = "任务状态已变化，终止到点微调"
+                        break
+                    decision = self._localization_decision()
+                    if (
+                        not self._localization_sample_fresh(decision)
+                        or bool(decision.get("lio_motion_anomaly"))
+                        or bool(decision.get("correction_smoothing_active"))
+                    ):
+                        failure_message = "定位数据不新鲜或定位校正未稳定"
+                        break
+                    pose = self.navigation.latest_pose()
+                    if pose is None:
+                        failure_message = "无法读取机器人位姿"
+                        break
+                    try:
+                        dx = float(waypoint["x"]) - float(pose.x)
+                        dy = float(waypoint["y"]) - float(pose.y)
+                        yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
+                        target_yaw = float(waypoint.get("yaw") or 0.0)
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        failure_message = "航点或机器人位姿无效"
+                        break
+                    distance = hypot(dx, dy)
+                    yaw_error = self._heading_error_rad(target_yaw, yaw)
+                    xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
+                        waypoint, reached_index
+                    )
+                    yaw_ok = yaw_tolerance is None or abs(yaw_error) <= yaw_tolerance
+                    if distance <= xy_tolerance and yaw_ok:
+                        stable += 1
+                        if stable >= ARRIVAL_ADJUST_STABLE_SAMPLES:
+                            succeeded = True
+                            break
+                    else:
+                        stable = 0
+                    body_x = cos(yaw) * dx + sin(yaw) * dy
+                    body_y = -sin(yaw) * dx + cos(yaw) * dy
+                    if distance > xy_tolerance:
+                        speed = min(self.arrival_adjust_speed_mps, max(0.03, distance * 0.35))
+                        vx = speed * body_x / max(distance, 1e-6)
+                        vy = speed * body_y / max(distance, 1e-6)
+                    else:
+                        vx = vy = 0.0
+                    yaw_rate = max(
+                        -self.arrival_adjust_yaw_rate_rps,
+                        min(self.arrival_adjust_yaw_rate_rps, yaw_error * 0.8),
+                    )
+                    observation = clearance(
+                        vx,
+                        vy,
+                        min(self.arrival_adjust_max_distance_m, distance + 0.05),
+                        max_scan_age_seconds=self.arrival_adjust_scan_max_age_seconds,
+                    ) or {}
+                    if not bool(observation.get("clear")):
+                        reason = str(observation.get("reason") or "unknown")
+                        failure_message = f"到点微调方向不安全（{reason}）"
+                        break
+                    velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+                if stop_event.wait(ARRIVAL_ADJUST_PERIOD_SECONDS):
+                    break
+            if not succeeded and not failure_message and not stop_event.is_set():
+                failure_message = "到点位姿在限定时间内未同时收敛"
+        except Exception:
+            LOGGER.exception("arrival heading-preserving adjustment failed")
+            failure_message = "到点微调执行异常"
+        finally:
+            try:
+                if callable(velocity):
+                    velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+            except Exception:
+                LOGGER.warning("failed to zero arrival adjustment velocity", exc_info=True)
+        with self._lock:
+            if self._arrival_adjustment_index != reached_index:
+                return
+            self._arrival_adjustment_index = None
+            self._arrival_adjustment_thread = None
+            if succeeded:
+                self.on_navigation_result("succeeded", generation=generation)
+                return
+            self._emit_safe_hold(
+                "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                failure_message or "到点位姿无法安全地同时满足位置和航向要求",
+            )
 
     def _is_last_route_waypoint(self, index: int) -> bool:
         if not self.context:
@@ -3061,6 +3320,8 @@ class TaskExecutor:
             # gate or fail-open intermediate policy can decide.
             return False
         self._arrival_retry_counts[reached_index] = retries + 1
+        self._cancel_arrival_adjustment(reset_state=True)
+        self._arrival_convergence_attempts.pop(reached_index, None)
         LOGGER.warning(
             "re-approaching waypoint %d after rejected arrival (attempt %d/%d)",
             reached_index,
@@ -3846,10 +4107,96 @@ class TaskExecutor:
                         "continuing with stationary localization policy",
                         reached_index,
                     )
-                arrival_heading_completed = self._arrival_heading_completed_index == reached_index
-                if not arrival_heading_completed and self._use_teleop_arrival_heading(
+                correction_completed = (
+                    self._arrival_correction_completed_index == reached_index
+                )
+                if not correction_completed:
+                    # Absolute correction owns the first stationary stage. A
+                    # later arrival-heading callback must not start it again.
+                    self._emit_arrival_stage(
+                        reached_index, "correction", "正在进行航点绝对定位校正"
+                    )
+                    self._correction_generation += 1
+                    self._correction_completed_at_mono = None
+                    self._emit_idempotent(
+                        "task.arrival_correcting",
+                        event_type_key="arrival_correcting",
+                        waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
+                        message="切换静止定位并校正",
+                        extra={"correction_generation": self._correction_generation},
+                    )
+                    self._set_localization_policy(reached_waypoint, "stationary")
+                    self._start_waypoint_localization_correction(
+                        reached_waypoint, reached_index
+                    )
+                    speech_configured = (
+                        self._waypoint_speech_enabled()
+                        and bool(reached_waypoint.get("speech_template_id"))
+                        and self._waypoint_speech_mode(reached_waypoint) != "disabled"
+                    )
+                    speech_blocks = speech_configured and self._waypoint_speech_blocks_navigation(
+                        reached_waypoint
+                    )
+                    if speech_blocks:
+                        self._clear_waypoint_speech_status(reached_index)
+                        self._waypoint_localization_ready_index = None
+                        self._start_waypoint_speech_wait(reached_index)
+                    if not self._absolute_localization_ready():
+                        self.navigation.stop_motion()
+                        self._restore_navigation_profile()
+                        self._paused_for_localization = True
+                        self._paused_localization_reason = "absolute_required"
+                        self.context.state = "paused"
+                        self.context.current_waypoint_index = reached_index
+                        self.context.state_version += 1
+                        self._persist()
+                        self._emit(
+                            "task.paused",
+                            code="ABSOLUTE_LOCALIZATION_REQUIRED",
+                            message=self._absolute_localization_wait_message(
+                                self._localization_decision()
+                            ),
+                        )
+                        self._arm_absolute_localization_resume_watch()
+                        return
+                    self._correction_completed_at_mono = time.monotonic()
+                    self._arrival_correction_completed_index = reached_index
+
+                    # Position approach is deliberately before final yaw. A
+                    # Nav2 re-approach invalidates both stage latches.
+                    self._emit_arrival_stage(
+                        reached_index, "position_approach", "正在按校正后位置确认航点"
+                    )
+                    if not self._arrival_xy_within_policy_tolerance(
+                        reached_waypoint, reached_index
+                    ):
+                        outdoor = self._outdoor_navigation_profile()
+                        decision = self._localization_decision()
+                        if outdoor and (
+                            not self._rtk_position_good_for_navigation()
+                            or self._rtk_xy_from_decision(decision) is None
+                        ):
+                            self._hold_unconfirmed_outdoor_arrival(
+                                reached_index,
+                                "waypoint reached by FAST-LIO but outdoor RTK is not fixed/usable; waiting before trusting arrival",
+                            )
+                            return
+                        if self._reapproach_rejected_arrival(reached_index):
+                            return
+                        self._emit_safe_hold(
+                            "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                            "校正后位置仍未到达当前航点，已停止继续收敛",
+                        )
+                        return
+                    self._arrival_retry_counts.pop(reached_index, None)
+
+                arrival_heading_completed = (
+                    self._arrival_heading_completed_index == reached_index
+                )
+                use_arrival_heading = self._use_teleop_arrival_heading(
                     reached_waypoint, reached_index
-                ):
+                )
+                if not arrival_heading_completed and use_arrival_heading:
                     pose = self.navigation.latest_pose() if self.navigation else None
                     error = None
                     if pose is not None:
@@ -3861,11 +4208,22 @@ class TaskExecutor:
                         except (AttributeError, KeyError, TypeError, ValueError):
                             error = None
                     if error is None or abs(error) > ARRIVAL_HEADING_ALIGN_RAD:
+                        attempts = int(self._arrival_convergence_attempts.get(reached_index, 0))
+                        if attempts >= ARRIVAL_CONVERGENCE_MAX_ATTEMPTS:
+                            self._emit_safe_hold(
+                                "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                                "最终航向两次调整后仍未收敛，机器人保持停车",
+                            )
+                            return
+                        self._arrival_convergence_attempts[reached_index] = attempts + 1
+                        self._emit_arrival_stage(
+                            reached_index, "heading_alignment", "位置确认完成，正在调整最终航向"
+                        )
                         self._emit_idempotent(
                             "task.arrival_heading_aligning",
-                            event_type_key="arrival_heading_aligning",
+                            event_type_key=f"arrival_heading_aligning_{attempts + 1}",
                             waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
-                            message="目标点已到达，原地对准朝向",
+                            message="目标点位置已确认，原地对准最终朝向",
                             extra={"target_yaw": reached_waypoint.get("yaw")},
                         )
                         if self._start_departure_heading(
@@ -3878,104 +4236,38 @@ class TaskExecutor:
                             tolerance_rad=ARRIVAL_HEADING_ALIGN_RAD,
                         ):
                             return
-                # Confirm this click while standing. Face the next leg in
-                # _continue_after_waypoint only after arrival is accepted.
-                # Turning first makes zero-motion fail, outdoor RTK look
-                # unusable, then re-approach spins the other way in place.
-                self._correction_generation += 1
-                self._correction_completed_at_mono = None
-                self._emit_idempotent(
-                    "task.arrival_correcting",
-                    event_type_key="arrival_correcting",
-                    waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
-                    message="切换静止定位并校正",
-                    extra={"correction_generation": self._correction_generation},
+                    else:
+                        self._arrival_heading_completed_index = reached_index
+                        arrival_heading_completed = True
+
+                self._emit_arrival_stage(
+                    reached_index, "pose_verification", "正在同时验收航点位置和最终航向"
                 )
-                self._set_localization_policy(reached_waypoint, "stationary")
-                self._start_waypoint_localization_correction(
+                if not self._arrival_pose_within_combined_tolerance(
                     reached_waypoint, reached_index
-                )
-                speech_configured = (
-                    self._waypoint_speech_enabled()
-                    and bool(reached_waypoint.get("speech_template_id"))
-                    and self._waypoint_speech_mode(reached_waypoint) != "disabled"
-                )
-                speech_blocks = speech_configured and self._waypoint_speech_blocks_navigation(
-                    reached_waypoint
-                )
-                if speech_blocks:
-                    self._clear_waypoint_speech_status(reached_index)
-                    # Speech and localization settling run independently; the
-                    # next waypoint is gated on both completion conditions.
-                    self._waypoint_localization_ready_index = None
-                    self._start_waypoint_speech_wait(reached_index)
-                if not self._absolute_localization_ready():
-                    self.navigation.stop_motion()
-                    self._restore_navigation_profile()
-                    self._paused_for_localization = True
-                    self._paused_localization_reason = "absolute_required"
-                    self.context.state = "paused"
-                    self.context.current_waypoint_index = reached_index
-                    self.context.state_version += 1
-                    self._persist()
-                    self._emit(
-                        "task.paused",
-                        code="ABSOLUTE_LOCALIZATION_REQUIRED",
-                        message=self._absolute_localization_wait_message(
-                            self._localization_decision()
-                        ),
+                ):
+                    distance, yaw_error = self._arrival_pose_errors(
+                        reached_waypoint, reached_index
                     )
-                    self._arm_absolute_localization_resume_watch()
-                    return
-                self._correction_completed_at_mono = time.monotonic()
-                # Correction finished (or was unnecessary). Re-check XY even
-                # after a successful final-yaw turn: the quadruped can translate
-                # during a nominally pure rotation, and the old pre-turn arrival
-                # must not be carried forward as proof that it is still here.
-                if not self._arrival_within_tolerance(reached_waypoint, reached_index):
-                    if arrival_heading_completed:
+                    if use_arrival_heading and arrival_heading_completed:
                         LOGGER.warning(
-                            "waypoint %d moved outside the click tolerance during "
-                            "arrival heading alignment; re-approaching",
+                            "waypoint %d final pose outside combined tolerance: xy=%s yaw=%s",
                             reached_index,
+                            distance,
+                            yaw_error,
                         )
-                    outdoor = self._outdoor_navigation_profile()
-                    rtk_usable = self._rtk_position_good_for_navigation()
-                    decision = self._localization_decision()
-                    rtk_xy = self._rtk_xy_from_decision(decision)
-                    if outdoor and (not rtk_usable or rtk_xy is None):
-                        self._hold_unconfirmed_outdoor_arrival(
-                            reached_index,
-                            (
-                                "waypoint reached by FAST-LIO but outdoor RTK is "
-                                "not fixed/usable; waiting before trusting arrival"
-                            ),
-                        )
-                        return
-                    if self._reapproach_rejected_arrival(reached_index):
-                        return
-                    if arrival_heading_completed:
+                        if self._start_arrival_adjustment(reached_waypoint, reached_index):
+                            return
                         self._emit_safe_hold(
-                            "PHYSICAL_REAPPROACH_EXHAUSTED",
-                            "目标朝向对准后位置偏移且到点重试耗尽，进入安全保持",
+                            "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                            "最终航向后位置偏移超过安全微调范围或安全条件不满足",
                         )
                         return
-                    if outdoor and self._is_last_route_waypoint(reached_index):
-                        LOGGER.error(
-                            "final waypoint %d still off-click after re-approaches; "
-                            "holding instead of completing the task",
-                            reached_index,
-                        )
-                        self._hold_unconfirmed_outdoor_arrival(
-                            reached_index,
-                            (
-                                "final waypoint is still off the map click after "
-                                "re-approach; waiting for a confirmed outdoor pose"
-                            ),
-                        )
-                        return
-                else:
-                    self._arrival_retry_counts.pop(reached_index, None)
+                    self._emit_safe_hold(
+                        "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                        "航点位置与航向无法同时满足验收条件",
+                    )
+                    return
                 if not self._arrival_pose_is_stable(reached_waypoint, reached_index):
                     self.navigation.stop_motion()
                     self._restore_navigation_profile()
@@ -4088,6 +4380,9 @@ class TaskExecutor:
                 return
             self._active_correction_transaction_id = None
             self._active_correction_mode = None
+            self._arrival_correction_completed_index = None
+            self._arrival_convergence_attempts.pop(reached_index, None)
+            self._cancel_arrival_adjustment()
             if self._departure_heading_completed_index == reached_index:
                 self._departure_heading_completed_index = None
             elif self._departure_heading_index is None and self._dispatch_departure_heading(reached_index):
@@ -4945,7 +5240,9 @@ class TaskExecutor:
                 "FINAL_POSE_OUT_OF_TOLERANCE",
                 "final outdoor pose is not confirmed by fixed RTK against the last click",
             )
-        if self._is_docking_task():
+        policy = self._arrival_policy(final_waypoint, len(waypoints) - 1)
+        require_final_yaw = bool(final_waypoint.get("require_yaw", False))
+        if self._is_docking_task() or policy == "precision" or require_final_yaw:
             try:
                 yaw_error = abs(
                     atan2(
@@ -4954,13 +5251,20 @@ class TaskExecutor:
                     )
                 )
             except (AttributeError, KeyError, TypeError, ValueError):
-                return ("FINAL_YAW_UNAVAILABLE", "final docking heading is unavailable")
-            if yaw_error > self.docking_goal_yaw_tolerance_rad:
+                return ("FINAL_YAW_UNAVAILABLE", "final waypoint heading is unavailable")
+            yaw_tolerance = (
+                self.docking_goal_yaw_tolerance_rad
+                if self._is_docking_task()
+                else PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
+                if policy == "precision"
+                else ARRIVAL_HEADING_ALIGN_RAD
+            )
+            if yaw_error > yaw_tolerance:
                 return (
                     "FINAL_YAW_OUT_OF_TOLERANCE",
                     (
-                        f"final heading is {yaw_error:.3f}rad from docking heading "
-                        f"(tolerance {self.docking_goal_yaw_tolerance_rad:.3f}rad)"
+                        f"final heading is {yaw_error:.3f}rad from requested heading "
+                        f"(tolerance {yaw_tolerance:.3f}rad)"
                     ),
                 )
         return None
@@ -4969,6 +5273,7 @@ class TaskExecutor:
         if not self.context:
             return
         self._cancel_waypoint_localization_correction()
+        self._cancel_arrival_adjustment(reset_state=True)
         self._clear_nav_dispatch_retry()
         self._cancel_waypoint_dwell()
         self._invalidate_nav_results()

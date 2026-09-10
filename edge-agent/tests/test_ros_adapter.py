@@ -1153,6 +1153,36 @@ def test_scan_reports_side_clearance_for_bypass():
     assert adapter._front_obstacle_distance_m is None
 
 
+def test_directional_clearance_uses_rear_and_side_scan_points():
+    adapter = object.__new__(RosAdapter)
+    adapter._scan_geometry_key = None
+    adapter._scan_geometry = []
+    adapter._latest_scan = SimpleNamespace(
+        # -pi=rear obstacle, -pi/2=right clear, 0=front clear, pi/2=left obstacle
+        ranges=[0.40, 4.0, 4.0, 0.35],
+        range_min=0.05,
+        angle_min=-math.pi,
+        angle_increment=math.pi / 2,
+    )
+    adapter._latest_scan_received_monotonic = time.monotonic()
+
+    assert adapter.directional_clearance(-0.08, 0.0, 0.3)["reason"] == "obstacle"
+    assert adapter.directional_clearance(0.08, 0.0, 0.3)["clear"] is True
+    assert adapter.directional_clearance(0.0, 0.08, 0.3)["reason"] == "obstacle"
+
+
+def test_directional_clearance_rejects_stale_scan():
+    adapter = object.__new__(RosAdapter)
+    adapter._latest_scan = SimpleNamespace(
+        ranges=[4.0], range_min=0.05, angle_min=0.0, angle_increment=1.0
+    )
+    adapter._latest_scan_received_monotonic = time.monotonic() - 0.6
+
+    result = adapter.directional_clearance(0.08, 0.0, 0.2, max_scan_age_seconds=0.5)
+    assert result["clear"] is False
+    assert result["reason"] == "scan_stale"
+
+
 def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
     adapter = object.__new__(RosAdapter)
     adapter._raw_forward_command = 0.0

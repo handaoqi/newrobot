@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from math import atan2, hypot
+from math import atan2, cos, hypot, sin
 import hashlib
 import json
 import threading
@@ -20,6 +20,8 @@ class FakeNavigation:
         self.stopped = True
         self.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
         self.teleop = []
+        self.arrival_adjustments = []
+        self.arrival_clearance = {"clear": True, "reason": "clear"}
         self.costmap_clears = 0
         self.trusted_pose = {
             "x": 3.0,
@@ -81,6 +83,24 @@ class FakeNavigation:
                 y=float(self.pose.y),
                 yaw=float(getattr(self.pose, "yaw", 0.0) or 0.0) + float(yaw_rate),
             )
+
+    def arrival_adjust_velocity(self, vx=0.0, vy=0.0, yaw_rate=0.0):
+        self.arrival_adjustments.append((vx, vy, yaw_rate))
+        yaw = float(getattr(self.pose, "yaw", 0.0) or 0.0)
+        # Accelerate the deterministic fake relative to the 10 Hz production
+        # loop while preserving the body->map transform used by the controller.
+        dt = 0.5
+        self.pose = SimpleNamespace(
+            x=float(self.pose.x) + (float(vx) * cos(yaw) - float(vy) * sin(yaw)) * dt,
+            y=float(self.pose.y) + (float(vx) * sin(yaw) + float(vy) * cos(yaw)) * dt,
+            yaw=yaw + float(yaw_rate) * dt,
+        )
+        return {"topic": "/cmd_vel_raw"}
+
+    def directional_clearance(
+        self, vx, vy, travel_distance_m, *, max_scan_age_seconds=0.5
+    ):
+        return dict(self.arrival_clearance)
 
     def clear_local_costmap(self, timeout_seconds=1.0):
         self.costmap_clears += 1
@@ -2366,7 +2386,7 @@ def test_waypoint_profile_uses_target_for_initial_approach_and_source_afterwards
     store.close()
 
 
-def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
+def test_patrol_require_yaw_does_not_generic_reapproach_after_large_turn_drift(tmp_path):
     from math import pi
 
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -2413,20 +2433,25 @@ def test_patrol_require_yaw_turns_in_place_after_xy_arrival(tmp_path):
     assert any(command[2] < 0.0 for command in nav.teleop)
     assert any(event[0] == "task.arrival_heading_aligning" for event in events)
     assert any(event[0] == "task.arrival_heading_aligned" for event in events)
-    # A pure-yaw command translated the quadruped outside the click tolerance,
-    # so the old pre-turn arrival is rejected and wp-1 is approached once more.
-    assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 2
-    nav.pose = SimpleNamespace(
-        x=float(first["x"]), y=float(first["y"]), yaw=float(first["yaw"])
-    )
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    _await_departure_heading(executor)
-    assert ids(nav.sent[-1]) == ["wp-2"]
+    # A 0.8 m turn drift is outside the bounded 0.5 m fine-adjustment range.
+    # It must pause instead of entering the generic face-click/reapproach path.
+    assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 1
+    assert executor.context.state == "paused"
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_POSE_CONVERGENCE_FAILED"
+    stages = [
+        event[1].get("arrival_stage")
+        for event in events
+        if event[0] == "task.recovery_active"
+    ]
+    assert stages.index("correction") < stages.index("position_approach")
+    assert stages.index("position_approach") < stages.index("heading_alignment")
+    assert stages.index("heading_alignment") < stages.index("pose_verification")
     executor.stop()
     store.close()
 
 
-def test_final_configured_heading_reapproaches_after_turn_translation(tmp_path):
+def test_final_configured_heading_large_translation_pauses_without_reapproach(tmp_path):
     from math import pi
 
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -2457,16 +2482,89 @@ def test_final_configured_heading_reapproaches_after_turn_translation(tmp_path):
     nav.result("succeeded", "", {"missed_waypoints": []})
     _await_departure_heading(executor)
 
-    assert executor.context.state == "running"
-    assert len(nav.sent) == 2
-    nav.pose = SimpleNamespace(
-        x=float(final["x"]), y=float(final["y"]), yaw=float(final["yaw"])
+    assert executor.context.state == "paused"
+    assert len(nav.sent) == 1
+    assert results == []
+    store.close()
+
+
+def test_final_heading_small_xy_drift_uses_cmd_vel_raw_adjustment(tmp_path):
+    from math import pi
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    results = []
+    envelope = command("task.start")
+    final = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    final.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [final]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: results.append(args),
     )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(final["x"]), y=float(final["y"]), yaw=pi)
+    original_teleop_velocity = nav.teleop_velocity
+
+    def drifting_teleop_velocity(vx=0.0, vy=0.0, yaw_rate=0.0):
+        original_teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        if abs(float(yaw_rate)) > 1e-6:
+            nav.pose.x = float(final["x"]) + 0.48
+
+    nav.teleop_velocity = drifting_teleop_velocity
     nav.result("succeeded", "", {"missed_waypoints": []})
+    deadline = time.time() + 5.0
+    while (executor.context.state == "running" or not results) and time.time() < deadline:
+        time.sleep(0.02)
 
     assert executor.context.state == "completed"
-    assert len(nav.sent) == 2
+    assert len(nav.sent) == 1
+    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
     assert results[-1][1] == "succeeded"
+    stages = [
+        event[1].get("arrival_stage")
+        for event in events
+        if event[0] == "task.recovery_active"
+    ]
+    assert "heading_preserving_adjustment" in stages
+    store.close()
+
+
+def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.arrival_clearance = {"clear": False, "reason": "obstacle"}
+    events = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.48, y=float(waypoint["y"]), yaw=0.0)
+
+    assert executor._start_arrival_adjustment(waypoint, 0) is True
+    deadline = time.time() + 1.0
+    while (
+        executor.context.state == "running"
+        or not any(event[0] == "task.safe_hold" for event in events)
+    ) and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert executor.context.state == "paused"
+    assert nav.arrival_adjustments[-1] == (0.0, 0.0, 0.0)
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_POSE_CONVERGENCE_FAILED"
+    assert "obstacle" in safe_hold[1]["reason_message"]
+    executor.stop()
     store.close()
 
 
@@ -2946,9 +3044,9 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     final = executor.context.route_snapshot["waypoints"][-1]
     face = atan2(float(final["y"]) - 2.0, float(final["x"]) - 1.0)
     # Stay far from the final waypoint so indoor click checks re-approach,
-    # then the final-pose gate fails once retries are exhausted.
+    # then safely pause once bounded convergence retries are exhausted.
     for _ in range(6):
-        if executor.context.state == "failed":
+        if executor.context.state == "paused":
             break
         nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=face)
         if executor._departure_heading_thread is not None:
@@ -2957,14 +3055,13 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
             break
         nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.stop_commands >= 1
-    assert executor.context.state == "failed"
-    assert results[0][1] == "failed"
-    assert results[0][3] == "FINAL_POSE_OUT_OF_TOLERANCE"
+    assert executor.context.state == "paused"
+    assert results == []
     store.close()
 
 
 def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
-    for distance, expected_state in ((0.42, "completed"), (0.46, "failed")):
+    for distance, expected_state in ((0.42, "completed"), (0.46, "paused")):
         store = LocalStore(str(tmp_path / f"edge-{distance}.db"))
         nav = FakeNavigation()
         executor = TaskExecutor(

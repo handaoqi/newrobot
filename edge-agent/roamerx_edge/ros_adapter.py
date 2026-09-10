@@ -195,6 +195,7 @@ class RosAdapter(Node):
         self._odometry_sequence = 0
         self._odometry_consumed_sequence = 0
         self._latest_scan = None
+        self._latest_scan_received_monotonic = 0.0
         self._scan_sequence = 0
         self._scan_consumed_sequence = 0
         self._scan_geometry_key = None
@@ -383,6 +384,9 @@ class RosAdapter(Node):
             else None
         )
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self._arrival_adjust_cmd_vel_pub = self.create_publisher(
+            Twist, ros_config.cmd_vel_raw_topic, 10
+        )
         self._teleop_cmd_vel_pub = self.create_publisher(Twist, "/teleop_cmd_vel", 10)
         self._teleop_action_pub = self.create_publisher(String, "/teleop_action", 10)
         self._remote_teleop_action_pub = self.create_publisher(String, "/remote_teleop_action", 10)
@@ -1148,13 +1152,14 @@ class RosAdapter(Node):
         started = time.perf_counter()
         dropped = 0
         optimization_enabled = self._callback_optimization_enabled()
+        self._latest_scan_received_monotonic = time.monotonic()
+        self._latest_scan = scan
         if optimization_enabled:
             dropped = int(
                 getattr(self, "_scan_sequence", 0)
                 > getattr(self, "_scan_consumed_sequence", 0)
             )
             self._scan_sequence = getattr(self, "_scan_sequence", 0) + 1
-            self._latest_scan = scan
         else:
             self._process_scan(scan)
         if self._callback_metrics_enabled():
@@ -1191,8 +1196,6 @@ class RosAdapter(Node):
             for index in range(len(scan.ranges)):
                 angle = scan.angle_min + index * scan.angle_increment
                 cosine = math.cos(angle)
-                if cosine <= 0.0:
-                    continue
                 geometry.append((index, cosine, math.sin(angle)))
             self._scan_geometry_key = key
             self._scan_geometry = geometry
@@ -1586,6 +1589,67 @@ class RosAdapter(Node):
             "vx": msg.linear.x,
             "vy": msg.linear.y,
             "yaw_rate": msg.angular.z,
+        }
+
+    def arrival_adjust_velocity(
+        self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0
+    ) -> dict:
+        """Publish an autonomous fine-adjustment through collision monitor."""
+        msg = Twist()
+        msg.linear.x = float(vx)
+        msg.linear.y = float(vy)
+        msg.angular.z = float(yaw_rate)
+        self._arrival_adjust_cmd_vel_pub.publish(msg)
+        return {
+            "topic": self.ros_config.cmd_vel_raw_topic,
+            "vx": msg.linear.x,
+            "vy": msg.linear.y,
+            "yaw_rate": msg.angular.z,
+        }
+
+    def directional_clearance(
+        self,
+        vx: float,
+        vy: float,
+        travel_distance_m: float,
+        *,
+        max_scan_age_seconds: float = 0.5,
+    ) -> dict:
+        """Check the 360-degree scan in the commanded translation corridor."""
+        scan = self._latest_scan
+        received = float(getattr(self, "_latest_scan_received_monotonic", 0.0) or 0.0)
+        age = max(0.0, time.monotonic() - received) if received else None
+        if scan is None or age is None or age > max(0.0, float(max_scan_age_seconds)):
+            return {"clear": False, "reason": "scan_stale", "scan_age_seconds": age}
+        speed = math.hypot(float(vx), float(vy))
+        if speed <= 1e-6:
+            return {"clear": True, "reason": "rotation_only", "scan_age_seconds": age}
+        ux, uy = float(vx) / speed, float(vy) / speed
+        # Base footprint is about 0.63 x 0.36 m. Project the rectangle into
+        # the commanded direction and add a conservative swept-corridor margin.
+        longitudinal_extent = abs(ux) * 0.315 + abs(uy) * 0.18
+        lateral_extent = abs(-uy) * 0.315 + abs(ux) * 0.18
+        corridor_end = longitudinal_extent + max(0.0, float(travel_distance_m)) + 0.15
+        corridor_half_width = lateral_extent + 0.10
+        nearest = None
+        for index, cosine, sine in self._scan_geometry_for(scan):
+            distance = scan.ranges[index]
+            if not math.isfinite(distance) or distance < scan.range_min:
+                continue
+            x = float(distance) * cosine
+            y = float(distance) * sine
+            along = x * ux + y * uy
+            lateral = abs(-x * uy + y * ux)
+            # Ignore the immediate sensor/footprint return, but cover forward,
+            # reverse and lateral motion with the same directional projection.
+            if 0.18 <= along <= corridor_end and lateral <= corridor_half_width:
+                nearest = along if nearest is None else min(nearest, along)
+        return {
+            "clear": nearest is None,
+            "reason": "clear" if nearest is None else "obstacle",
+            "scan_age_seconds": age,
+            "nearest_along_m": nearest,
+            "required_clearance_m": corridor_end,
         }
 
     def teleop_action(self, action: str) -> dict:

@@ -5,6 +5,7 @@ const REASON_LABELS = {
   LOCALIZATION_LOST: '定位丢失，导航已停车，正在自动重定位',
   ABSOLUTE_LOCALIZATION_REQUIRED: '已到达点位，正在等待绝对定位校正',
   ARRIVAL_CONFIRMATION_UNSTABLE: '到点位姿未稳定，等待重新确认',
+  ARRIVAL_POSE_CONVERGENCE_FAILED: '航点位置与最终航向无法同时安全收敛，设备已停车',
   RECOVERY_BUDGET_EXHAUSTED: '自动恢复次数已耗尽，设备进入安全保持',
   EDGE_SYNC_PAUSED: '云边状态已对账，设备端任务处于暂停状态',
 }
