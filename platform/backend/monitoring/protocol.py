@@ -92,6 +92,7 @@ UPLINK_MESSAGE_TYPES = {
     "task.pausing",
     "task.paused",
     "task.resuming",
+    "task.resumed",
     "task.cancelling",
     "task.completed",
     "task.failed",

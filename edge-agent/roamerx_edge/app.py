@@ -65,6 +65,7 @@ class EdgeAgentApplication:
             config.charge_control,
         )
         self.mqtt = EdgeMqttClient(config, self.store)
+        self._latest_task_state_event: dict = {}
         self.structured_logs = StructuredLogEmitter(self.mqtt.publish_system_logs)
         self.navigation_boundary = NavigationBoundaryManager(
             self.store,
@@ -367,10 +368,22 @@ class EdgeAgentApplication:
 
     def _publish_sync_request(self) -> None:
         context = self.task_executor.context
+        latest_event = self._latest_task_state_event
+        event_matches_context = bool(
+            context
+            and latest_event.get("task_execution_id") == context.task_execution_id
+            and latest_event.get("state") == context.state
+        )
         payload = {
             "current_task_execution_id": context.task_execution_id if context else None,
             "local_task_state": context.state if context else None,
             "local_task_state_version": context.state_version if context else 0,
+            "local_task_reason_code": (
+                latest_event.get("reason_code") if event_matches_context else None
+            ),
+            "local_task_reason_message": (
+                latest_event.get("reason_message") if event_matches_context else None
+            ),
             "last_processed_command_id": None,
             "last_trajectory_seq": -1,
             "outbox_pending": self.store.outbox_count(),
@@ -422,6 +435,10 @@ class EdgeAgentApplication:
                     "current_map": self._current_map_payload(),
                 },
             )
+            # A broker QoS acknowledgement does not prove the center worker
+            # persisted the event. Re-send the versioned state periodically so
+            # a transient center restart or uplink loss self-heals safely.
+            self._publish_sync_request()
 
     def _status_loop(self) -> None:
         while not self.stop_event.wait(self.config.telemetry.status_interval_seconds):
@@ -817,6 +834,17 @@ class EdgeAgentApplication:
         event_payload = dict(payload or {})
         if trace_id:
             event_payload.setdefault("trace_id", trace_id)
+        if event_type in {
+            "task.pausing", "task.paused", "task.resuming", "task.resumed",
+            "task.cancelling", "task.cancelled", "task.completed", "task.failed",
+            "task.safe_hold",
+        }:
+            self._latest_task_state_event = {
+                "task_execution_id": event_payload.get("task_execution_id"),
+                "state": event_payload.get("state"),
+                "reason_code": event_payload.get("reason_code"),
+                "reason_message": event_payload.get("reason_message"),
+            }
         self.mqtt.publish_task_event(event_type, event_payload, trace_id)
 
     @staticmethod

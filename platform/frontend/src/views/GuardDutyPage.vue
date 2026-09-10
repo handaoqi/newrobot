@@ -75,6 +75,7 @@ import {
   guardDutySpeedTitle,
   isLatestTrajectoryResponse,
 } from '../utils/guardDutySpeed'
+import { guardDutyPauseReason } from '../utils/guardDutyPauseReason'
 
 const overview = ref(null)
 const robots = ref([])
@@ -183,6 +184,7 @@ const currentExecutionRound = computed(() => {
   if (!execution.value?.id) return 0
   return Math.max(1, Number(execution.value.round_number || 1))
 })
+const pauseReason = computed(() => guardDutyPauseReason(execution.value))
 const waypointStates = computed(() => guardDutyWaypointStates(
   displayRouteWaypoints.value,
   waypointMilestones.value,
@@ -236,6 +238,9 @@ const guardRuntimeStatus = computed(() => {
   if (loopActive.value && loopState.value === 'resting') return `轮次休息中（${formatDuration(restRemainingMilliseconds.value)}）`
   if (loopActive.value && loopState.value === 'starting') return '正在启动下一轮'
   if (loopActive.value && loopState.value === 'finishing') return '循环到时，本轮结束后停止'
+  if (loopActive.value && ['pausing', 'paused', 'interrupted'].includes(execution.value?.state)) {
+    return `第 ${currentExecutionRound.value} 轮已暂停`
+  }
   if (loopActive.value) return `循环巡检中 · 第 ${loopRounds.value} 轮`
   return taskStateText.value
 })
@@ -1482,6 +1487,9 @@ watch(playUrlKey, () => {
               <small :title="formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at)">
                 {{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}
               </small>
+              <small v-if="pauseReason" class="guard-task-pause-reason" :title="pauseReason">
+                暂停原因：{{ pauseReason }}
+              </small>
             </div>
             <div class="guard-task-actions">
               <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
@@ -1554,6 +1562,7 @@ watch(playUrlKey, () => {
               <div class="guard-runtime-status"><span>当前状态</span><strong>{{ guardRuntimeStatus }}</strong></div>
             </div>
             <p class="guard-loop-message">{{ loopMessage }}</p>
+            <p v-if="pauseReason" class="guard-pause-reason">暂停原因：{{ pauseReason }}</p>
           </section>
         </section>
 
@@ -1727,6 +1736,7 @@ watch(playUrlKey, () => {
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .guard-task-state small { overflow: hidden; color: #70808c; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.guard-task-state .guard-task-pause-reason { color: #c94b32; font-weight: 700; }
 .guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; }
 .guard-task-actions > button { width: 100%; min-width: 0; padding-inline: 10px; font-size: 11px; white-space: nowrap; }
 .guard-task-selector { display: grid; gap: 5px; min-width: 0; }
@@ -1791,7 +1801,8 @@ watch(playUrlKey, () => {
 .guard-loop-inline .guard-runtime-grid > div { border-right: 1px solid #e5eaed; border-bottom: 0; }
 .guard-loop-inline .guard-runtime-grid > div:last-child { border-right: 0; }
 .guard-loop-inline .guard-runtime-status strong { white-space: normal; }
-.guard-loop-inline .guard-loop-message { grid-column: 1 / -1; }
+.guard-loop-inline .guard-loop-message,
+.guard-loop-inline .guard-pause-reason { grid-column: 1 / -1; }
 .guard-loop-light { width: 14px; height: 14px; border-radius: 50%; background: #a9b5bd; box-shadow: 0 0 0 5px rgba(169, 181, 189, .18); }
 .guard-loop-light.active { background: #19a568; box-shadow: 0 0 0 5px rgba(25, 165, 104, .18); }
 .guard-loop-settings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1809,6 +1820,7 @@ watch(playUrlKey, () => {
 .guard-runtime-grid strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .guard-runtime-grid strong.is-data-stale { color: #c57a12; }
 .guard-loop-message { margin: 0; color: #657681; font-size: 12px; line-height: 1.5; }
+.guard-pause-reason { margin: 0; color: #c94b32; font-size: 12px; font-weight: 700; line-height: 1.5; }
 .guard-map-panel { --guard-waypoint-idle: #2563eb; --guard-waypoint-target: #e79a18; --guard-waypoint-reached: #159a63; padding: 16px; }
 .guard-map-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .guard-map-head h2 { margin: 4px 0 0; font-size: 20px; }
@@ -2116,6 +2128,7 @@ watch(playUrlKey, () => {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .guard-loop-inline .guard-pause-reason { font-size: 10px; }
   .guard-side {
     gap: 14px;
     font-size: 11px;
@@ -2268,7 +2281,9 @@ watch(playUrlKey, () => {
   .guard-localization-bar { align-items: stretch; flex-direction: column; }
   .guard-initialize { width: 100%; }
   .guard-loop-inline { grid-template-columns: 1fr; }
-  .guard-loop-inline .guard-runtime-grid, .guard-loop-inline .guard-loop-message { grid-column: 1; }
+  .guard-loop-inline .guard-runtime-grid,
+  .guard-loop-inline .guard-loop-message,
+  .guard-loop-inline .guard-pause-reason { grid-column: 1; }
 }
 @media (min-width: 641px) and (max-width: 1024px) and (orientation: portrait) {
   .guard-page { min-width: 0; padding: 18px; }

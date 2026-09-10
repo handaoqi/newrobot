@@ -22,7 +22,10 @@ ALLOWED_TRANSITIONS = {
     # MQTT delivery can make the final Result overtake task.started.
     # Edge Result is authoritative, so terminal reconciliation is legal here.
     "accepted": {"running", "pausing", "resuming", "cancelling", "completed", "cancelled", "failed", "timed_out", "interrupted"},
-    "running": {"pausing", "resuming", "cancelling", "cancelled", "completed", "failed", "timed_out", "interrupted"},
+    # Safety gates such as absolute-localization and arrival-stability checks
+    # stop motion and emit task.paused atomically; they intentionally do not
+    # expose an intermediate pausing state.
+    "running": {"pausing", "paused", "resuming", "cancelling", "cancelled", "completed", "failed", "timed_out", "interrupted"},
     "pausing": {"accepted", "running", "paused", "resuming", "cancelling", "cancelled", "failed", "interrupted"},
     "paused": {"pausing", "resuming", "cancelling", "cancelled", "interrupted"},
     "resuming": {"accepted", "running", "paused", "pausing", "cancelling", "cancelled", "failed", "interrupted"},

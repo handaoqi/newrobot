@@ -985,35 +985,58 @@ def _handle_sync(
         }
     else:
         local_state = str(payload.get("local_task_state") or "")
+        try:
+            local_version = int(payload.get("local_task_state_version") or 0)
+        except (TypeError, ValueError):
+            local_version = 0
         reconciled = False
+        terminal_reconciled = False
         if (
             execution.state in TaskExecution.ACTIVE_STATES
-            and local_state in {"completed", "failed", "cancelled", "timed_out", "rejected"}
+            and local_state in {state for state, _label in TaskExecution.STATE_CHOICES}
+            and local_state != execution.state
+            and local_version > execution.state_version
         ):
+            previous_cloud_state = execution.state
+            terminal_reconciled = local_state in {
+                "completed", "failed", "cancelled", "timed_out", "rejected"
+            }
+            reason_code = str(payload.get("local_task_reason_code") or "")
+            reason_message = str(payload.get("local_task_reason_message") or "")
+            if terminal_reconciled and local_state != "completed" and not reason_code:
+                reason_code = "EDGE_SYNC_TERMINAL"
+                reason_message = reason_message or f"Edge 重连时上报终态 {local_state}"
+            elif local_state == "paused" and not reason_code:
+                reason_code = "EDGE_SYNC_PAUSED"
+                reason_message = reason_message or "云边状态对账：设备端任务已暂停"
             try:
-                local_version = int(payload.get("local_task_state_version") or 0)
-            except (TypeError, ValueError):
-                local_version = 0
-            execution = TaskExecutionService.transition(
-                execution,
-                local_state,
-                event_type="task.sync_terminal_reconciled",
-                state_version=max(execution.state_version + 1, local_version),
-                reason_code="" if local_state == "completed" else "EDGE_SYNC_TERMINAL",
-                reason_message="" if local_state == "completed" else f"Edge 重连时上报终态 {local_state}",
-                payload={
-                    "source": "edge_sync",
-                    "previous_cloud_state": execution.state,
-                    "local_task_state": local_state,
-                    "local_task_state_version": local_version,
-                    "outbox_pending": payload.get("outbox_pending"),
-                },
-            )
-            realtime_publisher.publish_task_event(
-                str(execution.id),
-                TaskExecutionSerializer(execution).data,
-            )
-            reconciled = True
+                execution = TaskExecutionService.transition(
+                    execution,
+                    local_state,
+                    event_type=(
+                        "task.sync_terminal_reconciled"
+                        if terminal_reconciled
+                        else "task.sync_state_reconciled"
+                    ),
+                    state_version=local_version,
+                    reason_code=reason_code,
+                    reason_message=reason_message,
+                    payload={
+                        "source": "edge_sync",
+                        "previous_cloud_state": previous_cloud_state,
+                        "local_task_state": local_state,
+                        "local_task_state_version": local_version,
+                        "outbox_pending": payload.get("outbox_pending"),
+                    },
+                )
+            except TaskStateError:
+                terminal_reconciled = False
+            else:
+                realtime_publisher.publish_task_event(
+                    str(execution.id),
+                    TaskExecutionSerializer(execution).data,
+                )
+                reconciled = True
         last_point = execution.trajectory_points.order_by("-seq").first()
         action = "report_only" if reconciled else "continue"
         if not reconciled and execution.state != local_state:
@@ -1026,7 +1049,8 @@ def _handle_sync(
             "expected_state_version": execution.state_version,
             "action": action,
             "last_accepted_trajectory_seq": last_point.seq if last_point else -1,
-            "terminal_reconciled": reconciled,
+            "state_reconciled": reconciled,
+            "terminal_reconciled": reconciled and terminal_reconciled,
         }
     if publish_response:
         publish_response(
