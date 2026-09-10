@@ -86,6 +86,65 @@ class AudioFallbackTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "nx=NX device unavailable; 3588=3588 sink unavailable"):
             client._play_audio_dual(Path("alert.wav"), threading.Event(), allow_single_fallback=True)
 
+    def test_normal_waypoint_playback_fails_fast_when_both_outputs_are_offline(self):
+        client = self.make_client()
+        client._play_audio_remote.side_effect = RuntimeError("3588 sink unavailable")
+        client._local_audio_endpoint.side_effect = RuntimeError("NX device unavailable")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "all audio outputs unavailable: 3588=3588 sink unavailable; nx=NX device unavailable",
+        ):
+            client._play_audio(Path("waypoint.wav"), threading.Event())
+
+        client._play_audio_local.assert_not_called()
+
+    def test_both_outputs_offline_reports_failure_without_raising(self):
+        client = self.make_client()
+        client._write_waypoint_status = Mock()
+        client.report = Mock()
+        client._play_audio = Mock(
+            side_effect=RuntimeError(
+                "dual-speaker playback failed: nx=NX device unavailable; 3588=3588 sink unavailable"
+            )
+        )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
+            audio_path = Path(audio_file.name)
+        client._download_audio = Mock(return_value=audio_path)
+        payload = {
+            "audio_url": "https://platform.example/waypoint.wav",
+            "source": "patrol_waypoint_speech",
+            "task_execution_id": "task-1",
+            "waypoint_id": "wp-1",
+            "dual_output": True,
+            "blocking_fifo": True,
+        }
+
+        client.handle_command({"id": 124, "action": "play_audio", "payload": payload})
+
+        self.assertEqual(client._write_waypoint_status.call_args_list[-1].args[2], "failed")
+        self.assertEqual(client.report.call_args_list[-1].args[1], "failed")
+
+    def test_missing_audio_url_writes_failed_waypoint_status(self):
+        client = self.make_client()
+        client._write_waypoint_status = Mock()
+        client.report = Mock()
+        payload = {
+            "source": "patrol_waypoint_speech",
+            "task_execution_id": "task-1",
+            "waypoint_id": "wp-1",
+        }
+
+        client.handle_command({"id": 125, "action": "play_audio", "payload": payload})
+
+        client._write_waypoint_status.assert_called_once_with(
+            125,
+            payload,
+            "failed",
+            "audio_url is required",
+        )
+        self.assertEqual(client.report.call_args.args[1], "failed")
+
     def test_uses_dual_output_when_both_outputs_are_online(self):
         client = self.make_client()
 

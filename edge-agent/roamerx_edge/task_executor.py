@@ -3899,10 +3899,18 @@ class TaskExecutor:
     def _waypoint_speech_mode(self, waypoint: dict | None = None) -> str:
         waypoint = waypoint or {}
         mode = str(waypoint.get("speech_mode") or "").strip().lower()
-        if mode in {"blocking", "non_blocking", "disabled"}:
-            return mode
         if not self._waypoint_speech_enabled():
             return "disabled"
+        if mode == "disabled":
+            return "disabled"
+        # Robot policy is authoritative.  A route created by an older center
+        # may still contain speech_mode=blocking, but speaker/TTS/command
+        # delivery failures must never hold up patrol navigation when the
+        # edge is configured for non-blocking speech.
+        if not bool(getattr(self.waypoint_speech, "block_navigation", False)):
+            return "non_blocking"
+        if mode in {"blocking", "non_blocking"}:
+            return mode
         if bool(getattr(self.waypoint_speech, "block_navigation", False)):
             return "blocking"
         return "non_blocking"

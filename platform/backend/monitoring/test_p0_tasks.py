@@ -83,6 +83,7 @@ class TaskExecutionTests(TestCase):
         waypoint = execution.route_snapshot["waypoints"][0]
         self.assertEqual(waypoint["speech_template_id"], template.id)
         self.assertEqual(waypoint["speech_template_name"], "到点提醒")
+        self.assertEqual(waypoint["speech_mode"], "non_blocking")
 
     def test_route_snapshot_preserves_heading_and_segment_avoidance(self):
         self.route.waypoints = [{

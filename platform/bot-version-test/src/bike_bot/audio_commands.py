@@ -158,6 +158,12 @@ class AudioCommandClient:
 
         audio_url = str(payload.get("audio_url") or "").strip()
         if not audio_url:
+            self._write_waypoint_status(
+                command_id,
+                payload,
+                "failed",
+                "audio_url is required",
+            )
             self.report(command_id, "failed", {}, "audio_url is required")
             return
 
@@ -353,9 +359,17 @@ class AudioCommandClient:
                 if cancel_event.is_set():
                     raise PlaybackSuperseded("replaced while switching to NX playback") from exc
                 LOGGER.warning("3588 audio unavailable; falling back to NX speaker: %s", exc)
+                try:
+                    self._local_audio_endpoint()
+                except Exception as local_exc:
+                    raise RuntimeError(
+                        "all audio outputs unavailable: "
+                        f"3588={exc}; nx={local_exc}"
+                    ) from local_exc
                 player = self._play_audio_local(local_path, cancel_event, alert_mode=alert_mode)
                 return PlaybackOutcome(player, "single_nx", ("nx",), {"3588": str(exc)})
 
+        self._local_audio_endpoint()
         player = self._play_audio_local(local_path, cancel_event, alert_mode=alert_mode)
         return PlaybackOutcome(player, "single_nx", ("nx",))
 

@@ -850,7 +850,7 @@ function normalizeArrivalPolicy(value, point = {}) {
 function normalizeSpeechMode(value, point = {}) {
   const normalized = String(value || '').trim().toLowerCase()
   if (['blocking', 'non_blocking', 'disabled'].includes(normalized)) return normalized
-  return point.speech_template_id ? 'blocking' : 'disabled'
+  return point.speech_template_id ? 'non_blocking' : 'disabled'
 }
 
 function setWaypointArrivalPolicy(index, policy) {
@@ -3225,11 +3225,11 @@ async function handleDeleteRoute(route) {
                       <label>
                         <span>语音模式</span>
                         <select
-                          :value="point.speech_mode || (point.speech_template_id ? 'blocking' : 'disabled')"
+                          :value="point.speech_mode || (point.speech_template_id ? 'non_blocking' : 'disabled')"
                           @change="waypoints[index] = { ...point, speech_mode: $event.target.value }"
                         >
                           <option value="blocking">阻塞下一段</option>
-                          <option value="non_blocking">非阻塞</option>
+                          <option value="non_blocking">非阻塞（推荐）</option>
                           <option value="disabled">关闭</option>
                         </select>
                       </label>

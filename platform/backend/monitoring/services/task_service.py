@@ -110,7 +110,10 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             )
             speech_mode = str(raw.get("speech_mode") or "").strip().lower()
             if speech_mode not in {"blocking", "non_blocking", "disabled"}:
-                speech_mode = "blocking" if speech_template_id not in (None, "") else "disabled"
+                # Playback is a patrol side effect.  Missing TTS, command
+                # delivery, or both speakers being offline must not gate the
+                # next navigation leg.
+                speech_mode = "non_blocking" if speech_template_id not in (None, "") else "disabled"
         elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
             x, y = raw[0], raw[1]
             yaw = raw[2] if len(raw) >= 3 else 0.0

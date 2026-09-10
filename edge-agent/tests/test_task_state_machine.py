@@ -1944,6 +1944,40 @@ def test_waypoint_speech_does_not_block_when_block_navigation_disabled(tmp_path)
     store.close()
 
 
+def test_edge_non_blocking_policy_overrides_legacy_blocking_waypoint(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    first = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    first["speech_template_id"] = 7
+    first["speech_mode"] = "blocking"
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        waypoint_speech=SimpleNamespace(
+            status_dir=str(tmp_path / "audio-status"),
+            timeout_seconds=120.0,
+            poll_interval_seconds=0.2,
+            enabled=True,
+            block_navigation=False,
+        ),
+    )
+
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]), yaw=0.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    _await_departure_heading(executor)
+
+    assert executor._waypoint_speech_mode(first) == "non_blocking"
+    assert executor._speech_waiting_index is None
+    assert executor.context.state == "running"
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    executor.stop()
+    store.close()
+
+
 def test_waypoint_speech_timeout_continues_navigation_when_blocking(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
