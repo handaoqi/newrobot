@@ -83,6 +83,20 @@ test('saving a route prepares its map, localization and navigation stack', () =>
   assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
 })
 
+test('navigation test hints describe the implemented localization gates and fallback order', () => {
+  const source = readFileSync(fileURLToPath(
+    new URL('../src/views/RoutePlannerPage.vue', import.meta.url),
+  ), 'utf8')
+
+  assert.match(source, /目标地图已就绪时直接复用/)
+  assert.match(source, /局部候选均无合格结果时才进入全图位置与航向匹配/)
+  assert.match(source, /漂移连续 3 个新样本严格小于 0\.30 m/)
+  assert.match(source, /原点阶段无合格候选才尝试手选点\/路线航点/)
+  assert.match(source, /稳定 NDT 分数严格小于 0\.01 时提前结束/)
+  assert.match(source, /最优 NDT 位姿已提交且分数严格小于 0\.01/)
+  assert.match(source, /不表示 FAST-LIO 已完成稳定接管/)
+})
+
 test('unreadiness reason distinguishes missing map, lost localization and Nav2 down', () => {
   const sampledAt = new Date().toISOString()
   const base = {

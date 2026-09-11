@@ -3447,10 +3447,10 @@ async function handleDeleteRoute(route) {
               <button class="btn btn-sm" :disabled="poseHistory.length === 0" @click="clearPoseHistory">清空尾迹</button>
             </div>
             <div class="localization-algorithm-note">
-              <span><strong>下发地图</strong> 应用地图后统一搜索建图原点、原点周边和路线航点，失败才进行全图位置与 360° 航向搜索。</span>
-              <span><strong>初始化定位</strong> 室外先验 RTK 固定解，漂移连续小于 0.30 m；否则快速搜索后全局回退。</span>
-              <span><strong>主动重定位</strong> 按建图原点、原点周边、手选点/路线航点和全局匹配顺序搜索；NDT 健康且分数低于 0.01 即停止尝试并采用最优解。</span>
-              <span><i class="legend-relocalization-dot"></i> 紫色标记仅表示已验证并提交成功的重定位位置。</span>
+              <span><strong>下发地图</strong> 目标地图已就绪时直接复用；否则应用地图并恢复定位，局部候选均无合格结果时才进入全图位置与航向匹配。</span>
+              <span><strong>初始化定位</strong> 室外/过渡且使用非本地坐标时优先验证 RTK 固定解；航向可用且漂移连续 3 个新样本严格小于 0.30 m 才通过，否则转入建图原点、航点和全局流程。</span>
+              <span><strong>主动重定位</strong> 静止搜索建图原点及周边，有合格候选即提交该阶段最优，其中稳定 NDT 分数严格小于 0.01 时提前结束；原点阶段无合格候选才尝试手选点/路线航点，仍无合格候选才全局匹配。</span>
+              <span><i class="legend-relocalization-dot"></i> 紫色标记仅记录终态中的严格优选位置：RTK 漂移验证通过，或最优 NDT 位姿已提交且分数严格小于 0.01；不表示 FAST-LIO 已完成稳定接管。</span>
             </div>
             <div v-if="initialPoseMode || manualInitialPose" class="initial-pose-panel">
               <div class="initial-pose-guide">
