@@ -62,7 +62,13 @@ class SafetyPolicy:
                 return
             time.sleep(min(0.2, still_needed))
 
-    def validate_task_start(self, envelope: MessageEnvelope, has_active_task: bool) -> None:
+    def validate_task_start(
+        self,
+        envelope: MessageEnvelope,
+        has_active_task: bool,
+        *,
+        allow_manual_takeover_release: bool = False,
+    ) -> None:
         if has_active_task:
             raise ProtocolError("ROBOT_BUSY", "another motion task is active")
         smart_initialize = bool((envelope.payload.get("command") or {}).get("smart_initialize", True))
@@ -79,7 +85,7 @@ class SafetyPolicy:
             raise ProtocolError("NAV_STACK_NOT_READY", "FollowWaypoints action server is unavailable")
         if self.state.emergency_stop:
             raise ProtocolError("EMERGENCY_STOP_ACTIVE", "emergency stop is active")
-        if self.state.control_mode == "manual_takeover":
+        if self.state.control_mode == "manual_takeover" and not allow_manual_takeover_release:
             raise ProtocolError("MANUAL_TAKEOVER_ACTIVE", "manual takeover is active")
         if (
             self.state.power_available

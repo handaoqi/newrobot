@@ -116,7 +116,16 @@ class CommandProcessor:
                     },
                     envelope=envelope,
                 )
-                self.safety.validate_task_start(envelope, self.task_executor.has_active_task())
+                # A deliberate navigation start is an explicit request to hand
+                # motion authority back to autonomy.  Validate every hard
+                # interlock first; only then release an existing operator
+                # session, so a rejected task cannot unexpectedly cancel it.
+                self.safety.validate_task_start(
+                    envelope,
+                    self.task_executor.has_active_task(),
+                    allow_manual_takeover_release=True,
+                )
+                self._release_manual_control_for_task()
                 # The acknowledgement must carry the same task version sequence
                 # as task.started/task.progress.  Previously it reused a
                 # completed task's stale version, causing progress events to be
@@ -894,6 +903,29 @@ class CommandProcessor:
         result = adapter.manual_assist_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
         result["mode"] = "manual_assist"
         return result
+
+    def _release_manual_control_for_task(self) -> None:
+        """Make a task.start an explicit, safe hand-back to autonomous motion.
+
+        This is intentionally invoked only after all task-start interlocks
+        have passed.  `manual_takeover` needs a direct zero command followed by
+        a confirmed SDK release.  `manual_assist` has no SDK ownership, but a
+        zero assist sample prevents a stale short-lived assist command from
+        carrying into the new route.
+        """
+        mode = self.safety.state.control_mode
+        if mode not in {"manual_assist", "manual_takeover"}:
+            return
+        adapter = self.localization_adapter
+        if not adapter:
+            raise ProtocolError("TELEOP_UNAVAILABLE", "teleop adapter is not configured")
+        if mode == "manual_assist":
+            adapter.manual_assist_velocity(0.0, 0.0, 0.0)
+        else:
+            adapter.teleop_velocity(0.0, 0.0, 0.0)
+            adapter.release_to_remote_control()
+        self.safety.state.control_mode = "autonomous"
+        LOGGER.info("released %s for explicit navigation task start", mode)
 
     def _complete_skill(self, envelope: MessageEnvelope, started_at: str, outcome: dict) -> None:
         """Publish the terminal result after the asynchronous local skill ends."""
