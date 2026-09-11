@@ -33,6 +33,27 @@ TEST(LioMotionGuard, RejectsSingleFrameYawJump)
   EXPECT_EQ(result.reason, "yaw_step_exceeded");
 }
 
+TEST(LioMotionGuard, AcceptsObservedTurnWithProductionLimits)
+{
+  // This reproduces the safe turn accumulated across a ~400 ms NDT callback.
+  // The optimized hard cap no longer rejects it solely because registration
+  // delayed the consumer; the node now observes the source at native 10 Hz.
+  const auto result = localization::evaluateLioMotion(
+    {0.0, 1000000000LL}, {13.0 * kDeg, 1400000000LL},
+    30.0 * kDeg, 60.0 * kDeg);
+  EXPECT_FALSE(result.anomaly);
+  EXPECT_NEAR(result.yaw_rate_radps, 32.5 * kDeg, 1.0e-6);
+}
+
+TEST(LioMotionGuard, ProductionHardCapStillRejectsDiscontinuity)
+{
+  const auto result = localization::evaluateLioMotion(
+    {0.0, 1000000000LL}, {31.0 * kDeg, 1600000000LL},
+    30.0 * kDeg, 60.0 * kDeg);
+  EXPECT_TRUE(result.anomaly);
+  EXPECT_EQ(result.reason, "yaw_step_exceeded");
+}
+
 TEST(LioMotionGuard, RejectsYawRateJump)
 {
   const auto result = localization::evaluateLioMotion(
