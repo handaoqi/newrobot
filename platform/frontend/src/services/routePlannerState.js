@@ -130,6 +130,10 @@ export function resolveMapClickAction(mode, initialPoseMode = false) {
   return mode === 'inspect' ? 'inspect' : 'waypoint'
 }
 
+export function shouldShowBoundaryPolicyStatus(boundaryEditing, boundary) {
+  return boundaryEditing === true || Boolean(boundary?.outer_polygon?.length)
+}
+
 /** A retained `normal` label is reusable only while the live stack and samples agree. */
 export function localizationReadyForReuse({
   mapMatches,

@@ -18,6 +18,7 @@ import {
   rtkPositionTypeLabel,
   rtkQualityLabel,
   rtkSolutionStatusLabel,
+  shouldShowBoundaryPolicyStatus,
 } from '../src/services/routePlannerState.js'
 
 test('heading input is normalized and converted only when valid', () => {
@@ -49,6 +50,16 @@ test('map click mode has one explicit action and initial pose takes precedence',
   assert.equal(resolveMapClickAction('waypoint'), 'waypoint')
   assert.equal(resolveMapClickAction('inspect'), 'inspect')
   assert.equal(resolveMapClickAction('waypoint', true), 'initial_pose')
+})
+
+test('unconfigured boundary status appears only after boundary editing is selected', () => {
+  const unconfigured = { outer_polygon: [] }
+  assert.equal(shouldShowBoundaryPolicyStatus(false, null), false)
+  assert.equal(shouldShowBoundaryPolicyStatus(false, unconfigured), false)
+  assert.equal(shouldShowBoundaryPolicyStatus(true, unconfigured), true)
+  assert.equal(shouldShowBoundaryPolicyStatus(false, {
+    outer_polygon: [[0, 0], [1, 0], [0, 1]],
+  }), true)
 })
 
 test('retained normal localization is not reused when the stack or samples are stale', () => {

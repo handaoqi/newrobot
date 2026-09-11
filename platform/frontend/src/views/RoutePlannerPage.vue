@@ -49,6 +49,7 @@ import {
   rtkPositionTypeLabel,
   rtkQualityLabel,
   rtkSolutionStatusLabel,
+  shouldShowBoundaryPolicyStatus,
 } from '../services/routePlannerState'
 import {
   buildLocalizationLossMarkers,
@@ -3634,7 +3635,10 @@ async function handleDeleteRoute(route) {
                   <span v-if="rtkEnuOrigin" class="map-origin-legend-item"><i class="map-origin-legend-icon map-origin-legend-rtk"><b>R</b></i>RTK原点R</span>
                 </span>
               </div>
-              <div :class="['boundary-policy-status', boundaryStatusPresentation().tone]">
+              <div
+                v-if="shouldShowBoundaryPolicyStatus(boundaryEditing, boundaryConfig)"
+                :class="['boundary-policy-status', boundaryStatusPresentation().tone]"
+              >
                 <strong>{{ boundaryStatusPresentation().title }}</strong>
                 <span>{{ boundaryStatusPresentation().detail }}</span>
                 <div class="boundary-legend" aria-label="导航区域图例">
