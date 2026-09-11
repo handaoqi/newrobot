@@ -2375,7 +2375,11 @@ private:
     rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
       (force_correction || !rtk_drift_gate_.correction_latched);
     CorrectionSelection selection;
-    if (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "ndt") {
+    const bool ukf_high_quality_ndt = effective_mode == CorrectionPolicyMode::ukf &&
+      !rtk_ready && match && ndt.eligible && match->fitness_score_ < 0.08f;
+    if (ukf_high_quality_ndt) {
+      selection = CorrectionSelection{CorrectionSource::ndt, "ukf_high_quality_ndt"};
+    } else if (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "ndt") {
       selection = ndt.eligible
         ? CorrectionSelection{CorrectionSource::ndt, "ukf_policy_prefer_ndt"}
         : CorrectionSelection{};

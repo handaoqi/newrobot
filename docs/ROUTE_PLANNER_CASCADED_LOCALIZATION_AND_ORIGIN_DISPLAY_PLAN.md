@@ -2,7 +2,7 @@
 
 ## UKF 航点校正门控（2026-09-11）
 
-UKF 航点校正按以下顺序处理：固定 RTK 合格时优先 RTK；无固定解时，浮点 RTK 与当前位置偏差不超过 `0.20 m` 且 NDT score `< 0.40` 时按观测噪声权重融合；否则 NDT score `< 0.40` 可单独校正。当浮点 RTK 偏差 `> 0.20 m` 且 NDT score `>= 0.40` 时，标记 `ukf_no_correction_sources_meet_gate`，保持当前 UKF/LIO 结果并继续后续处理，不等待 RTK 固定解。该放行仅适用于 UKF 航点校正，不改变 RTK 固定解作为连续导航主源的安全门槛。
+UKF 航点校正按以下顺序处理：固定 RTK 合格时优先 RTK；无固定解且 NDT score `< 0.08` 时立即选择 NDT 校正并记录 `ukf_high_quality_ndt`；浮点 RTK 与当前位置偏差不超过 `0.20 m` 且 NDT score `< 0.40` 时按观测噪声权重融合；其他 NDT score `< 0.40` 的候选可单独校正。当浮点 RTK 偏差 `> 0.20 m` 且 NDT score `>= 0.40` 时，标记 `ukf_no_correction_sources_meet_gate`，保持当前 UKF/LIO 结果并继续后续处理，不等待 RTK 固定解。该放行仅适用于 UKF 航点校正，不改变 RTK 固定解作为连续导航主源的安全门槛。
 
 ## 目标
 
