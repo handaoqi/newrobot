@@ -39,6 +39,65 @@ from .services.alert_skill_service import resolve_alert_template
 ResponsePublisher = Callable[[str, dict, int, bool], None]
 LOGGER = logging.getLogger(__name__)
 
+_TELEMETRY_AUDIT_FIELDS = (
+    "sampled_at",
+    "state_version",
+    "pose",
+    "power",
+    "network",
+    "audio",
+    "storage",
+    "runtime",
+    "current_map",
+    "map_set",
+)
+_LOCALIZATION_AUDIT_FIELDS = (
+    "sampled_at",
+    "fresh",
+    "sample_age_seconds",
+    "status",
+    "source_status",
+    "coord_type",
+    "quality",
+    "decision",
+    "recovery",
+    "imu_cross_check",
+    "time_diagnostics",
+)
+_MAPPING_AUDIT_FIELDS = (
+    "state",
+    "process_alive",
+    "save_progress",
+    "rtk_alignment",
+    "readiness",
+    "ready_for_motion",
+    "ready_for_save",
+    "optimization",
+    "origin",
+    "global_enu",
+    "origin_status",
+    "mapping_type",
+    "slam_process_alive",
+    "slam_warmup",
+    "mapping_capture_enabled",
+    "imu_initialized",
+    "slam_pose_ready",
+    "ready_for_mapping",
+    "odometry",
+)
+_POWER_MODE_AUDIT_FIELDS = (
+    "mode",
+    "transition_state",
+    "auto_charge_enabled",
+    "last_error",
+    "updated_at",
+    "last_warning",
+    "reboot_required",
+    "leg_power_state",
+    "charge_stage",
+    "charge_stage_detail",
+)
+
 
 def _public_media_url(saved_path: str) -> str:
     base_url = str(getattr(settings, "PUBLIC_BASE_URL", "") or "").rstrip("/")
@@ -264,14 +323,51 @@ def _event_time(payload: dict, *keys: str):
     return timezone.now()
 
 
-def _inbound_defaults(topic: str, envelope: MessageEnvelope, robot: Robot) -> dict:
+def _selected_fields(value, fields: tuple[str, ...]) -> dict:
+    value = value if isinstance(value, dict) else {}
+    return {field: value[field] for field in fields if field in value}
+
+
+def _telemetry_audit_payload(envelope: MessageEnvelope, *, preserve_full: bool = False) -> dict:
+    """Keep status audit rows useful without duplicating every large snapshot."""
+
+    if envelope.message_type != "telemetry.status" or preserve_full:
+        return envelope.raw
+    sample_every = int(getattr(settings, "INBOUND_TELEMETRY_FULL_PAYLOAD_SAMPLE_EVERY", 150))
+    keep_full_sample = sample_every > 0 and envelope.message_id.int % sample_every == 0
+    raw = dict(envelope.raw)
+    if keep_full_sample:
+        raw["_archive"] = {"payload_mode": "full_sample", "sample_every": sample_every}
+        return raw
+
+    payload = envelope.payload
+    compact_payload = _selected_fields(payload, _TELEMETRY_AUDIT_FIELDS)
+    compact_payload["localization"] = _selected_fields(payload.get("localization"), _LOCALIZATION_AUDIT_FIELDS)
+    compact_payload["mapping"] = _selected_fields(payload.get("mapping"), _MAPPING_AUDIT_FIELDS)
+    navigation = dict(payload.get("navigation") or {})
+    navigation.pop("global_plan", None)
+    compact_payload["navigation"] = navigation
+    compact_payload["sensors"] = dict(payload.get("sensors") or {})
+    compact_payload["power_mode"] = _selected_fields(payload.get("power_mode"), _POWER_MODE_AUDIT_FIELDS)
+    raw["payload"] = compact_payload
+    raw["_archive"] = {"payload_mode": "compact", "sample_every": sample_every}
+    return raw
+
+
+def _inbound_defaults(
+    topic: str,
+    envelope: MessageEnvelope,
+    robot: Robot,
+    *,
+    preserve_full: bool = False,
+) -> dict:
     return {
         "robot": robot,
         "session_id": uuid.UUID(envelope.session_id),
         "message_type": envelope.message_type,
         "sequence": envelope.sequence,
         "topic": topic,
-        "raw_payload": envelope.raw,
+        "raw_payload": _telemetry_audit_payload(envelope, preserve_full=preserve_full),
     }
 
 
@@ -301,7 +397,7 @@ def _persist_inbound_failure(
             InboundMessage.objects.update_or_create(
                 message_id=envelope.message_id,
                 defaults={
-                    **_inbound_defaults(topic, envelope, robot),
+                    **_inbound_defaults(topic, envelope, robot, preserve_full=True),
                     "process_status": "failed",
                     "error_message": str(exc),
                     "processed_at": timezone.now(),

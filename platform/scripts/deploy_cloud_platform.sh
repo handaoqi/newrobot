@@ -129,6 +129,7 @@ if "$DEPLOY_BACKEND"; then
 set -euo pipefail
 remote_root="$1"
 services=(
+  roamerx-patrol-loop-supervisor.service
   roamerx-patrol-scheduler.service
   roamerx-device-worker.service
   roamerx-center-api.service

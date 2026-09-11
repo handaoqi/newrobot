@@ -14,6 +14,7 @@ from .models import (
     RobotSession,
     RobotStatusLatest,
     RobotTelemetry,
+    RobotTelemetryDailySummary,
     TaskExecution,
     TrajectoryPoint,
     ScheduleRun,
@@ -64,6 +65,12 @@ class ScheduleRunAdmin(admin.ModelAdmin):
 class RobotTelemetryAdmin(admin.ModelAdmin):
     list_display = ("robot", "sequence_id", "position_name", "battery_level", "reported_at")
     search_fields = ("robot__code", "sequence_id", "position_name")
+
+
+@admin.register(RobotTelemetryDailySummary)
+class RobotTelemetryDailySummaryAdmin(admin.ModelAdmin):
+    list_display = ("robot", "day", "sample_count", "active_seconds", "distance_km")
+    list_filter = ("day", "robot")
 
 
 @admin.register(RobotSession)

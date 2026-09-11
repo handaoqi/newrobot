@@ -10,6 +10,8 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--retention-days", type=int, help="Processed/ignored packet retention; 0 disables.")
+        parser.add_argument("--telemetry-retention-days", type=int, help="telemetry.status retention; 0 disables.")
+        parser.add_argument("--operational-retention-days", type=int, help="Other terminal packet retention; 0 disables.")
         parser.add_argument("--failed-retention-days", type=int, help="Failed packet retention; 0 disables.")
         parser.add_argument("--batch-size", type=int, help="Maximum rows per status group in one batch.")
         parser.add_argument("--max-batches", type=int, default=1, help="Number of bounded batches to run.")
@@ -29,6 +31,8 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         kwargs = {
             "retention_days": options["retention_days"],
+            "telemetry_retention_days": options["telemetry_retention_days"],
+            "operational_retention_days": options["operational_retention_days"],
             "failed_retention_days": options["failed_retention_days"],
             "batch_size": options["batch_size"],
             "dry_run": bool(options["dry_run"]),
@@ -54,6 +58,7 @@ class Command(BaseCommand):
             result, batches = totals, ran
         mode = "eligible" if options["dry_run"] else "deleted"
         self.stdout.write(
-            f"Inbound message retention {mode}: processed_or_ignored={result.processed_deleted}, "
+            f"Inbound message retention {mode}: telemetry_status={result.telemetry_deleted}, "
+            f"operational={result.operational_deleted}, processed_or_ignored={result.processed_deleted}, "
             f"failed={result.failed_deleted}, stale_pending={result.stale_pending_expired}, batches={batches}"
         )

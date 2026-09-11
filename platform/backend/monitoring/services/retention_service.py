@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timedelta
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from ..models import InboundMessage, SystemLog
+from ..models import InboundMessage, RobotTelemetry, RobotTelemetryDailySummary, SystemLog
 from .sqlite_retry import checkpoint_sqlite_wal, with_sqlite_lock_retry
 
 
@@ -18,6 +21,8 @@ class InboundMessagePruneResult:
     processed_deleted: int = 0
     failed_deleted: int = 0
     stale_pending_expired: int = 0
+    telemetry_deleted: int = 0
+    operational_deleted: int = 0
 
     @property
     def deleted(self) -> int:
@@ -28,6 +33,8 @@ class InboundMessagePruneResult:
             processed_deleted=self.processed_deleted + other.processed_deleted,
             failed_deleted=self.failed_deleted + other.failed_deleted,
             stale_pending_expired=self.stale_pending_expired + other.stale_pending_expired,
+            telemetry_deleted=self.telemetry_deleted + other.telemetry_deleted,
+            operational_deleted=self.operational_deleted + other.operational_deleted,
         )
 
 
@@ -77,16 +84,29 @@ class InboundMessageRetentionService:
         *,
         now=None,
         retention_days: int | None = None,
+        telemetry_retention_days: int | None = None,
+        operational_retention_days: int | None = None,
         failed_retention_days: int | None = None,
         batch_size: int | None = None,
         dry_run: bool = False,
         expire_stale_pending: bool = False,
     ) -> InboundMessagePruneResult:
         now = now or timezone.now()
-        retention_days = cls._days(
-            retention_days,
-            "INBOUND_MESSAGE_RETENTION_DAYS",
-        )
+        # ``retention_days`` remains a command/API compatibility override.  In
+        # normal scheduled runs, high-volume status packets and lower-volume
+        # operational events use separate windows.
+        if telemetry_retention_days is None:
+            telemetry_retention_days = (
+                int(retention_days)
+                if retention_days is not None
+                else cls._days(None, "INBOUND_MESSAGE_TELEMETRY_RETENTION_DAYS")
+            )
+        if operational_retention_days is None:
+            operational_retention_days = (
+                int(retention_days)
+                if retention_days is not None
+                else cls._days(None, "INBOUND_MESSAGE_OPERATIONAL_RETENTION_DAYS")
+            )
         failed_retention_days = cls._days(
             failed_retention_days,
             "INBOUND_MESSAGE_FAILED_RETENTION_DAYS",
@@ -101,11 +121,19 @@ class InboundMessageRetentionService:
         if expire_stale_pending:
             stale_pending_expired = cls.expire_stale_pending(now=now, dry_run=dry_run)
 
-        processed_deleted = cls._prune_statuses(
+        telemetry_deleted = cls._prune_statuses(
             statuses=cls.TERMINAL_STATUSES,
-            cutoff=cls._cutoff(now, retention_days),
+            cutoff=cls._cutoff(now, telemetry_retention_days),
             batch_size=batch_size,
             dry_run=dry_run,
+            message_types=("telemetry.status",),
+        )
+        operational_deleted = cls._prune_statuses(
+            statuses=cls.TERMINAL_STATUSES,
+            cutoff=cls._cutoff(now, operational_retention_days),
+            batch_size=batch_size,
+            dry_run=dry_run,
+            exclude_message_types=("telemetry.status",),
         )
         failed_deleted = cls._prune_statuses(
             statuses=("failed",),
@@ -114,9 +142,11 @@ class InboundMessageRetentionService:
             dry_run=dry_run,
         )
         return InboundMessagePruneResult(
-            processed_deleted=processed_deleted,
+            processed_deleted=telemetry_deleted + operational_deleted,
             failed_deleted=failed_deleted,
             stale_pending_expired=stale_pending_expired,
+            telemetry_deleted=telemetry_deleted,
+            operational_deleted=operational_deleted,
         )
 
     @classmethod
@@ -197,13 +227,26 @@ class InboundMessageRetentionService:
         return now - timezone.timedelta(days=days)
 
     @staticmethod
-    def _prune_statuses(*, statuses: tuple[str, ...], cutoff, batch_size: int, dry_run: bool) -> int:
+    def _prune_statuses(
+        *,
+        statuses: tuple[str, ...],
+        cutoff,
+        batch_size: int,
+        dry_run: bool,
+        message_types: tuple[str, ...] | None = None,
+        exclude_message_types: tuple[str, ...] | None = None,
+    ) -> int:
         if cutoff is None:
             return 0
         queryset = InboundMessage.objects.filter(
             process_status__in=statuses,
             received_at__lt=cutoff,
-        ).order_by("received_at")
+        )
+        if message_types:
+            queryset = queryset.filter(message_type__in=message_types)
+        if exclude_message_types:
+            queryset = queryset.exclude(message_type__in=exclude_message_types)
+        queryset = queryset.order_by("received_at")
         if dry_run:
             return queryset.count()
         def delete_batch():
@@ -215,6 +258,202 @@ class InboundMessageRetentionService:
                 return deleted
 
         return with_sqlite_lock_retry(delete_batch, label="inbound message retention")
+
+
+@dataclass(frozen=True)
+class RobotTelemetryPruneResult:
+    details_deleted: int = 0
+    summaries_written: int = 0
+
+    def plus(self, other: "RobotTelemetryPruneResult") -> "RobotTelemetryPruneResult":
+        return RobotTelemetryPruneResult(
+            details_deleted=self.details_deleted + other.details_deleted,
+            summaries_written=self.summaries_written + other.summaries_written,
+        )
+
+
+class RobotTelemetryRetentionService:
+    """Archive completed local days, then remove their detailed telemetry."""
+
+    @classmethod
+    def prune_once(
+        cls,
+        *,
+        now=None,
+        retention_days: int | None = None,
+        max_days: int | None = None,
+        dry_run: bool = False,
+    ) -> RobotTelemetryPruneResult:
+        now = now or timezone.now()
+        retention_days = max(
+            1,
+            int(
+                retention_days
+                if retention_days is not None
+                else getattr(settings, "ROBOT_TELEMETRY_RETENTION_DAYS", 14)
+            ),
+        )
+        max_days = max(
+            1,
+            int(
+                max_days
+                if max_days is not None
+                else getattr(settings, "ROBOT_TELEMETRY_CLEANUP_DAYS_PER_RUN", 1)
+            ),
+        )
+        local_tz = timezone.get_current_timezone()
+        cutoff_day = timezone.localdate(now) - timedelta(days=retention_days)
+        cutoff = timezone.make_aware(datetime.combine(cutoff_day, datetime_time.min), local_tz)
+        eligible = RobotTelemetry.objects.filter(reported_at__lt=cutoff)
+        if dry_run:
+            return RobotTelemetryPruneResult(details_deleted=eligible.count())
+
+        total = RobotTelemetryPruneResult()
+        for _ in range(max_days):
+            candidate = eligible.order_by("reported_at").values_list("robot_id", "reported_at").first()
+            if candidate is None:
+                break
+            robot_id, reported_at = candidate
+            day = timezone.localtime(reported_at, local_tz).date()
+            result = with_sqlite_lock_retry(
+                lambda robot_id=robot_id, day=day: cls._archive_and_delete_day(
+                    robot_id=robot_id,
+                    day=day,
+                    local_tz=local_tz,
+                ),
+                label="robot telemetry daily archive",
+            )
+            total = total.plus(result)
+        return total
+
+    @classmethod
+    def prune_until_done(
+        cls,
+        *,
+        now=None,
+        max_days: int | None = None,
+        time_budget_seconds: float | None = None,
+        checkpoint: bool = False,
+        **kwargs,
+    ) -> tuple[RobotTelemetryPruneResult, int]:
+        now = now or timezone.now()
+        max_days = max(
+            1,
+            int(
+                max_days
+                if max_days is not None
+                else getattr(settings, "ROBOT_TELEMETRY_WEEKLY_CLEANUP_MAX_DAYS", 10_000)
+            ),
+        )
+        if time_budget_seconds is None:
+            time_budget_seconds = float(
+                getattr(settings, "ROBOT_TELEMETRY_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS", 600)
+            )
+        started = time.monotonic()
+        total = RobotTelemetryPruneResult()
+        batches = 0
+        dry_run = bool(kwargs.get("dry_run"))
+        for _ in range(max_days):
+            if time_budget_seconds and time.monotonic() - started >= time_budget_seconds:
+                break
+            result = cls.prune_once(now=now, max_days=1, **kwargs)
+            batches += 1
+            total = total.plus(result)
+            if dry_run or result.details_deleted == 0:
+                break
+        if checkpoint and not dry_run:
+            checkpoint_sqlite_wal()
+        return total, batches
+
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+        radius_km = 6371.0088
+        phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
+        delta_phi = math.radians(float(lat2) - float(lat1))
+        delta_lambda = math.radians(float(lon2) - float(lon1))
+        value = (
+            math.sin(delta_phi / 2) ** 2
+            + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+        )
+        return radius_km * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1 - value)))
+
+    @classmethod
+    def _archive_and_delete_day(cls, *, robot_id: int, day, local_tz) -> RobotTelemetryPruneResult:
+        day_start = timezone.make_aware(datetime.combine(day, datetime_time.min), local_tz)
+        day_end = day_start + timedelta(days=1)
+        with transaction.atomic():
+            queryset = RobotTelemetry.objects.select_for_update().filter(
+                robot_id=robot_id,
+                reported_at__gte=day_start,
+                reported_at__lt=day_end,
+            )
+            rows = list(
+                queryset.order_by("reported_at", "id").values_list(
+                    "reported_at", "latitude", "longitude"
+                )
+            )
+            if not rows:
+                return RobotTelemetryPruneResult()
+
+            distance_km = 0.0
+            first_point = None
+            last_point = None
+            previous = None
+            for _, latitude, longitude in rows:
+                if latitude is None or longitude is None:
+                    continue
+                point = (latitude, longitude)
+                if first_point is None:
+                    first_point = point
+                if previous is not None:
+                    distance_km += cls._haversine_km(*previous, *point)
+                previous = point
+                last_point = point
+
+            first_reported_at = rows[0][0]
+            last_reported_at = rows[-1][0]
+            summary = RobotTelemetryDailySummary.objects.select_for_update().filter(
+                robot_id=robot_id, day=day
+            ).first()
+            if summary is not None:
+                if summary.last_reported_at <= first_reported_at and summary.last_latitude is not None and first_point:
+                    distance_km += cls._haversine_km(
+                        summary.last_latitude, summary.last_longitude, *first_point
+                    )
+                elif last_reported_at <= summary.first_reported_at and last_point and summary.first_latitude is not None:
+                    distance_km += cls._haversine_km(
+                        *last_point, summary.first_latitude, summary.first_longitude
+                    )
+                first_is_new = first_reported_at < summary.first_reported_at
+                last_is_new = last_reported_at > summary.last_reported_at
+                first_reported_at = min(first_reported_at, summary.first_reported_at)
+                last_reported_at = max(last_reported_at, summary.last_reported_at)
+                summary.sample_count += len(rows)
+                summary.first_reported_at = first_reported_at
+                summary.last_reported_at = last_reported_at
+                summary.active_seconds = max(0, int((last_reported_at - first_reported_at).total_seconds()))
+                summary.distance_km += Decimal(str(round(distance_km, 6)))
+                if first_is_new and first_point:
+                    summary.first_latitude, summary.first_longitude = first_point
+                if last_is_new and last_point:
+                    summary.last_latitude, summary.last_longitude = last_point
+                summary.save()
+            else:
+                RobotTelemetryDailySummary.objects.create(
+                    robot_id=robot_id,
+                    day=day,
+                    sample_count=len(rows),
+                    first_reported_at=first_reported_at,
+                    last_reported_at=last_reported_at,
+                    active_seconds=max(0, int((last_reported_at - first_reported_at).total_seconds())),
+                    distance_km=Decimal(str(round(distance_km, 6))),
+                    first_latitude=first_point[0] if first_point else None,
+                    first_longitude=first_point[1] if first_point else None,
+                    last_latitude=last_point[0] if last_point else None,
+                    last_longitude=last_point[1] if last_point else None,
+                )
+            deleted, _ = queryset.delete()
+            return RobotTelemetryPruneResult(details_deleted=deleted, summaries_written=1)
 
 
 @dataclass(frozen=True)

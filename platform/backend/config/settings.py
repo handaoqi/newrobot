@@ -151,8 +151,29 @@ LOW_BATTERY_REARM_PERCENT = int(os.getenv("LOW_BATTERY_REARM_PERCENT", "25"))
 # Raw MQTT packets exist for short-term de-duplication and troubleshooting;
 # their business results are persisted separately.  Keep terminal packet data
 # bounded so a high-rate robot cannot exhaust the SQLite volume.
+# The legacy all-terminal window remains available for one-off management
+# command overrides. Scheduled cleanup uses the type-specific windows below.
 INBOUND_MESSAGE_RETENTION_DAYS = int(os.getenv("INBOUND_MESSAGE_RETENTION_DAYS", "30"))
+INBOUND_MESSAGE_TELEMETRY_RETENTION_DAYS = int(
+    os.getenv("INBOUND_MESSAGE_TELEMETRY_RETENTION_DAYS", "3")
+)
+INBOUND_MESSAGE_OPERATIONAL_RETENTION_DAYS = int(
+    os.getenv("INBOUND_MESSAGE_OPERATIONAL_RETENTION_DAYS", "30")
+)
 INBOUND_MESSAGE_FAILED_RETENTION_DAYS = int(os.getenv("INBOUND_MESSAGE_FAILED_RETENTION_DAYS", "180"))
+INBOUND_TELEMETRY_FULL_PAYLOAD_SAMPLE_EVERY = max(
+    0, int(os.getenv("INBOUND_TELEMETRY_FULL_PAYLOAD_SAMPLE_EVERY", "150"))
+)
+ROBOT_TELEMETRY_RETENTION_DAYS = max(1, int(os.getenv("ROBOT_TELEMETRY_RETENTION_DAYS", "14")))
+ROBOT_TELEMETRY_CLEANUP_DAYS_PER_RUN = max(
+    1, int(os.getenv("ROBOT_TELEMETRY_CLEANUP_DAYS_PER_RUN", "1"))
+)
+ROBOT_TELEMETRY_WEEKLY_CLEANUP_MAX_DAYS = max(
+    1, int(os.getenv("ROBOT_TELEMETRY_WEEKLY_CLEANUP_MAX_DAYS", "10000"))
+)
+ROBOT_TELEMETRY_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS = max(
+    30, int(os.getenv("ROBOT_TELEMETRY_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS", "600"))
+)
 SYSTEM_LOG_DEBUG_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_DEBUG_RETENTION_DAYS", "7"))
 SYSTEM_LOG_INFO_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_INFO_RETENTION_DAYS", "30"))
 SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS", "180"))

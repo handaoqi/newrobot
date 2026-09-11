@@ -287,10 +287,13 @@ PLATFORM_OPERATOR_PASSWORD='<strong-password>' python manage.py initialize_platf
 
 ## 9. 数据清理建议
 
-生产环境不要删除整库。MQTT 入站审计表由 `run_patrol_scheduler` 按保留窗口清理：已处理/忽略报文默认 30 天，失败报文 180 天；卡住超过 7 天的 `pending` 行在周任务中标为失败。调度器每小时删除一小批，并在每周一 03:00（`Asia/Shanghai`）循环删除直到没有过期行或达到 10 分钟预算，随后对 SQLite 做 `WAL` checkpoint。手工排空可执行：
+生产环境不要删除整库。`run_patrol_scheduler` 使用分层保留策略：成功的 `telemetry.status` MQTT 审计包保留 3 天，任务、命令、告警等其他成功包保留 30 天，失败包保留 180 天；`pending` 不直接删除，卡住超过 7 天后先标为失败。状态包通常只存精简诊断字段，并按每 150 条抽样保存一份完整载荷；失败状态包始终保存完整载荷。
+
+业务遥测明细 `RobotTelemetry` 保留 14 天。清理时先按机器人和本地自然日写入 `RobotTelemetryDailySummary`（样本数、活跃时长、里程及首末位置），再在同一事务内删除该日明细。调度器每小时处理小批量数据，并在每周一 03:00（`Asia/Shanghai`）循环清理积压，随后对 SQLite 做 `WAL` checkpoint。手工排空可执行：
 
 ```bash
 python manage.py prune_inbound_messages --until-done --expire-stale-pending
+python manage.py prune_robot_telemetry --until-done
 ```
 
 开发演示时可删除：

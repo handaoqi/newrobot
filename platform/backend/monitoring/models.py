@@ -397,6 +397,9 @@ class RobotTelemetry(BaseTimestampModel):
 
     class Meta:
         ordering = ["-reported_at"]
+        indexes = [
+            models.Index(fields=["reported_at"], name="robottelemetry_reported_idx"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["robot", "session_id", "sequence_id"],
@@ -406,6 +409,34 @@ class RobotTelemetry(BaseTimestampModel):
 
     def __str__(self) -> str:
         return f"{self.robot.code}#{self.sequence_id}"
+
+
+class RobotTelemetryDailySummary(BaseTimestampModel):
+    """Daily business metrics retained after detailed telemetry expires."""
+
+    robot = models.ForeignKey(Robot, related_name="telemetry_daily_summaries", on_delete=models.CASCADE)
+    day = models.DateField()
+    sample_count = models.PositiveIntegerField(default=0)
+    first_reported_at = models.DateTimeField()
+    last_reported_at = models.DateTimeField()
+    active_seconds = models.PositiveBigIntegerField(default=0)
+    distance_km = models.DecimalField(max_digits=14, decimal_places=6, default=0)
+    first_latitude = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+    first_longitude = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+    last_latitude = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+    last_longitude = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+
+    class Meta:
+        ordering = ["-day", "robot_id"]
+        indexes = [
+            models.Index(fields=["day"], name="telemetry_summary_day_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["robot", "day"], name="uniq_robot_daily_telemetry"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.robot.code}@{self.day}"
 
 
 class MediaAsset(BaseTimestampModel):

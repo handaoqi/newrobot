@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from monitoring.services.retention_service import (
     InboundMessageRetentionService,
+    RobotTelemetryRetentionService,
     SystemLogRetentionService,
     weekly_cleanup_due,
 )
@@ -56,8 +57,9 @@ class Command(BaseCommand):
             result = InboundMessageRetentionService.prune_once(now=now)
             if result.deleted:
                 LOGGER.info(
-                    "pruned MQTT inbound packets: processed_or_ignored=%s failed=%s",
-                    result.processed_deleted,
+                    "pruned MQTT inbound packets: telemetry_status=%s operational=%s failed=%s",
+                    result.telemetry_deleted,
+                    result.operational_deleted,
                     result.failed_deleted,
                 )
         except Exception:
@@ -73,13 +75,23 @@ class Command(BaseCommand):
                 )
         except Exception:
             LOGGER.exception("system log retention scan failed")
+        try:
+            telemetry_result = RobotTelemetryRetentionService.prune_once(now=now)
+            if telemetry_result.details_deleted:
+                LOGGER.info(
+                    "archived robot telemetry: details=%s daily_summaries=%s",
+                    telemetry_result.details_deleted,
+                    telemetry_result.summaries_written,
+                )
+        except Exception:
+            LOGGER.exception("robot telemetry retention scan failed")
 
     def _run_weekly_retention(self, now) -> None:
         try:
             result, batches = InboundMessageRetentionService.prune_until_done(
                 now=now,
                 expire_stale_pending=True,
-                checkpoint=True,
+                checkpoint=False,
             )
             LOGGER.info(
                 "weekly MQTT inbound drain: processed_or_ignored=%s failed=%s "
@@ -91,3 +103,16 @@ class Command(BaseCommand):
             )
         except Exception:
             LOGGER.exception("weekly inbound message retention drain failed")
+        try:
+            telemetry_result, telemetry_batches = RobotTelemetryRetentionService.prune_until_done(
+                now=now,
+                checkpoint=True,
+            )
+            LOGGER.info(
+                "weekly robot telemetry drain: details=%s daily_summaries=%s batches=%s",
+                telemetry_result.details_deleted,
+                telemetry_result.summaries_written,
+                telemetry_batches,
+            )
+        except Exception:
+            LOGGER.exception("weekly robot telemetry retention drain failed")

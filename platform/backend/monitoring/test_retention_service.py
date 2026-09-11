@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 
-from .models import InboundMessage, Robot, SystemLog
+from .message_handlers import _telemetry_audit_payload
+from .models import InboundMessage, Robot, RobotTelemetry, RobotTelemetryDailySummary, SystemLog
+from .protocol import parse_message
 from .services.retention_service import (
     InboundMessageRetentionService,
+    RobotTelemetryRetentionService,
     SystemLogRetentionService,
     weekly_cleanup_due,
 )
@@ -17,6 +21,8 @@ from .services.retention_service import (
 
 @override_settings(
     INBOUND_MESSAGE_RETENTION_DAYS=30,
+    INBOUND_MESSAGE_TELEMETRY_RETENTION_DAYS=30,
+    INBOUND_MESSAGE_OPERATIONAL_RETENTION_DAYS=30,
     INBOUND_MESSAGE_FAILED_RETENTION_DAYS=180,
     INBOUND_MESSAGE_CLEANUP_BATCH_SIZE=2,
     INBOUND_MESSAGE_STALE_PENDING_DAYS=7,
@@ -26,12 +32,12 @@ class InboundMessageRetentionTests(TestCase):
         self.robot = Robot.objects.create(code="retention-rx", name="Retention RX", location="site", area="site")
         self.now = timezone.now()
 
-    def message(self, *, status: str, age_days: int):
+    def message(self, *, status: str, age_days: int, message_type: str = "telemetry.status"):
         return InboundMessage.objects.create(
             message_id=uuid.uuid4(),
             robot=self.robot,
             session_id=uuid.uuid4(),
-            message_type="telemetry.status",
+            message_type=message_type,
             topic="robots/retention-rx/telemetry",
             process_status=status,
             received_at=self.now - timezone.timedelta(days=age_days),
@@ -102,6 +108,109 @@ class InboundMessageRetentionTests(TestCase):
         fresh.refresh_from_db()
         self.assertEqual(stale.process_status, "failed")
         self.assertEqual(fresh.process_status, "pending")
+
+    @override_settings(
+        INBOUND_MESSAGE_TELEMETRY_RETENTION_DAYS=3,
+        INBOUND_MESSAGE_OPERATIONAL_RETENTION_DAYS=30,
+    )
+    def test_uses_short_status_and_long_operational_windows(self):
+        old_status = self.message(status="processed", age_days=4)
+        retained_event = self.message(status="processed", age_days=4, message_type="task.progress")
+        old_event = self.message(status="processed", age_days=31, message_type="alert.event")
+
+        result = InboundMessageRetentionService.prune_once(now=self.now, batch_size=10)
+
+        self.assertEqual(result.telemetry_deleted, 1)
+        self.assertEqual(result.operational_deleted, 1)
+        self.assertFalse(InboundMessage.objects.filter(pk__in=[old_status.pk, old_event.pk]).exists())
+        self.assertTrue(InboundMessage.objects.filter(pk=retained_event.pk).exists())
+
+
+@override_settings(INBOUND_TELEMETRY_FULL_PAYLOAD_SAMPLE_EVERY=150)
+class TelemetryAuditPayloadTests(SimpleTestCase):
+    def envelope(self, message_id: int):
+        value = {
+            "protocol_version": "1.0",
+            "message_id": str(uuid.UUID(int=message_id)),
+            "message_type": "telemetry.status",
+            "robot_id": "retention-rx",
+            "session_id": str(uuid.uuid4()),
+            "sent_at": "2026-09-11T06:00:00Z",
+            "trace_id": str(uuid.uuid4()),
+            "sequence": 1,
+            "payload": {
+                "sampled_at": "2026-09-11T06:00:00Z",
+                "state_version": 1,
+                "pose": {"x": 1, "y": 2},
+                "localization": {"status": "healthy", "raw_rtk": {"large": "value"}},
+                "mapping": {"state": "idle", "post_save_validation": {"large": "value"}},
+                "navigation": {"actual_forward_speed_mps": 0.1, "global_plan": [1, 2, 3]},
+                "sensors": {"lidar": {"healthy": True}},
+                "power_mode": {"mode": "normal", "services": {"large": "value"}},
+            },
+        }
+        return parse_message(value)
+
+    def test_compact_status_removes_large_repeated_sections(self):
+        archived = _telemetry_audit_payload(self.envelope(1))
+
+        self.assertEqual(archived["_archive"]["payload_mode"], "compact")
+        self.assertNotIn("post_save_validation", archived["payload"]["mapping"])
+        self.assertNotIn("raw_rtk", archived["payload"]["localization"])
+        self.assertNotIn("global_plan", archived["payload"]["navigation"])
+        self.assertNotIn("services", archived["payload"]["power_mode"])
+
+    def test_deterministic_sample_and_failure_keep_full_payload(self):
+        sampled = _telemetry_audit_payload(self.envelope(0))
+        failed = _telemetry_audit_payload(self.envelope(1), preserve_full=True)
+
+        self.assertEqual(sampled["_archive"]["payload_mode"], "full_sample")
+        self.assertIn("post_save_validation", sampled["payload"]["mapping"])
+        self.assertNotIn("_archive", failed)
+        self.assertIn("post_save_validation", failed["payload"]["mapping"])
+
+
+@override_settings(ROBOT_TELEMETRY_RETENTION_DAYS=14, ROBOT_TELEMETRY_CLEANUP_DAYS_PER_RUN=1)
+class RobotTelemetryRetentionTests(TestCase):
+    def setUp(self):
+        self.robot = Robot.objects.create(code="telemetry-retention-rx", name="Telemetry Retention RX")
+        self.now = datetime(2026, 9, 11, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def telemetry(self, sequence: int, reported_at, latitude, longitude):
+        return RobotTelemetry.objects.create(
+            robot=self.robot,
+            sequence_id=str(sequence),
+            position_name="site",
+            latitude=Decimal(str(latitude)),
+            longitude=Decimal(str(longitude)),
+            reported_at=reported_at,
+        )
+
+    def test_archives_complete_day_before_deleting_details(self):
+        old_day = self.now - timezone.timedelta(days=16)
+        first = self.telemetry(1, old_day.replace(hour=9, minute=0), 31.200000, 121.500000)
+        second = self.telemetry(2, old_day.replace(hour=9, minute=10), 31.201000, 121.500000)
+        recent = self.telemetry(3, self.now - timezone.timedelta(days=2), 31.202000, 121.500000)
+
+        result = RobotTelemetryRetentionService.prune_once(now=self.now)
+
+        self.assertEqual(result.details_deleted, 2)
+        self.assertEqual(result.summaries_written, 1)
+        self.assertFalse(RobotTelemetry.objects.filter(pk__in=[first.pk, second.pk]).exists())
+        self.assertTrue(RobotTelemetry.objects.filter(pk=recent.pk).exists())
+        summary = RobotTelemetryDailySummary.objects.get(robot=self.robot, day=old_day.date())
+        self.assertEqual(summary.sample_count, 2)
+        self.assertEqual(summary.active_seconds, 600)
+        self.assertGreater(summary.distance_km, 0)
+
+    def test_dry_run_does_not_create_summary_or_delete(self):
+        self.telemetry(1, self.now - timezone.timedelta(days=20), 31.2, 121.5)
+
+        result = RobotTelemetryRetentionService.prune_once(now=self.now, dry_run=True)
+
+        self.assertEqual(result.details_deleted, 1)
+        self.assertEqual(RobotTelemetry.objects.count(), 1)
+        self.assertFalse(RobotTelemetryDailySummary.objects.exists())
 
 
 @override_settings(
