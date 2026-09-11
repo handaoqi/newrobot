@@ -30,7 +30,6 @@
   <exec_depend>navigo_core</exec_depend>
   <exec_depend>navigo_costmap_2d</exec_depend>
   <exec_depend>navigo_map_server</exec_depend>
-  <exec_depend>nav2_smoother</exec_depend>
   <exec_depend>navigo_smoother</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <build_depend>robots_dog_msgs</build_depend>

@@ -8,8 +8,8 @@ namespace navigo_smoother
 void PassthroughSmoother::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name, std::shared_ptr<tf2_ros::Buffer>,
-  std::shared_ptr<nav2_costmap_2d::CostmapSubscriber>,
-  std::shared_ptr<nav2_costmap_2d::FootprintSubscriber>)
+  std::shared_ptr<navigo_costmap_2d::CostmapSubscriber>,
+  std::shared_ptr<navigo_costmap_2d::FootprintSubscriber>)
 {
   parent_ = parent;
   name_ = std::move(name);
@@ -26,4 +26,4 @@ bool PassthroughSmoother::smooth(nav_msgs::msg::Path &, const rclcpp::Duration &
 
 }  // namespace navigo_smoother
 
-PLUGINLIB_EXPORT_CLASS(navigo_smoother::PassthroughSmoother, nav2_core::Smoother)
+PLUGINLIB_EXPORT_CLASS(navigo_smoother::PassthroughSmoother, navigo_core::Smoother)

@@ -1,6 +1,13 @@
+<class_libraries>
+<library path="navigo_simple_smoother">
+  <class type="navigo_smoother::SimpleSmoother" base_class_type="navigo_core::Smoother">
+    <description>Collision-checked iterative smoother using navigo_costmap_2d.</description>
+  </class>
+</library>
 <library path="navigo_passthrough_smoother">
   <class type="navigo_smoother::PassthroughSmoother"
-         base_class_type="nav2_core::Smoother">
+         base_class_type="navigo_core::Smoother">
     <description>Returns the planner path unchanged for precision and RTK legs.</description>
   </class>
 </library>
+</class_libraries>

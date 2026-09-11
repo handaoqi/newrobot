@@ -10,13 +10,17 @@
       <PipelineSequence name="NavigateWithReplanning">
         <PlannerSelector selected_planner="{selected_planner}" default_planner="ThetaStar" topic_name="/planner_selector"/>
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="/controller_selector"/>
+        <SmootherSelector selected_smoother="{selected_smoother}" default_smoother="simple_smoother" topic_name="/smoother_selector"/>
         <RateController hz="1.0">
-          <!-- Use the planner path directly.  The system Nav2 smoother is ABI
-               incompatible with the workspace's navigo_costmap_2d overlay. -->
-          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </RecoveryNode>
+          <Sequence name="PlanAndSmoothPath">
+            <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+            <ForceSuccess name="SmoothPathOrUseRaw">
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="{selected_smoother}" max_smoothing_duration="0.25" check_for_collisions="true"/>
+            </ForceSuccess>
+          </Sequence>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
           <FollowPath path="{path}" controller_id="{selected_controller}"/>

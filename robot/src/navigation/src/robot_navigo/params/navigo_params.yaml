@@ -401,7 +401,7 @@ smoother_server:
     use_sim_time: False
     smoother_plugins: [ "simple_smoother", "passthrough_smoother" ]
     simple_smoother:
-      plugin: "nav2_smoother::SimpleSmoother"
+      plugin: "navigo_smoother::SimpleSmoother"
       tolerance: 1.0e-6
       max_its: 200
       w_data: 0.2
