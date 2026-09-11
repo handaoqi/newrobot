@@ -4846,8 +4846,8 @@ class PatrolLoopSessionActionView(APIView):
         try:
             if self.action == "pause":
                 session = PatrolLoopService.pause(session, operator)
-            elif self.action == "resume":
-                session = PatrolLoopService.resume(session)
+            elif self.action in {"resume", "continue"}:
+                session = PatrolLoopService.continue_recovery(session)
             else:
                 session = PatrolLoopService.stop(session, operator)
         except (PatrolLoopError, TaskStateError) as exc:
@@ -4861,6 +4861,10 @@ class PatrolLoopSessionPauseView(PatrolLoopSessionActionView):
 
 class PatrolLoopSessionResumeView(PatrolLoopSessionActionView):
     action = "resume"
+
+
+class PatrolLoopSessionContinueView(PatrolLoopSessionActionView):
+    action = "continue"
 
 
 class PatrolLoopSessionStopView(PatrolLoopSessionActionView):

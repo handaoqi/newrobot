@@ -312,14 +312,14 @@ class TaskExecutor:
         arrival_adjust_clearance_lookahead_m: float | None = None,
         arrival_adjust_speed_mps: float = 0.08,
         arrival_adjust_yaw_rate_rps: float = 0.10,
-        arrival_adjust_timeout_seconds: float = 30.0,
+        arrival_adjust_timeout_seconds: float = 45.0,
         arrival_adjust_scan_max_age_seconds: float = 0.50,
         arrival_adjust_safety_grace_seconds: float = 2.0,
         arrival_micro_adjust_mode: str = "cmd_vel",
         arrival_micro_adjust_max_initial_error_m: float = 0.45,
-        arrival_micro_adjust_total_budget_m: float = 0.60,
+        arrival_micro_adjust_total_budget_m: float = 0.90,
         arrival_micro_adjust_step_m: float = 0.15,
-        arrival_micro_adjust_max_steps: int = 4,
+        arrival_micro_adjust_max_steps: int = 6,
         arrival_micro_goal_tolerance_m: float = 0.15,
         arrival_ndt_max_fitness_score: float = 0.45,
         arrival_convergence_samples: int = 3,
@@ -2422,6 +2422,55 @@ class TaskExecutor:
             self._persist()
         return advanced
 
+    def _confirm_and_skip_loop_anchor(self, previous_terminal: dict | None) -> int:
+        """Skip a repeated loop anchor only after a fresh full arrival check.
+
+        A route such as A-B-C-A finishes each round already at the next
+        round's first click.  Treating that click as a normal arrival would
+        replay its speech, actions and dwell.  This is deliberately separate
+        from reverse-start skipping: it applies only at a newly created loop
+        round and emits a dedicated audit event instead of ``waypoint_reached``.
+        """
+        if not self.context or self._is_docking_task() or not previous_terminal:
+            return 0
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if len(waypoints) < 2:
+            return 0
+        terminal_xy = _waypoint_xy(previous_terminal)
+        anchor_xy = _waypoint_xy(waypoints[0])
+        if terminal_xy is None or anchor_xy is None:
+            return 0
+        if hypot(terminal_xy[0] - anchor_xy[0], terminal_xy[1] - anchor_xy[1]) > WAYPOINT_COLOCATION_M:
+            return 0
+        if not self._arrival_pose_is_stable(waypoints[0], 0):
+            LOGGER.info(
+                "loop round %d anchor confirmation failed; dispatching waypoint 0 normally",
+                self.context.round_number,
+            )
+            return 0
+
+        self.context.current_waypoint_index = 1
+        self.context.state_version += 1
+        # Keep transport-side monotonic indices coherent, without producing a
+        # business arrival event or invoking post-arrival side effects.
+        self._last_target_index = 0
+        self._last_reached_index = 0
+        self._persist()
+        self._emit(
+            "task.loop_anchor_confirmed",
+            extra={
+                "round_number": self.context.round_number,
+                "skipped_waypoint_index": 0,
+                "skipped_waypoint_id": waypoints[0].get("waypoint_id"),
+                "next_waypoint_index": 1,
+            },
+        )
+        LOGGER.info(
+            "loop round %d confirmed repeated anchor waypoint 0; dispatching waypoint 1",
+            self.context.round_number,
+        )
+        return 1
+
     def _send_from(self, index: int) -> None:
         # Face the travel direction before every cruise leg. Restart, obstacle
         # redispatch, and localization recovery all enter here and previously
@@ -3420,15 +3469,23 @@ class TaskExecutor:
         if distance is None:
             return False
         xy_tolerance, _ = self._arrival_pose_tolerances(waypoint, reached_index)
-        if distance <= xy_tolerance or distance > self.arrival_micro_adjust_max_initial_error_m:
-            LOGGER.warning(
-                "waypoint %d post-yaw offset %.2fm outside bounded micro-adjust window (%.2f, %.2f]",
+        if distance <= xy_tolerance:
+            return False
+        # Do not reject a valid post-yaw residual solely because it is larger
+        # than the legacy initial-error setting.  This controller is bounded
+        # by *actual observed travel*, segment count, timeout, fresh
+        # localization and directional clearance.  In particular a 0.675 m
+        # residual may need only 0.375 m of safe travel to re-enter the
+        # ordinary 0.30 m arrival tolerance.
+        if distance > self.arrival_micro_adjust_max_initial_error_m:
+            LOGGER.info(
+                "waypoint %d post-yaw XY residual %.3fm exceeds legacy initial "
+                "micro-adjust value %.3fm; proceeding under travel budget %.3fm",
                 reached_index,
                 distance,
-                xy_tolerance,
                 self.arrival_micro_adjust_max_initial_error_m,
+                self.arrival_micro_adjust_total_budget_m,
             )
-            return False
         if self.context and self.context.arrival_micro_adjust_started_at is not None:
             elapsed = time.time() - float(self.context.arrival_micro_adjust_started_at)
             if elapsed >= self.arrival_adjust_timeout_seconds:
@@ -3661,8 +3718,13 @@ class TaskExecutor:
                         xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
                             waypoint, reached_index
                         )
+                        # Drive a little inside the business acceptance radius.
+                        # Stopping exactly on a floating-point boundary often
+                        # makes the subsequent three-sample confirmation fail
+                        # after the velocity controller has already released.
+                        xy_control_tolerance = max(0.01, xy_tolerance - 0.02)
                         yaw_ok = yaw_tolerance is None or abs(yaw_error) <= yaw_tolerance
-                        if distance <= xy_tolerance and yaw_ok:
+                        if distance <= xy_control_tolerance and yaw_ok:
                             stable += 1
                             if stable >= ARRIVAL_ADJUST_STABLE_SAMPLES:
                                 succeeded = True
@@ -3671,7 +3733,7 @@ class TaskExecutor:
                             stable = 0
                         body_x = cos(yaw) * dx + sin(yaw) * dy
                         body_y = -sin(yaw) * dx + cos(yaw) * dy
-                        if distance > xy_tolerance:
+                        if distance > xy_control_tolerance:
                             speed = min(
                                 self.arrival_adjust_speed_mps,
                                 max(0.03, distance * 0.35),
@@ -4860,32 +4922,64 @@ class TaskExecutor:
                     if not self._arrival_xy_is_stable(
                         reached_waypoint, reached_index
                     ):
-                        if post_arrival_active:
+                        if requires_micro_recheck:
+                            # A bounded cmd_vel segment intentionally stops
+                            # every 0.15 m for a fresh localization check.
+                            # If it has not reached the acceptance radius
+                            # yet, preserve the completed heading and let the
+                            # combined-pose gate start the next bounded
+                            # segment.  Business arrival side effects stay
+                            # latched and are never replayed here.
+                            self._set_post_arrival_stage(
+                                reached_index, "heading_aligned"
+                            )
+                        elif post_arrival_active:
                             self._emit_safe_hold(
                                 "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
                                 "微调分段后的定位校正或稳定位置验收未通过，保持停车等待自愈",
                             )
                             return
-                        outdoor = self._outdoor_navigation_profile()
-                        decision = self._localization_decision()
-                        if outdoor and (
-                            not self._rtk_position_good_for_navigation()
-                            or self._rtk_xy_from_decision(decision) is None
-                        ):
-                            self._hold_unconfirmed_outdoor_arrival(
-                                reached_index,
-                                "waypoint reached by FAST-LIO but outdoor RTK is not fixed/usable; waiting before trusting arrival",
+                        else:
+                            outdoor = self._outdoor_navigation_profile()
+                            decision = self._localization_decision()
+                            if outdoor and (
+                                not self._rtk_position_good_for_navigation()
+                                or self._rtk_xy_from_decision(decision) is None
+                            ):
+                                self._hold_unconfirmed_outdoor_arrival(
+                                    reached_index,
+                                    "waypoint reached by FAST-LIO but outdoor RTK is not fixed/usable; waiting before trusting arrival",
+                                )
+                                return
+                            distance, _ = self._arrival_pose_errors(
+                                reached_waypoint, reached_index
+                            )
+                            xy_tolerance, _ = self._arrival_pose_tolerances(
+                                reached_waypoint, reached_index
+                            )
+                            # Use raw-velocity correction only where its
+                            # configured total travel budget can plausibly
+                            # bring the robot inside the normal acceptance
+                            # window. Far-off Nav2 successes remain on the
+                            # established re-approach path.
+                            if (
+                                distance is not None
+                                and distance
+                                <= xy_tolerance + self.arrival_micro_adjust_total_budget_m
+                                and self._start_arrival_adjustment(
+                                    reached_waypoint, reached_index
+                                )
+                            ):
+                                return
+                            if self._reapproach_rejected_arrival(reached_index):
+                                return
+                            self._emit_safe_hold(
+                                "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                                "校正后位置仍未到达当前航点，已停止继续收敛",
                             )
                             return
-                        if self._reapproach_rejected_arrival(reached_index):
-                            return
-                        self._emit_safe_hold(
-                            "ARRIVAL_POSE_CONVERGENCE_FAILED",
-                            "校正后位置仍未到达当前航点，已停止继续收敛",
-                        )
-                        return
                     self._arrival_retry_counts.pop(reached_index, None)
-                    if post_arrival_active:
+                    if self.context.arrival_side_effects_started:
                         self._set_post_arrival_stage(reached_index, "xy_adjusted")
                     else:
                         self._set_post_arrival_stage(reached_index, "xy_reached")
@@ -4962,6 +5056,14 @@ class TaskExecutor:
                     distance, yaw_error = self._arrival_pose_errors(
                         reached_waypoint, reached_index
                     )
+                    if distance is None:
+                        self._emit_safe_hold(
+                            "ARRIVAL_MICRO_ADJUST_POSE_UNAVAILABLE",
+                            "到达后无法取得有效当前位姿，禁止执行 XY 微调",
+                        )
+                        return
+                    if self._start_arrival_adjustment(reached_waypoint, reached_index):
+                        return
                     if use_arrival_heading and arrival_heading_completed:
                         LOGGER.warning(
                             "waypoint %d final pose outside combined tolerance: xy=%s yaw=%s",
@@ -4969,11 +5071,9 @@ class TaskExecutor:
                             distance,
                             yaw_error,
                         )
-                        if self._start_arrival_adjustment(reached_waypoint, reached_index):
-                            return
                         self._emit_safe_hold(
-                            "ARRIVAL_POSE_CONVERGENCE_FAILED",
-                            "到达后微调能力不可用或当前位姿无效",
+                            "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
+                            "到达后 XY 微调接口不可用或未能启动，机器人保持停车",
                         )
                         return
                     self._emit_safe_hold(
@@ -5147,6 +5247,7 @@ class TaskExecutor:
                 self._fail(*pose_error)
                 return
             if self.context.round_number < self.context.loop_total:
+                previous_terminal = dict(self.context.route_snapshot["waypoints"][-1])
                 self.context.round_number += 1
                 base = [dict(point) for point in (self.context.loop_base_waypoints or self.context.route_snapshot["waypoints"])]
                 pose = self.navigation.latest_pose()
@@ -5184,7 +5285,9 @@ class TaskExecutor:
                 # Nav2 goal.  The selected local controller is able to turn
                 # while following this first leg; subsequent legs retain the
                 # normal pre-departure heading policy.
-                next_round_index = self._advance_past_colocated_waypoints(0)
+                next_round_index = self._confirm_and_skip_loop_anchor(previous_terminal)
+                if next_round_index == 0:
+                    next_round_index = self._advance_past_colocated_waypoints(0)
                 self._dispatch_navigation(next_round_index)
                 return
             if self._is_docking_task() and callable(self.docking_arrived_handler):

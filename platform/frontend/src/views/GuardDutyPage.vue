@@ -172,6 +172,22 @@ const batteryPercent = computed(() => resolveBatteryPercent(null, latestRobot.va
 const lowBatteryBlocked = computed(() => isLowBatteryBlocked(batteryPercent.value))
 const actions = computed(() => executionActions(execution.value?.state))
 const isRunning = computed(() => isExecutionActive(execution.value?.state))
+const loopContinuationState = computed(() => String(serverLoopSession.value?.state || ''))
+const manualTakeoverActive = computed(() => latestRobot.value?.control_mode === 'manual_takeover')
+const taskEndControl = computed(() => {
+  if (loopActive.value && loopSessionId.value) {
+    if (loopContinuationState.value === 'recovering') {
+      return { label: '自愈中...', mode: 'continue', enabled: false, hint: '正在执行恢复，请勿重复提交' }
+    }
+    if (['paused', 'observing'].includes(loopContinuationState.value)) {
+      if (manualTakeoverActive.value) {
+        return { label: '继续', mode: 'continue', enabled: false, hint: '先退出人工接管，再恢复自主控制' }
+      }
+      return { label: '继续', mode: 'continue', enabled: true, hint: '将重新执行安全观察后恢复当前保存的航点和阶段' }
+    }
+  }
+  return { label: '结束任务', mode: 'end', enabled: Boolean(execution.value?.id && actions.value.forceExit), hint: '结束当前任务并清理未结束的执行上下文' }
+})
 const routeWaypoints = computed(() => execution.value?.route_snapshot?.waypoints || routeData.value?.waypoints || [])
 const displayRouteWaypoints = computed(() => {
   const routeMapId = execution.value?.map_data || routeData.value?.map_data || presetTask.value?.map_id
@@ -1393,11 +1409,11 @@ async function toggleLoop() {
 
 async function toggleLoopPause() {
   if (!loopActive.value || !loopSessionId.value || busy.value) return
-  const action = serverLoopSession.value?.state === 'paused' ? 'resume' : 'pause'
+  const action = ['paused', 'observing'].includes(serverLoopSession.value?.state) ? 'continue' : 'pause'
   busy.value = true
   try {
     syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, action))
-    showToast(action === 'pause' ? '循环已人工暂停' : '循环将在安全观察后继续')
+    showToast(action === 'pause' ? '循环已人工暂停' : '已请求继续，正在进行安全观察')
   } catch (error) {
     showToast(error.message || '循环暂停状态切换失败', { variant: 'alert' })
   } finally {
@@ -1411,9 +1427,9 @@ async function controlTask() {
   busy.value = true
   try {
     if (loopActive.value && loopSessionId.value) {
-      const loopAction = serverLoopSession.value?.state === 'paused' ? 'resume' : 'pause'
+      const loopAction = ['paused', 'observing'].includes(serverLoopSession.value?.state) ? 'continue' : 'pause'
       syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, loopAction))
-      showToast(loopAction === 'pause' ? '循环已人工暂停' : '循环正在安全观察后恢复')
+      showToast(loopAction === 'pause' ? '循环已人工暂停' : '已请求继续，正在进行安全观察')
     } else {
       execution.value = await sendTaskExecutionAction(execution.value.id, action)
       showToast(action === 'pause' ? '任务暂停中' : '任务继续执行中')
@@ -1424,6 +1440,24 @@ async function controlTask() {
   } finally {
     busy.value = false
   }
+}
+
+async function taskEndOrContinue() {
+  if (busy.value || !taskEndControl.value.enabled) return
+  if (taskEndControl.value.mode === 'continue') {
+    busy.value = true
+    try {
+      syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, 'continue'))
+      showToast('已请求继续，正在进行安全观察')
+      startExecutionPolling()
+    } catch (error) {
+      showToast(error.message || '继续自愈失败', { variant: 'alert' })
+    } finally {
+      busy.value = false
+    }
+    return
+  }
+  await forceExitTask()
 }
 
 async function forceExitTask() {
@@ -1692,7 +1726,12 @@ watch(playUrlKey, () => {
               <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
                 {{ actions.control.label }}
               </button>
-              <button class="guard-danger" :disabled="busy || localizationBusy || !execution?.id || !actions.forceExit" @click="forceExitTask">强制退出</button>
+              <button
+                :class="taskEndControl.mode === 'continue' ? 'guard-primary' : 'guard-danger'"
+                :disabled="busy || localizationBusy || !taskEndControl.enabled"
+                :title="taskEndControl.hint"
+                @click="taskEndOrContinue"
+              >{{ taskEndControl.label }}</button>
             </div>
           </div>
 
@@ -1739,7 +1778,7 @@ watch(playUrlKey, () => {
                 :disabled="busy || localizationBusy || !loopActive || !loopSessionId || loopState === 'stopping'"
                 @click="toggleLoopPause"
               >
-                {{ loopState === 'paused' ? '继续循环' : '暂停循环' }}
+                {{ ['paused', 'observing'].includes(loopState) ? '继续循环' : '暂停循环' }}
               </button>
               <button
                 class="guard-loop-toggle"

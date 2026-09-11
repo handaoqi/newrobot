@@ -117,7 +117,13 @@ class FakeNavigation:
         return self.stopped
 
     def latest_pose(self):
-        return self.pose
+        # Production pose snapshots carry a changing sampled_at marker.  Give
+        # the fake the same contract so consecutive-arrival confirmation tests
+        # exercise the real freshness gate rather than a permanently stale
+        # synthetic sample.
+        values = vars(self.pose).copy()
+        values.setdefault("sampled_at", time.monotonic())
+        return SimpleNamespace(**values)
 
     def latest_trusted_pose(self):
         return dict(self.trusted_pose)
@@ -1542,6 +1548,50 @@ def test_loop_round_dispatches_first_leg_without_heading_worker(tmp_path):
     store.close()
 
 
+def test_loop_round_skips_confirmed_repeated_anchor_without_arrival_side_effects(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    command_body = envelope.payload["command"]
+    command_body["loop_execution"] = True
+    command_body["loop_total"] = 2
+    waypoints = command_body["route_snapshot"]["waypoints"]
+    waypoints[-1] = {
+        **waypoints[-1],
+        "waypoint_id": "wp-return-anchor",
+        "x": waypoints[0]["x"],
+        "y": waypoints[0]["y"],
+        "yaw": waypoints[0]["yaw"],
+    }
+
+    executor.start_task(envelope)
+    drive_patrol(nav, until_ids=["wp-return-anchor"], executor=executor)
+    nav.pose = SimpleNamespace(
+        x=float(waypoints[0]["x"]), y=float(waypoints[0]["y"]), yaw=float(waypoints[0]["yaw"])
+    )
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    assert executor.context.round_number == 2
+    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    milestones = [
+        event[1]["waypoint"]["waypoint_id"]
+        for event in events
+        if event[0] == "task.progress" and event[1].get("milestone") == "waypoint_reached"
+    ]
+    assert milestones.count("wp-1") == 1
+    assert any(event[0] == "task.loop_anchor_confirmed" for event in events)
+    executor.stop()
+    store.close()
+
+
 def test_reverse_execution_reports_each_actual_waypoint_identity(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -2587,7 +2637,7 @@ def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
 
     assert executor.context.state == "paused"
     assert len(nav.sent) == 1
-    assert not any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
+    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
     store.close()
 
 
@@ -2633,6 +2683,41 @@ def test_final_heading_small_xy_drift_uses_cmd_vel_raw_adjustment(tmp_path):
         if event[0] == "task.recovery_active"
     ]
     assert "heading_preserving_adjustment" in stages
+    store.close()
+
+
+def test_arrival_adjustment_allows_xy_residual_above_legacy_initial_value(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    # 0.675 m used to be rejected by the 0.45 m initial gate before the
+    # collision-monitored XY controller was even allowed to run.
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.675,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+
+    assert executor._start_arrival_adjustment(waypoint, 0) is True
+    deadline = time.time() + 1.0
+    while not any(
+        abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments
+    ) and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
+    executor._cancel_arrival_adjustment(reset_state=True)
+    executor.stop()
     store.close()
 
 
@@ -3432,8 +3517,8 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     store.close()
 
 
-def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
-    for distance, expected_state in ((0.42, "completed"), (0.46, "paused")):
+def test_patrol_final_pose_uses_bounded_micro_adjustment_budget(tmp_path):
+    for distance, expected_state in ((0.42, "completed"), (1.19, "paused")):
         store = LocalStore(str(tmp_path / f"edge-{distance}.db"))
         nav = FakeNavigation()
         executor = TaskExecutor(
@@ -3446,19 +3531,17 @@ def test_patrol_final_pose_uses_045_meter_postcheck_tolerance(tmp_path):
         assert ids(nav.sent[0]) == ["wp-1"]
         drive_patrol(nav, until_ids=["wp-3"], executor=executor)
         final = executor.context.route_snapshot["waypoints"][-1]
-        for _ in range(6):
-            if executor.context.state == expected_state:
-                break
-            nav.pose = SimpleNamespace(
-                x=float(final["x"]) + distance,
-                y=float(final["y"]),
-                yaw=float(final.get("yaw") or 0.0),
-            )
-            if executor._departure_heading_thread is not None:
-                _await_departure_heading(executor)
-            if nav.result is None:
-                break
-            nav.result("succeeded", "", {"missed_waypoints": []})
+        nav.pose = SimpleNamespace(
+            x=float(final["x"]) + distance,
+            y=float(final["y"]),
+            yaw=float(final.get("yaw") or 0.0),
+        )
+        if executor._departure_heading_thread is not None:
+            _await_departure_heading(executor)
+        nav.result("succeeded", "", {"missed_waypoints": []})
+        deadline = time.time() + 8.0
+        while executor.context.state not in {"completed", "paused"} and time.time() < deadline:
+            time.sleep(0.05)
         assert executor.context.state == expected_state
         store.close()
 

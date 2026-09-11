@@ -15,7 +15,7 @@ from .models import (
     Robot,
     RobotStatusLatest,
 )
-from .services.patrol_loop_service import PatrolLoopService
+from .services.patrol_loop_service import PatrolLoopError, PatrolLoopService
 from .services.command_service import CommandService
 from .services.task_service import TaskExecutionService
 
@@ -189,6 +189,48 @@ class PatrolLoopServiceTests(TestCase):
         self.assertEqual(session.state, "paused")
         self.assertFalse(RemoteCommand.objects.filter(command_type="task.recover.v1").exists())
 
+    def test_continue_creates_a_new_recovery_episode_after_safety_observation(self):
+        session = self.create_running_loop()
+        TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
+        TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
+        TaskExecutionService.transition(
+            session.current_execution,
+            "paused",
+            event_type="task.safe_hold",
+            reason_code="NAV_STACK_NOT_READY",
+        )
+        session = PatrolLoopService.pause(session, self.user)
+
+        session = PatrolLoopService.continue_recovery(session)
+
+        self.assertEqual(session.state, "observing")
+        self.assertEqual(session.recovery_reason_code, "OPERATOR_CONTINUE")
+        self.assertEqual(session.recovery_attempt, 0)
+        episode_id = session.recovery_episode_id
+        session = PatrolLoopService.process(session.id)
+        session.observation_started_at = timezone.now() - timezone.timedelta(seconds=6)
+        session.save(update_fields=["observation_started_at", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "recovering")
+        command = RemoteCommand.objects.get(command_type="task.recover.v1")
+        self.assertEqual(command.payload["recovery_episode_id"], str(episode_id))
+        self.assertEqual(command.payload["attempt"], 1)
+
+    def test_continue_blocks_manual_takeover_until_operator_releases_it(self):
+        session = self.create_running_loop()
+        TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
+        TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
+        TaskExecutionService.transition(session.current_execution, "paused", event_type="task.safe_hold")
+        session = PatrolLoopService.pause(session, self.user)
+        self.status.control_mode = "manual_takeover"
+        self.status.state_version += 1
+        self.status.save(update_fields=["control_mode", "state_version"])
+
+        with self.assertRaisesMessage(PatrolLoopError, "先退出人工接管"):
+            PatrolLoopService.continue_recovery(session)
+
     def test_low_battery_immediately_terminates_loop_and_execution(self):
         session = self.create_running_loop()
         start_command = session.current_execution.commands.get(command_type="task.start")
@@ -249,7 +291,7 @@ class PatrolLoopServiceTests(TestCase):
 
         CommandService.ensure_task_start_allowed(self.robot)
 
-    def test_tenth_failed_recovery_ends_round_without_an_eleventh_attempt(self):
+    def test_tenth_failed_recovery_holds_round_for_operator_continue(self):
         session = self.create_running_loop()
         TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
         TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
@@ -267,18 +309,13 @@ class PatrolLoopServiceTests(TestCase):
 
         session = PatrolLoopService.process(session.id)
 
-        self.assertEqual(session.state, "stopping")
+        self.assertEqual(session.state, "paused")
+        self.assertTrue(session.manual_paused)
+        self.assertTrue(session.metadata["continuation_required"])
         session.current_execution.refresh_from_db()
-        self.assertEqual(session.current_execution.state, "cancelled")
+        self.assertEqual(session.current_execution.state, "paused")
         self.assertFalse(RemoteCommand.objects.filter(command_type="task.recover.v1").exists())
-        force_exit = session.current_execution.commands.get(command_type="task.force_exit")
-        force_exit.status = "succeeded"
-        force_exit.result_payload = {"robot_stopped": True}
-        force_exit.save(update_fields=["status", "result_payload", "updated_at"])
-
-        session = PatrolLoopService.process(session.id)
-
-        self.assertEqual(session.state, "resting")
+        self.assertFalse(session.current_execution.commands.filter(command_type="task.force_exit").exists())
 
     def test_async_recovery_does_not_consume_another_attempt_while_in_progress(self):
         session = self.create_running_loop()

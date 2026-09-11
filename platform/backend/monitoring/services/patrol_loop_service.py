@@ -68,15 +68,40 @@ class PatrolLoopService:
         reason_code: str,
         reason_message: str,
     ) -> PatrolLoopSession:
-        """End only the current round after the Edge confirms a safe stop."""
-        cls._force_exit_execution(execution, reason="recovery_attempts_exhausted")
+        """Hold a safely paused round for an explicit operator continuation.
+
+        Recovery attempts are issued only while the Edge task is already
+        paused/interrupted.  Cancelling that task on exhaustion discards the
+        persisted waypoint/stage context and makes a later operator continue
+        start a new round.  Preserve it instead, so Continue can create a new
+        ``task.recover.v1`` episode from the exact held context.
+        """
+        if execution:
+            execution.refresh_from_db()
+        if execution and execution.state not in {"paused", "interrupted"}:
+            # Defensive fallback for an unexpected execution state: retain the
+            # prior stop-confirmation behavior rather than exposing Continue
+            # while motion might still be owned by the task.
+            cls._force_exit_execution(execution, reason="recovery_attempts_exhausted")
+            metadata = cls._metadata(session)
+            metadata["stop_scope"] = "round"
+            session.metadata = metadata
+            return cls._set_state(
+                session,
+                "stopping",
+                "loop.recovery_stopping",
+                reason_code=reason_code,
+                reason_message=reason_message,
+                next_action_at=timezone.now() + timedelta(seconds=1),
+            )
         metadata = cls._metadata(session)
-        metadata["stop_scope"] = "round"
+        metadata["continuation_required"] = True
         session.metadata = metadata
+        session.manual_paused = True
         return cls._set_state(
             session,
-            "stopping",
-            "loop.recovery_stopping",
+            "paused",
+            "loop.recovery_exhausted_paused",
             reason_code=reason_code,
             reason_message=reason_message,
             next_action_at=timezone.now() + timedelta(seconds=1),
@@ -256,18 +281,46 @@ class PatrolLoopService:
     @classmethod
     @transaction.atomic
     def resume(cls, session: PatrolLoopSession) -> PatrolLoopSession:
+        return cls.continue_recovery(session)
+
+    @classmethod
+    @transaction.atomic
+    def continue_recovery(cls, session: PatrolLoopSession) -> PatrolLoopSession:
         session = PatrolLoopSession.objects.select_for_update().get(pk=session.pk)
-        if session.state != "paused" or not session.manual_paused:
-            raise PatrolLoopError("循环不处于人工暂停状态")
+        if session.state in PatrolLoopSession.TERMINAL_STATES:
+            raise PatrolLoopError("循环已结束，不能继续恢复")
+        if session.state == "recovering":
+            raise PatrolLoopError("循环正在自愈，请勿重复继续")
+        if session.state == "stopping":
+            raise PatrolLoopError("正在确认机器人停车，确认完成后才能继续")
+        if session.state not in {"paused", "observing"}:
+            raise PatrolLoopError("当前循环状态无需人工继续")
+        safe, code, message = cls._observation_safety(session)
+        if not safe:
+            raise PatrolLoopError(
+                "先退出人工接管" if code == "MANUAL_TAKEOVER" else f"安全条件未满足：{message}"
+            )
+        execution = session.current_execution
+        if execution:
+            execution.refresh_from_db()
+        if execution is None or execution.state not in {"paused", "interrupted", "accepted", "running", "resuming"}:
+            raise PatrolLoopError("当前任务没有可恢复的已保存执行上下文")
         session.manual_paused = False
         session.observation_started_at = None
         session.recovery_episode_id = uuid.uuid4()
-        session.recovery_reason_code = "MANUAL_RESUME"
-        session.recovery_reason_message = "操作员要求继续，重新执行安全观察"
+        session.recovery_attempt = 0
+        session.recovery_reason_code = "OPERATOR_CONTINUE"
+        session.recovery_reason_message = "操作员要求继续，重新执行安全观察后恢复"
+        metadata = cls._metadata(session)
+        metadata.pop("continuation_required", None)
+        metadata.pop("recovery_in_progress_started_at", None)
+        session.metadata = metadata
         return cls._set_state(
             session,
             "observing",
-            "loop.manual_resume_requested",
+            "loop.continue_requested",
+            reason_code=session.recovery_reason_code,
+            reason_message=session.recovery_reason_message,
             next_action_at=timezone.now(),
         )
 
@@ -657,7 +710,7 @@ class PatrolLoopService:
                 "completed", "failed", "cancelled", "timed_out", "rejected"
             }:
                 session.current_execution = execution
-                delay = 0 if session.recovery_reason_code == "MANUAL_RESUME" else session.rest_seconds
+                delay = 0 if session.recovery_reason_code == "OPERATOR_CONTINUE" else session.rest_seconds
                 return cls._set_state(
                     session,
                     "resting",
