@@ -10,11 +10,19 @@
       <PipelineSequence name="NavigateWithReplanning">
         <PlannerSelector selected_planner="{selected_planner}" default_planner="ThetaStar" topic_name="/planner_selector"/>
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="/controller_selector"/>
+        <SmootherSelector selected_smoother="{selected_smoother}" default_smoother="simple_smoother" topic_name="/smoother_selector"/>
         <RateController hz="1.0">
-          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </RecoveryNode>
+          <Sequence name="PlanAndSmoothPath">
+            <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+            <!-- A failed or timed-out smoother intentionally leaves {path} as
+                 the planner output, so FollowPath keeps a safe raw fallback. -->
+            <ForceSuccess name="SmoothPathOrUseRaw">
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="{selected_smoother}" max_smoothing_duration="0.25" check_for_collisions="true"/>
+            </ForceSuccess>
+          </Sequence>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
           <FollowPath path="{path}" controller_id="{selected_controller}"/>
@@ -28,14 +36,9 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <!--
-            Keep single-pose recovery aligned with NavigateThroughPoses: when the
-            pose itself has drifted, clearing costmaps alone is not enough.
-            Server: /reinitialize_global_localization in localization_nodelet.cpp.
-          -->
-          <ReinitializeGlobalLocalization name="ReinitializeLocalization-Subtree" service_name="/reinitialize_global_localization"/>
-          <Spin spin_dist="1.57"/>
-          <BackUp backup_dist="0.30" backup_speed="0.05"/>
+          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_spin">
+            <Spin spin_dist="0.785"/>
+          </RecoveryLeaseScope>
           <Wait wait_duration="2"/>
         </RoundRobin>
       </ReactiveFallback>

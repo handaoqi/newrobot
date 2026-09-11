@@ -486,14 +486,22 @@ function serverLoopMessage(session) {
   if (!session) return '未启动循环巡检'
   if (session.state === 'observing') {
     const started = new Date(session.observation_started_at || '').getTime()
+    const blocker = session.metadata?.observation_blocker
+    const blockerText = blocker?.message || blocker?.code || ''
     if (!Number.isFinite(started)) {
-      return `等待安全条件 · ${session.recovery_reason_message || '机器人保持停车'}`
+      return `等待安全条件 · ${blockerText || session.recovery_reason_message || '机器人保持停车'}`
     }
     const remaining = Math.max(0, 5 - Math.floor((Date.now() - started) / 1000))
-    return `异常观察中 ${remaining} 秒 · ${session.recovery_reason_message || '等待安全条件稳定'}`
+    return `异常观察中 ${remaining} 秒 · ${blockerText || session.recovery_reason_message || '等待安全条件稳定'}`
   }
   if (session.state === 'recovering') {
+    if (session.metadata?.recovery_in_progress_started_at) {
+      return `定位恢复进行中 · 第 ${session.recovery_attempt}/${session.recovery_max_attempts} 次`
+    }
     return `正在自愈 ${session.recovery_attempt}/${session.recovery_max_attempts} · ${session.recovery_reason_message || '恢复导航'}`
+  }
+  if (session.state === 'stopping' && session.metadata?.stop_scope === 'round') {
+    return '自愈耗尽，正在确认本轮机器人停车'
   }
   if (session.state === 'paused') return '循环已人工暂停，等待明确继续'
   if (session.state === 'resting') return `第 ${session.current_round} 轮完成，等待下一轮`

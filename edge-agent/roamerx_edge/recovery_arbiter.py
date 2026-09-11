@@ -19,9 +19,13 @@ class RecoveryLease:
 class RecoveryBudget:
     """Finite budget that forces SAFE_HOLD when exhausted."""
 
-    max_attempts: int = 6
+    # Keep the Edge ceiling aligned with the durable centre-loop contract.
+    # Attempt ownership is still local and mutually exclusive; the centre's
+    # command counter is intentionally separate because a single command can
+    # wait for a long-running localization recovery.
+    max_attempts: int = 10
     max_duration_seconds: float = 180.0
-    max_distance_m: float = 8.0
+    max_distance_m: float = 1.2
     attempts: int = 0
     started_at: float | None = None
     distance_m: float = 0.0

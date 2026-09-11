@@ -17,6 +17,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(navigo_util REQUIRED)
+find_package(robots_dog_msgs REQUIRED)
 
 nav2_package()
 
@@ -41,6 +42,7 @@ set(dependencies
   std_msgs
   std_srvs
   navigo_util
+  robots_dog_msgs
 )
 
 add_library(${library_name} SHARED
@@ -182,6 +184,9 @@ list(APPEND plugin_libs navigo_round_robin_node_bt_node)
 
 add_library(navigo_single_trigger_bt_node SHARED plugins/decorator/single_trigger_node.cpp)
 list(APPEND plugin_libs navigo_single_trigger_bt_node)
+
+add_library(navigo_recovery_lease_scope_bt_node SHARED plugins/decorator/recovery_lease_scope.cpp)
+list(APPEND plugin_libs navigo_recovery_lease_scope_bt_node)
 
 add_library(navigo_planner_selector_bt_node SHARED plugins/action/planner_selector_node.cpp)
 list(APPEND plugin_libs navigo_planner_selector_bt_node)

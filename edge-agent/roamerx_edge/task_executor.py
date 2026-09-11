@@ -4046,11 +4046,25 @@ class TaskExecutor:
             self._assert_execution(execution_id)
             if not self.navigation.is_robot_stopped():
                 raise ProtocolError("ROBOT_NOT_STOPPED", "recovery requires a confirmed stop")
+            if self._recovery_arbiter.budget_exhausted():
+                return {
+                    "final_task_state": self.context.state,
+                    "state_version": self.context.state_version,
+                    "resume_blocked": True,
+                    "reason_code": "RECOVERY_BUDGET_EXHAUSTED",
+                    "reason_message": "Edge 自愈动作预算耗尽，保持停车",
+                    "recovery_action": "safe_hold",
+                    "recovery_status": "non_retryable",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                    "recovery": self._recovery_arbiter.snapshot(),
+                }
             if self.context.state == "running":
                 return {
                     "final_task_state": "running",
                     "state_version": self.context.state_version,
                     "recovery_action": "already_recovered",
+                    "recovery_status": "already_running",
                     "recovery_episode_id": recovery_episode_id,
                     "attempt": int(attempt),
                 }
@@ -4111,6 +4125,7 @@ class TaskExecutor:
                     "final_task_state": self.context.state if self.context else "completed",
                     "state_version": self.context.state_version if self.context else 0,
                     "recovery_action": "degraded_arrival_yaw",
+                    "recovery_status": "recovered",
                     "waypoint_index": index,
                     "distance_m": distance,
                 }
@@ -4124,6 +4139,8 @@ class TaskExecutor:
                     "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
                     "reason_message": "定位恢复正在执行，保持停车",
                     "recovery_action": "localization_recovery_in_progress",
+                    "recovery_status": "in_progress",
+                    "retry_after_seconds": 1,
                     "recovery_episode_id": recovery_episode_id,
                     "attempt": int(attempt),
                 }
@@ -4134,6 +4151,7 @@ class TaskExecutor:
             result.update(
                 {
                     "recovery_action": "resume_pending_waypoint",
+                    "recovery_status": "recovered",
                     "recovery_episode_id": recovery_episode_id,
                     "attempt": int(attempt),
                 }
@@ -5341,6 +5359,12 @@ class TaskExecutor:
             speed_profile=speed_profile,
             goal_checker_id=goal_checker_id,
             arrival_policy=arrival_policy,
+            smoother_id=(
+                "passthrough_smoother"
+                if outdoor_profile or precision_goal or final_approach
+                or arrival_policy in {"precision", "dock"}
+                else "simple_smoother"
+            ),
         )
         if leg_profile != self._active_leg_profile:
             LOGGER.info("applying leg profile generation=%s profile=%s", self._leg_generation + 1, leg_profile)
@@ -5361,6 +5385,7 @@ class TaskExecutor:
                 require_yaw=require_yaw,
                 final_approach=final_approach,
                 outdoor=outdoor_profile,
+                smoother_id=leg_profile.smoother_id,
             )
         else:
             safety_setter = getattr(self.navigation, "set_safety_profile", None)
@@ -5388,6 +5413,9 @@ class TaskExecutor:
                     outdoor=outdoor_profile,
                     local_controller=local_controller,
                 )
+            smoother_setter = getattr(self.navigation, "set_smoother", None)
+            if callable(smoother_setter):
+                smoother_setter(leg_profile.smoother_id)
             outdoor_setter = getattr(self.navigation, "apply_outdoor_gps_profile", None)
             if callable(outdoor_setter):
                 outdoor_setter(outdoor=outdoor_profile)

@@ -187,6 +187,12 @@
       <input_port name="server_timeout">Server timeout</input_port>
     </Action>
 
+    <Decorator ID="RecoveryLeaseScope">
+      <input_port name="owner">Recovery action owner</input_port>
+      <input_port name="reason">Recovery reason</input_port>
+      <input_port name="server_timeout">Lease service timeout</input_port>
+    </Decorator>
+
     <Action ID="Wait">
       <input_port name="wait_duration">Wait time</input_port>
       <input_port name="server_name">Server name</input_port>

@@ -91,6 +91,7 @@ public:
    * @return Whether polygon is enabled
    */
   bool getEnabled() const;
+  std::string getMotionScope() const;
   /**
    * @brief Obtains polygon maximum points to enter inside polygon causing no action
    * @return Maximum points to enter to current polygon and take no action
@@ -202,6 +203,8 @@ protected:
   std::unique_ptr<navigo_costmap_2d::FootprintSubscriber> footprint_sub_;
   /// @brief Whether polygon is enabled
   bool enabled_;
+  /// any, forward, reverse, rotation or lateral
+  std::string motion_scope_{"any"};
 
   // Global variables
   /// @brief TF buffer

@@ -119,6 +119,11 @@ bool Polygon::getEnabled() const
   return enabled_;
 }
 
+std::string Polygon::getMotionScope() const
+{
+  return motion_scope_;
+}
+
 int Polygon::getMaxPoints() const
 {
   return max_points_;
@@ -257,6 +262,18 @@ bool Polygon::getCommonParameters(std::string & polygon_pub_topic)
     navigo_util::declare_parameter_if_not_declared(
       node, polygon_name_ + ".enabled", rclcpp::ParameterValue(true));
     enabled_ = node->get_parameter(polygon_name_ + ".enabled").as_bool();
+
+    navigo_util::declare_parameter_if_not_declared(
+      node, polygon_name_ + ".motion_scope", rclcpp::ParameterValue("any"));
+    motion_scope_ = node->get_parameter(polygon_name_ + ".motion_scope").as_string();
+    if (motion_scope_ != "any" && motion_scope_ != "forward" &&
+      motion_scope_ != "reverse" && motion_scope_ != "rotation" &&
+      motion_scope_ != "lateral")
+    {
+      RCLCPP_ERROR(logger_, "[%s]: Unknown motion_scope: %s", polygon_name_.c_str(),
+        motion_scope_.c_str());
+      return false;
+    }
     
     navigo_util::declare_parameter_if_not_declared(
       node, polygon_name_ + ".max_points", rclcpp::ParameterValue(3));

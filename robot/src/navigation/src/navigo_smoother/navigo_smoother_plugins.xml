@@ -1,0 +1,6 @@
+<library path="navigo_passthrough_smoother">
+  <class type="navigo_smoother::PassthroughSmoother"
+         base_class_type="nav2_core::Smoother">
+    <description>Returns the planner path unchanged for precision and RTK legs.</description>
+  </class>
+</library>

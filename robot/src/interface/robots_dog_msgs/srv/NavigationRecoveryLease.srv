@@ -1,0 +1,20 @@
+# A BT recovery action must acquire before commanding motion and release the
+# exact generation when it exits.
+uint8 ACQUIRE=1
+uint8 RELEASE=2
+
+uint8 operation
+string owner
+string reason
+float32 distance_m
+uint64 generation
+---
+bool granted
+uint64 generation
+string owner
+string reason
+uint32 attempts
+uint32 max_attempts
+float32 distance_m
+float32 max_distance_m
+bool exhausted

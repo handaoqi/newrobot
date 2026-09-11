@@ -135,11 +135,13 @@ except ImportError:
 
 try:
     if ROS_AVAILABLE:
-        from robots_dog_msgs.srv import ControlLocalizationCorrection
+        from robots_dog_msgs.srv import ControlLocalizationCorrection, NavigationRecoveryLease
     else:
         ControlLocalizationCorrection = None
+        NavigationRecoveryLease = None
 except ImportError:
     ControlLocalizationCorrection = None
+    NavigationRecoveryLease = None
 
 
 class RosAdapter(Node):
@@ -177,6 +179,10 @@ class RosAdapter(Node):
         self._last_trusted_pose_report_monotonic = 0.0
         self._trusted_pose_frozen = False
         self._attempt_progress_cb: Callable | None = None
+        self._recovery_lease_acquire_cb: Callable | None = None
+        self._recovery_lease_release_cb: Callable | None = None
+        self._recovery_snapshot_cb: Callable | None = None
+        self._bt_recovery_leases: dict[int, object] = {}
         self.structured_logs = structured_logs
         self._callback_optimization = (
             callback_optimization_config or RosCallbackOptimizationConfig()
@@ -383,6 +389,16 @@ class RosAdapter(Node):
             if ControlLocalizationCorrection is not None
             else None
         )
+        self._recovery_lease_service = (
+            self.create_service(
+                NavigationRecoveryLease,
+                "/navigation/recovery/lease",
+                self._on_recovery_lease,
+                callback_group=self._control_callback_group,
+            )
+            if NavigationRecoveryLease is not None
+            else None
+        )
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self._arrival_adjust_cmd_vel_pub = self.create_publisher(
             Twist, ros_config.cmd_vel_raw_topic, 10
@@ -400,6 +416,7 @@ class RosAdapter(Node):
         self._fine_control_pub = self.create_publisher(Bool, "/navigation/fine_control", goal_yaw_qos)
         self._controller_selector_pub = self.create_publisher(String, "/controller_selector", goal_yaw_qos)
         self._planner_selector_pub = self.create_publisher(String, "/planner_selector", goal_yaw_qos)
+        self._smoother_selector_pub = self.create_publisher(String, "/smoother_selector", goal_yaw_qos)
         self.create_subscription(String, "/robot_motion_state", self._on_robot_motion_state, 10)
         self.create_subscription(Path, "/plan", self._on_global_plan, 10)
         self._install_callback_timers()
@@ -901,6 +918,60 @@ class RosAdapter(Node):
 
     def set_attempt_progress_callback(self, callback: Callable | None) -> None:
         self._attempt_progress_cb = callback
+
+    def set_recovery_lease_callbacks(
+        self,
+        acquire_callback: Callable,
+        release_callback: Callable,
+        snapshot_callback: Callable,
+    ) -> None:
+        """Expose the Edge recovery arbiter to BT actions over ROS."""
+        self._recovery_lease_acquire_cb = acquire_callback
+        self._recovery_lease_release_cb = release_callback
+        self._recovery_snapshot_cb = snapshot_callback
+
+    @staticmethod
+    def _fill_recovery_lease_response(response, *, granted: bool, lease=None, snapshot=None):
+        snapshot = snapshot or {}
+        budget = snapshot.get("budget", {})
+        response.granted = bool(granted)
+        response.generation = int(getattr(lease, "generation", snapshot.get("recovery_generation", 0)))
+        response.owner = str(getattr(lease, "owner", snapshot.get("owner", "NONE")))
+        response.reason = str(getattr(lease, "reason", snapshot.get("reason", "")))
+        response.attempts = int(budget.get("attempts", 0))
+        response.max_attempts = int(budget.get("max_attempts", 0))
+        response.distance_m = float(budget.get("distance_m", 0.0))
+        response.max_distance_m = float(budget.get("max_distance_m", 0.0))
+        response.exhausted = bool(budget.get("exhausted", False))
+        return response
+
+    def _on_recovery_lease(self, request, response):
+        """Bridge BT recovery ownership to the TaskExecutor arbiter."""
+        snapshot = self._recovery_snapshot_cb() if self._recovery_snapshot_cb else {}
+        if request.operation == NavigationRecoveryLease.Request.ACQUIRE:
+            if not self._recovery_lease_acquire_cb:
+                return self._fill_recovery_lease_response(response, granted=False, snapshot=snapshot)
+            lease = self._recovery_lease_acquire_cb(
+                str(request.owner), str(request.reason), distance_m=float(request.distance_m)
+            )
+            if lease is not None:
+                self._bt_recovery_leases[int(lease.generation)] = lease
+                snapshot = self._recovery_snapshot_cb() if self._recovery_snapshot_cb else snapshot
+                return self._fill_recovery_lease_response(
+                    response, granted=True, lease=lease, snapshot=snapshot
+                )
+            snapshot = self._recovery_snapshot_cb() if self._recovery_snapshot_cb else snapshot
+            return self._fill_recovery_lease_response(response, granted=False, snapshot=snapshot)
+
+        if request.operation == NavigationRecoveryLease.Request.RELEASE:
+            lease = self._bt_recovery_leases.pop(int(request.generation), None)
+            released = bool(lease and self._recovery_lease_release_cb and self._recovery_lease_release_cb(lease))
+            snapshot = self._recovery_snapshot_cb() if self._recovery_snapshot_cb else snapshot
+            return self._fill_recovery_lease_response(
+                response, granted=released, lease=lease if released else None, snapshot=snapshot
+            )
+
+        return self._fill_recovery_lease_response(response, granted=False, snapshot=snapshot)
 
     def set_mapping_divergence_callback(self, callback: Callable) -> None:
         self._mapping_divergence_cb = callback
@@ -3349,6 +3420,17 @@ class RosAdapter(Node):
         self._active_global_controller = normalized
         LOGGER.info("global controller set to %s (%s)", normalized, plugin_id)
 
+    def set_smoother(self, smoother_id: str) -> None:
+        """Select the already-loaded SmootherServer plugin for this leg."""
+        selected = str(smoother_id or "simple_smoother")
+        if selected == getattr(self, "_active_smoother", None):
+            return
+        publisher = getattr(self, "_smoother_selector_pub", None)
+        if publisher is not None:
+            self._publish_nav_selector(publisher, selected)
+        self._active_smoother = selected
+        LOGGER.info("path smoother set to %s", selected)
+
     def set_docking_profile(self, *, final_approach: bool) -> None:
         """Apply the slow, fine-control profile used only for the dock contact leg."""
         vx_max = 0.10 if final_approach else 0.5
@@ -3451,6 +3533,7 @@ class RosAdapter(Node):
         require_yaw: bool = False,
         final_approach: bool = False,
         outdoor: bool | None = None,
+        smoother_id: str = "simple_smoother",
         live: bool = False,
     ) -> dict:
         """Atomically apply a leg profile, read it back, and roll back on failure."""
@@ -3518,6 +3601,7 @@ class RosAdapter(Node):
                 local_controller=normalized_local,
             )
             self.set_local_controller(normalized_local)
+            self.set_smoother(smoother_id)
             self.apply_outdoor_gps_profile(outdoor=use_outdoor)
 
             applied = {
@@ -3532,6 +3616,7 @@ class RosAdapter(Node):
                 "require_yaw": bool(require_yaw),
                 "final_approach": bool(final_approach),
                 "outdoor": bool(use_outdoor),
+                "smoother_id": str(smoother_id),
                 "readback": {
                     "planner_use_astar": actual_astar,
                     "obstacle_layer.enabled": safety_readback.get("obstacle_layer.enabled"),

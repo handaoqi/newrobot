@@ -78,6 +78,8 @@ public:
     const rclcpp::Time & curr_time,
     std::vector<Point> & data) const;
 
+  bool isFresh(const rclcpp::Time & curr_time) const override;
+
 protected:
   /**
    * @brief Laser scanner data callback

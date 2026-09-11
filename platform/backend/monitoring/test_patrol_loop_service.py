@@ -173,7 +173,8 @@ class PatrolLoopServiceTests(TestCase):
         session = PatrolLoopService.process(session.id)
 
         self.assertIsNone(session.observation_started_at)
-        self.assertEqual(session.recovery_reason_code, "EMERGENCY_STOP")
+        self.assertEqual(session.recovery_reason_code, "NAV_STACK_NOT_READY")
+        self.assertEqual(session.metadata["observation_blocker"]["code"], "EMERGENCY_STOP")
         self.assertEqual(session.recovery_attempt, 0)
 
     def test_manual_pause_never_auto_resumes(self):
@@ -266,7 +267,78 @@ class PatrolLoopServiceTests(TestCase):
 
         session = PatrolLoopService.process(session.id)
 
-        self.assertEqual(session.state, "resting")
+        self.assertEqual(session.state, "stopping")
         session.current_execution.refresh_from_db()
         self.assertEqual(session.current_execution.state, "cancelled")
         self.assertFalse(RemoteCommand.objects.filter(command_type="task.recover.v1").exists())
+        force_exit = session.current_execution.commands.get(command_type="task.force_exit")
+        force_exit.status = "succeeded"
+        force_exit.result_payload = {"robot_stopped": True}
+        force_exit.save(update_fields=["status", "result_payload", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "resting")
+
+    def test_async_recovery_does_not_consume_another_attempt_while_in_progress(self):
+        session = self.create_running_loop()
+        TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
+        TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
+        TaskExecutionService.transition(
+            session.current_execution,
+            "paused",
+            event_type="task.safe_hold",
+            reason_code="LOCALIZATION_LOST",
+        )
+        session = PatrolLoopService.process(session.id)
+        session.observation_started_at = timezone.now() - timezone.timedelta(seconds=6)
+        session.save(update_fields=["observation_started_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+        command = RemoteCommand.objects.get(command_type="task.recover.v1")
+        command.status = "succeeded"
+        command.result_payload = {
+            "final_task_state": "paused",
+            "recovery_status": "in_progress",
+            "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
+        }
+        command.save(update_fields=["status", "result_payload", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+        self.assertEqual(session.state, "recovering")
+        self.assertEqual(session.recovery_attempt, 1)
+        session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
+        session.save(update_fields=["next_action_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "recovering")
+        self.assertEqual(session.recovery_attempt, 1)
+        self.assertEqual(RemoteCommand.objects.filter(command_type="task.recover.v1").count(), 1)
+
+    def test_successful_recovery_clears_episode_before_the_next_fault(self):
+        session = self.create_running_loop()
+        session.recovery_episode_id = uuid.uuid4()
+        session.recovery_attempt = 1
+        session.recovery_reason_code = "NAV_STACK_NOT_READY"
+        session.state = "recovering"
+        session.save()
+        TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
+        TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
+        command = RemoteCommand.objects.create(
+            robot=self.robot,
+            task_execution=session.current_execution,
+            command_type="task.recover.v1",
+            status="succeeded",
+            expires_at=timezone.now() + timezone.timedelta(minutes=5),
+            payload={
+                "recovery_episode_id": str(session.recovery_episode_id),
+                "attempt": 1,
+            },
+        )
+        command.result_payload = {"final_task_state": "running", "recovery_status": "recovered"}
+        command.save(update_fields=["result_payload", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "running")
+        self.assertIsNone(session.recovery_episode_id)
+        self.assertEqual(session.recovery_attempt, 0)

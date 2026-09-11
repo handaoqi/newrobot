@@ -416,6 +416,17 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
     return;
   }
 
+  if (!sourcesAllowMotion(curr_time) && !cmd_vel_in.isZero()) {
+    Action stop_action{STOP, {0.0, 0.0, 0.0}};
+    if (robot_action_prev_.action_type != STOP) {
+      RCLCPP_WARN(get_logger(), "Zeroing cmd_vel: an enabled collision source is stale");
+    }
+    publishVelocity(stop_action);
+    publishPolygons();
+    robot_action_prev_ = stop_action;
+    return;
+  }
+
   // Points array collected from different data sources in a robot base frame
   std::vector<Point> collision_points;
 
@@ -433,6 +444,9 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
 
   for (std::shared_ptr<Polygon> polygon : polygons_) {
     if (!polygon->getEnabled()) {
+      continue;
+    }
+    if (!polygonAppliesToVelocity(*polygon, cmd_vel_in)) {
       continue;
     }
     if (robot_action.action_type == STOP) {
@@ -491,6 +505,36 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   publishPolygons();
 
   robot_action_prev_ = robot_action;
+}
+
+bool CollisionMonitor::sourcesAllowMotion(const rclcpp::Time & curr_time) const
+{
+  for (const std::shared_ptr<Source> & source : sources_) {
+    if (source->getEnabled() && !source->isFresh(curr_time)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CollisionMonitor::polygonAppliesToVelocity(const Polygon & polygon, const Velocity & velocity)
+{
+  const std::string scope = polygon.getMotionScope();
+  if (scope == "any") {
+    return true;
+  }
+  const bool rotation = std::abs(velocity.x) < 0.02 && std::abs(velocity.y) < 0.02 &&
+    std::abs(velocity.tw) > 0.01;
+  if (scope == "rotation") {
+    return rotation;
+  }
+  if (scope == "forward") {
+    return velocity.x > 0.01;
+  }
+  if (scope == "reverse") {
+    return velocity.x < -0.01;
+  }
+  return std::abs(velocity.y) > 0.01;
 }
 
 void CollisionMonitor::publishState(const Action & robot_action)

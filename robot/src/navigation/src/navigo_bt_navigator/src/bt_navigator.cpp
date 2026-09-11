@@ -38,6 +38,7 @@ BtNavigator::BtNavigator(rclcpp::NodeOptions options)
     "navigo_compute_path_to_pose_action_bt_node",
     "navigo_compute_path_through_poses_action_bt_node",
     "navigo_smooth_path_action_bt_node",
+    "navigo_smoother_selector_bt_node",
     "navigo_follow_path_action_bt_node",
     "navigo_spin_action_bt_node",
     "navigo_wait_action_bt_node",

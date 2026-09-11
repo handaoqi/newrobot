@@ -343,6 +343,7 @@ def test_center_recovery_resumes_the_persisted_pending_waypoint(tmp_path):
 
     assert result["final_task_state"] == "running"
     assert result["recovery_action"] == "resume_pending_waypoint"
+    assert result["recovery_status"] == "recovered"
     assert result["recovery_episode_id"] == "episode-1"
     assert executor.context.current_waypoint_index == 0
     store.close()
@@ -379,6 +380,7 @@ def test_center_recovery_degrades_only_arrival_yaw_inside_safe_radius(tmp_path):
     )
 
     assert result["recovery_action"] == "degraded_arrival_yaw"
+    assert result["recovery_status"] == "recovered"
     assert result["distance_m"] < 0.60
     assert any(event[0] == "task.waypoint_degraded" for event in events)
     assert executor.context.state == "running"

@@ -197,6 +197,8 @@ protected:
    * still handled by the stop polygon, not this gate.
    */
   bool localizationAllowsMotion() const;
+  bool sourcesAllowMotion(const rclcpp::Time & curr_time) const;
+  static bool polygonAppliesToVelocity(const Polygon & polygon, const Velocity & velocity);
 
   void localizationCallback(robots_dog_msgs::msg::Localization::ConstSharedPtr msg);
 

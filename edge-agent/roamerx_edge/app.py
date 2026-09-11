@@ -139,6 +139,13 @@ class EdgeAgentApplication:
         )
         if callable(set_localization_recovery_callback):
             set_localization_recovery_callback(self._handle_task_localization_recovered)
+        set_recovery_lease_callbacks = getattr(navigation, "set_recovery_lease_callbacks", None)
+        if callable(set_recovery_lease_callbacks):
+            set_recovery_lease_callbacks(
+                self.task_executor.acquire_recovery,
+                self.task_executor.release_recovery,
+                self.task_executor.recovery_snapshot,
+            )
         # Deduplicates localization alerts the same way _mapping_divergence_notified
         # does for SLAM divergence: one alert per episode, re-armed on recovery.
         self._localization_alert_notified = False

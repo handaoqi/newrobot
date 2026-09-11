@@ -98,6 +98,11 @@ bool Source::getEnabled() const
   return enabled_;
 }
 
+bool Source::isFresh(const rclcpp::Time &) const
+{
+  return true;
+}
+
 rcl_interfaces::msg::SetParametersResult
 Source::dynamicParametersCallback(
   std::vector<rclcpp::Parameter> parameters)

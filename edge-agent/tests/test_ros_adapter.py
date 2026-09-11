@@ -7,6 +7,7 @@ import pytest
 
 from roamerx_edge.config import SafetyConfig
 from roamerx_edge.protocol import ProtocolError
+from roamerx_edge import ros_adapter as ros_adapter_module
 from roamerx_edge.ros_adapter import RosAdapter, follow_path_patrol_params
 
 
@@ -26,6 +27,60 @@ class FakeTelemetry:
 
     def on_localization_decision(self, decision):
         self.decision = dict(decision)
+
+
+class _FakeRecoveryLeaseService:
+    class Request:
+        ACQUIRE = 1
+        RELEASE = 2
+
+
+def test_recovery_lease_service_keeps_opaque_lease_by_generation(monkeypatch):
+    monkeypatch.setattr(ros_adapter_module, "NavigationRecoveryLease", _FakeRecoveryLeaseService)
+    adapter = object.__new__(RosAdapter)
+    adapter._bt_recovery_leases = {}
+    adapter._recovery_lease_acquire_cb = lambda owner, reason, distance_m: SimpleNamespace(
+        owner=owner, reason=reason, generation=17, distance_m=distance_m
+    )
+    released = []
+    adapter._recovery_lease_release_cb = lambda lease: released.append(lease) or True
+    adapter._recovery_snapshot_cb = lambda: {
+        "owner": "BT_NAVIGATOR",
+        "recovery_generation": 17,
+        "reason": "navigation_recovery_spin",
+        "budget": {"attempts": 1, "max_attempts": 10, "distance_m": 0.0, "max_distance_m": 1.2},
+    }
+    response = SimpleNamespace()
+
+    acquired = adapter._on_recovery_lease(
+        SimpleNamespace(operation=1, owner="BT_NAVIGATOR", reason="navigation_recovery_spin", distance_m=0.0),
+        response,
+    )
+
+    assert acquired.granted is True
+    assert acquired.generation == 17
+    released_response = adapter._on_recovery_lease(
+        SimpleNamespace(operation=2, owner="forged", reason="", generation=17, distance_m=0.0),
+        SimpleNamespace(),
+    )
+    assert released_response.granted is True
+    assert [lease.generation for lease in released] == [17]
+
+
+def test_recovery_lease_service_rejects_unknown_generation(monkeypatch):
+    monkeypatch.setattr(ros_adapter_module, "NavigationRecoveryLease", _FakeRecoveryLeaseService)
+    adapter = object.__new__(RosAdapter)
+    adapter._bt_recovery_leases = {}
+    adapter._recovery_lease_release_cb = lambda lease: True
+    adapter._recovery_snapshot_cb = lambda: {"budget": {"exhausted": True}}
+
+    response = adapter._on_recovery_lease(
+        SimpleNamespace(operation=2, owner="BT_NAVIGATOR", reason="", generation=99, distance_m=0.0),
+        SimpleNamespace(),
+    )
+
+    assert response.granted is False
+    assert response.exhausted is True
 
 
 def test_fresh_normal_streak_ignores_samples_before_candidate():

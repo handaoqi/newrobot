@@ -102,7 +102,9 @@ class SafetyConfig:
     # 0 keeps the historical unbounded retry - sometimes standing still and waiting
     # for a human is the safest outcome - but the escalation alert still fires so the
     # situation is visible instead of a task silently paused forever.
-    localization_recovery_max_cycles: int = 0
+    # A recovery worker must not remain alive forever while the centre waits
+    # on the same five-second recovery episode.
+    localization_recovery_max_cycles: int = 3
     # Reject persisted or in-memory trusted seeds that disagree with the live
     # published pose by more than this distance during automatic recovery.
     localization_trusted_seed_max_drift_m: float = 15.0

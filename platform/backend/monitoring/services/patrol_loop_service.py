@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -36,6 +36,51 @@ class PatrolLoopService:
     STATUS_FRESH_SECONDS = 15
     LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     LOW_BATTERY_REARM_PERCENT = getattr(settings, "LOW_BATTERY_REARM_PERCENT", 25)
+    RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS = 180
+
+    @staticmethod
+    def _metadata(session: PatrolLoopSession) -> dict:
+        return dict(session.metadata or {})
+
+    @classmethod
+    def _clear_recovery_episode(cls, session: PatrolLoopSession) -> None:
+        """Clear a completed episode so a later same-code fault is new work."""
+        session.recovery_attempt = 0
+        session.recovery_episode_id = None
+        session.recovery_reason_code = ""
+        session.recovery_reason_message = ""
+        session.observation_started_at = None
+        metadata = cls._metadata(session)
+        for key in (
+            "observation_blocker",
+            "recovery_in_progress_started_at",
+            "stop_scope",
+        ):
+            metadata.pop(key, None)
+        session.metadata = metadata
+
+    @classmethod
+    def _begin_recovery_stop(
+        cls,
+        session: PatrolLoopSession,
+        execution: TaskExecution | None,
+        *,
+        reason_code: str,
+        reason_message: str,
+    ) -> PatrolLoopSession:
+        """End only the current round after the Edge confirms a safe stop."""
+        cls._force_exit_execution(execution, reason="recovery_attempts_exhausted")
+        metadata = cls._metadata(session)
+        metadata["stop_scope"] = "round"
+        session.metadata = metadata
+        return cls._set_state(
+            session,
+            "stopping",
+            "loop.recovery_stopping",
+            reason_code=reason_code,
+            reason_message=reason_message,
+            next_action_at=timezone.now() + timedelta(seconds=1),
+        )
 
     @classmethod
     @transaction.atomic
@@ -453,6 +498,25 @@ class PatrolLoopService:
                     force_command.status == "succeeded"
                     and (force_command.result_payload or {}).get("robot_stopped")
                 )
+                if (session.metadata or {}).get("stop_scope") == "round":
+                    if not stopped:
+                        return cls._set_state(
+                            session,
+                            "failed",
+                            "loop.recovery_stop_unconfirmed",
+                            reason_code="ROBOT_STOP_UNCONFIRMED",
+                            reason_message="自愈耗尽后未收到机器人停车确认",
+                            terminal=True,
+                        )
+                    cls._clear_recovery_episode(session)
+                    return cls._set_state(
+                        session,
+                        "resting",
+                        "loop.recovery_stop_confirmed",
+                        reason_code="RECOVERY_ATTEMPTS_EXHAUSTED",
+                        reason_message="本轮自愈耗尽，机器人已停止；将继续下一轮",
+                        next_action_at=now + timedelta(seconds=session.rest_seconds),
+                    )
                 return cls._set_state(
                     session,
                     "completed" if stopped else "failed",
@@ -550,11 +614,16 @@ class PatrolLoopService:
         if session.state == "observing":
             healthy, code, message = cls._observation_safety(session)
             if not healthy:
-                reason_changed = session.recovery_reason_code != code
+                metadata = cls._metadata(session)
+                blocker = metadata.get("observation_blocker") or {}
+                reason_changed = blocker.get("code") != code
                 if session.observation_started_at is not None or reason_changed:
                     session.observation_started_at = None
-                    session.recovery_reason_code = code
-                    session.recovery_reason_message = message
+                    # Keep the navigation/localization root cause intact. A
+                    # transient movement or interlock is only an observation
+                    # blocker, not a replacement recovery diagnosis.
+                    metadata["observation_blocker"] = {"code": code, "message": message}
+                    session.metadata = metadata
                     session.save()
                     cls._event(
                         session,
@@ -596,14 +665,11 @@ class PatrolLoopService:
                     next_action_at=now + timedelta(seconds=delay),
                 )
             if session.recovery_attempt >= session.recovery_max_attempts:
-                cls._force_exit_execution(execution, reason="recovery_attempts_exhausted")
-                return cls._set_state(
+                return cls._begin_recovery_stop(
                     session,
-                    "resting",
-                    "loop.recovery_exhausted",
+                    execution,
                     reason_code="RECOVERY_ATTEMPTS_EXHAUSTED",
-                    reason_message="单个异常自愈已达到 10 次，结束本轮后继续下一轮",
-                    next_action_at=now + timedelta(seconds=session.rest_seconds),
+                    reason_message="单个异常自愈已达到 10 次，正在确认结束本轮",
                 )
             session.recovery_attempt += 1
             command = CommandService.create_task_recovery(
@@ -641,13 +707,56 @@ class PatrolLoopService:
             if command.status == "succeeded":
                 execution.refresh_from_db()
                 if execution.state in {"running", "accepted", "resuming"}:
-                    session.recovery_attempt = 0
-                    session.observation_started_at = None
+                    cls._clear_recovery_episode(session)
                     return cls._set_state(
                         session,
                         "running",
                         "loop.recovery_succeeded",
                         next_action_at=now + timedelta(seconds=1),
+                    )
+                result = command.result_payload or {}
+                recovery_status = str(result.get("recovery_status") or "").lower()
+                if recovery_status == "in_progress":
+                    metadata = cls._metadata(session)
+                    started_at = metadata.get("recovery_in_progress_started_at")
+                    if started_at is None:
+                        metadata["recovery_in_progress_started_at"] = now.isoformat()
+                        session.metadata = metadata
+                        session.next_action_at = now + timedelta(seconds=1)
+                        session.save(update_fields=["metadata", "next_action_at", "updated_at"])
+                        cls._event(
+                            session,
+                            "loop.recovery_in_progress",
+                            key=f"v{session.state_version}:in_progress:{session.recovery_attempt}",
+                            reason_code=result.get("reason_code") or session.recovery_reason_code,
+                            reason_message=result.get("reason_message") or "Edge 正在异步恢复",
+                        )
+                        return session
+                    try:
+                        elapsed = (now - datetime.fromisoformat(started_at)).total_seconds()
+                    except (TypeError, ValueError):
+                        elapsed = cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS + 1
+                    if elapsed < cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS:
+                        session.next_action_at = now + timedelta(seconds=1)
+                        session.save(update_fields=["next_action_at", "updated_at"])
+                        return session
+                    metadata.pop("recovery_in_progress_started_at", None)
+                    session.metadata = metadata
+                    session.observation_started_at = None
+                    return cls._set_state(
+                        session,
+                        "observing",
+                        "loop.recovery_in_progress_timeout",
+                        reason_code="RECOVERY_IN_PROGRESS_TIMEOUT",
+                        reason_message="Edge 异步恢复超时，重新进行安全观察",
+                        next_action_at=now,
+                    )
+                if recovery_status == "non_retryable":
+                    return cls._begin_recovery_stop(
+                        session,
+                        execution,
+                        reason_code=result.get("reason_code") or "RECOVERY_NON_RETRYABLE",
+                        reason_message=result.get("reason_message") or "Edge 判定当前异常不可继续恢复",
                     )
                 session.observation_started_at = None
                 return cls._set_state(

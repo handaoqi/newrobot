@@ -16,4 +16,4 @@ class LegProfile:
     speed_profile: str = "cruise"
     goal_checker_id: str = "general_goal_checker"
     arrival_policy: str = "stop_and_confirm"
-
+    smoother_id: str = "simple_smoother"

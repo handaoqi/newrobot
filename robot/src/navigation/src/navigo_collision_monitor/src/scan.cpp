@@ -169,6 +169,12 @@ void Scan::getData(
   }
 }
 
+bool Scan::isFresh(const rclcpp::Time & curr_time) const
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  return data_ != nullptr && sourceValid(data_->header.stamp, curr_time);
+}
+
 void Scan::dataCallback(sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
 {
   {

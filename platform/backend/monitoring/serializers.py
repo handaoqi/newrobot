@@ -1581,6 +1581,7 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
             "recovery_max_attempts",
             "manual_paused",
             "last_error",
+            "metadata",
             "recent_events",
             "created_at",
             "updated_at",

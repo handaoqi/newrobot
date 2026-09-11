@@ -80,6 +80,10 @@ public:
    */
   bool getEnabled() const;
 
+  /// True only when this source has a recent usable sample. The default keeps
+  /// compatibility for legacy sources; safety-critical scan sources override it.
+  virtual bool isFresh(const rclcpp::Time & curr_time) const;
+
 protected:
   /**
    * @brief Source configuration routine.
