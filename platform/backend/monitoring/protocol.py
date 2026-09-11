@@ -81,7 +81,6 @@ UPLINK_MESSAGE_TYPES = {
     "telemetry.status",
     "telemetry.pose",
     "trajectory.batch",
-    "trajectory.ack",
     "command.ack",
     "command.progress",
     "command.result",
@@ -101,6 +100,8 @@ UPLINK_MESSAGE_TYPES = {
     "task.interrupted",
     "task.arrival_pending_settle",
     "task.arrival_correcting",
+    "task.arrival_heading_aligning",
+    "task.arrival_heading_aligned",
     "task.recovery_active",
     "task.safe_hold",
     "task.waypoint_actions",
@@ -108,7 +109,10 @@ UPLINK_MESSAGE_TYPES = {
     "alert.event",
     "system.log.batch",
     "sync.request",
+}
+CENTER_DOWNLINK_MESSAGE_TYPES = {
     "sync.response",
+    "trajectory.ack",
 }
 ALL_MESSAGE_TYPES = UPLINK_MESSAGE_TYPES | COMMAND_TYPES
 
@@ -193,12 +197,16 @@ def parse_message(raw: bytes | str | dict[str, Any]) -> MessageEnvelope:
     if not isinstance(payload, dict):
         raise ProtocolError("INVALID_MESSAGE", "payload must be an object")
 
+    session_id = str(_required(data, "session_id"))
+    if message_type in UPLINK_MESSAGE_TYPES:
+        session_id = str(_uuid(session_id, "session_id"))
+
     envelope = MessageEnvelope(
         protocol_version=version,
         message_id=_uuid(_required(data, "message_id"), "message_id"),
         message_type=message_type,
         robot_id=robot_id,
-        session_id=str(_required(data, "session_id")),
+        session_id=session_id,
         sent_at=normalize_timestamp(_required(data, "sent_at")),
         trace_id=_uuid(_required(data, "trace_id"), "trace_id"),
         sequence=sequence,

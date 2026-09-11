@@ -21,6 +21,28 @@ class ProtocolContractTests(SimpleTestCase):
             parse_message(payload)
         self.assertEqual(raised.exception.code, "UNSUPPORTED_PROTOCOL_VERSION")
 
+    def test_rejects_non_uuid_edge_session_before_persistence(self):
+        payload = json.loads(self.fixture_path.read_text())
+        payload["message_type"] = "sync.request"
+        payload["payload"] = {}
+        payload["session_id"] = "center"
+        with self.assertRaises(ProtocolError) as raised:
+            parse_message(payload)
+        self.assertEqual(raised.exception.code, "INVALID_MESSAGE")
+        self.assertEqual(raised.exception.message, "session_id must be UUID")
+
+    def test_accepts_arrival_heading_stage_events(self):
+        for message_type in ("task.arrival_heading_aligning", "task.arrival_heading_aligned"):
+            payload = json.loads(self.fixture_path.read_text())
+            payload["message_type"] = message_type
+            payload["session_id"] = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+            payload["payload"] = {
+                "task_execution_id": payload["payload"]["task_execution_id"],
+                "state": "running",
+                "state_version": 7,
+            }
+            self.assertEqual(parse_message(payload).message_type, message_type)
+
     def test_rejects_non_contiguous_waypoints(self):
         payload = json.loads(self.fixture_path.read_text())
         payload["payload"]["command"]["route_snapshot"]["waypoints"][1]["sequence"] = 8

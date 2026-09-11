@@ -16,6 +16,7 @@ from .models import (
     RobotCommand,
     SpeechCategory,
     SpeechTemplate,
+    SystemLog,
     TaskExecution,
     TaskExecutionEvent,
     TrajectoryBatchReceipt,
@@ -169,6 +170,53 @@ class MessageHandlerTests(TestCase):
         event = TaskExecutionEvent.objects.get(event_type="task.sync_terminal_reconciled")
         self.assertEqual(event.payload["previous_cloud_state"], "dispatching")
         self.assertEqual(event.payload["outbox_pending"], 3056)
+
+    @patch("monitoring.message_handlers.realtime_publisher.publish_task_event")
+    def test_arrival_heading_stage_events_are_informational(self, publish_task_event):
+        self.execution.refresh_from_db()
+        initial_state = self.execution.state
+        initial_version = self.execution.state_version
+
+        for sequence, message_type in enumerate(
+            ("task.arrival_heading_aligning", "task.arrival_heading_aligned"),
+            start=10,
+        ):
+            result = handle_mqtt_message(
+                "robots/rx-001/events/task",
+                self.envelope(
+                    message_type,
+                    {
+                        "task_execution_id": str(self.execution.id),
+                        "state": initial_state,
+                        "state_version": initial_version,
+                        "waypoint_index": 0,
+                        "reason_message": message_type,
+                    },
+                    sequence=sequence,
+                ),
+            )
+            self.assertEqual(result, {"state": initial_state, "state_version": initial_version})
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, initial_state)
+        self.assertEqual(self.execution.state_version, initial_version)
+        self.assertEqual(
+            set(
+                SystemLog.objects.filter(
+                    task_execution=self.execution,
+                    event_code__in={"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+                ).values_list("event_code", flat=True)
+            ),
+            {"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+        )
+        self.assertEqual(
+            InboundMessage.objects.filter(
+                message_type__in={"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+                process_status="processed",
+            ).count(),
+            2,
+        )
+        self.assertEqual(publish_task_event.call_count, 2)
 
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(

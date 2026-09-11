@@ -1,4 +1,5 @@
 import json
+import threading
 from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase
@@ -8,6 +9,42 @@ from .protocol import ProtocolError
 
 
 class PlatformMqttClientTests(SimpleTestCase):
+    def test_sync_subscription_uses_mqtt_v5_no_local(self):
+        platform_client = object.__new__(PlatformMqttClient)
+        platform_client._connected = threading.Event()
+        mqtt_client = Mock()
+
+        platform_client.on_connect(mqtt_client, None, None, 0, None)
+
+        sync_calls = [
+            call for call in mqtt_client.subscribe.call_args_list
+            if call.args[0] == "robots/+/sync/state"
+        ]
+        self.assertEqual(len(sync_calls), 1)
+        options = sync_calls[0].kwargs["options"]
+        self.assertEqual(options.QoS, 1)
+        self.assertTrue(options.noLocal)
+
+    def test_on_message_ignores_center_sync_downlinks(self):
+        platform_client = object.__new__(PlatformMqttClient)
+        for message_type in ("sync.response", "trajectory.ack"):
+            message = Mock()
+            message.topic = "robots/rx-001/sync/state"
+            message.payload = json.dumps({"message_type": message_type}).encode()
+            with patch("monitoring.mqtt_client.handle_mqtt_message") as handler:
+                platform_client.on_message(None, None, message)
+            handler.assert_not_called()
+
+    def test_on_message_forwards_edge_sync_request(self):
+        platform_client = object.__new__(PlatformMqttClient)
+        platform_client._last_protocol_error_at = {}
+        message = Mock()
+        message.topic = "robots/rx-001/sync/state"
+        message.payload = json.dumps({"message_type": "sync.request"}).encode()
+        with patch("monitoring.mqtt_client.handle_mqtt_message") as handler:
+            platform_client.on_message(None, None, message)
+        handler.assert_called_once_with(message.topic, message.payload, platform_client.publish_json)
+
     def test_invalid_trajectory_protocol_error_publishes_drop_ack(self):
         client = object.__new__(PlatformMqttClient)
         client.publish_json = Mock()

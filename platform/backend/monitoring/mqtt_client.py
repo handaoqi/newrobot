@@ -15,7 +15,7 @@ from django.utils import timezone
 from .message_handlers import handle_mqtt_message
 from .dev_message_handlers import handle_dev_mqtt_message
 from .models import DevelopmentTask, RemoteCommand
-from .protocol import ProtocolError, build_command_message
+from .protocol import CENTER_DOWNLINK_MESSAGE_TYPES, ProtocolError, build_command_message
 from .services.command_service import CommandService
 
 LOGGER = logging.getLogger(__name__)
@@ -83,7 +83,11 @@ class PlatformMqttClient:
             "robots/+/dev/tasks/+/result",
             "robots/+/dev/voice/audio",
         ):
-            client.subscribe(topic, qos=1 if "pose" not in topic and "status" not in topic else 0)
+            qos = 1 if "pose" not in topic and "status" not in topic else 0
+            if topic.endswith("/sync/state"):
+                client.subscribe(topic, options=mqtt.SubscribeOptions(qos=qos, noLocal=True))
+            else:
+                client.subscribe(topic, qos=qos)
         LOGGER.info("MQTT device worker connected")
 
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
@@ -91,6 +95,11 @@ class PlatformMqttClient:
         LOGGER.warning("MQTT device worker disconnected: %s", reason_code)
 
     def on_message(self, client, userdata, message) -> None:
+        # sync/state is bidirectional. MQTT v5 No Local prevents the normal
+        # self-loop, while this filter also protects against brokers that do
+        # not honor it and messages published by another center instance.
+        if self._is_center_sync_downlink(message.topic, message.payload):
+            return
         try:
             if "/dev/" in message.topic:
                 handle_dev_mqtt_message(message.topic, message.payload, self.publish_json)
@@ -113,6 +122,18 @@ class PlatformMqttClient:
                 self._last_protocol_error_at[message.topic] = now
         except Exception:
             LOGGER.exception("failed to process device message topic=%s", message.topic)
+
+    @staticmethod
+    def _is_center_sync_downlink(topic: str, raw_payload: bytes | str) -> bool:
+        if not topic.endswith("/sync/state"):
+            return False
+        try:
+            if isinstance(raw_payload, bytes):
+                raw_payload = raw_payload.decode("utf-8")
+            payload = json.loads(raw_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(payload, dict) and payload.get("message_type") in CENTER_DOWNLINK_MESSAGE_TYPES
 
     def _publish_trajectory_rejection(self, topic: str, raw_payload: bytes, error: ProtocolError) -> None:
         """Tell Edge to drop a permanently invalid trajectory batch."""

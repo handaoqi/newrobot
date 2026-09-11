@@ -373,15 +373,12 @@ def _inbound_defaults(
 
 def _record_inbound(topic: str, envelope: MessageEnvelope, robot: Robot) -> tuple[InboundMessage, bool]:
     try:
-        try:
-            return InboundMessage.objects.get_or_create(
-                message_id=envelope.message_id,
-                defaults=_inbound_defaults(topic, envelope, robot),
-            )
-        except IntegrityError:
-            return InboundMessage.objects.get(message_id=envelope.message_id), False
-    except ValueError as exc:
-        raise ProtocolError("INVALID_MESSAGE", "session_id must be UUID for Edge uplink") from exc
+        return InboundMessage.objects.get_or_create(
+            message_id=envelope.message_id,
+            defaults=_inbound_defaults(topic, envelope, robot),
+        )
+    except IntegrityError:
+        return InboundMessage.objects.get(message_id=envelope.message_id), False
 
 
 def _persist_inbound_failure(
@@ -848,6 +845,8 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
     if envelope.message_type in {
         "task.arrival_pending_settle",
         "task.arrival_correcting",
+        "task.arrival_heading_aligning",
+        "task.arrival_heading_aligned",
         "task.recovery_active",
         "task.waypoint_actions",
         "task.waypoint_degraded",
