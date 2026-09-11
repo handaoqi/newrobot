@@ -2113,7 +2113,9 @@ private:
       return false;
     }
     last_rtk_aux_observation_stamp_ns_ = observation.stamp_ns;
-    const bool quality_ok = rtkCorrectionQualityOk(observation);
+    const bool fixed_quality_ok = rtkCorrectionQualityOk(observation);
+    const bool float_quality_ok = rtkFloatQualityOk(observation);
+    const bool quality_ok = fixed_quality_ok || float_quality_ok;
     if (!quality_ok) {
       rtk_stability_window_.clear();
       rtk_self_stable_ = false;
@@ -2128,10 +2130,10 @@ private:
         (rtk_position_for_stability.head<2>() -
          rtk_drift_gate_.prev_source_xy.head<2>()).norm();
     }
-    const bool rtk_self_stable = quality_ok && updateRtkSelfStability(
+    const bool rtk_self_stable = fixed_quality_ok && updateRtkSelfStability(
       rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
     const bool trust_rtk = rtk_self_stable ||
-      (!force_correction && motion_phase_ == "moving" && quality_ok);
+      (!force_correction && motion_phase_ == "moving" && fixed_quality_ok);
     if (force_correction && quality_ok && !rtk_self_stable) {
       rtk_drift_gate_.last_decision = "awaiting_rtk_self_stable";
       if (force_correction && one_shot_correction_.active) {
@@ -2176,6 +2178,11 @@ private:
         "fixed RTK is self_stable",
         drift_yaw * 180.0 / M_PI,
         lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+    }
+    const bool float_within_gate = float_quality_ok && drift_xy <= 0.20f;
+    if (force_correction && !fixed_quality_ok && !float_within_gate) {
+      rtk_drift_gate_.last_decision = "float_rtk_outside_ukf_gate";
+      return false;
     }
     const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
@@ -2287,7 +2294,8 @@ private:
   CorrectionCandidateSummary rtkCorrectionCandidate(
       const RtkObservation& observation) const {
     CorrectionCandidateSummary candidate;
-    candidate.eligible = pose_estimator && rtkCorrectionQualityOk(observation);
+    candidate.eligible = pose_estimator &&
+      (rtkCorrectionQualityOk(observation) || rtkFloatQualityOk(observation));
     candidate.stamp_ns = observation.stamp_ns;
     if (!candidate.eligible) {
       return candidate;
@@ -2303,6 +2311,10 @@ private:
     candidate.orientation_variance = noise.orientation_variance;
     candidate.residual_xy =
       (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm();
+    if (observation.quality == "float" && candidate.residual_xy > 0.20f) {
+      candidate.eligible = false;
+      return candidate;
+    }
     candidate.residual_yaw = observation.heading_usable
       ? pose_estimator->quat().angularDistance(observation.orientation) : 0.0;
     return candidate;
@@ -2318,6 +2330,15 @@ private:
       observation.position.allFinite() &&
       std::isfinite(observation.horizontal_std_m) &&
       observation.horizontal_std_m <= gnss_max_horizontal_std_ &&
+      std::isfinite(observation.age_s) && observation.age_s <= gnss_max_age_ &&
+      observation.stamp_ns > 0;
+  }
+
+  bool rtkFloatQualityOk(const RtkObservation& observation) const {
+    return observation.usable && observation.quality == "float" &&
+      observation.position.allFinite() &&
+      std::isfinite(observation.horizontal_std_m) &&
+      observation.horizontal_std_m <= gnss_max_horizontal_std_ * 2.0 &&
       std::isfinite(observation.age_s) && observation.age_s <= gnss_max_age_ &&
       observation.stamp_ns > 0;
   }
