@@ -2411,6 +2411,18 @@ private:
         rtk_drift_gate_.last_decision = "quality_rejected";
       }
       if (force_correction) {
+        if (effective_mode == CorrectionPolicyMode::rtk &&
+            observation.usable && observation.quality != "fixed") {
+          // RTK mode must not wait indefinitely for a fixed solution. A
+          // floating/single-point sample is retained as diagnostic input; the
+          // continuous LIO/UKF estimate remains authoritative for this leg.
+          one_shot_correction_.status = "completed";
+          one_shot_correction_.selected_source = "none";
+          one_shot_correction_.reason = "rtk_no_correction_continue";
+          RCLCPP_WARN(get_logger(),
+            "RTK correction skipped without blocking: quality=%s; continuing on LIO/UKF",
+            observation.quality.c_str());
+        } else {
         const bool rtk_float = observation.usable && observation.quality == "float" &&
           pose_estimator && observation.position.allFinite() &&
           (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm() > 0.20f;
@@ -2425,6 +2437,7 @@ private:
         } else {
           one_shot_correction_.status = "waiting_source";
           one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
+        }
         }
       }
     }
