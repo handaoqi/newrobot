@@ -3419,6 +3419,10 @@ class RosAdapter(Node):
         # collision-monitor cycle.  Repeating is safe and makes this operation
         # idempotent when completion/cancel/recovery paths race.
         for _ in range(10):
+            # Feed the zero into the collision monitor as well as publishing
+            # the final output. Publishing only /cmd_vel races the monitor's
+            # last non-zero /cmd_vel_raw and can immediately overwrite stop.
+            self._arrival_adjust_cmd_vel_pub.publish(zero)
             self._cmd_vel_pub.publish(zero)
             time.sleep(0.05)
 
