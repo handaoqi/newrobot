@@ -2407,8 +2407,21 @@ private:
         rtk_drift_gate_.last_decision = "quality_rejected";
       }
       if (force_correction) {
-        one_shot_correction_.status = "waiting_source";
-        one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
+        const bool rtk_float = observation.usable && observation.quality == "float" &&
+          pose_estimator && observation.position.allFinite() &&
+          (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm() > 0.20f;
+        const bool ndt_poor = !match || !std::isfinite(match->fitness_score_) ||
+          match->fitness_score_ >= 0.40f;
+        if (effective_mode == CorrectionPolicyMode::ukf && rtk_float && ndt_poor) {
+          one_shot_correction_.status = "completed";
+          one_shot_correction_.selected_source = "none";
+          one_shot_correction_.reason = "ukf_no_correction_sources_meet_gate";
+          RCLCPP_WARN(get_logger(),
+            "UKF correction skipped without blocking: RTK float drift >0.20m, NDT score >=0.40");
+        } else {
+          one_shot_correction_.status = "waiting_source";
+          one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
+        }
       }
     }
     if (corrected) {
