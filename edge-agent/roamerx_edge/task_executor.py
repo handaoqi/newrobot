@@ -1449,8 +1449,27 @@ class TaskExecutor:
             # safe approach line and must never be skipped by nearest-point
             # task startup behavior.
             initial_waypoint_index = 0 if docking.get("enabled") else self._nearest_waypoint_index(route)
+            loop_direction = str(command.get("loop_direction") or "").strip().lower()
+            explicit_loop_round = bool(
+                command.get("loop_execution")
+                and int(command.get("round_number", 1) or 1) > 1
+                and loop_direction in {"forward", "reverse"}
+            )
+            if explicit_loop_round and loop_direction == "reverse":
+                route["waypoints"].reverse()
+                for sequence, waypoint in enumerate(route["waypoints"]):
+                    waypoint.setdefault("map_point_number", int(waypoint.get("sequence", 0)) + 1)
+                    waypoint["sequence"] = sequence
+                route["execution_order"] = "reverse_from_route_end"
+                initial_waypoint_index = 0
+            elif explicit_loop_round:
+                route["execution_order"] = "forward"
+                initial_waypoint_index = 0
+            if explicit_loop_round:
+                route["loop_round_continuation"] = True
             reverse_return = bool(
                 command.get("loop_execution")
+                and not explicit_loop_round
                 and not docking.get("enabled")
                 and len(route["waypoints"]) > 1
                 and initial_waypoint_index == len(route["waypoints"]) - 1
@@ -2403,7 +2422,10 @@ class TaskExecutor:
         if not self.context or self._is_docking_task():
             return index
         order = str(self.context.route_snapshot.get("execution_order") or "")
-        if order not in {"reverse_from_route_end", "reverse"}:
+        continuation = bool(self.context.route_snapshot.get("loop_round_continuation"))
+        if order not in {"reverse_from_route_end", "reverse", "forward"}:
+            return index
+        if order == "forward" and not continuation:
             return index
         if index != 0:
             return index

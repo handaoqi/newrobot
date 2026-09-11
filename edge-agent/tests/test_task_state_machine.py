@@ -1641,6 +1641,33 @@ def test_loop_round_dispatches_first_leg_without_heading_worker(tmp_path):
     store.close()
 
 
+def test_center_loop_round_uses_explicit_direction_at_boundary(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # The previous round ended at the last click.  A slightly stale pose is
+    # closer to the preceding click; explicit round direction must still start
+    # the return leg from the terminal anchor, not redispatch that click.
+    nav.pose = SimpleNamespace(x=2.7, y=4.0, yaw=0.0)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    body = envelope.payload["command"]
+    body["loop_execution"] = True
+    body["loop_total"] = 1
+    body["round_number"] = 2
+    body["loop_direction"] = "reverse"
+    executor.start_task(envelope)
+    _await_departure_heading(executor)
+    assert executor.context.route_snapshot["execution_order"] == "reverse_from_route_end"
+    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[0]) == ["wp-2"]
+    store.close()
+
+
 def test_loop_round_skips_confirmed_repeated_anchor_without_arrival_side_effects(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

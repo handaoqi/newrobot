@@ -484,7 +484,14 @@ class PatrolLoopService:
                 execution,
                 "task.start",
                 session.created_by,
-                command_options={"loop_execution": True, "loop_total": 1},
+                command_options={
+                    "loop_execution": True,
+                    "loop_total": 1,
+                    # A new round must start from the terminal side reached by
+                    # the previous round.  Recomputing the nearest point from
+                    # a drifting RTK/LIO sample can dispatch 6 then 7 again.
+                    "loop_direction": "forward" if round_number % 2 else "reverse",
+                },
             )
         else:
             execution = existing
