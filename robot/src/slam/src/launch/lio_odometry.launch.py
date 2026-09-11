@@ -35,7 +35,10 @@ def generate_launch_description():
                 {
                     'frontend.odometry_only': True,
                     'frontend.odometry_topic': '/odom/lio_odom',
-                    'preprocess.fov_degree': 360.0,
+                    # Match the front 240-degree scan geometry used to build
+                    # the map and by NDT/VGICP. The independent obstacle
+                    # LaserScan path continues to consume the full 360 degrees.
+                    'preprocess.fov_degree': 240.0,
                     'preprocess.max_range': max_range,
                     'keyframe_record.enable': False,
                     'global_optimization.enable': False,

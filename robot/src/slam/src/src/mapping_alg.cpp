@@ -518,11 +518,9 @@ namespace robot::slam
             map_pub_en = false;
             path_en = false;
             state_.store(SlamState::WARMUP);
-            // Navigation LIO keeps the full Mid-360 scan; front-FOV crop is mapping-only.
-            scan_fov_degree = 360.0;
             RCLCPP_INFO(this->get_logger(),
-                "FAST-LIO2 odometry-only mode: frontend only, topic=%s, loop/backend/map IO disabled, scan FOV=360",
-                lio_odometry_topic_.c_str());
+                "FAST-LIO2 odometry-only mode: frontend only, topic=%s, loop/backend/map IO disabled, scan FOV=%.1f",
+                lio_odometry_topic_.c_str(), scan_fov_degree);
         }
         p_pre->setFovDegree(scan_fov_degree);
         p_pre->setMaxRange(scan_max_range);

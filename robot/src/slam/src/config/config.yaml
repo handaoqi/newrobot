@@ -25,7 +25,8 @@
         # Launch profiles override this to 10 m indoors and 25 m outdoors.
         max_range: 10.0
         # Keep the front 240 degrees, i.e. mask only the rear +/-60 degree
-        # operator sector. Navigation LIO overrides this to the full 360.
+        # sector. Mapping and navigation LIO use the same scan geometry;
+        # the independent obstacle LaserScan path remains full 360 degrees.
         fov_degree: 240.0
         timestamp_unit: 3
         scan_rate: 10

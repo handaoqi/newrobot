@@ -147,6 +147,8 @@ publish.world_points_en=false
 
 `/odom/lio_odom` 由 `/lio_odometry` 单一发布，实测约 10.00 Hz，并由 `/localization` 消费。`planner_server`、`controller_server`、`bt_navigator` 和 `collision_monitor` 均存在。完整 `roamerx-mapping.service` 保持 inactive/disabled。
 
+2026-09-11更新：正式建图、导航FAST-LIO前端和NDT/VGICP地图匹配现统一采用前向240°点云，减少正后方无建图对应点参与LIO计算；原始`/front_lidar`及其360° LaserScan避障链保持不裁剪，因此该调整不缩小碰撞监控安全视场。导航launch保留单一参数回滚入口，可在运动回放发现前侧特征不足时恢复FAST-LIO为360°。
+
 因此导航阶段的进程边界是“完整导航与定位链路 + FAST-LIO 里程计前端”，而不是完整 SLAM 建图进程。地图保存后停止全局优化、关键帧记录和地图发布等建图后端，但任何回滚均不得停止导航定位必需的 `/lio_odometry`。
 
 ## 5. 现场验收结果

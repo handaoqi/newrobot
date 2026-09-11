@@ -1,5 +1,12 @@
 # 室内 FAST-LIO2、NDT/VGICP 循环导航与重定位完善计划
 
+## 0. 实施状态更新（2026-09-11）
+
+- 正式建图、导航 FAST-LIO前端和NDT/VGICP地图匹配统一使用前向240°点云，即雷达坐标系`-120°～+120°`。
+- 导航 LIO不再在`frontend.odometry_only=true`时强制恢复360°，实际视场由`preprocess.fov_degree`统一配置。
+- `/front_lidar -> /laser_scan_raw -> /laser_scan -> collision_monitor`避障链路仍保留360°，本次调整不形成侧后方安全盲区。
+- 240°相对360°会减少正后方特征；需要通过原地转向、低速短路线和受控倒退回放确认LIO保持至少8 Hz、定位状态保持3且无新增运动异常。出现退化时只需把导航launch的`preprocess.fov_degree`恢复为360°，不影响建图地图和避障配置。
+
 ## 1. 目标
 
 - FAST-LIO2 继续作为唯一连续主定位源，保持约 10 Hz 平滑里程计。
@@ -14,7 +21,7 @@
 
 - 导航阶段以 `robot_slam/mapping` 的 `frontend.odometry_only=true` 模式运行。
 - 输入 `/front_lidar` 和雷达内置 `/front_lidar/imu`，输出 `/odom/lio_odom`。
-- 室内点云范围为 0.5-10 m，导航前端使用 360° 点云并开启重力约束地面滤除。
+- 室内点云范围为 0.5-10 m，导航前端与建图统一使用前向240°点云并开启重力约束地面滤除。
 - FAST-LIO2 内部使用激光-IMU紧耦合 ESKF；定位 UKF 设置 `use_imu=false`，不重复融合原始 IMU。
 - 导航阶段关闭 FAST-LIO2 后端回环、GNSS因子、地图输出和全局优化。
 
