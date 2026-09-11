@@ -172,13 +172,17 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(event.payload["outbox_pending"], 3056)
 
     @patch("monitoring.message_handlers.realtime_publisher.publish_task_event")
-    def test_arrival_heading_stage_events_are_informational(self, publish_task_event):
+    def test_arrival_stage_events_are_informational(self, publish_task_event):
         self.execution.refresh_from_db()
         initial_state = self.execution.state
         initial_version = self.execution.state_version
 
         for sequence, message_type in enumerate(
-            ("task.arrival_heading_aligning", "task.arrival_heading_aligned"),
+            (
+                "task.arrival_heading_aligning",
+                "task.arrival_heading_aligned",
+                "task.waypoint_postprocess_completed",
+            ),
             start=10,
         ):
             result = handle_mqtt_message(
@@ -204,19 +208,31 @@ class MessageHandlerTests(TestCase):
             set(
                 SystemLog.objects.filter(
                     task_execution=self.execution,
-                    event_code__in={"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+                    event_code__in={
+                        "task.arrival_heading_aligning",
+                        "task.arrival_heading_aligned",
+                        "task.waypoint_postprocess_completed",
+                    },
                 ).values_list("event_code", flat=True)
             ),
-            {"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+            {
+                "task.arrival_heading_aligning",
+                "task.arrival_heading_aligned",
+                "task.waypoint_postprocess_completed",
+            },
         )
         self.assertEqual(
             InboundMessage.objects.filter(
-                message_type__in={"task.arrival_heading_aligning", "task.arrival_heading_aligned"},
+                message_type__in={
+                    "task.arrival_heading_aligning",
+                    "task.arrival_heading_aligned",
+                    "task.waypoint_postprocess_completed",
+                },
                 process_status="processed",
             ).count(),
-            2,
+            3,
         )
-        self.assertEqual(publish_task_event.call_count, 2)
+        self.assertEqual(publish_task_event.call_count, 3)
 
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(

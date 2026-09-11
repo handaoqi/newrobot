@@ -359,7 +359,7 @@ def test_center_recovery_resumes_the_persisted_pending_waypoint(tmp_path):
     store.close()
 
 
-def test_center_recovery_degrades_only_arrival_yaw_inside_safe_radius(tmp_path):
+def test_center_recovery_reapproaches_instead_of_skipping_final_yaw(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     events = []
@@ -372,7 +372,7 @@ def test_center_recovery_degrades_only_arrival_yaw_inside_safe_radius(tmp_path):
         nav,
         event_callback=lambda *args: events.append(args),
         start_result_callback=lambda *args: None,
-        arrival_degraded_tolerance_m=0.60,
+        arrival_nav2_reapproach_max_error_m=1.50,
     )
     executor.start_task(envelope)
     executor.context.state = "paused"
@@ -389,11 +389,12 @@ def test_center_recovery_degrades_only_arrival_yaw_inside_safe_radius(tmp_path):
         attempt=1,
     )
 
-    assert result["recovery_action"] == "degraded_arrival_yaw"
-    assert result["recovery_status"] == "recovered"
-    assert result["distance_m"] < 0.60
-    assert any(event[0] == "task.waypoint_degraded" for event in events)
+    assert result["recovery_action"] == "nav2_reapproach"
+    assert result["recovery_status"] == "in_progress"
+    assert result["distance_m"] < 1.50
+    assert not any(event[0] == "task.waypoint_degraded" for event in events)
     assert executor.context.state == "running"
+    assert len(nav.sent) == 2
     store.close()
 
 
@@ -1046,6 +1047,96 @@ def test_reapproach_rejected_arrival_redispatches_same_waypoint(tmp_path):
     assert len(nav.sent) == before + 1
     assert executor.context.current_waypoint_index == 1
     assert executor._arrival_retry_counts[1] == 1
+    store.close()
+
+
+def test_initial_xy_failure_never_starts_cmd_vel_adjustment(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.40, y=float(waypoint["y"]), yaw=0.0)
+
+    # The adjustment entry point itself enforces the state-machine boundary:
+    # before verified XY and final yaw, the caller must re-approach with Nav2.
+    assert executor._start_arrival_adjustment(waypoint, 0) is False
+    assert not any(
+        abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
+        for vx, vy, yaw_rate in nav.arrival_adjustments
+    )
+    store.close()
+
+
+def test_reapproach_above_one_point_five_metres_requires_localization_recovery(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    recovery_requests = []
+    envelope = command("task.start")
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        arrival_nav2_reapproach_max_error_m=1.50,
+        localization_recovery_callback=lambda reason: recovery_requests.append(reason),
+    )
+    executor.start_task(envelope)
+    waypoint = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 1.51, y=float(waypoint["y"]), yaw=0.0)
+    before = len(nav.sent)
+
+    assert executor._reapproach_rejected_arrival(0) is True
+    assert len(nav.sent) == before
+    assert executor.context.state == "paused"
+    assert recovery_requests == ["arrival_precision_recovery"]
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_XY_UNVERIFIED"
+    executor.stop()
+    store.close()
+
+
+def test_reapproach_after_precision_recovery_allows_far_corrected_pose(tmp_path):
+    """The 1.50 m guard gates localization recovery, not the recovered Nav2 leg."""
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = command("task.start")
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        arrival_nav2_reapproach_max_error_m=1.50,
+    )
+    executor.start_task(envelope)
+    waypoint = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    # Face the original click so the assertion observes the re-approach goal
+    # itself rather than the optional pre-leg yaw-alignment phase.
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 1.51,
+        y=float(waypoint["y"]),
+        yaw=3.141592653589793,
+    )
+    before = len(nav.sent)
+
+    # Precision localization has declared the corrected pose stable.  Nav2
+    # must now plan from that pose back to the original waypoint, even though
+    # it is still farther than the recovery trigger threshold.
+    assert executor._reapproach_rejected_arrival(0, localization_recovered=True) is True
+    assert len(nav.sent) == before + 1
+    assert executor.context.state == "running"
+    assert executor.context.current_waypoint_index == 0
+    assert executor._arrival_retry_counts[0] == 1
+    executor.stop()
     store.close()
 
 
@@ -2686,7 +2777,7 @@ def test_final_heading_small_xy_drift_uses_cmd_vel_raw_adjustment(tmp_path):
     store.close()
 
 
-def test_arrival_adjustment_allows_xy_residual_above_legacy_initial_value(tmp_path):
+def test_post_yaw_arrival_adjustment_allows_residual_above_legacy_diagnostic_value(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     envelope = command("task.start")
@@ -2700,8 +2791,11 @@ def test_arrival_adjustment_allows_xy_residual_above_legacy_initial_value(tmp_pa
         start_result_callback=lambda *args: None,
     )
     executor.start_task(envelope)
+    executor.context.arrival_side_effects_started = True
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
     # 0.675 m used to be rejected by the 0.45 m initial gate before the
-    # collision-monitored XY controller was even allowed to run.
+    # collision-monitored *post-yaw* XY controller was even allowed to run.
     nav.pose = SimpleNamespace(
         x=float(waypoint["x"]) + 0.675,
         y=float(waypoint["y"]),
@@ -2737,6 +2831,9 @@ def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(envelope)
+    executor.context.arrival_side_effects_started = True
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
     nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.40, y=float(waypoint["y"]), yaw=0.0)
 
     assert executor._start_arrival_adjustment(waypoint, 0) is True
@@ -2778,7 +2875,9 @@ def test_nav2_micro_goal_requires_post_action_pose_revalidation(tmp_path):
     )
     executor.start_task(envelope)
     nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.40, y=float(waypoint["y"]), yaw=0.0)
+    executor.context.arrival_side_effects_started = True
     executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
 
     assert executor._start_arrival_adjustment(waypoint, 0) is True
     assert nav.arrival_micro_goal_profiles == [(True, 0.15)]
@@ -2826,7 +2925,9 @@ def test_arrival_adjustment_retries_transient_stale_scan_then_completes(tmp_path
         return {"clear": True, "reason": "clear"}
 
     nav.directional_clearance = transient_clearance
+    executor.context.arrival_side_effects_started = True
     executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
 
     assert executor._start_arrival_adjustment(waypoint, 0) is True
     deadline = time.time() + 5.0
@@ -2871,7 +2972,9 @@ def test_arrival_adjustment_pauses_after_stale_scan_grace_expires(tmp_path):
         y=float(waypoint["y"]),
         yaw=0.0,
     )
+    executor.context.arrival_side_effects_started = True
     executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
 
     assert executor._start_arrival_adjustment(waypoint, 0) is True
     deadline = time.time() + 1.0
@@ -3517,8 +3620,8 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     store.close()
 
 
-def test_patrol_final_pose_uses_bounded_micro_adjustment_budget(tmp_path):
-    for distance, expected_state in ((0.42, "completed"), (1.19, "paused")):
+def test_patrol_initial_xy_failure_uses_nav2_reapproach_not_micro_adjustment(tmp_path):
+    for distance in (0.42, 1.19):
         store = LocalStore(str(tmp_path / f"edge-{distance}.db"))
         nav = FakeNavigation()
         executor = TaskExecutor(
@@ -3539,10 +3642,16 @@ def test_patrol_final_pose_uses_bounded_micro_adjustment_budget(tmp_path):
         if executor._departure_heading_thread is not None:
             _await_departure_heading(executor)
         nav.result("succeeded", "", {"missed_waypoints": []})
-        deadline = time.time() + 8.0
-        while executor.context.state not in {"completed", "paused"} and time.time() < deadline:
+        deadline = time.time() + 2.0
+        while len(nav.sent) < 4 and time.time() < deadline:
             time.sleep(0.05)
-        assert executor.context.state == expected_state
+        assert executor.context.state == "running"
+        assert ids(nav.sent[-1]) == ["wp-3"]
+        assert not any(
+            abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
+            for vx, vy, yaw_rate in nav.arrival_adjustments
+        )
+        executor.stop()
         store.close()
 
 

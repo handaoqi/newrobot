@@ -312,14 +312,16 @@ class TaskExecutor:
         arrival_adjust_clearance_lookahead_m: float | None = None,
         arrival_adjust_speed_mps: float = 0.08,
         arrival_adjust_yaw_rate_rps: float = 0.10,
-        arrival_adjust_timeout_seconds: float = 45.0,
+        arrival_adjust_timeout_seconds: float = 30.0,
         arrival_adjust_scan_max_age_seconds: float = 0.50,
         arrival_adjust_safety_grace_seconds: float = 2.0,
         arrival_micro_adjust_mode: str = "cmd_vel",
         arrival_micro_adjust_max_initial_error_m: float = 0.45,
-        arrival_micro_adjust_total_budget_m: float = 0.90,
+        arrival_micro_adjust_total_budget_m: float = 0.60,
         arrival_micro_adjust_step_m: float = 0.15,
-        arrival_micro_adjust_max_steps: int = 6,
+        arrival_micro_adjust_max_steps: int = 4,
+        arrival_nav2_reapproach_max_error_m: float = 1.50,
+        arrival_precision_recovery_retry_seconds: float = 5.0,
         arrival_micro_goal_tolerance_m: float = 0.15,
         arrival_ndt_max_fitness_score: float = 0.45,
         arrival_convergence_samples: int = 3,
@@ -377,6 +379,13 @@ class TaskExecutor:
         )
         self.arrival_micro_adjust_step_m = max(0.01, float(arrival_micro_adjust_step_m))
         self.arrival_micro_adjust_max_steps = max(1, int(arrival_micro_adjust_max_steps))
+        self.arrival_nav2_reapproach_max_error_m = max(
+            self.final_waypoint_tolerance_m,
+            float(arrival_nav2_reapproach_max_error_m),
+        )
+        self.arrival_precision_recovery_retry_seconds = max(
+            1.0, float(arrival_precision_recovery_retry_seconds)
+        )
         self.arrival_micro_goal_tolerance_m = max(
             0.01, float(arrival_micro_goal_tolerance_m)
         )
@@ -424,6 +433,7 @@ class TaskExecutor:
         self._departure_heading_tolerance_rad = DEPARTURE_HEADING_ALIGN_RAD
         self._absolute_pause_watch_stop: threading.Event | None = None
         self._absolute_pause_watch_thread: threading.Thread | None = None
+        self._arrival_precision_recovery_timer: threading.Timer | None = None
         self._last_progress_emit_at: float | None = None
         self._obstacle_monitor_stop = threading.Event()
         self._obstacle_monitor_thread = None
@@ -564,6 +574,7 @@ class TaskExecutor:
         ):
             heading_thread.join(timeout=1.0)
         self._cancel_absolute_localization_resume_watch()
+        self._cancel_arrival_precision_recovery_retry()
         self._restore_navigation_profile()
         if self._blocked_retry_timer:
             self._blocked_retry_timer.cancel()
@@ -1223,6 +1234,7 @@ class TaskExecutor:
         """Resume a safety-paused task after localization is stably normal."""
         with self._lock:
             self._cancel_absolute_localization_resume_watch()
+            self._cancel_arrival_precision_recovery_retry()
             if not self.context or self.context.state in self.TERMINAL_STATES:
                 return
             # Keep the pending target. Re-picking the nearest remaining point
@@ -1314,12 +1326,18 @@ class TaskExecutor:
                     return
                 LOGGER.info(
                     "absolute localization pause cleared at waypoint %s but "
-                    "the corrected pose is still off-click; re-approaching",
+                    "the corrected pose is still off-click; re-approaching from the corrected pose",
                     resume_index,
                 )
                 self._navigation_prepared = False
                 self._clear_departure_heading(cancel_navigation=True)
-                if not self._reapproach_rejected_arrival(resume_index):
+                # This callback is emitted only after the localization layer
+                # has accepted a stable recovery.  Do not poll it again with
+                # a zero-second budget here: that can observe no sample at all
+                # and turn a successful recovery into a false safe hold.
+                if not self._reapproach_rejected_arrival(
+                    resume_index, localization_recovered=True
+                ):
                     self._emit_safe_hold(
                         "PHYSICAL_REAPPROACH_EXHAUSTED",
                         "重定位后仍未到达当前航点，进入安全保持",
@@ -3267,9 +3285,14 @@ class TaskExecutor:
 
     def _arrival_xy_is_stable(self, waypoint: dict, reached_index: int) -> bool:
         """Confirm corrected XY over consecutive fresh localization samples."""
+        required = (
+            PRECISION_CONFIRMATION_FRAMES
+            if self._arrival_policy(waypoint, reached_index) in {"precision", "dock"}
+            else self.arrival_convergence_samples
+        )
         deadline = time.monotonic() + max(
             0.5,
-            self.arrival_convergence_samples
+            required
             * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS
             * 4,
         )
@@ -3293,7 +3316,7 @@ class TaskExecutor:
                 waypoint, reached_index
             ):
                 stable += 1
-                if stable >= self.arrival_convergence_samples:
+                if stable >= required:
                     return True
             else:
                 stable = 0
@@ -3302,7 +3325,7 @@ class TaskExecutor:
             "waypoint %d corrected XY was not stable: %d/%d fresh frames",
             reached_index,
             stable,
-            self.arrival_convergence_samples,
+            required,
         )
         return False
 
@@ -3462,6 +3485,19 @@ class TaskExecutor:
             self._reset_arrival_micro_adjustment()
 
     def _start_arrival_adjustment(self, waypoint: dict, reached_index: int) -> bool:
+        # This is exclusively the post-final-yaw XY compensation path. A
+        # failed initial XY arrival must be corrected and re-approached by
+        # Nav2, never pushed by raw velocity.
+        if (
+            not self.context
+            or not self.context.arrival_side_effects_started
+            or self._arrival_heading_completed_index != reached_index
+        ):
+            LOGGER.warning(
+                "refusing XY micro-adjust before waypoint %d has verified XY and final yaw",
+                reached_index,
+            )
+            return False
         policy = self._arrival_policy(waypoint, reached_index)
         if policy == "dock" and self._is_docking_task():
             return False
@@ -3470,6 +3506,17 @@ class TaskExecutor:
             return False
         xy_tolerance, _ = self._arrival_pose_tolerances(waypoint, reached_index)
         if distance <= xy_tolerance:
+            return False
+        micro_adjust_max_residual = (
+            xy_tolerance + self.arrival_micro_adjust_total_budget_m
+        )
+        if distance > micro_adjust_max_residual:
+            LOGGER.warning(
+                "waypoint %d post-yaw XY residual %.3fm exceeds bounded micro-adjust limit %.3fm",
+                reached_index,
+                distance,
+                micro_adjust_max_residual,
+            )
             return False
         # Do not reject a valid post-yaw residual solely because it is larger
         # than the legacy initial-error setting.  This controller is bounded
@@ -3845,21 +3892,88 @@ class TaskExecutor:
         )
         self._arm_absolute_localization_resume_watch()
 
-    def _reapproach_rejected_arrival(self, reached_index: int) -> bool:
-        """Re-dispatch the same waypoint after a rejected arrival pose check."""
+    def _cancel_arrival_precision_recovery_retry(self) -> None:
+        timer = self._arrival_precision_recovery_timer
+        self._arrival_precision_recovery_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _hold_for_arrival_precision_recovery(self, message: str) -> None:
+        """Keep a far off-click arrival stopped and re-request localization.
+
+        Localization recovery itself may finish with a still-invalid map pose.
+        Retry requests every five seconds while that condition remains, then
+        let ``on_localization_recovered`` decide whether to re-approach.
+        """
+        if not self.context:
+            return
+        self._paused_for_localization = True
+        self._paused_localization_reason = "absolute_required"
+        self._emit_safe_hold("ARRIVAL_XY_UNVERIFIED", message)
+
+        def _retry() -> None:
+            with self._lock:
+                if (
+                    not self.context
+                    or self.context.state in self.TERMINAL_STATES
+                    or not self._paused_for_localization
+                    or self._paused_localization_reason != "absolute_required"
+                ):
+                    self._arrival_precision_recovery_timer = None
+                    return
+                callback = self.localization_recovery_callback
+                if callable(callback):
+                    callback("arrival_precision_recovery")
+                timer = threading.Timer(
+                    self.arrival_precision_recovery_retry_seconds, _retry
+                )
+                timer.daemon = True
+                self._arrival_precision_recovery_timer = timer
+                timer.start()
+
+        callback = self.localization_recovery_callback
+        if not callable(callback):
+            return
+        callback("arrival_precision_recovery")
+        self._cancel_arrival_precision_recovery_retry()
+        timer = threading.Timer(self.arrival_precision_recovery_retry_seconds, _retry)
+        timer.daemon = True
+        self._arrival_precision_recovery_timer = timer
+        timer.start()
+
+    def _reapproach_rejected_arrival(
+        self, reached_index: int, *, localization_recovered: bool = False
+    ) -> bool:
+        """Re-dispatch the original waypoint from the latest corrected pose.
+
+        A residual above 1.50m first requires stationary precision
+        localization.  Once that recovery reports a stable absolute pose, the
+        same distance is no longer a motion prohibition: Nav2 can safely plan
+        from the corrected current pose to the original waypoint.
+        """
         retries = int(self._arrival_retry_counts.get(reached_index, 0))
         waypoint = self.context.route_snapshot["waypoints"][reached_index]
-        policy = self._arrival_policy(waypoint, reached_index)
         distance, _ = self._arrival_pose_errors(waypoint, reached_index)
-        if distance is not None and distance > 1.0:
+        if distance is None:
             LOGGER.warning(
-                "waypoint %d corrected arrival error %.2fm requires localization recovery before re-approach",
+                "waypoint %d corrected arrival error is unavailable; requires precision localization before re-approach",
+                reached_index,
+            )
+            self._hold_for_arrival_precision_recovery(
+                "校正后航点残差超过 1.50 米或不可用，先执行精准定位恢复再重接近",
+            )
+            return True
+        if (
+            distance > self.arrival_nav2_reapproach_max_error_m
+            and not localization_recovered
+        ):
+            LOGGER.warning(
+                "waypoint %d corrected arrival error %.2fm requires precision localization before re-approach",
                 reached_index,
                 distance,
             )
-            self._emit_safe_hold(
-                "ARRIVAL_XY_UNVERIFIED",
-                "校正后航点残差超过 1.0 米，先执行定位恢复再重接近",
+            self._hold_for_arrival_precision_recovery(
+                "校正后航点残差超过 1.50 米，先执行精准定位恢复再重接近",
             )
             return True
         if retries >= WAYPOINT_ARRIVAL_RETRY_MAX:
@@ -3869,15 +3983,11 @@ class TaskExecutor:
                 retries,
             )
             self._arrival_retry_counts.pop(reached_index, None)
-            if policy in {"precision", "dock"}:
-                self._emit_safe_hold(
-                    "PHYSICAL_REAPPROACH_EXHAUSTED",
-                    "精确到点重试耗尽，进入安全保持",
-                )
-                return True
-            # Ordinary/final points fall through so the existing final-pose
-            # gate or fail-open intermediate policy can decide.
-            return False
+            self._emit_safe_hold(
+                "PHYSICAL_REAPPROACH_EXHAUSTED",
+                "航点重接近重试耗尽，进入安全保持",
+            )
+            return True
         self._arrival_retry_counts[reached_index] = retries + 1
         self._cancel_arrival_adjustment(reset_state=True)
         self._arrival_convergence_attempts.pop(reached_index, None)
@@ -4254,7 +4364,9 @@ class TaskExecutor:
                             existing,
                             waypoint_localization_mode(waypoint.get("localization_mode")),
                         )
-                if self._absolute_localization_ready(timeout_seconds=0.0):
+                # Give the readiness probe one scheduler tick.  A literal
+                # zero-second deadline can skip its first sample altogether.
+                if self._absolute_localization_ready(timeout_seconds=0.01):
                     self.on_localization_recovered()
                     return {
                         "final_task_state": self.context.state if self.context else "completed",
@@ -4367,7 +4479,12 @@ class TaskExecutor:
             code = str(
                 self.context.last_safe_hold_code or trigger_reason_code or "TASK_INTERRUPTED"
             )
-            if code == "ARRIVAL_POSE_CONVERGENCE_FAILED":
+            if code in {
+                "ARRIVAL_POSE_CONVERGENCE_FAILED",
+                "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
+                "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
+                "ARRIVAL_MICRO_ADJUST_POSE_UNAVAILABLE",
+            }:
                 index = (
                     self.context.post_arrival_waypoint_index
                     if self.context.post_arrival_waypoint_index is not None
@@ -4377,53 +4494,66 @@ class TaskExecutor:
                 if index < 0 or index >= len(waypoints):
                     raise ProtocolError("TASK_CONTEXT_MISMATCH", "arrival waypoint is missing")
                 waypoint = waypoints[index]
-                if self._is_docking_task() or self._arrival_policy(waypoint, index) != "stop_and_confirm":
-                    raise ProtocolError(
-                        "ARRIVAL_DEGRADE_FORBIDDEN",
-                        "precision and docking points cannot skip final pose convergence",
-                    )
                 decision = self._localization_decision()
                 if not self._localization_sample_fresh(decision):
-                    raise ProtocolError("LOCALIZATION_NOT_READY", "localization is not fresh")
-                distance, _yaw_error = self._arrival_pose_errors(waypoint, index)
-                if distance is None or distance > self.arrival_degraded_tolerance_m:
-                    raise ProtocolError(
-                        "ARRIVAL_DEGRADE_TOO_FAR",
-                        f"distance {distance} exceeds {self.arrival_degraded_tolerance_m:.2f}m",
+                    self._hold_for_arrival_precision_recovery(
+                        "到点定位数据不新鲜，正在执行精准定位恢复",
                     )
-                self._cancel_arrival_adjustment(reset_state=False)
-                self.context.state = "running"
-                self.context.state_version += 1
-                self.context.last_safe_hold_code = ""
-                self.context.last_safe_hold_message = ""
-                self._set_post_arrival_stage(index, "post_arrival_ready")
-                self._persist()
-                self._emit(
-                    "task.resumed",
-                    code="ARRIVAL_YAW_DEGRADED",
-                    message="position is safe; final yaw was skipped by recovery policy",
-                )
-                self._emit_idempotent(
-                    "task.waypoint_degraded",
-                    event_type_key=f"arrival_degraded:{recovery_episode_id}:{attempt}",
-                    waypoint_id=str(waypoint.get("waypoint_id") or index),
-                    code="ARRIVAL_YAW_DEGRADED",
-                    message="航点位置已安全到达，跳过最终朝向",
-                    extra={
-                        "distance_m": distance,
-                        "threshold_m": self.arrival_degraded_tolerance_m,
+                    return {
+                        "final_task_state": "paused",
+                        "state_version": self.context.state_version,
+                        "resume_blocked": True,
+                        "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
+                        "reason_message": "到点定位数据不新鲜，正在执行精准定位恢复",
+                        "recovery_action": "precision_localization_recovery",
+                        "recovery_status": "in_progress",
+                        "retry_after_seconds": 1,
                         "recovery_episode_id": recovery_episode_id,
                         "attempt": int(attempt),
-                    },
-                )
-                self._resume_post_arrival(index)
+                    }
+                distance, _yaw_error = self._arrival_pose_errors(waypoint, index)
+                if (
+                    distance is None
+                    or distance > self.arrival_nav2_reapproach_max_error_m
+                ):
+                    # Probe the now-stopped pose once before requesting a new
+                    # precision-recovery episode.
+                    if not self._absolute_localization_ready(timeout_seconds=0.01):
+                        self._hold_for_arrival_precision_recovery(
+                            "到点残差超过 1.50 米，正在执行精准定位恢复",
+                        )
+                        return {
+                            "final_task_state": "paused",
+                            "state_version": self.context.state_version,
+                            "resume_blocked": True,
+                            "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
+                            "reason_message": "到点残差超过 1.50 米，正在执行精准定位恢复",
+                            "recovery_action": "precision_localization_recovery",
+                            "recovery_status": "in_progress",
+                            "retry_after_seconds": 1,
+                            "recovery_episode_id": recovery_episode_id,
+                            "attempt": int(attempt),
+                        }
+                self.context.last_safe_hold_code = ""
+                self.context.last_safe_hold_message = ""
+                if not self._reapproach_rejected_arrival(
+                    index,
+                    localization_recovered=distance is not None
+                    and distance > self.arrival_nav2_reapproach_max_error_m,
+                ):
+                    self._emit_safe_hold(
+                        "PHYSICAL_REAPPROACH_EXHAUSTED",
+                        "到点自愈无法重新接近航点，保持停车",
+                    )
                 return {
-                    "final_task_state": self.context.state if self.context else "completed",
-                    "state_version": self.context.state_version if self.context else 0,
-                    "recovery_action": "degraded_arrival_yaw",
-                    "recovery_status": "recovered",
+                    "final_task_state": self.context.state,
+                    "state_version": self.context.state_version,
+                    "recovery_action": "nav2_reapproach",
+                    "recovery_status": "in_progress",
                     "waypoint_index": index,
                     "distance_m": distance,
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
                 }
             if "LOCALIZATION" in code.upper() or code in {"ARRIVAL_XY_UNVERIFIED", "ARRIVAL_CORRECTION_FAILED"}:
                 if callable(self.localization_recovery_callback):
@@ -4860,11 +4990,11 @@ class TaskExecutor:
                     message="Nav2已到目标附近，等待停车稳定",
                 )
                 if not self._hold_final_pose():
-                    LOGGER.warning(
-                        "waypoint %d reached but zero-motion confirmation timed out; "
-                        "continuing with stationary localization policy",
-                        reached_index,
+                    self._emit_safe_hold(
+                        "ARRIVAL_STOP_NOT_CONFIRMED",
+                        "Nav2 到点后未确认零速，禁止进入定位校正与到点验收",
                     )
+                    return
                 correction_completed = (
                     self._arrival_correction_completed_index == reached_index
                 )
@@ -4951,26 +5081,9 @@ class TaskExecutor:
                                     "waypoint reached by FAST-LIO but outdoor RTK is not fixed/usable; waiting before trusting arrival",
                                 )
                                 return
-                            distance, _ = self._arrival_pose_errors(
-                                reached_waypoint, reached_index
-                            )
-                            xy_tolerance, _ = self._arrival_pose_tolerances(
-                                reached_waypoint, reached_index
-                            )
-                            # Use raw-velocity correction only where its
-                            # configured total travel budget can plausibly
-                            # bring the robot inside the normal acceptance
-                            # window. Far-off Nav2 successes remain on the
-                            # established re-approach path.
-                            if (
-                                distance is not None
-                                and distance
-                                <= xy_tolerance + self.arrival_micro_adjust_total_budget_m
-                                and self._start_arrival_adjustment(
-                                    reached_waypoint, reached_index
-                                )
-                            ):
-                                return
+                            # Initial XY verification never uses cmd_vel.
+                            # Only the post-final-yaw path may make the
+                            # bounded heading-preserving correction.
                             if self._reapproach_rejected_arrival(reached_index):
                                 return
                             self._emit_safe_hold(
@@ -4982,7 +5095,7 @@ class TaskExecutor:
                     if self.context.arrival_side_effects_started:
                         self._set_post_arrival_stage(reached_index, "xy_adjusted")
                     else:
-                        self._set_post_arrival_stage(reached_index, "xy_reached")
+                        self._set_post_arrival_stage(reached_index, "xy_verified")
                         self._start_arrival_side_effects(
                             reached_index, reached_waypoint
                         )
@@ -5509,6 +5622,16 @@ class TaskExecutor:
             self._dwell_wait_finished = False
             self._dwell_wait_stop = None
         self._waypoint_localization_ready_index = None
+        self._set_post_arrival_stage(waypoint_index, "postprocess_completed")
+        self._emit_idempotent(
+            "task.waypoint_postprocess_completed",
+            event_type_key="waypoint_postprocess_completed",
+            waypoint_id=str(
+                self.context.route_snapshot["waypoints"][waypoint_index].get("waypoint_id")
+                or waypoint_index
+            ),
+            message="航点最终位置、航向与后处理已完成",
+        )
         self._active_correction_transaction_id = None
         self._active_correction_mode = None
         self._continue_after_waypoint(waypoint_index)

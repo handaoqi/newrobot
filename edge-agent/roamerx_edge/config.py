@@ -131,7 +131,7 @@ class SafetyConfig:
     arrival_adjust_clearance_lookahead_m: float | None = None
     arrival_adjust_speed_mps: float = 0.08
     arrival_adjust_yaw_rate_rps: float = 0.10
-    arrival_adjust_timeout_seconds: float = 45.0
+    arrival_adjust_timeout_seconds: float = 30.0
     arrival_adjust_scan_max_age_seconds: float = 0.50
     arrival_adjust_safety_grace_seconds: float = 2.0
     arrival_micro_adjust_mode: str = "cmd_vel"
@@ -139,9 +139,15 @@ class SafetyConfig:
     # observed travel, steps and timeout rather than rejecting a valid initial
     # XY residual before it can converge.
     arrival_micro_adjust_max_initial_error_m: float = 0.45
-    arrival_micro_adjust_total_budget_m: float = 0.90
+    arrival_micro_adjust_total_budget_m: float = 0.60
     arrival_micro_adjust_step_m: float = 0.15
-    arrival_micro_adjust_max_steps: int = 6
+    arrival_micro_adjust_max_steps: int = 4
+    # Above this corrected residual, a normal Nav2 re-approach is no longer
+    # trusted; stationary precision localization must recover first.
+    arrival_nav2_reapproach_max_error_m: float = 1.50
+    # While an off-click arrival waits for precise localization, retry the
+    # self-heal request at this cadence without commanding motion.
+    arrival_precision_recovery_retry_seconds: float = 5.0
     arrival_micro_goal_tolerance_m: float = 0.15
     arrival_ndt_max_fitness_score: float = 0.45
     arrival_convergence_samples: int = 3

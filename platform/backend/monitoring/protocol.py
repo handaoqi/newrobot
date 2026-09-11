@@ -106,6 +106,7 @@ UPLINK_MESSAGE_TYPES = {
     "task.safe_hold",
     "task.waypoint_actions",
     "task.waypoint_degraded",
+    "task.waypoint_postprocess_completed",
     "alert.event",
     "system.log.batch",
     "sync.request",

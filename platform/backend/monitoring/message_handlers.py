@@ -850,6 +850,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         "task.recovery_active",
         "task.waypoint_actions",
         "task.waypoint_degraded",
+        "task.waypoint_postprocess_completed",
     }:
         realtime_publisher.publish_task_event(
             str(execution.id),

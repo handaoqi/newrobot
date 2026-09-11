@@ -120,6 +120,8 @@ class EdgeAgentApplication:
             arrival_micro_adjust_total_budget_m=config.safety.arrival_micro_adjust_total_budget_m,
             arrival_micro_adjust_step_m=config.safety.arrival_micro_adjust_step_m,
             arrival_micro_adjust_max_steps=config.safety.arrival_micro_adjust_max_steps,
+            arrival_nav2_reapproach_max_error_m=config.safety.arrival_nav2_reapproach_max_error_m,
+            arrival_precision_recovery_retry_seconds=config.safety.arrival_precision_recovery_retry_seconds,
             arrival_micro_goal_tolerance_m=config.safety.arrival_micro_goal_tolerance_m,
             arrival_ndt_max_fitness_score=config.safety.arrival_ndt_max_fitness_score,
             arrival_convergence_samples=config.safety.arrival_convergence_samples,
@@ -1295,7 +1297,14 @@ class EdgeAgentApplication:
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
                 return
-            cycle_retry = max(1.0, self.config.safety.localization_recovery_cycle_seconds)
+            cycle_retry = max(
+                1.0,
+                (
+                    self.config.safety.arrival_precision_recovery_retry_seconds
+                    if str(reason).startswith("arrival_precision")
+                    else self.config.safety.localization_recovery_cycle_seconds
+                ),
+            )
             max_cycles = max(0, int(self.config.safety.localization_recovery_max_cycles))
             cycle = 0
             started_at = time.time()

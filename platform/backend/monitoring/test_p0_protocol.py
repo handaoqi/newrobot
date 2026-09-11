@@ -31,8 +31,12 @@ class ProtocolContractTests(SimpleTestCase):
         self.assertEqual(raised.exception.code, "INVALID_MESSAGE")
         self.assertEqual(raised.exception.message, "session_id must be UUID")
 
-    def test_accepts_arrival_heading_stage_events(self):
-        for message_type in ("task.arrival_heading_aligning", "task.arrival_heading_aligned"):
+    def test_accepts_arrival_stage_events(self):
+        for message_type in (
+            "task.arrival_heading_aligning",
+            "task.arrival_heading_aligned",
+            "task.waypoint_postprocess_completed",
+        ):
             payload = json.loads(self.fixture_path.read_text())
             payload["message_type"] = message_type
             payload["session_id"] = "63b66a16-1947-4be7-889b-d851a5f4ba20"

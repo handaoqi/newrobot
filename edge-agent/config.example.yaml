@@ -77,10 +77,13 @@ safety:
   # is diagnostic only and is not a start gate.
   arrival_micro_adjust_mode: cmd_vel
   arrival_micro_adjust_max_initial_error_m: 0.45
-  arrival_micro_adjust_total_budget_m: 0.90
+  arrival_micro_adjust_total_budget_m: 0.60
   arrival_micro_adjust_step_m: 0.15
-  arrival_micro_adjust_max_steps: 6
-  arrival_micro_adjust_timeout_seconds: 45
+  arrival_micro_adjust_max_steps: 4
+  # Above this residual, do stationary precision localization before moving.
+  arrival_nav2_reapproach_max_error_m: 1.50
+  arrival_precision_recovery_retry_seconds: 5.0
+  arrival_micro_adjust_timeout_seconds: 30
   arrival_micro_goal_tolerance_m: 0.15
   arrival_ndt_max_fitness_score: 0.45
   arrival_convergence_samples: 3
