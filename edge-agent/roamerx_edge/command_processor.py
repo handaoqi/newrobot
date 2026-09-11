@@ -91,7 +91,6 @@ class CommandProcessor:
             self._validate_expected_state(envelope)
             prepared_task_start = envelope.message_type == "task.start"
             if prepared_task_start:
-                self._release_manual_control_for_task()
                 self._ensure_navigation_stack_for_task()
                 docking = ((envelope.payload.get("command") or {}).get("docking") or {})
                 if docking.get("enabled"):
@@ -302,17 +301,6 @@ class CommandProcessor:
             return result
         finally:
             self._navigation_command_lock.release()
-
-    def _release_manual_control_for_task(self) -> None:
-        """Clear manual input before a navigation task takes control."""
-        if self.person_follow_controller:
-            self.person_follow_controller.stop("task_takeover")
-        if self.safety.state.control_mode != "manual_takeover":
-            return
-        if self.localization_adapter:
-            self.localization_adapter.teleop_velocity(0.0, 0.0, 0.0)
-        self.safety.state.control_mode = "autonomous"
-        LOGGER.info("task.start cleared manual remote control; teleop bridge remains resident")
 
     def _prepare_docking_map(self, command: dict) -> None:
         if not self.map_activation_adapter or not self.navigation_stack_adapter:
@@ -749,13 +737,31 @@ class CommandProcessor:
         }:
             self.person_follow_controller.stop("manual_teleop_override")
         if action == "takeover_enter":
-            result_payload = teleop_adapter.confirmed_remote_teleop_action(
-                "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
-            )
-            self.safety.state.control_mode = "manual_takeover"
+            if bool(command.get("assist", False)):
+                if not self.task_executor.has_active_task():
+                    raise ProtocolError(
+                        "MANUAL_ASSIST_REQUIRES_ACTIVE_TASK",
+                        "manual assist requires an active navigation task",
+                    )
+                self.safety.validate_manual_assist()
+                self.safety.state.control_mode = "manual_assist"
+                result_payload = {
+                    "mode": "manual_assist",
+                    "motion_topic": "/cmd_vel_assist",
+                    "detail": "Nav2 remains active; assist is collision-monitored and time-bounded",
+                }
+            else:
+                result_payload = teleop_adapter.confirmed_remote_teleop_action(
+                    "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
+                )
+                self.safety.state.control_mode = "manual_takeover"
         elif action == "takeover_exit":
-            teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
-            result_payload = teleop_adapter.release_to_remote_control()
+            if self.safety.state.control_mode == "manual_assist":
+                result_payload = self._manual_assist_velocity(teleop_adapter)
+                result_payload["mode"] = "autonomous"
+            else:
+                teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+                result_payload = teleop_adapter.release_to_remote_control()
             self.safety.state.control_mode = "autonomous"
         elif action == "stand_up":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
@@ -781,7 +787,10 @@ class CommandProcessor:
         elif action == "move_stop":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("move_stop")
-            result_payload = teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
+            if self.safety.state.control_mode == "manual_assist":
+                result_payload = self._manual_assist_velocity(teleop_adapter)
+            else:
+                result_payload = teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
         elif action == "person_follow_start":
             if not self.person_follow_controller:
                 raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "person follow controller is not configured")
@@ -825,22 +834,28 @@ class CommandProcessor:
                 raise ProtocolError("TELEOP_UNAVAILABLE", "skill executor is not configured")
             result_payload = self.skill_executor.cancel(str(command.get("command_id") or ""))
         elif action == "move_forward":
-            result_payload = teleop_adapter.teleop_velocity(vx=float(command.get("vx", 0.35)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, vx=float(command.get("vx", 0.35)))
         elif action == "move_backward":
-            result_payload = teleop_adapter.teleop_velocity(vx=float(command.get("vx", -0.35)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, vx=float(command.get("vx", -0.35)))
         elif action == "move_left":
-            result_payload = teleop_adapter.teleop_velocity(vy=float(command.get("vy", 0.25)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, vy=float(command.get("vy", 0.25)))
         elif action == "move_right":
-            result_payload = teleop_adapter.teleop_velocity(vy=float(command.get("vy", -0.25)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, vy=float(command.get("vy", -0.25)))
         elif action == "turn_left":
-            result_payload = teleop_adapter.teleop_velocity(yaw_rate=float(command.get("yaw_rate", 0.45)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, yaw_rate=float(command.get("yaw_rate", 0.45)))
         elif action == "turn_right":
-            result_payload = teleop_adapter.teleop_velocity(yaw_rate=float(command.get("yaw_rate", -0.45)))
+            result_payload = self._manual_assist_velocity(
+                teleop_adapter, yaw_rate=float(command.get("yaw_rate", -0.45)))
         elif action == "move_velocity":
             vx = max(-0.5, min(0.5, float(command.get("vx", 0.0))))
             vy = max(-0.5, min(0.5, float(command.get("vy", 0.0))))
             yaw_rate = max(-0.5, min(0.5, float(command.get("yaw_rate", 0.0))))
-            result_payload = teleop_adapter.teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+            result_payload = self._manual_assist_velocity(teleop_adapter, vx=vx, vy=vy, yaw_rate=yaw_rate)
         elif action in {"speed_micro", "speed_slow", "speed_normal", "speed_fast"}:
             result_payload = teleop_adapter.remote_teleop_action(action)
         elif action == "passive":
@@ -862,6 +877,23 @@ class CommandProcessor:
             result=result_payload,
             started_at=started_at,
         )
+
+    def _manual_assist_velocity(self, adapter, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0) -> dict:
+        """Route assist through the Nav2 safety pipeline while a task remains active."""
+        if self.safety.state.control_mode != "manual_assist":
+            return adapter.teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        if not self.task_executor.has_active_task():
+            self.safety.state.control_mode = "autonomous"
+            return adapter.teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        self.safety.validate_manual_assist()
+        # A second clamp at Edge bounds a malformed remote payload before the
+        # velocity optimizer applies its independent final limits.
+        vx = max(-0.10, min(0.10, float(vx)))
+        vy = max(-0.10, min(0.10, float(vy)))
+        yaw_rate = max(-0.25, min(0.25, float(yaw_rate)))
+        result = adapter.manual_assist_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
+        result["mode"] = "manual_assist"
+        return result
 
     def _complete_skill(self, envelope: MessageEnvelope, started_at: str, outcome: dict) -> None:
         """Publish the terminal result after the asynchronous local skill ends."""

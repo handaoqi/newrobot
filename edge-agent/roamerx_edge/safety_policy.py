@@ -110,6 +110,19 @@ class SafetyPolicy:
         if (required_map.get("map_id") != self.state.current_map_id or required_map.get("map_version") != self.state.current_map_version):
             raise ProtocolError("MAP_VERSION_MISMATCH", "current map does not match task")
 
+    def validate_manual_assist(self) -> None:
+        """Allow bounded assist only while all hard safety interlocks are clear."""
+        if self.state.emergency_stop:
+            raise ProtocolError("EMERGENCY_STOP_ACTIVE", "emergency stop is active")
+        if self.state.control_mode == "manual_takeover":
+            raise ProtocolError("MANUAL_TAKEOVER_ACTIVE", "manual takeover is active")
+        if (
+            self.state.power_available
+            and self.state.battery_percent is not None
+            and self.state.battery_percent < self.config.low_battery_percent
+        ):
+            raise ProtocolError("LOW_BATTERY", f"battery={self.state.battery_percent}")
+
     @staticmethod
     def validate_pause(state: str) -> None:
         if state not in {"accepted", "running", "pausing", "paused", "resuming", "interrupted"}:

@@ -106,6 +106,11 @@ class FakeNavigation:
         self.teleop_velocities.append(payload)
         return payload
 
+    def manual_assist_velocity(self, vx=0.0, vy=0.0, yaw_rate=0.0):
+        payload = {"topic": "/cmd_vel_assist", "vx": vx, "vy": vy, "yaw_rate": yaw_rate}
+        self.teleop_velocities.append(payload)
+        return payload
+
     def obstacle_monitor_snapshot(self):
         return {}
 
@@ -470,7 +475,7 @@ def test_task_progress_version_follows_start_ack_version(tmp_path):
     store.close()
 
 
-def test_task_start_clears_manual_control_before_validation(tmp_path):
+def test_task_start_rejects_manual_takeover_without_releasing_control(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()
@@ -499,13 +504,12 @@ def test_task_start_clears_manual_control_before_validation(tmp_path):
         teleop_control_adapter=teleop_control,
     )
 
-    ack, _ = processor.handle_command(raw)
+    ack, result = processor.handle_command(raw)
 
-    assert ack["payload"]["ack"] == "accepted"
-    assert state.control_mode == "autonomous"
-    assert navigation.teleop_velocities[-1] == {
-        "topic": "/teleop_cmd_vel", "vx": 0.0, "vy": 0.0, "yaw_rate": 0.0,
-    }
+    assert ack["payload"]["ack"] == "rejected"
+    assert result is None
+    assert state.control_mode == "manual_takeover"
+    assert navigation.teleop_velocities == []
     store.close()
 
 
@@ -957,6 +961,36 @@ def test_teleop_move_is_dispatched_to_navigation_adapter(tmp_path):
     assert navigation.teleop_velocities[-1]["vx"] == 0.2
     assert result["payload"]["status"] == "succeeded"
     assert results[0]["payload"]["result"]["topic"] == "/teleop_cmd_vel"
+    store.close()
+
+
+def test_manual_assist_uses_collision_monitored_pipeline_without_blocking_task(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.takeover_enter"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"assist": True}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None)
+    executor.has_active_task = lambda: True
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True, control_mode="autonomous")
+    processor = CommandProcessor(
+        robot_id="rx-001", store=store, safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor, publish_ack=lambda *args: None, publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert state.control_mode == "manual_assist"
+    assert result["payload"]["result"]["motion_topic"] == "/cmd_vel_assist"
+    raw["message_type"] = "teleop.move_velocity"
+    raw["payload"]["command_id"] = "11111111-1111-4111-8111-111111111111"
+    raw["payload"]["command"] = {"vx": 0.4, "vy": -0.4, "yaw_rate": 0.8}
+    _, result = processor.handle_command(raw)
+    assert result["payload"]["result"] == {
+        "topic": "/cmd_vel_assist", "vx": 0.1, "vy": -0.1, "yaw_rate": 0.25, "mode": "manual_assist",
+    }
     store.close()
 
 

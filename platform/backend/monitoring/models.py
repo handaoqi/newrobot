@@ -71,6 +71,7 @@ class Robot(BaseTimestampModel):
         choices=[
             ("unknown", "未知"),
             ("autonomous", "自主"),
+            ("manual_assist", "人工辅助"),
             ("manual_takeover", "人工接管"),
             ("emergency_stop", "急停"),
         ],

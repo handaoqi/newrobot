@@ -403,6 +403,9 @@ class RosAdapter(Node):
         self._arrival_adjust_cmd_vel_pub = self.create_publisher(
             Twist, ros_config.cmd_vel_raw_topic, 10
         )
+        # Manual assist is deliberately routed through the Nav2 velocity
+        # optimizer and collision monitor, never directly to the vendor bridge.
+        self._manual_assist_cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel_assist", 10)
         self._teleop_cmd_vel_pub = self.create_publisher(Twist, "/teleop_cmd_vel", 10)
         self._teleop_action_pub = self.create_publisher(String, "/teleop_action", 10)
         self._remote_teleop_action_pub = self.create_publisher(String, "/remote_teleop_action", 10)
@@ -1676,6 +1679,22 @@ class RosAdapter(Node):
         self._teleop_cmd_vel_pub.publish(msg)
         return {
             "topic": "/teleop_cmd_vel",
+            "vx": msg.linear.x,
+            "vy": msg.linear.y,
+            "yaw_rate": msg.angular.z,
+        }
+
+    def manual_assist_velocity(
+        self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0
+    ) -> dict:
+        """Publish bounded operator intent into the safe Nav2 control pipeline."""
+        msg = Twist()
+        msg.linear.x = float(vx)
+        msg.linear.y = float(vy)
+        msg.angular.z = float(yaw_rate)
+        self._manual_assist_cmd_vel_pub.publish(msg)
+        return {
+            "topic": "/cmd_vel_assist",
             "vx": msg.linear.x,
             "vy": msg.linear.y,
             "yaw_rate": msg.angular.z,

@@ -31,7 +31,8 @@ namespace navigo_velocity_optimizer
 
 VelocityOptimizer::VelocityOptimizer(const rclcpp::NodeOptions & options)
 : LifecycleNode("velocity_smoother", "", options),
-  last_command_time_{0, 0, get_clock()->get_clock_type()}
+  last_command_time_{0, 0, get_clock()->get_clock_type()},
+  last_assist_command_time_{0, 0, get_clock()->get_clock_type()}
 {
 }
 
@@ -95,14 +96,22 @@ VelocityOptimizer::on_configure(const rclcpp_lifecycle::State &)
   declare_parameter_if_not_declared(
     node, "deadband_velocity", rclcpp::ParameterValue(std::vector<double>{0.0, 0.0, 0.0}));
   declare_parameter_if_not_declared(node, "velocity_timeout", rclcpp::ParameterValue(1.0));
+  declare_parameter_if_not_declared(node, "manual_assist_timeout", rclcpp::ParameterValue(0.65));
+  declare_parameter_if_not_declared(
+    node, "manual_assist_max_velocity", rclcpp::ParameterValue(std::vector<double>{0.10, 0.10, 0.25}));
   node->get_parameter("odom_topic", odom_topic_);
   node->get_parameter("odom_duration", odom_duration_);
   node->get_parameter("deadband_velocity", deadband_velocities_);
   node->get_parameter("velocity_timeout", velocity_timeout_dbl);
+  double manual_assist_timeout_dbl;
+  node->get_parameter("manual_assist_timeout", manual_assist_timeout_dbl);
+  node->get_parameter("manual_assist_max_velocity", manual_assist_max_velocities_);
   velocity_timeout_ = rclcpp::Duration::from_seconds(velocity_timeout_dbl);
+  manual_assist_timeout_ = rclcpp::Duration::from_seconds(manual_assist_timeout_dbl);
 
   if (max_velocities_.size() != 3 || min_velocities_.size() != 3 ||
-    max_accels_.size() != 3 || max_decels_.size() != 3 || deadband_velocities_.size() != 3)
+    max_accels_.size() != 3 || max_decels_.size() != 3 || deadband_velocities_.size() != 3 ||
+    manual_assist_max_velocities_.size() != 3)
   {
     throw std::runtime_error(
             "Invalid setting of kinematic and/or deadband limits!"
@@ -124,6 +133,9 @@ VelocityOptimizer::on_configure(const rclcpp_lifecycle::State &)
   cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
     "cmd_vel", rclcpp::QoS(1),
     std::bind(&VelocityOptimizer::inputCommandCallback, this, std::placeholders::_1));
+  assist_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+    "/cmd_vel_assist", rclcpp::QoS(1),
+    std::bind(&VelocityOptimizer::assistCommandCallback, this, std::placeholders::_1));
 
   return navigo_util::CallbackReturn::SUCCESS;
 }
@@ -169,6 +181,7 @@ VelocityOptimizer::on_cleanup(const rclcpp_lifecycle::State &)
   smoothed_cmd_pub_.reset();
   odom_smoother_.reset();
   cmd_sub_.reset();
+  assist_sub_.reset();
   return navigo_util::CallbackReturn::SUCCESS;
 }
 
@@ -189,6 +202,16 @@ void VelocityOptimizer::inputCommandCallback(const geometry_msgs::msg::Twist::Sh
 
   command_ = msg;
   last_command_time_ = now();
+}
+
+void VelocityOptimizer::assistCommandCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+  if (!navigo_util::validateTwist(*msg)) {
+    RCLCPP_ERROR(get_logger(), "Manual assist contains NaNs or Infs! Ignoring as invalid!");
+    return;
+  }
+  assist_command_ = msg;
+  last_assist_command_time_ = now();
 }
 
 double VelocityOptimizer::findEtaConstraint(
@@ -247,20 +270,34 @@ double VelocityOptimizer::applyConstraints(
 
 void VelocityOptimizer::smootherTimer()
 {
-  // Wait until the first command is received
-  if (!command_) {
+  const auto now_time = now();
+  const bool assist_fresh = assist_command_ &&
+    now_time - last_assist_command_time_ <= manual_assist_timeout_;
+  // A newer Nav2 zero is a hard stop request and always wins over assist.
+  const bool nav_zero_after_assist = command_ &&
+    now_time - last_command_time_ <= velocity_timeout_ &&
+    last_command_time_ >= last_assist_command_time_ &&
+    *command_ == geometry_msgs::msg::Twist();
+  const auto selected = assist_fresh && !nav_zero_after_assist ? assist_command_ : command_;
+  if (!selected) {
     return;
   }
 
   auto cmd_vel = std::make_unique<geometry_msgs::msg::Twist>();
+  auto requested = *selected;
 
-  // Check for velocity timeout. If nothing received, publish zeros to apply deceleration
-  if (now() - last_command_time_ > velocity_timeout_) {
+  // A stale selected source decelerates to zero. Assist expires independently
+  // so Nav2 resumes without requiring an operator-side release message.
+  const auto selected_time = assist_fresh && !nav_zero_after_assist ?
+    last_assist_command_time_ : last_command_time_;
+  const auto selected_timeout = assist_fresh && !nav_zero_after_assist ?
+    manual_assist_timeout_ : velocity_timeout_;
+  if (now_time - selected_time > selected_timeout) {
     if (last_cmd_ == geometry_msgs::msg::Twist() || stopped_) {
       stopped_ = true;
       return;
     }
-    *command_ = geometry_msgs::msg::Twist();
+    requested = geometry_msgs::msg::Twist();
   }
 
   stopped_ = false;
@@ -273,10 +310,19 @@ void VelocityOptimizer::smootherTimer()
     current_ = odom_smoother_->getTwist();
   }
 
-  // Apply absolute velocity restrictions to the command
-  command_->linear.x = std::clamp(command_->linear.x, min_velocities_[0], max_velocities_[0]);
-  command_->linear.y = std::clamp(command_->linear.y, min_velocities_[1], max_velocities_[1]);
-  command_->angular.z = std::clamp(command_->angular.z, min_velocities_[2], max_velocities_[2]);
+  // Apply absolute velocity restrictions. Assist has a smaller independent
+  // envelope before the normal platform limits and collision monitor apply.
+  if (assist_fresh && !nav_zero_after_assist) {
+    requested.linear.x = std::clamp(requested.linear.x,
+      -manual_assist_max_velocities_[0], manual_assist_max_velocities_[0]);
+    requested.linear.y = std::clamp(requested.linear.y,
+      -manual_assist_max_velocities_[1], manual_assist_max_velocities_[1]);
+    requested.angular.z = std::clamp(requested.angular.z,
+      -manual_assist_max_velocities_[2], manual_assist_max_velocities_[2]);
+  }
+  requested.linear.x = std::clamp(requested.linear.x, min_velocities_[0], max_velocities_[0]);
+  requested.linear.y = std::clamp(requested.linear.y, min_velocities_[1], max_velocities_[1]);
+  requested.angular.z = std::clamp(requested.angular.z, min_velocities_[2], max_velocities_[2]);
 
   // Find if any component is not within the acceleration constraints. If so, store the most
   // significant scale factor to apply to the vector <dvx, dvy, dvw>, eta, to reduce all axes
@@ -288,30 +334,30 @@ void VelocityOptimizer::smootherTimer()
     double curr_eta = -1.0;
 
     curr_eta = findEtaConstraint(
-      current_.linear.x, command_->linear.x, max_accels_[0], max_decels_[0]);
+    current_.linear.x, requested.linear.x, max_accels_[0], max_decels_[0]);
     if (curr_eta > 0.0 && std::fabs(1.0 - curr_eta) > std::fabs(1.0 - eta)) {
       eta = curr_eta;
     }
 
     curr_eta = findEtaConstraint(
-      current_.linear.y, command_->linear.y, max_accels_[1], max_decels_[1]);
+    current_.linear.y, requested.linear.y, max_accels_[1], max_decels_[1]);
     if (curr_eta > 0.0 && std::fabs(1.0 - curr_eta) > std::fabs(1.0 - eta)) {
       eta = curr_eta;
     }
 
     curr_eta = findEtaConstraint(
-      current_.angular.z, command_->angular.z, max_accels_[2], max_decels_[2]);
+    current_.angular.z, requested.angular.z, max_accels_[2], max_decels_[2]);
     if (curr_eta > 0.0 && std::fabs(1.0 - curr_eta) > std::fabs(1.0 - eta)) {
       eta = curr_eta;
     }
   }
 
   cmd_vel->linear.x = applyConstraints(
-    current_.linear.x, command_->linear.x, max_accels_[0], max_decels_[0], eta);
+    current_.linear.x, requested.linear.x, max_accels_[0], max_decels_[0], eta);
   cmd_vel->linear.y = applyConstraints(
-    current_.linear.y, command_->linear.y, max_accels_[1], max_decels_[1], eta);
+    current_.linear.y, requested.linear.y, max_accels_[1], max_decels_[1], eta);
   cmd_vel->angular.z = applyConstraints(
-    current_.angular.z, command_->angular.z, max_accels_[2], max_decels_[2], eta);
+    current_.angular.z, requested.angular.z, max_accels_[2], max_decels_[2], eta);
   last_cmd_ = *cmd_vel;
 
   // Apply deadband restrictions & publish

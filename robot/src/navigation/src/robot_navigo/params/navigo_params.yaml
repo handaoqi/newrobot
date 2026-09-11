@@ -431,6 +431,8 @@ velocity_optimizer:
     min_velocity: [-0.12, -0.5, -0.5]
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
+    manual_assist_timeout: 0.65
+    manual_assist_max_velocity: [0.10, 0.10, 0.25]
     max_accel: [1.5, 1.0, 1.5]
     max_decel: [-1.5, -1.0, -1.5]
     odom_topic: "/odom/nav2"

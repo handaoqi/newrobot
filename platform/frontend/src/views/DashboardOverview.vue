@@ -59,6 +59,7 @@ const loadError = ref('')
 const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
+const assistActive = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const speechCategories = ref([])
 const speechTemplates = ref([])
@@ -762,19 +763,24 @@ async function enterTakeover() {
   }
   commandSending.value = true
   try {
+    const assist = Boolean(robot.current_task_name)
     await sendRobotCommand(robot.id, {
       action: 'takeover_enter',
       payload: {
-        source: 'manual_takeover_enter',
-        note: 'Enter remote takeover mode before showing fullscreen controls.',
+        assist,
+        source: assist ? 'manual_assist_enter' : 'manual_takeover_enter',
+        note: assist
+          ? 'Enter bounded manual assist while Nav2 remains active.'
+          : 'Enter exclusive remote takeover mode before showing fullscreen controls.',
       },
     })
+    assistActive.value = assist
     takeoverActive.value = true
     await nextTick()
     try {
       await videoStageRef.value?.requestFullscreen?.()
     } catch {}
-    showToast('已切换至远程接管模式')
+    showToast(assist ? '已切换至人工辅助模式，自动导航保持运行' : '已切换至远程接管模式')
   } catch (error) {
     showToast(error.message || '接管指令下发失败')
   } finally {
@@ -803,6 +809,7 @@ async function exitTakeover(options = {}) {
     showToast(error.message || '退出接管失败')
   } finally {
     takeoverActive.value = false
+    assistActive.value = false
     takeoverExitInFlight = false
   }
   if (!options.skipFullscreen && document.fullscreenElement) {
@@ -980,7 +987,7 @@ function handleVisibilityChange() {
 
               <div v-if="takeoverActive" class="takeover-layer">
             <div class="takeover-status">
-              <strong>人工接管</strong>
+              <strong>{{ assistActive ? '人工辅助' : '人工接管' }}</strong>
               <span>{{ latestRobot?.code }} · {{ latestRobot?.location }}</span>
             </div>
             <button class="takeover-exit" type="button" @click="exitTakeover">退出</button>
@@ -1064,7 +1071,7 @@ function handleVisibilityChange() {
             <span>{{ latestRobot?.area }}</span>
           </div>
           <button class="takeover-btn" :disabled="!hasLiveStream || commandSending" @click="enterTakeover">
-            {{ commandSending ? '下发中...' : '接管' }}
+            {{ commandSending ? '下发中...' : (latestRobot?.current_task_name ? '辅助导航' : '接管') }}
           </button>
           <div class="footer-card">
             <strong>设备电量</strong>
