@@ -75,9 +75,9 @@ DEPARTURE_HEADING_TELEOP_PERIOD_SECONDS = 0.10
 DEPARTURE_HEADING_STABLE_SAMPLES = 3
 # Quadruped coast after Nav2 reports goal reached; wait before measuring pose.
 HOLD_FINAL_POSE_TIMEOUT_SECONDS = 3.0
-# Outdoor patrol: a short coast check is enough; the long indoor wait burned
-# ~3s at every waypoint even when cmd_vel was already zero.
-HOLD_FINAL_POSE_OUTDOOR_TIMEOUT_SECONDS = 0.5
+# Outdoor patrol still needs to satisfy the 1s continuous-zero confirmation
+# gate. Keep a margin for the controller/collision-monitor command handoff.
+HOLD_FINAL_POSE_OUTDOOR_TIMEOUT_SECONDS = 2.0
 # Stopped at a waypoint: give RTK/NDT time to pull FAST-LIO back before leaving.
 WAYPOINT_SETTLE_TIMEOUT_SECONDS = 12.0
 # Outdoor clean arrival (no pending correction): brief health check only.

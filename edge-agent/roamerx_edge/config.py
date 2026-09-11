@@ -83,6 +83,8 @@ class TelemetryConfig:
 class SafetyConfig:
     stop_speed_threshold_mps: float = 0.03
     stop_confirmation_seconds: float = 1.0
+    # Reject stale post-collision-monitor velocity samples during stop checks.
+    stop_velocity_max_age_seconds: float = 0.5
     localization_stable_seconds: float = 3.0
     localization_loss_samples: int = 5
     ndt_failure_score: float = 0.5

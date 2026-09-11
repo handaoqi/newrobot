@@ -4131,8 +4131,13 @@ class RosAdapter(Node):
             # enough to report >1 m/s while the robot is stationary.  The
             # collision-monitor output is the actual motion command and is the
             # reliable source for pause confirmation.
+            velocity_age = time.monotonic() - self._actual_velocity_updated_monotonic
+            velocity_fresh = (
+                self._actual_velocity_updated_monotonic > 0.0
+                and velocity_age <= self.safety_config.stop_velocity_max_age_seconds
+            )
             planar_speed = math.hypot(self._actual_forward_command, self._actual_lateral_command)
-            stopped = (
+            stopped = velocity_fresh and (
                 planar_speed <= self.safety_config.stop_speed_threshold_mps
                 and abs(self._actual_turn_command) <= 0.05
             )

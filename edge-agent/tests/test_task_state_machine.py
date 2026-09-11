@@ -1140,7 +1140,7 @@ def test_reapproach_after_precision_recovery_allows_far_corrected_pose(tmp_path)
     store.close()
 
 
-def test_outdoor_hold_final_pose_uses_short_timeout(tmp_path):
+def test_outdoor_hold_final_pose_allows_stop_confirmation_window(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.stopped = False
@@ -1169,7 +1169,8 @@ def test_outdoor_hold_final_pose_uses_short_timeout(tmp_path):
     )()
     started = time.monotonic()
     assert executor._hold_final_pose() is False
-    assert time.monotonic() - started < 1.5
+    # The timeout must exceed the 1s continuous-zero confirmation window.
+    assert 1.8 <= time.monotonic() - started < 2.5
     store.close()
 
 
