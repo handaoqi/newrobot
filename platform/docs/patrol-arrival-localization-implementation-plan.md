@@ -10,6 +10,7 @@
 - [x] **按航点定位锚定策略**：路线快照、协议与定位节点支持 `localization_mode`、`localization_anchor_preference`、`rtk_primary_allowed` 和微调模式。室内 NDT、开阔室外 UKF、过渡段 UKF→NDT 回退、长走廊 NDT 首选以及显式 RTK-primary 的保护性提升/降级已落地；RTK-primary 仅对明确允许的 `rtk` 航段生效。
 - [x] **可观测性和恢复持久化**：到航校正事务、实际锚点源、RTK/NDT 原子样本、微调预算/结果与恢复上下文已纳入事件和 Edge 持久化；重启不会重置当前航点的补偿预算。
 - [x] **ABI 安全的原生路径平滑**：新增 `navigo_smoother::SmootherServer`、`SimpleSmoother` 和 `PassthroughSmoother`，使用 `navigo_core` 与 `navigo_costmap_2d`，保留标准 `SmoothPath` Action。平滑过程与最终路径均做代价地图/footprint 碰撞校验，超时或不可行时回退原规划路径；不再加载与工作区覆盖库 ABI 不兼容的系统 `nav2_smoother`。
+- [x] **人工辅助与独占接管分离**：新增 `manual_assist`。辅助模式不阻断中心 5 秒自愈和 Nav2 任务；人工速度进入 `/cmd_vel_assist`，由速度优化器以 650 ms 短时优先、`±0.10 m/s` XY 和 `±0.25 rad/s` yaw 限幅后，再经过 collision monitor、边界、零速和定位联锁。`manual_takeover` 仍为独占控制，任务启动/恢复必须等待操作员明确退出；不再由 `task.start` 擅自清除接管状态。
 - [x] **构建、部署与运行态验收**：相关 ROS 包以 2 并行任务构建通过；NX 部署清单为提交 `7f0e1fc`、无脏改动。设备观测确认定位 `status=3`、Edge 服务 active，`planner_server`、`controller_server`、`smoother_server`、`bt_navigator` 和 `waypoint_follower` 均为 `active [3]`。验证期间未发送运动目标或速度指令。
 
 ### 已完成：提交记录
@@ -19,6 +20,7 @@
 - [x] `bf038d8`：全量工作区构建纳入 `navigo_smoother`。
 - [x] `0bc735e`：临时安全回退，隔离不兼容系统 smoother。
 - [x] `7f0e1fc`：原生 ABI 安全 `navigo_smoother` 服务端与平滑插件。
+- [x] `49fe197`：人工辅助仲裁、独占接管保护与 `manual_assist` 状态。
 
 ### 后续验收与优化（尚未作为完成条件）
 
