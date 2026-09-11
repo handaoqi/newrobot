@@ -4484,6 +4484,7 @@ class TaskExecutor:
                 "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
                 "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
                 "ARRIVAL_MICRO_ADJUST_POSE_UNAVAILABLE",
+                "ARRIVAL_MICRO_ADJUST_RESIDUAL_EXCEEDED",
             }:
                 index = (
                     self.context.post_arrival_waypoint_index
@@ -5173,6 +5174,38 @@ class TaskExecutor:
                         self._emit_safe_hold(
                             "ARRIVAL_MICRO_ADJUST_POSE_UNAVAILABLE",
                             "到达后无法取得有效当前位姿，禁止执行 XY 微调",
+                        )
+                        return
+                    xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
+                        reached_waypoint, reached_index
+                    )
+                    if (
+                        use_arrival_heading
+                        and arrival_heading_completed
+                        and distance <= xy_tolerance
+                        and yaw_tolerance is not None
+                        and (yaw_error is None or yaw_error > yaw_tolerance)
+                    ):
+                        # The pose used to finish the in-place heading can be
+                        # superseded by a later fresh localization sample.
+                        # There is no XY residual to adjust in this case;
+                        # retry the bounded final-heading stage instead of
+                        # misreporting an unavailable XY-adjust interface.
+                        self._arrival_heading_completed_index = None
+                        self._set_post_arrival_stage(reached_index, "xy_adjusted")
+                        self.on_navigation_result(
+                            "succeeded", generation=self._nav_goal_generation
+                        )
+                        return
+                    micro_adjust_limit = (
+                        xy_tolerance + self.arrival_micro_adjust_total_budget_m
+                    )
+                    if distance > micro_adjust_limit:
+                        self._emit_safe_hold(
+                            "ARRIVAL_MICRO_ADJUST_RESIDUAL_EXCEEDED",
+                            "最终航向后 XY 偏差"
+                            f" {distance:.2f} 米超过可微调上限"
+                            f" {micro_adjust_limit:.2f} 米，保持停车",
                         )
                         return
                     if self._start_arrival_adjustment(reached_waypoint, reached_index):

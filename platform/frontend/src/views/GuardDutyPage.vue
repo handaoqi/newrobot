@@ -174,19 +174,20 @@ const actions = computed(() => executionActions(execution.value?.state))
 const isRunning = computed(() => isExecutionActive(execution.value?.state))
 const loopContinuationState = computed(() => String(serverLoopSession.value?.state || ''))
 const manualTakeoverActive = computed(() => latestRobot.value?.control_mode === 'manual_takeover')
-const taskEndControl = computed(() => {
+const taskControl = computed(() => {
   if (loopActive.value && loopSessionId.value) {
     if (loopContinuationState.value === 'recovering') {
-      return { label: '自愈中...', mode: 'continue', enabled: false, hint: '正在执行恢复，请勿重复提交' }
+      return { label: '自愈中...', action: '', enabled: false, hint: '正在执行恢复，请勿重复提交' }
     }
     if (['paused', 'observing'].includes(loopContinuationState.value)) {
       if (manualTakeoverActive.value) {
-        return { label: '继续', mode: 'continue', enabled: false, hint: '先退出人工接管，再恢复自主控制' }
+        return { label: '继续', action: '', enabled: false, hint: '先退出人工接管，再恢复自主控制' }
       }
-      return { label: '继续', mode: 'continue', enabled: true, hint: '将重新执行安全观察后恢复当前保存的航点和阶段' }
+      return { label: '继续', action: 'continue', enabled: true, hint: '将重新执行安全观察后恢复当前保存的航点和阶段' }
     }
+    return { label: '暂停', action: 'pause', enabled: loopContinuationState.value !== 'stopping', hint: '暂停当前循环任务' }
   }
-  return { label: '结束任务', mode: 'end', enabled: Boolean(execution.value?.id && actions.value.forceExit), hint: '结束当前任务并清理未结束的执行上下文' }
+  return actions.value.control
 })
 const routeWaypoints = computed(() => execution.value?.route_snapshot?.waypoints || routeData.value?.waypoints || [])
 const displayRouteWaypoints = computed(() => {
@@ -1407,29 +1408,14 @@ async function toggleLoop() {
   }
 }
 
-async function toggleLoopPause() {
-  if (!loopActive.value || !loopSessionId.value || busy.value) return
-  const action = ['paused', 'observing'].includes(serverLoopSession.value?.state) ? 'continue' : 'pause'
-  busy.value = true
-  try {
-    syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, action))
-    showToast(action === 'pause' ? '循环已人工暂停' : '已请求继续，正在进行安全观察')
-  } catch (error) {
-    showToast(error.message || '循环暂停状态切换失败', { variant: 'alert' })
-  } finally {
-    busy.value = false
-  }
-}
-
 async function controlTask() {
-  const action = actions.value.control.action
-  if ((!execution.value?.id && !loopSessionId.value) || busy.value || !action) return
+  const action = taskControl.value.action
+  if ((!execution.value?.id && !loopSessionId.value) || busy.value || !taskControl.value.enabled || !action) return
   busy.value = true
   try {
     if (loopActive.value && loopSessionId.value) {
-      const loopAction = ['paused', 'observing'].includes(serverLoopSession.value?.state) ? 'continue' : 'pause'
-      syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, loopAction))
-      showToast(loopAction === 'pause' ? '循环已人工暂停' : '已请求继续，正在进行安全观察')
+      syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, action))
+      showToast(action === 'pause' ? '循环已人工暂停' : '已请求继续，正在进行安全观察')
     } else {
       execution.value = await sendTaskExecutionAction(execution.value.id, action)
       showToast(action === 'pause' ? '任务暂停中' : '任务继续执行中')
@@ -1440,24 +1426,6 @@ async function controlTask() {
   } finally {
     busy.value = false
   }
-}
-
-async function taskEndOrContinue() {
-  if (busy.value || !taskEndControl.value.enabled) return
-  if (taskEndControl.value.mode === 'continue') {
-    busy.value = true
-    try {
-      syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, 'continue'))
-      showToast('已请求继续，正在进行安全观察')
-      startExecutionPolling()
-    } catch (error) {
-      showToast(error.message || '继续自愈失败', { variant: 'alert' })
-    } finally {
-      busy.value = false
-    }
-    return
-  }
-  await forceExitTask()
 }
 
 async function forceExitTask() {
@@ -1723,15 +1691,13 @@ watch(playUrlKey, () => {
               <button class="guard-primary" :disabled="busy || localizationBusy || loopActive || !presetTask || isRunning" @click="startTask">
                 {{ busy ? '处理中...' : '开始巡检' }}
               </button>
-              <button class="guard-secondary" :disabled="busy || localizationBusy || !actions.control.enabled" @click="controlTask">
-                {{ actions.control.label }}
-              </button>
               <button
-                :class="taskEndControl.mode === 'continue' ? 'guard-primary' : 'guard-danger'"
-                :disabled="busy || localizationBusy || !taskEndControl.enabled"
-                :title="taskEndControl.hint"
-                @click="taskEndOrContinue"
-              >{{ taskEndControl.label }}</button>
+                class="guard-secondary"
+                :disabled="busy || localizationBusy || !taskControl.enabled"
+                :title="taskControl.hint"
+                @click="controlTask"
+              >{{ taskControl.label }}</button>
+              <button class="guard-danger" :disabled="busy || localizationBusy || !execution?.id || !actions.forceExit" @click="forceExitTask">强制退出</button>
             </div>
           </div>
 
@@ -1773,13 +1739,6 @@ watch(playUrlKey, () => {
                 <span>倒计时</span>
                 <strong>{{ loopActive ? formatDuration(loopRemainingMilliseconds) : '00:00:00' }}</strong>
               </div>
-              <button
-                class="guard-secondary"
-                :disabled="busy || localizationBusy || !loopActive || !loopSessionId || loopState === 'stopping'"
-                @click="toggleLoopPause"
-              >
-                {{ ['paused', 'observing'].includes(loopState) ? '继续循环' : '暂停循环' }}
-              </button>
               <button
                 class="guard-loop-toggle"
                 :class="{ 'is-active': loopActive }"
@@ -2033,8 +1992,8 @@ watch(playUrlKey, () => {
 .guard-loop-inline { grid-template-columns: 150px minmax(0, 1fr); align-items: end; border-right: 0; border-bottom: 0; border-left: 0; }
 .guard-loop-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .guard-loop-heading h2 { margin: 5px 0 0; font-size: 22px; }
-.guard-loop-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 150px) minmax(112px, 132px); align-items: end; gap: 10px; }
-.guard-loop-inline .guard-loop-settings { max-width: 460px; }
+.guard-loop-controls { display: grid; grid-template-columns: minmax(250px, 360px) minmax(108px, 124px) minmax(96px, 110px); align-items: end; justify-content: end; gap: 10px; }
+.guard-loop-inline .guard-loop-settings { max-width: 360px; }
 .guard-loop-inline .guard-loop-toggle { height: 42px; min-height: 42px; }
 .guard-countdown-clock { display: grid; gap: 4px; }
 .guard-countdown-clock span { color: #687a86; font-size: 12px; font-weight: 700; }
@@ -2316,10 +2275,7 @@ watch(playUrlKey, () => {
     width: 11px;
     height: 11px;
   }
-  .guard-loop-controls {
-    grid-template-columns: minmax(0, 1fr) minmax(96px, 110px) minmax(92px, 104px);
-    gap: 8px;
-  }
+  .guard-loop-controls { grid-template-columns: minmax(220px, 300px) minmax(96px, 110px) minmax(92px, 104px); gap: 8px; }
   .guard-loop-settings {
     gap: 8px;
   }
@@ -2539,7 +2495,7 @@ watch(playUrlKey, () => {
   .guard-task-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .guard-primary, .guard-secondary, .guard-danger, .guard-initialize { width: 100%; min-width: 0; }
   .guard-loop-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .guard-loop-inline .guard-loop-toggle { grid-column: 1 / -1; height: auto; min-height: 44px; }
+  .guard-loop-inline .guard-loop-toggle { height: auto; min-height: 44px; }
   .guard-loop-inline .guard-loop-settings { max-width: none; }
   .guard-loop-inline .guard-runtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .guard-loop-inline .guard-runtime-grid > div { border-bottom: 1px solid #e5eaed; }
@@ -2574,7 +2530,6 @@ watch(playUrlKey, () => {
   .guard-task-actions > button { padding-inline: 6px; font-size: 10px; }
   .guard-primary, .guard-secondary, .guard-danger { width: 100%; }
   .guard-loop-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .guard-loop-toggle { grid-column: 1 / -1; }
   .guard-loop-inline .guard-loop-settings { grid-column: 1 / -1; max-width: none; }
   .guard-loop-inline .guard-runtime-grid { grid-template-columns: 1fr 1fr; }
   .guard-loop-inline .guard-runtime-grid > div { border-right: 0; border-bottom: 1px solid #e5eaed; }

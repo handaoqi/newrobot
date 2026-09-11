@@ -2777,6 +2777,51 @@ def test_final_heading_small_xy_drift_uses_cmd_vel_raw_adjustment(tmp_path):
     store.close()
 
 
+def test_post_heading_yaw_drift_realigns_instead_of_reporting_xy_adjust_unavailable(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    results = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(envelope)
+    executor.context.arrival_side_effects_started = True
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
+    # A fresh localization sample after a completed turn can show yaw drift
+    # while XY remains valid. This must restart heading alignment, not try to
+    # start an XY correction and emit the misleading unavailable error.
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]),
+        y=float(waypoint["y"]),
+        yaw=0.35,
+    )
+
+    executor.on_navigation_result("succeeded", generation=executor._nav_goal_generation)
+    deadline = time.time() + 5.0
+    while (executor.context.state == "running" or not results) and time.time() < deadline:
+        time.sleep(0.02)
+
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
+    assert not any(
+        event[0] == "task.safe_hold"
+        and event[1].get("reason_code") == "ARRIVAL_MICRO_ADJUST_UNAVAILABLE"
+        for event in events
+    )
+    executor.stop()
+    store.close()
+
+
 def test_post_yaw_arrival_adjustment_allows_residual_above_legacy_diagnostic_value(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
