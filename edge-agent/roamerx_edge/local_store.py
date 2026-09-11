@@ -43,6 +43,9 @@ class LocalStore:
                     post_arrival_waypoint_index INTEGER,
                     post_arrival_stage TEXT NOT NULL DEFAULT '',
                     arrival_side_effects_started INTEGER NOT NULL DEFAULT 0,
+                    arrival_micro_adjust_total_m REAL NOT NULL DEFAULT 0,
+                    arrival_micro_adjust_steps INTEGER NOT NULL DEFAULT 0,
+                    arrival_micro_adjust_started_at REAL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
@@ -83,6 +86,18 @@ class LocalStore:
             if "arrival_side_effects_started" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN arrival_side_effects_started INTEGER NOT NULL DEFAULT 0"
+                )
+            if "arrival_micro_adjust_total_m" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_micro_adjust_total_m REAL NOT NULL DEFAULT 0"
+                )
+            if "arrival_micro_adjust_steps" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_micro_adjust_steps INTEGER NOT NULL DEFAULT 0"
+                )
+            if "arrival_micro_adjust_started_at" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_micro_adjust_started_at REAL"
                 )
             self._prune_trajectory_outbox_locked()
 
@@ -160,8 +175,9 @@ class LocalStore:
                     task_execution_id, state, state_version, route_snapshot_json,
                     current_waypoint_index, start_command_id, record_rosbag,
                     post_arrival_waypoint_index, post_arrival_stage,
-                    arrival_side_effects_started
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    arrival_side_effects_started, arrival_micro_adjust_total_m,
+                    arrival_micro_adjust_steps, arrival_micro_adjust_started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_execution_id) DO UPDATE SET
                     state=excluded.state,
                     state_version=excluded.state_version,
@@ -172,6 +188,9 @@ class LocalStore:
                     post_arrival_waypoint_index=excluded.post_arrival_waypoint_index,
                     post_arrival_stage=excluded.post_arrival_stage,
                     arrival_side_effects_started=excluded.arrival_side_effects_started,
+                    arrival_micro_adjust_total_m=excluded.arrival_micro_adjust_total_m,
+                    arrival_micro_adjust_steps=excluded.arrival_micro_adjust_steps,
+                    arrival_micro_adjust_started_at=excluded.arrival_micro_adjust_started_at,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -185,6 +204,9 @@ class LocalStore:
                     context.get("post_arrival_waypoint_index"),
                     str(context.get("post_arrival_stage") or ""),
                     int(bool(context.get("arrival_side_effects_started", False))),
+                    max(0.0, float(context.get("arrival_micro_adjust_total_m") or 0.0)),
+                    max(0, int(context.get("arrival_micro_adjust_steps") or 0)),
+                    context.get("arrival_micro_adjust_started_at"),
                 ),
             )
 
@@ -209,6 +231,9 @@ class LocalStore:
             "post_arrival_waypoint_index": row["post_arrival_waypoint_index"],
             "post_arrival_stage": str(row["post_arrival_stage"] or ""),
             "arrival_side_effects_started": bool(row["arrival_side_effects_started"]),
+            "arrival_micro_adjust_total_m": float(row["arrival_micro_adjust_total_m"] or 0.0),
+            "arrival_micro_adjust_steps": int(row["arrival_micro_adjust_steps"] or 0),
+            "arrival_micro_adjust_started_at": row["arrival_micro_adjust_started_at"],
         }
 
     def clear_task_context(self, task_execution_id: str, final_state: str) -> None:

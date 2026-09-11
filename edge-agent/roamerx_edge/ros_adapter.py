@@ -759,14 +759,33 @@ class RosAdapter(Node):
             message_time_valid=bool(stamp_seconds > 0 and offset is not None and abs(offset) <= 5.0),
         )
 
-    def set_localization_policy(self, source: str, phase: str) -> dict:
+    def set_localization_policy(
+        self,
+        source: str,
+        phase: str,
+        anchor_preference: str = "balanced",
+        rtk_primary_allowed: bool = False,
+    ) -> dict:
         normalized_source = str(source).strip().lower()
         source = normalized_source if normalized_source in {"ndt", "rtk", "ukf"} else "ndt"
         phase = "moving" if str(phase).lower() == "moving" else "stationary"
+        anchor_preference = str(anchor_preference or "balanced").strip().lower()
+        if anchor_preference not in {"ndt", "rtk", "balanced"}:
+            anchor_preference = "balanced"
+        rtk_primary_allowed = bool(rtk_primary_allowed) and source == "rtk"
         msg = String()
-        msg.data = f"{phase}:{source}"
+        # Keep the original first two fields intact for older localization
+        # nodes; newer nodes consume the anchor preference and explicit RTK
+        # primary opt-in after the second colon.
+        msg.data = f"{phase}:{source}:{anchor_preference}:{int(rtk_primary_allowed)}"
         self._localization_policy_pub.publish(msg)
-        return {"topic": "/localization/policy", "source": source, "phase": phase}
+        return {
+            "topic": "/localization/policy",
+            "source": source,
+            "phase": phase,
+            "anchor_preference": anchor_preference,
+            "rtk_primary_allowed": rtk_primary_allowed,
+        }
 
     def localization_decision(self) -> dict:
         return self.telemetry.localization_decision()
@@ -3846,6 +3865,45 @@ class RosAdapter(Node):
             )
         except ProtocolError:
             LOGGER.warning("unable to set goal precision enabled=%s", enabled)
+            if enabled:
+                raise
+
+    def set_arrival_micro_goal_profile(
+        self, *, enabled: bool, tolerance_m: float = 0.15
+    ) -> None:
+        """Temporarily tighten Nav2 only for one post-yaw micro goal.
+
+        The Edge still performs its own localization and pose confirmation
+        after the action result; this profile is only a motion controller
+        contract and must never be treated as an arrival verdict.
+        """
+        xy_tolerance = max(0.01, float(tolerance_m)) if enabled else 0.35
+        planner_tolerance = 0.05 if enabled else (
+            2.0 if getattr(self, "_outdoor_planner_profile", False) else 0.5
+        )
+        plugin_id = global_controller_plugin_id(
+            normalize_global_controller(getattr(self, "_active_global_controller", None))
+        )
+        try:
+            self._set_remote_parameters(
+                "/controller_server",
+                {
+                    "general_goal_checker.xy_goal_tolerance": xy_tolerance,
+                    "general_goal_checker.required_yaw_goal_tolerance": 0.25,
+                    "progress_checker.required_movement_radius": 0.05 if enabled else 0.15,
+                    "progress_checker.movement_time_allowance": 8.0 if enabled else 10.0,
+                },
+                code="ARRIVAL_MICRO_GOAL_PROFILE_FAILED",
+                attempts=4 if enabled else 2,
+            )
+            self._set_remote_parameters(
+                "/planner_server",
+                {f"{plugin_id}.tolerance": planner_tolerance},
+                code="ARRIVAL_MICRO_GOAL_PROFILE_FAILED",
+                attempts=4 if enabled else 2,
+            )
+        except ProtocolError:
+            LOGGER.warning("unable to set arrival micro-goal profile enabled=%s", enabled)
             if enabled:
                 raise
 

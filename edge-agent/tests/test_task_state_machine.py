@@ -21,6 +21,7 @@ class FakeNavigation:
         self.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
         self.teleop = []
         self.arrival_adjustments = []
+        self.arrival_micro_goal_profiles = []
         self.arrival_clearance = {"clear": True, "reason": "clear"}
         self.costmap_clears = 0
         self.trusted_pose = {
@@ -96,6 +97,9 @@ class FakeNavigation:
             yaw=yaw + float(yaw_rate) * dt,
         )
         return {"topic": "/cmd_vel_raw"}
+
+    def set_arrival_micro_goal_profile(self, *, enabled, tolerance_m=0.15):
+        self.arrival_micro_goal_profiles.append((enabled, tolerance_m))
 
     def directional_clearance(
         self, vx, vy, travel_distance_m, *, max_scan_age_seconds=0.5
@@ -1015,7 +1019,7 @@ def test_reapproach_rejected_arrival_redispatches_same_waypoint(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     # Already face wp-2 so outdoor re-approach cruises immediately.
-    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=atan2(1.0, 1.0))
+    nav.pose = SimpleNamespace(x=1.6, y=2.6, yaw=atan2(1.0, 1.0))
     executor = TaskExecutor(
         store,
         nav,
@@ -2545,7 +2549,7 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
     store.close()
 
 
-def test_final_configured_heading_large_translation_adjusts_without_timeout_or_reapproach(tmp_path):
+def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
     from math import pi
 
     store = LocalStore(str(tmp_path / "edge.db"))
@@ -2561,7 +2565,6 @@ def test_final_configured_heading_large_translation_adjusts_without_timeout_or_r
         nav,
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: results.append(args),
-        # The legacy convergence timeout is intentionally ignored.
         arrival_adjust_timeout_seconds=0.01,
     )
 
@@ -2579,13 +2582,12 @@ def test_final_configured_heading_large_translation_adjusts_without_timeout_or_r
     _await_departure_heading(executor)
 
     deadline = time.time() + 5.0
-    while (executor.context.state == "running" or not results) and time.time() < deadline:
+    while executor.context.state == "running" and time.time() < deadline:
         time.sleep(0.02)
 
-    assert executor.context.state == "completed"
+    assert executor.context.state == "paused"
     assert len(nav.sent) == 1
-    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
-    assert results[-1][1] == "succeeded"
+    assert not any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
     store.close()
 
 
@@ -2613,7 +2615,7 @@ def test_final_heading_small_xy_drift_uses_cmd_vel_raw_adjustment(tmp_path):
     def drifting_teleop_velocity(vx=0.0, vy=0.0, yaw_rate=0.0):
         original_teleop_velocity(vx=vx, vy=vy, yaw_rate=yaw_rate)
         if abs(float(yaw_rate)) > 1e-6:
-            nav.pose.x = float(final["x"]) + 0.48
+            nav.pose.x = float(final["x"]) + 0.40
 
     nav.teleop_velocity = drifting_teleop_velocity
     nav.result("succeeded", "", {"missed_waypoints": []})
@@ -2650,7 +2652,7 @@ def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(envelope)
-    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.48, y=float(waypoint["y"]), yaw=0.0)
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.40, y=float(waypoint["y"]), yaw=0.0)
 
     assert executor._start_arrival_adjustment(waypoint, 0) is True
     deadline = time.time() + 1.0
@@ -2666,6 +2668,45 @@ def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
     assert safe_hold[1]["reason_code"] == "ARRIVAL_POSE_CONVERGENCE_FAILED"
     assert "obstacle" in safe_hold[1]["reason_message"]
     executor.stop()
+    store.close()
+
+
+def test_nav2_micro_goal_requires_post_action_pose_revalidation(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    results = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update(
+        {
+            "require_yaw": True,
+            "yaw": 0.0,
+            "arrival_micro_adjust_mode": "nav2_goal",
+        }
+    )
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]) + 0.40, y=float(waypoint["y"]), yaw=0.0)
+    executor._arrival_heading_completed_index = 0
+
+    assert executor._start_arrival_adjustment(waypoint, 0) is True
+    assert nav.arrival_micro_goal_profiles == [(True, 0.15)]
+    assert len(nav.sent) == 2
+
+    # Nav2 success alone is deliberately insufficient. Only the following
+    # corrected pose check is allowed to complete the waypoint.
+    nav.pose = SimpleNamespace(x=float(waypoint["x"]), y=float(waypoint["y"]), yaw=0.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    assert nav.arrival_micro_goal_profiles[-1] == (False, 0.15)
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
     store.close()
 
 
@@ -2686,7 +2727,7 @@ def test_arrival_adjustment_retries_transient_stale_scan_then_completes(tmp_path
     )
     executor.start_task(envelope)
     nav.pose = SimpleNamespace(
-        x=float(waypoint["x"]) + 0.48,
+        x=float(waypoint["x"]) + 0.40,
         y=float(waypoint["y"]),
         yaw=0.0,
     )
@@ -2741,7 +2782,7 @@ def test_arrival_adjustment_pauses_after_stale_scan_grace_expires(tmp_path):
     )
     executor.start_task(envelope)
     nav.pose = SimpleNamespace(
-        x=float(waypoint["x"]) + 0.48,
+        x=float(waypoint["x"]) + 0.40,
         y=float(waypoint["y"]),
         yaw=0.0,
     )
@@ -2779,7 +2820,7 @@ def test_live_pause_resume_continues_post_arrival_adjustment_without_nav2_redisp
     )
     executor.start_task(envelope)
     nav.pose = SimpleNamespace(
-        x=float(waypoint["x"]) + 0.8,
+        x=float(waypoint["x"]) + 0.40,
         y=float(waypoint["y"]),
         yaw=0.0,
     )

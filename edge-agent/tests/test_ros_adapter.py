@@ -709,8 +709,14 @@ def test_localization_policy_preserves_ukf_mode():
 
     result = adapter.set_localization_policy("UKF", "moving")
 
-    assert result == {"topic": "/localization/policy", "source": "ukf", "phase": "moving"}
-    assert published[0].data == "moving:ukf"
+    assert result == {
+        "topic": "/localization/policy",
+        "source": "ukf",
+        "phase": "moving",
+        "anchor_preference": "balanced",
+        "rtk_primary_allowed": False,
+    }
+    assert published[0].data == "moving:ukf:balanced:0"
 
 
 def test_good_rtk_ignores_ndt_degradation_before_active_source_switches():

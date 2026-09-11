@@ -73,6 +73,20 @@ def _normalize_arrival_policy(value: object | None, *, dwell_seconds: float = 0.
     return "stop_and_confirm"
 
 
+def _normalize_arrival_micro_adjust_mode(value: object | None, *, arrival_policy: str) -> str:
+    mode = str(value or "cmd_vel").strip().lower()
+    if mode not in {"cmd_vel", "nav2_goal"}:
+        mode = "cmd_vel"
+    if arrival_policy in {"pass_through", "dock"}:
+        return "cmd_vel"
+    return mode
+
+
+def _normalize_anchor_preference(value: object | None) -> str:
+    value = str(value or "balanced").strip().lower()
+    return value if value in {"ndt", "rtk", "balanced"} else "balanced"
+
+
 def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
     normalized = []
     names = route.waypoint_names or []
@@ -112,6 +126,13 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 require_yaw=require_yaw, actions=actions,
                 is_last=index == len(route.waypoints or []) - 1,
             )
+            arrival_micro_adjust_mode = _normalize_arrival_micro_adjust_mode(
+                raw.get("arrival_micro_adjust_mode"), arrival_policy=arrival_policy
+            )
+            localization_anchor_preference = _normalize_anchor_preference(
+                raw.get("localization_anchor_preference")
+            )
+            rtk_primary_allowed = bool(raw.get("rtk_primary_allowed", False))
             speech_mode = str(raw.get("speech_mode") or "").strip().lower()
             if speech_mode not in {"blocking", "non_blocking", "disabled"}:
                 # Playback is a patrol side effect.  Missing TTS, command
@@ -142,6 +163,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 None, dwell_seconds=0, require_yaw=False, actions=[],
                 is_last=index == len(route.waypoints or []) - 1,
             )
+            arrival_micro_adjust_mode = "cmd_vel"
+            localization_anchor_preference = "balanced"
+            rtk_primary_allowed = False
         else:
             raise TaskStateError(f"route waypoint {index} has invalid format")
         waypoint = {
@@ -163,6 +187,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "collision_stop_enabled": collision_stop_enabled,
                 "require_yaw": require_yaw,
                 "arrival_policy": arrival_policy,
+                "arrival_micro_adjust_mode": arrival_micro_adjust_mode,
+                "localization_anchor_preference": localization_anchor_preference,
+                "rtk_primary_allowed": rtk_primary_allowed,
                 "speech_mode": speech_mode,
             }
         if speech_template_id not in (None, ""):

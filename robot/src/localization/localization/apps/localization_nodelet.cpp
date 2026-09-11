@@ -2359,11 +2359,19 @@ private:
       (force_correction || !ndt_drift_gate_.correction_latched);
     rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
       (force_correction || !rtk_drift_gate_.correction_latched);
-    const CorrectionSelection selection = selectCorrectionSource(
-      effective_mode, ndt, rtk,
-      lio_drift_xy_m_, lio_drift_yaw_rad_,
-      lio_drift_xy_m_, lio_drift_yaw_rad_,
-      prefer_fixed_rtk_for_correction_);
+    CorrectionSelection selection;
+    if (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "ndt") {
+      selection = ndt.eligible
+        ? CorrectionSelection{CorrectionSource::ndt, "ukf_policy_prefer_ndt"}
+        : CorrectionSelection{};
+    } else {
+      selection = selectCorrectionSource(
+        effective_mode, ndt, rtk,
+        lio_drift_xy_m_, lio_drift_yaw_rad_,
+        lio_drift_xy_m_, lio_drift_yaw_rad_,
+        prefer_fixed_rtk_for_correction_ ||
+          (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "rtk"));
+    }
     last_correction_candidate_source_ = correctionSourceName(selection.source);
     last_correction_selection_reason_ = selection.reason;
 
@@ -2485,9 +2493,20 @@ private:
   void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
     const std::string command = msg ? msg->data : "";
     const auto separator = command.find(':');
+    const auto mode_end = separator == std::string::npos
+      ? std::string::npos : command.find(':', separator + 1);
     const std::string requested_mode = separator == std::string::npos
-      ? command : command.substr(separator + 1);
+      ? command : command.substr(separator + 1, mode_end - separator - 1);
     const CorrectionPolicyMode next_mode = parseCorrectionPolicyMode(requested_mode);
+    const auto anchor_end = mode_end == std::string::npos
+      ? std::string::npos : command.find(':', mode_end + 1);
+    std::string anchor_preference = "balanced";
+    if (mode_end != std::string::npos) {
+      anchor_preference = command.substr(mode_end + 1, anchor_end - mode_end - 1);
+      if (anchor_preference != "ndt" && anchor_preference != "rtk") {
+        anchor_preference = "balanced";
+      }
+    }
     if (next_mode != preferred_correction_mode_) {
       preferred_correction_mode_ = next_mode;
       preferred_source_ = correctionPolicyModeName(next_mode);
@@ -2502,6 +2521,21 @@ private:
         preferred_source_.c_str());
     }
     motion_phase_ = command.find("moving") != std::string::npos ? "moving" : "stationary";
+    bool rtk_primary_allowed = false;
+    if (mode_end != std::string::npos) {
+      const auto primary_begin = command.find(':', mode_end + 1);
+      if (primary_begin != std::string::npos) {
+        const std::string primary_value = command.substr(primary_begin + 1);
+        rtk_primary_allowed = primary_value == "1" || primary_value == "true";
+      }
+    }
+    // RTK may become the continuous source only at an explicitly opted-in
+    // outdoor RTK waypoint. It still has to pass the existing Fixed + heading
+    // latch; losing that evidence immediately returns to FAST-LIO.
+    rtk_primary_allowed_by_policy_ =
+      rtk_primary_allowed && next_mode == CorrectionPolicyMode::rtk && motion_phase_ == "moving";
+    ukf_anchor_preference_ = next_mode == CorrectionPolicyMode::ukf
+      ? anchor_preference : "balanced";
     if (motion_phase_ == "stationary") {
       bridge_active_ = false;
       bridge_distance_m_ = 0.0;
@@ -2520,7 +2554,7 @@ private:
 
   void updateRtkAutoPrimary(const RtkObservation& observation, const rclcpp::Time& stamp) {
     (void)stamp;
-    if (!prefer_fixed_rtk_ || !source_arbiter_enable_) {
+    if (!(prefer_fixed_rtk_ || rtk_primary_allowed_by_policy_) || !source_arbiter_enable_) {
       if (rtk_auto_primary_latched_) {
         suppressLioMotionAnomalyForRtkHandoff("prefer_fixed_rtk disabled");
       }
@@ -2917,6 +2951,7 @@ private:
         << "{\"active_source\":\"" << active_source_
         << "\",\"preferred_source\":\"" << preferred_source_
         << "\",\"correction_policy\":\"" << preferred_source_
+        << "\",\"anchor_preference\":\"" << ukf_anchor_preference_
         << "\",\"allowed_correction_sources\":\""
         << (preferred_correction_mode_ == CorrectionPolicyMode::ndt
           ? "ndt_vgicp"
@@ -2945,6 +2980,8 @@ private:
         << "\",\"selected_source\":\"" << one_shot_correction_.selected_source
         << "\",\"reason\":\"" << one_shot_correction_.reason << "\"}"
         << ",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
+        << ",\"rtk_primary_allowed_by_policy\":"
+        << (rtk_primary_allowed_by_policy_ ? "true" : "false")
         << ",\"rtk_good_for_navigation\":" << (rtkGoodForNavigation(rtk) ? "true" : "false")
         << ",\"rtk_position_good_for_navigation\":"
         << (rtkPositionGoodForNavigation(rtk) ? "true" : "false")
@@ -6153,6 +6190,7 @@ private:
   bool gnss_recovery_seed_pending_ = false;
   bool source_arbiter_enable_ = true;
   bool prefer_fixed_rtk_ = false;
+  bool rtk_primary_allowed_by_policy_ = false;
   int rtk_primary_promote_samples_ = 20;
   int rtk_primary_demote_samples_ = 8;
   double rtk_primary_handoff_suppress_s_ = 2.5;
@@ -6163,6 +6201,7 @@ private:
   bool lidar_matching_paused_for_rtk_ = false;
   std::string preferred_source_ = "ndt";
   CorrectionPolicyMode preferred_correction_mode_ = CorrectionPolicyMode::ndt;
+  std::string ukf_anchor_preference_ = "balanced";
   bool policy_source_ready_ = false;
   std::string last_correction_candidate_source_ = "none";
   std::string last_correction_selection_reason_ = "idle";

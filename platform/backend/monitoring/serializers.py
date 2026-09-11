@@ -1095,7 +1095,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         for index, point in enumerate(value):
             if not isinstance(point, dict):
                 continue
-            for field in ("avoidance_to_next", "require_yaw"):
+            for field in ("avoidance_to_next", "require_yaw", "rtk_primary_allowed"):
                 if field in point and not isinstance(point[field], bool):
                     raise serializers.ValidationError(f"途经点 {index + 1} 的 {field} 必须是布尔值")
             if "dwell_seconds" in point:
@@ -1113,6 +1113,24 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
         if invalid_modes:
             raise serializers.ValidationError("途经点定位方式只能是 NDT、UKF 或 RTK")
+        for index, point in enumerate(value):
+            if not isinstance(point, dict):
+                continue
+            policy = str(point.get("arrival_policy") or "stop_and_confirm").lower()
+            micro_mode = str(point.get("arrival_micro_adjust_mode") or "cmd_vel").lower()
+            if micro_mode not in {"cmd_vel", "nav2_goal"}:
+                raise serializers.ValidationError(
+                    f"途经点 {index + 1} 的到点微调模式只能是 cmd_vel 或 nav2_goal"
+                )
+            if micro_mode == "nav2_goal" and policy not in {"stop_and_confirm", "precision"}:
+                raise serializers.ValidationError(
+                    f"途经点 {index + 1} 的 nav2_goal 微调只适用于停车校正确认或精确到点"
+                )
+            anchor = str(point.get("localization_anchor_preference") or "balanced").lower()
+            if anchor not in {"ndt", "rtk", "balanced"}:
+                raise serializers.ValidationError(
+                    f"途经点 {index + 1} 的定位锚点偏好只能是 ndt、rtk 或 balanced"
+                )
         invalid_local_controllers = [
             point.get("local_controller")
             for point in value

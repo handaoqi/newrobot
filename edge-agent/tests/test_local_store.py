@@ -59,6 +59,9 @@ def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
             "post_arrival_waypoint_index": 0,
             "post_arrival_stage": "xy_adjusting",
             "arrival_side_effects_started": True,
+            "arrival_micro_adjust_total_m": 0.30,
+            "arrival_micro_adjust_steps": 2,
+            "arrival_micro_adjust_started_at": 1234.5,
         }
     )
 
@@ -67,6 +70,9 @@ def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
     assert restored["post_arrival_waypoint_index"] == 0
     assert restored["post_arrival_stage"] == "xy_adjusting"
     assert restored["arrival_side_effects_started"] is True
+    assert restored["arrival_micro_adjust_total_m"] == 0.30
+    assert restored["arrival_micro_adjust_steps"] == 2
+    assert restored["arrival_micro_adjust_started_at"] == 1234.5
     store.close()
 
 

@@ -294,6 +294,21 @@ def _validate_task_start(command: dict[str, Any]) -> None:
             "pass_through", "stop_and_confirm", "precision", "dock",
         }:
             raise ProtocolError("INVALID_MESSAGE", "waypoint arrival_policy is invalid")
+        arrival_policy = str(waypoint.get("arrival_policy") or "stop_and_confirm").lower()
+        if "arrival_micro_adjust_mode" in waypoint:
+            mode = str(waypoint["arrival_micro_adjust_mode"]).lower()
+            if mode not in {"cmd_vel", "nav2_goal"}:
+                raise ProtocolError("INVALID_MESSAGE", "waypoint arrival_micro_adjust_mode is invalid")
+            if mode == "nav2_goal" and arrival_policy in {"pass_through", "dock"}:
+                raise ProtocolError("INVALID_MESSAGE", "nav2_goal is not allowed for pass_through or dock")
+        if "localization_anchor_preference" in waypoint and str(
+            waypoint["localization_anchor_preference"]
+        ).lower() not in {"ndt", "rtk", "balanced"}:
+            raise ProtocolError("INVALID_MESSAGE", "waypoint localization_anchor_preference is invalid")
+        if "rtk_primary_allowed" in waypoint and not isinstance(
+            waypoint["rtk_primary_allowed"], bool
+        ):
+            raise ProtocolError("INVALID_MESSAGE", "waypoint rtk_primary_allowed must be boolean")
         if "speech_mode" in waypoint and str(waypoint["speech_mode"]).lower() not in {
             "blocking", "non_blocking", "disabled",
         }:

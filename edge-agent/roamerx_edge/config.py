@@ -119,20 +119,29 @@ class SafetyConfig:
     navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
-    final_waypoint_tolerance_m: float = 0.45
+    # Ordinary stop-and-confirm points must be verified against the corrected
+    # map pose; this is intentionally stricter than Nav2's normal goal checker.
+    final_waypoint_tolerance_m: float = 0.30
     arrival_degraded_tolerance_m: float = 0.60
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
-    # Deprecated as an initial-distance limit. Retained as a fallback rolling
-    # clearance lookahead for older deployed configuration files.
+    # Arrival correction is split into bounded segments.  The legacy
+    # max-distance is retained only as a fallback rolling clearance lookahead.
     arrival_adjust_max_distance_m: float = 0.50
     arrival_adjust_clearance_lookahead_m: float | None = None
     arrival_adjust_speed_mps: float = 0.08
     arrival_adjust_yaw_rate_rps: float = 0.10
-    # Deprecated: post-arrival adjustment has no total convergence timeout.
-    arrival_adjust_timeout_seconds: float = 8.0
+    arrival_adjust_timeout_seconds: float = 30.0
     arrival_adjust_scan_max_age_seconds: float = 0.50
     arrival_adjust_safety_grace_seconds: float = 2.0
+    arrival_micro_adjust_mode: str = "cmd_vel"
+    arrival_micro_adjust_max_initial_error_m: float = 0.45
+    arrival_micro_adjust_total_budget_m: float = 0.60
+    arrival_micro_adjust_step_m: float = 0.15
+    arrival_micro_adjust_max_steps: int = 4
+    arrival_micro_goal_tolerance_m: float = 0.15
+    arrival_ndt_max_fitness_score: float = 0.45
+    arrival_convergence_samples: int = 3
 
 
 @dataclass
