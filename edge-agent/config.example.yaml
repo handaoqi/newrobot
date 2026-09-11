@@ -52,7 +52,6 @@ telemetry:
 safety:
   stop_speed_threshold_mps: 0.03
   stop_confirmation_seconds: 1.0
-  stop_velocity_max_age_seconds: 0.5
   localization_stable_seconds: 3.0
   localization_loss_samples: 5
   ndt_failure_score: 0.5

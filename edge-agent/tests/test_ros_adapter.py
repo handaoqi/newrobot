@@ -1279,3 +1279,41 @@ def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
     stale = adapter.obstacle_monitor_snapshot()["global_plan"]
     assert stale["updated"] is False
     assert stale["points"] == []
+
+
+def test_stopped_accepts_stale_zero_after_collision_monitor_quiet_period():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SafetyConfig()
+    adapter._actual_forward_command = 0.0
+    adapter._actual_lateral_command = 0.0
+    adapter._actual_turn_command = 0.0
+    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
+
+    assert adapter._is_stopped_from_velocity(time.monotonic()) is True
+
+
+def test_stopped_rejects_nonzero_command_even_when_feedback_is_stale():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SafetyConfig()
+    adapter._actual_forward_command = 0.12
+    adapter._actual_lateral_command = 0.0
+    adapter._actual_turn_command = 0.0
+    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
+
+    assert adapter._is_stopped_from_velocity(time.monotonic()) is False
+
+
+def test_nonzero_command_clears_stopped_state():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SafetyConfig()
+    adapter._actual_forward_command = 0.0
+    adapter._actual_lateral_command = 0.0
+    adapter._actual_turn_command = 0.0
+    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
+    assert adapter._is_stopped_from_velocity(time.monotonic()) is True
+
+    adapter._on_cmd_vel(SimpleNamespace(
+        linear=SimpleNamespace(x=0.12, y=0.0),
+        angular=SimpleNamespace(z=0.0),
+    ))
+    assert adapter._is_stopped_from_velocity(time.monotonic()) is False

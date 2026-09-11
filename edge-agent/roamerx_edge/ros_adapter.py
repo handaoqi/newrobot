@@ -4135,16 +4135,7 @@ class RosAdapter(Node):
             # enough to report >1 m/s while the robot is stationary.  The
             # collision-monitor output is the actual motion command and is the
             # reliable source for pause confirmation.
-            velocity_age = time.monotonic() - self._actual_velocity_updated_monotonic
-            velocity_fresh = (
-                self._actual_velocity_updated_monotonic > 0.0
-                and velocity_age <= self.safety_config.stop_velocity_max_age_seconds
-            )
-            planar_speed = math.hypot(self._actual_forward_command, self._actual_lateral_command)
-            stopped = velocity_fresh and (
-                planar_speed <= self.safety_config.stop_speed_threshold_mps
-                and abs(self._actual_turn_command) <= 0.05
-            )
+            stopped = self._is_stopped_from_velocity(time.monotonic())
             if stopped:
                 stable_since = stable_since or time.monotonic()
                 if time.monotonic() - stable_since >= self.safety_config.stop_confirmation_seconds:
@@ -4153,6 +4144,26 @@ class RosAdapter(Node):
                 stable_since = None
             time.sleep(0.05)
         return False
+
+    def _is_stopped_from_velocity(self, now: float) -> bool:
+        """Evaluate the last command without requiring static zero republishing.
+
+        Collision Monitor intentionally stops publishing /cmd_vel after a
+        stationary timeout. A stale *zero* therefore remains valid, while a
+        stale non-zero command is never accepted for recovery.
+        """
+        planar_speed = math.hypot(self._actual_forward_command, self._actual_lateral_command)
+        command_zero = (
+            planar_speed <= self.safety_config.stop_speed_threshold_mps
+            and abs(self._actual_turn_command) <= 0.05
+        )
+        if not command_zero:
+            return False
+        if self._actual_velocity_updated_monotonic <= 0.0:
+            return False
+        # A stale zero is expected when Collision Monitor suppresses output;
+        # only stale non-zero values are unsafe and rejected above.
+        return True
 
 
 class RosRuntime:
