@@ -581,8 +581,11 @@ namespace robot::slam
         init();
         pcd2grid_ptr_ = std::make_shared<Pcd2Grid>(pcd2pgm_options_);
 
+        // Navigation only needs the most recent scan. Formal mapping keeps its
+        // deeper FIFO subscription so every scan remains available for capture.
         sub_lidar_ptr_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            lid_topic, rclcpp::QoS(10).best_effort(), std::bind(&MappingAlg::lidarCallBack, this, std::placeholders::_1));
+            lid_topic, rclcpp::QoS(odometry_only_ ? 1 : 10).best_effort(),
+            std::bind(&MappingAlg::lidarCallBack, this, std::placeholders::_1));
 
         sub_imu_ptr_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(200).best_effort(), std::bind(&MappingAlg::imuCallBack, this, std::placeholders::_1));
@@ -961,7 +964,6 @@ namespace robot::slam
     void MappingAlg::reset()
     {
         stopKeyframeWriter(false);
-        time_buffer.clear();
         lidar_buffer.clear();
         imu_buffer.clear();
         is_first_lidar      = true;
@@ -1262,8 +1264,9 @@ namespace robot::slam
         pcl::fromROSMsg(*msg, pl_orig);
 
         p_pre->process(pl_orig, ptr);
-        lidar_buffer.push_back(ptr);
-        time_buffer.push_back(last_timestamp_lidar);
+        if (odometry_only_)
+            discardSupersededNavigationScans(lidar_buffer, lidar_pushed);
+        lidar_buffer.push_back({ last_timestamp_lidar, ptr });
 
         mtx_buffer.unlock();
         sig_buffer.notify_all();
@@ -1912,8 +1915,8 @@ namespace robot::slam
 
         if (!lidar_pushed)
         {
-            meas.lidar          = lidar_buffer.front();
-            meas.lidar_beg_time = time_buffer.front();
+            meas.lidar          = lidar_buffer.front().cloud;
+            meas.lidar_beg_time = lidar_buffer.front().stamp;
             if (meas.lidar->points.size() <= 1)  // time too little
             {
                 lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
@@ -1952,7 +1955,6 @@ namespace robot::slam
         }
 
         lidar_buffer.pop_front();
-        time_buffer.pop_front();
         lidar_pushed = false;
         return true;
     }
@@ -2010,6 +2012,8 @@ namespace robot::slam
 
     void MappingAlg::pubWorldPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
     {
+        if (!needsWorldPointCloud(pub_world_points_flag_, mapping_capture_enabled_, keyframe_record_enable_))
+            return;
 
         PointCloudType::Ptr laserCloudFullRes(feats_undistort);
         int                 size = laserCloudFullRes->points.size();

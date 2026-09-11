@@ -153,6 +153,12 @@ if(BUILD_TESTING)
     )
     target_link_libraries(ground_filter_test ${PCL_LIBRARIES})
   endif()
+  ament_add_gtest(frontend_scan_buffer_test test/frontend_scan_buffer_test.cpp)
+  if(TARGET frontend_scan_buffer_test)
+    target_include_directories(frontend_scan_buffer_test PRIVATE
+      ${CMAKE_CURRENT_LIST_DIR}/include
+    )
+  endif()
 endif()
 
 install(TARGETS mapping slam_enu_converter pcd2grid_streaming
