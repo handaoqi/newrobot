@@ -280,6 +280,8 @@ class TaskContext:
     post_arrival_waypoint_index: int | None = None
     post_arrival_stage: str = ""
     arrival_side_effects_started: bool = False
+    last_safe_hold_code: str = ""
+    last_safe_hold_message: str = ""
 
 
 class TaskExecutor:
@@ -293,6 +295,7 @@ class TaskExecutor:
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
         final_waypoint_tolerance_m: float = 0.45,
+        arrival_degraded_tolerance_m: float = 0.60,
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         arrival_adjust_max_distance_m: float = 0.50,
@@ -317,6 +320,10 @@ class TaskExecutor:
         self.event_callback = event_callback
         self.start_result_callback = start_result_callback
         self.final_waypoint_tolerance_m = final_waypoint_tolerance_m
+        self.arrival_degraded_tolerance_m = max(
+            float(final_waypoint_tolerance_m),
+            float(arrival_degraded_tolerance_m),
+        )
         self.docking_goal_tolerance_m = docking_goal_tolerance_m
         self.docking_goal_yaw_tolerance_rad = docking_goal_yaw_tolerance_rad
         # Keep the legacy max-distance setting loadable, but use it only as the
@@ -463,7 +470,9 @@ class TaskExecutor:
         if self.context.state not in self.TERMINAL_STATES | {"paused"}:
             self.context.state = "paused"
             self.context.state_version += 1
-            self._persist()
+        self.context.last_safe_hold_code = code
+        self.context.last_safe_hold_message = message
+        self._persist()
         self._emit_idempotent(
             "task.safe_hold",
             event_type_key="safe_hold",
@@ -4024,9 +4033,129 @@ class TaskExecutor:
                 "resume_from_waypoint_index": resume_index,
             }
 
-    def force_exit(self, execution_id: str) -> dict:
+    def recover_task(
+        self,
+        execution_id: str,
+        *,
+        trigger_reason_code: str,
+        recovery_episode_id: str,
+        attempt: int,
+    ) -> dict:
+        """Resume a system-held task after the center's five-second gate."""
+        with self._lock:
+            self._assert_execution(execution_id)
+            if not self.navigation.is_robot_stopped():
+                raise ProtocolError("ROBOT_NOT_STOPPED", "recovery requires a confirmed stop")
+            if self.context.state == "running":
+                return {
+                    "final_task_state": "running",
+                    "state_version": self.context.state_version,
+                    "recovery_action": "already_recovered",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
+            code = str(
+                self.context.last_safe_hold_code or trigger_reason_code or "TASK_INTERRUPTED"
+            )
+            if code == "ARRIVAL_POSE_CONVERGENCE_FAILED":
+                index = (
+                    self.context.post_arrival_waypoint_index
+                    if self.context.post_arrival_waypoint_index is not None
+                    else self.context.current_waypoint_index
+                )
+                waypoints = self.context.route_snapshot.get("waypoints") or []
+                if index < 0 or index >= len(waypoints):
+                    raise ProtocolError("TASK_CONTEXT_MISMATCH", "arrival waypoint is missing")
+                waypoint = waypoints[index]
+                if self._is_docking_task() or self._arrival_policy(waypoint, index) != "stop_and_confirm":
+                    raise ProtocolError(
+                        "ARRIVAL_DEGRADE_FORBIDDEN",
+                        "precision and docking points cannot skip final pose convergence",
+                    )
+                decision = self._localization_decision()
+                if not self._localization_sample_fresh(decision):
+                    raise ProtocolError("LOCALIZATION_NOT_READY", "localization is not fresh")
+                distance, _yaw_error = self._arrival_pose_errors(waypoint, index)
+                if distance is None or distance > self.arrival_degraded_tolerance_m:
+                    raise ProtocolError(
+                        "ARRIVAL_DEGRADE_TOO_FAR",
+                        f"distance {distance} exceeds {self.arrival_degraded_tolerance_m:.2f}m",
+                    )
+                self._cancel_arrival_adjustment(reset_state=False)
+                self.context.state = "running"
+                self.context.state_version += 1
+                self.context.last_safe_hold_code = ""
+                self.context.last_safe_hold_message = ""
+                self._set_post_arrival_stage(index, "post_arrival_ready")
+                self._persist()
+                self._emit(
+                    "task.resumed",
+                    code="ARRIVAL_YAW_DEGRADED",
+                    message="position is safe; final yaw was skipped by recovery policy",
+                )
+                self._emit_idempotent(
+                    "task.waypoint_degraded",
+                    event_type_key=f"arrival_degraded:{recovery_episode_id}:{attempt}",
+                    waypoint_id=str(waypoint.get("waypoint_id") or index),
+                    code="ARRIVAL_YAW_DEGRADED",
+                    message="航点位置已安全到达，跳过最终朝向",
+                    extra={
+                        "distance_m": distance,
+                        "threshold_m": self.arrival_degraded_tolerance_m,
+                        "recovery_episode_id": recovery_episode_id,
+                        "attempt": int(attempt),
+                    },
+                )
+                self._resume_post_arrival(index)
+                return {
+                    "final_task_state": self.context.state if self.context else "completed",
+                    "state_version": self.context.state_version if self.context else 0,
+                    "recovery_action": "degraded_arrival_yaw",
+                    "waypoint_index": index,
+                    "distance_m": distance,
+                }
+            if "LOCALIZATION" in code.upper():
+                if callable(self.localization_recovery_callback):
+                    self.localization_recovery_callback("center_loop_recovery")
+                return {
+                    "final_task_state": "paused",
+                    "state_version": self.context.state_version,
+                    "resume_blocked": True,
+                    "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
+                    "reason_message": "定位恢复正在执行，保持停车",
+                    "recovery_action": "localization_recovery_in_progress",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
+            self.context.last_safe_hold_code = ""
+            self.context.last_safe_hold_message = ""
+            self._persist()
+            result = self.resume_task(execution_id, self.context.current_waypoint_index)
+            result.update(
+                {
+                    "recovery_action": "resume_pending_waypoint",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
+            )
+            return result
+
+    def force_exit(
+        self,
+        execution_id: str,
+        *,
+        reason_code: str = "FORCE_EXIT",
+        reason_message: str = "task force-exited",
+        report_start_result: bool = True,
+    ) -> dict:
         """Idempotently clear any local motion task, regardless of its state."""
         with self._lock:
+            self._clear_nav_dispatch_retry()
+            self._cancel_waypoint_localization_correction()
+            self._cancel_arrival_adjustment(reset_state=True)
+            self._cancel_absolute_localization_resume_watch()
+            self._clear_departure_heading(cancel_navigation=False)
+            self._invalidate_nav_results()
             self._cancel_waypoint_dwell()
             self._stop_obstacle_monitor()
             self._stop_task_rosbag()
@@ -4044,14 +4173,40 @@ class TaskExecutor:
                 context.state = "cancelled"
                 context.state_version += 1
                 self._persist()
+                result = {
+                    "final_task_state": "cancelled",
+                    "state_version": context.state_version,
+                    "robot_stopped": self.navigation.is_robot_stopped(),
+                    "cleared": True,
+                    "reason_code": reason_code,
+                    "reason_message": reason_message,
+                    "rosbag": self._rosbag_state if context.record_rosbag else None,
+                }
+                if report_start_result:
+                    try:
+                        self.start_result_callback(
+                            context.start_command_id,
+                            "cancelled",
+                            result,
+                            reason_code,
+                            reason_message,
+                        )
+                    except Exception:
+                        # The callback stores to the durable outbox before it
+                        # publishes. Network failure must never retain a motion
+                        # context after force-exit.
+                        LOGGER.exception("failed to publish force-exit start result")
                 self.store.clear_task_context(context.task_execution_id, "cancelled")
                 self.context = None
+                return result
             return {
                 "final_task_state": "cancelled",
-                "state_version": context.state_version if context else 0,
+                "state_version": 0,
                 "robot_stopped": self.navigation.is_robot_stopped(),
                 "cleared": True,
-                "rosbag": self._rosbag_state if context and context.record_rosbag else None,
+                "reason_code": reason_code,
+                "reason_message": reason_message,
+                "rosbag": None,
             }
 
     def cancel_task(self, execution_id: str) -> dict:
@@ -4098,8 +4253,7 @@ class TaskExecutor:
             self.context.state_version += 1
             self._persist()
             self._emit("task.cancelled")
-            self.store.clear_task_context(execution_id, "cancelled")
-            return {
+            result = {
                 "final_task_state": "cancelled",
                 "state_version": self.context.state_version,
                 "robot_stopped": True,
@@ -4107,6 +4261,18 @@ class TaskExecutor:
                 "cancel_performed": True,
                 "rosbag": self._rosbag_state if self.context.record_rosbag else None,
             }
+            try:
+                self.start_result_callback(
+                    self.context.start_command_id,
+                    "cancelled",
+                    result,
+                    "TASK_CANCELLED",
+                    "task cancelled",
+                )
+            except Exception:
+                LOGGER.exception("failed to publish cancelled start result")
+            self.store.clear_task_context(execution_id, "cancelled")
+            return result
 
     def on_feedback(
         self,

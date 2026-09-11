@@ -27,7 +27,8 @@ ALLOWED_TRANSITIONS = {
     # expose an intermediate pausing state.
     "running": {"pausing", "paused", "resuming", "cancelling", "cancelled", "completed", "failed", "timed_out", "interrupted"},
     "pausing": {"accepted", "running", "paused", "resuming", "cancelling", "cancelled", "failed", "interrupted"},
-    "paused": {"pausing", "resuming", "cancelling", "cancelled", "interrupted"},
+    # A recovery command result can overtake task.resuming/task.resumed events.
+    "paused": {"running", "pausing", "resuming", "cancelling", "cancelled", "interrupted"},
     "resuming": {"accepted", "running", "paused", "pausing", "cancelling", "cancelled", "failed", "interrupted"},
     "cancelling": {"cancelled", "failed", "interrupted"},
     "interrupted": {"paused", "running", "pausing", "resuming", "cancelling", "cancelled", "failed"},
@@ -267,6 +268,7 @@ class TaskExecutionService:
         *,
         loop_session_id=None,
         round_number: int = 1,
+        route_snapshot: dict | None = None,
     ) -> TaskExecution:
         robot = Robot.objects.select_for_update().get(pk=task.robot_id)
         active = TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).order_by("-created_at").first()
@@ -277,15 +279,16 @@ class TaskExecutionService:
         route = task.route
         if route is None:
             raise TaskStateError("TASK_ROUTE_MISSING")
+        snapshot = dict(route_snapshot) if route_snapshot is not None else None
         try:
             validate_route_against_map(
                 constraints_from_map_data(route.map_data),
                 scene_scope=str(getattr(route, "scene_scope", "") or route.map_data.scene_scope or "indoor"),
-                waypoints=route.waypoints or [],
+                waypoints=(snapshot.get("waypoints") or []) if snapshot is not None else (route.waypoints or []),
             )
         except MapConstraintError as exc:
             raise TaskStateError(exc.code) from exc
-        snapshot = build_route_snapshot(route)
+        snapshot = snapshot if snapshot is not None else build_route_snapshot(route)
         try:
             execution = TaskExecution.objects.create(
                 task=task,
@@ -360,6 +363,16 @@ class TaskExecutionService:
             reason_message=reason_message,
             payload=payload or {},
         )
+        if target in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
+            # Local import avoids a module cycle: CommandService delegates task
+            # state changes here, while terminal task state owns start-command
+            # lifecycle reconciliation.
+            from .command_service import CommandService
+
+            CommandService.reconcile_task_start_for_execution(
+                locked,
+                source=event_type,
+            )
         return locked
 
     @staticmethod

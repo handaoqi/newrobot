@@ -5,9 +5,12 @@ from .models import (
     CommandEvent,
     InspectionEvent,
     PatrolSchedule,
+    PatrolLoopEvent,
+    PatrolLoopSession,
     PatrolTask,
     RemoteCommand,
     Robot,
+    RobotLowBatteryEpisode,
     RobotSession,
     RobotStatusLatest,
     RobotTelemetry,
@@ -72,6 +75,24 @@ class RobotSessionAdmin(admin.ModelAdmin):
 class TaskExecutionAdmin(admin.ModelAdmin):
     list_display = ("id", "task", "robot", "state", "state_version", "current_waypoint_index", "created_at")
     list_filter = ("state",)
+
+
+@admin.register(PatrolLoopSession)
+class PatrolLoopSessionAdmin(admin.ModelAdmin):
+    list_display = ("id", "robot", "task", "state", "current_round", "ends_at", "updated_at")
+    list_filter = ("state", "robot")
+
+
+@admin.register(PatrolLoopEvent)
+class PatrolLoopEventAdmin(admin.ModelAdmin):
+    list_display = ("loop_session", "event_type", "state", "recovery_attempt", "occurred_at")
+    list_filter = ("event_type", "state")
+
+
+@admin.register(RobotLowBatteryEpisode)
+class RobotLowBatteryEpisodeAdmin(admin.ModelAdmin):
+    list_display = ("robot", "battery_percent", "active", "source", "triggered_at", "cleared_at")
+    list_filter = ("active", "source")
 
 
 @admin.register(RemoteCommand)

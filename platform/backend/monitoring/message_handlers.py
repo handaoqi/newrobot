@@ -28,6 +28,7 @@ from .realtime_gateway import realtime_publisher
 from .serializers import EventSerializer, TaskExecutionSerializer
 from .services.alert_service import AlertService
 from .services.task_service import TaskExecutionService, TaskStateError
+from .services.patrol_loop_service import PatrolLoopService
 from .services.telemetry_service import TelemetryService
 from .services.system_log_service import emit_center_log, ingest_batch
 from .services.sqlite_retry import is_sqlite_lock_error, with_sqlite_lock_retry
@@ -402,6 +403,21 @@ def _dispatch(
             # alert-only stop: it must never dispatch docking or switch maps.
             if created:
                 _queue_low_battery_alert_speech(robot, payload)
+            attributes = payload.get("attributes") or {}
+            PatrolLoopService.terminate_low_battery(
+                robot=robot,
+                episode_key=str(
+                    attributes.get("low_battery_episode_id")
+                    or payload.get("event_id")
+                ),
+                battery_percent=int(
+                    attributes.get("battery_percent")
+                    if attributes.get("battery_percent") is not None
+                    else robot.battery_level
+                ),
+                source="edge_alert",
+                task_execution_id=payload.get("task_execution_id"),
+            )
             return {
                 "created": created,
                 "registered": event is not None,
@@ -738,6 +754,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         "task.arrival_correcting",
         "task.recovery_active",
         "task.waypoint_actions",
+        "task.waypoint_degraded",
     }:
         realtime_publisher.publish_task_event(
             str(execution.id),

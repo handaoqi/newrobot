@@ -500,20 +500,22 @@ def test_recovered_callback_rearms_alerting_and_clears_recovery_state():
     assert resumed == [True]
 
 
-def test_low_battery_terminal_context_uses_idempotent_cancel_without_force_exit():
+def test_low_battery_retained_context_is_force_exited_immediately():
     application = object.__new__(EdgeAgentApplication)
     context = SimpleNamespace(task_execution_id="task-1", state="failed", docking={})
     calls = []
     application.task_executor = SimpleNamespace(
         context=context,
         has_active_task=lambda: False,
-        cancel_task=lambda execution_id: calls.append(("cancel", execution_id)) or {
-            "final_task_state": "failed",
-            "already_terminal": True,
-        },
-        force_exit=lambda _execution_id: calls.append(("force", _execution_id)),
+        force_exit=lambda execution_id, **kwargs: calls.append(
+            ("force", execution_id, kwargs.get("reason_code"))
+        ) or {"robot_stopped": True, "cleared": True},
     )
-    application.navigation = SimpleNamespace(latest_pose=lambda: None)
+    application.navigation = SimpleNamespace(
+        latest_pose=lambda: None,
+        is_robot_stopped=lambda: True,
+        stop_motion=lambda: None,
+    )
     application.safety_state = SimpleNamespace(
         current_map_id="map-1", current_map_version="v1"
     )
@@ -529,10 +531,11 @@ def test_low_battery_terminal_context_uses_idempotent_cancel_without_force_exit(
 
     application._handle_low_battery_alert("episode-1", 19)
 
-    assert calls == [("cancel", "task-1")]
+    assert calls == [("force", "task-1", "LOW_BATTERY")]
     assert alerts[0]["event_type"] == "low_battery_alert"
     assert alerts[0]["source"]["code"] == "LOW_BATTERY_ALERT"
-    assert alerts[0]["attributes"]["action"] == "alert_only"
+    assert alerts[0]["attributes"]["action"] == "force_exited"
+    assert alerts[0]["attributes"]["robot_stopped"] is True
     assert alerts[0]["attributes"]["automatic_docking"] is False
 
 

@@ -8,12 +8,12 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 
-from ..models import CommandEvent, RemoteCommand, Robot, TaskExecution
+from ..models import CommandEvent, RemoteCommand, Robot, RobotLowBatteryEpisode, TaskExecution
 from .task_service import TaskExecutionService, TaskStateError
 
 
 class CommandService:
-    LOW_BATTERY_PERCENT = 20
+    LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     COMMAND_TARGET_STATES = {
         "task.start": "dispatching",
         "task.pause": "pausing",
@@ -21,6 +21,13 @@ class CommandService:
         "task.resume_forward": "resuming",
         "task.cancel": "cancelling",
         "task.force_exit": "cancelling",
+    }
+    EXECUTION_COMMAND_STATUS = {
+        "completed": "succeeded",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        "timed_out": "timed_out",
+        "rejected": "rejected",
     }
 
     @classmethod
@@ -72,7 +79,7 @@ class CommandService:
             command_payload = {"reason": "operator_resume_forward", "resume_forward": True}
             expiry_seconds = getattr(settings, "COMMAND_CONTROL_EXPIRY_SECONDS", 15)
         else:
-            command_payload = {"reason": "operator_request"}
+            command_payload = {"reason": str(command_options.get("reason") or "operator_request")}
             expiry_seconds = getattr(settings, "COMMAND_CONTROL_EXPIRY_SECONDS", 15)
 
         command = RemoteCommand.objects.create(
@@ -140,8 +147,86 @@ class CommandService:
             payload={"error": message},
         )
 
+    @classmethod
+    @transaction.atomic
+    def reconcile_task_start_for_execution(
+        cls,
+        execution: TaskExecution,
+        *,
+        source: str = "execution_terminal",
+    ) -> int:
+        """Make ``task.start`` reflect the authoritative execution terminal state.
+
+        The start command spans the whole physical task.  Force-exit and Edge
+        sync can finish an execution without returning a result for that
+        original command, so leaving it open lets the expiry worker create a
+        false timeout hours later.
+        """
+        target_status = cls.EXECUTION_COMMAND_STATUS.get(execution.state)
+        if target_status is None:
+            return 0
+        changed = 0
+        commands = RemoteCommand.objects.select_for_update().filter(
+            task_execution=execution,
+            command_type="task.start",
+        )
+        for command in commands:
+            if command.status == target_status:
+                continue
+            previous_status = command.status
+            result = dict(command.result_payload or {})
+            result.update(
+                {
+                    "final_task_state": execution.state,
+                    "state_version": execution.state_version,
+                    "reconciled_from_execution": True,
+                }
+            )
+            command.status = target_status
+            command.finished_at = execution.finished_at or timezone.now()
+            command.result_payload = result
+            if target_status == "succeeded":
+                command.error_code = ""
+                command.error_message = ""
+            else:
+                command.error_code = execution.failure_code or (
+                    "COMMAND_TIMED_OUT" if target_status == "timed_out" else ""
+                )
+                command.error_message = execution.failure_message or ""
+            command.save(
+                update_fields=[
+                    "status",
+                    "finished_at",
+                    "result_payload",
+                    "error_code",
+                    "error_message",
+                    "updated_at",
+                ]
+            )
+            CommandEvent.objects.create(
+                command=command,
+                event_type="execution_terminal",
+                source="center",
+                payload={
+                    "source": source,
+                    "previous_status": previous_status,
+                    "execution_state": execution.state,
+                    "execution_state_version": execution.state_version,
+                },
+            )
+            changed += 1
+        return changed
+
     @staticmethod
     def mark_timeout(command: RemoteCommand) -> None:
+        if command.command_type == "task.start" and command.task_execution_id:
+            execution = TaskExecution.objects.filter(pk=command.task_execution_id).first()
+            if execution and execution.state in CommandService.EXECUTION_COMMAND_STATUS:
+                CommandService.reconcile_task_start_for_execution(
+                    execution,
+                    source="timeout_sweeper_precheck",
+                )
+                return
         if command.status in {"succeeded", "failed", "cancelled", "rejected", "timed_out", "expired"}:
             return
         previous_status = command.status
@@ -246,6 +331,51 @@ class CommandService:
         return command
 
     @classmethod
+    @transaction.atomic
+    def create_task_recovery(
+        cls,
+        execution: TaskExecution,
+        *,
+        episode_id,
+        attempt: int,
+        reason_code: str,
+        reason_message: str,
+    ) -> RemoteCommand:
+        payload = {
+            "recovery_episode_id": str(episode_id),
+            "attempt": int(attempt),
+            "expected_task_state_version": int(execution.state_version),
+            "trigger_reason_code": reason_code,
+            "trigger_reason_message": reason_message,
+            "observation_seconds": 5,
+        }
+        existing = RemoteCommand.objects.filter(
+            task_execution=execution,
+            command_type="task.recover.v1",
+            payload__recovery_episode_id=str(episode_id),
+            payload__attempt=int(attempt),
+        ).first()
+        if existing:
+            return existing
+        command = RemoteCommand.objects.create(
+            robot=execution.robot,
+            task_execution=execution,
+            command_type="task.recover.v1",
+            payload=payload,
+            trace_id=uuid.uuid4(),
+            expires_at=timezone.now() + timedelta(
+                seconds=getattr(settings, "TASK_RECOVERY_EXPIRY_SECONDS", 300)
+            ),
+        )
+        CommandEvent.objects.create(
+            command=command,
+            event_type="created",
+            source="center",
+            payload={"command_type": "task.recover.v1", **payload},
+        )
+        return command
+
+    @classmethod
     def ensure_task_start_allowed(cls, robot: Robot, *, allow_docking: bool = False) -> None:
         """Run admission checks that must happen before creating an execution."""
         cls._ensure_battery_allows(robot, "task.start", allow_docking=allow_docking)
@@ -259,6 +389,13 @@ class CommandService:
             percent = int(latest.battery_percent)
         elif robot.battery_level is not None:
             percent = int(robot.battery_level)
+        if command_type == "task.start" and not allow_docking:
+            latched = RobotLowBatteryEpisode.objects.filter(robot=robot, active=True).first()
+            if latched:
+                raise PermissionDenied(
+                    f"低电量保护仍在锁存（触发时 {latched.battery_percent}%），电量达到 "
+                    f"{latched.rearm_percent}% 后才可重新巡逻。"
+                )
         if percent is None or percent >= cls.LOW_BATTERY_PERCENT:
             return
         if command_type == "task.start" and not allow_docking:

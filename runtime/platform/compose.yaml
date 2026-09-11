@@ -62,6 +62,14 @@ services:
       backend:
         condition: service_healthy
 
+  patrol-loop-supervisor:
+    <<: *backend
+    container_name: roamerx-patrol-loop-supervisor
+    command: ["python", "manage.py", "run_patrol_loop_supervisor", "--interval", "1"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
   validation-storage:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: roamerx-validation-storage

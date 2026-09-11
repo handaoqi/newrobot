@@ -951,6 +951,7 @@ class RemoteCommand(BaseTimestampModel):
         ("task.resume_forward", "恢复前向"),
         ("task.cancel", "终止任务"),
         ("task.force_exit", "强制退出并清理任务"),
+        ("task.recover.v1", "任务自愈"),
         ("mapping.start", "开始建图"),
         ("mapping.save", "停止并保存地图"),
         ("mapping.cancel", "取消建图"),
@@ -1074,6 +1075,145 @@ class CommandEvent(BaseTimestampModel):
     class Meta:
         ordering = ["event_at"]
         indexes = [models.Index(fields=["command", "event_at"], name="command_event_time_idx")]
+
+
+class PatrolLoopSession(BaseTimestampModel):
+    ACTIVE_STATES = [
+        "starting",
+        "running",
+        "resting",
+        "observing",
+        "recovering",
+        "paused",
+        "stopping",
+    ]
+    TERMINAL_STATES = ["completed", "failed", "cancelled", "low_battery_stopped"]
+    STATE_CHOICES = [
+        ("starting", "准备启动"),
+        ("running", "循环执行中"),
+        ("resting", "轮间休息"),
+        ("observing", "异常观察中"),
+        ("recovering", "自愈中"),
+        ("paused", "人工暂停"),
+        ("stopping", "停止中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已停止"),
+        ("low_battery_stopped", "低电量终止"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="patrol_loop_sessions", on_delete=models.PROTECT)
+    task = models.ForeignKey("PatrolTask", related_name="loop_sessions", on_delete=models.PROTECT)
+    route_snapshot = models.JSONField(default=dict)
+    state = models.CharField(max_length=32, choices=STATE_CHOICES, default="starting")
+    state_version = models.BigIntegerField(default=0)
+    duration_seconds = models.PositiveIntegerField()
+    rest_seconds = models.PositiveIntegerField(default=0)
+    started_at = models.DateTimeField(default=timezone.now)
+    ends_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+    current_round = models.PositiveIntegerField(default=0)
+    current_execution = models.ForeignKey(
+        TaskExecution,
+        related_name="owning_loop_sessions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    next_action_at = models.DateTimeField(default=timezone.now, db_index=True)
+    observation_started_at = models.DateTimeField(null=True, blank=True)
+    recovery_episode_id = models.UUIDField(null=True, blank=True)
+    recovery_reason_code = models.CharField(max_length=64, blank=True)
+    recovery_reason_message = models.TextField(blank=True)
+    recovery_attempt = models.PositiveSmallIntegerField(default=0)
+    recovery_max_attempts = models.PositiveSmallIntegerField(default=10)
+    manual_paused = models.BooleanField(default=False)
+    last_error = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="created_patrol_loop_sessions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["state", "next_action_at"], name="loop_state_due_idx"),
+            models.Index(fields=["robot", "-created_at"], name="loop_robot_recent_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=Q(duration_seconds__gt=0), name="loop_duration_gt_0"),
+            models.CheckConstraint(condition=Q(recovery_attempt__lte=10), name="loop_recovery_attempt_lte_10"),
+            models.UniqueConstraint(
+                fields=["robot"],
+                condition=Q(
+                    state__in=[
+                        "starting",
+                        "running",
+                        "resting",
+                        "observing",
+                        "recovering",
+                        "paused",
+                        "stopping",
+                    ]
+                ),
+                name="uniq_active_patrol_loop_per_robot",
+            ),
+        ]
+
+
+class PatrolLoopEvent(BaseTimestampModel):
+    loop_session = models.ForeignKey(
+        PatrolLoopSession,
+        related_name="events",
+        on_delete=models.CASCADE,
+    )
+    task_execution = models.ForeignKey(
+        TaskExecution,
+        related_name="loop_events",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(max_length=64)
+    state = models.CharField(max_length=32, choices=PatrolLoopSession.STATE_CHOICES)
+    occurred_at = models.DateTimeField(default=timezone.now)
+    reason_code = models.CharField(max_length=64, blank=True)
+    reason_message = models.TextField(blank=True)
+    recovery_attempt = models.PositiveSmallIntegerField(default=0)
+    idempotency_key = models.CharField(max_length=160, unique=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [models.Index(fields=["loop_session", "-occurred_at"], name="loop_event_recent_idx")]
+
+
+class RobotLowBatteryEpisode(BaseTimestampModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="low_battery_episodes", on_delete=models.CASCADE)
+    episode_key = models.CharField(max_length=128, unique=True)
+    active = models.BooleanField(default=True)
+    battery_percent = models.PositiveSmallIntegerField()
+    threshold_percent = models.PositiveSmallIntegerField(default=20)
+    rearm_percent = models.PositiveSmallIntegerField(default=25)
+    source = models.CharField(max_length=32, default="edge_alert")
+    triggered_at = models.DateTimeField(default=timezone.now)
+    cleared_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-triggered_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["robot"],
+                condition=Q(active=True),
+                name="uniq_active_low_battery_episode",
+            )
+        ]
 
 
 class DebugLogSession(BaseTimestampModel):

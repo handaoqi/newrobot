@@ -118,6 +118,7 @@ class SafetyConfig:
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
     final_waypoint_tolerance_m: float = 0.45
+    arrival_degraded_tolerance_m: float = 0.60
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
     # Deprecated as an initial-distance limit. Retained as a fallback rolling

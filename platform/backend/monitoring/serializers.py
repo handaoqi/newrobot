@@ -21,6 +21,8 @@ from .models import (
     InspectionEvent,
     MediaAsset,
     PatrolTask,
+    PatrolLoopEvent,
+    PatrolLoopSession,
     PatrolSchedule,
     RemoteCommand,
     Robot,
@@ -1529,6 +1531,70 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
 
 class TaskExecutionActionSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, default="operator_request", max_length=256)
+
+
+class PatrolLoopEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PatrolLoopEvent
+        fields = [
+            "id",
+            "event_type",
+            "state",
+            "occurred_at",
+            "reason_code",
+            "reason_message",
+            "recovery_attempt",
+            "payload",
+        ]
+
+
+class PatrolLoopSessionSerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True)
+    task_name = serializers.CharField(source="task.name", read_only=True)
+    current_execution_detail = TaskExecutionSerializer(source="current_execution", read_only=True)
+    recent_events = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PatrolLoopSession
+        fields = [
+            "id",
+            "robot",
+            "robot_name",
+            "task",
+            "task_name",
+            "state",
+            "state_version",
+            "duration_seconds",
+            "rest_seconds",
+            "started_at",
+            "ends_at",
+            "finished_at",
+            "current_round",
+            "current_execution",
+            "current_execution_detail",
+            "next_action_at",
+            "observation_started_at",
+            "recovery_episode_id",
+            "recovery_reason_code",
+            "recovery_reason_message",
+            "recovery_attempt",
+            "recovery_max_attempts",
+            "manual_paused",
+            "last_error",
+            "recent_events",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_recent_events(self, obj):
+        return PatrolLoopEventSerializer(obj.events.order_by("-occurred_at")[:20], many=True).data
+
+
+class PatrolLoopSessionCreateSerializer(serializers.Serializer):
+    task_id = serializers.IntegerField(min_value=1)
+    duration_seconds = serializers.IntegerField(min_value=1, max_value=86400)
+    rest_seconds = serializers.IntegerField(min_value=0, max_value=3600, default=0)
+    session_id = serializers.UUIDField(required=False)
 
 
 class TrajectoryPointSerializer(serializers.ModelSerializer):

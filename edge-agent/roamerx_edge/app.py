@@ -105,6 +105,7 @@ class EdgeAgentApplication:
             event_callback=self._publish_task_event,
             start_result_callback=self._publish_start_result,
             final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
+            arrival_degraded_tolerance_m=config.safety.arrival_degraded_tolerance_m,
             docking_goal_tolerance_m=config.safety.docking_goal_tolerance_m,
             docking_goal_yaw_tolerance_rad=config.safety.docking_goal_yaw_tolerance_rad,
             arrival_adjust_max_distance_m=config.safety.arrival_adjust_max_distance_m,
@@ -320,6 +321,7 @@ class EdgeAgentApplication:
                     "task.pause",
                     "task.resume",
                     "task.cancel",
+                    "task.recover.v1",
                     "mapping.start",
                     "mapping.save",
                     "mapping.cancel",
@@ -764,23 +766,29 @@ class EdgeAgentApplication:
             and context
             and (context.docking or {}).get("enabled")
         )
-        action = "docking_already_active" if docking_active else "alert_only"
-        # Always pass a retained non-docking context through the idempotent
-        # cancel path. It may have become terminal after the snapshot above;
-        # cancel_task then performs only the local zero-velocity safety action
-        # and returns immediately without waiting for Nav2.
+        action = "docking_already_active" if docking_active else "no_active_task"
+        # Low battery is terminal, not recoverable.  Stop locally before the
+        # alert crosses an unreliable network and use force-exit semantics so
+        # a paused/interrupted task cannot retain a context or restart later.
         if context and not docking_active:
             try:
-                self.task_executor.cancel_task(execution_id)
-                LOGGER.warning("low battery cancelled active navigation; automatic return is disabled")
+                stopped = self.task_executor.force_exit(
+                    execution_id,
+                    reason_code="LOW_BATTERY",
+                    reason_message=f"battery {battery_percent}% is below the patrol threshold",
+                )
+                action = "force_exited"
+                LOGGER.warning("low battery force-exited active navigation; automatic return is disabled")
             except Exception:
-                LOGGER.exception("graceful low-battery task cancellation failed; forcing local exit")
-                action = "alert_only_after_force_exit"
-                try:
-                    self.task_executor.force_exit(execution_id)
-                except Exception:
-                    action = "navigation_stop_failed_alert_only"
-                    LOGGER.exception("failed to force low-battery task exit")
+                stopped = {"robot_stopped": False, "cleared": False}
+                action = "navigation_stop_failed_alert_only"
+                self.navigation.stop_motion()
+                LOGGER.exception("failed to force low-battery task exit")
+        else:
+            stopped = {
+                "robot_stopped": self.navigation.is_robot_stopped(),
+                "cleared": not bool(context),
+            }
         pose = self.navigation.latest_pose()
         pose_payload = {"frame_id": "map"}
         if pose is not None:
@@ -817,6 +825,8 @@ class EdgeAgentApplication:
                     "threshold_percent": self.config.charge_control.low_battery_start_percent,
                     "rearm_percent": self.config.charge_control.low_battery_rearm_percent,
                     "action": action,
+                    "robot_stopped": bool(stopped.get("robot_stopped")),
+                    "task_context_cleared": bool(stopped.get("cleared")),
                     "automatic_docking": False,
                 },
             }

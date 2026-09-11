@@ -8,10 +8,13 @@ import RobotDogIcon from '../components/RobotDogIcon.vue'
 import { useToast } from '../composables/useToast'
 import {
   API_BASE,
+  createPatrolLoopSession,
   executePatrolTask,
   fetchMapDetail,
   fetchOverview,
   fetchPatrolTasks,
+  fetchPatrolLoopSession,
+  fetchPatrolLoopSessions,
   fetchRobotDetail,
   fetchRobotNavigationStatus,
   fetchRobots,
@@ -20,6 +23,7 @@ import {
   fetchTaskTrajectory,
   sendRecordedAudioCommand,
   sendRobotNavigationCommand,
+  sendPatrolLoopSessionAction,
   sendTaskExecutionAction,
   sendTextToSpeechCommand,
 } from '../services/api'
@@ -118,6 +122,7 @@ const loopAccumulatedDistance = ref(0)
 const loopCountedExecutionIds = ref([])
 const loopCurrentExecutionId = ref('')
 const loopMessage = ref('未启动循环巡检')
+const serverLoopSession = ref(null)
 const nowMs = ref(Date.now())
 const liveSpeechOpen = ref(false)
 const liveSpeechText = ref('')
@@ -243,6 +248,7 @@ const elapsedMilliseconds = computed(() => {
 const loopRemainingMilliseconds = computed(() => loopActive.value ? Math.max(0, loopEndsAt.value - nowMs.value) : 0)
 const restRemainingMilliseconds = computed(() => loopState.value === 'resting' ? Math.max(0, loopRestUntil.value - nowMs.value) : 0)
 const guardRuntimeStatus = computed(() => {
+  if (loopActive.value && ['observing', 'recovering', 'paused', 'stopping'].includes(loopState.value)) return loopMessage.value
   if (loopActive.value && loopState.value === 'resting') return `轮次休息中（${formatDuration(restRemainingMilliseconds.value)}）`
   if (loopActive.value && loopState.value === 'starting') return '正在启动下一轮'
   if (loopActive.value && loopState.value === 'finishing') return '循环到时，本轮结束后停止'
@@ -472,6 +478,71 @@ function stopForLowBattery({ notify = true } = {}) {
   if (notify) showToast(loopMessage.value, { variant: 'alert', duration: 8000 })
 }
 
+const SERVER_LOOP_ACTIVE_STATES = new Set([
+  'starting', 'running', 'resting', 'observing', 'recovering', 'paused', 'stopping',
+])
+
+function serverLoopMessage(session) {
+  if (!session) return '未启动循环巡检'
+  if (session.state === 'observing') {
+    const started = new Date(session.observation_started_at || '').getTime()
+    if (!Number.isFinite(started)) {
+      return `等待安全条件 · ${session.recovery_reason_message || '机器人保持停车'}`
+    }
+    const remaining = Math.max(0, 5 - Math.floor((Date.now() - started) / 1000))
+    return `异常观察中 ${remaining} 秒 · ${session.recovery_reason_message || '等待安全条件稳定'}`
+  }
+  if (session.state === 'recovering') {
+    return `正在自愈 ${session.recovery_attempt}/${session.recovery_max_attempts} · ${session.recovery_reason_message || '恢复导航'}`
+  }
+  if (session.state === 'paused') return '循环已人工暂停，等待明确继续'
+  if (session.state === 'resting') return `第 ${session.current_round} 轮完成，等待下一轮`
+  if (session.state === 'low_battery_stopped') return lowBatteryGuardMessage(batteryPercent.value)
+  if (session.state === 'completed') return '循环巡检已按设定时长完成'
+  if (session.state === 'cancelled') return '循环已停止'
+  if (session.state === 'failed') return session.last_error || '循环执行失败'
+  if (session.state === 'starting') return '正在启动下一轮'
+  return `循环巡检中 · 第 ${session.current_round} 轮`
+}
+
+function syncServerLoopSession(session) {
+  if (!session?.id) return
+  serverLoopSession.value = session
+  loopSessionId.value = String(session.id)
+  loopState.value = String(session.state || 'idle')
+  loopActive.value = SERVER_LOOP_ACTIVE_STATES.has(loopState.value)
+  loopStartedAt.value = new Date(session.started_at || '').getTime() || 0
+  loopEndsAt.value = new Date(session.ends_at || '').getTime() || 0
+  loopStoppedAt.value = new Date(session.finished_at || '').getTime() || 0
+  loopRestUntil.value = session.state === 'resting' ? (new Date(session.next_action_at || '').getTime() || 0) : 0
+  loopRounds.value = Number(session.current_round || 0)
+  loopCurrentExecutionId.value = String(session.current_execution || '')
+  loopMessage.value = serverLoopMessage(session)
+  if (session.current_execution_detail) {
+    execution.value = session.current_execution_detail
+    selectedTaskId.value = String(session.task || selectedTaskId.value)
+    startExecutionPolling()
+  }
+  persistLoopState()
+}
+
+async function restoreServerLoopSession(robotId) {
+  if (!robotId) return null
+  const active = await fetchPatrolLoopSessions({ robotId, active: true })
+  if (active?.length) {
+    syncServerLoopSession(active[0])
+    return active[0]
+  }
+  if (loopSessionId.value && (loopActive.value || !serverLoopSession.value)) {
+    try {
+      const existing = await fetchPatrolLoopSession(loopSessionId.value)
+      syncServerLoopSession(existing)
+      return existing
+    } catch {}
+  }
+  return null
+}
+
 function reconcileLowBatteryState() {
   const recentLowBattery = (latestRobot.value?.recent_events || []).find(isLowBatteryStopAlert)
   const detectedAt = new Date(recentLowBattery?.detected_at || '').getTime()
@@ -497,7 +568,12 @@ function addRealtimeEvent(event) {
     variant: 'alert',
     duration: isLowBattery ? 8000 : 5200,
   })
-  if (isLowBattery) void refreshExecution()
+  if (isLowBattery) {
+    void refreshExecution()
+    if (loopSessionId.value) {
+      void fetchPatrolLoopSession(loopSessionId.value).then(syncServerLoopSession).catch(() => {})
+    }
+  }
 }
 
 function openPendingEvents() {
@@ -550,6 +626,7 @@ async function load() {
     selectedTaskId.value = String(availableTasks[0]?.id || '')
   }
   restoreLoopState(robotId)
+  await restoreServerLoopSession(robotId)
   reconcileLowBatteryState()
   await restoreExecution(taskResult, robotId)
   await refreshExecutionVisual()
@@ -912,6 +989,20 @@ function finishLoop(message, { notify = true } = {}) {
 
 async function stopLoop({ notify = true, clearExecution = true } = {}) {
   if (!loopActive.value) return null
+  if (loopSessionId.value) {
+    busy.value = true
+    try {
+      const session = await sendPatrolLoopSessionAction(loopSessionId.value, 'stop')
+      syncServerLoopSession(session)
+      if (notify) showToast(loopMessage.value, { variant: 'alert' })
+      return session
+    } catch (error) {
+      if (notify) showToast(error.message || '停止中心循环失败', { variant: 'alert' })
+      return null
+    } finally {
+      busy.value = false
+    }
+  }
   loopNavRepairToken += 1
   loopNavRepairBusy = false
   const executionId = guardDutyLoopCleanupExecutionId(loopCurrentExecutionId.value, execution.value)
@@ -1130,6 +1221,18 @@ async function startLoopRestNavigationRepair() {
 
 async function runLoopCycle() {
   nowMs.value = Date.now()
+  if (loopSessionId.value && (loopActive.value || !serverLoopSession.value)) {
+    if (loopCycleBusy) return
+    loopCycleBusy = true
+    try {
+      syncServerLoopSession(await fetchPatrolLoopSession(loopSessionId.value))
+    } catch (error) {
+      loopMessage.value = `中心循环状态同步失败：${error.message || '稍后重试'}`
+    } finally {
+      loopCycleBusy = false
+    }
+    return
+  }
   if (!loopActive.value || loopCycleBusy) return
   if (lowBatteryBlocked.value) {
     stopForLowBattery()
@@ -1241,7 +1344,6 @@ async function runLoopCycle() {
 
 async function toggleLoop() {
   if (loopActive.value) {
-    if (!loopLeaseOwned && !acquireLoopOwnership({ notify: true })) return
     await stopLoop()
     return
   }
@@ -1260,34 +1362,54 @@ async function toggleLoop() {
     showToast('请填写正确的循环时长和休息时间', { variant: 'alert' })
     return
   }
-  if (!acquireLoopOwnership({ notify: true })) return
-  const startedAt = Date.now()
-  loopActive.value = true
-  loopState.value = 'starting'
-  loopStartedAt.value = startedAt
-  loopEndsAt.value = startedAt + duration * 60 * 1000
-  loopStoppedAt.value = 0
-  loopRestUntil.value = 0
-  loopRounds.value = 0
-  loopSessionId.value = createLoopSessionId()
-  loopAccumulatedDistance.value = 0
-  loopCountedExecutionIds.value = []
-  loopCurrentExecutionId.value = ''
-  loopMessage.value = '正在启动第 1 轮巡检'
-  persistLoopState()
-  const started = await launchTask({ fromLoop: true })
-  if (!started && loopActive.value) {
-    scheduleNextLoopRound('第 1 轮启动失败，短间隔后重试', { shortRetry: true })
+  busy.value = true
+  try {
+    const session = await createPatrolLoopSession({
+      taskId: presetTask.value.id,
+      durationSeconds: Math.round(duration * 60),
+      restSeconds: Math.round(rest),
+      sessionId: createLoopSessionId(),
+    })
+    loopAccumulatedDistance.value = 0
+    loopCountedExecutionIds.value = []
+    syncServerLoopSession(session)
+    showToast('中心循环巡检已启动')
+    await refreshExecutionVisual()
+  } catch (error) {
+    if (isLowBatteryTaskError(error)) stopForLowBattery()
+    else showToast(error.message || '中心循环启动失败', { variant: 'alert' })
+  } finally {
+    busy.value = false
+  }
+}
+
+async function toggleLoopPause() {
+  if (!loopActive.value || !loopSessionId.value || busy.value) return
+  const action = serverLoopSession.value?.state === 'paused' ? 'resume' : 'pause'
+  busy.value = true
+  try {
+    syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, action))
+    showToast(action === 'pause' ? '循环已人工暂停' : '循环将在安全观察后继续')
+  } catch (error) {
+    showToast(error.message || '循环暂停状态切换失败', { variant: 'alert' })
+  } finally {
+    busy.value = false
   }
 }
 
 async function controlTask() {
   const action = actions.value.control.action
-  if (!execution.value?.id || busy.value || !action) return
+  if ((!execution.value?.id && !loopSessionId.value) || busy.value || !action) return
   busy.value = true
   try {
-    execution.value = await sendTaskExecutionAction(execution.value.id, action)
-    showToast(action === 'pause' ? '任务暂停中' : '任务继续执行中')
+    if (loopActive.value && loopSessionId.value) {
+      const loopAction = serverLoopSession.value?.state === 'paused' ? 'resume' : 'pause'
+      syncServerLoopSession(await sendPatrolLoopSessionAction(loopSessionId.value, loopAction))
+      showToast(loopAction === 'pause' ? '循环已人工暂停' : '循环正在安全观察后恢复')
+    } else {
+      execution.value = await sendTaskExecutionAction(execution.value.id, action)
+      showToast(action === 'pause' ? '任务暂停中' : '任务继续执行中')
+    }
     startExecutionPolling()
   } catch (error) {
     showToast(error.message || (action === 'pause' ? '暂停任务失败' : '继续任务失败'), { variant: 'alert' })
@@ -1299,7 +1421,12 @@ async function controlTask() {
 async function forceExitTask() {
   if (!execution.value?.id || busy.value) return
   if (!window.confirm('强制退出会停止当前导航，并清理该机器人的全部未结束任务。确认继续？')) return
+  const serverLoopWasActive = Boolean(loopActive.value && loopSessionId.value)
   await stopLoop({ notify: false, clearExecution: false })
+  if (serverLoopWasActive) {
+    showToast('循环和当前任务已强制退出', { variant: 'alert' })
+    return
+  }
   busy.value = true
   try {
     execution.value = await sendTaskExecutionAction(execution.value.id, 'force-exit')
@@ -1599,6 +1726,13 @@ watch(playUrlKey, () => {
                 <span>倒计时</span>
                 <strong>{{ loopActive ? formatDuration(loopRemainingMilliseconds) : '00:00:00' }}</strong>
               </div>
+              <button
+                class="guard-secondary"
+                :disabled="busy || localizationBusy || !loopActive || !loopSessionId || loopState === 'stopping'"
+                @click="toggleLoopPause"
+              >
+                {{ loopState === 'paused' ? '继续循环' : '暂停循环' }}
+              </button>
               <button
                 class="guard-loop-toggle"
                 :class="{ 'is-active': loopActive }"

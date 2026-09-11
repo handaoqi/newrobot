@@ -143,6 +143,10 @@ COMMAND_RESULT_TIMEOUT_SECONDS = int(os.getenv("COMMAND_RESULT_TIMEOUT_SECONDS",
 COMMAND_START_EXPIRY_SECONDS = int(os.getenv("COMMAND_START_EXPIRY_SECONDS", "30"))
 COMMAND_CONTROL_EXPIRY_SECONDS = int(os.getenv("COMMAND_CONTROL_EXPIRY_SECONDS", "15"))
 TASK_MAX_DURATION_SECONDS = int(os.getenv("TASK_MAX_DURATION_SECONDS", "1800"))
+TASK_RECOVERY_EXPIRY_SECONDS = int(os.getenv("TASK_RECOVERY_EXPIRY_SECONDS", "300"))
+PATROL_LOOP_SELF_HEAL_ENABLED = os.getenv("PATROL_LOOP_SELF_HEAL_ENABLED", "true").lower() == "true"
+LOW_BATTERY_STOP_PERCENT = int(os.getenv("LOW_BATTERY_STOP_PERCENT", "20"))
+LOW_BATTERY_REARM_PERCENT = int(os.getenv("LOW_BATTERY_REARM_PERCENT", "25"))
 
 # Raw MQTT packets exist for short-term de-duplication and troubleshooting;
 # their business results are persisted separately.  Keep terminal packet data

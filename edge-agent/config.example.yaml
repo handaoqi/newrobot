@@ -65,6 +65,8 @@ safety:
   stop_confirmation_seconds: 1.0
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
+  # Ordinary stop-and-confirm points may skip final yaw inside this radius.
+  arrival_degraded_tolerance_m: 0.60
   # Used only at the final docking contact waypoint.
   docking_goal_tolerance_m: 0.08
   docking_goal_yaw_tolerance_rad: 0.0872665

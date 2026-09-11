@@ -167,7 +167,10 @@ class CommandProcessor:
             # accepted context: it would reject every later task as ROBOT_BUSY.
             if prepared_task_start:
                 try:
-                    self.task_executor.force_exit(envelope.payload["task_execution_id"])
+                    self.task_executor.force_exit(
+                        envelope.payload["task_execution_id"],
+                        report_start_result=False,
+                    )
                 except Exception:
                     LOGGER.exception("failed to clear task after launch error")
             result = build_result(
@@ -190,7 +193,10 @@ class CommandProcessor:
             )
             if prepared_task_start and ack is not None:
                 try:
-                    self.task_executor.force_exit(envelope.payload["task_execution_id"])
+                    self.task_executor.force_exit(
+                        envelope.payload["task_execution_id"],
+                        report_start_result=False,
+                    )
                 except Exception:
                     LOGGER.exception("failed to clear task after unexpected launch error")
             result = build_result(
@@ -333,7 +339,7 @@ class CommandProcessor:
         # Task controls express an operator's current intent.  They must remain
         # usable while the centre and the edge are briefly out of sync (for
         # example while a navigation result is still being reconciled).
-        if envelope.message_type in {"task.pause", "task.resume", "task.force_exit"}:
+        if envelope.message_type in {"task.pause", "task.resume", "task.force_exit", "task.recover.v1"}:
             return
         expected = envelope.payload.get("expected_robot_state_version")
         if expected is None:
@@ -393,6 +399,54 @@ class CommandProcessor:
             result_payload = self.task_executor.resume_task(execution_id, resume_index)
         elif envelope.message_type == "task.resume_forward":
             result_payload = self.task_executor.resume_forward(execution_id)
+        elif envelope.message_type == "task.recover.v1":
+            command = envelope.payload.get("command") or {}
+            state = self.safety.state
+            if state.emergency_stop:
+                raise ProtocolError("EMERGENCY_STOP_ACTIVE", "emergency stop is active")
+            if state.control_mode == "manual_takeover":
+                raise ProtocolError("MANUAL_TAKEOVER_ACTIVE", "manual takeover is active")
+            if (
+                state.power_available
+                and state.battery_percent is not None
+                and state.battery_percent < self.safety.config.low_battery_percent
+            ):
+                raise ProtocolError("LOW_BATTERY", f"battery={state.battery_percent}")
+            self.safety.validate_resume(self.task_executor.context.state)
+            if not state.nav_ready:
+                if not self.navigation_stack_adapter:
+                    raise ProtocolError(
+                        "NAVIGATION_STACK_UNAVAILABLE",
+                        "navigation stack adapter is not configured",
+                    )
+                self.navigation_stack_adapter.recover(
+                    {"reason": "center_loop_recovery", "attempt": int(command.get("attempt") or 0)}
+                )
+                self._await_navigation_stack_ready(
+                    timeout_seconds=45.0,
+                    message="Nav2 did not become ready during task recovery",
+                )
+            if (
+                str(command.get("trigger_reason_code") or "")
+                == "ARRIVAL_POSE_CONVERGENCE_FAILED"
+                and self.navigation_boundary
+            ):
+                pose = self.task_executor.navigation.latest_pose()
+                if pose is None:
+                    raise ProtocolError("LOCALIZATION_NOT_READY", "current pose is unavailable")
+                route = self.task_executor.context.route_snapshot or {}
+                self.navigation_boundary.validate_point(
+                    str(state.current_map_id or ""),
+                    float(pose.x),
+                    float(pose.y),
+                    expected_revision=route.get("boundary_revision"),
+                )
+            result_payload = self.task_executor.recover_task(
+                execution_id,
+                trigger_reason_code=str(command.get("trigger_reason_code") or ""),
+                recovery_episode_id=str(command.get("recovery_episode_id") or ""),
+                attempt=int(command.get("attempt") or 0),
+            )
         else:
             self.safety.validate_cancel(self.task_executor.context.state)
             result_payload = self.task_executor.cancel_task(execution_id)

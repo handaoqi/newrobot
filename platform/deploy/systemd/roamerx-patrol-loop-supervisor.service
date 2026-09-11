@@ -1,0 +1,17 @@
+[Unit]
+Description=RoamerX Durable Patrol Loop Supervisor
+After=network.target roamerx-center-api.service roamerx-device-worker.service
+
+[Service]
+Type=simple
+User=roamerx
+WorkingDirectory=/opt/roamerx/current/backend
+EnvironmentFile=/etc/roamerx/center.env
+ExecStart=/opt/roamerx/venv/bin/python manage.py run_patrol_loop_supervisor --interval 1
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

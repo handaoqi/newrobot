@@ -113,4 +113,7 @@ class TelemetryService:
         if values["signal_percent"] is not None:
             robot.network_strength = values["signal_percent"]
         robot.save()
+        from .patrol_loop_service import PatrolLoopService
+
+        PatrolLoopService.observe_battery(latest)
         return latest, created

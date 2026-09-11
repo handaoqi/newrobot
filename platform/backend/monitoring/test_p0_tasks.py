@@ -217,12 +217,47 @@ class TaskExecutionTests(TestCase):
 
     def test_force_exit_clears_active_execution_and_unblocks_next_task(self):
         execution = TaskExecutionService.create_execution(self.task, self.user)
+        start_command = CommandService.create(execution, "task.start", self.user)
         command = CommandService.create(execution, "task.force_exit", self.user)
         execution.refresh_from_db()
+        start_command.refresh_from_db()
         self.assertEqual(command.command_type, "task.force_exit")
         self.assertEqual(execution.state, "cancelled")
+        self.assertEqual(start_command.status, "cancelled")
+        self.assertEqual(start_command.result_payload["final_task_state"], "cancelled")
+        self.assertTrue(start_command.events.filter(event_type="execution_terminal").exists())
+        RemoteCommand.objects.filter(pk=start_command.pk).update(
+            issued_at=timezone.now() - timezone.timedelta(minutes=2),
+            expires_at=timezone.now() - timezone.timedelta(seconds=1)
+        )
+        DeviceWorkerCommand._expire_commands()
+        start_command.refresh_from_db()
+        self.assertEqual(start_command.status, "cancelled")
         next_execution = TaskExecutionService.create_execution(self.task, self.user)
         self.assertEqual(next_execution.state, "created")
+
+    def test_late_terminal_execution_repairs_historical_start_timeout(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        start_command = CommandService.create(execution, "task.start", self.user)
+        TaskExecutionService.transition(execution, "accepted", event_type="command.ack")
+        RemoteCommand.objects.filter(pk=start_command.pk).update(
+            status="timed_out",
+            error_code="COMMAND_TIMED_OUT",
+            error_message="legacy false timeout",
+        )
+
+        TaskExecutionService.transition(
+            TaskExecution.objects.get(pk=execution.pk),
+            "cancelled",
+            event_type="task.sync_terminal_reconciled",
+            reason_code="FORCE_EXIT",
+            reason_message="设备端已退出",
+        )
+
+        start_command.refresh_from_db()
+        self.assertEqual(start_command.status, "cancelled")
+        self.assertEqual(start_command.error_code, "FORCE_EXIT")
+        self.assertEqual(start_command.error_message, "设备端已退出")
 
     def test_task_api_execute_and_busy_conflict(self):
         client = APIClient()

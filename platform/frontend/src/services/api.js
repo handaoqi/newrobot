@@ -317,6 +317,37 @@ export async function executePatrolTask(taskId, {
   })
 }
 
+export async function createPatrolLoopSession({ taskId, durationSeconds, restSeconds, sessionId = null }) {
+  const payload = {
+    task_id: taskId,
+    duration_seconds: durationSeconds,
+    rest_seconds: restSeconds,
+  }
+  if (sessionId) payload.session_id = sessionId
+  return request('/patrol-loop-sessions/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function fetchPatrolLoopSessions({ robotId = null, active = false } = {}) {
+  const query = new URLSearchParams()
+  if (robotId) query.set('robot_id', robotId)
+  if (active) query.set('active', 'true')
+  return request(`/patrol-loop-sessions/${query.toString() ? `?${query}` : ''}`)
+}
+
+export async function fetchPatrolLoopSession(sessionId) {
+  return request(`/patrol-loop-sessions/${sessionId}/`)
+}
+
+export async function sendPatrolLoopSessionAction(sessionId, action) {
+  return request(`/patrol-loop-sessions/${sessionId}/${action}/`, {
+    method: 'POST',
+    body: '{}',
+  })
+}
+
 export async function fetchPatrolSchedules(params = {}) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {

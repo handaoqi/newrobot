@@ -35,6 +35,7 @@ from .models import (
     CalendarDay,
     DebugLogSession,
     MediaAsset,
+    PatrolLoopSession,
     PatrolTask,
     PatrolSchedule,
     Robot,
@@ -66,6 +67,7 @@ from .services.alert_service import AlertService, is_bicycle_detection
 from .services.command_service import CommandService
 from .services.docking_service import DockingDispatchError, dispatch_docking_task
 from .services.schedule_service import ScheduleService
+from .services.patrol_loop_service import PatrolLoopError, PatrolLoopService
 from .services.task_service import TaskExecutionService, TaskStateError
 from .services.navigation_boundary_service import boundary_payload, normalize_boundary_payload, point_allowed_by_boundary
 from .services.map_scene_service import SceneArtifactError, build_scene_manifest, scene_cloud_path
@@ -82,6 +84,8 @@ from .serializers import (
     MediaUploadSerializer,
     PatrolTaskSerializer,
     PatrolTaskCreateSerializer,
+    PatrolLoopSessionCreateSerializer,
+    PatrolLoopSessionSerializer,
     PatrolScheduleSerializer,
     RobotCommandCreateSerializer,
     RobotCommandSerializer,
@@ -4778,6 +4782,89 @@ class PatrolTaskExecuteView(APIView):
             )
         execution.refresh_from_db()
         return _task_execution_response(execution, created)
+
+
+class PatrolLoopSessionListCreateView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        queryset = PatrolLoopSession.objects.select_related(
+            "robot", "task", "current_execution"
+        ).prefetch_related("events")
+        robot_id = request.query_params.get("robot_id")
+        if robot_id:
+            queryset = queryset.filter(robot_id=robot_id)
+        if request.query_params.get("active", "").lower() == "true":
+            queryset = queryset.filter(state__in=PatrolLoopSession.ACTIVE_STATES)
+        return Response(PatrolLoopSessionSerializer(queryset[:100], many=True).data)
+
+    def post(self, request):
+        serializer = PatrolLoopSessionCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        task = get_object_or_404(
+            PatrolTask.objects.select_related("robot", "route", "route__map_data"),
+            pk=serializer.validated_data["task_id"],
+        )
+        try:
+            session, created = PatrolLoopService.create_session(
+                task=task,
+                duration_seconds=serializer.validated_data["duration_seconds"],
+                rest_seconds=serializer.validated_data["rest_seconds"],
+                session_id=serializer.validated_data.get("session_id"),
+                operator=request.user if request.user.is_authenticated else None,
+            )
+            if created:
+                session = PatrolLoopService.process(session.id)
+        except (PatrolLoopError, TaskStateError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(
+            PatrolLoopSessionSerializer(session).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class PatrolLoopSessionDetailView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, session_id):
+        session = get_object_or_404(
+            PatrolLoopSession.objects.select_related(
+                "robot", "task", "current_execution"
+            ).prefetch_related("events", "current_execution__events", "current_execution__commands__events"),
+            pk=session_id,
+        )
+        return Response(PatrolLoopSessionSerializer(session).data)
+
+
+class PatrolLoopSessionActionView(APIView):
+    permission_classes = [permissions.AllowAny]
+    action = ""
+
+    def post(self, request, session_id):
+        session = get_object_or_404(PatrolLoopSession, pk=session_id)
+        operator = request.user if request.user.is_authenticated else None
+        try:
+            if self.action == "pause":
+                session = PatrolLoopService.pause(session, operator)
+            elif self.action == "resume":
+                session = PatrolLoopService.resume(session)
+            else:
+                session = PatrolLoopService.stop(session, operator)
+        except (PatrolLoopError, TaskStateError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(PatrolLoopSessionSerializer(session).data, status=status.HTTP_202_ACCEPTED)
+
+
+class PatrolLoopSessionPauseView(PatrolLoopSessionActionView):
+    action = "pause"
+
+
+class PatrolLoopSessionResumeView(PatrolLoopSessionActionView):
+    action = "resume"
+
+
+class PatrolLoopSessionStopView(PatrolLoopSessionActionView):
+    action = "stop"
 
 
 class TaskExecutionDetailView(APIView):

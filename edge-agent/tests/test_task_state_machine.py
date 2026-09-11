@@ -320,6 +320,71 @@ def test_pause_resume_cancel(tmp_path):
     store.close()
 
 
+def test_center_recovery_resumes_the_persisted_pending_waypoint(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    executor.pause_task(execution_id)
+
+    result = executor.recover_task(
+        execution_id,
+        trigger_reason_code="NAV_STACK_NOT_READY",
+        recovery_episode_id="episode-1",
+        attempt=1,
+    )
+
+    assert result["final_task_state"] == "running"
+    assert result["recovery_action"] == "resume_pending_waypoint"
+    assert result["recovery_episode_id"] == "episode-1"
+    assert executor.context.current_waypoint_index == 0
+    store.close()
+
+
+def test_center_recovery_degrades_only_arrival_yaw_inside_safe_radius(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    waypoint = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    waypoint["arrival_policy"] = "stop_and_confirm"
+    waypoint["require_yaw"] = True
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        arrival_degraded_tolerance_m=0.60,
+    )
+    executor.start_task(envelope)
+    executor.context.state = "paused"
+    executor.context.current_waypoint_index = 0
+    executor.context.post_arrival_waypoint_index = 0
+    executor.context.post_arrival_stage = "xy_adjusting"
+    executor.context.last_safe_hold_code = "ARRIVAL_POSE_CONVERGENCE_FAILED"
+    nav.pose = SimpleNamespace(x=1.2, y=2.0, yaw=1.5)
+
+    result = executor.recover_task(
+        executor.context.task_execution_id,
+        trigger_reason_code="ARRIVAL_POSE_CONVERGENCE_FAILED",
+        recovery_episode_id="episode-arrival",
+        attempt=1,
+    )
+
+    assert result["recovery_action"] == "degraded_arrival_yaw"
+    assert result["distance_m"] < 0.60
+    assert any(event[0] == "task.waypoint_degraded" for event in events)
+    assert executor.context.state == "running"
+    store.close()
+
+
 def test_waypoint_global_controller_overrides_route_default(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -3104,11 +3169,12 @@ def test_navigation_rosbag_force_exit_returns_stopped_status(tmp_path):
     recorder = FakeRosbagRecorder()
     envelope = command("task.start")
     envelope.payload["command"]["record_rosbag"] = True
+    start_results = []
     executor = TaskExecutor(
         store,
         nav,
         event_callback=lambda *args: None,
-        start_result_callback=lambda *args: None,
+        start_result_callback=lambda *args: start_results.append(args),
         rosbag_recorder=recorder,
     )
 
@@ -3119,6 +3185,36 @@ def test_navigation_rosbag_force_exit_returns_stopped_status(tmp_path):
     assert result["final_task_state"] == "cancelled"
     assert result["rosbag"]["running"] is False
     assert result["rosbag"]["size_bytes"] == 1024
+    assert start_results[0][0] == envelope.payload["command_id"]
+    assert start_results[0][1] == "cancelled"
+    assert start_results[0][2]["final_task_state"] == "cancelled"
+    store.close()
+
+
+def test_force_exit_clears_context_when_result_publish_raises(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+
+    def fail_publish(*_args):
+        raise RuntimeError("mqtt offline")
+
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=fail_publish,
+    )
+    envelope = command("task.start")
+    executor.start_task(envelope)
+
+    result = executor.force_exit(
+        envelope.payload["task_execution_id"],
+        reason_code="LOW_BATTERY",
+    )
+
+    assert result["final_task_state"] == "cancelled"
+    assert executor.context is None
+    assert store.load_active_task_context() is None
     store.close()
 
 
