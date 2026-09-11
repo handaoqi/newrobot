@@ -111,6 +111,7 @@ all)
     navigo_path_controller \
     navigo_navfn_planner \
     navigo_path_planner \
+    navigo_smoother \
     navigo_util \
     navigo_velocity_optimizer \
     navigo_waypoint_follower \
