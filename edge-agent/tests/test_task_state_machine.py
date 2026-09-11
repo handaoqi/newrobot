@@ -356,6 +356,7 @@ def test_center_recovery_resumes_the_persisted_pending_waypoint(tmp_path):
     assert result["recovery_status"] == "recovered"
     assert result["recovery_episode_id"] == "episode-1"
     assert executor.context.current_waypoint_index == 0
+    assert nav.stop_commands >= 2  # pause + recovery confirmation refresh
     store.close()
 
 

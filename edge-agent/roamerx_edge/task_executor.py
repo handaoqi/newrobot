@@ -4452,6 +4452,12 @@ class TaskExecutor:
         """Resume a system-held task after the center's five-second gate."""
         with self._lock:
             self._assert_execution(execution_id)
+            # Recovery may be requested long after the original pause. Refresh
+            # the zero command first so the confirmation is based on a current
+            # collision-monitor output rather than an expired/stale sample.
+            stop_motion = getattr(self.navigation, "stop_motion", None)
+            if callable(stop_motion):
+                stop_motion()
             if not self.navigation.is_robot_stopped():
                 raise ProtocolError("ROBOT_NOT_STOPPED", "recovery requires a confirmed stop")
             if self._recovery_arbiter.budget_exhausted():
