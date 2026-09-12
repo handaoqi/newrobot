@@ -53,44 +53,116 @@ class NavigationStackAdapter:
         return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 90))
 
     def reload_map(self, pcd_path: str, yaml_path: str) -> dict:
-        """Atomically reload the active localization and Nav2 map assets.
+        """Reload the active localization and Nav2 map assets as one operation.
 
         Map activation changes symlinks on disk, while both localization and
         Nav2 keep their maps in memory.  Reload both services before reporting
         the activation as usable so the next initial-pose command targets the
         selected map instead of the previously active one.
         """
+        localization = self.reload_localization_map(pcd_path)
+        navigation = self.reload_navigation_map(yaml_path)
+        return {
+            "action": "reload_map",
+            "returncode": 0,
+            "deferred": False,
+            "pcd_path": pcd_path,
+            "yaml_path": yaml_path,
+            "localization_reloaded": True,
+            "navigation_reloaded": True,
+            "localization": localization,
+            "navigation": navigation,
+        }
+
+    def reload_localization_map(self, pcd_path: str) -> dict:
+        """Reload and validate the PCD held by a running localization node."""
         script = (
             "source /opt/ros/humble/setup.bash && "
             "source /home/dogrobot/robot/install/setup.bash && "
             "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} "
             "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
-            "timeout 25 ros2 service call /load_map_service "
-            "robots_dog_msgs/srv/LoadMap "
-            + shlex.quote("{pcd_path: '" + pcd_path + "'}")
-            + " && timeout 25 ros2 service call /map_server/load_map "
+            "/home/dogrobot/robot/script/robot/load_localization_map.py "
+            + shlex.quote(pcd_path)
+            + " --timeout 25"
+        )
+        return self._run_map_reload_command(
+            "reload_localization_map",
+            script,
+            error_code="LOCALIZATION_MAP_RELOAD_FAILED",
+            payload={"pcd_path": pcd_path},
+        )
+
+    def reload_navigation_map(self, yaml_path: str) -> dict:
+        """Reload the occupancy grid held by a running Nav2 map server."""
+        script = (
+            "source /opt/ros/humble/setup.bash && "
+            "source /home/dogrobot/robot/install/setup.bash && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-24} "
+            "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
+            "timeout 25 ros2 service call /map_server/load_map "
             "nav2_msgs/srv/LoadMap "
             + shlex.quote("{map_url: '" + yaml_path + "'}")
         )
-        completed = subprocess.run(
-            ["bash", "-lc", script],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=max(self.config.command_timeout_seconds, 60),
+        return self._run_map_reload_command(
+            "reload_navigation_map",
+            script,
+            error_code="NAVIGATION_MAP_RELOAD_FAILED",
+            payload={"yaml_path": yaml_path},
+            success_markers=("result=0", "result: 0"),
         )
-        payload = {
-            "action": "reload_map",
+
+    def _run_map_reload_command(
+        self,
+        action: str,
+        script: str,
+        *,
+        error_code: str,
+        payload: dict,
+        success_markers: tuple[str, ...] = (),
+    ) -> dict:
+        try:
+            completed = subprocess.run(
+                ["bash", "-lc", script],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=max(self.config.command_timeout_seconds, 60),
+            )
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "action": action,
+                "returncode": 124,
+                "stdout": self._decode_subprocess_output(exc.stdout)[-6000:],
+                "stderr": self._decode_subprocess_output(exc.stderr)[-6000:],
+                **payload,
+            }
+            raise ProtocolError(
+                error_code,
+                result["stderr"] or result["stdout"] or f"{action} timed out",
+                details=result,
+            ) from exc
+        result = {
+            "action": action,
             "returncode": completed.returncode,
             "stdout": completed.stdout[-6000:],
             "stderr": completed.stderr[-6000:],
-            "pcd_path": pcd_path,
-            "yaml_path": yaml_path,
+            **payload,
         }
         if completed.returncode != 0:
-            raise ProtocolError("MAP_RELOAD_FAILED", payload["stderr"] or payload["stdout"])
-        return payload
+            raise ProtocolError(
+                error_code,
+                result["stderr"] or result["stdout"],
+                details=result,
+            )
+        if success_markers and not any(marker in completed.stdout for marker in success_markers):
+            result["returncode"] = 1
+            raise ProtocolError(
+                error_code,
+                result["stdout"] or f"{action} returned no successful service response",
+                details=result,
+            )
+        return result
 
     def reload_map_if_running(self, pcd_path: str, yaml_path: str) -> dict:
         """Reload live consumers, or defer until the next navigation start.
@@ -110,17 +182,57 @@ class NavigationStackAdapter:
             "robot_navigo navigation_bringup.launch.py",
             "navigo_container",
         ))
-        if not (localization_running and navigation_running):
+        if localization_running and navigation_running:
+            result = self.reload_map(pcd_path, yaml_path)
+            result["precheck"] = status_payload
+            return result
+
+        if localization_running:
+            localization = self.reload_localization_map(pcd_path)
+            return {
+                "action": "reload_map",
+                "returncode": 0,
+                "deferred": True,
+                "reason": "navigation_consumer_inactive",
+                "deferred_consumers": ["navigation"],
+                "pcd_path": pcd_path,
+                "yaml_path": yaml_path,
+                "localization_reloaded": True,
+                "navigation_reloaded": False,
+                "localization": localization,
+                "precheck": status_payload,
+            }
+
+        if navigation_running:
+            navigation = self.reload_navigation_map(yaml_path)
+            return {
+                "action": "reload_map",
+                "returncode": 0,
+                "deferred": True,
+                "reason": "localization_consumer_inactive",
+                "deferred_consumers": ["localization"],
+                "pcd_path": pcd_path,
+                "yaml_path": yaml_path,
+                "localization_reloaded": False,
+                "navigation_reloaded": True,
+                "navigation": navigation,
+                "precheck": status_payload,
+            }
+
+        if not (localization_running or navigation_running):
             return {
                 "action": "reload_map",
                 "returncode": 0,
                 "deferred": True,
                 "reason": "map_consumers_inactive",
+                "deferred_consumers": ["localization", "navigation"],
                 "pcd_path": pcd_path,
                 "yaml_path": yaml_path,
+                "localization_reloaded": False,
+                "navigation_reloaded": False,
                 "precheck": status_payload,
             }
-        return self.reload_map(pcd_path, yaml_path)
+        raise AssertionError("unreachable map consumer state")
 
     def reload_boundary_filter(self) -> dict:
         """Reload the generated keepout mask, bootstrapping new filter nodes when needed."""

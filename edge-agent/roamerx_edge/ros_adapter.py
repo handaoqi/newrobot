@@ -2080,63 +2080,126 @@ class RosAdapter(Node):
             records = [
                 {
                     **record,
-                    "matched_pose": dict(record.get("matched_pose") or {}),
+                    "matched_pose": (
+                        dict(record["matched_pose"])
+                        if record.get("matched_pose") else None
+                    ),
                 }
                 for record in self._scan_match_records.values()
                 if int(record.get("sequence", 0)) > after_sequence
             ]
+        if not records:
+            return None
+        score_limit = float(self.safety_config.ndt_failure_score)
+        min_inlier_fraction = 0.50
         usable = [
             record for record in records
             if record.get("has_converged") is True
-            and math.isfinite(float(record.get("matching_error", float("inf"))))
-            and float(record.get("matching_error", float("inf"))) < self.safety_config.ndt_failure_score
-            and float(record.get("inlier_fraction", 0.0)) >= 0.50
+            and self._finite_or_none(record.get("matching_error")) is not None
+            and float(record["matching_error"]) < score_limit
+            and (self._finite_or_none(record.get("inlier_fraction")) or 0.0) >= min_inlier_fraction
             and record.get("matched_pose")
         ]
-        if not usable:
-            return None
         decision = self.telemetry.localization_decision()
         initialization = dict(decision.get("initialization") or {})
         verified = bool(initialization.get("verified"))
         stable_frames = int(initialization.get("stable_frames") or 0)
         required_frames = max(1, int(initialization.get("required_stable_frames") or 3))
-        # When C++ has verified a stable streak, choose the strongest result
-        # from that streak rather than an earlier isolated low score that may
-        # belong to a different local minimum.
-        ranked_pool = sorted(usable, key=lambda item: int(item.get("sequence", 0)))
-        if verified or stable_frames >= required_frames:
-            ranked_pool = ranked_pool[-required_frames:]
-        best = min(
-            ranked_pool,
-            key=lambda item: (
-                float(item.get("matching_error", float("inf"))),
-                -float(item.get("inlier_fraction", 0.0)),
-            ),
+
+        if usable:
+            # When C++ has verified a stable streak, choose the strongest
+            # result from that streak rather than an earlier isolated low
+            # score that may belong to a different local minimum.
+            ranked_pool = sorted(usable, key=lambda item: int(item.get("sequence", 0)))
+            if verified or stable_frames >= required_frames:
+                ranked_pool = ranked_pool[-required_frames:]
+            best = min(
+                ranked_pool,
+                key=lambda item: (
+                    float(item.get("matching_error", float("inf"))),
+                    -float(item.get("inlier_fraction", 0.0)),
+                ),
+            )
+        else:
+            # A rejected observation is still operational evidence.  Keep the
+            # strongest raw sample so every attempted seed reports score,
+            # inlier ratio and the exact gate that rejected it.
+            best = min(
+                records,
+                key=lambda item: (
+                    0 if item.get("has_converged") is True else 1,
+                    self._finite_or_none(item.get("matching_error"))
+                    if self._finite_or_none(item.get("matching_error")) is not None
+                    else float("inf"),
+                    -(self._finite_or_none(item.get("inlier_fraction")) or 0.0),
+                    -int(item.get("sequence", 0)),
+                ),
+            )
+
+        matched_pose = dict(best["matched_pose"]) if best.get("matched_pose") else None
+        position_correction_m = None
+        yaw_correction_rad = None
+        if matched_pose:
+            position_correction_m = math.hypot(
+                float(matched_pose["x"]) - float(submitted_pose["x"]),
+                float(matched_pose["y"]) - float(submitted_pose["y"]),
+            )
+            yaw_correction_rad = math.atan2(
+                math.sin(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
+                math.cos(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
+            )
+        within_seed_gate = bool(
+            position_correction_m is not None
+            and yaw_correction_rad is not None
+            and position_correction_m <= 1.50
+            and abs(yaw_correction_rad) <= math.radians(30.0)
         )
-        matched_pose = dict(best["matched_pose"])
-        position_correction_m = math.hypot(
-            float(matched_pose["x"]) - float(submitted_pose["x"]),
-            float(matched_pose["y"]) - float(submitted_pose["y"]),
-        )
-        yaw_correction_rad = math.atan2(
-            math.sin(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
-            math.cos(float(matched_pose["yaw"]) - float(submitted_pose.get("yaw", 0.0))),
-        )
-        within_seed_gate = position_correction_m <= 1.50 and abs(yaw_correction_rad) <= math.radians(30.0)
+        matching_error = self._finite_or_none(best.get("matching_error"))
+        inlier_fraction = self._finite_or_none(best.get("inlier_fraction"))
+        quality_failures = []
+        if best.get("has_converged") is not True:
+            quality_failures.append("ndt_not_converged")
+        if matching_error is None:
+            quality_failures.append("ndt_score_unavailable")
+        elif matching_error >= score_limit:
+            quality_failures.append("ndt_score_above_threshold")
+        if inlier_fraction is None:
+            quality_failures.append("ndt_inlier_fraction_unavailable")
+        elif inlier_fraction < min_inlier_fraction:
+            quality_failures.append("ndt_inlier_fraction_below_threshold")
+        if not matched_pose:
+            quality_failures.append("ndt_matched_pose_unavailable")
+        if matched_pose and not within_seed_gate:
+            if position_correction_m is not None and position_correction_m > 1.50:
+                quality_failures.append("seed_position_correction_exceeded")
+            if yaw_correction_rad is not None and abs(yaw_correction_rad) > math.radians(30.0):
+                quality_failures.append("seed_yaw_correction_exceeded")
+        stable_enough = verified or stable_frames >= required_frames
+        if not stable_enough:
+            quality_failures.append("ndt_stable_frames_insufficient")
+        eligible = not quality_failures
         geometric_rmse = self._finite_or_none(best.get("geometric_rmse"))
         return {
             "matched_pose": matched_pose,
-            "matching_error": float(best["matching_error"]),
-            "inlier_fraction": float(best["inlier_fraction"]),
+            "has_converged": best.get("has_converged") is True,
+            "matching_error": matching_error,
+            "inlier_fraction": inlier_fraction,
             "geometric_rmse": geometric_rmse,
             "healthy_samples": len(usable),
+            "sample_count": len(records),
             "stable_frames": stable_frames,
             "required_stable_frames": required_frames,
             "verified": verified,
             "position_correction_m": position_correction_m,
-            "yaw_correction_deg": math.degrees(yaw_correction_rad),
+            "yaw_correction_deg": (
+                math.degrees(yaw_correction_rad) if yaw_correction_rad is not None else None
+            ),
             "within_seed_gate": within_seed_gate,
-            "eligible": within_seed_gate and (verified or stable_frames >= required_frames),
+            "ndt_score_threshold": score_limit,
+            "min_inlier_fraction": min_inlier_fraction,
+            "quality_failures": quality_failures,
+            "reject_reason": quality_failures[0] if quality_failures else None,
+            "eligible": eligible,
         }
 
     @staticmethod
@@ -2359,13 +2422,29 @@ class RosAdapter(Node):
             best_candidate = self._best_ndt_candidate(scan_match_sequence, {
                 "x": x, "y": y, "z": z, "yaw": yaw,
             })
+            diagnostic = ""
+            if best_candidate:
+                score = best_candidate.get("matching_error")
+                inlier = best_candidate.get("inlier_fraction")
+                reason = best_candidate.get("reject_reason") or "quality_gate"
+                score_text = f"{float(score):.3f}" if score is not None else "unavailable"
+                inlier_text = f"{float(inlier):.3f}" if inlier is not None else "unavailable"
+                diagnostic = (
+                    f", ndt_score={score_text}, inlier_fraction={inlier_text}, "
+                    f"reject_reason={reason}"
+                )
             raise ProtocolError(
                 "INITIAL_POSE_NOT_ACCEPTED",
-                f"localization_status={status}, wait_seconds={wait_seconds:.1f}",
+                f"localization_status={status}, wait_seconds={wait_seconds:.1f}{diagnostic}",
                 details={
                     "submitted_pose": {"x": x, "y": y, "z": z, "yaw": yaw},
                     "best_ndt_candidate": best_candidate,
                     "localization_status": status,
+                    "ndt_observation_available": best_candidate is not None,
+                    "reject_reason": (
+                        best_candidate.get("reject_reason")
+                        if best_candidate else "ndt_sample_unavailable"
+                    ),
                 },
             )
         return {
@@ -2804,6 +2883,7 @@ class RosAdapter(Node):
             self._trusted_pose_frozen = False
 
         session["stages"][-1]["status"] = "failed"
+        session["best_ndt_candidate"] = self._best_diagnostic_candidate(attempts)
         session["stages"].append({"stage": "keyframe_global_match", "status": "searching"})
         session.update({
             "state": "global_searching",
@@ -2813,9 +2893,36 @@ class RosAdapter(Node):
             "attempts": attempts,
         })
         self._report_localization_attempts(session)
-        global_result = self._global_relocalize_once(
-            max(30.0, overall_deadline - time.monotonic()), generation
-        )
+        try:
+            global_result = self._global_relocalize_once(
+                max(30.0, overall_deadline - time.monotonic()), generation
+            )
+        except ProtocolError as exc:
+            failed_at = now_iso()
+            session["stages"][-1].update({
+                "status": "failed",
+                "finished_at": failed_at,
+                "error_code": exc.code,
+                "error_message": exc.message,
+            })
+            session.update({
+                "state": "failed",
+                "evaluated_candidate_count": sum(
+                    1 for item in attempts if item.get("status") != "skipped"
+                ),
+                "live_pose": self._current_live_pose(),
+                "global_relocalization_error": {
+                    "error_code": exc.code,
+                    "error_message": exc.message,
+                    "details": dict(exc.details or {}),
+                },
+            })
+            self._report_localization_attempts(session)
+            raise ProtocolError(
+                "QUICK_THEN_GLOBAL_RELOCALIZATION_FAILED",
+                f"quick NDT candidates and global relocalization failed: {exc.message}",
+                details=session,
+            ) from exc
         session["stages"][-1]["status"] = "accepted"
         payload = {
             **global_result,
@@ -3077,6 +3184,8 @@ class RosAdapter(Node):
         if route_stage is not None:
             route_stage.update({"status": "rejected", "finished_at": now_iso()})
 
+        session["best_ndt_candidate"] = self._best_diagnostic_candidate(all_attempts)
+
         global_stage = {
             "stage": "keyframe_global_match",
             "status": "searching",
@@ -3090,14 +3199,29 @@ class RosAdapter(Node):
                 max(30.0, deadline - time.monotonic()), generation
             )
         except ProtocolError as exc:
-            global_stage.update({"status": "failed", "finished_at": now_iso(), "error_code": exc.code})
+            global_stage.update({
+                "status": "failed",
+                "finished_at": now_iso(),
+                "error_code": exc.code,
+                "error_message": exc.message,
+            })
             details = {
                 "mode": "progressive_stationary_search",
                 "strategy": strategy,
                 "stages": stages,
                 "attempts": all_attempts,
+                "best_ndt_candidate": self._best_diagnostic_candidate(all_attempts),
+                "candidate_count": len(all_attempts),
+                "evaluated_candidate_count": sum(
+                    1 for item in all_attempts if item.get("status") != "skipped"
+                ),
                 "motion_commanded": False,
                 "live_pose": self._current_live_pose(),
+                "global_relocalization_error": {
+                    "error_code": exc.code,
+                    "error_message": exc.message,
+                    "details": dict(exc.details or {}),
+                },
             }
             self._report_localization_attempts({**details, "state": "failed"})
             raise ProtocolError(
@@ -3282,6 +3406,7 @@ class RosAdapter(Node):
                 latest = self.telemetry.latest_pose() if getattr(self, "telemetry", None) else None
                 session.update({
                     "state": "failed",
+                    "best_ndt_candidate": self._best_diagnostic_candidate(attempts),
                     "live_pose": self._current_live_pose(),
                     "localization_status": getattr(latest, "localization_status", None),
                     "timed_out": sum(1 for item in attempts if item.get("status") != "waiting") < max_attempts,
@@ -3425,10 +3550,21 @@ class RosAdapter(Node):
                 raise
             candidate = dict((exc.details or {}).get("best_ndt_candidate") or {})
             attempt["error_code"] = exc.code
-            attempt["reject_reason"] = exc.code
+            attempt["error_message"] = exc.message
+            attempt["reject_reason"] = (
+                candidate.get("reject_reason")
+                or (exc.details or {}).get("reject_reason")
+                or "ndt_sample_unavailable"
+            )
         attempt["live_pose"] = self._current_live_pose()
         attempt["ndt_candidate"] = candidate or None
         attempt["matched_pose"] = (candidate or {}).get("matched_pose")
+        for field in (
+            "has_converged", "matching_error", "inlier_fraction", "geometric_rmse",
+            "stable_frames", "required_stable_frames", "quality_failures",
+        ):
+            if field in candidate:
+                attempt[field] = candidate[field]
         if candidate.get("eligible"):
             # NDT verification for this seed has finished.  It is eligible
             # for ranking but is not yet the committed localization result.
@@ -3453,6 +3589,30 @@ class RosAdapter(Node):
         if not eligible:
             return None
         return min(eligible, key=lambda item: self._candidate_rank(item.get("ndt_candidate")))
+
+    def _best_diagnostic_candidate(self, attempts: list[dict]) -> dict | None:
+        """Return the strongest observed candidate even when every gate rejects it."""
+        candidates = [
+            (item, dict(item.get("ndt_candidate") or {}))
+            for item in attempts
+            if item.get("ndt_candidate")
+        ]
+        if not candidates:
+            return None
+
+        def diagnostic_rank(entry: tuple[dict, dict]) -> tuple:
+            attempt, candidate = entry
+            score = self._finite_or_none(candidate.get("matching_error"))
+            inlier = self._finite_or_none(candidate.get("inlier_fraction"))
+            return (
+                0 if candidate.get("has_converged") is True else 1,
+                0 if score is not None else 1,
+                score if score is not None else float("inf"),
+                -(inlier if inlier is not None else -1.0),
+                int(attempt.get("index") or 0),
+            )
+
+        return min(candidates, key=diagnostic_rank)[1]
 
     @staticmethod
     def _mark_out_ranked_attempts(attempts: list[dict], winner: dict) -> None:

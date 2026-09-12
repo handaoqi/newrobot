@@ -691,7 +691,24 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
     command.finished_at = _event_time(payload, "finished_at")
     command.error_code = payload.get("error_code") or ""
     command.error_message = payload.get("error_message") or ""
-    command.result_payload = payload.get("result") or {}
+    incoming_result = payload.get("result") or {}
+    if not isinstance(incoming_result, dict):
+        incoming_result = {}
+    # Localization emits the candidate table while a command is executing.
+    # A terminal failure from a deeper fallback may contain only its own
+    # error, so retain the last complete attempt snapshot instead of erasing
+    # every score and inlier ratio at the exact moment the UI needs them.
+    previous_result = dict(command.result_payload or {})
+    if (
+        command.command_type in {"nav.initial_pose", "nav.relocalize"}
+        and "localization_attempts" in previous_result
+        and "localization_attempts" not in incoming_result
+        and "attempts" not in incoming_result
+        and "best_ndt_candidate" not in incoming_result
+    ):
+        incoming_result = dict(incoming_result)
+        incoming_result["localization_attempts"] = previous_result["localization_attempts"]
+    command.result_payload = incoming_result
     command.save()
     if command.command_type == "map.activate" and terminal_status == "succeeded":
         current_map = command.result_payload.get("current_map") or command.result_payload

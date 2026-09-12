@@ -48,6 +48,82 @@ def test_reload_map_runs_when_both_consumers_are_active(tmp_path, monkeypatch):
     assert calls == [("/maps/map.pcd", "/maps/map.yaml")]
 
 
+def test_reload_map_reloads_localization_when_nav2_is_inactive(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "action": "status",
+        "returncode": 0,
+        "stdout": "ros2 launch localization localization.launch.py\nstatus: 0\n",
+        "stderr": "",
+    })
+    calls = []
+    monkeypatch.setattr(
+        adapter,
+        "reload_localization_map",
+        lambda pcd: calls.append(pcd) or {"returncode": 0},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "reload_navigation_map",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("inactive Nav2 must be deferred")),
+    )
+
+    result = adapter.reload_map_if_running("/maps/map.pcd", "/maps/map.yaml")
+
+    assert calls == ["/maps/map.pcd"]
+    assert result["localization_reloaded"] is True
+    assert result["navigation_reloaded"] is False
+    assert result["deferred_consumers"] == ["navigation"]
+
+
+def test_reload_map_reloads_nav2_when_localization_is_inactive(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    monkeypatch.setattr(adapter, "status", lambda: {
+        "action": "status",
+        "returncode": 0,
+        "stdout": "ros2 launch robot_navigo navigation_bringup.launch.py\n",
+        "stderr": "",
+    })
+    calls = []
+    monkeypatch.setattr(
+        adapter,
+        "reload_navigation_map",
+        lambda yaml: calls.append(yaml) or {"returncode": 0},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "reload_localization_map",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("inactive localization must be deferred")),
+    )
+
+    result = adapter.reload_map_if_running("/maps/map.pcd", "/maps/map.yaml")
+
+    assert calls == ["/maps/map.yaml"]
+    assert result["localization_reloaded"] is False
+    assert result["navigation_reloaded"] is True
+    assert result["deferred_consumers"] == ["localization"]
+
+
+def test_navigation_map_reload_rejects_unsuccessful_service_response(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["ros2", "service", "call"],
+            returncode=0,
+            stdout="nav2_msgs.srv.LoadMap_Response(result=1)",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(ProtocolError) as captured:
+        adapter.reload_navigation_map("/maps/map.yaml")
+
+    assert captured.value.code == "NAVIGATION_MAP_RELOAD_FAILED"
+    assert captured.value.details["yaml_path"] == "/maps/map.yaml"
+
+
 
 def _ready_status_stdout(*, localization_status: str = "3") -> str:
     return (

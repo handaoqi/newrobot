@@ -315,6 +315,39 @@ def test_best_ndt_candidate_uses_verified_streak_and_seed_gate():
     assert result["eligible"] is True
 
 
+def test_best_ndt_candidate_preserves_rejected_score_and_inlier_diagnostics():
+    adapter = object.__new__(RosAdapter)
+    adapter._scan_match_condition = threading.Condition()
+    adapter._scan_match_records = {
+        (1, 0): {
+            "sequence": 1,
+            "has_converged": False,
+            "matching_error": 1.65,
+            "inlier_fraction": 0.0,
+            "geometric_rmse": 0.82,
+            "matched_pose": {"x": 0.1, "y": -0.1, "z": 0.0, "yaw": 0.02},
+        },
+    }
+    adapter.safety_config = SafetyConfig(ndt_failure_score=0.40)
+    adapter.telemetry = FakeTelemetry({
+        "initialization": {
+            "verified": False,
+            "stable_frames": 0,
+            "required_stable_frames": 3,
+        }
+    })
+
+    result = adapter._best_ndt_candidate(0, {"x": 0.0, "y": 0.0, "yaw": 0.0})
+
+    assert result["eligible"] is False
+    assert result["has_converged"] is False
+    assert result["matching_error"] == pytest.approx(1.65)
+    assert result["inlier_fraction"] == pytest.approx(0.0)
+    assert result["reject_reason"] == "ndt_not_converged"
+    assert "ndt_score_above_threshold" in result["quality_failures"]
+    assert "ndt_inlier_fraction_below_threshold" in result["quality_failures"]
+
+
 def test_candidate_rank_prefers_stable_frames_then_inliers():
     weaker = {
         "eligible": True,
@@ -455,6 +488,63 @@ def test_quick_then_global_stops_on_strict_optimal_ndt_candidate():
     assert result["global_search_started"] is False
     assert result["evaluated_candidate_count"] == 1
     assert result["attempts"][1]["status"] == "skipped"
+
+
+def test_quick_then_global_failure_keeps_each_rejected_ndt_measurement():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_quick_search_seconds=30.0,
+        localization_optimal_ndt_score=0.01,
+    )
+    adapter._start_localization_operation = lambda *_args, **_kwargs: 7
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter.latest_trusted_pose = lambda: None
+    adapter._current_live_pose = lambda: None
+    adapter._relocalization_candidates = lambda x, y, z, yaw: [
+        {"x": x, "y": y, "z": z, "yaw": yaw},
+        {"x": x, "y": y, "z": z, "yaw": yaw + 0.5},
+    ]
+    progress = []
+    adapter._report_localization_attempts = lambda payload, **_kwargs: progress.append(payload)
+
+    def reject(seed, _generation, **kwargs):
+        index = kwargs["index"]
+        score = 0.70 + index / 10
+        return {
+            "index": index,
+            "status": "rejected",
+            "seed_pose": seed,
+            "stage": kwargs["extra"]["stage"],
+            "reject_reason": "ndt_score_above_threshold",
+            "ndt_candidate": {
+                "eligible": False,
+                "has_converged": True,
+                "matching_error": score,
+                "inlier_fraction": 0.30,
+                "reject_reason": "ndt_score_above_threshold",
+            },
+        }
+
+    adapter._probe_localization_seed = reject
+    adapter._global_relocalize_once = lambda *_args: (_ for _ in ()).throw(
+        ProtocolError("GLOBAL_RELOCALIZATION_NOT_VERIFIED", "global score 1.42 rejected")
+    )
+
+    with pytest.raises(ProtocolError) as captured:
+        adapter.quick_then_global_relocalize(
+            origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            scene_scope="indoor",
+            wait_seconds=60.0,
+        )
+
+    assert captured.value.code == "QUICK_THEN_GLOBAL_RELOCALIZATION_FAILED"
+    assert [
+        item["ndt_candidate"]["matching_error"]
+        for item in captured.value.details["attempts"]
+    ] == pytest.approx([0.8, 0.9])
+    assert captured.value.details["best_ndt_candidate"]["matching_error"] == pytest.approx(0.8)
+    assert captured.value.details["global_relocalization_error"]["error_code"] == "GLOBAL_RELOCALIZATION_NOT_VERIFIED"
+    assert progress[-1]["state"] == "failed"
 
 
 def test_rtk_drift_verification_requires_fresh_consecutive_samples_below_threshold():

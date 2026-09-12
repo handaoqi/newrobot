@@ -17,6 +17,25 @@ export const LOCALIZATION_ATTEMPT_COMMAND_TYPES = new Set([
 
 export const ATTEMPT_MARKER_VISIBLE_MS = 60_000
 
+const ATTEMPT_REJECT_REASON_LABELS = {
+  ndt_not_converged: 'NDT未收敛',
+  ndt_score_unavailable: '未收到NDT分数',
+  ndt_score_above_threshold: 'NDT分数超过阈值',
+  ndt_inlier_fraction_unavailable: '未收到内点率',
+  ndt_inlier_fraction_below_threshold: '内点率低于门限',
+  ndt_matched_pose_unavailable: '无有效NDT匹配位姿',
+  ndt_stable_frames_insufficient: 'NDT稳定帧不足',
+  seed_position_correction_exceeded: '位置修正超过安全门限',
+  seed_yaw_correction_exceeded: '航向修正超过安全门限',
+  ndt_sample_unavailable: '本候选未收到新的NDT观测',
+  quality_gate: '未通过NDT质量门限',
+  out_ranked: '已被更优候选替代',
+  optimal_threshold_reached: '已有最优候选，未再尝试',
+  quick_search_budget_exhausted: '快速搜索时间已用完',
+  LOCAL_SEARCH_BUDGET_EXHAUSTED: '局部搜索时间已用完',
+  INITIAL_POSE_NOT_ACCEPTED: '初始位姿未通过定位验收',
+}
+
 const ATTEMPT_TERMINAL_STATES = new Set([
   'accepted',
   'failed',
@@ -121,8 +140,19 @@ function normalizeAttempt(attempt, index) {
     matchingError: finiteNumber(candidate.matching_error ?? attempt?.matching_error),
     inlierFraction: finiteNumber(candidate.inlier_fraction ?? attempt?.inlier_fraction),
     geometricRmse: finiteNumber(candidate.geometric_rmse ?? attempt?.geometric_rmse),
+    hasConverged: typeof (candidate.has_converged ?? attempt?.has_converged) === 'boolean'
+      ? Boolean(candidate.has_converged ?? attempt?.has_converged)
+      : null,
     stableFrames: Number(candidate.stable_frames || attempt?.stable_frames || 0),
-    rejectReason: attempt?.reject_reason || attempt?.rejectReason || attempt?.error_code || '',
+    requiredStableFrames: Number(candidate.required_stable_frames || attempt?.required_stable_frames || 0),
+    qualityFailures: Array.isArray(candidate.quality_failures ?? attempt?.quality_failures)
+      ? [...(candidate.quality_failures ?? attempt?.quality_failures)]
+      : [],
+    rejectReason: attempt?.reject_reason
+      || attempt?.rejectReason
+      || candidate.reject_reason
+      || attempt?.error_code
+      || '',
     eligible: Boolean(attempt?.eligible || candidate.eligible),
     accepted: attempt?.accepted === true || attempt?.status === 'accepted',
     stage: attempt?.stage || '',
@@ -558,6 +588,61 @@ export function attemptStatusClass(status) {
 
 export function attemptStatusLabel(status) {
   return ATTEMPT_STATUS_LABELS[status] || status || '等待'
+}
+
+export function attemptRejectReasonLabel(reason) {
+  const value = String(reason || '').trim()
+  return ATTEMPT_REJECT_REASON_LABELS[value] || value
+}
+
+export function localizationAttemptFailureMessage(session, fallback = '定位初始化失败') {
+  if (!session) return fallback
+  const attempts = Array.isArray(session.attempts) ? session.attempts : []
+  const measured = attempts.filter(attempt => (
+    attempt.matchingError !== null
+    || attempt.inlierFraction !== null
+  ))
+  const observed = measured.length
+    ? measured
+    : attempts.filter(attempt => attempt.rejectReason)
+  const ranked = [...observed].sort((left, right) => {
+    if (left.hasConverged !== right.hasConverged) {
+      if (left.hasConverged === true) return -1
+      if (right.hasConverged === true) return 1
+    }
+    const leftScore = left.matchingError === null ? Number.POSITIVE_INFINITY : left.matchingError
+    const rightScore = right.matchingError === null ? Number.POSITIVE_INFINITY : right.matchingError
+    if (leftScore !== rightScore) return leftScore - rightScore
+    const leftInlier = left.inlierFraction === null ? -1 : left.inlierFraction
+    const rightInlier = right.inlierFraction === null ? -1 : right.inlierFraction
+    return rightInlier - leftInlier
+  })
+  let diagnostic = measured.length ? (ranked[0] || null) : null
+  if (session.bestNdtCandidate && !diagnostic) {
+    const candidate = session.bestNdtCandidate
+    diagnostic = {
+      candidateNumber: null,
+      matchingError: finiteNumber(candidate.matching_error),
+      inlierFraction: finiteNumber(candidate.inlier_fraction),
+      rejectReason: candidate.reject_reason || '',
+      hasConverged: typeof candidate.has_converged === 'boolean'
+        ? candidate.has_converged
+        : null,
+    }
+  }
+  if (!diagnostic) diagnostic = ranked[0] || null
+  if (!diagnostic) return fallback
+  const number = diagnostic.candidateNumber ? ` #${diagnostic.candidateNumber}` : ''
+  const score = diagnostic.matchingError === null
+    ? 'NDT —'
+    : `NDT ${diagnostic.matchingError.toFixed(3)}`
+  const inlier = diagnostic.inlierFraction === null
+    ? '内点 —'
+    : `内点 ${(diagnostic.inlierFraction * 100).toFixed(1)}%`
+  const reason = attemptRejectReasonLabel(
+    diagnostic.rejectReason || (diagnostic.hasConverged === false ? 'ndt_not_converged' : ''),
+  )
+  return `定位初始化未通过：最佳失败候选${number} · ${score} · ${inlier}${reason ? ` · ${reason}` : ''}`
 }
 
 export function formatAttemptPose(pose) {

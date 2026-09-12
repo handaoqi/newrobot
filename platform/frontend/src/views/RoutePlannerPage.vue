@@ -65,6 +65,7 @@ import {
 } from '../services/progressiveLocalization'
 import {
   attemptMarkerPose,
+  attemptRejectReasonLabel,
   attemptStatusClass,
   attemptStatusLabel,
   clearStoredAttemptSession,
@@ -72,6 +73,7 @@ import {
   formatAttemptMetric,
   formatAttemptPose,
   localizationAttemptTimeline,
+  localizationAttemptFailureMessage,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   readStoredAttemptSession,
@@ -2129,7 +2131,10 @@ async function initializeLocalization() {
     const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
     localizationInitMessage.value = outcome?.bestNdtCommitted
       ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
-      : (error.message || '定位初始化失败')
+      : localizationAttemptFailureMessage(
+        localizationAttemptSession.value,
+        error.message || '定位初始化失败',
+      )
     navError.value = localizationInitMessage.value
   } finally {
     navCommandBusy.value = ''
@@ -2194,7 +2199,10 @@ async function activeRelocalize() {
     const outcome = error?.command ? applyInitialPoseOutcome(error.command) : null
     localizationInitMessage.value = outcome?.bestNdtCommitted
       ? initialPoseOutcomeMessage('最优NDT位姿已提交，但FAST-LIO接管未完成', outcome)
-      : (error.message || '主动重定位失败')
+      : localizationAttemptFailureMessage(
+        localizationAttemptSession.value,
+        error.message || '主动重定位失败',
+      )
     navError.value = localizationInitMessage.value
   } finally {
     navCommandBusy.value = ''
@@ -3570,9 +3578,10 @@ async function handleDeleteRoute(route) {
                           <b>#{{ attempt.candidateNumber }}</b>
                           <span>{{ attemptStatusLabel(attempt.status) }}</span>
                           <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
-                          <small v-if="attempt.matchingError !== null">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
-                          <small v-if="attempt.inlierFraction !== null">内点 {{ (attempt.inlierFraction * 100).toFixed(1) }}%</small>
-                          <small v-if="attempt.rejectReason">{{ attempt.rejectReason }}</small>
+                          <small v-if="attempt.matchingError !== null || ['rejected', 'failed'].includes(attempt.status)">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
+                          <small v-if="attempt.inlierFraction !== null || ['rejected', 'failed'].includes(attempt.status)">内点 {{ attempt.inlierFraction === null ? '—' : `${(attempt.inlierFraction * 100).toFixed(1)}%` }}</small>
+                          <small v-if="attempt.hasConverged !== null">收敛 {{ attempt.hasConverged ? '是' : '否' }}</small>
+                          <small v-if="attempt.rejectReason">{{ attemptRejectReasonLabel(attempt.rejectReason) }}</small>
                         </div>
                       </div>
                     </div>

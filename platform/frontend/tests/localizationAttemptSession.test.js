@@ -3,12 +3,14 @@ import test from 'node:test'
 
 import {
   attemptMarkerPose,
+  attemptRejectReasonLabel,
   attemptStatusClass,
   ATTEMPT_MARKER_VISIBLE_MS,
   beginStoredAttemptSession,
   emptyAttemptSession,
   formatAttemptPose,
   localizationAttemptTimeline,
+  localizationAttemptFailureMessage,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   shouldShowAttemptMarkers,
@@ -72,6 +74,43 @@ test('command progress snapshots keep candidate order and hide transfer-phase ma
   }, { phase: 'transfer', showCandidates: false })
   assert.equal(transfer.showCandidates, false)
   assert.equal(shouldShowAttemptMarkers(transfer), false)
+})
+
+test('failed candidates retain score, inlier, convergence and a readable summary', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-failed',
+    command_type: 'nav.initial_pose',
+    status: 'failed',
+    result_payload: {
+      localization_attempts: {
+        state: 'failed',
+        attempts: [{
+          index: 1,
+          status: 'rejected',
+          ndt_candidate: {
+            has_converged: false,
+            matching_error: 1.65,
+            inlier_fraction: 0,
+            reject_reason: 'ndt_not_converged',
+            quality_failures: [
+              'ndt_not_converged',
+              'ndt_score_above_threshold',
+              'ndt_inlier_fraction_below_threshold',
+            ],
+          },
+        }],
+      },
+    },
+  })
+
+  assert.equal(session.attempts[0].hasConverged, false)
+  assert.equal(session.attempts[0].matchingError, 1.65)
+  assert.equal(session.attempts[0].inlierFraction, 0)
+  assert.equal(attemptRejectReasonLabel(session.attempts[0].rejectReason), 'NDT未收敛')
+  assert.equal(
+    localizationAttemptFailureMessage(session),
+    '定位初始化未通过：最佳失败候选 #1 · NDT 1.650 · 内点 0.0% · NDT未收敛',
+  )
 })
 
 test('new operations start from an empty session and accepted status uses a distinct class', () => {

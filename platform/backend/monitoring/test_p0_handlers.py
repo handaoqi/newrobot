@@ -142,6 +142,57 @@ class MessageHandlerTests(TestCase):
         )
         self.assertIsNone(self.command.finished_at)
 
+    def test_localization_terminal_error_preserves_last_candidate_metrics(self):
+        command = CommandService.create_robot_command(
+            robot=self.robot,
+            command_type="nav.relocalize",
+            payload={"seed_source": "quick_then_global"},
+        )
+        progress = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(command.id),
+                "task_execution_id": None,
+                "status": "executing",
+                "started_at": timezone.now().isoformat(),
+                "result": {
+                    "localization_attempts": {
+                        "state": "running",
+                        "attempts": [{
+                            "index": 1,
+                            "status": "rejected",
+                            "matching_error": 1.65,
+                            "inlier_fraction": 0.0,
+                            "reject_reason": "ndt_not_converged",
+                        }],
+                    },
+                },
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", progress)
+        result = self.envelope(
+            "command.result",
+            {
+                "command_id": str(command.id),
+                "task_execution_id": None,
+                "status": "failed",
+                "started_at": timezone.now().isoformat(),
+                "finished_at": timezone.now().isoformat(),
+                "error_code": "INITIAL_POSE_NOT_ACCEPTED",
+                "error_message": "initial pose rejected",
+                "result": {"localization_status": "global_search_required"},
+            },
+            sequence=2,
+        )
+
+        handle_mqtt_message("robots/rx-001/commands/x/result", result)
+
+        command.refresh_from_db()
+        attempt = command.result_payload["localization_attempts"]["attempts"][0]
+        self.assertEqual(attempt["matching_error"], 1.65)
+        self.assertEqual(attempt["inlier_fraction"], 0.0)
+        self.assertEqual(command.result_payload["localization_status"], "global_search_required")
+
     def test_sync_reconciles_edge_terminal_state_and_releases_robot(self):
         result = handle_mqtt_message(
             "robots/rx-001/sync/state",
