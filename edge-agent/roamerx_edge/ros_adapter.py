@@ -234,6 +234,7 @@ class RosAdapter(Node):
         self._log_context_provider: Callable | None = None
         self._localization_sample_condition = threading.Condition()
         self._localization_sample_sequence = 0
+        self._localization_decision_sequence = 0
         self._localization_status_samples = deque(maxlen=100)
         # A localization operation owns a monotonically increasing generation.
         # Starting an operator request invalidates an older automatic search so
@@ -546,6 +547,13 @@ class RosAdapter(Node):
         if not isinstance(payload, dict):
             return
         self.telemetry.on_localization_decision(payload)
+        decision_condition = getattr(self, "_localization_sample_condition", None)
+        if decision_condition is not None:
+            with decision_condition:
+                self._localization_decision_sequence = int(
+                    getattr(self, "_localization_decision_sequence", 0)
+                ) + 1
+                decision_condition.notify_all()
         anomaly = bool(payload.get("lio_motion_anomaly"))
         if not anomaly:
             self._lio_motion_anomaly_notified = False
@@ -1165,6 +1173,34 @@ class RosAdapter(Node):
     def latest_trusted_pose(self) -> dict | None:
         pose = getattr(self, "_last_trusted_pose", None)
         return dict(pose) if pose else None
+
+    def invalidate_last_trusted_pose(self) -> None:
+        """Drop a prior task's in-memory seed and freeze writes during startup."""
+        self._last_trusted_pose = None
+        self._last_trusted_pose_report_monotonic = 0.0
+        self._trusted_pose_frozen = True
+
+    def accept_startup_trusted_pose(self) -> None:
+        """Persist only the fresh, verified pose produced by this task's startup."""
+        decision = self._localization_decision()
+        latest = self.telemetry.latest_pose()
+        if not (
+            latest
+            and decision.get("active_source") == "lio_imu"
+            and decision.get("lio_healthy") is True
+            and decision.get("lio_anchored") is True
+            and decision.get("absolute_stable") is True
+        ):
+            raise ProtocolError(
+                "LIO_HANDOFF_TIMEOUT",
+                "startup absolute pose was accepted but FAST-LIO handoff is not ready",
+                details={"localization_decision": decision},
+            )
+        self._trusted_pose_frozen = False
+        self._update_last_trusted_pose(latest)
+        if self._trusted_pose_cb:
+            self._trusted_pose_cb(latest)
+            self._last_trusted_pose_report_monotonic = time.monotonic()
 
     def _notify_localization_recovery_when_stable(self) -> None:
         try:
@@ -2470,59 +2506,298 @@ class RosAdapter(Node):
         generation = self._start_localization_operation("operator_rtk_initial_pose")
         return self._set_initial_pose_from_rtk_once(wait_seconds, generation)
 
-    def _wait_for_verified_rtk_drift(
+    def _rtk_verification_observation(self, decision: dict) -> dict:
+        """Capture the concrete RTK values used by the fixed-solution gate."""
+        diagnostics = {}
+        diagnostics_getter = getattr(getattr(self, "telemetry", None), "localization_diagnostics", None)
+        if callable(diagnostics_getter):
+            try:
+                diagnostics = diagnostics_getter() or {}
+            except Exception:
+                LOGGER.exception("unable to capture RTK diagnostics for localization attempt")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        raw_rtk = diagnostics.get("raw_rtk") if isinstance(
+            diagnostics.get("raw_rtk"), dict
+        ) else {}
+        time_diagnostics = diagnostics.get("time_diagnostics") if isinstance(
+            diagnostics.get("time_diagnostics"), dict
+        ) else {}
+        rtk_time = time_diagnostics.get("rtk") if isinstance(
+            time_diagnostics.get("rtk"), dict
+        ) else {}
+        heading = raw_rtk.get("heading") if isinstance(raw_rtk.get("heading"), dict) else {}
+        drift = decision.get("rtk_drift") if isinstance(
+            decision.get("rtk_drift"), dict
+        ) else {}
+
+        def finite(value):
+            return self._finite_or_none(value)
+
+        try:
+            sample_stamp_ns = int(drift.get("sample_stamp_ns") or 0)
+        except (TypeError, ValueError):
+            sample_stamp_ns = 0
+        return {
+            "sample_stamp_ns": sample_stamp_ns,
+            "quality": str(decision.get("rtk_quality") or raw_rtk.get("quality") or "unknown"),
+            "usable": decision.get("rtk_usable") is True,
+            "heading_usable": decision.get("rtk_heading_usable") is True,
+            "good_for_navigation": decision.get("rtk_good_for_navigation") is True,
+            "blocked_reason": str(decision.get("rtk_blocked_reason") or ""),
+            "map_x": finite(decision.get("rtk_x")),
+            "map_y": finite(decision.get("rtk_y")),
+            "map_yaw": finite(decision.get("rtk_yaw")),
+            "latitude": finite(raw_rtk.get("latitude")),
+            "longitude": finite(raw_rtk.get("longitude")),
+            "altitude": finite(raw_rtk.get("altitude")),
+            "position_age_s": finite(
+                rtk_time.get("sample_age_seconds", raw_rtk.get("sample_age_seconds"))
+            ),
+            "horizontal_std_m": finite(raw_rtk.get("horizontal_std_m")),
+            "fix_status": raw_rtk.get("fix_status"),
+            "solution_status": raw_rtk.get("solution_status"),
+            "position_type": raw_rtk.get("position_type"),
+            "solution_satellites": raw_rtk.get("solution_satellites"),
+            "heading_status": heading.get("status"),
+            "heading_type": heading.get("type"),
+            "heading_deg": finite(heading.get("heading_deg")),
+            "heading_std_deg": finite(heading.get("heading_std_deg")),
+            "heading_baseline_m": finite(heading.get("baseline_m")),
+            "heading_age_s": finite(
+                decision.get("rtk_heading_age_s", heading.get("sample_age_seconds"))
+            ),
+        }
+
+    def _new_rtk_verification(self, decision: dict) -> dict:
+        required = max(1, int(getattr(
+            self.safety_config, "localization_rtk_required_samples", 3
+        )))
+        max_span = float(getattr(
+            self.safety_config, "localization_rtk_max_drift_m", 0.30
+        ))
+        return {
+            "status": "verifying",
+            "verified": False,
+            "conclusion_code": "awaiting_fresh_rtk_samples",
+            "conclusion": "waiting for fresh fixed RTK position-and-heading samples",
+            "source": "rtk_self_stability",
+            "sample_count": 0,
+            "stable_frames": 0,
+            "required_stable_frames": required,
+            "span_m": None,
+            "threshold_xy_m": max_span,
+            "last_sample": self._rtk_verification_observation(decision),
+            "sample_history": [],
+        }
+
+    def _report_rtk_verification(
+        self,
+        verification: dict,
+        *,
+        state: str = "running",
+        stage_status: str = "verifying",
+        error_code: str = "",
+        error_message: str = "",
+    ) -> None:
+        stage = {
+            "stage": "rtk_fixed",
+            "status": stage_status,
+            "rtk_verification": verification,
+        }
+        if error_code:
+            stage["error_code"] = error_code
+        if error_message:
+            stage["error_message"] = error_message
+        self._report_localization_attempts({
+            "state": state,
+            "mode": "rtk_fixed_initialization",
+            "selected_stage": "rtk_fixed",
+            "strategy": ["rtk_fixed"],
+            "stages": [stage],
+            "attempts": [],
+            "candidate_count": 0,
+            "evaluated_candidate_count": 0,
+            "motion_commanded": False,
+            "rtk_verification": verification,
+            "rtk_stability": verification,
+        })
+
+    def _wait_for_verified_fixed_rtk(
         self,
         *,
         timeout_seconds: float,
         generation: int,
-        after_stamp_ns: int = 0,
-    ) -> dict | None:
+        on_update: Callable[[dict], None] | None = None,
+    ) -> dict:
+        """Verify RTK from consecutive RTK samples, never from LIO agreement."""
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         required = max(1, int(getattr(
             self.safety_config, "localization_rtk_required_samples", 3
         )))
-        threshold = float(getattr(
+        max_span = float(getattr(
             self.safety_config, "localization_rtk_max_drift_m", 0.30
         ))
-        streak = 0
-        last_stamp = int(after_stamp_ns or 0)
-        latest_result = None
+        samples: list[tuple[float, float]] = []
+        last_stamp = 0
+        sample_count = 0
+        sample_history = []
+        last_decision = self._localization_decision()
+        latest_result = self._new_rtk_verification(last_decision)
         while time.monotonic() < deadline:
             self._assert_localization_operation(generation)
             decision = self._localization_decision()
+            last_decision = decision
             drift = decision.get("rtk_drift") if isinstance(
                 decision.get("rtk_drift"), dict
             ) else {}
             try:
                 stamp_ns = int(drift.get("sample_stamp_ns") or 0)
-                drift_xy = float(drift.get("xy_m"))
+                x = float(decision.get("rtk_x"))
+                y = float(decision.get("rtk_y"))
             except (TypeError, ValueError):
                 stamp_ns = 0
-                drift_xy = float("inf")
+                x = y = float("nan")
             if stamp_ns > last_stamp:
                 last_stamp = stamp_ns
-                accepted = (
-                    decision.get("rtk_usable") is True
-                    and str(decision.get("rtk_quality") or "").lower() == "fixed"
-                    and decision.get("rtk_heading_usable") is True
-                    and str(drift.get("source") or "") == "aligned_fast_lio"
-                    and math.isfinite(drift_xy)
-                    and drift_xy < threshold
-                    and decision.get("correction_smoothing_active") is not True
-                )
-                streak = streak + 1 if accepted else 0
-                latest_result = {
-                    **drift,
-                    "xy_m": drift_xy if math.isfinite(drift_xy) else None,
-                    "threshold_xy_m": threshold,
-                    "stable_frames": streak,
-                    "required_stable_frames": required,
-                    "verified": accepted and streak >= required,
+                sample_count += 1
+                quality = str(decision.get("rtk_quality") or "").lower()
+                checks = {
+                    "position_usable": {
+                        "actual": decision.get("rtk_usable"),
+                        "expected": True,
+                        "passed": decision.get("rtk_usable") is True,
+                    },
+                    "fixed_quality": {
+                        "actual": quality or "unknown",
+                        "expected": "fixed",
+                        "passed": quality == "fixed",
+                    },
+                    "heading_usable": {
+                        "actual": decision.get("rtk_heading_usable"),
+                        "expected": True,
+                        "passed": decision.get("rtk_heading_usable") is True,
+                    },
+                    "map_position_finite": {
+                        "actual": [x, y] if math.isfinite(x) and math.isfinite(y) else None,
+                        "expected": "finite map x/y",
+                        "passed": math.isfinite(x) and math.isfinite(y),
+                    },
                 }
-                if latest_result["verified"]:
+                reject_reasons = [
+                    code for code, check in checks.items() if check["passed"] is not True
+                ]
+                accepted = not reject_reasons
+                if not accepted:
+                    samples.clear()
+                else:
+                    samples.append((x, y))
+                    samples = samples[-required:]
+                span = max(
+                    (math.hypot(ax - bx, ay - by)
+                     for index, (ax, ay) in enumerate(samples)
+                     for bx, by in samples[index + 1:]),
+                    default=0.0,
+                )
+                verified = len(samples) >= required and span <= max_span
+                if accepted and len(samples) < required:
+                    conclusion_code = "fixed_rtk_samples_pending"
+                    conclusion = f"fixed RTK sample streak {len(samples)}/{required}"
+                elif accepted and span > max_span:
+                    conclusion_code = "rtk_self_span_above_threshold"
+                    conclusion = (
+                        f"RTK position span {span:.3f} m exceeds {max_span:.3f} m"
+                    )
+                    reject_reasons.append("rtk_self_span_above_threshold")
+                elif verified:
+                    conclusion_code = "fixed_rtk_verified"
+                    conclusion = (
+                        f"fixed RTK verified with {required} fresh samples; "
+                        f"position span {span:.3f} m <= {max_span:.3f} m"
+                    )
+                else:
+                    conclusion_code = reject_reasons[0]
+                    conclusion = f"RTK sample rejected by {', '.join(reject_reasons)}"
+                observation = {
+                    **self._rtk_verification_observation(decision),
+                    "accepted": accepted and span <= max_span,
+                    "reject_reasons": reject_reasons,
+                }
+                sample_history.append(observation)
+                sample_history = sample_history[-12:]
+                latest_result = {
+                    "sample_stamp_ns": stamp_ns,
+                    "source": "rtk_self_stability",
+                    "span_m": span,
+                    "threshold_xy_m": max_span,
+                    "stable_frames": len(samples),
+                    "required_stable_frames": required,
+                    "verified": verified,
+                    "status": "accepted" if verified else "verifying",
+                    "conclusion_code": conclusion_code,
+                    "conclusion": conclusion,
+                    "sample_count": sample_count,
+                    "checks": checks,
+                    "last_sample": observation,
+                    "sample_history": list(sample_history),
+                }
+                if callable(on_update):
+                    on_update(latest_result)
+                if verified:
                     return latest_result
             time.sleep(0.1)
-        return None
+        latest_result = {
+            **latest_result,
+            "status": "rejected",
+            "verified": False,
+            "timed_out": True,
+        }
+        if sample_count == 0:
+            latest_result.update({
+                "conclusion_code": "no_fresh_rtk_samples",
+                "conclusion": "no fresh RTK sample arrived before the verification timeout",
+                "last_sample": self._rtk_verification_observation(last_decision),
+            })
+        elif latest_result.get("conclusion_code") == "fixed_rtk_samples_pending":
+            latest_result["conclusion"] = (
+                f"only {latest_result.get('stable_frames', 0)}/{required} consecutive "
+                "fixed RTK samples arrived before timeout"
+            )
+        if callable(on_update):
+            on_update(latest_result)
+        return latest_result
+
+    def _wait_for_lio_handoff(
+        self,
+        *,
+        after_generation: int,
+        timeout_seconds: float,
+        generation: int,
+    ):
+        """Wait for the localization node to accept a post-seed FAST-LIO frame."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        last_decision = {}
+        while time.monotonic() < deadline:
+            self._assert_localization_operation(generation)
+            decision = self._localization_decision()
+            last_decision = decision
+            try:
+                handoff_generation = int(decision.get("handoff_anchor_generation") or 0)
+            except (TypeError, ValueError):
+                handoff_generation = 0
+            ready = (
+                handoff_generation > after_generation
+                and decision.get("handoff_state") == "ready"
+                and decision.get("active_source") == "lio_imu"
+                and decision.get("lio_healthy") is True
+                and decision.get("lio_anchored") is True
+                and decision.get("absolute_stable") is True
+            )
+            latest = self.telemetry.latest_pose()
+            if ready and latest and int(getattr(latest, "localization_status", 0)) == 3:
+                return latest, decision
+            time.sleep(0.1)
+        return None, last_decision
 
     def _set_initial_pose_from_rtk_once(
         self,
@@ -2530,67 +2805,146 @@ class RosAdapter(Node):
         generation: int,
     ) -> dict:
         self._assert_localization_operation(generation)
+        previous_decision = self._localization_decision()
+        verification = self._new_rtk_verification(previous_decision)
+        self._report_rtk_verification(verification)
         if not self._rtk_initial_pose_client.wait_for_service(timeout_sec=3.0):
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="failed",
+                error_code="RTK_INITIAL_POSE_UNAVAILABLE",
+                error_message="/localization/seed_from_rtk service is unavailable",
+            )
             raise ProtocolError(
                 "RTK_INITIAL_POSE_UNAVAILABLE",
                 "/localization/seed_from_rtk service is unavailable",
+                details={"rtk_verification": verification},
             )
-        with self._localization_sample_condition:
-            sample_sequence = self._localization_sample_sequence
-        previous_decision = self._localization_decision()
-        previous_drift = previous_decision.get("rtk_drift") if isinstance(
-            previous_decision.get("rtk_drift"), dict
-        ) else {}
         try:
-            previous_stamp_ns = int(previous_drift.get("sample_stamp_ns") or 0)
+            previous_handoff_generation = int(
+                previous_decision.get("handoff_anchor_generation") or 0
+            )
         except (TypeError, ValueError):
-            previous_stamp_ns = 0
+            previous_handoff_generation = 0
         deadline = time.monotonic() + max(1.0, float(wait_seconds))
+        last_progress_at = 0.0
+
+        def report_progress(current: dict) -> None:
+            nonlocal last_progress_at
+            now_monotonic = time.monotonic()
+            terminal = current.get("status") in {"accepted", "rejected"}
+            if terminal or not last_progress_at or now_monotonic - last_progress_at >= 0.5:
+                self._report_rtk_verification(current)
+                last_progress_at = now_monotonic
+
+        stability = self._wait_for_verified_fixed_rtk(
+            timeout_seconds=max(0.0, deadline - time.monotonic()),
+            generation=generation,
+            on_update=report_progress,
+        )
+        if not stability or not stability.get("verified"):
+            verification = stability or verification
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="rejected",
+                error_code="RTK_FIXED_NOT_STABLE",
+                error_message=verification.get("conclusion") or "fixed RTK verification failed",
+            )
+            raise ProtocolError(
+                "RTK_FIXED_NOT_STABLE",
+                "fixed RTK did not provide 3 fresh position-and-heading samples within the 0.30 m self-stability gate",
+                details={
+                    "rtk_stability": verification,
+                    "rtk_verification": verification,
+                },
+            )
+        verification = stability
         future = self._rtk_initial_pose_client.call_async(Trigger.Request())
         completed = threading.Event()
         future.add_done_callback(lambda _future: completed.set())
         if not completed.wait(timeout=5.0) or not future.done():
-            raise ProtocolError("RTK_INITIAL_POSE_TIMEOUT", "RTK initial pose service timed out")
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="failed",
+                error_code="RTK_INITIAL_POSE_TIMEOUT",
+                error_message="RTK initial pose service timed out after RTK verification passed",
+            )
+            raise ProtocolError(
+                "RTK_INITIAL_POSE_TIMEOUT",
+                "RTK initial pose service timed out",
+                details={"rtk_verification": verification},
+            )
         response = future.result()
         self._assert_localization_operation(generation)
         if response is None or not response.success:
+            error_message = (
+                response.message if response else "RTK initial pose service returned no response"
+            )
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="failed",
+                error_code="RTK_POSE_UNAVAILABLE",
+                error_message=error_message,
+            )
             raise ProtocolError(
                 "RTK_POSE_UNAVAILABLE",
-                response.message if response else "RTK initial pose service returned no response",
+                error_message,
+                details={"rtk_verification": verification},
             )
-        drift = self._wait_for_verified_rtk_drift(
-            timeout_seconds=max(0.0, deadline - time.monotonic()),
-            generation=generation,
-            after_stamp_ns=previous_stamp_ns,
+        handoff_timeout = min(
+            max(0.0, deadline - time.monotonic()),
+            float(getattr(self.safety_config, "localization_handoff_settle_seconds", 8.0)),
         )
-        if drift is None:
-            raise ProtocolError(
-                "RTK_INITIAL_POSE_NOT_CONVERGED",
-                "fixed RTK seed was applied but aligned FAST-LIO drift did not stay below 0.30 m for 3 fresh samples",
-                details={
-                    "rtk_drift_threshold_m": float(getattr(
-                        self.safety_config, "localization_rtk_max_drift_m", 0.30
-                    )),
-                    "required_stable_frames": int(getattr(
-                        self.safety_config, "localization_rtk_required_samples", 3
-                    )),
-                },
-            )
-        latest = self._wait_for_fresh_normal_samples(
-            after_sequence=sample_sequence,
-            # The RTK/FAST-LIO drift gate already required three consecutive
-            # fresh stable samples.  Only one fresh normal status sample is
-            # needed here to publish the accepted pose without a second
-            # redundant three-frame wait.
-            required_samples=1,
-            timeout_seconds=max(0.0, deadline - time.monotonic()),
+        latest, handoff_decision = self._wait_for_lio_handoff(
+            after_generation=previous_handoff_generation,
+            timeout_seconds=handoff_timeout,
             generation=generation,
         )
         if latest is None:
-            raise ProtocolError(
-                "RTK_INITIAL_POSE_NOT_CONVERGED",
-                "fixed RTK pose was accepted but localization did not report a normal GPS pose",
+            handoff = {
+                "status": "failed",
+                "conclusion_code": "lio_handoff_timeout",
+                "conclusion": "RTK seed passed, but no fresh stable FAST-LIO handoff was verified",
+                "active_source": handoff_decision.get("active_source"),
+                "handoff_state": handoff_decision.get("handoff_state"),
+                "lio_healthy": handoff_decision.get("lio_healthy"),
+                "lio_anchored": handoff_decision.get("lio_anchored"),
+                "absolute_stable": handoff_decision.get("absolute_stable"),
+            }
+            verification = {**verification, "handoff": handoff}
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="failed",
+                error_code="LIO_HANDOFF_TIMEOUT",
+                error_message=handoff["conclusion"],
             )
+            raise ProtocolError(
+                "LIO_HANDOFF_TIMEOUT",
+                "fixed RTK pose was accepted but FAST-LIO did not become the fresh continuous source",
+                details={
+                    "rtk_stability": verification,
+                    "rtk_verification": verification,
+                    "localization_decision": handoff_decision,
+                },
+            )
+        verification = {
+            **verification,
+            "handoff": {
+                "status": "accepted",
+                "conclusion_code": "lio_imu_handoff_verified",
+                "conclusion": "RTK absolute seed accepted; fresh FAST-LIO + IMU is the continuous pose source",
+                "active_source": handoff_decision.get("active_source"),
+                "handoff_state": handoff_decision.get("handoff_state"),
+                "lio_healthy": handoff_decision.get("lio_healthy"),
+                "lio_anchored": handoff_decision.get("lio_anchored"),
+                "absolute_stable": handoff_decision.get("absolute_stable"),
+            },
+        }
         localized_pose = {
             "x": latest.x,
             "y": latest.y,
@@ -2606,29 +2960,43 @@ class RosAdapter(Node):
             "seed_pose": localized_pose,
             "matched_pose": localized_pose,
             "rtk_quality": "fixed",
-            "rtk_drift": drift,
+            "rtk_stability": stability,
+            "rtk_verification": verification,
         }
-        return {
+        result = {
             "source": "rtk_fixed",
             "service": "/localization/seed_from_rtk",
             "message": response.message,
             "localization_status": latest.localization_status,
             "localized_pose": localized_pose,
             "best_match_pose": localized_pose,
-            "rtk_drift": drift,
+            "rtk_stability": stability,
+            "rtk_verification": verification,
             "localization_attempts": {
                 "state": "accepted",
                 "mode": "rtk_fixed_initialization",
                 "selected_stage": "rtk_fixed",
-                "stop_reason": "rtk_fixed_drift_below_threshold",
+                "stop_reason": "rtk_fixed_stable_then_lio_handoff",
                 "early_stopped": True,
                 "candidate_count": 1,
                 "evaluated_candidate_count": 1,
                 "attempts": [attempt],
                 "best_match_pose": localized_pose,
-                "rtk_drift": drift,
+                "rtk_stability": stability,
+                "rtk_verification": verification,
+                "stages": [{
+                    "stage": "rtk_fixed",
+                    "status": "accepted",
+                    "rtk_verification": verification,
+                }],
             },
         }
+        self._report_rtk_verification(
+            verification,
+            state="accepted",
+            stage_status="accepted",
+        )
+        return result
 
     def global_relocalize(self, wait_seconds: float = 90.0, *, automatic: bool = False) -> dict:
         """Run map-wide position and 360-degree yaw search without a guessed pose."""
@@ -2713,6 +3081,7 @@ class RosAdapter(Node):
             and str(coordinate_mode or "").lower() != "local_only"
         )
         stages = []
+        rtk_verification = None
 
         if manual_seed is None and outdoor:
             self._report_localization_attempts({
@@ -2734,18 +3103,23 @@ class RosAdapter(Node):
                     "mode": "quick_then_global",
                     "selected_stage": "rtk_fixed",
                     "early_stopped": True,
-                    "stop_reason": "rtk_fixed_drift_below_threshold",
+                    "stop_reason": "rtk_fixed_stable_then_lio_handoff",
                     "global_search_started": False,
                 }
             except ProtocolError as exc:
                 if exc.code == "RELOCALIZATION_SUPERSEDED":
                     raise
-                stages.append({
+                error_details = dict(exc.details or {})
+                rtk_verification = error_details.get("rtk_verification")
+                rejected_stage = {
                     "stage": "rtk_fixed",
                     "status": "rejected",
                     "error_code": exc.code,
                     "error_message": exc.message,
-                })
+                }
+                if isinstance(rtk_verification, dict):
+                    rejected_stage["rtk_verification"] = rtk_verification
+                stages.append(rejected_stage)
 
         seeds = []
         if manual_seed is not None:
@@ -2798,6 +3172,9 @@ class RosAdapter(Node):
             "early_stopped": False,
             "motion_commanded": False,
         }
+        if isinstance(rtk_verification, dict):
+            session["rtk_verification"] = rtk_verification
+            session["rtk_stability"] = rtk_verification
         self._trusted_pose_frozen = True
         try:
             self._report_localization_attempts(session)

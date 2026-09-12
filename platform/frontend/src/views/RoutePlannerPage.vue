@@ -72,6 +72,8 @@ import {
   emptyAttemptSession,
   formatAttemptMetric,
   formatAttemptPose,
+  rtkVerificationConclusionLabel,
+  rtkVerificationReasonLabel,
   localizationAttemptTimeline,
   localizationAttemptFailureMessage,
   isAttemptSessionTerminal,
@@ -3482,9 +3484,9 @@ async function handleDeleteRoute(route) {
             </div>
             <div class="localization-algorithm-note">
               <span><strong>下发地图</strong> 目标地图已就绪时直接复用；否则应用地图并恢复定位，局部候选均无合格结果时才进入全图位置与航向匹配。</span>
-              <span><strong>初始化定位</strong> 室外/过渡且使用非本地坐标时优先验证 RTK 固定解；航向可用且漂移连续 3 个新样本严格小于 0.30 m 才通过，否则转入建图原点、航点和全局流程。</span>
+              <span><strong>初始化定位</strong> 室外/过渡且使用 RTK 固定原点时优先验证 RTK；位置与双天线航向可用、连续 3 个新样本的 RTK 自身位置跨度不超过 0.30 m 才通过，随后必须由新鲜 FAST-LIO + IMU 完成接管，否则转入建图原点、航点和全局流程。</span>
               <span><strong>主动重定位</strong> 静止搜索建图原点及周边，有合格候选即提交该阶段最优，其中稳定 NDT 分数严格小于 0.01 时提前结束；原点阶段无合格候选才尝试手选点/路线航点，仍无合格候选才全局匹配。</span>
-              <span><i class="legend-relocalization-dot"></i> 紫色标记仅记录终态中的严格优选位置：RTK 漂移验证通过，或最优 NDT 位姿已提交且分数严格小于 0.01；不表示 FAST-LIO 已完成稳定接管。</span>
+              <span><i class="legend-relocalization-dot"></i> 紫色标记仅记录终态中的严格优选位置：RTK 固定解验证及 FAST-LIO 接管通过，或最优 NDT 位姿已提交且分数严格小于 0.01；NDT 标记本身不表示 FAST-LIO 已完成稳定接管。</span>
             </div>
             <div v-if="initialPoseMode || manualInitialPose" class="initial-pose-panel">
               <div class="initial-pose-guide">
@@ -3543,6 +3545,87 @@ async function handleDeleteRoute(route) {
                   · 阈值 &lt; {{ formatAttemptMetric(localizationAttemptSession.rtkDrift.threshold_xy_m, 2) }} m
                   · {{ localizationAttemptSession.rtkDrift.verified ? '通过' : '验证中' }}
                 </p>
+                <div v-if="localizationAttemptSession.rtkVerification" class="rtk-verification-card">
+                  <div class="rtk-verification-heading">
+                    <strong>RTK 验证结论</strong>
+                    <span :class="localizationAttemptSession.rtkVerification.verified ? 'passed' : 'pending'">
+                      {{ rtkVerificationConclusionLabel(localizationAttemptSession.rtkVerification) }}
+                    </span>
+                  </div>
+                  <div class="rtk-verification-grid">
+                    <span>解状态</span>
+                    <strong>{{ localizationAttemptSession.rtkVerification.lastSample?.quality || 'unknown' }}</strong>
+                    <span>位置 / 航向</span>
+                    <strong>
+                      {{ localizationAttemptSession.rtkVerification.lastSample?.usable ? '可用' : '不可用' }} /
+                      {{ localizationAttemptSession.rtkVerification.lastSample?.headingUsable ? '可用' : '不可用' }}
+                    </strong>
+                    <span>地图坐标</span>
+                    <strong>
+                      x {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.mapX) }} /
+                      y {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.mapY) }} /
+                      yaw {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.mapYaw) }}
+                    </strong>
+                    <span>经纬高</span>
+                    <strong>
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.latitude, 7) }} /
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.longitude, 7) }} /
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.altitude, 2) }} m
+                    </strong>
+                    <span>位置年龄 / 标准差</span>
+                    <strong>
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.positionAgeSeconds, 2) }} s /
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.horizontalStdM, 3) }} m
+                    </strong>
+                    <span>解算状态 / 类型 / 卫星</span>
+                    <strong>
+                      {{ localizationAttemptSession.rtkVerification.lastSample?.solutionStatus ?? '—' }} /
+                      {{ localizationAttemptSession.rtkVerification.lastSample?.positionType ?? '—' }} /
+                      {{ localizationAttemptSession.rtkVerification.lastSample?.solutionSatellites ?? '—' }}
+                    </strong>
+                    <span>航向 / 标准差</span>
+                    <strong>
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.headingDeg, 2) }}° /
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.headingStdDeg, 2) }}°
+                    </strong>
+                    <span>航向年龄 / 基线</span>
+                    <strong>
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.headingAgeSeconds, 2) }} s /
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.lastSample?.headingBaselineM, 3) }} m
+                    </strong>
+                    <span>稳定样本</span>
+                    <strong>
+                      {{ localizationAttemptSession.rtkVerification.stableFrames }} /
+                      {{ localizationAttemptSession.rtkVerification.requiredStableFrames }}，共验证
+                      {{ localizationAttemptSession.rtkVerification.sampleCount }} 个新样本
+                    </strong>
+                    <span>位置跨度门限</span>
+                    <strong>
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.spanM) }} m ≤
+                      {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.thresholdM) }} m
+                    </strong>
+                  </div>
+                  <p v-if="localizationAttemptSession.rtkVerification.lastSample?.blockedReason" class="rtk-verification-reason">
+                    定位节点拒绝原因：{{ localizationAttemptSession.rtkVerification.lastSample.blockedReason }}
+                  </p>
+                  <p v-if="localizationAttemptSession.rtkVerification.lastSample?.rejectReasons?.length" class="rtk-verification-reason">
+                    本样本未通过：{{ localizationAttemptSession.rtkVerification.lastSample.rejectReasons.map(rtkVerificationReasonLabel).join('、') }}
+                  </p>
+                  <ol v-if="localizationAttemptSession.rtkVerification.sampleHistory?.length" class="rtk-verification-history">
+                    <li v-for="(sample, sampleIndex) in localizationAttemptSession.rtkVerification.sampleHistory" :key="`${sample.sampleStampNs || 0}-${sampleIndex}`">
+                      <span>#{{ Math.max(1, localizationAttemptSession.rtkVerification.sampleCount - localizationAttemptSession.rtkVerification.sampleHistory.length + sampleIndex + 1) }}</span>
+                      <strong>{{ sample.quality }} · x {{ formatAttemptMetric(sample.mapX) }} / y {{ formatAttemptMetric(sample.mapY) }}</strong>
+                      <small>{{ sample.accepted ? '样本通过' : (sample.rejectReasons.map(rtkVerificationReasonLabel).join('、') || '样本未通过') }}</small>
+                    </li>
+                  </ol>
+                  <p v-if="localizationAttemptSession.rtkVerification.handoff" class="rtk-handoff-result">
+                    FAST-LIO + IMU 接管：{{ localizationAttemptSession.rtkVerification.handoff.status === 'accepted' ? '通过' : '失败' }}
+                    · source={{ localizationAttemptSession.rtkVerification.handoff.activeSource || '—' }}
+                    · LIO {{ localizationAttemptSession.rtkVerification.handoff.lioHealthy ? '健康' : '未健康' }}
+                    · 锚点 {{ localizationAttemptSession.rtkVerification.handoff.lioAnchored ? '已建立' : '未建立' }}
+                    · 绝对稳定 {{ localizationAttemptSession.rtkVerification.handoff.absoluteStable ? '是' : '否' }}
+                  </p>
+                </div>
                 <p v-if="localizationAttemptSession.bestMatchPose">
                   最优位姿 {{ formatAttemptPose(localizationAttemptSession.bestMatchPose) }}
                   <span v-if="localizationAttemptSession.bestNdtCandidate">
@@ -5813,6 +5896,36 @@ async function handleDeleteRoute(route) {
 .localization-attempt-toggle small { color: #64748b; font-size: 0.78rem; }
 .localization-attempt-toggle small { margin-left: auto; }
 .localization-attempt-body { padding: 0 0.75rem 0.75rem; font-size: 0.78rem; color: #334155; }
+.rtk-verification-card {
+  margin: 0.5rem 0;
+  padding: 0.55rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.rtk-verification-heading { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.45rem; }
+.rtk-verification-heading span { padding: 0.12rem 0.4rem; border-radius: 999px; background: #fef3c7; color: #92400e; }
+.rtk-verification-heading span.passed { background: #dcfce7; color: #166534; }
+.rtk-verification-grid {
+  display: grid;
+  grid-template-columns: minmax(7rem, auto) minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+}
+.rtk-verification-grid > span { color: #64748b; }
+.rtk-verification-grid > strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.rtk-verification-reason { margin: 0.4rem 0 0; color: #b91c1c; }
+.rtk-verification-history { margin: 0.45rem 0 0; padding: 0; list-style: none; display: grid; gap: 0.2rem; }
+.rtk-verification-history li {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: 6px;
+  background: #fff;
+}
+.rtk-verification-history li > span,
+.rtk-verification-history li > small { color: #64748b; }
+.rtk-handoff-result { margin: 0.45rem 0 0; padding-top: 0.4rem; border-top: 1px solid #e2e8f0; }
 .localization-attempt-list { margin: 0.4rem 0 0; padding: 0; list-style: none; display: grid; gap: 0.35rem; }
 .localization-attempt-list li {
   display: grid;

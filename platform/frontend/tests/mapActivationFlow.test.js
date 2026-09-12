@@ -90,7 +90,8 @@ test('navigation test hints describe the implemented localization gates and fall
 
   assert.match(source, /目标地图已就绪时直接复用/)
   assert.match(source, /局部候选均无合格结果时才进入全图位置与航向匹配/)
-  assert.match(source, /漂移连续 3 个新样本严格小于 0\.30 m/)
+  assert.match(source, /连续 3 个新样本的 RTK 自身位置跨度不超过 0\.30 m/)
+  assert.match(source, /随后必须由新鲜 FAST-LIO \+ IMU 完成接管/)
   assert.match(source, /原点阶段无合格候选才尝试手选点\/路线航点/)
   assert.match(source, /稳定 NDT 分数严格小于 0\.01 时提前结束/)
   assert.match(source, /最优 NDT 位姿已提交且分数严格小于 0\.01/)

@@ -43,10 +43,30 @@ const ATTEMPT_TERMINAL_STATES = new Set([
   'succeeded',
 ])
 
+const RTK_VERIFICATION_CONCLUSION_LABELS = {
+  awaiting_fresh_rtk_samples: '等待新的 RTK 样本',
+  fixed_rtk_samples_pending: '固定解稳定样本不足',
+  fixed_rtk_verified: 'RTK 固定解验证通过',
+  no_fresh_rtk_samples: '验证窗口内没有新的 RTK 样本',
+  position_usable: 'RTK 位置不可用或已过期',
+  fixed_quality: 'RTK 不是固定解',
+  heading_usable: '双天线航向不可用或质量不合格',
+  map_position_finite: 'RTK 无有效地图坐标',
+  rtk_self_span_above_threshold: 'RTK 位置稳定跨度超过门限',
+}
+
+const RTK_VERIFICATION_REASON_LABELS = {
+  position_usable: '位置可用性未通过',
+  fixed_quality: '不是固定解',
+  heading_usable: '航向不可用',
+  map_position_finite: '地图坐标无效',
+  rtk_self_span_above_threshold: '位置稳定跨度超限',
+}
+
 const TIMELINE_STAGE_META = {
   map_transfer: { title: '地图下发', detail: '确认目标地图已传输并应用到机器狗' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
-  rtk_fixed: { title: 'RTK 固定解验证', detail: '验证 RTK 固定解及 RTK/Fast-LIO 漂移' },
+  rtk_fixed: { title: 'RTK 固定解验证', detail: '验证固定解、双天线航向与 RTK 自身位置稳定性' },
   last_trusted: { title: '可信位姿候选', detail: '尝试最近一次可信定位位姿' },
   mapping_origin_bounded: { title: '建图原点及周边候选', detail: '原点、航向假设和 0.3/0.6/1.0 m 周边候选' },
   route_waypoints: { title: '手选点/路线航点候选', detail: '逐个验证手选点和路线航点' },
@@ -95,6 +115,107 @@ function finitePose(value) {
   if (![x, y, yaw].every(item => item !== null)) return null
   const z = finiteNumber(value.z)
   return z === null ? { x, y, yaw } : { x, y, yaw, z }
+}
+
+function normalizeRtkSample(value) {
+  if (!value || typeof value !== 'object') return null
+  return {
+    sampleStampNs: finiteNumber(value.sample_stamp_ns ?? value.sampleStampNs),
+    quality: value.quality || 'unknown',
+    usable: value.usable === true,
+    headingUsable: value.heading_usable === true || value.headingUsable === true,
+    goodForNavigation: value.good_for_navigation === true || value.goodForNavigation === true,
+    blockedReason: value.blocked_reason || value.blockedReason || '',
+    mapX: finiteNumber(value.map_x ?? value.mapX),
+    mapY: finiteNumber(value.map_y ?? value.mapY),
+    mapYaw: finiteNumber(value.map_yaw ?? value.mapYaw),
+    latitude: finiteNumber(value.latitude),
+    longitude: finiteNumber(value.longitude),
+    altitude: finiteNumber(value.altitude),
+    positionAgeSeconds: finiteNumber(value.position_age_s ?? value.positionAgeSeconds),
+    horizontalStdM: finiteNumber(value.horizontal_std_m ?? value.horizontalStdM),
+    fixStatus: value.fix_status ?? value.fixStatus ?? null,
+    solutionStatus: value.solution_status ?? value.solutionStatus ?? null,
+    positionType: value.position_type ?? value.positionType ?? null,
+    solutionSatellites: finiteNumber(value.solution_satellites ?? value.solutionSatellites),
+    headingStatus: value.heading_status ?? value.headingStatus ?? null,
+    headingType: value.heading_type ?? value.headingType ?? null,
+    headingDeg: finiteNumber(value.heading_deg ?? value.headingDeg),
+    headingStdDeg: finiteNumber(value.heading_std_deg ?? value.headingStdDeg),
+    headingBaselineM: finiteNumber(value.heading_baseline_m ?? value.headingBaselineM),
+    headingAgeSeconds: finiteNumber(value.heading_age_s ?? value.headingAgeSeconds),
+    accepted: value.accepted === true,
+    rejectReasons: Array.isArray(value.reject_reasons ?? value.rejectReasons)
+      ? [...(value.reject_reasons ?? value.rejectReasons)]
+      : [],
+  }
+}
+
+function normalizeRtkVerification(value) {
+  if (!value || typeof value !== 'object') return null
+  const handoff = value.handoff && typeof value.handoff === 'object'
+    ? {
+        status: value.handoff.status || '',
+        conclusionCode: value.handoff.conclusion_code || value.handoff.conclusionCode || '',
+        conclusion: value.handoff.conclusion || '',
+        activeSource: value.handoff.active_source || value.handoff.activeSource || '',
+        handoffState: value.handoff.handoff_state || value.handoff.handoffState || '',
+        lioHealthy: value.handoff.lio_healthy === true || value.handoff.lioHealthy === true,
+        lioAnchored: value.handoff.lio_anchored === true || value.handoff.lioAnchored === true,
+        absoluteStable: value.handoff.absolute_stable === true || value.handoff.absoluteStable === true,
+      }
+    : null
+  return {
+    status: value.status || '',
+    verified: value.verified === true,
+    conclusionCode: value.conclusion_code || value.conclusionCode || '',
+    conclusion: value.conclusion || '',
+    source: value.source || '',
+    sampleCount: Number(value.sample_count ?? value.sampleCount ?? 0),
+    stableFrames: Number(value.stable_frames ?? value.stableFrames ?? 0),
+    requiredStableFrames: Number(value.required_stable_frames ?? value.requiredStableFrames ?? 0),
+    spanM: finiteNumber(value.span_m ?? value.spanM),
+    thresholdM: finiteNumber(value.threshold_xy_m ?? value.thresholdM),
+    timedOut: value.timed_out === true || value.timedOut === true,
+    checks: value.checks && typeof value.checks === 'object' ? value.checks : {},
+    lastSample: normalizeRtkSample(value.last_sample || value.lastSample),
+    sampleHistory: Array.isArray(value.sample_history ?? value.sampleHistory)
+      ? (value.sample_history ?? value.sampleHistory).map(normalizeRtkSample).filter(Boolean)
+      : [],
+    handoff,
+  }
+}
+
+export function rtkVerificationConclusionLabel(verification) {
+  if (!verification) return ''
+  return RTK_VERIFICATION_CONCLUSION_LABELS[verification.conclusionCode]
+    || verification.conclusion
+    || verification.conclusionCode
+    || '等待验证结论'
+}
+
+export function rtkVerificationReasonLabel(reason) {
+  const value = String(reason || '').trim()
+  return RTK_VERIFICATION_REASON_LABELS[value] || value
+}
+
+export function formatRtkVerificationSummary(verification) {
+  if (!verification) return '等待 RTK 固定解验证数据'
+  const sample = verification.lastSample || {}
+  const quality = sample.quality === 'fixed'
+    ? '固定解'
+    : (sample.quality === 'float' ? '浮点解' : (sample.quality || '未知解'))
+  const parts = [
+    `解状态 ${quality}`,
+    `位置${sample.usable ? '可用' : '不可用'}`,
+    `航向${sample.headingUsable ? '可用' : '不可用'}`,
+    `稳定样本 ${verification.stableFrames}/${verification.requiredStableFrames}`,
+  ]
+  if (verification.spanM !== null || verification.thresholdM !== null) {
+    parts.push(`位置跨度 ${formatAttemptMetric(verification.spanM)} / ${formatAttemptMetric(verification.thresholdM)} m`)
+  }
+  parts.push(`结论：${rtkVerificationConclusionLabel(verification)}`)
+  return parts.join(' · ')
 }
 
 function firstTimestamp(...values) {
@@ -185,6 +306,17 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
   const attemptSource = Array.isArray(raw.attempts)
     ? raw.attempts
     : (Array.isArray(result.attempts) ? result.attempts : [])
+  const rawStages = Array.isArray(raw.stages)
+    ? raw.stages
+    : (Array.isArray(result.stages) ? result.stages : [])
+  const rtkStage = rawStages.find(record => canonicalTimelineStage(record?.stage) === 'rtk_fixed')
+  const rtkVerification = normalizeRtkVerification(
+    raw.rtk_verification
+      || result.rtk_verification
+      || rtkStage?.rtk_verification
+      || raw.rtk_stability
+      || result.rtk_stability,
+  )
   const phase = extras.phase
     || (String(command.command_type || extras.commandType || '') === 'map.activate' ? 'transfer' : 'localization')
   const showCandidates = extras.showCandidates !== false && phase !== 'transfer'
@@ -216,6 +348,7 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     ),
     activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
+    rtkVerification,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     strategy: Array.isArray(raw.strategy)
       ? raw.strategy
@@ -248,7 +381,8 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
   }
   const score = finiteNumber(session.bestNdtCandidate?.matching_error)
   session.optimalVerified = Boolean(
-    session.rtkDrift?.verified
+    session.rtkVerification?.verified
+    || session.rtkDrift?.verified
     || (session.bestNdtCommitted && score !== null && score < 0.01),
   )
   return withAttemptMarkerExpiry(session)
@@ -277,6 +411,7 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     activeCandidateNumber: null,
     activeCandidateStage: '',
     rtkDrift: null,
+    rtkVerification: null,
     bestNdtCommitted: false,
     optimalVerified: false,
     strategy: [],
@@ -357,10 +492,15 @@ function inferredStageStatus(session, stageKey, attempts, stageRecord) {
   return 'waiting'
 }
 
-function timelineDetail(stageKey, status, attempts, session) {
+function timelineDetail(stageKey, status, attempts, session, stageRecord = null) {
   const meta = TIMELINE_STAGE_META[stageKey] || { title: stageKey, detail: '' }
   if (stageKey === 'map_transfer' && session?.phase === 'transfer') {
     return status === 'done' ? '地图下发并应用完成' : '正在等待机器狗确认地图命令'
+  }
+  if (stageKey === 'rtk_fixed') {
+    const verification = normalizeRtkVerification(stageRecord?.rtk_verification)
+      || session?.rtkVerification
+    return formatRtkVerificationSummary(verification)
   }
   if (attempts.length) {
     const active = attempts.find(attempt => (
@@ -483,7 +623,7 @@ export function localizationAttemptTimeline(session) {
     timeline.push({
       key,
       title: meta.title,
-      detail: detail || timelineDetail(key, status, attempts, session),
+      detail: detail || timelineDetail(key, status, attempts, session, record),
       status: timelineStatusClass(status),
       statusLabel: timelineStatusLabel(status, key),
       attempts,
@@ -521,7 +661,7 @@ export function localizationAttemptTimeline(session) {
   ;(session.strategy || []).forEach(addStageKey)
   ;(session.stages || []).forEach(record => addStageKey(record?.stage))
   ;(session.attempts || []).forEach(attempt => addStageKey(attempt?.stage))
-  if (session.rtkDrift && !stageKeys.includes('rtk_fixed')) stageKeys.unshift('rtk_fixed')
+  if ((session.rtkVerification || session.rtkDrift) && !stageKeys.includes('rtk_fixed')) stageKeys.unshift('rtk_fixed')
   if (!stageKeys.length) stageKeys.push('mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match')
 
   stageKeys.forEach(key => {
@@ -531,7 +671,7 @@ export function localizationAttemptTimeline(session) {
       key,
       inferredStageStatus(session, key, attempts, record),
       attempts,
-      record?.error_message || record?.message || '',
+      key === 'rtk_fixed' ? '' : (record?.error_message || record?.message || ''),
       record,
     )
   })

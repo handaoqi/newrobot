@@ -9,11 +9,13 @@ import {
   beginStoredAttemptSession,
   emptyAttemptSession,
   formatAttemptPose,
+  formatRtkVerificationSummary,
   localizationAttemptTimeline,
   localizationAttemptFailureMessage,
   isAttemptSessionTerminal,
   localizationAttemptSessionFromCommand,
   shouldShowAttemptMarkers,
+  rtkVerificationConclusionLabel,
   updateStoredAttemptSession,
   withAttemptMarkerExpiry,
 } from '../src/services/localizationAttemptSession.js'
@@ -463,4 +465,73 @@ test('only strict NDT or verified RTK results qualify as optimal markers', () =>
     result_payload: { rtk_drift: { xy_m: 0.29, verified: true } },
   })
   assert.equal(rtk.optimalVerified, true)
+})
+
+test('RTK fixed verification keeps concrete samples, rejection conclusion, and LIO handoff', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-rtk-details',
+    command_type: 'nav.initial_pose',
+    status: 'succeeded',
+    result_payload: {
+      localization_attempts: {
+        state: 'accepted',
+        selected_stage: 'rtk_fixed',
+        strategy: ['rtk_fixed'],
+        stages: [{
+          stage: 'rtk_fixed',
+          status: 'accepted',
+          rtk_verification: {
+            status: 'accepted',
+            verified: true,
+            conclusion_code: 'fixed_rtk_verified',
+            sample_count: 3,
+            stable_frames: 3,
+            required_stable_frames: 3,
+            span_m: 0.08,
+            threshold_xy_m: 0.30,
+            last_sample: {
+              sample_stamp_ns: 103,
+              quality: 'fixed',
+              usable: true,
+              heading_usable: true,
+              map_x: 10.05,
+              map_y: 2.06,
+              latitude: 31.1234567,
+              longitude: 121.7654321,
+              horizontal_std_m: 0.012,
+              solution_satellites: 24,
+              heading_deg: 93.2,
+              heading_std_deg: 0.4,
+              accepted: true,
+              reject_reasons: [],
+            },
+            sample_history: [
+              { sample_stamp_ns: 101, quality: 'float', usable: true, heading_usable: false, reject_reasons: ['fixed_quality', 'heading_usable'] },
+              { sample_stamp_ns: 103, quality: 'fixed', usable: true, heading_usable: true, map_x: 10.05, map_y: 2.06, accepted: true },
+            ],
+            handoff: {
+              status: 'accepted',
+              conclusion_code: 'lio_imu_handoff_verified',
+              active_source: 'lio_imu',
+              lio_healthy: true,
+              lio_anchored: true,
+              absolute_stable: true,
+            },
+          },
+        }],
+      },
+    },
+  })
+
+  assert.equal(session.rtkVerification.verified, true)
+  assert.equal(session.rtkVerification.lastSample.quality, 'fixed')
+  assert.equal(session.rtkVerification.lastSample.solutionSatellites, 24)
+  assert.deepEqual(session.rtkVerification.sampleHistory[0].rejectReasons, ['fixed_quality', 'heading_usable'])
+  assert.equal(session.rtkVerification.handoff.activeSource, 'lio_imu')
+  assert.equal(rtkVerificationConclusionLabel(session.rtkVerification), 'RTK 固定解验证通过')
+  assert.match(formatRtkVerificationSummary(session.rtkVerification), /稳定样本 3\/3/)
+  assert.match(
+    localizationAttemptTimeline(session).find(step => step.key === 'rtk_fixed').detail,
+    /结论：RTK 固定解验证通过/,
+  )
 })

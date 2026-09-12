@@ -547,34 +547,173 @@ def test_quick_then_global_failure_keeps_each_rejected_ndt_measurement():
     assert progress[-1]["state"] == "failed"
 
 
-def test_rtk_drift_verification_requires_fresh_consecutive_samples_below_threshold():
+def test_quick_then_global_keeps_failed_rtk_verification_details_during_fallback():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_quick_search_seconds=30.0,
+        localization_optimal_ndt_score=0.01,
+    )
+    adapter._start_localization_operation = lambda *_args, **_kwargs: 7
+    adapter._assert_localization_operation = lambda _generation: None
+    verification = {
+        "status": "rejected",
+        "verified": False,
+        "conclusion_code": "fixed_quality",
+        "last_sample": {"quality": "float", "usable": True},
+    }
+    adapter._set_initial_pose_from_rtk_once = lambda *_args: (_ for _ in ()).throw(
+        ProtocolError(
+            "RTK_FIXED_NOT_STABLE",
+            "RTK was not fixed",
+            details={"rtk_verification": verification},
+        )
+    )
+    adapter.latest_trusted_pose = lambda: None
+    adapter._current_live_pose = lambda: None
+    adapter._global_relocalize_once = lambda *_args: {
+        "localized_pose": {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.0},
+        "motion_commanded": False,
+    }
+    progress = []
+    adapter._report_localization_attempts = lambda payload, **_kwargs: progress.append(payload)
+
+    result = adapter.quick_then_global_relocalize(
+        origin=None,
+        scene_scope="outdoor",
+        coordinate_mode="rtk_fixed",
+        wait_seconds=60.0,
+    )
+
+    assert result["stages"][0]["error_code"] == "RTK_FIXED_NOT_STABLE"
+    assert result["stages"][0]["rtk_verification"] == verification
+    fallback_progress = next(
+        payload for payload in progress if payload.get("selected_stage") == "keyframe_global_match"
+    )
+    assert fallback_progress["rtk_verification"] == verification
+
+
+def test_fixed_rtk_verification_uses_rtk_self_span_not_lio_drift():
     adapter = object.__new__(RosAdapter)
     adapter.safety_config = SimpleNamespace(
         localization_rtk_max_drift_m=0.30,
         localization_rtk_required_samples=3,
     )
     adapter._assert_localization_operation = lambda _generation: None
+    adapter.telemetry = SimpleNamespace(localization_diagnostics=lambda: {
+        "raw_rtk": {
+            "latitude": 31.1234567,
+            "longitude": 121.7654321,
+            "altitude": 8.2,
+            "horizontal_std_m": 0.012,
+            "solution_status": 0,
+            "position_type": 50,
+            "solution_satellites": 24,
+            "heading": {
+                "status": 0,
+                "type": 50,
+                "heading_deg": 93.2,
+                "heading_std_deg": 0.4,
+                "baseline_m": 0.8,
+            },
+        },
+        "time_diagnostics": {"rtk": {"sample_age_seconds": 0.12}},
+    })
+    progress = []
     samples = iter([
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_drift": {"sample_stamp_ns": 10, "source": "aligned_fast_lio", "xy_m": 0.31}},
+         "rtk_x": 10.00, "rtk_y": 2.00,
+         "rtk_drift": {"sample_stamp_ns": 9, "xy_m": 8.0}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_drift": {"sample_stamp_ns": 11, "source": "aligned_fast_lio", "xy_m": 0.20}},
+         "rtk_x": 10.00, "rtk_y": 2.00,
+         "rtk_drift": {"sample_stamp_ns": 10, "xy_m": 8.0}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_drift": {"sample_stamp_ns": 12, "source": "aligned_fast_lio", "xy_m": 0.19}},
+         "rtk_x": 10.08, "rtk_y": 2.03,
+         "rtk_drift": {"sample_stamp_ns": 11, "xy_m": 8.2}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_drift": {"sample_stamp_ns": 13, "source": "aligned_fast_lio", "xy_m": 0.18}},
+         "rtk_x": 10.05, "rtk_y": 2.06,
+         "rtk_drift": {"sample_stamp_ns": 12, "xy_m": 8.1}},
     ])
     adapter._localization_decision = lambda: next(samples)
 
-    result = adapter._wait_for_verified_rtk_drift(
+    result = adapter._wait_for_verified_fixed_rtk(
         timeout_seconds=1.0,
         generation=7,
-        after_stamp_ns=9,
+        on_update=lambda payload: progress.append(payload),
     )
 
     assert result["verified"] is True
     assert result["stable_frames"] == 3
-    assert result["xy_m"] == pytest.approx(0.18)
+    assert result["span_m"] < 0.30
+    assert result["source"] == "rtk_self_stability"
+    assert result["conclusion_code"] == "fixed_rtk_verified"
+    assert result["sample_count"] == 3
+    assert result["last_sample"]["quality"] == "fixed"
+    assert result["last_sample"]["map_x"] == pytest.approx(10.05)
+    assert result["last_sample"]["latitude"] == pytest.approx(31.1234567)
+    assert result["last_sample"]["horizontal_std_m"] == pytest.approx(0.012)
+    assert result["last_sample"]["solution_satellites"] == 24
+    assert result["last_sample"]["heading_std_deg"] == pytest.approx(0.4)
+    assert result["last_sample"]["position_age_s"] == pytest.approx(0.12)
+    assert result["last_sample"]["accepted"] is True
+    assert len(result["sample_history"]) == 3
+    assert progress[-1]["verified"] is True
+
+
+def test_fixed_rtk_verification_reports_concrete_rejection_and_timeout():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_rtk_max_drift_m=0.30,
+        localization_rtk_required_samples=3,
+    )
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._localization_decision = lambda: {
+        "rtk_usable": True,
+        "rtk_quality": "float",
+        "rtk_heading_usable": False,
+        "rtk_x": 3.2,
+        "rtk_y": -1.4,
+        "rtk_blocked_reason": "fixed_rtk_required",
+        "rtk_drift": {"sample_stamp_ns": 20},
+    }
+
+    result = adapter._wait_for_verified_fixed_rtk(
+        timeout_seconds=0.01,
+        generation=7,
+    )
+
+    assert result["verified"] is False
+    assert result["status"] == "rejected"
+    assert result["timed_out"] is True
+    assert result["conclusion_code"] == "fixed_quality"
+    assert result["last_sample"]["quality"] == "float"
+    assert result["last_sample"]["blocked_reason"] == "fixed_rtk_required"
+    assert result["last_sample"]["reject_reasons"] == [
+        "fixed_quality",
+        "heading_usable",
+    ]
+
+
+def test_lio_handoff_requires_a_new_ready_generation():
+    adapter = object.__new__(RosAdapter)
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter.telemetry = SimpleNamespace(
+        latest_pose=lambda: SimpleNamespace(localization_status=3, x=1.0, y=2.0)
+    )
+    adapter._localization_decision = lambda: {
+        "handoff_anchor_generation": 5,
+        "handoff_state": "ready",
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "lio_anchored": True,
+        "absolute_stable": True,
+    }
+
+    latest, decision = adapter._wait_for_lio_handoff(
+        after_generation=4, timeout_seconds=0.01, generation=7
+    )
+
+    assert latest.x == 1.0
+    assert decision["active_source"] == "lio_imu"
 
 
 def test_active_relocalize_executes_the_one_meter_candidates():
