@@ -56,6 +56,10 @@ from .models import (
 
 from .services.map_coordinate import MapConstraintError, constraints_from_map_data, validate_route_against_map
 from .services.navigation_boundary_service import validate_waypoints_against_boundary
+from .services.trajectory_distance_service import (
+    calculate_loop_total_distance,
+    stored_loop_total_distance,
+)
 
 
 def _snapshot_path(snapshot_url: str) -> Path | None:
@@ -1572,6 +1576,7 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
     task_name = serializers.CharField(source="task.name", read_only=True)
     current_execution_detail = TaskExecutionSerializer(source="current_execution", read_only=True)
     recent_events = serializers.SerializerMethodField()
+    total_distance_m = serializers.SerializerMethodField()
 
     class Meta:
         model = PatrolLoopSession
@@ -1589,6 +1594,7 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
             "ends_at",
             "finished_at",
             "current_round",
+            "total_distance_m",
             "current_execution",
             "current_execution_detail",
             "next_action_at",
@@ -1608,6 +1614,12 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
 
     def get_recent_events(self, obj):
         return PatrolLoopEventSerializer(obj.events.order_by("-occurred_at")[:20], many=True).data
+
+    def get_total_distance_m(self, obj):
+        distance = stored_loop_total_distance(obj)
+        if distance is None:
+            distance = calculate_loop_total_distance(obj.id)
+        return format(distance, "f")
 
 
 class PatrolLoopSessionCreateSerializer(serializers.Serializer):

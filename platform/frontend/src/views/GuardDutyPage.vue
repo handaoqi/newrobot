@@ -250,6 +250,8 @@ const displayedTotalDistance = computed(() => {
     loopAccumulatedDistance: loopAccumulatedDistance.value,
     loopCountedExecutionIds: loopCountedExecutionIds.value,
     loopCurrentExecutionId: loopCurrentExecutionId.value,
+    serverLoopSessionId: serverLoopSession.value?.id,
+    serverTotalDistance: serverLoopSession.value?.total_distance_m,
   })
 })
 const elapsedMilliseconds = computed(() => {

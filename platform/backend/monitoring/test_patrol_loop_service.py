@@ -98,6 +98,7 @@ class PatrolLoopServiceTests(TestCase):
         session = PatrolLoopSession.objects.get(pk=session_id)
         self.assertEqual(session.state, "running")
         self.assertEqual(session.current_round, 1)
+        self.assertEqual(response.data["total_distance_m"], "0.000000")
         self.assertEqual(session.current_execution.loop_session_id, session.id)
         self.assertTrue(session.current_execution.commands.filter(command_type="task.start").exists())
 

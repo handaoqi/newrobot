@@ -160,6 +160,7 @@ class PatrolLoopService:
             ends_at=now + timedelta(seconds=duration_seconds),
             next_action_at=now,
             recovery_max_attempts=cls.MAX_RECOVERY_ATTEMPTS,
+            metadata={"total_distance_m": "0.000000"},
             created_by=operator,
         )
         cls._event(session, "loop.created", key="created")

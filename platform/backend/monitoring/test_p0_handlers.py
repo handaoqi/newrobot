@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.test import TestCase
@@ -9,6 +10,7 @@ from .models import (
     InboundMessage,
     InspectionEvent,
     MapData,
+    PatrolLoopSession,
     PatrolRoute,
     PatrolTask,
     RemoteCommand,
@@ -23,6 +25,7 @@ from .models import (
     TrajectoryPoint,
 )
 from .protocol import ProtocolError
+from .serializers import PatrolLoopSessionSerializer
 from .services.command_service import CommandService
 from .services.task_service import TaskExecutionService
 
@@ -560,6 +563,103 @@ class MessageHandlerTests(TestCase):
         duplicate = self.envelope("trajectory.batch", payload, sequence=2)
         handle_mqtt_message("robots/rx-001/telemetry/trajectory", duplicate)
         self.assertEqual(TrajectoryPoint.objects.count(), 2)
+
+    def test_loop_trajectory_batches_accumulate_once_across_rounds(self):
+        loop_id = uuid.uuid4()
+        self.execution.loop_session_id = loop_id
+        self.execution.save(update_fields=["loop_session_id", "updated_at"])
+        loop = PatrolLoopSession.objects.create(
+            id=loop_id,
+            robot=self.robot,
+            task=self.execution.task,
+            route_snapshot={},
+            state="running",
+            duration_seconds=600,
+            ends_at=timezone.now() + timezone.timedelta(minutes=10),
+            current_round=1,
+            current_execution=self.execution,
+        )
+
+        tail_payload = {
+            "task_execution_id": str(self.execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(uuid.uuid4()),
+            "first_seq": 2,
+            "last_seq": 2,
+            "points": [
+                {"seq": 2, "sampled_at": timezone.now().isoformat(), "x": 6.0, "y": 8.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+            ],
+        }
+        handle_mqtt_message(
+            "robots/rx-001/telemetry/trajectory",
+            self.envelope("trajectory.batch", tail_payload),
+        )
+
+        first_batch_id = uuid.uuid4()
+        first_payload = {
+            "task_execution_id": str(self.execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(first_batch_id),
+            "first_seq": 0,
+            "last_seq": 1,
+            "points": [
+                {"seq": 0, "sampled_at": timezone.now().isoformat(), "x": 0.0, "y": 0.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+                {"seq": 1, "sampled_at": timezone.now().isoformat(), "x": 3.0, "y": 4.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+            ],
+        }
+        handle_mqtt_message(
+            "robots/rx-001/telemetry/trajectory",
+            self.envelope("trajectory.batch", first_payload),
+        )
+        handle_mqtt_message(
+            "robots/rx-001/telemetry/trajectory",
+            self.envelope("trajectory.batch", first_payload, sequence=2),
+        )
+
+        self.execution.state = "completed"
+        self.execution.finished_at = timezone.now()
+        self.execution.save(update_fields=["state", "finished_at", "updated_at"])
+        second_execution = TaskExecution.objects.create(
+            task=self.execution.task,
+            robot=self.robot,
+            route=self.execution.route,
+            map_data=self.execution.map_data,
+            route_snapshot=self.execution.route_snapshot,
+            loop_session_id=loop_id,
+            round_number=2,
+        )
+        loop.current_round = 2
+        loop.current_execution = second_execution
+        loop.save(update_fields=["current_round", "current_execution", "updated_at"])
+        second_payload = {
+            "task_execution_id": str(second_execution.id),
+            "map_id": "1",
+            "map_version": "v1",
+            "frame_id": "map",
+            "batch_id": str(uuid.uuid4()),
+            "first_seq": 0,
+            "last_seq": 1,
+            "points": [
+                {"seq": 0, "sampled_at": timezone.now().isoformat(), "x": 0.0, "y": 0.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+                {"seq": 1, "sampled_at": timezone.now().isoformat(), "x": 0.0, "y": 6.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+            ],
+        }
+        handle_mqtt_message(
+            "robots/rx-001/telemetry/trajectory",
+            self.envelope("trajectory.batch", second_payload, sequence=3),
+        )
+
+        loop.refresh_from_db()
+        self.assertEqual(Decimal(loop.metadata["total_distance_m"]), Decimal("16.000000"))
+        loop.metadata = {}
+        self.assertEqual(
+            PatrolLoopSessionSerializer(loop).data["total_distance_m"],
+            "16.000000",
+        )
 
     def test_trajectory_ack_is_published_after_commit(self):
         payload = {

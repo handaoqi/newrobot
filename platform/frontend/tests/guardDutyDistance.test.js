@@ -29,6 +29,33 @@ test('falls back to a trajectory that arrived after a zero loop capture', () => 
   }), 24.02)
 })
 
+test('uses the center loop authoritative accumulated distance across rounds', () => {
+  assert.equal(displayedGuardDutyDistance({
+    currentDistance: 10.6,
+    currentExecutionId: 'execution-2',
+    executionLoopSessionId: 'loop-1',
+    loopStartedAt: 100,
+    loopSessionId: 'loop-1',
+    loopActive: true,
+    loopAccumulatedDistance: 0,
+    serverLoopSessionId: 'loop-1',
+    serverTotalDistance: '21.200000',
+  }), 21.2)
+})
+
+test('ignores an authoritative distance from a stale loop session', () => {
+  assert.equal(displayedGuardDutyDistance({
+    currentDistance: 7.5,
+    currentExecutionId: 'execution-new',
+    loopStartedAt: 100,
+    loopSessionId: 'loop-new',
+    loopActive: true,
+    loopCurrentExecutionId: 'execution-new',
+    serverLoopSessionId: 'loop-old',
+    serverTotalDistance: '42.000000',
+  }), 7.5)
+})
+
 test('stale loop state does not replace a normal execution distance', () => {
   assert.equal(displayedGuardDutyDistance({
     currentDistance: 8.5,

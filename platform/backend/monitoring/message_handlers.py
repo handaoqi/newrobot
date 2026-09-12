@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 from collections.abc import Callable
 
 from django.conf import settings
@@ -22,6 +22,7 @@ from .models import (
     TrajectoryPoint,
     DebugLogSession,
     MapNavigationBoundary,
+    PatrolLoopSession,
 )
 from .protocol import MessageEnvelope, ProtocolError, parse_message
 from .realtime_gateway import realtime_publisher
@@ -31,6 +32,7 @@ from .services.task_service import TaskExecutionService, TaskStateError
 from .services.patrol_loop_service import PatrolLoopService
 from .services.telemetry_service import TelemetryService
 from .services.system_log_service import emit_center_log, ingest_batch
+from .services.trajectory_distance_service import update_patrol_loop_distance
 from .services.sqlite_retry import is_sqlite_lock_error, with_sqlite_lock_retry
 from .services import tts_service
 from .services.alert_skill_service import resolve_alert_template
@@ -1009,6 +1011,13 @@ def _handle_trajectory(
             execution = TaskExecution.objects.get(pk=payload["task_execution_id"], robot=robot)
         except TaskExecution.DoesNotExist as exc:
             raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
+        loop_session = None
+        if execution.loop_session_id:
+            loop_session = (
+                PatrolLoopSession.objects.select_for_update()
+                .filter(pk=execution.loop_session_id)
+                .first()
+            )
         points = [
             TrajectoryPoint(
                 robot=robot,
@@ -1044,6 +1053,8 @@ def _handle_trajectory(
             if receipt is None:
                 raise
             duplicate = True
+        if not duplicate:
+            update_patrol_loop_distance(loop_session, execution, batch_id)
         result = _trajectory_result(receipt, duplicate=duplicate)
         transaction.on_commit(
             lambda: _publish_trajectory_ack(robot, envelope, result, publish_response)

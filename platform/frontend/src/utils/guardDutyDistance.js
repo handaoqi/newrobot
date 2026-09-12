@@ -55,10 +55,21 @@ export function displayedGuardDutyDistance({
   loopAccumulatedDistance = 0,
   loopCountedExecutionIds = [],
   loopCurrentExecutionId = '',
+  serverLoopSessionId = '',
+  serverTotalDistance = null,
 } = {}) {
   const current = Number(currentDistance)
   const safeCurrent = Number.isFinite(current) && current >= 0 ? current : 0
   if (!loopStartedAt) return safeCurrent
+
+  const authoritative = Number(serverTotalDistance)
+  const hasAuthoritativeDistance = serverTotalDistance !== null
+    && serverTotalDistance !== ''
+    && Number.isFinite(authoritative)
+    && authoritative >= 0
+    && loopSessionId
+    && String(serverLoopSessionId || '') === String(loopSessionId)
+  if (hasAuthoritativeDistance) return authoritative
 
   const executionId = String(currentExecutionId || '')
   const counted = loopCountedExecutionIds.map(String).includes(executionId)
