@@ -2745,8 +2745,61 @@ class MapDataSceneSemanticsView(APIView):
         except (TypeError, ValueError):
             previous_revision = 0
         normalized["revision"] = str(previous_revision + 1)
-        normalized["status"] = "ready"
+        normalized["status"] = "review" if normalized.get("review_candidates") else "ready"
         scene["scene_semantics"] = normalized
+        scene["static_assets"] = instances
+        description["scene_manifest"] = scene
+        map_data.description = json.dumps(description, ensure_ascii=False)
+        map_data.save(update_fields=["description", "updated_at"])
+        return Response(build_scene_manifest(map_data), status=status.HTTP_200_OK)
+
+
+class MapDataSceneSemanticsStatusView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        manifest = build_scene_manifest(map_data)
+        return Response({"map_id": pk, "semantic_build": manifest["semantic_build"], "semantic_review": manifest["semantic_review"]})
+
+
+class MapDataSceneSemanticsReviewView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        description = _parse_map_description(map_data)
+        scene = description.get("scene_manifest") if isinstance(description.get("scene_manifest"), dict) else {}
+        semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
+        candidates = semantics.get("review_candidates") if isinstance(semantics.get("review_candidates"), list) else []
+        candidate_id = str(request.data.get("candidate_id") or "").strip()
+        action = str(request.data.get("action") or "").strip().lower()
+        candidate = next((item for item in candidates if isinstance(item, dict) and str(item.get("id") or "") == candidate_id), None)
+        if not candidate:
+            return Response({"detail": "未找到待审核的候选目标"}, status=status.HTTP_404_NOT_FOUND)
+        if action not in {"approve", "reject"}:
+            return Response({"detail": "action 必须是 approve 或 reject"}, status=status.HTTP_400_BAD_REQUEST)
+        remaining = [item for item in candidates if item is not candidate]
+        instances = semantics.get("instances") if isinstance(semantics.get("instances"), list) else []
+        if action == "approve":
+            approved = dict(candidate)
+            approved["review_state"] = "approved"
+            if request.data.get("asset_id"):
+                approved["asset_id"] = str(request.data["asset_id"])
+            instances.append(approved)
+        else:
+            rejected = dict(candidate)
+            rejected["review_state"] = "rejected"
+            instances.append(rejected)
+        semantics = dict(semantics)
+        semantics["instances"] = instances
+        semantics["review_candidates"] = remaining
+        semantics["status"] = "review" if remaining else "ready"
+        try:
+            semantics["revision"] = str(int(semantics.get("revision") or 0) + 1)
+        except (TypeError, ValueError):
+            semantics["revision"] = "1"
+        scene["scene_semantics"] = semantics
         scene["static_assets"] = instances
         description["scene_manifest"] = scene
         map_data.description = json.dumps(description, ensure_ascii=False)
@@ -4282,6 +4335,8 @@ class PatrolRouteExecuteView(APIView):
             PatrolRoute.objects.select_related("robot", "map_data"),
             pk=pk,
         )
+        if record_rosbag is None:
+            record_rosbag = bool(route.record_rosbag)
         existing = _existing_loop_execution(loop_session_id, round_number)
         if existing is not None:
             return _task_execution_response(existing, False)
@@ -4298,6 +4353,7 @@ class PatrolRouteExecuteView(APIView):
                 scheduled_start=now,
                 scheduled_end=now + timezone.timedelta(hours=1),
                 enabled=True,
+                record_rosbag=record_rosbag,
                 description="路径规划页面直接执行路线自动创建",
                 created_by=request.user if request.user.is_authenticated else None,
             )
@@ -4307,7 +4363,8 @@ class PatrolRouteExecuteView(APIView):
             task.scheduled_start = now
             task.scheduled_end = now + timezone.timedelta(hours=1)
             task.enabled = True
-            task.save(update_fields=["robot", "route_name", "scheduled_start", "scheduled_end", "enabled", "updated_at"])
+            task.record_rosbag = record_rosbag
+            task.save(update_fields=["robot", "route_name", "scheduled_start", "scheduled_end", "enabled", "record_rosbag", "updated_at"])
 
         readiness_error = validate_task_execution_readiness(task)
         if readiness_error is not None:

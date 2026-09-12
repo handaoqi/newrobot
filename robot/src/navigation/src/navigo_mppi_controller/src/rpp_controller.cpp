@@ -30,10 +30,15 @@ void RPPController::configure(
   parameter(min_linear_vel_, "min_linear_vel", min_linear_vel_);
   parameter(lookahead_dist_, "lookahead_dist", lookahead_dist_);
   parameter(min_lookahead_dist_, "min_lookahead_dist", min_lookahead_dist_);
+  parameter(max_lookahead_dist_, "max_lookahead_dist", max_lookahead_dist_);
+  parameter(lookahead_time_, "lookahead_time", lookahead_time_);
+  parameter(use_velocity_scaled_lookahead_dist_, "use_velocity_scaled_lookahead_dist", use_velocity_scaled_lookahead_dist_);
   parameter(max_angular_vel_, "max_angular_vel", max_angular_vel_);
   parameter(rotate_to_heading_threshold_, "rotate_to_heading_threshold", rotate_to_heading_threshold_);
   parameter(rotate_to_heading_angular_vel_, "rotate_to_heading_angular_vel", rotate_to_heading_angular_vel_);
   parameter(curvature_speed_regulation_, "curvature_speed_regulation", curvature_speed_regulation_);
+  parameter(use_regulated_linear_velocity_scaling_, "use_regulated_linear_velocity_scaling", curvature_speed_regulation_);
+  parameter(angular_deadband_, "angular_deadband", angular_deadband_);
   RCLCPP_INFO(logger_, "Configured RPP controller: %s", name_.c_str());
 }
 
@@ -64,7 +69,7 @@ void RPPController::setSpeedLimit(const double & speed_limit, const bool & perce
 
 geometry_msgs::msg::TwistStamped RPPController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & robot_pose,
-  const geometry_msgs::msg::Twist &,
+  const geometry_msgs::msg::Twist & robot_speed,
   navigo_core::GoalChecker * goal_checker)
 {
   geometry_msgs::msg::TwistStamped command;
@@ -89,7 +94,11 @@ geometry_msgs::msg::TwistStamped RPPController::computeVelocityCommands(
     }
   }
 
-  const auto lookahead = std::max(min_lookahead_dist_, lookahead_dist_);
+  const auto speed_lookahead = std::abs(robot_speed.linear.x) * lookahead_time_;
+  const auto requested_lookahead = use_velocity_scaled_lookahead_dist_
+    ? std::max(lookahead_dist_, speed_lookahead) : lookahead_dist_;
+  const auto lookahead = std::clamp(
+    requested_lookahead, min_lookahead_dist_, std::max(min_lookahead_dist_, max_lookahead_dist_));
   size_t target = nearest;
   for (size_t i = nearest; i < plan_.poses.size(); ++i) {
     const auto dx = plan_.poses[i].pose.position.x - robot_pose.pose.position.x;
@@ -116,12 +125,15 @@ geometry_msgs::msg::TwistStamped RPPController::computeVelocityCommands(
   const auto distance = std::max(std::hypot(dx, dy), min_lookahead_dist_);
   const auto curvature = 2.0 * std::sin(heading_error) / distance;
   auto speed = desired_linear_vel_ * speed_limit_scale_;
-  if (curvature_speed_regulation_) {
+  if (use_regulated_linear_velocity_scaling_ || curvature_speed_regulation_) {
     speed /= 1.0 + 2.0 * std::abs(curvature);
   }
   speed = std::clamp(speed, min_linear_vel_ * speed_limit_scale_, desired_linear_vel_ * speed_limit_scale_);
   command.twist.linear.x = speed;
   command.twist.angular.z = std::clamp(curvature * speed, -max_angular_vel_, max_angular_vel_);
+  if (std::abs(command.twist.angular.z) < angular_deadband_) {
+    command.twist.angular.z = 0.0;
+  }
   return command;
 }
 

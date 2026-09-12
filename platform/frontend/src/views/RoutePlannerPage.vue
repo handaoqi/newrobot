@@ -245,6 +245,7 @@ const routeForm = ref({
   robot: null,
   description: '',
   scene_scope: 'indoor',
+  record_rosbag: false,
 })
 const allWaypointsExpanded = computed(() => (
   waypoints.value.length > 0
@@ -636,6 +637,7 @@ async function handleMapSelect(map) {
     robot: routeForm.value.robot || robots.value[0]?.id || map?.robot || 1,
     description: '',
     scene_scope: map?.scene_scope || 'indoor',
+    record_rosbag: false,
   }
   refreshImageGeometry()
   refreshNavigationStatus()
@@ -1347,6 +1349,7 @@ function buildRoutePayload() {
     description: routeForm.value.description,
     scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
     global_controller: DEFAULT_GLOBAL_CONTROLLER,
+    record_rosbag: Boolean(routeForm.value.record_rosbag),
   }
 }
 
@@ -1516,6 +1519,7 @@ async function handleLoadRoute(route) {
   routeForm.value.map_data = hydratedRoute.map_data
   routeForm.value.map_set = hydratedRoute.map_set || null
   routeForm.value.scene_scope = hydratedRoute.scene_scope || routeMap?.scene_scope || 'indoor'
+  routeForm.value.record_rosbag = Boolean(hydratedRoute.record_rosbag)
   if (mapChanged) clearInspectedMapPoints()
   await nextTick()
   const [, detailedMap] = await Promise.all([
@@ -2149,6 +2153,9 @@ async function activeRelocalize() {
       sceneScope,
       coordinateMode,
     })
+    payload.seed_source = 'quick_then_global'
+    payload.scene_scope = sceneScope
+    payload.coordinate_mode = coordinateMode
     const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload, { traceId })
     const completed = await waitForRobotCommand(robotId, command, {
       timeoutMs: progressiveLocalizationTimeoutMs(payload),
@@ -2201,7 +2208,10 @@ async function handleExecuteRoute() {
   routeExecuteBusy.value = true
   navError.value = ''
   try {
-    lastExecution.value = await executeRoute(selectedRoute.value.id, { traceId })
+    lastExecution.value = await executeRoute(selectedRoute.value.id, {
+      recordRosbag: Boolean(selectedRoute.value.record_rosbag),
+      traceId,
+    })
     taskMapExecution.value = lastExecution.value
     taskMapTrajectory.value = []
     syncExecutionTimelineClock(lastExecution.value)
@@ -3283,6 +3293,10 @@ async function handleDeleteRoute(route) {
                   <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
                 </label>
                 <div class="waypoint-actions">
+                  <label class="diagnostic-record-toggle route-record-toggle">
+                    <input v-model="routeForm.record_rosbag" type="checkbox" />
+                    <span>录制导航调试包</span>
+                  </label>
                   <button class="btn btn-primary route-main-action route-save-action" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
                     保存路线
                   </button>
@@ -4745,6 +4759,18 @@ async function handleDeleteRoute(route) {
 .route-last-execution {
   display: block;
   margin-top: 0.45rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.route-record-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-right: 0.6rem;
   color: var(--muted);
   font-size: 0.72rem;
 }

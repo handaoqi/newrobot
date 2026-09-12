@@ -98,6 +98,7 @@ from .media_client import MediaClient
 from .origin_lock import OriginLockMonitor, OriginSample
 from .protocol import ProtocolError, now_iso
 from .rtk_origin import build_origin_sample
+from .scene_semantic_runner import SceneSemanticError, run_scene_semantics, write_scene_semantics
 
 
 @dataclass
@@ -165,7 +166,7 @@ class MappingAdapter:
         "frontend.odometry_only:=true",
     )
 
-    def __init__(self, config: MappingConfig, media_client: MediaClient) -> None:
+    def __init__(self, config: MappingConfig, media_client: MediaClient, scene_semantics_config=None) -> None:
         self.config = config
         self.media_client = media_client
         self.map_dir = Path(config.map_dir).expanduser()
@@ -183,6 +184,10 @@ class MappingAdapter:
         self._global_enu_file = self._origin_file.parent / "global_enu.yaml"
         self._post_save_validation_file = self.map_dir / "post_save_validation.json"
         self._post_save_validation_lock = threading.RLock()
+        self._scene_semantics_config = scene_semantics_config
+        self._scene_semantics_lock = threading.RLock()
+        self._scene_semantics_thread: threading.Thread | None = None
+        self._scene_semantics_job: dict = {"status": "unavailable", "message": "未配置点云语义模型"}
         self._origin_state_file = (
             Path(config.origin_state_file).expanduser()
             if config.origin_state_file
@@ -529,6 +534,7 @@ class MappingAdapter:
             result["package_path"] = str(package_path)
             result["mapping_metrics"] = metadata.get("mapping_metrics", {})
             result["upload_result"] = upload_result
+            result["semantic_job"] = self._maybe_start_scene_semantics(work_dir, command, metadata, upload_result)
             return result
 
         if not self._any_slam_process_alive:
@@ -617,11 +623,7 @@ class MappingAdapter:
             raise ProtocolError("SCENE_SEMANTIC_MAP_MISSING", "没有可用于语义处理的本地完整地图")
         sidecar = source_dir / "scene_semantics.json"
         if not sidecar.is_file():
-            return {
-                "status": "unavailable",
-                "reason": "scene_semantics.json 不存在；请先运行 Orin 点云模型推理器",
-                "map_dir": str(source_dir),
-            }
+            return self._start_scene_semantics(source_dir, str(command.get("map_id") or ""), str(command.get("map_sha256") or ""))
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -643,6 +645,81 @@ class MappingAdapter:
             "instance_count": len(instances),
             "upload_result": upload_result,
         }
+
+    def scene_semantics_status(self) -> dict:
+        with self._scene_semantics_lock:
+            return dict(self._scene_semantics_job)
+
+    def _start_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str) -> dict:
+        config = self._scene_semantics_config
+        if config is None or not config.enabled:
+            return {"status": "unavailable", "reason": "scene semantics is disabled", "map_dir": str(source_dir)}
+        with self._scene_semantics_lock:
+            if self._scene_semantics_thread and self._scene_semantics_thread.is_alive():
+                return dict(self._scene_semantics_job)
+            self._scene_semantics_job = {
+                "status": "queued",
+                "map_id": map_id,
+                "map_dir": str(source_dir),
+                "model_version": config.model_version,
+            }
+            self._scene_semantics_thread = threading.Thread(
+                target=self._run_scene_semantics,
+                args=(source_dir, map_id, map_sha256),
+                name="scene-semantic-runner",
+                daemon=True,
+            )
+            self._scene_semantics_thread.start()
+            return dict(self._scene_semantics_job)
+
+    def _run_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str) -> None:
+        config = self._scene_semantics_config
+        with self._scene_semantics_lock:
+            self._scene_semantics_job["status"] = "running"
+        try:
+            payload = run_scene_semantics(
+                source_dir,
+                model_path=config.model_path,
+                model_version=config.model_version,
+                confidence_threshold=config.confidence_threshold,
+                min_support_frames=config.min_support_frames,
+                voxel_size_m=config.voxel_size_m,
+                max_points=config.max_points,
+                asset_catalog_path=config.asset_catalog_path,
+                map_sha256=map_sha256,
+            )
+            sidecar = source_dir / "scene_semantics.json"
+            write_scene_semantics(sidecar, payload)
+            upload_result = self.media_client.upload_scene_semantics(map_id, payload) if map_id else None
+            with self._scene_semantics_lock:
+                self._scene_semantics_job = {
+                    "status": payload.get("status", "ready"),
+                    "map_id": map_id,
+                    "map_dir": str(source_dir),
+                    "model_version": config.model_version,
+                    "instance_count": len(payload.get("instances", [])),
+                    "review_count": len(payload.get("review_candidates", [])),
+                    "upload_result": upload_result,
+                }
+        except (SceneSemanticError, OSError, ValueError) as exc:
+            LOGGER.exception("scene semantic inference failed for %s", source_dir)
+            with self._scene_semantics_lock:
+                self._scene_semantics_job = {
+                    "status": "failed",
+                    "map_id": map_id,
+                    "map_dir": str(source_dir),
+                    "model_version": config.model_version,
+                    "message": str(exc),
+                }
+
+    def _maybe_start_scene_semantics(self, work_dir: Path, command: dict, metadata: dict, upload_result: dict | None) -> dict | None:
+        config = self._scene_semantics_config
+        if config is None or not config.enabled or str(command.get("scene_scope") or self._scene_scope) == "indoor":
+            return None
+        map_id = str((upload_result or {}).get("id") or command.get("map_id") or "")
+        if not map_id:
+            return {"status": "unavailable", "reason": "地图上传结果缺少 map id"}
+        return self._start_scene_semantics(work_dir, map_id, str(metadata.get("package_sha256") or ""))
 
     def _save_active_mapping(self, command: dict) -> dict:
         saved_mapping_type = (
@@ -713,7 +790,9 @@ class MappingAdapter:
                 result["mapping_metrics"] = metadata.get("mapping_metrics", {})
                 if should_upload:
                     self._set_state("uploading")
-                    result["upload_result"] = self.media_client.upload_map_package(str(package_path), metadata)
+                    upload_result = self.media_client.upload_map_package(str(package_path), metadata)
+                    result["upload_result"] = upload_result
+                    result["semantic_job"] = self._maybe_start_scene_semantics(work_dir, command, metadata, upload_result)
         except Exception:
             if should_stop:
                 self._set_state("stopping")

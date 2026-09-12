@@ -610,6 +610,13 @@ export async function fetchMapScene(mapId, { signal } = {}) {
   return request(`/maps/${mapId}/scene/`, { signal })
 }
 
+export async function reviewMapSceneSemantics(mapId, candidateId, action, assetId = '') {
+  return request(`/maps/${mapId}/scene-semantics/review/`, {
+    method: 'POST',
+    body: JSON.stringify({ candidate_id: candidateId, action, ...(assetId ? { asset_id: assetId } : {}) }),
+  })
+}
+
 export async function fetchMapSceneCloud(mapId, { signal } = {}) {
   const token = localStorage.getItem('inspection_token')
   const headers = token ? { Authorization: `Token ${token}` } : {}
@@ -743,22 +750,23 @@ export async function deleteRoute(routeId) {
 }
 
 export async function executeRoute(routeId, {
-  recordRosbag = false,
+  recordRosbag,
   loopExecution = false,
   loopSessionId = null,
   roundNumber = 1,
   loopTotal = 1,
   traceId = '',
 } = {}) {
+  const body = {
+    loop_execution: loopExecution,
+    loop_session_id: loopSessionId,
+    round_number: roundNumber,
+    loop_total: loopTotal,
+  }
+  if (typeof recordRosbag === 'boolean') body.record_rosbag = recordRosbag
   const result = await request(`/routes/${routeId}/execute/`, {
     method: 'POST',
-    body: JSON.stringify({
-      record_rosbag: recordRosbag,
-      loop_execution: loopExecution,
-      loop_session_id: loopSessionId,
-      round_number: roundNumber,
-      loop_total: loopTotal,
-    }), traceId,
+    body: JSON.stringify(body), traceId,
   })
   listCache.invalidate('routes-summary')
   return result

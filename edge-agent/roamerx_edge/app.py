@@ -168,7 +168,7 @@ class EdgeAgentApplication:
         set_trusted_pose_callback = getattr(navigation, "set_trusted_pose_callback", None)
         if callable(set_trusted_pose_callback):
             set_trusted_pose_callback(self._persist_last_trusted_pose)
-        self.mapping_adapter = MappingAdapter(config.mapping, self.media_client)
+        self.mapping_adapter = MappingAdapter(config.mapping, self.media_client, config.scene_semantics)
         self._mapping_divergence_notified = False
         self._mapping_rescue_lock = threading.Lock()
         set_mapping_divergence_callback = getattr(navigation, "set_mapping_divergence_callback", None)

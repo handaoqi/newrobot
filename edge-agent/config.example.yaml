@@ -121,6 +121,21 @@ media:
   device_key: ""
   map_upload_timeout_seconds: 1800
 
+scene_semantics:
+  # Enable after the PTv3 ONNX model and catalog are installed on the Orin.
+  enabled: false
+  model_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1.onnx"
+  engine_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1_fp16.engine"
+  asset_catalog_path: "/home/dogrobot/runtime/nx-edge/install/share/scene-assets/catalog.json"
+  model_version: "ptv3-park-v1"
+  confidence_threshold: 0.80
+  min_support_frames: 3
+  voxel_size_m: 0.10
+  tile_size_m: 20.0
+  tile_overlap_m: 1.0
+  max_points: 1000000
+  nice_level: 10
+
 mapping:
   # Always retain loop candidates for Map Management review, but do not warp
   # the exported navigation map automatically.

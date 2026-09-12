@@ -18,7 +18,7 @@ SCENE_POINT_CAP = 600_000
 SCENE_ASSET_CATALOG_SCHEMA = "roamerx.scene-assets.v1"
 SCENE_ASSET_CATALOG_URL = "/scene-assets/catalog.json"
 _PCD_NAMES = ("scene_preview.pcd", "map.pcd")
-_STATIC_ASSET_CATEGORIES = frozenset(("wall", "building", "tree", "road"))
+_STATIC_ASSET_CATEGORIES = frozenset(("wall", "building", "tree", "road", "barrier", "traffic_cone", "vegetation", "debris"))
 SCENE_SEMANTICS_SCHEMA = "roamerx.scene-semantics.v1"
 
 
@@ -186,7 +186,7 @@ def _scene_static_assets(scene: dict) -> list[dict]:
         if category not in _STATIC_ASSET_CATEGORIES:
             continue
         confidence = _finite_number(raw.get("confidence"), 1.0)
-        if (semantic_assets and confidence < 0.8) or str(raw.get("review_state") or "generated") == "rejected":
+        if (semantic_assets and confidence < 0.8 and str(raw.get("review_state") or "") != "approved") or str(raw.get("review_state") or "generated") == "rejected":
             continue
         item = dict(raw)
         item.setdefault("id", f"static-{index}")
@@ -334,6 +334,7 @@ def build_scene_manifest(map_data) -> dict:
     asset_catalog_url = str(scene.get("asset_catalog_url") or SCENE_ASSET_CATALOG_URL)
     semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
     semantic_status = str(semantics.get("status") or ("ready" if _scene_static_assets(scene) else "unavailable"))
+    review_candidates = semantics.get("review_candidates") if isinstance(semantics.get("review_candidates"), list) else []
     return {
         "schema": SCENE_SCHEMA,
         "map_id": map_data.pk,
@@ -363,6 +364,10 @@ def build_scene_manifest(map_data) -> dict:
             "revision": str(semantics.get("revision") or ""),
             "map_sha256": str(semantics.get("map_sha256") or ""),
             "message": str(semantics.get("message") or ""),
+        },
+        "semantic_review": {
+            "pending_count": len(review_candidates),
+            "candidates": review_candidates,
         },
         "geo_reference": _scene_geo_reference(description),
         "boundary": boundary,

@@ -1030,6 +1030,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             "description",
             "scene_scope",
             "global_controller",
+            "record_rosbag",
             "created_at",
             "updated_at",
         ]

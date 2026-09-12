@@ -46,4 +46,6 @@ test('server keeps replay pages while the container package includes scene visua
   const containerConfig = JSON.parse(fs.readFileSync(path.join(frontendRoot, 'modules.json'), 'utf8'))
   assert.equal(containerConfig.enabled_modules.includes('scene-visualizer'), true)
   assert.deepEqual(['validation', 'replay-debug', 'tracks'].some((id) => containerConfig.enabled_modules.includes(id)), false)
+  assert.equal(MODULES.find((module) => module.id === 'validation').parentId, 'tasks')
+  assert.equal(MODULES.find((module) => module.id === 'replay-debug').parentId, 'tasks')
 })

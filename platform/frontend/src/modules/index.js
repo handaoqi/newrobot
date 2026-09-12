@@ -25,8 +25,8 @@ const productionDefinitions = [
 ]
 
 const serverReplayDefinitions = [
-  { id: 'validation', title: '仿真与回放检查', path: '/dashboard/validation', component: () => import('../views/ValidationJobsPage.vue'), recommended: [] },
-  { id: 'replay-debug', title: '回放调试台', path: '/dashboard/replay-debug', component: () => import('../views/ReplayDebugPage.vue'), recommended: [] },
+  { id: 'validation', title: '仿真与回放检查', path: '/dashboard/validation', parentId: 'tasks', component: () => import('../views/ValidationJobsPage.vue'), recommended: [] },
+  { id: 'replay-debug', title: '回放调试台', path: '/dashboard/replay-debug', parentId: 'tasks', component: () => import('../views/ReplayDebugPage.vue'), recommended: [] },
   { id: 'tracks', title: '轨迹回放', path: '/dashboard/tasks/tracks', parentId: 'tasks', component: () => import('../views/TrackPlaybackPage.vue'), recommended: [] },
 ]
 

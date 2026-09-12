@@ -1017,6 +1017,8 @@ class CommandProcessor:
             result_payload = self.mapping_adapter.status()
         elif envelope.message_type == "mapping.scene_semantics":
             result_payload = self.mapping_adapter.build_scene_semantics(command)
+        elif envelope.message_type == "mapping.scene_semantics_status":
+            result_payload = self.mapping_adapter.scene_semantics_status()
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", envelope.message_type)
         return build_result(

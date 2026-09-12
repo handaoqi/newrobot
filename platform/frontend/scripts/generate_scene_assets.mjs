@@ -132,6 +132,8 @@ function createVehicle(type) {
     sedan: { length: 4.5, width: 1.8, height: 1.5, color: COLORS.vehicle, roof: 1.15 },
     van: { length: 5, width: 2, height: 2.2, color: COLORS.vehicleAlt, roof: 1.65 },
     'golf-cart': { length: 2.8, width: 1.3, height: 1.8, color: COLORS.vehicleUtility, roof: 1.55 },
+    bus: { length: 10, width: 2.6, height: 3.2, color: COLORS.vehicleAlt, roof: 2.65 },
+    bicycle: { length: 1.8, width: .55, height: 1.35, color: COLORS.vehicleUtility, roof: 0 },
   }[type]
   const wheelRadius = type === 'golf-cart' ? .24 : .32
   box(group, [config.length, config.width, .55], [0, 0, .58], config.color)
@@ -142,6 +144,41 @@ function createVehicle(type) {
   if (type === 'golf-cart') {
     box(group, [1.9, 1.15, .1], [0, 0, 1.68], COLORS.roof)
     box(group, [.12, 1.05, 1.1], [-.82, 0, 1.1], COLORS.roofDark)
+  }
+  if (type === 'bicycle') {
+    group.clear()
+    for (const x of [-.55, .55]) cylinder(group, .3, .06, [x, 0, .35], COLORS.wheel, 12)
+    box(group, [.08, .08, .85], [0, 0, .78], COLORS.vehicleUtility, [0, 0, -.55])
+    box(group, [.08, .08, .7], [.55, 0, .75], COLORS.vehicleUtility, [0, 0, .55])
+    box(group, [.08, .08, .55], [-.1, 0, 1.05], COLORS.vehicleUtility, [0, 0, 1.1])
+  }
+  return group
+}
+
+function createTrafficCone() {
+  const group = new THREE.Group()
+  box(group, [.55, .55, .08], [0, 0, .04], COLORS.roadMark)
+  addMesh(group, new THREE.ConeGeometry(.22, .65, 12), material(COLORS.vehicleAlt), [0, 0, .4])
+  box(group, [.25, .25, .06], [0, 0, .52], COLORS.roadMark)
+  return group
+}
+
+function createBarrier() {
+  const group = new THREE.Group()
+  box(group, [2, .55, .8], [0, 0, .4], COLORS.wall)
+  return group
+}
+
+function createGroundAsset(type) {
+  const group = new THREE.Group()
+  if (type === 'vegetation') {
+    cylinder(group, .7, .08, [0, 0, .04], COLORS.foliage, 12)
+    for (const x of [-.35, 0, .35]) sphere(group, .18, [x, 0, .2], COLORS.foliageLight, 0)
+  } else if (type === 'debris') {
+    sphere(group, .45, [0, 0, .3], COLORS.wallLow, 1)
+    box(group, [.35, .25, .18], [.35, 0, .12], COLORS.wall)
+  } else {
+    box(group, [.12, .12, 1.6], [0, 0, .8], COLORS.wall, [0, .25, 0])
   }
   return group
 }
@@ -228,6 +265,13 @@ const DEFINITIONS = [
   { asset_id: 'vehicle.sedan', category: 'vehicle', label_zh: '轿车', aliases: ['car', 'sedan'], role: 'dynamic_entity', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createVehicle('sedan'), collision: { type: 'box', dimensions_m: { x: 4.5, y: 1.8, z: 1.5 } } },
   { asset_id: 'vehicle.van', category: 'vehicle', label_zh: '面包车', aliases: ['van', 'truck'], role: 'dynamic_entity', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createVehicle('van'), collision: { type: 'box', dimensions_m: { x: 5, y: 2, z: 2.2 } } },
   { asset_id: 'vehicle.golf-cart', category: 'vehicle', label_zh: '电瓶车', aliases: ['golf_cart', 'service_cart'], role: 'dynamic_entity', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createVehicle('golf-cart'), collision: { type: 'box', dimensions_m: { x: 2.8, y: 1.3, z: 1.8 } } },
+  { asset_id: 'vehicle.bus', category: 'vehicle', label_zh: '公交车', aliases: ['bus'], role: 'dynamic_entity', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createVehicle('bus'), collision: { type: 'box', dimensions_m: { x: 10, y: 2.6, z: 3.2 } } },
+  { asset_id: 'bicycle.standard', category: 'bicycle', label_zh: '自行车', aliases: ['bicycle', 'bike'], role: 'dynamic_entity', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createVehicle('bicycle'), collision: { type: 'box', dimensions_m: { x: 1.8, y: .55, z: 1.35 } } },
+  { asset_id: 'traffic-cone.standard', category: 'traffic_cone', label_zh: '交通锥', aliases: ['traffic_cone', 'cone'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: createTrafficCone, collision: { type: 'box', dimensions_m: { x: .55, y: .55, z: .7 } } },
+  { asset_id: 'barrier.concrete', category: 'barrier', label_zh: '混凝土隔离墩', aliases: ['barrier', 'concrete_barrier'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'length_only', build: createBarrier, collision: { type: 'box', dimensions_m: { x: 2, y: .55, z: .8 } } },
+  { asset_id: 'vegetation.groundcover', category: 'vegetation', label_zh: '地被植被', aliases: ['vegetation', 'groundcover'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createGroundAsset('vegetation'), collision: { type: 'cylinder', radius_m: .7, height_m: .25 } },
+  { asset_id: 'debris.pile', category: 'debris', label_zh: '杂物堆', aliases: ['debris'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createGroundAsset('debris'), collision: { type: 'box', dimensions_m: { x: 1, y: 1, z: .6 } } },
+  { asset_id: 'wall.vertical-thin', category: 'wall', label_zh: '细立柱', aliases: ['vertical_thin', 'pole'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createGroundAsset('vertical_thin'), collision: { type: 'box', dimensions_m: { x: .2, y: .2, z: 1.6 } } },
   { asset_id: 'tree.deciduous', category: 'tree', label_zh: '乔木', aliases: ['tree', 'deciduous_tree'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createTree('deciduous'), collision: { type: 'cylinder', radius_m: 1.35, height_m: 4.6 } },
   { asset_id: 'tree.conifer', category: 'tree', label_zh: '针叶树', aliases: ['conifer', 'pine'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createTree('conifer'), collision: { type: 'cylinder', radius_m: 1.2, height_m: 4.7 } },
   { asset_id: 'tree.shrub', category: 'tree', label_zh: '灌木', aliases: ['shrub', 'bush'], role: 'static_environment', anchor: 'footprint_center', scale_mode: 'uniform', build: () => createTree('shrub'), collision: { type: 'cylinder', radius_m: .7, height_m: 1.25 } },
@@ -315,6 +359,10 @@ async function main() {
       vehicle: 'vehicle.sedan',
       tree: 'tree.deciduous',
       road: 'road.straight',
+      barrier: 'barrier.concrete',
+      traffic_cone: 'traffic-cone.standard',
+      vegetation: 'vegetation.groundcover',
+      debris: 'debris.pile',
     },
     assets,
   }

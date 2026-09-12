@@ -718,6 +718,7 @@ class PatrolRoute(BaseTimestampModel):
         default="theta_star",
         verbose_name="全局控制器",
     )
+    record_rosbag = models.BooleanField(default=False, verbose_name="录制导航调试包")
 
     class Meta:
         verbose_name = "巡逻路线"

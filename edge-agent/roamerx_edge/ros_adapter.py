@@ -58,7 +58,11 @@ def follow_path_patrol_params(
         "FollowPath.vx_min": vx_min,
         "FollowPath.vy_max": 0.5,
         "FollowPath.wz_max": wz_max,
-        "FollowPath.wz_std": 0.08,
+        "FollowPath.wz_std": 0.04,
+        "FollowPath.gamma": 0.03,
+        "FollowPath.time_steps": 40,
+        "FollowPath.model_dt": 0.05,
+        "FollowPath.batch_size": 1200,
         "FollowPath.GoalCritic.enabled": bool(final_approach),
         # A heading-constrained stop needs an explicit terminal-angle cost.
         # PathAlign targets the path tangent instead and made the robot orbit
@@ -81,8 +85,10 @@ def follow_path_patrol_params(
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
         "FollowPath.PathAlignCritic.use_path_orientations": False,
         "FollowPath.PathFollowCritic.enabled": True,
+        "FollowPath.PathFollowCritic.cost_weight": 14.0,
         "FollowPath.PathAngleCritic.enabled": True,
-        "FollowPath.PathAngleCritic.max_angle_to_furthest": 0.40,
+        "FollowPath.PathAngleCritic.cost_weight": 3.0,
+        "FollowPath.PathAngleCritic.max_angle_to_furthest": 0.30,
     }
 
 try:
@@ -2284,7 +2290,11 @@ class RosAdapter(Node):
             )
         latest = self._wait_for_fresh_normal_samples(
             after_sequence=sample_sequence,
-            required_samples=3,
+            # The RTK/FAST-LIO drift gate already required three consecutive
+            # fresh stable samples.  Only one fresh normal status sample is
+            # needed here to publish the accepted pose without a second
+            # redundant three-frame wait.
+            required_samples=1,
             timeout_seconds=max(0.0, deadline - time.monotonic()),
             generation=generation,
         )
@@ -3778,13 +3788,18 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
         elif use_rpp:
             params = {
-                "RPP.desired_linear_vel": 0.18 if final_approach else 0.25,
+                "RPP.desired_linear_vel": 0.18 if final_approach else 0.22,
                 "RPP.min_linear_vel": 0.03 if final_approach else 0.05,
-                "RPP.lookahead_dist": 0.40 if final_approach else 0.65,
-                "RPP.min_lookahead_dist": 0.25 if final_approach else 0.35,
-                "RPP.max_angular_vel": 0.30 if require_yaw else 0.45,
-                "RPP.rotate_to_heading_threshold": 0.35 if require_yaw else 0.785,
-                "RPP.rotate_to_heading_angular_vel": 0.25 if require_yaw else 0.35,
+                "RPP.lookahead_dist": 0.40 if final_approach else 1.2,
+                "RPP.min_lookahead_dist": 0.25 if final_approach else 0.6,
+                "RPP.max_lookahead_dist": 0.8 if final_approach else 1.8,
+                "RPP.use_velocity_scaled_lookahead_dist": not final_approach,
+                "RPP.lookahead_time": 1.5 if final_approach else 2.5,
+                "RPP.max_angular_vel": 0.30,
+                "RPP.rotate_to_heading_threshold": 0.35 if require_yaw else 0.52,
+                "RPP.rotate_to_heading_angular_vel": 0.25 if require_yaw else 0.22,
+                "RPP.use_regulated_linear_velocity_scaling": True,
+                "RPP.angular_deadband": 0.03,
             }
             self._boundary_base_velocity = {
                 "vx_max": float(params["RPP.desired_linear_vel"]),

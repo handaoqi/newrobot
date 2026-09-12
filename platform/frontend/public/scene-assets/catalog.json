@@ -10,7 +10,11 @@
     "building": "building.kiosk",
     "vehicle": "vehicle.sedan",
     "tree": "tree.deciduous",
-    "road": "road.straight"
+    "road": "road.straight",
+    "barrier": "barrier.concrete",
+    "traffic_cone": "traffic-cone.standard",
+    "vegetation": "vegetation.groundcover",
+    "debris": "debris.pile"
   },
   "assets": [
     {
@@ -502,6 +506,295 @@
       "triangle_count": 208,
       "byte_size": 21804,
       "sha256": "42702f27a3a492fa8bd3a3f22621237377a5e60819cf82c5263c41296caa7e62",
+      "revision": 1
+    },
+    {
+      "asset_id": "vehicle.bus",
+      "category": "vehicle",
+      "label_zh": "公交车",
+      "aliases": [
+        "bus"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/vehicle.bus.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 10,
+        "y": 3.3,
+        "z": 3.56
+      },
+      "bounds_m": {
+        "min": {
+          "x": -5,
+          "y": -1.65,
+          "z": 0.24
+        },
+        "max": {
+          "x": 5,
+          "y": 1.65,
+          "z": 3.8
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 10,
+          "y": 2.6,
+          "z": 3.2
+        }
+      },
+      "triangle_count": 184,
+      "byte_size": 17832,
+      "sha256": "4d894d962341874edbbc7af7bf2fc1a34fd850b0c9d067ee5d5930668ec0905d",
+      "revision": 1
+    },
+    {
+      "asset_id": "bicycle.standard",
+      "category": "bicycle",
+      "label_zh": "自行车",
+      "aliases": [
+        "bicycle",
+        "bike"
+      ],
+      "role": "dynamic_entity",
+      "url": "/scene-assets/bicycle.standard.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 1.7,
+        "y": 0.6,
+        "z": 1.005
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.85,
+          "y": -0.3,
+          "z": 0.32
+        },
+        "max": {
+          "x": 0.85,
+          "y": 0.3,
+          "z": 1.325
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 1.8,
+          "y": 0.55,
+          "z": 1.35
+        }
+      },
+      "triangle_count": 132,
+      "byte_size": 13884,
+      "sha256": "d99263e162d82599726ba0d0d245f020f149ccbee13ecd6f21dbe8093a520ac2",
+      "revision": 1
+    },
+    {
+      "asset_id": "traffic-cone.standard",
+      "category": "traffic_cone",
+      "label_zh": "交通锥",
+      "aliases": [
+        "traffic_cone",
+        "cone"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/traffic-cone.standard.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.55,
+        "y": 0.65,
+        "z": 0.62
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.275,
+          "y": -0.325,
+          "z": 0
+        },
+        "max": {
+          "x": 0.275,
+          "y": 0.325,
+          "z": 0.62
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 0.55,
+          "y": 0.55,
+          "z": 0.7
+        }
+      },
+      "triangle_count": 48,
+      "byte_size": 6960,
+      "sha256": "5346c7494f9f9720c57015b0f94a8919fc6f5b51658613ce550c85f45b5fb495",
+      "revision": 1
+    },
+    {
+      "asset_id": "barrier.concrete",
+      "category": "barrier",
+      "label_zh": "混凝土隔离墩",
+      "aliases": [
+        "barrier",
+        "concrete_barrier"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/barrier.concrete.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "length_only",
+      "dimensions_m": {
+        "x": 2,
+        "y": 0.55,
+        "z": 0.8
+      },
+      "bounds_m": {
+        "min": {
+          "x": -1,
+          "y": -0.275,
+          "z": 0
+        },
+        "max": {
+          "x": 1,
+          "y": 0.275,
+          "z": 0.8
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 2,
+          "y": 0.55,
+          "z": 0.8
+        }
+      },
+      "triangle_count": 12,
+      "byte_size": 2148,
+      "sha256": "393ca3b476dbfec71b5928500f81e6097a17bddea74d1498aa5ef8dbda4de9be",
+      "revision": 1
+    },
+    {
+      "asset_id": "vegetation.groundcover",
+      "category": "vegetation",
+      "label_zh": "地被植被",
+      "aliases": [
+        "vegetation",
+        "groundcover"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/vegetation.groundcover.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 1.4,
+        "y": 1.4,
+        "z": 0.353
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.7,
+          "y": -0.7,
+          "z": 0
+        },
+        "max": {
+          "x": 0.7,
+          "y": 0.7,
+          "z": 0.353
+        }
+      },
+      "collision": {
+        "type": "cylinder",
+        "radius_m": 0.7,
+        "height_m": 0.25
+      },
+      "triangle_count": 108,
+      "byte_size": 13076,
+      "sha256": "774d1e2878be947c8a023c327bb99c4af05eec326c5aa4dfe03be6ca1131e5c0",
+      "revision": 1
+    },
+    {
+      "asset_id": "debris.pile",
+      "category": "debris",
+      "label_zh": "杂物堆",
+      "aliases": [
+        "debris"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/debris.pile.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.975,
+        "y": 0.9,
+        "z": 0.9
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.45,
+          "y": -0.45,
+          "z": -0.15
+        },
+        "max": {
+          "x": 0.525,
+          "y": 0.45,
+          "z": 0.75
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 1,
+          "y": 1,
+          "z": 0.6
+        }
+      },
+      "triangle_count": 92,
+      "byte_size": 10760,
+      "sha256": "a2209023bfd894c399bceeeb586699f12a05c2ea03a67675ec1c8a81c4693554",
+      "revision": 1
+    },
+    {
+      "asset_id": "wall.vertical-thin",
+      "category": "wall",
+      "label_zh": "细立柱",
+      "aliases": [
+        "vertical_thin",
+        "pole"
+      ],
+      "role": "static_environment",
+      "url": "/scene-assets/wall.vertical-thin.glb",
+      "anchor": "footprint_center",
+      "scale_mode": "uniform",
+      "dimensions_m": {
+        "x": 0.512,
+        "y": 0.12,
+        "z": 1.58
+      },
+      "bounds_m": {
+        "min": {
+          "x": -0.256,
+          "y": -0.06,
+          "z": 0.01
+        },
+        "max": {
+          "x": 0.256,
+          "y": 0.06,
+          "z": 1.59
+        }
+      },
+      "collision": {
+        "type": "box",
+        "dimensions_m": {
+          "x": 0.2,
+          "y": 0.2,
+          "z": 1.6
+        }
+      },
+      "triangle_count": 12,
+      "byte_size": 2244,
+      "sha256": "1773069cbda6fadc32249b56d255ecf3668b87ec1ef4fe939ebfcd66c6617ae9",
       "revision": 1
     },
     {

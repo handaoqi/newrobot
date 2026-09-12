@@ -198,6 +198,28 @@ class MediaConfig:
 
 
 @dataclass
+class SceneSemanticsConfig:
+    """Offline static-scene inference settings.
+
+    The model is deliberately optional: map saving and navigation must remain
+    usable before a licensed, park-specific checkpoint is deployed.
+    """
+
+    enabled: bool = False
+    model_path: str = "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1.onnx"
+    engine_path: str = "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1_fp16.engine"
+    asset_catalog_path: str = "/home/dogrobot/runtime/nx-edge/install/share/scene-assets/catalog.json"
+    model_version: str = "ptv3-park-v1"
+    confidence_threshold: float = 0.80
+    min_support_frames: int = 3
+    voxel_size_m: float = 0.10
+    tile_size_m: float = 20.0
+    tile_overlap_m: float = 1.0
+    max_points: int = 1_000_000
+    nice_level: int = 10
+
+
+@dataclass
 class MappingConfig:
     map_dir: str = "/home/dogrobot/runtime/nx-edge/data/jszr/map"
     log_dir: str = "/tmp/roamerx_mapping_logs"
@@ -420,6 +442,7 @@ class EdgeConfig:
     ros_callback_optimization: RosCallbackOptimizationConfig = field(
         default_factory=RosCallbackOptimizationConfig
     )
+    scene_semantics: SceneSemanticsConfig = field(default_factory=SceneSemanticsConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "EdgeConfig":
@@ -446,4 +469,5 @@ class EdgeConfig:
             ros_callback_optimization=RosCallbackOptimizationConfig(
                 **raw.get("ros_callback_optimization", {})
             ),
+            scene_semantics=SceneSemanticsConfig(**raw.get("scene_semantics", {})),
         )

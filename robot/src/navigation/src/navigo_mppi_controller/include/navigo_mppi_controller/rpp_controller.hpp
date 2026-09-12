@@ -42,10 +42,15 @@ private:
   double min_linear_vel_{0.05};
   double lookahead_dist_{0.65};
   double min_lookahead_dist_{0.35};
+  double max_lookahead_dist_{1.8};
+  double lookahead_time_{2.5};
   double max_angular_vel_{0.45};
   double rotate_to_heading_threshold_{0.785};
   double rotate_to_heading_angular_vel_{0.35};
   bool curvature_speed_regulation_{true};
+  bool use_velocity_scaled_lookahead_dist_{false};
+  bool use_regulated_linear_velocity_scaling_{true};
+  double angular_deadband_{0.0};
   double speed_limit_scale_{1.0};
 };
 

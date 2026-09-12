@@ -24,7 +24,7 @@ export const SCENE_MAP_MODES = Object.freeze({
   'street-block': '街区模式',
 })
 
-export const SCENE_STATIC_ASSET_CATEGORIES = Object.freeze(['wall', 'building', 'tree', 'road'])
+export const SCENE_STATIC_ASSET_CATEGORIES = Object.freeze(['wall', 'building', 'tree', 'road', 'barrier', 'traffic_cone', 'vegetation', 'debris'])
 export const SCENE_DYNAMIC_OBJECT_CATEGORIES = Object.freeze(['person', 'vehicle', 'bicycle'])
 export const SCENE_DYNAMIC_SPEED_THRESHOLD_MPS = 0.05
 export const EARTH_RADIUS_M = 6378137
@@ -40,6 +40,9 @@ export const ASSET_REGISTRY = Object.freeze({
   building: { label: '建筑', aliases: [], color: '#64748b', kind: 'building', dynamic: false },
   tree: { label: '树木', aliases: ['bush', 'shrub', 'conifer', 'pine'], color: '#22c55e', kind: 'tree', dynamic: false },
   road: { label: '道路', aliases: ['path', 'walkway', 'crossroad', 'intersection'], color: '#64748b', kind: 'road', dynamic: false },
+  barrier: { label: '隔离设施', aliases: ['barrier', 'traffic_cone', 'traffic-cone'], color: '#fb923c', kind: 'barrier', dynamic: false },
+  vegetation: { label: '地被植被', aliases: ['vegetation', 'groundcover'], color: '#4ade80', kind: 'vegetation', dynamic: false },
+  debris: { label: '杂物', aliases: ['debris'], color: '#a8a29e', kind: 'debris', dynamic: false },
   unknown_obstacle: { label: '未知障碍', aliases: ['unknown'], color: '#a78bfa', kind: 'obstacle', dynamic: true },
 })
 

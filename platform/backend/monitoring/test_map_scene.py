@@ -107,6 +107,33 @@ class MapSceneApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(MapNavigationBoundary.objects.filter(map_data=self.map).exists())
 
+    def test_scene_semantics_review_can_approve_low_confidence_candidate(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            f"/api/maps/{self.map.id}/scene-semantics/",
+            {
+                "schema": "roamerx.scene-semantics.v1",
+                "model_version": "ptv3-test-v1",
+                "instances": [],
+                "review_candidates": [{
+                    "id": "wall-1", "asset_id": "wall.straight", "confidence": 0.61,
+                    "position": [3, 4, 0],
+                }],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["semantic_build"]["status"], "review")
+        response = self.client.post(
+            f"/api/maps/{self.map.id}/scene-semantics/review/",
+            {"candidate_id": "wall-1", "action": "approve"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["semantic_review"]["pending_count"], 0)
+        self.assertEqual(response.data["static_assets"][0]["review_state"], "approved")
+        self.assertEqual(response.data["static_assets"][0]["asset_id"], "wall.straight")
+
     def test_manifest_normalizes_only_valid_static_asset_instances(self):
         self.map.description = json.dumps({
             "scene_manifest": {

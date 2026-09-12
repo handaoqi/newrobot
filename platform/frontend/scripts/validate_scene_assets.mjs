@@ -8,7 +8,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ASSET_DIR = path.resolve(HERE, '../public/scene-assets')
 const MAX_ASSET_BYTES = 256 * 1024
-const EXPECTED_ASSETS = 18
+const EXPECTED_ASSETS = 25
 
 function sha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex')

@@ -6,7 +6,7 @@ import AmapSatelliteViewport from '../components/scene/AmapSatelliteViewport.vue
 import SystemLogPanel from '../components/SystemLogPanel.vue'
 import {
   fetchMapScene, fetchMapSceneCloud, fetchMapSummaries, fetchRobotNavigationStatus,
-  fetchRobotPersonDetections, fetchRobotStatus, fetchRobots, fetchRouteDetail,
+  fetchRobotPersonDetections, fetchRobotStatus, fetchRobots, fetchRouteDetail, reviewMapSceneSemantics,
   fetchRouteSummaries,
 } from '../services/api'
 import { openLiveMessageSource, scanBagMessages } from '../services/rosStream'
@@ -82,6 +82,7 @@ const dataAge = computed(() => {
 const sourceLabel = computed(() => ({ live: '实时机器狗', map: '平台离线地图包', bag: '本地 MCAP' }[sourceMode.value]))
 const staticAssets = computed(() => filterStaticSceneAssets(manifest.value?.static_assets || []))
 const viewportStaticAssets = computed(() => staticAssets.value)
+const reviewCandidates = computed(() => manifest.value?.semantic_review?.candidates || [])
 const robotMoving = computed(() => isRobotMoving({
   ...status.value,
   speed_mps: Number.isFinite(Number(status.value.speed_mps)) ? status.value.speed_mps : streamPose.value?.speed_mps,
@@ -324,6 +325,15 @@ function handleAssetInference(result) {
   assetInference.value = result || { status: 'unavailable', pointCount: 0, source: 'semantic_artifact' }
 }
 
+async function reviewCandidate(candidate, action) {
+  if (!selectedMapId.value || !candidate?.id) return
+  try {
+    manifest.value = await reviewMapSceneSemantics(selectedMapId.value, candidate.id, action, candidate.asset_id)
+  } catch (cause) {
+    error.value = cause.message || '语义候选审核失败'
+  }
+}
+
 async function openBag(event) {
   const file = event.target.files?.[0]
   event.target.value = ''
@@ -411,7 +421,7 @@ onBeforeUnmount(() => {
   <section class="scene-page">
     <header class="scene-head">
       <div>
-        <p class="eyebrow">HUMAN VIEW · READ ONLY</p>
+        <p class="eyebrow">HUMAN VIEW · REVIEWABLE</p>
         <h2>场景视角调试</h2>
         <p>把机器狗看到的点云、定位决策、障碍物和语义目标还原到人的场景视角。</p>
       </div>
@@ -503,6 +513,13 @@ onBeforeUnmount(() => {
             静态资产 {{ viewportStaticAssets.length }} 个 · {{ manifest?.semantic_build?.status === 'ready' ? '高置信度语义清单' : manifest?.semantic_build?.status === 'processing' ? '语义识别处理中' : '未生成可靠语义模型' }}<span v-if="assetInference.pointCount"> · {{ assetInference.pointCount.toLocaleString() }} 点</span>
           </div>
           <div class="asset-grid"><span v-for="(asset,key) in ASSET_REGISTRY" :key="key"><i :style="{background:asset.color}"></i>{{ asset.label }}</span></div>
+          <div v-if="reviewCandidates.length" class="review-box">
+            <h3>低置信度候选 · 待人工确认 {{ reviewCandidates.length }}</h3>
+            <article v-for="candidate in reviewCandidates" :key="candidate.id" class="review-item">
+              <div><strong>{{ candidate.asset_id || candidate.class_name || '未知目标' }}</strong><small>{{ number(candidate.confidence * 100, 0, '%') }} · {{ number(candidate.position?.x) }}, {{ number(candidate.position?.y) }}</small></div>
+              <span><button type="button" @click="reviewCandidate(candidate, 'approve')">采用</button><button type="button" class="reject" @click="reviewCandidate(candidate, 'reject')">排除</button></span>
+            </article>
+          </div>
           <div class="readonly-note motion-note">实时动态目标：{{ robotMoving ? `机器狗运动中（${number(status.speed_mps,2,' m/s')}）` : '机器狗停止或速度未知，已清空行人车辆' }}</div>
           <div class="object-list"><article v-for="item in visibleObjects" :key="item.id"><i :style="{background:item.asset.color}"></i><div><strong>{{ item.asset.label }} · {{ item.id }}</strong><small>{{ number(item.position.x) }}, {{ number(item.position.y) }}, {{ number(item.position.z) }} · {{ number(item.confidence * 100,0,'%') }}</small></div></article><p v-if="!visibleObjects.length" class="empty">尚未收到符合当前模式约束的三维目标；不会用二维框伪造地图坐标。</p></div>
           <small v-if="personDetections?.detections?.length" class="projection-pending">收到 {{ personDetections.detections.length }} 个二维YOLO框，等待 `/perception/semantic_objects` 三维投影。</small>
@@ -528,6 +545,7 @@ onBeforeUnmount(() => {
 .metric-list { margin: 0; }.metric-list div { display: grid; grid-template-columns: minmax(110px,.8fr) minmax(0,1.2fr); gap: 10px; padding: 7px 2px; border-bottom: 1px solid var(--line); font-size: 11px; }.metric-list dt { color: var(--muted); }.metric-list dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-family: ui-monospace,monospace; }.ok{color:#22c55e!important}.warn{color:#eab308!important}.bad{color:#ef4444!important}.fusion-flow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; padding: 9px; border: 1px solid #245b72; border-radius: 9px; background: rgba(8,122,160,.09); font-size: 10px; }.fusion-flow span,.fusion-flow strong { padding: 5px; border-radius: 6px; background: var(--panel-soft); }.fusion-flow b { color: var(--cyan); }.readonly-note { padding: 8px 10px; border-left: 3px solid #38bdf8; color: var(--muted); background: var(--panel-soft); font-size: 11px; }.waypoint-list { display: grid; gap: 7px; }.waypoint-list article { padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.waypoint-list header { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 7px; font-size: 11px; }.waypoint-list header b { display:grid;place-content:center;width:20px;height:20px;border-radius:50%;color:#fff;background:#087aa0 }.waypoint-list header span { color: var(--muted); font-family:ui-monospace,monospace }.waypoint-list article>div { display:flex;flex-wrap:wrap;gap:5px;margin-top:7px }.waypoint-list article>div span { padding:3px 5px;border-radius:5px;color:var(--muted);background:var(--panel-soft);font-size:9px }
 .boundary-note { margin-top:10px;line-height:1.55 }.boundary-note a { margin-left:3px;color:var(--cyan) }.motion-note { margin-top:10px;line-height:1.45 }
 .layer-list { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.layer-list label { display:flex;gap:7px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px;font-size:10px }.asset-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.asset-grid span { display:flex;gap:7px;align-items:center;font-size:10px }.asset-grid i,.object-list i { width:9px;height:9px;border-radius:2px }.object-list { display:grid;gap:6px;margin-top:12px }.object-list article { display:flex;gap:8px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px }.object-list div { display:grid;gap:2px }.object-list strong,.object-list small { font-size:10px }.object-list small,.empty,.projection-pending { color:var(--muted) }.empty { font-size:11px;line-height:1.5 }.projection-pending { display:block;margin-top:9px;font-size:10px }.file-picker { position:absolute;width:1px;height:1px;opacity:0;pointer-events:none }
+.review-box { display:grid; gap:7px; margin-top:12px; padding:10px; border:1px solid #7c5b22; border-radius:8px; background:rgba(124,91,34,.1) }.review-box h3 { margin:0; font-size:12px }.review-item { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:7px; border:1px solid var(--line); border-radius:7px }.review-item div { display:grid; gap:2px; min-width:0 }.review-item small { color:var(--muted); font-size:9px }.review-item button { padding:4px 7px; border:0; border-radius:5px; color:#fff; background:#087aa0; cursor:pointer; font-size:10px }.review-item button.reject { margin-left:4px; background:#6b3440 }
 @media (max-width: 1250px) { .scene-workspace { grid-template-columns: minmax(0,1.35fr) minmax(330px,.85fr); }.control-bar { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 900px) { .scene-head { align-items:stretch;flex-direction:column }.source-tabs { align-self:flex-start }.scene-workspace { grid-template-columns:1fr;min-height:0 }.viewport-wrap { min-height:430px }.diagnostic-card { max-height:600px }.control-bar { grid-template-columns:1fr 1fr }.runtime-state { grid-column:1/-1 } }
 </style>
