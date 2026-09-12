@@ -215,7 +215,7 @@ localization:
     ndt_resolution: 0.15
     # Upper mean squared point-to-map distance accepted by scan matching.
     # Inlier and transform-continuity checks remain separate acceptance gates.
-    ndt_max_fitness_score: 0.45
+    ndt_max_fitness_score: 0.40
     # Indoor navigation: NDT coarse-locks on the full map, then FastVGICP
     # snaps the current scan onto local planar structure (walls/floor).
     # NDT voxels smear indoor planes; VGICP on the whole building PCD is too

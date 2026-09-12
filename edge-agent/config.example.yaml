@@ -86,7 +86,7 @@ safety:
   arrival_precision_recovery_retry_seconds: 5.0
   arrival_micro_adjust_timeout_seconds: 30
   arrival_micro_goal_tolerance_m: 0.15
-  arrival_ndt_max_fitness_score: 0.45
+  arrival_ndt_max_fitness_score: 0.40
   arrival_convergence_samples: 3
   arrival_adjust_clearance_lookahead_m: 0.50
   arrival_adjust_speed_mps: 0.08

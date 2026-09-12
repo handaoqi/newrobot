@@ -181,7 +181,7 @@ public:
     ndt_neighbor_search_radius       = declare_parameter<double>("ndt_neighbor_search_radius", 2.0);
     ndt_resolution                   = declare_parameter<double>("ndt_resolution", 1.0);
     ndt_max_fitness_score_ = static_cast<float>(std::max(
-      0.001, declare_parameter<double>("ndt_max_fitness_score", 0.50)));
+      0.001, declare_parameter<double>("ndt_max_fitness_score", 0.40)));
     scan_matching_refine_enable_ = declare_parameter<bool>("scan_matching.refine_enable", true);
     scan_matching_local_map_xy_radius_ = static_cast<float>(std::max(
       3.0, declare_parameter<double>("scan_matching.local_map_xy_radius", 18.0)));
@@ -1730,7 +1730,12 @@ private:
       if (one_shot_correction_.active && one_shot_correction_.status == "smoothing") {
         one_shot_correction_.active = false;
         one_shot_correction_.status = "completed";
-        one_shot_correction_.reason = "anchor_update_completed";
+        one_shot_correction_.reason = one_shot_correction_.selected_source == "ukf_fused"
+          ? "corrected_ukf_fused"
+          : one_shot_correction_.selected_source == "rtk"
+            ? "corrected_rtk"
+            : one_shot_correction_.selected_source == "ndt_vgicp"
+              ? "corrected_ndt" : "anchor_update_completed";
         one_shot_correction_.completed_steady_ns = last_correction_completed_steady_ns_;
       }
     }
@@ -2022,6 +2027,11 @@ private:
       const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp,
       bool force_correction = false) {
     lio_corrected_this_frame_ = false;
+    if (motion_phase_ != "stationary") {
+      ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "correction_requires_stationary";
+      return false;
+    }
     if (!pose_estimator || pending_lio_correction_.active ||
         !match.is_converged_ || !match.transform_.allFinite() ||
         !std::isfinite(match.fitness_score_) ||
@@ -2108,6 +2118,11 @@ private:
 
   bool maybeCorrectRtkDrift(
       const RtkObservation& observation, bool force_correction = false) {
+    if (motion_phase_ != "stationary") {
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "correction_requires_stationary";
+      return false;
+    }
     if (observation.stamp_ns <= 0 ||
         observation.stamp_ns == last_rtk_aux_observation_stamp_ns_) {
       return false;
@@ -2261,6 +2276,47 @@ private:
     return true;
   }
 
+  bool maybeCorrectUkfFused(
+      const PoseEstimator::MatchResult& match,
+      const RtkObservation& observation,
+      const rclcpp::Time& stamp) {
+    if (!pose_estimator || !match.transform_.allFinite() ||
+        !std::isfinite(match.fitness_score_) || match.fitness_score_ >= 0.40f ||
+        !rtkFloatQualityOk(observation)) {
+      return false;
+    }
+    const Eigen::Vector3f ndt_position = match.transform_.block<3, 1>(0, 3);
+    const Eigen::Vector3f rtk_position = observation.position;
+    const CorrectionNoise ndt_noise = scanMatchCorrectionNoise(match);
+    const CorrectionNoise rtk_noise = rtkCorrectionNoise(observation);
+    const double ndt_weight = 1.0 / std::max(1.0e-6f, ndt_noise.horizontal_variance);
+    const double rtk_weight = 1.0 / std::max(1.0e-6f, rtk_noise.horizontal_variance);
+    const float weight_sum = static_cast<float>(ndt_weight + rtk_weight);
+    Eigen::Isometry3f target = Eigen::Isometry3f::Identity();
+    target.translation().head<2>() = static_cast<float>(ndt_weight / weight_sum) *
+      ndt_position.head<2>() + static_cast<float>(rtk_weight / weight_sum) *
+      rtk_position.head<2>();
+    target.translation().z() = ndt_position.z();
+    Eigen::Quaternionf ndt_orientation(match.transform_.block<3, 3>(0, 0));
+    ndt_orientation.normalize();
+    target.linear() = ndt_orientation.toRotationMatrix();
+    const float fused_variance = static_cast<float>(1.0 / (ndt_weight + rtk_weight));
+    CorrectionNoise fused_noise = ndt_noise;
+    fused_noise.horizontal_variance = fused_variance;
+    fused_noise.quality_penalty = std::max(ndt_noise.quality_penalty, rtk_noise.quality_penalty);
+    if (!scheduleLioAnchorCorrection(
+          target, fused_noise, "NDT+RTK_FLOAT(UKF)", stamp,
+          -1.0f, -1.0f, true)) {
+      return false;
+    }
+    if (one_shot_correction_.active) {
+      one_shot_correction_.status = "smoothing";
+      one_shot_correction_.selected_source = "ukf_fused";
+      one_shot_correction_.reason = "corrected_ukf_fused";
+    }
+    return true;
+  }
+
   CorrectionCandidateSummary ndtCorrectionCandidate(
       const PoseEstimator::MatchResult& match,
       bool quality_ok,
@@ -2351,6 +2407,7 @@ private:
     const bool ndt_fresh = last_ndt_healthy_ && last_ndt_update_time_.nanoseconds() > 0 &&
       std::fabs((stamp - last_ndt_update_time_).seconds()) <= 1.0;
     const bool rtk_ready = rtkCorrectionQualityOk(observation);
+    const bool rtk_float_ready = rtkFloatQualityOk(observation);
     const bool force_correction = one_shot_correction_.active;
     const CorrectionPolicyMode effective_mode = force_correction
       ? one_shot_correction_.mode : preferred_correction_mode_;
@@ -2358,7 +2415,7 @@ private:
       ? ndt_fresh
       : effective_mode == CorrectionPolicyMode::rtk
         ? rtk_ready
-        : (ndt_fresh || rtk_ready);
+        : (ndt_fresh || rtk_ready || rtk_float_ready);
 
     if (!lio_anchor_valid_.load() || pending_lio_correction_.active) {
       last_correction_candidate_source_ = "none";
@@ -2374,6 +2431,12 @@ private:
     CorrectionCandidateSummary rtk;
     if (correctionPolicyAllowsRtk(effective_mode)) {
       rtk = rtkCorrectionCandidate(observation);
+      // RTK mode is an absolute fixed-RTK policy.  Floating samples may be
+      // considered only by the explicit UKF fusion policy; they must never
+      // become a standalone RTK anchor correction.
+      if (effective_mode == CorrectionPolicyMode::rtk && !rtk_ready) {
+        rtk.eligible = false;
+      }
     }
 
     const bool ndt_drifted = ndt.eligible &&
@@ -2396,9 +2459,14 @@ private:
     rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
       (force_correction || !rtk_drift_gate_.correction_latched);
     CorrectionSelection selection;
+    const bool ukf_float_fusion = effective_mode == CorrectionPolicyMode::ukf &&
+      !rtk_ready && rtk_float_ready && ndt.eligible && match &&
+      match->fitness_score_ < 0.40f && match->fitness_score_ >= 0.08f;
     const bool ukf_high_quality_ndt = effective_mode == CorrectionPolicyMode::ukf &&
-      !rtk_ready && match && ndt.eligible && match->fitness_score_ < 0.08f;
-    if (ukf_high_quality_ndt) {
+      !rtk_ready && !ukf_float_fusion && match && ndt.eligible && match->fitness_score_ < 0.08f;
+    if (ukf_float_fusion) {
+      selection = CorrectionSelection{CorrectionSource::ukf_fused, "corrected_ukf_fused"};
+    } else if (ukf_high_quality_ndt) {
       selection = CorrectionSelection{CorrectionSource::ndt, "ukf_high_quality_ndt"};
     } else if (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "ndt") {
       selection = ndt.eligible
@@ -2416,12 +2484,21 @@ private:
     last_correction_selection_reason_ = selection.reason;
 
     bool corrected = false;
-    if (selection.source == CorrectionSource::ndt && match) {
+    if (ukf_float_fusion && match) {
+      ndt_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.resetConsecutive();
+      corrected = maybeCorrectUkfFused(*match, observation, stamp);
+    } else if (selection.source == CorrectionSource::ndt && match) {
       rtk_drift_gate_.resetConsecutive();
       corrected = maybeCorrectLioDrift(*match, stamp, force_correction);
     } else if (selection.source == CorrectionSource::rtk) {
       ndt_drift_gate_.resetConsecutive();
       corrected = maybeCorrectRtkDrift(observation, force_correction);
+      if (corrected && force_correction && observation.quality == "float" &&
+          one_shot_correction_.active) {
+        one_shot_correction_.selected_source = "ukf_fused";
+        one_shot_correction_.reason = "corrected_ukf_fused";
+      }
     } else {
       if (match && !ndt_quality_ok) {
         ndt_drift_gate_.resetConsecutive();
@@ -2437,6 +2514,7 @@ private:
           // RTK mode must not wait indefinitely for a fixed solution. A
           // floating/single-point sample is retained as diagnostic input; the
           // continuous LIO/UKF estimate remains authoritative for this leg.
+          one_shot_correction_.active = false;
           one_shot_correction_.status = "completed";
           one_shot_correction_.selected_source = "none";
           one_shot_correction_.reason = "rtk_no_correction_continue";
@@ -2450,6 +2528,7 @@ private:
         const bool ndt_poor = !match || !std::isfinite(match->fitness_score_) ||
           match->fitness_score_ >= 0.40f;
         if (effective_mode == CorrectionPolicyMode::ukf && rtk_float && ndt_poor) {
+          one_shot_correction_.active = false;
           one_shot_correction_.status = "completed";
           one_shot_correction_.selected_source = "none";
           one_shot_correction_.reason = "ukf_no_correction_sources_meet_gate";
@@ -4309,7 +4388,7 @@ private:
       absolute_observation_updated = run_ndt;
       applyRtkHeadingObservation(rtk_observation);
       rtk_position_fused_this_frame_ = applyGnssCorrection(rclcpp::Time(stamp));
-    } else if (rtk_observation.usable) {
+    } else if (rtkGoodForNavigation(rtk_observation)) {
       absolute_pose_valid = applyRtkObservation(rtk_observation);
       active_source_ = absolute_pose_valid ? "rtk_imu" : "unavailable";
       absolute_observation_updated = absolute_pose_valid &&
@@ -4377,7 +4456,7 @@ private:
       }
       is_extrapolating_ = true;
       current_confidence_ = 0.0;
-      if (!bridge_active_ && !rtk_observation.usable && !lio_observation_applied &&
+      if (!bridge_active_ && !rtkCorrectionQualityOk(rtk_observation) && !lio_observation_applied &&
           is_init_success_ && has_valid_pose_history_ &&
           !runtime_relocalization_attempted_ &&
           consecutive_match_failures_ >= runtime_relocalization_failure_threshold_) {
@@ -6553,7 +6632,7 @@ private:
   float lidar_odom_voxel_size_ = 0.40f;
   float lidar_odom_max_correspondence_distance_ = 1.00f;
   float lidar_odom_max_fitness_score_ = 0.50f;
-  float ndt_max_fitness_score_ = 0.50f;
+  float ndt_max_fitness_score_ = 0.40f;
   bool scan_matching_refine_enable_ = true;
   float scan_matching_local_map_xy_radius_ = 18.0f;
   float scan_matching_local_map_z_radius_ = 4.0f;

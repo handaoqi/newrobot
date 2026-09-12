@@ -27,6 +27,10 @@ TEST(CorrectionPolicy, ParsesAndRoutesEveryWaypointMode) {
   EXPECT_TRUE(correctionPolicyAllowsRtk(CorrectionPolicyMode::ukf));
 }
 
+TEST(CorrectionPolicy, NamesUkfFusedCorrectionSource) {
+  EXPECT_STREQ(correctionSourceName(CorrectionSource::ukf_fused), "ukf_fused");
+}
+
 TEST(CorrectionPolicy, StrictModesNeverUseTheOtherSource) {
   const auto ndt = candidate(0.0, 0.02, 10);
   const auto rtk = candidate(0.0, 0.01, 20);

@@ -149,7 +149,7 @@ class SafetyConfig:
     # self-heal request at this cadence without commanding motion.
     arrival_precision_recovery_retry_seconds: float = 5.0
     arrival_micro_goal_tolerance_m: float = 0.15
-    arrival_ndt_max_fitness_score: float = 0.45
+    arrival_ndt_max_fitness_score: float = 0.40
     arrival_convergence_samples: int = 3
 
 

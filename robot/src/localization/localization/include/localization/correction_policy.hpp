@@ -11,7 +11,7 @@
 namespace localization {
 
 enum class CorrectionPolicyMode { ndt, rtk, ukf };
-enum class CorrectionSource { none, ndt, rtk, conflict };
+enum class CorrectionSource { none, ndt, rtk, ukf_fused, conflict };
 
 inline const char* correctionSourceName(CorrectionSource source) {
   switch (source) {
@@ -19,6 +19,8 @@ inline const char* correctionSourceName(CorrectionSource source) {
       return "ndt_vgicp";
     case CorrectionSource::rtk:
       return "rtk";
+    case CorrectionSource::ukf_fused:
+      return "ukf_fused";
     case CorrectionSource::conflict:
       return "conflict";
     case CorrectionSource::none:
