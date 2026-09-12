@@ -5,4 +5,7 @@
 	<class name="navigo_navfn_planner/ThetaStarPlanner" type="navigo_navfn_planner::ThetaStarPlanner" base_class_type="navigo_core::GlobalPlanner">
 	  <description>Cost-aware Theta* line-of-sight relaxed planner</description>
 	</class>
+	<class name="navigo_navfn_planner/SmacHybridPlanner" type="navigo_navfn_planner::SmacHybridPlanner" base_class_type="navigo_core::GlobalPlanner">
+	  <description>Cost-aware SE(2) Hybrid-A* planner with bounded NavFn fallback</description>
+	</class>
 </library>

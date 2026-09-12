@@ -3765,9 +3765,9 @@ class RobotNavigationSingleGoalView(APIView):
         except (TypeError, ValueError, KeyError):
             return Response({"detail": "单点导航需要数值 x、y、yaw。"}, status=status.HTTP_400_BAD_REQUEST)
         global_controller = str(request.data.get("global_controller") or "theta_star").strip().lower()
-        if global_controller not in {"theta_star", "navfn"}:
+        if global_controller not in {"theta_star", "navfn", "smac_hybrid"}:
             return Response(
-                {"detail": "单点导航全局控制器只能是 Theta* 或 NavFn (A*)。"},
+                {"detail": "单点导航全局控制器只能是 Theta*、NavFn (A*) 或 Smac Hybrid A*。"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         map_id = str(request.data.get("map_id") or robot.current_map_id or "")

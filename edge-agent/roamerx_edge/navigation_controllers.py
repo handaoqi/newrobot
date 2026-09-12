@@ -4,25 +4,26 @@ from __future__ import annotations
 DEFAULT_LOCAL_CONTROLLER = "mppi"
 DEFAULT_GLOBAL_CONTROLLER = "theta_star"
 
-LOCAL_CONTROLLERS = frozenset({"mppi", "rpp"})
-GLOBAL_CONTROLLERS = frozenset({"theta_star", "navfn"})
+LOCAL_CONTROLLERS = frozenset({"mppi", "rpp", "ilqr"})
+GLOBAL_CONTROLLERS = frozenset({"theta_star", "navfn", "smac_hybrid"})
 
 LOCAL_CONTROLLER_PLUGIN_IDS = {
     "mppi": "FollowPath",
     "rpp": "RPP",
+    "ilqr": "ILQR",
 }
 
 GLOBAL_CONTROLLER_PLUGIN_IDS = {
     "theta_star": "ThetaStar",
     "navfn": "NavFn",
+    "smac_hybrid": "SmacHybrid",
 }
 
 # Page/API combinations that this robot build statically registers.
-SUPPORTED_NAVIGATION_COMBOS = (
-    ("theta_star", "mppi"),
-    ("theta_star", "rpp"),
-    ("navfn", "mppi"),
-    ("navfn", "rpp"),
+SUPPORTED_NAVIGATION_COMBOS = tuple(
+    (global_name, local_name)
+    for global_name in sorted(GLOBAL_CONTROLLERS)
+    for local_name in sorted(LOCAL_CONTROLLERS)
 )
 
 

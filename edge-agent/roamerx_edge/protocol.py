@@ -204,27 +204,27 @@ def validate_command(envelope: MessageEnvelope) -> None:
                 raise ProtocolError("INVALID_MESSAGE", "waypoint speech_mode is invalid")
             if "local_controller" in waypoint:
                 mode = str(waypoint["local_controller"]).lower()
-                if mode not in {"mppi", "rpp"}:
+                if mode not in {"mppi", "rpp", "ilqr"}:
                     raise ProtocolError(
                         "INVALID_MESSAGE",
-                        "waypoint local_controller must be mppi or rpp",
+                        "waypoint local_controller must be mppi, rpp or ilqr",
                     )
             if "global_controller" in waypoint:
                 mode = str(waypoint["global_controller"]).lower()
-                if mode not in {"theta_star", "navfn"}:
+                if mode not in {"theta_star", "navfn", "smac_hybrid"}:
                     raise ProtocolError(
                         "INVALID_MESSAGE",
-                        "waypoint global_controller must be theta_star or navfn",
+                        "waypoint global_controller must be theta_star, navfn or smac_hybrid",
                     )
             if "dwell_seconds" in waypoint:
                 dwell_seconds = waypoint["dwell_seconds"]
                 if isinstance(dwell_seconds, bool) or not isinstance(dwell_seconds, (int, float)) or not 0 <= dwell_seconds <= 3600:
                     raise ProtocolError("INVALID_MESSAGE", "waypoint dwell_seconds must be between 0 and 3600")
         route_global_controller = str(route.get("global_controller") or "theta_star").lower()
-        if route_global_controller not in {"theta_star", "navfn"}:
+        if route_global_controller not in {"theta_star", "navfn", "smac_hybrid"}:
             raise ProtocolError(
                 "INVALID_MESSAGE",
-                "route global_controller must be theta_star or navfn",
+                "route global_controller must be theta_star, navfn or smac_hybrid",
             )
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
@@ -264,10 +264,10 @@ def validate_command(envelope: MessageEnvelope) -> None:
             if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"nav.single_goal {field} must be numeric")
         global_controller = str(command.get("global_controller") or "theta_star").lower()
-        if global_controller not in {"theta_star", "navfn"}:
+        if global_controller not in {"theta_star", "navfn", "smac_hybrid"}:
             raise ProtocolError(
                 "INVALID_MESSAGE",
-                "nav.single_goal global_controller must be theta_star or navfn",
+                "nav.single_goal global_controller must be theta_star, navfn or smac_hybrid",
             )
     if envelope.message_type == "nav.relocalize":
         command = payload["command"]

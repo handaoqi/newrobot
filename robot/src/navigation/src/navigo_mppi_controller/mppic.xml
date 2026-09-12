@@ -6,5 +6,8 @@
     <class type="navigo_mppi_controller::RPPController" base_class_type="navigo_core::Controller">
       <description>Regulated Pure Pursuit controller for deterministic waypoint tracking</description>
     </class>
+    <class type="navigo_mppi_controller::ILQRController" base_class_type="navigo_core::Controller">
+      <description>Iterative finite-horizon LQR controller for precise path tracking</description>
+    </class>
   </library>
 </class_libraries>

@@ -8,12 +8,15 @@ from roamerx_edge.protocol import ProtocolError
 from roamerx_edge.ros_adapter import RosAdapter
 
 
-def test_navigation_capabilities_lists_four_combos():
+def test_navigation_capabilities_lists_all_registered_combos():
     caps = navigation_capabilities()
-    assert caps["global_controllers"] == ["navfn", "theta_star"]
-    assert caps["local_controllers"] == ["mppi", "rpp"]
-    assert len(SUPPORTED_NAVIGATION_COMBOS) == 4
+    assert caps["global_controllers"] == ["navfn", "smac_hybrid", "theta_star"]
+    assert caps["local_controllers"] == ["ilqr", "mppi", "rpp"]
+    assert len(SUPPORTED_NAVIGATION_COMBOS) == 9
     assert {"global_controller": "navfn", "local_controller": "rpp"} in caps["supported_combos"]
+    assert {
+        "global_controller": "smac_hybrid", "local_controller": "ilqr"
+    } in caps["supported_combos"]
 
 
 def test_apply_navigation_profile_rolls_back_on_readback_failure(monkeypatch):
@@ -38,6 +41,7 @@ def test_apply_navigation_profile_rolls_back_on_readback_failure(monkeypatch):
     adapter.set_safety_profile = lambda **kwargs: calls.append(("safety", kwargs))
     adapter.set_waypoint_profile = lambda **kwargs: calls.append(("waypoint", kwargs))
     adapter.set_local_controller = lambda mode: calls.append(("local", mode))
+    adapter.set_smoother = lambda mode: calls.append(("smoother", mode))
     adapter.apply_outdoor_gps_profile = lambda **kwargs: calls.append(("outdoor", kwargs))
     adapter._rtk_is_navigation_pose_source = lambda: False
 
@@ -74,6 +78,7 @@ def test_apply_navigation_profile_success_stores_last_good(monkeypatch):
     adapter.set_safety_profile = lambda **kwargs: None
     adapter.set_waypoint_profile = lambda **kwargs: None
     adapter.set_local_controller = lambda mode: None
+    adapter.set_smoother = lambda mode: None
     adapter.apply_outdoor_gps_profile = lambda **kwargs: None
     adapter._rtk_is_navigation_pose_source = lambda: False
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <string>
 #include <memory>
 
@@ -28,16 +29,19 @@ DriveOnHeadingAction::DriveOnHeadingAction(
 {
   double dist;
   getInput("dist_to_travel", dist);
+  double lateral_dist;
+  getInput("lateral_dist", lateral_dist);
   double speed;
   getInput("speed", speed);
   double time_allowance;
   getInput("time_allowance", time_allowance);
 
   // Populate the input message
-  goal_.target.x = dist;
-  goal_.target.y = 0.0;
+  goal_.target.x = std::abs(lateral_dist) > 1e-6 ? 0.0 : dist;
+  goal_.target.y = lateral_dist;
   goal_.target.z = 0.0;
-  goal_.speed = speed;
+  const double direction = std::abs(lateral_dist) > 1e-6 ? lateral_dist : dist;
+  goal_.speed = std::copysign(std::abs(speed), direction);
   goal_.time_allowance = rclcpp::Duration::from_seconds(time_allowance);
 }
 

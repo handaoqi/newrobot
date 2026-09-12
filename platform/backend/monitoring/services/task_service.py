@@ -49,12 +49,12 @@ def assert_transition_allowed(current: str, target: str) -> None:
 
 def _normalize_global_controller(value: object | None) -> str:
     normalized = str(value or "theta_star").strip().lower()
-    return normalized if normalized in {"theta_star", "navfn"} else "theta_star"
+    return normalized if normalized in {"theta_star", "navfn", "smac_hybrid"} else "theta_star"
 
 
 def _normalize_local_controller(value: object | None) -> str:
     normalized = str(value or "mppi").strip().lower()
-    return normalized if normalized in {"mppi", "rpp"} else "mppi"
+    return normalized if normalized in {"mppi", "rpp", "ilqr"} else "mppi"
 
 
 def _normalize_arrival_policy(value: object | None, *, dwell_seconds: float = 0.0,

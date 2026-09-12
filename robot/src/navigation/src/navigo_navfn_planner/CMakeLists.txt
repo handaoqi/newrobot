@@ -46,6 +46,7 @@ set(dependencies
 add_library(${library_name} SHARED
   src/navfn_planner.cpp
   src/theta_star_planner.cpp
+  src/smac_hybrid_planner.cpp
   src/navfn.cpp
 )
 

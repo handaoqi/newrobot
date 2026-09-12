@@ -219,7 +219,7 @@ planner_server:
     expected_planner_frequency: 1.0
     odom_topic: /odom/nav2
     use_sim_time: False
-    planner_plugins: ["ThetaStar", "NavFn"]
+    planner_plugins: ["ThetaStar", "NavFn", "SmacHybrid"]
     ThetaStar:
       plugin: "navigo_navfn_planner/ThetaStarPlanner"
       tolerance: 0.5
@@ -237,6 +237,20 @@ planner_server:
       allow_unknown: true
       allow_straight_line_fallback: false
       prefer_straight_line: false
+    SmacHybrid:
+      plugin: "navigo_navfn_planner/SmacHybridPlanner"
+      tolerance: 0.20
+      allow_unknown: true
+      allow_straight_line_fallback: false
+      prefer_straight_line: false
+      angle_quantization_bins: 72
+      minimum_turning_radius: 0.50
+      step_size: 0.10
+      max_iterations: 200000
+      cost_penalty: 2.0
+      reverse_penalty: 2.0
+      change_penalty: 0.20
+      allow_reverse: false
 
 controller_server:
   ros__parameters:
@@ -244,7 +258,7 @@ controller_server:
     odom_topic: "/odom/nav2"
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
-    controller_plugins: ["FollowPath", "RPP"]
+    controller_plugins: ["FollowPath", "RPP", "ILQR"]
 
     # Progress checker parameters
     progress_checker:
@@ -399,11 +413,27 @@ controller_server:
       use_regulated_linear_velocity_scaling: true
       angular_deadband: 0.03
 
+    ILQR:
+      plugin: "navigo_mppi_controller::ILQRController"
+      desired_linear_vel: 0.20
+      max_angular_vel: 0.35
+      model_dt: 0.05
+      time_steps: 24
+      iteration_count: 4
+      position_weight: 8.0
+      yaw_weight: 3.0
+      velocity_weight: 0.6
+      angular_weight: 0.4
+
 
 smoother_server:
   ros__parameters:
     use_sim_time: False
-    smoother_plugins: [ "simple_smoother", "passthrough_smoother" ]
+    smoother_plugins: [ "savitzky_golay", "simple_smoother", "passthrough_smoother" ]
+    savitzky_golay:
+      plugin: "navigo_smoother::SavitzkyGolaySmoother"
+      refinement_passes: 2
+      max_point_deviation: 0.30
     simple_smoother:
       plugin: "navigo_smoother::SimpleSmoother"
       tolerance: 1.0e-6
@@ -463,7 +493,7 @@ collision_monitor:
     localization_topic: "/localization_info"
     localization_timeout: 0.75
     require_healthy_localization: true
-    polygons: ["PolygonStop", "PolygonSlow", "PolygonRearStop", "PolygonRearSlow", "PolygonRotationStop"]
+    polygons: ["PolygonStop", "PolygonSlow", "PolygonRearStop", "PolygonRearSlow", "PolygonLeftStop", "PolygonRightStop", "PolygonRotationStop"]
     PolygonStop:
       type: "polygon"
       # Last-resort collision brake. Start in front of the body so lidar zero
@@ -505,6 +535,24 @@ collision_monitor:
       slowdown_ratio: 0.70
       visualize: true
       polygon_pub_topic: "polygon_rear_slowdown"
+      enabled: true
+    PolygonLeftStop:
+      type: "polygon"
+      points: [0.35, 0.55, -0.35, 0.55, -0.35, 0.18, 0.35, 0.18]
+      action_type: "stop"
+      motion_scope: "left"
+      max_points: 3
+      visualize: true
+      polygon_pub_topic: "polygon_left_stop"
+      enabled: true
+    PolygonRightStop:
+      type: "polygon"
+      points: [0.35, -0.18, -0.35, -0.18, -0.35, -0.55, 0.35, -0.55]
+      action_type: "stop"
+      motion_scope: "right"
+      max_points: 3
+      visualize: true
+      polygon_pub_topic: "polygon_right_stop"
       enabled: true
     PolygonRotationStop:
       type: "circle"

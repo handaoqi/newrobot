@@ -31,6 +31,17 @@ def test_rejects_invalid_waypoint_global_controller():
     assert exc.value.code == "INVALID_MESSAGE"
 
 
+def test_accepts_smac_hybrid_and_ilqr_waypoint():
+    payload = json.loads(FIXTURE.read_text())
+    waypoint = payload["payload"]["command"]["route_snapshot"]["waypoints"][0]
+    waypoint["global_controller"] = "smac_hybrid"
+    waypoint["local_controller"] = "ilqr"
+    envelope = decode_message(payload)
+    decoded = envelope.payload["command"]["route_snapshot"]["waypoints"][0]
+    assert decoded["global_controller"] == "smac_hybrid"
+    assert decoded["local_controller"] == "ilqr"
+
+
 def test_accepts_nav_single_goal_global_controller():
     payload = json.loads(FIXTURE.read_text())
     payload["message_type"] = "nav.single_goal"

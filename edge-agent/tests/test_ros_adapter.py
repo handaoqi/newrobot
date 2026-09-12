@@ -1129,6 +1129,43 @@ def test_waypoint_profile_skips_identical_rewrite(monkeypatch):
     assert len(calls) == first
 
 
+def test_ilqr_waypoint_profile_and_boundary_limit_use_ilqr_parameters(monkeypatch):
+    adapter = object.__new__(RosAdapter)
+    adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
+    adapter._active_local_controller = "ilqr"
+    adapter._boundary_zone_speed_limit = None
+    adapter._rtk_is_navigation_pose_source = lambda: False
+    adapter.set_local_controller = lambda *_args, **_kwargs: None
+    adapter.set_safety_profile = lambda **_kwargs: None
+    monkeypatch.setattr(
+        "roamerx_edge.ros_adapter.Bool",
+        lambda: SimpleNamespace(data=False),
+    )
+    writes = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(
+        (node, dict(values), kwargs["code"])
+    )
+
+    adapter.set_waypoint_profile(
+        avoid_obstacles=True,
+        require_yaw=False,
+        final_approach=False,
+        local_controller="ilqr",
+    )
+    assert writes[0] == (
+        "/controller_server",
+        {"ILQR.desired_linear_vel": 0.20, "ILQR.max_angular_vel": 0.35},
+        "WAYPOINT_PROFILE_FAILED",
+    )
+
+    adapter.set_boundary_speed_limit(0.12)
+    assert writes[-1] == (
+        "/controller_server",
+        {"ILQR.desired_linear_vel": 0.12},
+        "BOUNDARY_SPEED_LIMIT_FAILED",
+    )
+
+
 def test_remote_param_cooldown_skips_unavailable_nodes():
     from roamerx_edge.protocol import ProtocolError
 

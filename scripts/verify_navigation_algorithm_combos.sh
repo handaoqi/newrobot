@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the four page algorithm combinations against the live Nav2 stack.
+# Verify the nine page algorithm combinations against the live NaviGo stack.
 # Usage (on NX, with navigation running):
 #   sudo bash scripts/verify_navigation_algorithm_combos.sh
 set -eo pipefail
@@ -30,12 +30,17 @@ check() {
 echo "=== capability: registered plugins ==="
 planner_plugins="$(timeout 8 ros2 param get /planner_server planner_plugins)"
 controller_plugins="$(timeout 8 ros2 param get /controller_server controller_plugins)"
+smoother_plugins="$(timeout 8 ros2 param get /smoother_server smoother_plugins)"
 echo "$planner_plugins"
 echo "$controller_plugins"
+echo "$smoother_plugins"
 check "planner ThetaStar registered" "$planner_plugins" "ThetaStar"
 check "planner NavFn registered" "$planner_plugins" "NavFn"
+check "planner SmacHybrid registered" "$planner_plugins" "SmacHybrid"
 check "controller FollowPath registered" "$controller_plugins" "FollowPath"
 check "controller RPP registered" "$controller_plugins" "RPP"
+check "controller ILQR registered" "$controller_plugins" "ILQR"
+check "smoother Savitzky-Golay registered" "$smoother_plugins" "savitzky_golay"
 
 apply_combo() {
   local global_name="$1"
@@ -64,8 +69,13 @@ apply_combo() {
 # rpp        -> RPP
 apply_combo theta_star mppi ThetaStar FollowPath False
 apply_combo theta_star rpp ThetaStar RPP False
+apply_combo theta_star ilqr ThetaStar ILQR False
 apply_combo navfn mppi NavFn FollowPath True
 apply_combo navfn rpp NavFn RPP True
+apply_combo navfn ilqr NavFn ILQR True
+apply_combo smac_hybrid mppi SmacHybrid FollowPath False
+apply_combo smac_hybrid rpp SmacHybrid RPP False
+apply_combo smac_hybrid ilqr SmacHybrid ILQR False
 
 echo
 echo "=== restore default cruise safety layers ==="
@@ -77,7 +87,8 @@ check "PolygonStop stays enabled" "$stop_got" "True"
 
 # Leave selectors on the combo used most in today's patrols.
 timeout 3 ros2 topic pub --once /planner_selector std_msgs/msg/String "{data: 'ThetaStar'}" >/dev/null
-timeout 3 ros2 topic pub --once /controller_selector std_msgs/msg/String "{data: 'RPP'}" >/dev/null
+timeout 3 ros2 topic pub --once /controller_selector std_msgs/msg/String "{data: 'FollowPath'}" >/dev/null
+timeout 3 ros2 topic pub --once /smoother_selector std_msgs/msg/String "{data: 'savitzky_golay'}" >/dev/null
 timeout 8 ros2 param set /planner_server NavFn.use_astar False >/dev/null || true
 
 echo
@@ -85,4 +96,4 @@ echo "RESULT pass=${pass} fail=${fail}"
 if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
-echo "All four algorithm combinations read back successfully."
+echo "All nine algorithm combinations read back successfully."

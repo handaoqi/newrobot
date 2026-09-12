@@ -15,20 +15,24 @@ def test_normalize_local_controller_defaults_to_registered_mppi():
     assert normalize_local_controller(None) == "mppi"
     assert normalize_local_controller("mppi") == "mppi"
     assert normalize_local_controller("rpp") == "rpp"
+    assert normalize_local_controller("ilqr") == "ilqr"
     assert normalize_local_controller("unknown") == "mppi"
 
 
 def test_normalize_global_controller_defaults_to_theta_star():
     assert normalize_global_controller(None) == "theta_star"
     assert normalize_global_controller("navfn") == "navfn"
+    assert normalize_global_controller("smac_hybrid") == "smac_hybrid"
     assert normalize_global_controller("invalid") == "theta_star"
 
 
 def test_controller_plugin_ids():
     assert local_controller_plugin_id("rpp") == "RPP"
     assert local_controller_plugin_id("mppi") == "FollowPath"
+    assert local_controller_plugin_id("ilqr") == "ILQR"
     assert global_controller_plugin_id("theta_star") == "ThetaStar"
     assert global_controller_plugin_id("navfn") == "NavFn"
+    assert global_controller_plugin_id("smac_hybrid") == "SmacHybrid"
 
 
 def test_default_navigation_trees_use_runtime_controller_selectors():
@@ -47,6 +51,10 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         if compute is None:
             compute = root.find(".//ComputePathThroughPoses")
         follow = root.find(".//FollowPath")
+        smoother_selector = root.find(".//SmootherSelector")
+        smoothers = root.findall(".//SmoothPath")
+        backups = root.findall(".//BackUp")
+        lateral_recoveries = root.findall(".//DriveOnHeading")
 
         assert planner_selector is not None
         assert planner_selector.attrib == {
@@ -64,6 +72,15 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         assert compute.attrib["planner_id"] == "{selected_planner}"
         assert follow is not None
         assert follow.attrib["controller_id"] == "{selected_controller}"
+        assert smoother_selector is not None
+        assert smoother_selector.attrib["default_smoother"] == "savitzky_golay"
+        assert [node.attrib["smoother_id"] for node in smoothers] == [
+            "{selected_smoother}", "simple_smoother"
+        ]
+        assert len(backups) == 1
+        assert {node.attrib["lateral_dist"] for node in lateral_recoveries} == {
+            "-0.20", "0.20"
+        }
 
 
 def test_nav2_plugin_registry_matches_edge_controller_mapping():
@@ -77,9 +94,33 @@ def test_nav2_plugin_registry_matches_edge_controller_mapping():
     planner = params["planner_server"]["ros__parameters"]
     controller = params["controller_server"]["ros__parameters"]
 
-    assert planner["planner_plugins"] == ["ThetaStar", "NavFn"]
+    assert planner["planner_plugins"] == ["ThetaStar", "NavFn", "SmacHybrid"]
     assert planner["ThetaStar"]["plugin"] == "navigo_navfn_planner/ThetaStarPlanner"
     assert planner["NavFn"]["plugin"] == "navigo_navfn_planner/NavfnPlanner"
-    assert controller["controller_plugins"] == ["FollowPath", "RPP"]
+    assert planner["SmacHybrid"]["plugin"] == "navigo_navfn_planner/SmacHybridPlanner"
+    assert controller["controller_plugins"] == ["FollowPath", "RPP", "ILQR"]
     assert controller["FollowPath"]["plugin"] == "navigo_mppi_controller::MPPIController"
     assert controller["RPP"]["plugin"] == "navigo_mppi_controller::RPPController"
+    assert controller["ILQR"]["plugin"] == "navigo_mppi_controller::ILQRController"
+    smoother = params["smoother_server"]["ros__parameters"]
+    assert smoother["smoother_plugins"] == [
+        "savitzky_golay", "simple_smoother", "passthrough_smoother"
+    ]
+    assert smoother["savitzky_golay"]["plugin"] == (
+        "navigo_smoother::SavitzkyGolaySmoother"
+    )
+
+
+def test_collision_monitor_has_directional_lateral_stop_zones():
+    repo_root = Path(__file__).resolve().parents[2]
+    params = yaml.safe_load(
+        (repo_root / "robot/src/navigation/src/robot_navigo/params/navigo_params.yaml")
+        .read_text(encoding="utf-8")
+    )
+    monitor = params["collision_monitor"]["ros__parameters"]
+    assert monitor["cmd_vel_in_topic"] == "cmd_vel_raw"
+    assert monitor["cmd_vel_out_topic"] == "cmd_vel"
+    assert monitor["PolygonLeftStop"]["motion_scope"] == "left"
+    assert monitor["PolygonRightStop"]["motion_scope"] == "right"
+    assert monitor["PolygonLeftStop"]["enabled"] is True
+    assert monitor["PolygonRightStop"]["enabled"] is True

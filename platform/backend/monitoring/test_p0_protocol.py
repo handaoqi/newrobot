@@ -59,6 +59,13 @@ class ProtocolContractTests(SimpleTestCase):
         with self.assertRaises(ProtocolError):
             parse_message(payload)
 
+    def test_accepts_smac_hybrid_and_ilqr_waypoint(self):
+        payload = json.loads(self.fixture_path.read_text())
+        waypoint = payload["payload"]["command"]["route_snapshot"]["waypoints"][0]
+        waypoint["global_controller"] = "smac_hybrid"
+        waypoint["local_controller"] = "ilqr"
+        self.assertEqual(parse_message(payload).message_type, "task.start")
+
     def test_rejects_nav2_micro_goal_for_pass_through_or_dock(self):
         for policy in ("pass_through", "dock"):
             payload = json.loads(self.fixture_path.read_text())

@@ -42,10 +42,15 @@ add_library(navigo_passthrough_smoother SHARED src/passthrough_smoother.cpp)
 target_include_directories(navigo_passthrough_smoother PUBLIC include)
 ament_target_dependencies(navigo_passthrough_smoother ${dependencies})
 
+add_library(navigo_savitzky_golay_smoother SHARED src/savitzky_golay_smoother.cpp)
+target_include_directories(navigo_savitzky_golay_smoother PUBLIC include)
+ament_target_dependencies(navigo_savitzky_golay_smoother ${dependencies})
+
 pluginlib_export_plugin_description_file(navigo_core navigo_smoother_plugins.xml)
 rclcpp_components_register_nodes(smoother_server_core "navigo_smoother::SmootherServer")
 
 install(TARGETS smoother_server_core navigo_simple_smoother navigo_passthrough_smoother
+  navigo_savitzky_golay_smoother
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
@@ -54,6 +59,7 @@ install(DIRECTORY include/ DESTINATION include)
 install(FILES navigo_smoother_plugins.xml DESTINATION share/${PROJECT_NAME})
 
 ament_export_include_directories(include)
-ament_export_libraries(smoother_server_core navigo_simple_smoother navigo_passthrough_smoother)
+ament_export_libraries(smoother_server_core navigo_simple_smoother navigo_passthrough_smoother
+  navigo_savitzky_golay_smoother)
 ament_export_dependencies(${dependencies})
 ament_package()

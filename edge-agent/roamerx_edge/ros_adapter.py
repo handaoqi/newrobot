@@ -3474,7 +3474,7 @@ class RosAdapter(Node):
 
     def set_smoother(self, smoother_id: str) -> None:
         """Select the already-loaded SmootherServer plugin for this leg."""
-        selected = str(smoother_id or "simple_smoother")
+        selected = str(smoother_id or "savitzky_golay")
         if selected == getattr(self, "_active_smoother", None):
             return
         publisher = getattr(self, "_smoother_selector_pub", None)
@@ -3585,7 +3585,7 @@ class RosAdapter(Node):
         require_yaw: bool = False,
         final_approach: bool = False,
         outdoor: bool | None = None,
-        smoother_id: str = "simple_smoother",
+        smoother_id: str = "savitzky_golay",
         live: bool = False,
     ) -> dict:
         """Atomically apply a leg profile, read it back, and roll back on failure."""
@@ -3713,6 +3713,7 @@ class RosAdapter(Node):
             local_controller=str(snapshot.get("local_controller") or "mppi"),
         )
         self.set_local_controller(str(snapshot.get("local_controller") or "mppi"))
+        self.set_smoother(str(snapshot.get("smoother_id") or "savitzky_golay"))
         self.apply_outdoor_gps_profile(outdoor=bool(snapshot.get("outdoor", False)))
         self._last_good_navigation_profile = copy.deepcopy(snapshot)
 
@@ -3737,6 +3738,7 @@ class RosAdapter(Node):
         normalized_local = normalize_local_controller(local_controller)
         use_mppi = normalized_local == "mppi"
         use_rpp = normalized_local == "rpp"
+        use_ilqr = normalized_local == "ilqr"
         signature = (
             normalize_local_controller(local_controller),
             bool(require_yaw),
@@ -3815,6 +3817,30 @@ class RosAdapter(Node):
                 follow_applied = True
             except ProtocolError:
                 LOGGER.warning("unable to apply RPP waypoint speed profile")
+        elif use_ilqr:
+            params = {
+                "ILQR.desired_linear_vel": 0.14 if final_approach else 0.20,
+                "ILQR.max_angular_vel": 0.25 if final_approach else 0.35,
+            }
+            self._boundary_base_velocity = {
+                "vx_max": float(params["ILQR.desired_linear_vel"]),
+                "vx_min": 0.0,
+                "vy_max": 0.0,
+            }
+            boundary_limit = getattr(self, "_boundary_zone_speed_limit", None)
+            if boundary_limit is not None:
+                params["ILQR.desired_linear_vel"] = min(
+                    params["ILQR.desired_linear_vel"], boundary_limit
+                )
+            try:
+                self._set_remote_parameters(
+                    "/controller_server", params,
+                    code="WAYPOINT_PROFILE_FAILED",
+                    attempts=2 if live else 3,
+                )
+                follow_applied = True
+            except ProtocolError:
+                LOGGER.warning("unable to apply ILQR waypoint speed profile")
         if not live:
             # Prefer the explicit three-layer safety API. CostCritic still tracks
             # avoid_obstacles via FollowPath params above.
@@ -3842,9 +3868,15 @@ class RosAdapter(Node):
             final_approach,
             live,
             follow_applied,
-            params.get("FollowPath.vx_min") if use_mppi else params.get("RPP.min_linear_vel"),
-            params.get("FollowPath.vx_max") if use_mppi else params.get("RPP.desired_linear_vel"),
-            params.get("FollowPath.wz_max") if use_mppi else params.get("RPP.max_angular_vel"),
+            params.get("FollowPath.vx_min") if use_mppi else (
+                params.get("RPP.min_linear_vel") if use_rpp else 0.0
+            ),
+            params.get("FollowPath.vx_max") if use_mppi else (
+                params.get("RPP.desired_linear_vel") if use_rpp else params.get("ILQR.desired_linear_vel")
+            ),
+            params.get("FollowPath.wz_max") if use_mppi else (
+                params.get("RPP.max_angular_vel") if use_rpp else params.get("ILQR.max_angular_vel")
+            ),
             params.get("FollowPath.PathAlignCritic.enabled") if use_mppi else None,
             params.get("FollowPath.CostCritic.enabled") if use_mppi else None,
             params.get("FollowPath.CostCritic.cost_weight") if use_mppi else None,
@@ -4107,19 +4139,26 @@ class RosAdapter(Node):
         raise ProtocolError(code, last_error or f"unable to set parameters on {node_name}")
 
     def set_boundary_speed_limit(self, speed_limit_mps: float | None) -> None:
-        """Apply the most restrictive active map-zone speed to MPPI."""
+        """Apply the most restrictive active map-zone speed to the selected controller."""
         self._boundary_zone_speed_limit = (
             None if speed_limit_mps is None else max(0.05, min(0.30, float(speed_limit_mps)))
         )
         base = getattr(self, "_boundary_base_velocity", {"vx_max": 0.30, "vx_min": -0.12, "vy_max": 0.5})
         limit = base["vx_max"] if self._boundary_zone_speed_limit is None else min(base["vx_max"], self._boundary_zone_speed_limit)
-        self._set_remote_parameters(
-            "/controller_server",
-            {
+        active = normalize_local_controller(getattr(self, "_active_local_controller", None))
+        if active == "rpp":
+            controller_params = {"RPP.desired_linear_vel": limit}
+        elif active == "ilqr":
+            controller_params = {"ILQR.desired_linear_vel": limit}
+        else:
+            controller_params = {
                 "FollowPath.vx_max": limit,
                 "FollowPath.vx_min": -min(abs(base["vx_min"]), limit),
                 "FollowPath.vy_max": min(base["vy_max"], limit),
-            },
+            }
+        self._set_remote_parameters(
+            "/controller_server",
+            controller_params,
             code="BOUNDARY_SPEED_LIMIT_FAILED",
             attempts=2,
         )

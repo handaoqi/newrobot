@@ -86,7 +86,7 @@ bool Polygon::configure()
   // Add callback for dynamic parameters
   dyn_params_handler_ = node->add_on_set_parameters_callback(
     std::bind(&Polygon::dynamicParametersCallback, this, std::placeholders::_1));
-  
+
   return true;
 }
 
@@ -268,13 +268,15 @@ bool Polygon::getCommonParameters(std::string & polygon_pub_topic)
     motion_scope_ = node->get_parameter(polygon_name_ + ".motion_scope").as_string();
     if (motion_scope_ != "any" && motion_scope_ != "forward" &&
       motion_scope_ != "reverse" && motion_scope_ != "rotation" &&
-      motion_scope_ != "lateral")
+      motion_scope_ != "lateral" && motion_scope_ != "left" &&
+      motion_scope_ != "right")
     {
-      RCLCPP_ERROR(logger_, "[%s]: Unknown motion_scope: %s", polygon_name_.c_str(),
+      RCLCPP_ERROR(
+        logger_, "[%s]: Unknown motion_scope: %s", polygon_name_.c_str(),
         motion_scope_.c_str());
       return false;
     }
-    
+
     navigo_util::declare_parameter_if_not_declared(
       node, polygon_name_ + ".max_points", rclcpp::ParameterValue(3));
     max_points_ = node->get_parameter(polygon_name_ + ".max_points").as_int();

@@ -126,6 +126,20 @@ class TaskExecutionTests(TestCase):
         execution = TaskExecutionService.create_execution(self.task, self.user)
         self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "rpp")
 
+    def test_route_snapshot_preserves_smac_hybrid_and_ilqr(self):
+        self.route.global_controller = "smac_hybrid"
+        self.route.waypoints = [{
+            "x": 1, "y": 2, "yaw": 0,
+            "global_controller": "smac_hybrid",
+            "local_controller": "ilqr",
+        }]
+        self.route.save(update_fields=["global_controller", "waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertEqual(execution.route_snapshot["global_controller"], "smac_hybrid")
+        self.assertEqual(waypoint["global_controller"], "smac_hybrid")
+        self.assertEqual(waypoint["local_controller"], "ilqr")
+
     def test_route_representation_exposes_registered_controllers(self):
         self.route.global_controller = "navfn"
         self.route.waypoints = [[1, 2], {"x": 3, "y": 4, "local_controller": "rpp"}]

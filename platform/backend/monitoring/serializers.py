@@ -1038,7 +1038,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         route_global_controller = str(data.get("global_controller") or "theta_star").lower()
-        if route_global_controller not in {"theta_star", "navfn"}:
+        if route_global_controller not in {"theta_star", "navfn", "smac_hybrid"}:
             route_global_controller = "theta_star"
             data["global_controller"] = route_global_controller
         # Summary responses omit waypoints. Do not inject an empty list — the
@@ -1063,7 +1063,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             ).lower()
             normalized["local_controller"] = (
                 waypoint_local_controller
-                if waypoint_local_controller in {"mppi", "rpp"}
+                if waypoint_local_controller in {"mppi", "rpp", "ilqr"}
                 else "mppi"
             )
             waypoint_global_controller = str(
@@ -1071,7 +1071,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             ).lower()
             normalized["global_controller"] = (
                 waypoint_global_controller
-                if waypoint_global_controller in {"theta_star", "navfn"}
+                if waypoint_global_controller in {"theta_star", "navfn", "smac_hybrid"}
                 else route_global_controller
             )
             normalized_waypoints.append(normalized)
@@ -1136,18 +1136,18 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
             point.get("local_controller")
             for point in value
             if isinstance(point, dict)
-            and str(point.get("local_controller") or "mppi").lower() not in {"rpp", "mppi"}
+            and str(point.get("local_controller") or "mppi").lower() not in {"rpp", "mppi", "ilqr"}
         ]
         if invalid_local_controllers:
-            raise serializers.ValidationError("途经点局部控制器只能是 MPPI 或 RPP")
+            raise serializers.ValidationError("途经点局部控制器只能是 MPPI、RPP 或 iLQR")
         invalid_global_controllers = [
             point.get("global_controller")
             for point in value
             if isinstance(point, dict)
-            and str(point.get("global_controller") or "theta_star").lower() not in {"theta_star", "navfn"}
+            and str(point.get("global_controller") or "theta_star").lower() not in {"theta_star", "navfn", "smac_hybrid"}
         ]
         if invalid_global_controllers:
-            raise serializers.ValidationError("途经点全局控制器只能是 Theta* 或 NavFn (A*)")
+            raise serializers.ValidationError("途经点全局控制器只能是 Theta*、NavFn (A*) 或 Smac Hybrid A*")
         try:
             template_ids = {
                 int(point["speech_template_id"])
@@ -1190,8 +1190,8 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         if scene_scope is None and self.instance is not None:
             scene_scope = self.instance.scene_scope
         global_controller = attrs.get("global_controller")
-        if global_controller is not None and str(global_controller).lower() not in {"theta_star", "navfn"}:
-            raise serializers.ValidationError("路线全局控制器只能是 Theta* 或 NavFn (A*)")
+        if global_controller is not None and str(global_controller).lower() not in {"theta_star", "navfn", "smac_hybrid"}:
+            raise serializers.ValidationError("路线全局控制器只能是 Theta*、NavFn (A*) 或 Smac Hybrid A*")
         if map_data is not None:
             try:
                 validate_route_against_map(

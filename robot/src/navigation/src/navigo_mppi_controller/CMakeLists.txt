@@ -14,6 +14,7 @@ set(XTENSOR_USE_XSIMD 1)
 find_package(ament_cmake REQUIRED)
 find_package(xtensor REQUIRED)
 find_package(xsimd REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 include_directories(
   include
@@ -80,6 +81,7 @@ add_library(mppi_controller SHARED
   src/parameters_handler.cpp
   src/noise_generator.cpp
   src/rpp_controller.cpp
+  src/ilqr_controller.cpp
 )
 
 add_library(mppi_critics SHARED
@@ -105,6 +107,8 @@ foreach(lib IN LISTS libraries)
   target_link_libraries(${lib} xtensor xtensor::optimize xtensor::use_xsimd)
   ament_target_dependencies(${lib} ${dependencies_pkgs})
 endforeach()
+
+target_link_libraries(mppi_controller Eigen3::Eigen)
 
 install(TARGETS mppi_controller mppi_critics
   ARCHIVE DESTINATION lib

@@ -224,10 +224,12 @@ let routeLoadSequence = 0
 const GLOBAL_CONTROLLER_OPTIONS = [
   { value: 'theta_star', label: 'Theta*（ThetaStar）' },
   { value: 'navfn', label: 'NavFn（A*）' },
+  { value: 'smac_hybrid', label: 'Smac Hybrid A*（高精度）' },
 ]
 const LOCAL_CONTROLLER_OPTIONS = [
   { value: 'mppi', label: 'MPPI（FollowPath）' },
   { value: 'rpp', label: 'RPP（Regulated Pure Pursuit）' },
+  { value: 'ilqr', label: 'iLQR（高精度）' },
 ]
 const ARRIVAL_POLICY_OPTIONS = [
   { value: 'pass_through', label: '通过（不停留）' },
@@ -833,12 +835,12 @@ function normalizeWaypointLocalizationMode(mode) {
 
 function normalizeLocalController(mode) {
   const normalized = String(mode || 'mppi').trim().toLowerCase()
-  return normalized === 'rpp' ? 'rpp' : 'mppi'
+  return ['mppi', 'rpp', 'ilqr'].includes(normalized) ? normalized : 'mppi'
 }
 
 function normalizeGlobalController(mode) {
   const normalized = String(mode || 'theta_star').trim().toLowerCase()
-  return normalized === 'navfn' ? 'navfn' : 'theta_star'
+  return ['theta_star', 'navfn', 'smac_hybrid'].includes(normalized) ? normalized : 'theta_star'
 }
 
 function normalizeArrivalPolicy(value, point = {}) {

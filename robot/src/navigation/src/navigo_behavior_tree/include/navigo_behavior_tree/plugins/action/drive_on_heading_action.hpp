@@ -49,6 +49,7 @@ public:
     return providedBasicPorts(
       {
         BT::InputPort<double>("dist_to_travel", 0.15, "Distance to travel"),
+        BT::InputPort<double>("lateral_dist", 0.0, "Signed body-frame lateral distance"),
         BT::InputPort<double>("speed", 0.025, "Speed at which to travel"),
         BT::InputPort<double>("time_allowance", 10.0, "Allowed time for driving on heading")
       });

@@ -10,4 +10,10 @@
     <description>Returns the planner path unchanged for precision and RTK legs.</description>
   </class>
 </library>
+<library path="navigo_savitzky_golay_smoother">
+  <class type="navigo_smoother::SavitzkyGolaySmoother"
+         base_class_type="navigo_core::Smoother">
+    <description>Collision-checked quadratic Savitzky-Golay path smoothing.</description>
+  </class>
+</library>
 </class_libraries>

@@ -534,6 +534,12 @@ bool CollisionMonitor::polygonAppliesToVelocity(const Polygon & polygon, const V
   if (scope == "reverse") {
     return velocity.x < -0.01;
   }
+  if (scope == "left") {
+    return velocity.y > 0.01;
+  }
+  if (scope == "right") {
+    return velocity.y < -0.01;
+  }
   return std::abs(velocity.y) > 0.01;
 }
 

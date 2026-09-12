@@ -5894,12 +5894,9 @@ class TaskExecutor:
             speed_profile=speed_profile,
             goal_checker_id=goal_checker_id,
             arrival_policy=arrival_policy,
-            smoother_id=(
-                "passthrough_smoother"
-                if outdoor_profile or precision_goal or final_approach
-                or arrival_policy in {"precision", "dock"}
-                else "simple_smoother"
-            ),
+            # The filter preserves both endpoints, so it is also safe for
+            # outdoor and precision legs. The BT owns simple/raw fallbacks.
+            smoother_id="savitzky_golay",
         )
         if leg_profile != self._active_leg_profile:
             LOGGER.info("applying leg profile generation=%s profile=%s", self._leg_generation + 1, leg_profile)

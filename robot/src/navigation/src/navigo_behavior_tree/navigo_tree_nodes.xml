@@ -17,6 +17,7 @@
 
     <Action ID="DriveOnHeading">
       <input_port name="dist_to_travel">Distance to travel</input_port>
+      <input_port name="lateral_dist">Signed body-frame lateral distance</input_port>
       <input_port name="speed">Speed at which to travel</input_port>
       <input_port name="time_allowance">Allowed time for reversing</input_port>
       <input_port name="server_name">Server name</input_port>
