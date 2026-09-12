@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -14,6 +14,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from bike_bot.audio_commands import AudioCommandClient, PlaybackOutcome  # noqa: E402
+from bike_bot.main import (  # noqa: E402
+    CLOUD_AUDIO_POLL_INTERVAL_SECONDS,
+    cloud_audio_command_worker,
+)
 
 
 class FakeRemoteClient:
@@ -188,6 +192,56 @@ class AudioFallbackTests(unittest.TestCase):
         final_report = client.report.call_args_list[-1]
         self.assertEqual(final_report.args[1], "finished")
         self.assertEqual(final_report.args[2]["playback_mode"], "single_nx")
+
+    @patch("bike_bot.audio_commands.Path.mkdir")
+    @patch("bike_bot.audio_commands.requests.Session")
+    def test_command_poll_reuses_https_session(self, session_factory, _mkdir):
+        response = Mock(status_code=204)
+        session = session_factory.return_value
+        session.get.return_value = response
+        config = SimpleNamespace(
+            robot=SimpleNamespace(code="robot-1"),
+            telemetry=SimpleNamespace(
+                endpoint="https://platform.example/api/device/telemetry/",
+                timeout_seconds=5,
+                verify_tls=True,
+                device_key="",
+            ),
+        )
+        client = AudioCommandClient(config)
+
+        self.assertIsNone(client.poll_once())
+        self.assertIsNone(client.poll_once())
+        self.assertEqual(session.get.call_count, 2)
+        session_factory.assert_called_once_with()
+
+        client.shutdown()
+        session.close.assert_called_once_with()
+
+    def test_cloud_command_idle_poll_interval_is_500ms(self):
+        class StopAfterFirstWait:
+            def __init__(self):
+                self.stopped = False
+                self.wait_calls = []
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, seconds):
+                self.wait_calls.append(seconds)
+                self.stopped = True
+                return True
+
+        stop_event = StopAfterFirstWait()
+        client = Mock()
+        client.poll_once.return_value = None
+
+        cloud_audio_command_worker(stop_event, client)
+
+        client.poll_once.assert_called_once_with()
+        client.shutdown.assert_called_once_with()
+        self.assertEqual(stop_event.wait_calls, [CLOUD_AUDIO_POLL_INTERVAL_SECONDS])
+        self.assertEqual(CLOUD_AUDIO_POLL_INTERVAL_SECONDS, 0.5)
 
 
 if __name__ == "__main__":

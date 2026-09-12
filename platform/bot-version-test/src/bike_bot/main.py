@@ -23,6 +23,7 @@ from .telemetry import TelemetryClient
 
 LOGGER = logging.getLogger(__name__)
 PERF_LOG_INTERVAL_SECONDS = 10.0
+CLOUD_AUDIO_POLL_INTERVAL_SECONDS = 0.5
 
 
 def _milliseconds(seconds: float) -> float:
@@ -684,7 +685,7 @@ def cloud_audio_command_worker(stop_event: threading.Event, client: AudioCommand
                 LOGGER.exception("cloud audio command poll failed")
                 stop_event.wait(2)
                 continue
-            stop_event.wait(0.2)
+            stop_event.wait(CLOUD_AUDIO_POLL_INTERVAL_SECONDS)
     finally:
         client.shutdown()
 
@@ -814,6 +815,7 @@ def main() -> None:
     finally:
         for thread in threads:
             thread.join(timeout=2)
+        client.close()
 
 
 if __name__ == "__main__":

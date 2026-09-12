@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from itertools import count
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, Thread, local
 from uuid import uuid4
 
 import requests
@@ -57,6 +57,33 @@ class TelemetryClient:
         self._actual_frame_height: int | None = None
         self._last_person_report_at = 0.0
         self._person_report_lock = Lock()
+        self._session_registry_lock = Lock()
+        self._sessions: list[requests.Session] = []
+        self._thread_session = local()
+        # Person reports use short-lived worker threads, but the existing
+        # report lock guarantees one request at a time, so one dedicated
+        # session can safely retain that HTTPS connection.
+        self._person_report_session = self._new_session()
+
+    def _new_session(self) -> requests.Session:
+        session = requests.Session()
+        with self._session_registry_lock:
+            self._sessions.append(session)
+        return session
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._thread_session, "session", None)
+        if session is None:
+            session = self._new_session()
+            self._thread_session.session = session
+        return session
+
+    def close(self) -> None:
+        with self._session_registry_lock:
+            sessions = self._sessions
+            self._sessions = []
+        for session in sessions:
+            session.close()
 
     def update_frame_size(self, width: int, height: int) -> None:
         if width <= 0 or height <= 0:
@@ -125,7 +152,7 @@ class TelemetryClient:
 
         try:
             post_started_at = time.perf_counter()
-            response = requests.post(
+            response = self._session().post(
                 self.config.telemetry.endpoint,
                 json=payload_dict,
                 headers=headers,
@@ -262,7 +289,7 @@ class TelemetryClient:
         if self.config.telemetry.device_key:
             headers["X-Device-Key"] = self.config.telemetry.device_key
         try:
-            response = requests.get(
+            response = self._session().get(
                 endpoint,
                 params={"robot_code": self.config.robot.code},
                 headers=headers,
@@ -277,7 +304,7 @@ class TelemetryClient:
 
     def _post_person_detections(self, endpoint: str, payload: dict, headers: dict) -> None:
         try:
-            response = requests.post(
+            response = self._person_report_session.post(
                 endpoint,
                 json=payload,
                 headers=headers,
@@ -331,7 +358,7 @@ class TelemetryClient:
             upload_started_at = time.perf_counter()
             try:
                 with snapshot_path.open("rb") as handle:
-                    response = requests.post(
+                    response = self._session().post(
                         endpoint,
                         data=data,
                         files={"file": (snapshot_path.name, handle, mime_type)},

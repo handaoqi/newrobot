@@ -64,6 +64,10 @@ class AudioCommandClient:
         self.config = config
         self.stream_pusher = stream_pusher
         self.api_base = self._derive_api_base(config.telemetry.endpoint)
+        # The command poll is the only high-frequency HTTP path. Keep one
+        # session for that worker so HTTPS connections can be reused instead
+        # of performing a new TCP/TLS handshake for every empty poll.
+        self._poll_session = requests.Session()
         self.cache_dir = Path("data/audio-cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._playback_lock = threading.Lock()
@@ -78,7 +82,7 @@ class AudioCommandClient:
         return endpoint.rstrip("/")
 
     def poll_once(self) -> dict | None:
-        response = requests.get(
+        response = self._poll_session.get(
             f"{self.api_base}/device/commands/poll/",
             params={"robot_code": self.config.robot.code},
             headers=self._headers(),
@@ -124,6 +128,9 @@ class AudioCommandClient:
 
     def shutdown(self) -> None:
         self.interrupt_current()
+        poll_session = getattr(self, "_poll_session", None)
+        if poll_session is not None:
+            poll_session.close()
 
     def handle_command(self, command: dict, cancel_event: threading.Event | None = None) -> None:
         cancel_event = cancel_event or threading.Event()
