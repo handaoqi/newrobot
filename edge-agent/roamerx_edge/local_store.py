@@ -408,6 +408,16 @@ class LocalStore:
         value = self.get_metadata(self._trusted_pose_key(map_id, map_version))
         return value if isinstance(value, dict) else None
 
+    def clear_last_trusted_pose(self, map_id: str, map_version: str) -> None:
+        """Invalidate the map-scoped trusted seed before a new task starts."""
+        if not map_id:
+            return
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM agent_metadata WHERE key=?",
+                (self._trusted_pose_key(map_id, map_version),),
+            )
+
     def start_self_heal_episode(
         self,
         episode_id: str,

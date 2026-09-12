@@ -1379,14 +1379,20 @@ def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
     )
-    executor.prepare_task_start(command("task.start"))
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a", "map_version": "v1", "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
     assert nav.rtk_calls == 1
     assert nav.relocalize_calls == []
     store.close()
 
 
-def test_startup_skips_seed_when_already_on_fixed_rtk(tmp_path):
+def test_indoor_startup_keeps_an_already_stable_fixed_rtk_pose(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.localization_state = {
@@ -1410,6 +1416,35 @@ def test_startup_skips_seed_when_already_on_fixed_rtk(tmp_path):
     executor.initialize_before_navigation()
     assert nav.rtk_calls == 0
     assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    store.close()
+
+
+def test_new_task_invalidates_disk_and_memory_trusted_pose_before_initialization(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.invalidated = 0
+
+    def invalidate_last_trusted_pose():
+        nav.invalidated += 1
+        nav.trusted_pose = None
+
+    nav.invalidate_last_trusted_pose = invalidate_last_trusted_pose
+    envelope = command("task.start")
+    route = envelope.payload["command"]["route_snapshot"]
+    route["map"] = {"map_id": "site-a", "map_version": "v1"}
+    store.save_last_trusted_pose("site-a", "v1", {"x": 80.0, "y": -40.0})
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    executor.prepare_task_start(envelope)
+
+    assert nav.invalidated == 1
+    assert nav.trusted_pose is None
+    assert store.load_last_trusted_pose("site-a", "v1") is None
     store.close()
 
 
@@ -1450,7 +1485,13 @@ def test_startup_falls_back_to_ndt_when_rtk_is_poor(tmp_path):
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
     )
-    executor.prepare_task_start(command("task.start"))
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a", "map_version": "v1", "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
     assert nav.relocalize_calls[0]["source"] == "startup_trusted"
     store.close()
@@ -2370,7 +2411,7 @@ def test_outdoor_final_pose_error_rejects_rtk_off_click(tmp_path):
     store.close()
 
 
-def test_startup_reanchors_when_lio_rtk_xy_drift_is_large(tmp_path):
+def test_outdoor_startup_reseeds_fixed_rtk_even_when_lio_is_already_stable(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.pose = SimpleNamespace(x=10.0, y=10.0, yaw=0.0)
@@ -2379,6 +2420,8 @@ def test_startup_reanchors_when_lio_rtk_xy_drift_is_large(tmp_path):
         "absolute_stable": True,
         "rtk_quality": "fixed",
         "rtk_usable": True,
+        "rtk_heading_usable": True,
+        "rtk_good_for_navigation": True,
         "rtk_position_good_for_navigation": True,
         "rtk_x": 10.0,
         "rtk_y": 10.8,
@@ -2396,7 +2439,13 @@ def test_startup_reanchors_when_lio_rtk_xy_drift_is_large(tmp_path):
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
     )
-    executor.prepare_task_start(command("task.start"))
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a", "map_version": "v1", "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
     assert nav.rtk_calls == 1
     store.close()

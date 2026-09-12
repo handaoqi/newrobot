@@ -117,6 +117,18 @@ def test_last_trusted_pose_is_scoped_by_map(tmp_path):
     store.close()
 
 
+def test_clear_last_trusted_pose_removes_only_the_selected_map_scope(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    store.save_last_trusted_pose("92", "v1", {"x": 1.0, "y": 2.0})
+    store.save_last_trusted_pose("93", "v1", {"x": 3.0, "y": 4.0})
+
+    store.clear_last_trusted_pose("92", "v1")
+
+    assert store.load_last_trusted_pose("92", "v1") is None
+    assert store.load_last_trusted_pose("93", "v1") == {"x": 3.0, "y": 4.0}
+    store.close()
+
+
 def test_outbox_prioritizes_control_events_ahead_of_trajectory(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     for index in range(3):

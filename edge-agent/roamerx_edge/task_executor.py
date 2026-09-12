@@ -244,6 +244,8 @@ class NavigationAdapter(Protocol):
     def is_robot_stopped(self) -> bool: ...
     def latest_pose(self): ...
     def latest_trusted_pose(self): ...
+    def invalidate_last_trusted_pose(self) -> None: ...
+    def accept_startup_trusted_pose(self) -> None: ...
     def set_localization_policy(
         self,
         source: str,
@@ -1445,6 +1447,17 @@ class TaskExecutor:
             route["waypoints"] = [dict(waypoint) for waypoint in route.get("waypoints") or []]
             base_waypoints = [dict(point) for point in route["waypoints"]]
             self._assert_map_constraints(route)
+            map_info = dict(route.get("map") or {})
+            map_id = str(map_info.get("map_id") or "")
+            map_version = str(map_info.get("map_version") or "")
+            # A trusted pose is task-local evidence.  Reusing it across task
+            # starts can retain a valid but distant pose on the same map and
+            # prevent the new RTK/NDT initialization from becoming canonical.
+            self.store.clear_last_trusted_pose(map_id, map_version)
+            invalidate_trusted = getattr(self.navigation, "invalidate_last_trusted_pose", None)
+            if callable(invalidate_trusted):
+                invalidate_trusted()
+            LOGGER.info("invalidated last_trusted pose for new task map=%s version=%s", map_id, map_version)
             docking = dict(command.get("docking") or {})
             dock_points = [
                 index
@@ -1789,60 +1802,25 @@ class TaskExecutor:
         return True
 
     def initialize_before_navigation(self) -> None:
+        self._initialize_before_navigation()
+        accept_trusted = getattr(self.navigation, "accept_startup_trusted_pose", None)
+        if callable(accept_trusted):
+            accept_trusted()
+
+    def _initialize_before_navigation(self) -> None:
         """Require a verified absolute pose before the first Nav2 goal."""
         if not self.context or self.context.state != "accepted":
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
         decision = self._localization_decision()
-        if self._rtk_good_for_navigation() or (
-            self._rtk_position_good_for_navigation()
-            and str(decision.get("active_source") or "") == "lio_imu"
-            and bool(decision.get("absolute_stable"))
-        ):
-            if (
-                decision.get("active_source") == "rtk_imu"
-                and bool(decision.get("absolute_stable"))
-            ):
-                LOGGER.info("startup localization already on fixed RTK")
-                return
-            if (
-                decision.get("active_source") == "lio_imu"
-                and bool(decision.get("absolute_stable"))
-                and self._rtk_position_good_for_navigation()
-            ):
-                if self._startup_rtk_xy_needs_reanchor(decision):
-                    seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
-                    if callable(seed_rtk):
-                        pose_xy = self._current_pose_xy() or (0.0, 0.0)
-                        LOGGER.warning(
-                            "startup LIO↔RTK XY drift=%.2fm; re-anchoring from fixed RTK",
-                            hypot(
-                                float(decision["rtk_x"]) - pose_xy[0],
-                                float(decision["rtk_y"]) - pose_xy[1],
-                            ),
-                        )
-                        try:
-                            seed_rtk()
-                            return
-                        except Exception as exc:
-                            LOGGER.warning(
-                                "startup RTK re-anchor failed (%s); continuing on current LIO pose",
-                                exc,
-                            )
-                LOGGER.info("startup localization on FAST-LIO with fixed RTK XY")
-                return
+        if self._outdoor_navigation_profile() and self._rtk_good_for_navigation():
             seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
             if not callable(seed_rtk):
-                if self._rtk_position_good_for_navigation() and bool(
-                    decision.get("absolute_stable")
-                ):
-                    LOGGER.info("startup localization accepts stable outdoor pose without RTK seed API")
-                    return
                 raise ProtocolError(
                     "INITIALIZATION_FAILED",
                     "fixed RTK is available but GPS initialization is unavailable",
                 )
             try:
-                LOGGER.info("startup localization using fixed RTK")
+                LOGGER.info("startup localization verifying and seeding fixed RTK before FAST-LIO handoff")
                 seed_rtk()
                 return
             except ProtocolError:

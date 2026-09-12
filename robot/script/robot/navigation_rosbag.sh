@@ -23,7 +23,7 @@ export RESOURCE_METRICS_ENABLED="${RESOURCE_METRICS_ENABLED:-1}"
 # as the difference between the two.
 # /status carries the scan-match quality flags but only a frame-to-frame delta
 # pose, so /localization/scan_match_pose carries the absolute NDT/VGICP result.
-export ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-/localization_info /status /localization/scan_match_pose /laser_scan /odom/nav2 /plan /transformed_global_plan /cmd_vel_nav /local_costmap/costmap_raw /polygon_stop /polygon_slowdown /sensor_health /mppi/performance /trajectories}"
+export ROSBAG_EXTRA_TOPICS="${ROSBAG_EXTRA_TOPICS:-/localization_info /localization/decision /localization/policy /status /localization/scan_match_pose /laser_scan /odom/nav2 /plan /transformed_global_plan /cmd_vel_nav /local_costmap/costmap_raw /polygon_stop /polygon_slowdown /sensor_health /mppi/performance /trajectories}"
 
 BASE_RECORDER="$(dirname "$0")/mapping_rosbag.sh"
 AVOIDANCE_SUMMARY_TOOL="${AVOIDANCE_SUMMARY_TOOL:-$(dirname "$0")/summarize_avoidance_bag.py}"

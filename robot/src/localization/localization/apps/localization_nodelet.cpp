@@ -1259,6 +1259,7 @@ private:
       latest_lio_odom_ = *msg;
       latest_lio_odom_stamp_ = rclcpp::Time(msg->header.stamp);
       has_lio_odom_ = true;
+      ++lio_odom_sequence_;
       lio_pose_history_.push_back({latest_lio_odom_stamp_.nanoseconds(), next_pose});
       const int64_t horizon = latest_lio_odom_stamp_.nanoseconds() -
         static_cast<int64_t>(lio_pose_history_seconds_ * 1.0e9);
@@ -1309,6 +1310,74 @@ private:
     // NDT UKF, which is exactly the indoor flicker we observed.
     const double age = (stamp - latest_lio_odom_stamp_).seconds();
     return std::isfinite(age) && std::fabs(age) <= lio_max_age_s_;
+  }
+
+  void beginLioHandoff(const char* source) {
+    if (!enable_lio_primary_) {
+      return;
+    }
+    std::uint64_t required_sequence = 0;
+    std::uint64_t generation = 0;
+    const char* handoff_source = source ? source : "absolute_pose";
+    {
+      std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+      required_sequence = lio_odom_sequence_;
+    }
+    {
+      std::lock_guard<std::mutex> lock(lio_handoff_mutex_);
+      generation = ++lio_handoff_generation_;
+      lio_handoff_required_sequence_ = required_sequence;
+      lio_handoff_source_ = handoff_source;
+      lio_handoff_failure_reason_ = "waiting_for_fresh_lio";
+      lio_handoff_pending_ = true;
+    }
+    active_source_ = "unavailable";
+    policy_source_ready_ = false;
+    absolute_stable_ = false;
+    absolute_stable_count_ = 0;
+    stable_source_.clear();
+    RCLCPP_INFO(
+      get_logger(), "FAST-LIO handoff pending generation=%llu source=%s after_lio_sequence=%llu",
+      static_cast<unsigned long long>(generation), handoff_source,
+      static_cast<unsigned long long>(required_sequence));
+  }
+
+  bool lioHandoffHasFreshFrame() const {
+    std::uint64_t current_sequence = 0;
+    {
+      std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+      current_sequence = lio_odom_sequence_;
+    }
+    std::lock_guard<std::mutex> lock(lio_handoff_mutex_);
+    return !lio_handoff_pending_ || current_sequence > lio_handoff_required_sequence_;
+  }
+
+  void completeLioHandoff() {
+    std::lock_guard<std::mutex> lock(lio_handoff_mutex_);
+    if (!lio_handoff_pending_) {
+      return;
+    }
+    lio_handoff_pending_ = false;
+    lio_handoff_failure_reason_ = "none";
+    RCLCPP_INFO(
+      get_logger(), "FAST-LIO handoff ready generation=%llu source=%s",
+      static_cast<unsigned long long>(lio_handoff_generation_), lio_handoff_source_.c_str());
+  }
+
+  struct LioHandoffSnapshot {
+    bool pending = false;
+    std::uint64_t generation = 0;
+    std::uint64_t required_sequence = 0;
+    std::string source = "none";
+    std::string failure_reason = "none";
+  };
+
+  LioHandoffSnapshot lioHandoffSnapshot() const {
+    std::lock_guard<std::mutex> lock(lio_handoff_mutex_);
+    return {
+      lio_handoff_pending_, lio_handoff_generation_, lio_handoff_required_sequence_,
+      lio_handoff_source_, lio_handoff_failure_reason_
+    };
   }
 
   void resetLioAnchor() {
@@ -1798,6 +1867,12 @@ private:
     if (lio_motion_anomaly_active_) {
       return false;
     }
+    // The absolute RTK/NDT pose may be based on the most recently received
+    // LIO frame, but it cannot authorize that old frame as the new continuous
+    // source. Require one subsequent independent FAST-LIO callback.
+    if (!lioHandoffHasFreshFrame()) {
+      return false;
+    }
     if (lio_has_previous_pose_) {
       const Eigen::Isometry3f delta = previous_lio_pose_.inverse() * T_lio;
       if (!delta.matrix().allFinite() || delta.translation().norm() > lio_max_step_m_) {
@@ -1839,6 +1914,7 @@ private:
     previous_lio_pose_ = T_lio;
     lio_has_previous_pose_ = true;
     last_lio_observation_stamp_ = stamp;
+    completeLioHandoff();
     return true;
   }
 
@@ -3206,6 +3282,7 @@ private:
       rtk.orientation.toRotationMatrix()(0, 0));
     const bool rtk_heading_available = rtk_position_available && rtk.heading_usable &&
       std::isfinite(rtk_map_yaw);
+    const LioHandoffSnapshot lio_handoff = lioHandoffSnapshot();
     Eigen::Vector3d anchor_covariance = Eigen::Vector3d::Zero();
     Eigen::Vector3d anchor_innovation = Eigen::Vector3d::Zero();
     Eigen::Vector3d anchor_gain = Eigen::Vector3d::Zero();
@@ -3330,6 +3407,12 @@ private:
         << "\",\"ndt_healthy\":" << (last_ndt_healthy_ ? "true" : "false")
         << ",\"ndt_score\":" << last_ndt_score_
         << ",\"lio_primary\":" << (enable_lio_primary_ ? "true" : "false")
+        << ",\"handoff_state\":\""
+        << (lio_handoff.pending ? "lio_handoff_pending" : "ready")
+        << "\",\"handoff_anchor_generation\":" << lio_handoff.generation
+        << ",\"handoff_required_lio_sequence\":" << lio_handoff.required_sequence
+        << ",\"handoff_source\":\"" << lio_handoff.source
+        << "\",\"handoff_failure_reason\":\"" << lio_handoff.failure_reason << "\""
         << ",\"single_continuous_source_enforced\":"
         << ((enable_lio_primary_ && !rtk_auto_primary_latched_) ? "true" : "false")
         << ",\"lio_healthy\":"
@@ -3723,6 +3806,7 @@ private:
       // Align the continuous LIO map←odom bridge to the RTK XY+yaw seed now so
       // the next LIO frame does not reintroduce a large yaw residual.
       reanchorLioToUkf();
+      beginLioHandoff("rtk_fixed");
       const float seeded_yaw = yawFromRotation(last_init_quat_.toRotationMatrix());
       RCLCPP_INFO(get_logger(),
         "Fixed RTK accepted as %s for %s without NDT validation "
@@ -4309,6 +4393,7 @@ private:
         init_match_count_ = init_match_count_threshold_;
         advanceGlobalRelocalizationGeneration("optimal NDT initialization");
         clearLioMotionAnomaly("optimal NDT initialization");
+        beginLioHandoff("ndt_optimal");
         initialized_this_frame = true;
         localization_state_ = 2;
         RCLCPP_INFO(get_logger(),
@@ -4331,6 +4416,7 @@ private:
           initialization_state_ = "localized";
           global_search_required_ = false;
           clearLioMotionAnomaly("verified NDT relocalization");
+          beginLioHandoff("ndt_verified");
           initialized_this_frame = true;
           localization_state_ = 2;
           RCLCPP_INFO(get_logger(), "Init Pose Successful!!!");
@@ -6201,7 +6287,7 @@ private:
         // FAST-LIO is the only continuous motion source. Publish every timer
         // tick from the latest local pose and the slowly changing map->lio
         // anchor, independently of the lower-rate NDT point-cloud callback.
-        if (enable_lio_primary_ && lio_anchor_valid_.load() &&
+        if (enable_lio_primary_ && !lioHandoffSnapshot().pending && lio_anchor_valid_.load() &&
             !lio_motion_anomaly_active_) {
             const rclcpp::Time now = this->get_clock()->now();
             Eigen::Isometry3f lio_pose = Eigen::Isometry3f::Identity();
@@ -6806,12 +6892,19 @@ private:
   nav_msgs::msg::Odometry latest_lio_odom_;
   rclcpp::Time latest_lio_odom_stamp_{0, 0, RCL_ROS_TIME};
   bool has_lio_odom_ = false;
+  std::uint64_t lio_odom_sequence_ = 0;
   std::deque<StampedLioPose> lio_pose_history_;
   double lio_pose_history_seconds_ = 2.0;
   double lio_observation_sync_tolerance_s_ = 0.20;
   Eigen::Isometry3f anchor_prediction_lio_pose_ = Eigen::Isometry3f::Identity();
   bool has_anchor_prediction_lio_pose_ = false;
   std::atomic<bool> lio_anchor_valid_{false};
+  mutable std::mutex lio_handoff_mutex_;
+  bool lio_handoff_pending_ = false;
+  std::uint64_t lio_handoff_generation_ = 0;
+  std::uint64_t lio_handoff_required_sequence_ = 0;
+  std::string lio_handoff_source_ = "none";
+  std::string lio_handoff_failure_reason_ = "none";
   bool lio_has_previous_pose_ = false;
   bool lio_corrected_this_frame_ = false;
   PendingLioCorrection pending_lio_correction_;

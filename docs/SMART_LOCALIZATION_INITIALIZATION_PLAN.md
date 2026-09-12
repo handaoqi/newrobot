@@ -72,6 +72,33 @@ task.start → 检查地图和机器人状态 → 检查定位是否稳定
 - 页面可重新发起智能初始化或人工下发初始点，成功后由人工重新执行任务；
 - 启动前失败返回 `INITIALIZATION_FAILED`，导航中失败则保存当前航点并进入 `paused`。
 
+### 固定 RTK 与 FAST-LIO 接管（2026-09-13 更新）
+
+室外或过渡场景、且地图坐标模式为 `rtk_fixed` 时，任务启动不复用上一次
+任务的 `last_trusted_pose`，按以下状态机完成：
+
+```text
+task.start
+→ 清除本地图内存/SQLite last_trusted
+→ fixed RTK + 双天线航向连续 3 帧、RTK 自身跨度 ≤0.30m
+→ /localization/seed_from_rtk 写入绝对位姿、创建 map←lio 锚点代次
+→ 等待置姿后的新鲜 FAST-LIO 帧
+→ lio_healthy + lio_anchored + absolute_stable + active_source=lio_imu
+→ 启动 Nav2
+```
+
+- RTK 与 FAST-LIO 的 XY 差仅用于诊断，不能阻止 fixed RTK 初始化；
+  原有“差值 <0.30m 连续三帧”门禁取消。
+- NDT 候选提交后走相同的 `lio_handoff_pending` 状态；NDT 负责绝对校正，
+  RTK/NDT 都不得替代 FAST-LIO 成为连续输出源。
+- 接管仅接受绝对置姿/候选提交之后的新 LIO 帧。若 8 秒内未完成，返回
+  `LIO_HANDOFF_TIMEOUT`，上报 LIO 流、锚点或运动异常诊断，保持安全停止，
+  不重复候选搜索。
+- 定位决策需发布 `handoff_state`、锚点代次、接管来源和失败原因；导航 MCAP
+  必须录制 `/localization/decision`、`/localization/policy`。
+- 新任务完成启动验证前冻结 trusted 写入；只有本任务已完成 LIO 接管后，才以
+  当前新鲜稳定位姿重建 `last_trusted`。启动失败则保持失效。
+
 ## 接口与状态
 
 复用现有 `nav.initial_pose`、`nav.relocalize`、`task.resume` 接口，智能初始化增加：

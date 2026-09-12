@@ -86,6 +86,8 @@ def test_navigation_recorder_contains_stage_zero_evidence_topics():
         "/polygon_slowdown",
         "/sensor_health",
         "/mppi/performance",
+        "/localization/decision",
+        "/localization/policy",
     ):
         assert topic in source
 
