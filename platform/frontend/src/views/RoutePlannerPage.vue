@@ -3232,7 +3232,7 @@ async function handleDeleteRoute(route) {
                       </label>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
-                        <span>到下个点避障（绕行+减速；硬急停始终开启）</span>
+                        <span>到下个点避障（绕行+减速；硬急停）</span>
                       </label>
                       <label>
                         <span>语音模式</span>
@@ -3292,11 +3292,11 @@ async function handleDeleteRoute(route) {
                   <span>描述</span>
                   <textarea v-model="routeForm.description" rows="2" placeholder="输入路线描述"></textarea>
                 </label>
+                <label class="diagnostic-record-toggle route-record-toggle">
+                  <input v-model="routeForm.record_rosbag" type="checkbox" />
+                  <span>录制导航调试包</span>
+                </label>
                 <div class="waypoint-actions">
-                  <label class="diagnostic-record-toggle route-record-toggle">
-                    <input v-model="routeForm.record_rosbag" type="checkbox" />
-                    <span>录制导航调试包</span>
-                  </label>
                   <button class="btn btn-primary route-main-action route-save-action" @click="handleSaveRoute" :disabled="!selectedMap || waypoints.length === 0 || drillRunning">
                     保存路线
                   </button>
@@ -4767,12 +4767,22 @@ async function handleDeleteRoute(route) {
 }
 
 .route-record-toggle {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 0.4rem;
-  margin-right: 0.6rem;
-  color: var(--muted);
-  font-size: 0.72rem;
+  width: 100%;
+  margin-top: 0.55rem;
+  color: #667085;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  font-weight: 400;
+}
+
+.route-record-toggle input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin: 0;
 }
 
 .route-list-toggle {
