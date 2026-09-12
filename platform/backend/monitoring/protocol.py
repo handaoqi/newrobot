@@ -37,6 +37,7 @@ COMMAND_TYPES = {
     "nav.single_goal",
     "nav.relocalize",
     "diagnostics.log_config",
+    "diagnostics.nav_rosbag_stop",
     "map.activate",
     "map.boundary_apply",
     "map.optimize",
@@ -233,6 +234,8 @@ def validate_payload(envelope: MessageEnvelope) -> None:
             raise ProtocolError("INVALID_MESSAGE", "command must be an object")
         if envelope.message_type == "task.start":
             _validate_task_start(command)
+        elif envelope.message_type == "diagnostics.nav_rosbag_stop":
+            _uuid(_required(command, "loop_session_id"), "loop_session_id")
         elif envelope.message_type == "nav.single_goal":
             _validate_nav_single_goal(command)
     elif envelope.message_type == "command.ack":
@@ -335,6 +338,13 @@ def _validate_task_start(command: dict[str, Any]) -> None:
     record_rosbag = command.get("record_rosbag")
     if record_rosbag is not None and not isinstance(record_rosbag, bool):
         raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
+    continuous_rosbag = command.get("continuous_rosbag", False)
+    if not isinstance(continuous_rosbag, bool):
+        raise ProtocolError("INVALID_MESSAGE", "task.start continuous_rosbag must be boolean")
+    if continuous_rosbag:
+        if not record_rosbag:
+            raise ProtocolError("INVALID_MESSAGE", "continuous_rosbag requires record_rosbag")
+        _uuid(_required(command, "loop_session_id"), "loop_session_id")
 
 
 def _validate_nav_single_goal(command: dict[str, Any]) -> None:

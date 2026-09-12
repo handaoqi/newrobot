@@ -392,6 +392,7 @@ class EdgeAgentApplication:
                     "map.optimize",
                     "map.boundary_apply",
                     "diagnostics.log_config",
+                    "diagnostics.nav_rosbag_stop",
                     "structured_logs.v1",
                     "navigation_boundaries.v1",
                     "map_set.v1",
@@ -809,6 +810,14 @@ class EdgeAgentApplication:
         """Stop patrol motion and report low battery without requesting docking."""
         context = self.task_executor.context
         execution_id = context.task_execution_id if context else ""
+        continuous_loop_session_id = (
+            str(getattr(context, "loop_session_id", "") or "")
+            if context
+            and bool(getattr(context, "record_rosbag", False))
+            and bool(getattr(context, "loop_execution", False))
+            and bool(getattr(context, "continuous_rosbag", False))
+            else ""
+        )
         docking_active = bool(
             self.task_executor.has_active_task()
             and context
@@ -825,6 +834,14 @@ class EdgeAgentApplication:
                     reason_code="LOW_BATTERY",
                     reason_message=f"battery {battery_percent}% is below the patrol threshold",
                 )
+                if continuous_loop_session_id:
+                    # The cloud also emits an idempotent stop command when it
+                    # closes the loop.  Stop locally as well because the low
+                    # battery path must remain terminal even while MQTT is
+                    # unavailable.
+                    stopped["rosbag"] = self.task_executor.stop_loop_rosbag(
+                        continuous_loop_session_id
+                    )
                 action = "force_exited"
                 LOGGER.warning("low battery force-exited active navigation; automatic return is disabled")
             except Exception:

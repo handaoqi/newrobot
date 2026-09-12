@@ -15,6 +15,10 @@ def test_sqlite_restart_recovery(tmp_path):
             "route_snapshot": {"waypoints": [{"sequence": 0}]},
             "current_waypoint_index": 0,
             "start_command_id": "cmd-1",
+            "record_rosbag": True,
+            "loop_execution": True,
+            "loop_session_id": "63b66a16-1947-4be7-889b-d851a5f4ba20",
+            "continuous_rosbag": True,
         }
     )
     first.enqueue_outbox("topic", {"message_type": "task.progress"}, dedupe_key="event-1")
@@ -22,7 +26,12 @@ def test_sqlite_restart_recovery(tmp_path):
 
     second = LocalStore(str(path))
     assert second.get_processed_command("cmd-1")["ack"]["accepted"] is True
-    assert second.load_active_task_context()["state"] == "running"
+    restored = second.load_active_task_context()
+    assert restored["state"] == "running"
+    assert restored["record_rosbag"] is True
+    assert restored["loop_execution"] is True
+    assert restored["loop_session_id"] == "63b66a16-1947-4be7-889b-d851a5f4ba20"
+    assert restored["continuous_rosbag"] is True
     assert second.outbox_count() == 1
     second.close()
 
@@ -73,6 +82,9 @@ def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
     assert restored["arrival_micro_adjust_total_m"] == 0.30
     assert restored["arrival_micro_adjust_steps"] == 2
     assert restored["arrival_micro_adjust_started_at"] == 1234.5
+    assert restored["loop_execution"] is False
+    assert restored["loop_session_id"] == ""
+    assert restored["continuous_rosbag"] is False
     store.close()
 
 

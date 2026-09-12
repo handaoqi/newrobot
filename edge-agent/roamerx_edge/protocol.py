@@ -21,7 +21,10 @@ NAV_COMMAND_TYPES = {
     "nav.initial_pose", "nav.relocalize", "nav.single_goal",
 }
 MAP_COMMAND_TYPES = {"map.activate", "map.optimize", "map.boundary_apply"}
-DIAGNOSTICS_COMMAND_TYPES = {"diagnostics.log_config"}
+DIAGNOSTICS_COMMAND_TYPES = {
+    "diagnostics.log_config",
+    "diagnostics.nav_rosbag_stop",
+}
 SENSOR_COMMAND_TYPES = {"sensor.restart"}
 CHARGE_COMMAND_TYPES = {"charge.start", "charge.stop"}
 MOTION_CONTROL_COMMAND_TYPES = {"motion.start", "motion.stop"}
@@ -229,6 +232,18 @@ def validate_command(envelope: MessageEnvelope) -> None:
         record_rosbag = payload["command"].get("record_rosbag")
         if record_rosbag is not None and not isinstance(record_rosbag, bool):
             raise ProtocolError("INVALID_MESSAGE", "task.start record_rosbag must be boolean")
+        continuous_rosbag = payload["command"].get("continuous_rosbag", False)
+        if not isinstance(continuous_rosbag, bool):
+            raise ProtocolError("INVALID_MESSAGE", "task.start continuous_rosbag must be boolean")
+        if continuous_rosbag:
+            if not record_rosbag:
+                raise ProtocolError(
+                    "INVALID_MESSAGE",
+                    "continuous_rosbag requires record_rosbag",
+                )
+            parse_uuid(payload["command"].get("loop_session_id"), "loop_session_id")
+    if envelope.message_type == "diagnostics.nav_rosbag_stop":
+        parse_uuid(payload["command"].get("loop_session_id"), "loop_session_id")
     if envelope.message_type in {"mapping.start", "mapping.origin_start", "mapping.slam_start"}:
         map_name = payload["command"].get("map_name")
         if map_name is not None and not isinstance(map_name, str):

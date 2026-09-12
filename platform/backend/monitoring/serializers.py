@@ -322,6 +322,10 @@ class PatrolTaskSerializer(serializers.ModelSerializer):
     route_name_display = serializers.CharField(source="route.name", read_only=True, allow_null=True)
     map_id = serializers.IntegerField(source="route.map_data_id", read_only=True, allow_null=True)
     latest_execution = serializers.SerializerMethodField()
+    route_record_rosbag = serializers.BooleanField(
+        source="route.record_rosbag", read_only=True, default=False
+    )
+    effective_record_rosbag = serializers.SerializerMethodField()
 
     class Meta:
         model = PatrolTask
@@ -341,11 +345,19 @@ class PatrolTaskSerializer(serializers.ModelSerializer):
             "map_id",
             "enabled",
             "record_rosbag",
+            "route_record_rosbag",
+            "effective_record_rosbag",
             "description",
             "latest_execution",
             "created_at",
             "updated_at",
         ]
+
+    def get_effective_record_rosbag(self, obj):
+        return bool(
+            (obj.route_id and obj.route and obj.route.record_rosbag)
+            or obj.record_rosbag
+        )
 
     def get_latest_execution(self, obj):
         execution = obj.executions.order_by("-created_at").first()
@@ -1217,7 +1229,7 @@ class PatrolRouteSummarySerializer(PatrolRouteSerializer):
         fields = [
             "id", "name", "map_data", "map_name", "map_set", "map_set_name", "robot",
             "robot_name", "robot_code", "waypoint_count", "description", "scene_scope", "global_controller",
-            "latest_execution", "created_at", "updated_at",
+            "record_rosbag", "latest_execution", "created_at", "updated_at",
         ]
 
     def get_waypoint_count(self, obj):
@@ -1577,6 +1589,7 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
     current_execution_detail = TaskExecutionSerializer(source="current_execution", read_only=True)
     recent_events = serializers.SerializerMethodField()
     total_distance_m = serializers.SerializerMethodField()
+    record_rosbag = serializers.SerializerMethodField()
 
     class Meta:
         model = PatrolLoopSession
@@ -1590,6 +1603,7 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
             "state_version",
             "duration_seconds",
             "rest_seconds",
+            "record_rosbag",
             "started_at",
             "ends_at",
             "finished_at",
@@ -1614,6 +1628,9 @@ class PatrolLoopSessionSerializer(serializers.ModelSerializer):
 
     def get_recent_events(self, obj):
         return PatrolLoopEventSerializer(obj.events.order_by("-occurred_at")[:20], many=True).data
+
+    def get_record_rosbag(self, obj):
+        return bool((obj.metadata or {}).get("record_rosbag", False))
 
     def get_total_distance_m(self, obj):
         distance = stored_loop_total_distance(obj)

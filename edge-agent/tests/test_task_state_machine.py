@@ -209,13 +209,15 @@ class FakeRosbagRecorder:
         self.started = []
         self.stopped = 0
         self.running = False
+        self.bag_dir = None
 
     def start(self, label):
         self.started.append(label)
         self.running = True
+        self.bag_dir = f"/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/{label}"
         return {
             "running": True,
-            "bag_dir": f"/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/{label}",
+            "bag_dir": self.bag_dir,
             "started_at_unix": 100,
             "size_bytes": 0,
         }
@@ -225,7 +227,7 @@ class FakeRosbagRecorder:
         self.running = False
         return {
             "running": False,
-            "bag_dir": "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/test",
+            "bag_dir": self.bag_dir or "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/test",
             "duration_seconds": 12,
             "size_bytes": 1024,
         }
@@ -233,7 +235,10 @@ class FakeRosbagRecorder:
     def status(self):
         return {
             "running": self.running,
-            "bag_dir": "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/stale" if self.running else None,
+            "bag_dir": self.bag_dir or (
+                "/home/dogrobot/runtime/nx-edge/data/rosbags/navigation/stale"
+                if self.running else None
+            ),
         }
 
 
@@ -3549,6 +3554,86 @@ def test_navigation_rosbag_starts_a_fresh_recording_for_next_execution(tmp_path)
 
     assert recorder.stopped == 1
     assert recorder.started == ["task_44444444", "task_55555555"]
+    store.close()
+
+
+def test_navigation_rosbag_reuses_one_package_across_loop_rounds(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    recorder = FakeRosbagRecorder()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        rosbag_recorder=recorder,
+    )
+    loop_session_id = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+
+    first = command("task.start")
+    first.payload["command"].update({
+        "record_rosbag": True,
+        "loop_execution": True,
+        "loop_session_id": loop_session_id,
+        "continuous_rosbag": True,
+        "round_number": 1,
+    })
+    executor.start_task(first)
+    drive_patrol(nav, until_state="completed", executor=executor)
+
+    second = command("task.start")
+    second.payload["task_execution_id"] = "55555555-5555-4555-8555-555555555555"
+    second.payload["command_id"] = "66666666-6666-4666-8666-666666666666"
+    second.payload["command"].update({
+        "record_rosbag": True,
+        "loop_execution": True,
+        "loop_session_id": loop_session_id,
+        "continuous_rosbag": True,
+        "round_number": 2,
+        "loop_direction": "reverse",
+    })
+    executor.start_task(second)
+
+    assert recorder.started == ["loop_63b66a1619474be7889bd851a5f4ba20"]
+    assert recorder.stopped == 0
+    assert recorder.running is True
+
+    stopped = executor.stop_loop_rosbag(loop_session_id)
+
+    assert recorder.stopped == 1
+    assert stopped["running"] is False
+    assert stopped["ignored"] is False
+    store.close()
+
+
+def test_delayed_loop_rosbag_stop_does_not_stop_newer_recording(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    recorder = FakeRosbagRecorder()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        rosbag_recorder=recorder,
+    )
+    current_session = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+    stale_session = "73b66a16-1947-4be7-889b-d851a5f4ba20"
+    envelope = command("task.start")
+    envelope.payload["command"].update({
+        "record_rosbag": True,
+        "loop_execution": True,
+        "loop_session_id": current_session,
+        "continuous_rosbag": True,
+    })
+    executor.start_task(envelope)
+
+    result = executor.stop_loop_rosbag(stale_session)
+
+    assert result["ignored"] is True
+    assert recorder.running is True
+    assert recorder.stopped == 0
+    executor.stop_loop_rosbag(current_session)
     store.close()
 
 

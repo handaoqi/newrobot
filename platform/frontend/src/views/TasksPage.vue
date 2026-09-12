@@ -203,7 +203,7 @@ onMounted(load)
           <input v-model="form.record_rosbag" type="checkbox" />
           <span>
             <strong>录制导航诊断包</strong>
-            <small>持久保存；手动、日历调度和循环执行都生效。</small>
+            <small>路线已开启时优先生效；否则使用任务开关。循环执行保存为一个连续包。</small>
           </span>
         </label>
       </div>
@@ -224,11 +224,11 @@ onMounted(load)
             <label class="task-record-toggle">
               <input
                 :checked="task.record_rosbag"
-                :disabled="savingRecordTaskId === task.id"
+                :disabled="savingRecordTaskId === task.id || task.route_record_rosbag"
                 type="checkbox"
                 @change="setTaskRecording(task, $event)"
               />
-              <span>{{ savingRecordTaskId === task.id ? '保存中…' : '录制导航包' }}</span>
+              <span>{{ task.route_record_rosbag ? '路线已开启录包' : savingRecordTaskId === task.id ? '保存中…' : '录制导航包' }}</span>
             </label>
             <span class="panel-badge">{{ task.latest_execution?.state || '未执行' }}</span>
             <button v-if="task.latest_execution" class="ghost-btn" @click="router.push(`/dashboard/task-executions/${task.latest_execution.id}`)">详情</button>

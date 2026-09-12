@@ -365,6 +365,17 @@ class CommandProcessor:
             return self._execute_mapping(envelope, started_at)
         if envelope.message_type.startswith("map."):
             return self._execute_map(envelope, started_at)
+        if envelope.message_type == "diagnostics.nav_rosbag_stop":
+            command = envelope.payload.get("command") or {}
+            result_payload = self.task_executor.stop_loop_rosbag(
+                command.get("loop_session_id")
+            )
+            return build_result(
+                envelope,
+                status="succeeded",
+                result=result_payload,
+                started_at=started_at,
+            )
         if envelope.message_type == "diagnostics.log_config":
             if not self.structured_logs:
                 raise ProtocolError("STRUCTURED_LOGS_UNAVAILABLE", "structured logging is not configured")

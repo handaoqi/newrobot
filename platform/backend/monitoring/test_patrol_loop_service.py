@@ -102,6 +102,93 @@ class PatrolLoopServiceTests(TestCase):
         self.assertEqual(session.current_execution.loop_session_id, session.id)
         self.assertTrue(session.current_execution.commands.filter(command_type="task.start").exists())
 
+    def test_route_save_to_task_list_to_guard_loop_keeps_continuous_recording(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        saved = client.put(
+            f"/api/routes/{self.route.id}/",
+            {"record_rosbag": True},
+            format="json",
+        )
+        tasks = client.get("/api/patrol-tasks/")
+        created = client.post(
+            "/api/patrol-loop-sessions/",
+            {
+                "task_id": self.task.id,
+                "duration_seconds": 600,
+                "rest_seconds": 5,
+            },
+            format="json",
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertIs(saved.data["record_rosbag"], True)
+        self.assertEqual(tasks.status_code, 200)
+        listed = next(item for item in tasks.data if item["id"] == self.task.id)
+        self.assertIs(listed["route_record_rosbag"], True)
+        self.assertIs(listed["effective_record_rosbag"], True)
+        self.assertEqual(created.status_code, 201)
+        session = PatrolLoopSession.objects.get(pk=created.data["id"])
+        command = session.current_execution.commands.get(command_type="task.start")
+        self.assertIs(created.data["record_rosbag"], True)
+        self.assertIs(command.payload["record_rosbag"], True)
+        self.assertIs(command.payload["continuous_rosbag"], True)
+
+    def test_loop_freezes_route_priority_recording_and_dispatches_continuous_bag(self):
+        self.route.record_rosbag = True
+        self.route.save(update_fields=["record_rosbag", "updated_at"])
+        session, _ = PatrolLoopService.create_session(
+            task=self.task,
+            duration_seconds=600,
+            rest_seconds=1,
+            operator=self.user,
+        )
+
+        session = PatrolLoopService.process(session.id)
+        first = session.current_execution.commands.get(command_type="task.start")
+
+        self.assertIs(session.metadata["record_rosbag"], True)
+        self.assertEqual(session.metadata["record_rosbag_source"], "route")
+        self.assertIs(first.payload["record_rosbag"], True)
+        self.assertIs(first.payload["continuous_rosbag"], True)
+        self.assertEqual(first.payload["loop_session_id"], str(session.id))
+
+        TaskExecutionService.transition(
+            session.current_execution,
+            "completed",
+            event_type="task.completed",
+        )
+        session = PatrolLoopService.process(session.id)
+        self.route.record_rosbag = False
+        self.route.save(update_fields=["record_rosbag", "updated_at"])
+        session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
+        session.save(update_fields=["next_action_at", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+        second = session.current_execution.commands.get(command_type="task.start")
+
+        self.assertIs(second.payload["record_rosbag"], True)
+        self.assertIs(second.payload["continuous_rosbag"], True)
+
+    def test_terminal_loop_dispatches_one_idempotent_recording_stop(self):
+        self.route.record_rosbag = True
+        self.route.save(update_fields=["record_rosbag", "updated_at"])
+        session = self.create_running_loop()
+
+        session = PatrolLoopService.stop(session, self.user)
+        session = PatrolLoopService.stop(session, self.user)
+
+        stop_commands = RemoteCommand.objects.filter(
+            command_type="diagnostics.nav_rosbag_stop",
+            payload__loop_session_id=str(session.id),
+        )
+        self.assertEqual(stop_commands.count(), 1)
+        self.assertEqual(
+            session.metadata["recording_stop_command_id"],
+            str(stop_commands.get().id),
+        )
+
     def test_completed_round_rests_then_dispatches_next_round(self):
         session = self.create_running_loop()
         TaskExecutionService.transition(

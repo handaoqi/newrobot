@@ -633,6 +633,48 @@ def test_low_battery_retained_context_is_force_exited_immediately():
     assert alerts[0]["attributes"]["automatic_docking"] is False
 
 
+def test_low_battery_also_stops_continuous_loop_rosbag_locally():
+    application = object.__new__(EdgeAgentApplication)
+    loop_session_id = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+    context = SimpleNamespace(
+        task_execution_id="task-1",
+        state="running",
+        docking={},
+        record_rosbag=True,
+        loop_execution=True,
+        loop_session_id=loop_session_id,
+        continuous_rosbag=True,
+    )
+    stopped_scopes = []
+    application.task_executor = SimpleNamespace(
+        context=context,
+        has_active_task=lambda: True,
+        force_exit=lambda *args, **kwargs: {"robot_stopped": True, "cleared": True},
+        stop_loop_rosbag=lambda scope: stopped_scopes.append(scope)
+        or {"running": False, "ignored": False},
+    )
+    application.navigation = SimpleNamespace(
+        latest_pose=lambda: None,
+        is_robot_stopped=lambda: True,
+        stop_motion=lambda: None,
+    )
+    application.safety_state = SimpleNamespace(
+        current_map_id="map-1", current_map_version="v1"
+    )
+    application.config = SimpleNamespace(
+        robot=SimpleNamespace(agent_version="test"),
+        charge_control=SimpleNamespace(
+            low_battery_start_percent=20,
+            low_battery_rearm_percent=25,
+        ),
+    )
+    application.mqtt = SimpleNamespace(publish_alert=lambda payload: None)
+
+    application._handle_low_battery_alert("episode-1", 19)
+
+    assert stopped_scopes == [loop_session_id]
+
+
 def test_mapping_divergence_alert_emits_once(monkeypatch):
     application = object.__new__(EdgeAgentApplication)
     application._mapping_divergence_notified = False

@@ -1449,6 +1449,43 @@ def _nav_command(message_type: str) -> dict:
     return raw
 
 
+def test_navigation_rosbag_stop_command_closes_requested_loop_scope(tmp_path):
+    loop_session_id = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+    raw = _nav_command("diagnostics.nav_rosbag_stop")
+    raw["payload"]["command"] = {"loop_session_id": loop_session_id}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    calls = []
+
+    def stop_loop_rosbag(requested):
+        calls.append(requested)
+        return {"running": False, "loop_session_id": requested, "ignored": False}
+
+    executor.stop_loop_rosbag = stop_loop_rosbag
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+    )
+
+    ack, result = processor.handle_command(raw)
+
+    assert ack["payload"]["ack"] == "accepted"
+    assert result["payload"]["status"] == "succeeded"
+    assert result["payload"]["result"]["running"] is False
+    assert calls == [loop_session_id]
+    store.close()
+
+
 def test_nav_start_waits_until_nav2_ready(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()

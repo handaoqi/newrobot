@@ -1685,6 +1685,9 @@ watch(playUrlKey, () => {
               <small :title="formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at)">
                 {{ formatExecutionTime(execution?.created_at || presetTask?.latest_execution?.created_at) }}
               </small>
+              <small class="guard-task-recording" :class="{ enabled: presetTask?.effective_record_rosbag }">
+                导航调试包：{{ presetTask?.effective_record_rosbag ? (loopActive ? '循环单包录制中' : '已开启') : '未开启' }}
+              </small>
               <small v-if="executionReason" class="guard-task-pause-reason" :title="executionReason.text">
                 {{ executionReason.label }}：{{ executionReason.text }}
               </small>
@@ -1939,6 +1942,7 @@ watch(playUrlKey, () => {
 .guard-task-bar span { color: #70808c; font-size: 12px; }
 .guard-task-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .guard-task-state small { overflow: hidden; color: #70808c; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.guard-task-state .guard-task-recording.enabled { color: #14734c; font-weight: 800; }
 .guard-task-state .guard-task-pause-reason { color: #c94b32; font-weight: 700; }
 .guard-task-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; }
 .guard-task-actions > button { width: 100%; min-width: 0; padding-inline: 10px; font-size: 11px; white-space: nowrap; }

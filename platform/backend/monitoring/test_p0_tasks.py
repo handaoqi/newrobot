@@ -304,6 +304,57 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
 
+    def test_route_navigation_rosbag_setting_has_priority_over_task_setting(self):
+        self.route.record_rosbag = True
+        self.route.save(update_fields=["record_rosbag", "updated_at"])
+        self.task.record_rosbag = False
+        self.task.save(update_fields=["record_rosbag", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {"record_rosbag": False},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_saved_route_recording_setting_reaches_route_preview_execution(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        saved = client.put(
+            f"/api/routes/{self.route.id}/",
+            {"record_rosbag": True},
+            format="json",
+        )
+
+        response = client.post(
+            f"/api/routes/{self.route.id}/execute/",
+            {"record_rosbag": False},
+            format="json",
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertIs(saved.data["record_rosbag"], True)
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(RemoteCommand.objects.get().payload["record_rosbag"], True)
+
+    def test_task_api_exposes_route_and_effective_navigation_rosbag_settings(self):
+        self.route.record_rosbag = True
+        self.route.save(update_fields=["record_rosbag", "updated_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.get("/api/patrol-tasks/")
+
+        self.assertEqual(response.status_code, 200)
+        task = next(item for item in response.data if item["id"] == self.task.id)
+        self.assertIs(task["record_rosbag"], False)
+        self.assertIs(task["route_record_rosbag"], True)
+        self.assertIs(task["effective_record_rosbag"], True)
+
     def test_task_execute_can_override_persisted_navigation_rosbag_setting(self):
         self.task.record_rosbag = True
         self.task.save(update_fields=["record_rosbag", "updated_at"])

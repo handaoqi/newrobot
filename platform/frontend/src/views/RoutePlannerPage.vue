@@ -2211,7 +2211,7 @@ async function handleExecuteRoute() {
   navError.value = ''
   try {
     lastExecution.value = await executeRoute(selectedRoute.value.id, {
-      recordRosbag: Boolean(selectedRoute.value.record_rosbag),
+      recordRosbag: Boolean(routeForm.value.record_rosbag),
       traceId,
     })
     taskMapExecution.value = lastExecution.value

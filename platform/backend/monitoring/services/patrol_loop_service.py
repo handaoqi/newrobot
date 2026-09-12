@@ -37,10 +37,58 @@ class PatrolLoopService:
     LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     LOW_BATTERY_REARM_PERCENT = getattr(settings, "LOW_BATTERY_REARM_PERCENT", 25)
     RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS = 180
+    LOOP_ROSBAG_STOP_COMMAND = "diagnostics.nav_rosbag_stop"
 
     @staticmethod
     def _metadata(session: PatrolLoopSession) -> dict:
         return dict(session.metadata or {})
+
+    @staticmethod
+    def _recording_config(task: PatrolTask) -> dict:
+        route_enabled = bool(task.route_id and task.route.record_rosbag)
+        task_enabled = bool(task.record_rosbag)
+        return {
+            "record_rosbag": route_enabled or task_enabled,
+            "record_rosbag_source": (
+                "route" if route_enabled else "task" if task_enabled else "disabled"
+            ),
+            "recording_mode": "continuous_loop",
+        }
+
+    @classmethod
+    def _ensure_recording_stop(
+        cls,
+        session: PatrolLoopSession,
+        *,
+        reason: str,
+    ) -> RemoteCommand | None:
+        metadata = cls._metadata(session)
+        if not bool(metadata.get("record_rosbag")):
+            return None
+        command = RemoteCommand.objects.filter(
+            robot=session.robot,
+            command_type=cls.LOOP_ROSBAG_STOP_COMMAND,
+            payload__loop_session_id=str(session.id),
+        ).order_by("issued_at").first()
+        if command is None:
+            command = CommandService.create_robot_command(
+                robot=session.robot,
+                command_type=cls.LOOP_ROSBAG_STOP_COMMAND,
+                payload={
+                    "loop_session_id": str(session.id),
+                    "reason": str(reason or "loop_terminal"),
+                },
+                operator=session.created_by,
+                # A terminal stop is still useful after a long MQTT outage.
+                # Edge scopes the request to this loop UUID, so a delayed
+                # command cannot stop a newer loop recording.
+                expiry_seconds=24 * 60 * 60,
+            )
+        metadata["recording_stop_command_id"] = str(command.id)
+        metadata["recording_stop_requested_at"] = timezone.now().isoformat()
+        session.metadata = metadata
+        session.save(update_fields=["metadata", "updated_at"])
+        return command
 
     @classmethod
     def _clear_recovery_episode(cls, session: PatrolLoopSession) -> None:
@@ -149,6 +197,7 @@ class PatrolLoopService:
             raise PatrolLoopError("当前 Edge 版本不支持中心循环自愈，请先升级 Edge")
         CommandService.ensure_task_start_allowed(robot)
         now = timezone.now()
+        recording = cls._recording_config(task)
         session = PatrolLoopSession.objects.create(
             id=requested_id,
             robot=robot,
@@ -160,7 +209,7 @@ class PatrolLoopService:
             ends_at=now + timedelta(seconds=duration_seconds),
             next_action_at=now,
             recovery_max_attempts=cls.MAX_RECOVERY_ATTEMPTS,
-            metadata={"total_distance_m": "0.000000"},
+            metadata={"total_distance_m": "0.000000", **recording},
             created_by=operator,
         )
         cls._event(session, "loop.created", key="created")
@@ -219,6 +268,11 @@ class PatrolLoopService:
             reason_message=reason_message,
             payload=payload,
         )
+        if terminal:
+            cls._ensure_recording_stop(
+                session,
+                reason=reason_code or state,
+            )
         return session
 
     @classmethod
@@ -486,6 +540,11 @@ class PatrolLoopService:
                 "task.start",
                 session.created_by,
                 command_options={
+                    "record_rosbag": bool(
+                        cls._metadata(session).get("record_rosbag", False)
+                    ),
+                    "record_rosbag_frozen": True,
+                    "continuous_rosbag": True,
                     "loop_execution": True,
                     "loop_total": 1,
                     # A new round must start from the terminal side reached by

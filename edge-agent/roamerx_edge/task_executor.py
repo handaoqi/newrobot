@@ -279,6 +279,9 @@ class TaskContext:
     start_command_id: str
     current_segment_index: int = 0
     record_rosbag: bool = False
+    loop_execution: bool = False
+    loop_session_id: str = ""
+    continuous_rosbag: bool = False
     docking: dict | None = None
     round_number: int = 1
     loop_total: int = 1
@@ -296,6 +299,7 @@ class TaskContext:
 
 class TaskExecutor:
     TERMINAL_STATES = {"completed", "failed", "cancelled", "timed_out", "rejected"}
+    ROSBAG_SCOPE_METADATA_KEY = "navigation_rosbag_scope"
 
     def __init__(
         self,
@@ -568,7 +572,7 @@ class TaskExecutor:
         self._cancel_arrival_adjustment(reset_state=True)
         self._cancel_waypoint_dwell()
         self._stop_obstacle_monitor()
-        self._stop_task_rosbag()
+        self._stop_task_rosbag(force=True)
         heading_thread = self._departure_heading_thread
         self._clear_departure_heading(cancel_navigation=True)
         if (
@@ -1501,6 +1505,9 @@ class TaskExecutor:
                 current_waypoint_index=initial_waypoint_index,
                 start_command_id=envelope.payload["command_id"],
                 record_rosbag=bool(command.get("record_rosbag", False)),
+                loop_execution=bool(command.get("loop_execution", False)),
+                loop_session_id=str(command.get("loop_session_id") or ""),
+                continuous_rosbag=bool(command.get("continuous_rosbag", False)),
                 docking=docking,
                 round_number=max(1, int(command.get("round_number", 1))),
                 loop_total=max(1, int(command.get("loop_total", 1))),
@@ -6373,39 +6380,126 @@ class TaskExecutor:
         )
 
     def _start_task_rosbag(self) -> None:
-        if not self.context or not self.context.record_rosbag:
-            self._rosbag_state = {}
-            return
         if not self.rosbag_recorder:
-            self._rosbag_state = {"running": False, "available": False, "error": "recorder unavailable"}
+            self._rosbag_state = (
+                {"running": False, "available": False, "error": "recorder unavailable"}
+                if self.context and self.context.record_rosbag
+                else {}
+            )
             return
-        label = f"task_{self.context.task_execution_id[:8]}"
+        context = self.context
+        continuous = bool(
+            context
+            and context.record_rosbag
+            and context.loop_execution
+            and context.continuous_rosbag
+            and context.loop_session_id
+        )
+        scope_id = context.loop_session_id if continuous else context.task_execution_id if context else ""
+        scope_kind = "loop" if continuous else "task"
+        label = (
+            f"loop_{scope_id.replace('-', '')}"
+            if continuous
+            else f"task_{scope_id[:8]}"
+        )
         try:
             try:
                 status = self.rosbag_recorder.status()
             except Exception:
                 LOGGER.warning("could not inspect navigation rosbag before task start", exc_info=True)
                 status = {}
+            remembered = self.store.get_metadata(self.ROSBAG_SCOPE_METADATA_KEY) or {}
+            bag_name = Path(str(status.get("bag_dir") or "")).name
+            same_scope = bool(
+                status.get("running")
+                and context
+                and context.record_rosbag
+                and remembered.get("kind") == scope_kind
+                and remembered.get("id") == scope_id
+                and label in bag_name
+            )
+            if same_scope:
+                self._rosbag_state = status
+                return
             if status.get("running"):
                 LOGGER.warning(
                     "stopping stale navigation rosbag before starting task %s",
-                    self.context.task_execution_id,
+                    context.task_execution_id if context else "without-recording",
                 )
                 self.rosbag_recorder.stop()
+            self.store.set_metadata(self.ROSBAG_SCOPE_METADATA_KEY, None)
+            if not context or not context.record_rosbag:
+                self._rosbag_state = {}
+                return
             self._rosbag_state = self.rosbag_recorder.start(label)
+            self.store.set_metadata(
+                self.ROSBAG_SCOPE_METADATA_KEY,
+                {
+                    "kind": scope_kind,
+                    "id": scope_id,
+                    "label": label,
+                    "bag_dir": self._rosbag_state.get("bag_dir"),
+                },
+            )
         except Exception as exc:
             LOGGER.exception("failed to start navigation rosbag")
             self._rosbag_state = {"running": False, "available": True, "error": str(exc)}
 
-    def _stop_task_rosbag(self) -> None:
-        if not self.context or not self.context.record_rosbag or not self.rosbag_recorder:
+    def _stop_task_rosbag(self, *, force: bool = False) -> None:
+        if not self.rosbag_recorder:
+            return
+        context = self.context
+        if (
+            not force
+            and context
+            and context.record_rosbag
+            and context.loop_execution
+            and context.continuous_rosbag
+            and context.loop_session_id
+        ):
+            try:
+                self._rosbag_state = self.rosbag_recorder.status()
+            except Exception:
+                LOGGER.warning("could not inspect continuous loop rosbag", exc_info=True)
+            return
+        if not force and (not context or not context.record_rosbag):
             return
         try:
-            self._rosbag_state = self.rosbag_recorder.stop()
+            status = self.rosbag_recorder.status()
+            self._rosbag_state = self.rosbag_recorder.stop() if status.get("running") else status
+            self.store.set_metadata(self.ROSBAG_SCOPE_METADATA_KEY, None)
         except Exception as exc:
             LOGGER.exception("failed to stop navigation rosbag")
             self._rosbag_state = {
                 **self._rosbag_state,
                 "running": False,
                 "error": str(exc),
+            }
+
+    def stop_loop_rosbag(self, loop_session_id: str) -> dict:
+        """Stop one continuous loop recording without touching a newer session."""
+        with self._lock:
+            requested = str(uuid.UUID(str(loop_session_id)))
+            if not self.rosbag_recorder:
+                return {
+                    "running": False,
+                    "available": False,
+                    "loop_session_id": requested,
+                    "error": "recorder unavailable",
+                }
+            remembered = self.store.get_metadata(self.ROSBAG_SCOPE_METADATA_KEY) or {}
+            status = self.rosbag_recorder.status()
+            if remembered.get("kind") != "loop" or remembered.get("id") != requested:
+                return {
+                    **status,
+                    "loop_session_id": requested,
+                    "ignored": True,
+                    "reason": "recording scope does not match",
+                }
+            self._rosbag_state = self.rosbag_recorder.stop() if status.get("running") else status
+            self.store.set_metadata(self.ROSBAG_SCOPE_METADATA_KEY, None)
+            return {
+                **self._rosbag_state,
+                "loop_session_id": requested,
+                "ignored": False,
             }

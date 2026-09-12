@@ -15,6 +15,23 @@ def test_contract_task_start_fixture():
     assert len(envelope.payload["command"]["route_snapshot"]["waypoints"]) == 3
 
 
+def test_accepts_continuous_loop_rosbag_and_stop_command():
+    loop_session_id = "63b66a16-1947-4be7-889b-d851a5f4ba20"
+    payload = json.loads(FIXTURE.read_text())
+    payload["payload"]["command"].update({
+        "record_rosbag": True,
+        "loop_execution": True,
+        "loop_session_id": loop_session_id,
+        "continuous_rosbag": True,
+    })
+    assert decode_message(payload).message_type == "task.start"
+
+    payload["message_type"] = "diagnostics.nav_rosbag_stop"
+    payload["payload"].pop("task_execution_id", None)
+    payload["payload"]["command"] = {"loop_session_id": loop_session_id}
+    assert decode_message(payload).message_type == "diagnostics.nav_rosbag_stop"
+
+
 def test_rejects_non_contiguous_waypoints():
     payload = json.loads(FIXTURE.read_text())
     payload["payload"]["command"]["route_snapshot"]["waypoints"][1]["sequence"] = 9

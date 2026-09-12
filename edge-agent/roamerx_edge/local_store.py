@@ -49,6 +49,9 @@ class LocalStore:
                     current_waypoint_index INTEGER NOT NULL DEFAULT 0,
                     start_command_id TEXT,
                     record_rosbag INTEGER NOT NULL DEFAULT 0,
+                    loop_execution INTEGER NOT NULL DEFAULT 0,
+                    loop_session_id TEXT NOT NULL DEFAULT '',
+                    continuous_rosbag INTEGER NOT NULL DEFAULT 0,
                     post_arrival_waypoint_index INTEGER,
                     post_arrival_stage TEXT NOT NULL DEFAULT '',
                     arrival_side_effects_started INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +130,18 @@ class LocalStore:
             if "record_rosbag" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN record_rosbag INTEGER NOT NULL DEFAULT 0"
+                )
+            if "loop_execution" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN loop_execution INTEGER NOT NULL DEFAULT 0"
+                )
+            if "loop_session_id" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN loop_session_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "continuous_rosbag" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN continuous_rosbag INTEGER NOT NULL DEFAULT 0"
                 )
             if "post_arrival_waypoint_index" not in task_columns:
                 self._connection.execute(
@@ -237,10 +252,11 @@ class LocalStore:
                 INSERT INTO task_context(
                     task_execution_id, state, state_version, route_snapshot_json,
                     current_waypoint_index, start_command_id, record_rosbag,
+                    loop_execution, loop_session_id, continuous_rosbag,
                     post_arrival_waypoint_index, post_arrival_stage,
                     arrival_side_effects_started, arrival_micro_adjust_total_m,
                     arrival_micro_adjust_steps, arrival_micro_adjust_started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_execution_id) DO UPDATE SET
                     state=excluded.state,
                     state_version=excluded.state_version,
@@ -248,6 +264,9 @@ class LocalStore:
                     current_waypoint_index=excluded.current_waypoint_index,
                     start_command_id=excluded.start_command_id,
                     record_rosbag=excluded.record_rosbag,
+                    loop_execution=excluded.loop_execution,
+                    loop_session_id=excluded.loop_session_id,
+                    continuous_rosbag=excluded.continuous_rosbag,
                     post_arrival_waypoint_index=excluded.post_arrival_waypoint_index,
                     post_arrival_stage=excluded.post_arrival_stage,
                     arrival_side_effects_started=excluded.arrival_side_effects_started,
@@ -264,6 +283,9 @@ class LocalStore:
                     context.get("current_waypoint_index", 0),
                     context.get("start_command_id"),
                     int(bool(context.get("record_rosbag", False))),
+                    int(bool(context.get("loop_execution", False))),
+                    str(context.get("loop_session_id") or ""),
+                    int(bool(context.get("continuous_rosbag", False))),
                     context.get("post_arrival_waypoint_index"),
                     str(context.get("post_arrival_stage") or ""),
                     int(bool(context.get("arrival_side_effects_started", False))),
@@ -291,6 +313,9 @@ class LocalStore:
             "current_waypoint_index": row["current_waypoint_index"],
             "start_command_id": row["start_command_id"],
             "record_rosbag": bool(row["record_rosbag"]),
+            "loop_execution": bool(row["loop_execution"]),
+            "loop_session_id": str(row["loop_session_id"] or ""),
+            "continuous_rosbag": bool(row["continuous_rosbag"]),
             "post_arrival_waypoint_index": row["post_arrival_waypoint_index"],
             "post_arrival_stage": str(row["post_arrival_stage"] or ""),
             "arrival_side_effects_started": bool(row["arrival_side_effects_started"]),

@@ -13,6 +13,7 @@ from .task_service import TaskExecutionService, TaskStateError
 
 
 class CommandService:
+    INTERNAL_ROBOT_COMMAND_TYPES = {"diagnostics.nav_rosbag_stop"}
     LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     COMMAND_TARGET_STATES = {
         "task.start": "dispatching",
@@ -29,6 +30,25 @@ class CommandService:
         "timed_out": "timed_out",
         "rejected": "rejected",
     }
+
+    @staticmethod
+    def effective_record_rosbag(
+        execution: TaskExecution,
+        requested: bool | None = None,
+    ) -> bool:
+        """Resolve navigation recording without letting a stale task hide route intent.
+
+        A route-level opt-in is authoritative because the same route can be
+        launched from the planner, a task template, a schedule, or Guard Duty.
+        The task/request flags remain additive opt-ins for routes that do not
+        enable recording themselves.
+        """
+        route = execution.route or getattr(execution.task, "route", None)
+        if route is not None and bool(route.record_rosbag):
+            return True
+        if requested is not None:
+            return bool(requested)
+        return bool(execution.task.record_rosbag)
 
     @classmethod
     @transaction.atomic
@@ -50,9 +70,18 @@ class CommandService:
             allow_docking=bool((command_options.get("docking") or {}).get("enabled")),
         )
         if command_type == "task.start":
-            record_rosbag = command_options.get("record_rosbag")
-            if record_rosbag is None:
-                record_rosbag = execution.task.record_rosbag
+            if command_options.get("record_rosbag_frozen", False):
+                record_rosbag = bool(command_options.get("record_rosbag", False))
+            else:
+                record_rosbag = cls.effective_record_rosbag(
+                    execution,
+                    command_options.get("record_rosbag"),
+                )
+            continuous_rosbag = bool(
+                record_rosbag
+                and execution.loop_session_id
+                and command_options.get("continuous_rosbag", False)
+            )
             command_payload = {
                 "task_id": str(execution.task_id),
                 "task_name": execution.task.name,
@@ -64,6 +93,7 @@ class CommandService:
                     "continue_on_disconnect": True,
                 },
                 "record_rosbag": bool(record_rosbag),
+                "continuous_rosbag": continuous_rosbag,
                 "loop_execution": bool(command_options.get("loop_execution", False)),
                 "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
                 "round_number": execution.round_number,
@@ -309,7 +339,9 @@ class CommandService:
         expiry_seconds: int | None = None,
         trace_id=None,
     ) -> RemoteCommand:
-        supported = {choice[0] for choice in RemoteCommand.TYPE_CHOICES}
+        supported = {
+            choice[0] for choice in RemoteCommand.TYPE_CHOICES
+        } | cls.INTERNAL_ROBOT_COMMAND_TYPES
         if command_type not in supported:
             raise ValueError(f"unsupported command type: {command_type}")
         expiry_seconds = expiry_seconds or getattr(settings, "COMMAND_CONTROL_EXPIRY_SECONDS", 15)
