@@ -50,6 +50,9 @@ run rsync -a --delete \
   --exclude='node_modules/' --exclude='dist/' \
   "$REPO_ROOT/platform/frontend/" "$HOST:$REMOTE_SOURCE/platform/frontend/"
 run rsync -a --delete \
+  --exclude='__pycache__/' \
+  "$REPO_ROOT/platform/validation-gateway/" "$HOST:$REMOTE_SOURCE/platform/validation-gateway/"
+run rsync -a --delete \
   --exclude='data/' --exclude='conf/platform.env' --exclude='conf/mosquitto.conf' \
   --exclude='conf/mosquitto.passwd' \
   "$REPO_ROOT/runtime/platform/" "$HOST:$REMOTE_RUNTIME/"
