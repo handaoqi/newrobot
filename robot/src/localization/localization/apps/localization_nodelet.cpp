@@ -3245,7 +3245,7 @@ private:
         << "\",\"anchor_preference\":\"" << ukf_anchor_preference_
         << "\",\"fusion_profile\":\"" << fusionProfileName(fusion_profile_.load())
         << "\",\"fusion_profile_generation\":" << fusion_profile_generation_.load()
-        << "\",\"allowed_correction_sources\":\""
+        << ",\"allowed_correction_sources\":\""
         << (preferred_correction_mode_ == CorrectionPolicyMode::ndt
           ? "ndt_vgicp"
           : preferred_correction_mode_ == CorrectionPolicyMode::rtk
