@@ -92,6 +92,8 @@ set(srv_files
         "srv/SetLocalizationType.srv"
         "srv/ControlLocalizationCorrection.srv"
         "srv/NavigationRecoveryLease.srv"
+        "srv/NavigationSelfHealing.srv"
+        "srv/SetLocalizationFusionProfile.srv"
 )
 
 set(action_files

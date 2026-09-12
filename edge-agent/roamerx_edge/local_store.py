@@ -66,6 +66,40 @@ class LocalStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS self_heal_episodes (
+                    episode_id TEXT PRIMARY KEY,
+                    fault_label TEXT NOT NULL,
+                    scene_mode TEXT NOT NULL,
+                    task_execution_id TEXT NOT NULL DEFAULT '',
+                    map_id TEXT NOT NULL DEFAULT '',
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    success INTEGER,
+                    terminal_level INTEGER,
+                    terminal_action TEXT NOT NULL DEFAULT '',
+                    duration_seconds REAL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_self_heal_episodes_started
+                    ON self_heal_episodes(started_at);
+                CREATE INDEX IF NOT EXISTS idx_self_heal_episodes_fault_success
+                    ON self_heal_episodes(fault_label, success);
+                CREATE TABLE IF NOT EXISTS self_heal_actions (
+                    action_id TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL,
+                    level INTEGER NOT NULL,
+                    action_type TEXT NOT NULL,
+                    success INTEGER,
+                    reason TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT,
+                    FOREIGN KEY(episode_id) REFERENCES self_heal_episodes(episode_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_self_heal_actions_episode
+                    ON self_heal_actions(episode_id, level);
+                CREATE INDEX IF NOT EXISTS idx_self_heal_actions_type_success
+                    ON self_heal_actions(action_type, success);
                 """
             )
             task_columns = {
@@ -319,6 +353,124 @@ class LocalStore:
             return None
         value = self.get_metadata(self._trusted_pose_key(map_id, map_version))
         return value if isinstance(value, dict) else None
+
+    def start_self_heal_episode(
+        self,
+        episode_id: str,
+        *,
+        fault_label: str,
+        scene_mode: str,
+        task_execution_id: str = "",
+        map_id: str = "",
+        evidence: dict | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO self_heal_episodes(
+                    episode_id, fault_label, scene_mode, task_execution_id,
+                    map_id, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    episode_id,
+                    fault_label,
+                    scene_mode,
+                    task_execution_id,
+                    map_id,
+                    json.dumps(evidence or {}, ensure_ascii=False),
+                ),
+            )
+
+    def finish_self_heal_episode(
+        self,
+        episode_id: str,
+        *,
+        success: bool,
+        terminal_level: int,
+        terminal_action: str,
+        duration_seconds: float,
+        reason: str = "",
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE self_heal_episodes
+                SET success=?, terminal_level=?, terminal_action=?,
+                    duration_seconds=?, reason=?, finished_at=CURRENT_TIMESTAMP
+                WHERE episode_id=?
+                """,
+                (
+                    int(bool(success)),
+                    int(terminal_level),
+                    terminal_action,
+                    max(0.0, float(duration_seconds)),
+                    reason,
+                    episode_id,
+                ),
+            )
+
+    def start_self_heal_action(
+        self,
+        action_id: str,
+        *,
+        episode_id: str,
+        level: int,
+        action_type: str,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO self_heal_actions(
+                    action_id, episode_id, level, action_type
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (action_id, episode_id, int(level), action_type),
+            )
+
+    def finish_self_heal_action(
+        self,
+        action_id: str,
+        *,
+        success: bool,
+        reason: str = "",
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE self_heal_actions
+                SET success=?, reason=?, finished_at=CURRENT_TIMESTAMP
+                WHERE action_id=?
+                """,
+                (int(bool(success)), reason, action_id),
+            )
+
+    def self_heal_statistics(self) -> dict:
+        episodes = self._connection.execute(
+            """
+            SELECT fault_label, COUNT(*) AS total,
+                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS succeeded,
+                   AVG(duration_seconds) AS average_duration_seconds
+            FROM self_heal_episodes
+            WHERE finished_at IS NOT NULL
+            GROUP BY fault_label
+            ORDER BY total DESC, fault_label
+            """
+        ).fetchall()
+        actions = self._connection.execute(
+            """
+            SELECT action_type, COUNT(*) AS total,
+                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS succeeded
+            FROM self_heal_actions
+            WHERE finished_at IS NOT NULL
+            GROUP BY action_type
+            ORDER BY total DESC, action_type
+            """
+        ).fetchall()
+        return {
+            "faults": [dict(row) for row in episodes],
+            "actions": [dict(row) for row in actions],
+        }
 
     def next_trajectory_seq(self, task_execution_id: str) -> int:
         with self._lock, self._connection:

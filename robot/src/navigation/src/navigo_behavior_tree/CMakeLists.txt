@@ -18,6 +18,7 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(navigo_util REQUIRED)
 find_package(robots_dog_msgs REQUIRED)
+find_package(localization REQUIRED)
 
 nav2_package()
 
@@ -43,6 +44,7 @@ set(dependencies
   std_srvs
   navigo_util
   robots_dog_msgs
+  localization
 )
 
 add_library(${library_name} SHARED
@@ -187,6 +189,21 @@ list(APPEND plugin_libs navigo_single_trigger_bt_node)
 
 add_library(navigo_recovery_lease_scope_bt_node SHARED plugins/decorator/recovery_lease_scope.cpp)
 list(APPEND plugin_libs navigo_recovery_lease_scope_bt_node)
+
+add_library(navigo_fault_diagnose_bt_node SHARED plugins/action/fault_diagnose_node.cpp)
+list(APPEND plugin_libs navigo_fault_diagnose_bt_node)
+
+add_library(navigo_smart_rtk_wait_bt_node SHARED plugins/action/smart_rtk_wait.cpp)
+list(APPEND plugin_libs navigo_smart_rtk_wait_bt_node)
+
+add_library(navigo_set_ukf_weight_bt_node SHARED plugins/action/set_ukf_weight.cpp)
+list(APPEND plugin_libs navigo_set_ukf_weight_bt_node)
+
+add_library(navigo_adaptive_spin_bt_node SHARED plugins/decorator/adaptive_spin.cpp)
+list(APPEND plugin_libs navigo_adaptive_spin_bt_node)
+
+add_library(navigo_search_laser_feature_bt_node SHARED plugins/decorator/search_laser_feature.cpp)
+list(APPEND plugin_libs navigo_search_laser_feature_bt_node)
 
 add_library(navigo_planner_selector_bt_node SHARED plugins/action/planner_selector_node.cpp)
 list(APPEND plugin_libs navigo_planner_selector_bt_node)

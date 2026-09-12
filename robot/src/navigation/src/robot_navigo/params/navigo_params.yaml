@@ -27,6 +27,11 @@ bt_navigator:
       - navigo_smooth_path_action_bt_node
       - navigo_smoother_selector_bt_node
       - navigo_recovery_lease_scope_bt_node
+      - navigo_fault_diagnose_bt_node
+      - navigo_smart_rtk_wait_bt_node
+      - navigo_set_ukf_weight_bt_node
+      - navigo_adaptive_spin_bt_node
+      - navigo_search_laser_feature_bt_node
       - navigo_follow_path_action_bt_node
       - navigo_spin_action_bt_node
       - navigo_wait_action_bt_node

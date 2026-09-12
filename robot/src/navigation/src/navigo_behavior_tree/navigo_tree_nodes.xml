@@ -7,6 +7,35 @@
 <root>
   <TreeNodesModel>
     <!-- ############################### ACTION NODES ################################# -->
+    <Action ID="FaultDiagnoseNode">
+      <input_port name="episode_id">Existing self-healing episode</input_port>
+      <input_port name="fault_label">Raw fault label</input_port>
+      <input_port name="level">Requested recovery level</input_port>
+      <output_port name="diagnosed_episode_id">Edge episode identifier</output_port>
+      <output_port name="diagnosed_fault">Normalized fault label</output_port>
+      <output_port name="scene_mode">Indoor, outdoor, or transition</output_port>
+      <output_port name="action_type">Recommended action</output_port>
+      <output_port name="forbid_spin">True when rotation is prohibited</output_port>
+      <output_port name="wait_for_rtk">True for smart RTK wait</output_port>
+      <output_port name="use_lio_hold">True for LIO hold profile</output_port>
+      <output_port name="search_laser">True for bounded laser feature search</output_port>
+      <output_port name="recovered">True when health already recovered</output_port>
+    </Action>
+
+    <Action ID="SmartRTKWait">
+      <input_port name="enabled">Execute only when Edge selected RTK wait</input_port>
+      <input_port name="episode_id">Self-healing episode</input_port>
+      <input_port name="fault_label">Normalized fault label</input_port>
+      <input_port name="wait_seconds">Maximum wait duration</input_port>
+      <input_port name="poll_seconds">Health polling period</input_port>
+    </Action>
+
+    <Action ID="SetUkfWeight">
+      <input_port name="enabled">Execute only when Edge selected fusion handoff</input_port>
+      <input_port name="profile">Restricted fusion profile name</input_port>
+      <input_port name="duration_seconds">Temporary profile lifetime</input_port>
+      <input_port name="reason">Audit reason</input_port>
+    </Action>
     <Action ID="BackUp">
       <input_port name="backup_dist">Distance to backup</input_port>
       <input_port name="backup_speed">Speed at which to backup</input_port>
@@ -191,6 +220,9 @@
     <Decorator ID="RecoveryLeaseScope">
       <input_port name="owner">Recovery action owner</input_port>
       <input_port name="reason">Recovery reason</input_port>
+      <input_port name="episode_id">Self-healing episode</input_port>
+      <input_port name="level">Recovery level</input_port>
+      <input_port name="action_type">Concrete recovery action name</input_port>
       <input_port name="server_timeout">Lease service timeout</input_port>
     </Decorator>
 
@@ -269,6 +301,18 @@
     <Control ID="RoundRobin"/>
 
     <!-- ############################### DECORATOR NODES ############################## -->
+    <Decorator ID="AdaptiveSpin">
+      <input_port name="forbid_spin">Hard scene/fault rotation prohibition</input_port>
+      <input_port name="score_threshold">NDT success threshold</input_port>
+      <input_port name="max_age_seconds">Maximum NDT sample age</input_port>
+    </Decorator>
+
+    <Decorator ID="SearchLaserFeature">
+      <input_port name="enabled">Execute only when Edge selected laser search</input_port>
+      <input_port name="score_threshold">NDT success threshold</input_port>
+      <input_port name="max_age_seconds">Maximum NDT/laser sample age</input_port>
+    </Decorator>
+
     <Decorator ID="RateController">
       <input_port name="hz">Rate</input_port>
     </Decorator>

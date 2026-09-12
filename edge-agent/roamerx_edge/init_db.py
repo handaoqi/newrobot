@@ -15,6 +15,8 @@ EDGE_TABLES = {
     "outbox",
     "trajectory_sequence",
     "agent_metadata",
+    "self_heal_episodes",
+    "self_heal_actions",
 }
 
 

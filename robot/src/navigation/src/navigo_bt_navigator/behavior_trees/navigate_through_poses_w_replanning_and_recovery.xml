@@ -38,16 +38,47 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_spin">
-            <Spin spin_dist="0.785"/>
+          <Sequence name="Level0SmartRtkWait">
+            <FaultDiagnoseNode fault_label="navigation_failed" level="0"
+              diagnosed_episode_id="{self_heal_episode}" diagnosed_fault="{self_heal_fault}"
+              wait_for_rtk="{wait_for_rtk}" forbid_spin="{forbid_spin}"
+              use_lio_hold="{use_lio_hold}" search_laser="{search_laser}"/>
+            <SmartRTKWait enabled="{wait_for_rtk}" episode_id="{self_heal_episode}"
+              fault_label="{self_heal_fault}" wait_seconds="5.0" poll_seconds="0.1"/>
+          </Sequence>
+          <Sequence name="Level1LioHold">
+            <FaultDiagnoseNode episode_id="{self_heal_episode}" fault_label="{self_heal_fault}" level="1"
+              diagnosed_episode_id="{self_heal_episode}" diagnosed_fault="{self_heal_fault}"
+              use_lio_hold="{use_lio_hold}" forbid_spin="{forbid_spin}"/>
+            <SetUkfWeight enabled="{use_lio_hold}" profile="lio_hold" duration_seconds="10.0" reason="bt_navigation_recovery"/>
+          </Sequence>
+          <Sequence name="Level2LaserFeatureSearch">
+            <FaultDiagnoseNode episode_id="{self_heal_episode}" fault_label="{self_heal_fault}" level="2"
+              diagnosed_episode_id="{self_heal_episode}" diagnosed_fault="{self_heal_fault}"
+              search_laser="{search_laser}" forbid_spin="{forbid_spin}"/>
+            <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_laser_feature"
+              episode_id="{self_heal_episode}" level="2" action_type="search_laser_feature">
+              <SearchLaserFeature enabled="{search_laser}" score_threshold="0.4" max_age_seconds="0.75">
+                <DriveOnHeading dist_to_travel="0.12" speed="0.04" time_allowance="4.0"/>
+              </SearchLaserFeature>
+            </RecoveryLeaseScope>
+          </Sequence>
+          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_spin"
+            episode_id="{self_heal_episode}" level="2" action_type="adaptive_spin">
+            <AdaptiveSpin forbid_spin="{forbid_spin}" score_threshold="0.4" max_age_seconds="0.75">
+              <Spin spin_dist="0.785" time_allowance="6.0"/>
+            </AdaptiveSpin>
           </RecoveryLeaseScope>
-          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_backup">
+          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_backup"
+            episode_id="{self_heal_episode}" level="2" action_type="bounded_reverse">
             <BackUp backup_dist="0.25" backup_speed="0.06" time_allowance="6.0"/>
           </RecoveryLeaseScope>
-          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_lateral">
+          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_lateral"
+            episode_id="{self_heal_episode}" level="2" action_type="bounded_lateral_right">
             <DriveOnHeading lateral_dist="-0.20" speed="0.06" time_allowance="6.0"/>
           </RecoveryLeaseScope>
-          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_lateral">
+          <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_lateral"
+            episode_id="{self_heal_episode}" level="2" action_type="bounded_lateral_left">
             <DriveOnHeading lateral_dist="0.20" speed="0.06" time_allowance="6.0"/>
           </RecoveryLeaseScope>
           <Wait wait_duration="2"/>

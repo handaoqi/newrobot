@@ -54,7 +54,16 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         smoother_selector = root.find(".//SmootherSelector")
         smoothers = root.findall(".//SmoothPath")
         backups = root.findall(".//BackUp")
-        lateral_recoveries = root.findall(".//DriveOnHeading")
+        drive_on_heading_nodes = root.findall(".//DriveOnHeading")
+        lateral_recoveries = [
+            node for node in drive_on_heading_nodes if "lateral_dist" in node.attrib
+        ]
+        feature_searches = root.findall(".//SearchLaserFeature/DriveOnHeading")
+        spins = root.findall(".//Spin")
+        guarded_spins = root.findall(".//AdaptiveSpin/Spin")
+        diagnoses = root.findall(".//FaultDiagnoseNode")
+        smart_rtk_waits = root.findall(".//SmartRTKWait")
+        fusion_profiles = root.findall(".//SetUkfWeight")
 
         assert planner_selector is not None
         assert planner_selector.attrib == {
@@ -81,6 +90,12 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         assert {node.attrib["lateral_dist"] for node in lateral_recoveries} == {
             "-0.20", "0.20"
         }
+        assert len(feature_searches) == 1
+        assert feature_searches[0].attrib["dist_to_travel"] == "0.12"
+        assert spins == guarded_spins
+        assert len(diagnoses) >= 3
+        assert len(smart_rtk_waits) == 1
+        assert fusion_profiles[0].attrib["duration_seconds"] == "10.0"
 
 
 def test_nav2_plugin_registry_matches_edge_controller_mapping():

@@ -69,6 +69,7 @@
 #include <robots_dog_msgs/srv/load_map.hpp>
 #include <robots_dog_msgs/srv/localization_state.hpp>
 #include <robots_dog_msgs/srv/control_localization_correction.hpp>
+#include <robots_dog_msgs/srv/set_localization_fusion_profile.hpp>
 #include <robots_dog_msgs/msg/localization.hpp>
 #include <robots_dog_msgs/msg/uni_rtk_pvh.hpp>
 
@@ -427,6 +428,8 @@ public:
     bridge_translation_variance_per_m_ = declare_parameter<double>("source_arbiter.odom_translation_variance_per_m", 0.0025);
     anchor_yaw_variance_per_rad_ = std::max(
       0.0, declare_parameter<double>("lio_primary.anchor_ukf.yaw_variance_per_rad", 0.01));
+    lio_hold_covariance_scale_ = std::max(
+      1.0, declare_parameter<double>("lio_primary.self_healing.lio_hold_covariance_scale", 4.0));
     lio_pose_history_seconds_ = std::max(
       0.5, declare_parameter<double>("lio_primary.anchor_ukf.pose_history_seconds", 2.0));
     lio_observation_sync_tolerance_s_ = std::max(
@@ -769,6 +772,11 @@ public:
       create_service<robots_dog_msgs::srv::ControlLocalizationCorrection>(
         "/localization/control_correction",
         std::bind(&HdlLocalizationNode::control_localization_correction_callback, this,
+          std::placeholders::_1, std::placeholders::_2));
+    set_localization_fusion_profile_service_ =
+      create_service<robots_dog_msgs::srv::SetLocalizationFusionProfile>(
+        "/localization/set_fusion_profile",
+        std::bind(&HdlLocalizationNode::set_localization_fusion_profile_callback, this,
           std::placeholders::_1, std::placeholders::_2));
     localization_decision_pub_ = create_publisher<std_msgs::msg::String>("/localization/decision", 10);
 
@@ -2417,6 +2425,20 @@ private:
         ? rtk_ready
         : (ndt_fresh || rtk_ready || rtk_float_ready);
 
+    // In LIO-hold mode both absolute observers have already failed their
+    // quality gates.  Keep propagating the high-rate FAST-LIO pose and reject
+    // automatic anchor updates; increasing anchor process noise here would
+    // have the opposite effect by increasing the next absolute-observation
+    // gain. Explicit operator one-shot corrections remain allowed.
+    if (fusion_profile_.load() == kFusionProfileLioHold && !force_correction) {
+      policy_source_ready_ = lioOdomFresh(stamp);
+      last_correction_candidate_source_ = "none";
+      last_correction_selection_reason_ = "lio_hold_external_observations_suppressed";
+      ndt_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.resetConsecutive();
+      return;
+    }
+
     if (!lio_anchor_valid_.load() || pending_lio_correction_.active) {
       last_correction_candidate_source_ = "none";
       last_correction_selection_reason_ = pending_lio_correction_.active
@@ -2633,6 +2655,72 @@ private:
     response->accepted = true;
     response->status = one_shot_correction_.status;
     response->message = "one-shot correction transaction started";
+  }
+
+  static const char* fusionProfileName(uint8_t profile) {
+    switch (profile) {
+      case kFusionProfileLioHold:
+        return "lio_hold";
+      case kFusionProfileBalanced:
+        return "balanced";
+      default:
+        return "nominal";
+    }
+  }
+
+  void maybeExpireFusionProfile() {
+    const auto expiry_ns = fusion_profile_expires_steady_ns_.load();
+    if (expiry_ns <= 0 || steadyNowNanoseconds() < expiry_ns) {
+      return;
+    }
+    const auto previous = fusion_profile_.exchange(kFusionProfileNominal);
+    fusion_profile_expires_steady_ns_.store(0);
+    if (previous != kFusionProfileNominal) {
+      RCLCPP_INFO(
+        get_logger(), "temporary localization fusion profile %s expired; restored nominal",
+        fusionProfileName(previous));
+    }
+  }
+
+  void set_localization_fusion_profile_callback(
+      const std::shared_ptr<robots_dog_msgs::srv::SetLocalizationFusionProfile::Request> request,
+      std::shared_ptr<robots_dog_msgs::srv::SetLocalizationFusionProfile::Response> response) {
+    using Request = robots_dog_msgs::srv::SetLocalizationFusionProfile::Request;
+    if (!request || (request->profile != Request::PROFILE_NOMINAL &&
+        request->profile != Request::PROFILE_LIO_HOLD &&
+        request->profile != Request::PROFILE_BALANCED)) {
+      response->accepted = false;
+      response->applied_profile = fusion_profile_.load();
+      response->profile_name = fusionProfileName(response->applied_profile);
+      response->message = "unsupported localization fusion profile";
+      return;
+    }
+    const double duration_seconds = request->profile == Request::PROFILE_NOMINAL ? 0.0 :
+      std::clamp(
+        request->duration_seconds > 0.0F ?
+        static_cast<double>(request->duration_seconds) : 10.0,
+        1.0, 180.0);
+    {
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      fusion_profile_.store(request->profile);
+      fusion_profile_expires_steady_ns_.store(
+        duration_seconds > 0.0 ?
+        steadyNowNanoseconds() + static_cast<std::int64_t>(duration_seconds * 1.0e9) : 0);
+      if (request->profile == Request::PROFILE_LIO_HOLD) {
+        ndt_drift_gate_.resetConsecutive();
+        rtk_drift_gate_.resetConsecutive();
+        last_correction_candidate_source_ = "none";
+        last_correction_selection_reason_ = "lio_hold_requested";
+      }
+    }
+    response->accepted = true;
+    response->applied_profile = request->profile;
+    response->profile_name = fusionProfileName(request->profile);
+    response->message = std::string("localization fusion profile applied: ") +
+      response->profile_name +
+      (duration_seconds > 0.0 ? " for " + std::to_string(duration_seconds) + "s" : "") +
+      (request->reason.empty() ? "" : " (" + request->reason + ")");
+    RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
   }
 
   void localization_policy_callback(const std_msgs::msg::String::SharedPtr msg) {
@@ -3108,6 +3196,7 @@ private:
         << "\",\"preferred_source\":\"" << preferred_source_
         << "\",\"correction_policy\":\"" << preferred_source_
         << "\",\"anchor_preference\":\"" << ukf_anchor_preference_
+        << "\",\"fusion_profile\":\"" << fusionProfileName(fusion_profile_.load())
         << "\",\"allowed_correction_sources\":\""
         << (preferred_correction_mode_ == CorrectionPolicyMode::ndt
           ? "ndt_vgicp"
@@ -4919,6 +5008,11 @@ private:
     odom.child_frame_id = localization_odom_frame_id;
     if (pose_estimator) {
       odom.pose.covariance = pose_estimator->pose_covariance();
+      if (fusion_profile_.load() == kFusionProfileLioHold) {
+        for (auto & value : odom.pose.covariance) {
+          value *= lio_hold_covariance_scale_;
+        }
+      }
     } else {
       odom.pose.covariance.fill(0.0);
       odom.pose.covariance[0] = 1.0e6;
@@ -5858,6 +5952,7 @@ private:
   }
 
   void PublishLidarLocalizationInfo() {
+        maybeExpireFusionProfile();
         auto current_time = this->get_clock()->now();
         updateConfidence(current_time);
         if (lidar_status_buffer_.size() > 0) {
@@ -6276,6 +6371,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                              global_relocalize_service_;
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr                                reinitialize_global_localization_service_;
   rclcpp::Service<robots_dog_msgs::srv::ControlLocalizationCorrection>::SharedPtr control_localization_correction_service_;
+  rclcpp::Service<robots_dog_msgs::srv::SetLocalizationFusionProfile>::SharedPtr set_localization_fusion_profile_service_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
 
@@ -6374,6 +6470,12 @@ private:
   double bridge_max_yaw_sigma_rad_ = 15.0 * M_PI / 180.0;
   double bridge_translation_variance_per_m_ = 0.0025;
   double anchor_yaw_variance_per_rad_ = 0.01;
+  static constexpr uint8_t kFusionProfileNominal = 0;
+  static constexpr uint8_t kFusionProfileLioHold = 1;
+  static constexpr uint8_t kFusionProfileBalanced = 2;
+  std::atomic<uint8_t> fusion_profile_{kFusionProfileNominal};
+  std::atomic<std::int64_t> fusion_profile_expires_steady_ns_{0};
+  double lio_hold_covariance_scale_ = 4.0;
   double bridge_max_odom_speed_mps_ = 1.5;
   double bridge_max_odom_yaw_rate_rps_ = 2.0;
   int absolute_recovery_samples_ = 3;

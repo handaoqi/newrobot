@@ -527,6 +527,10 @@ class TaskExecutor:
             extra={"recovery": self._recovery_arbiter.snapshot()},
         )
 
+    def enter_safe_hold(self, code: str, message: str) -> None:
+        """Public boundary for recovery coordinators after all levels fail."""
+        self._emit_safe_hold(code, message)
+
     def _idempotency_key(self, event_type: str, waypoint_id: str | None = None) -> str:
         waypoint = waypoint_id or ""
         if self.context and not waypoint:
@@ -5321,7 +5325,10 @@ class TaskExecutor:
                 if self._hold_blocked_task():
                     return
                 self._stop_obstacle_monitor()
-                self._fail("NAVIGATION_FAILED", error_message or status)
+                self._emit_safe_hold(
+                    "NAVIGATION_RECOVERY_EXHAUSTED",
+                    error_message or "导航自愈等级已耗尽，进入安全保持",
+                )
 
     def _dispatch_departure_heading(self, reached_index: int) -> bool:
         """Rotate in place toward the next waypoint before departing.

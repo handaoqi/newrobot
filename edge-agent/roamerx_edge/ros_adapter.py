@@ -149,6 +149,16 @@ except ImportError:
     ControlLocalizationCorrection = None
     NavigationRecoveryLease = None
 
+try:
+    if ROS_AVAILABLE:
+        from robots_dog_msgs.srv import NavigationSelfHealing, SetLocalizationFusionProfile
+    else:
+        NavigationSelfHealing = None
+        SetLocalizationFusionProfile = None
+except ImportError:
+    NavigationSelfHealing = None
+    SetLocalizationFusionProfile = None
+
 
 class RosAdapter(Node):
     def __init__(
@@ -188,6 +198,7 @@ class RosAdapter(Node):
         self._recovery_lease_acquire_cb: Callable | None = None
         self._recovery_lease_release_cb: Callable | None = None
         self._recovery_snapshot_cb: Callable | None = None
+        self._self_healing_cb: Callable | None = None
         self._bt_recovery_leases: dict[int, object] = {}
         self.structured_logs = structured_logs
         self._callback_optimization = (
@@ -243,6 +254,7 @@ class RosAdapter(Node):
         self._localization_recovery_pending = False
         self._localization_recovery_armed = False
         self._latest_speed = 0.0
+        self._latest_localization_status = None
         self._raw_forward_command = 0.0
         self._actual_forward_command = 0.0
         self._raw_lateral_command = 0.0
@@ -395,6 +407,15 @@ class RosAdapter(Node):
             if ControlLocalizationCorrection is not None
             else None
         )
+        self._localization_fusion_profile_client = (
+            self.create_client(
+                SetLocalizationFusionProfile,
+                "/localization/set_fusion_profile",
+                callback_group=self._nav_service_callback_group,
+            )
+            if SetLocalizationFusionProfile is not None
+            else None
+        )
         self._recovery_lease_service = (
             self.create_service(
                 NavigationRecoveryLease,
@@ -403,6 +424,16 @@ class RosAdapter(Node):
                 callback_group=self._control_callback_group,
             )
             if NavigationRecoveryLease is not None
+            else None
+        )
+        self._self_healing_service = (
+            self.create_service(
+                NavigationSelfHealing,
+                "/navigation/self_healing",
+                self._on_navigation_self_healing,
+                callback_group=self._control_callback_group,
+            )
+            if NavigationSelfHealing is not None
             else None
         )
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -851,6 +882,57 @@ class RosAdapter(Node):
             "message": str(response.message),
         }
 
+    def set_localization_fusion_profile(
+        self,
+        profile: str,
+        *,
+        reason: str = "",
+        duration_seconds: float = 180.0,
+        timeout_seconds: float = 2.0,
+    ) -> dict:
+        client = self._localization_fusion_profile_client
+        if client is None:
+            return {
+                "accepted": False,
+                "profile_name": "unavailable",
+                "message": "SetLocalizationFusionProfile interface is unavailable",
+            }
+        if not client.wait_for_service(timeout_sec=max(0.0, timeout_seconds)):
+            return {
+                "accepted": False,
+                "profile_name": "unavailable",
+                "message": "/localization/set_fusion_profile is unavailable",
+            }
+        request = SetLocalizationFusionProfile.Request()
+        normalized = str(profile or "nominal").strip().lower()
+        request.profile = {
+            "lio_hold": request.PROFILE_LIO_HOLD,
+            "balanced": request.PROFILE_BALANCED,
+        }.get(normalized, request.PROFILE_NOMINAL)
+        request.reason = str(reason)
+        request.duration_seconds = (
+            0.0 if request.profile == request.PROFILE_NOMINAL
+            else max(1.0, min(180.0, float(duration_seconds)))
+        )
+        future = client.call_async(request)
+        completed = threading.Event()
+        future.add_done_callback(lambda _: completed.set())
+        if not completed.wait(timeout=max(0.0, timeout_seconds)):
+            return {"accepted": False, "profile_name": normalized, "message": "service timeout"}
+        if future.exception() is not None:
+            return {
+                "accepted": False,
+                "profile_name": normalized,
+                "message": str(future.exception()),
+            }
+        response = future.result()
+        return {
+            "accepted": bool(response.accepted),
+            "applied_profile": int(response.applied_profile),
+            "profile_name": str(response.profile_name),
+            "message": str(response.message),
+        }
+
     def prepare_for_navigation(self, timeout_seconds: float = 12.0) -> bool:
         """Stand the robot and wait for the SDK bridge to confirm it is stable."""
         self._robot_standing_event.clear()
@@ -872,6 +954,7 @@ class RosAdapter(Node):
 
     def _on_localization(self, msg) -> None:
         self._latest_speed = float(msg.speed)
+        self._latest_localization_status = int(msg.status)
         self.telemetry.on_localization(msg)
         status = int(msg.status)
         with self._localization_sample_condition:
@@ -957,6 +1040,64 @@ class RosAdapter(Node):
         self._recovery_lease_acquire_cb = acquire_callback
         self._recovery_lease_release_cb = release_callback
         self._recovery_snapshot_cb = snapshot_callback
+
+    def set_self_healing_callback(self, callback: Callable) -> None:
+        """Expose the Edge-owned diagnosis/decision coordinator to BT nodes."""
+        self._self_healing_cb = callback
+
+    def self_healing_evidence(self) -> dict:
+        decision = self._localization_decision()
+        obstacle = self.obstacle_monitor_snapshot()
+        return {
+            "localization_status": self._latest_localization_status,
+            "localization_decision": decision,
+            "obstacle": obstacle,
+            "sensor_stale": bool(
+                decision.get("lio_healthy") is False
+                and decision.get("ndt_healthy") is False
+                and decision.get("rtk_usable") is False
+            ),
+        }
+
+    @staticmethod
+    def _fill_self_healing_response(response, result: dict | None):
+        result = result or {}
+        response.accepted = bool(result.get("accepted", False))
+        response.episode_id = str(result.get("episode_id") or "")
+        response.action_id = str(result.get("action_id") or "")
+        response.fault_label = str(result.get("fault_label") or "")
+        response.scene_mode = str(result.get("scene_mode") or "indoor")
+        response.level = int(result.get("level", 0))
+        response.action_type = str(result.get("action_type") or "")
+        response.forbid_spin = bool(result.get("forbid_spin", False))
+        response.wait_for_rtk = bool(result.get("wait_for_rtk", False))
+        response.use_lio_hold = bool(result.get("use_lio_hold", False))
+        response.search_laser = bool(result.get("search_laser", False))
+        response.recovered = bool(result.get("recovered", False))
+        response.reason = str(result.get("reason") or "")
+        return response
+
+    def _on_navigation_self_healing(self, request, response):
+        if self._self_healing_cb is None:
+            return self._fill_self_healing_response(
+                response, {"accepted": False, "reason": "self_healing_coordinator_unavailable"}
+            )
+        try:
+            result = self._self_healing_cb({
+                "operation": int(request.operation),
+                "episode_id": str(request.episode_id),
+                "action_id": str(request.action_id),
+                "fault_label": str(request.fault_label),
+                "level": int(request.level),
+                "action_type": str(request.action_type),
+                "success": bool(request.success),
+                "detail": str(request.detail),
+                "evidence": self.self_healing_evidence(),
+            })
+        except Exception as exc:
+            LOGGER.exception("self-healing service callback failed")
+            result = {"accepted": False, "reason": str(exc)}
+        return self._fill_self_healing_response(response, result)
 
     @staticmethod
     def _fill_recovery_lease_response(response, *, granted: bool, lease=None, snapshot=None):
@@ -1466,6 +1607,14 @@ class RosAdapter(Node):
             if self._actual_velocity_updated_monotonic
             else None
         )
+        scan_age = (
+            max(0.0, now_monotonic - getattr(self, "_latest_scan_received_monotonic", 0.0))
+            if getattr(self, "_latest_scan_received_monotonic", 0.0)
+            else None
+        )
+        scan_max_age = float(getattr(
+            getattr(self, "safety_config", None), "arrival_adjust_scan_max_age_seconds", 0.5
+        ))
         plan_fresh = bool(
             plan_age is not None
             and plan_age <= self._global_plan_stale_seconds
@@ -1488,6 +1637,13 @@ class RosAdapter(Node):
             "front_obstacle_distance_m": self._front_obstacle_distance_m,
             "left_clearance_m": self._left_clearance_m,
             "right_clearance_m": self._right_clearance_m,
+            "scan_sample_age_seconds": round(scan_age, 3) if scan_age is not None else None,
+            "stale": scan_age is None or scan_age > scan_max_age,
+            "collision_limited": bool(
+                math.hypot(self._raw_forward_command, self._raw_lateral_command) > 0.03
+                and math.hypot(self._actual_forward_command, self._actual_lateral_command)
+                < 0.5 * math.hypot(self._raw_forward_command, self._raw_lateral_command)
+            ),
             "localization_normal": getattr(
                 getattr(self, "safety_state", None), "localization_status", ""
             ) == "normal",
@@ -1705,6 +1861,56 @@ class RosAdapter(Node):
             "vy": msg.linear.y,
             "yaw_rate": msg.angular.z,
         }
+
+    def search_laser_feature(
+        self,
+        *,
+        max_distance_m: float = 0.15,
+        timeout_seconds: float = 4.0,
+        allow_rotation: bool = False,
+    ) -> bool:
+        """Perform one collision-monitored, bounded feature-search motion.
+
+        Commands enter through /cmd_vel_assist, so Collision Monitor remains
+        the final authority. Outdoor callers keep ``allow_rotation`` false.
+        """
+        speed = 0.05
+        yaw_rate = 0.10 if allow_rotation else 0.0
+        motion_seconds = min(
+            max(0.2, max_distance_m / speed),
+            max(0.2, float(timeout_seconds)),
+        )
+        deadline = time.monotonic() + motion_seconds
+        try:
+            while time.monotonic() < deadline:
+                decision = self._localization_decision()
+                score = decision.get("ndt_score")
+                try:
+                    ndt_health = decision.get("ndt_healthy")
+                    ndt_good = ndt_health is True or (
+                        not isinstance(ndt_health, bool)
+                        and score is not None
+                        and math.isfinite(float(score))
+                        and float(score) < self.safety_config.ndt_failure_score
+                    )
+                except (TypeError, ValueError):
+                    ndt_good = False
+                if ndt_good:
+                    return True
+                observation = self.obstacle_monitor_snapshot()
+                if observation.get("stale") is True:
+                    LOGGER.warning("laser feature search stopped: scan is stale")
+                    return False
+                front = observation.get("front_obstacle_distance_m")
+                if front is not None and float(front) < 0.8:
+                    LOGGER.warning("laser feature search stopped: front clearance %.2fm", float(front))
+                    return False
+                self.manual_assist_velocity(vx=speed, vy=0.0, yaw_rate=yaw_rate)
+                time.sleep(0.1)
+            return False
+        finally:
+            self.manual_assist_velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
+            self.stop_motion()
 
     def arrival_adjust_velocity(
         self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0

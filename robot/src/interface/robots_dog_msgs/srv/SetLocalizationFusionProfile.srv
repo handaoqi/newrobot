@@ -1,0 +1,16 @@
+# Restricted runtime profiles prevent arbitrary covariance values from being
+# injected by a behavior tree.
+uint8 PROFILE_NOMINAL=0
+uint8 PROFILE_LIO_HOLD=1
+uint8 PROFILE_BALANCED=2
+
+uint8 profile
+string reason
+# Non-nominal profiles must be temporary. A zero duration is accepted only
+# for PROFILE_NOMINAL; callers otherwise receive the server-side default.
+float32 duration_seconds
+---
+bool accepted
+uint8 applied_profile
+string profile_name
+string message

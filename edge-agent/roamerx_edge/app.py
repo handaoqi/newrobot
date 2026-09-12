@@ -32,6 +32,7 @@ from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
 from .rosbag_recorder import RosbagRecorder
 from .safety_policy import RuntimeSafetyState, SafetyPolicy
 from .sensor_control_adapter import SensorControlAdapter
+from .self_healing import FaultDiagnoser, SelfHealingCoordinator
 from .task_executor import TaskExecutor
 from .telemetry_collector import TelemetryCollector
 from .teleop_control_adapter import TeleopControlAdapter
@@ -132,6 +133,12 @@ class EdgeAgentApplication:
             rosbag_recorder=self.navigation_rosbag,
             localization_recovery_callback=self._handle_task_localization_loss,
         )
+        self.self_healing = SelfHealingCoordinator(
+            store=self.store,
+            event_callback=self._publish_task_event,
+            ndt_failure_score=config.safety.ndt_failure_score,
+            rtk_required_samples=config.safety.localization_rtk_required_samples,
+        )
         set_log_context_provider = getattr(navigation, "set_log_context_provider", None)
         if callable(set_log_context_provider):
             set_log_context_provider(lambda: {
@@ -156,6 +163,9 @@ class EdgeAgentApplication:
                 self.task_executor.release_recovery,
                 self.task_executor.recovery_snapshot,
             )
+        set_self_healing_callback = getattr(navigation, "set_self_healing_callback", None)
+        if callable(set_self_healing_callback):
+            set_self_healing_callback(self._handle_navigation_self_healing)
         # Deduplicates localization alerts the same way _mapping_divergence_notified
         # does for SLAM divergence: one alert per episode, re-armed on recovery.
         self._localization_alert_notified = False
@@ -886,6 +896,35 @@ class EdgeAgentApplication:
                 "reason_code": event_payload.get("reason_code"),
                 "reason_message": event_payload.get("reason_message"),
             }
+        coordinator = getattr(self, "self_healing", None)
+        if coordinator is not None and event_type in {
+            "task.progress", "task.completed", "task.failed", "task.safe_hold"
+        }:
+            snapshot = coordinator.snapshot()
+            navigation_fault = snapshot.get("fault_label") in {
+                "nav_stuck", "nav_action_failed", "collision_stop"
+            }
+            if snapshot and not snapshot.get("finished") and navigation_fault:
+                succeeded = event_type in {"task.progress", "task.completed"}
+                coordinator.finish_action(
+                    str(snapshot.get("action_id") or ""),
+                    success=succeeded,
+                    reason=(
+                        "navigation_progress_resumed"
+                        if succeeded else str(
+                            event_payload.get("reason_code") or event_type
+                        )
+                    ),
+                )
+                coordinator.complete(
+                    success=succeeded,
+                    reason=(
+                        "navigation_progress_resumed"
+                        if succeeded else str(
+                            event_payload.get("reason_code") or event_type
+                        )
+                    ),
+                )
         self.mqtt.publish_task_event(event_type, event_payload, trace_id)
 
     @staticmethod
@@ -1001,14 +1040,178 @@ class EdgeAgentApplication:
         except Exception:
             LOGGER.exception("failed to report localization recovery state")
 
-    def _handle_task_localization_recovered(self) -> None:
+    def _self_healing_route_snapshot(self) -> dict:
+        context = getattr(self.task_executor, "context", None)
+        return dict(context.route_snapshot) if context else {}
+
+    def _self_healing_evidence(self, supplied: dict | None = None) -> dict:
+        evidence = dict(supplied or {})
+        diagnostics_getter = getattr(self.navigation, "localization_diagnostics", None)
+        diagnostics = diagnostics_getter() if callable(diagnostics_getter) else {}
+        decision_getter = getattr(self.navigation, "localization_decision", None)
+        decision = decision_getter() if callable(decision_getter) else {}
+        obstacle_getter = getattr(self.navigation, "obstacle_monitor_snapshot", None)
+        obstacle = obstacle_getter() if callable(obstacle_getter) else {}
+        context = self.task_executor.context
+        evidence.setdefault("localization_decision", decision if isinstance(decision, dict) else {})
+        safety_state = getattr(self, "safety_state", None)
+        evidence.setdefault("localization_status", getattr(safety_state, "localization_status", None))
+        # RuntimeSafetyState stores the readable value. The diagnoser consumes
+        # the wire value so both ROS and injected test adapters use one rule.
+        if evidence.get("localization_status") == "normal":
+            evidence["localization_status"] = 3
+        elif evidence.get("localization_status") in {"lost", "degraded"}:
+            evidence["localization_status"] = 4
+        evidence.setdefault("obstacle", obstacle if isinstance(obstacle, dict) else {})
+        evidence.setdefault("localization_quality", (diagnostics or {}).get("quality"))
+        evidence.setdefault("task_execution_id", getattr(context, "task_execution_id", ""))
+        robot_config = getattr(getattr(self, "config", None), "robot", None)
+        evidence.setdefault("map_id", getattr(robot_config, "current_map_id", ""))
+        return evidence
+
+    def _diagnose_self_healing(
+        self,
+        fault_label: str,
+        *,
+        episode_id: str = "",
+        level: int | None = None,
+        evidence: dict | None = None,
+    ):
+        coordinator = getattr(self, "self_healing", None)
+        if coordinator is None:
+            safety = getattr(getattr(self, "config", None), "safety", None)
+            diagnoser = FaultDiagnoser(
+                ndt_failure_score=float(getattr(safety, "ndt_failure_score", 0.5))
+            )
+            return diagnoser.diagnose(
+                episode_id=episode_id or "legacy-untracked",
+                requested_fault=fault_label,
+                route_snapshot=self._self_healing_route_snapshot(),
+                evidence=self._self_healing_evidence(evidence),
+                level=0 if level is None else level,
+            )
+        return coordinator.diagnose(
+            fault_label,
+            route_snapshot=self._self_healing_route_snapshot(),
+            evidence=self._self_healing_evidence(evidence),
+            episode_id=episode_id,
+            level=level,
+        )
+
+    def _begin_self_heal_action(self, *, level: int, action_type: str) -> str:
+        coordinator = getattr(self, "self_healing", None)
+        return coordinator.begin_action(level=level, action_type=action_type) if coordinator else ""
+
+    def _finish_self_heal_action(
+        self, action_id: str, *, success: bool, reason: str = ""
+    ) -> None:
+        coordinator = getattr(self, "self_healing", None)
+        if coordinator:
+            coordinator.finish_action(action_id, success=success, reason=reason)
+
+    def _complete_self_healing(self, *, success: bool, reason: str) -> None:
+        coordinator = getattr(self, "self_healing", None)
+        if coordinator:
+            coordinator.complete(success=success, reason=reason)
+
+    def _handle_navigation_self_healing(self, request: dict) -> dict:
+        """Serve thin BT nodes while keeping diagnosis and level state in Edge."""
+        operation = int(request.get("operation", 0))
+        episode_id = str(request.get("episode_id") or "")
+        action_id = str(request.get("action_id") or "")
+        level = min(3, max(0, int(request.get("level", 0))))
+        fault_label = str(request.get("fault_label") or "navigation_failed")
+        action_type = str(request.get("action_type") or "")
+        detail = str(request.get("detail") or "")
+        if getattr(self, "self_healing", None) is None:
+            return {"accepted": False, "reason": "self_healing_coordinator_unavailable"}
+        before = self.self_healing.snapshot()
+        if (
+            operation == 1
+            and before.get("action_id")
+            and level > int(before.get("level", 0))
+        ):
+            self.self_healing.finish_action(
+                str(before["action_id"]),
+                success=False,
+                reason="advanced_to_next_recovery_level",
+            )
+        if operation == 3:  # ACTION_STARTED
+            active = self.self_healing.snapshot()
+            if active.get("action_id"):
+                self.self_healing.finish_action(
+                    str(active["action_id"]),
+                    success=False,
+                    reason="replaced_by_concrete_bt_action",
+                )
+            action_id = self.self_healing.begin_action(level=level, action_type=action_type)
+        elif operation == 4:  # ACTION_FINISHED
+            self.self_healing.finish_action(
+                action_id,
+                success=bool(request.get("success")),
+                reason=detail,
+            )
+        diagnosis = self._diagnose_self_healing(
+            fault_label,
+            episode_id=episode_id,
+            level=level,
+            evidence=request.get("evidence"),
+        )
+        if diagnosis.recovered:
+            self.self_healing.finish_action(
+                str(before.get("action_id") or action_id),
+                success=True,
+                reason=diagnosis.reason,
+            )
+        elif operation == 1:  # DIAGNOSE selects the logical BT action.
+            current = self.self_healing.snapshot()
+            if not current.get("action_id"):
+                action_id = self.self_healing.begin_action(
+                    level=diagnosis.level,
+                    action_type=diagnosis.action_type,
+                )
+        result = vars(diagnosis).copy()
+        result.update({"accepted": True, "action_id": action_id})
+        return result
+
+    def _handle_task_localization_recovered(self, restore_fusion: bool = True) -> None:
         """Re-arm localization alerting, then resume the task as before."""
         self._localization_alert_notified = False
+        self._complete_self_healing(success=True, reason="localization_health_recovered")
+        navigation = getattr(self, "navigation", None)
+        set_fusion_profile = getattr(navigation, "set_localization_fusion_profile", None)
+        if restore_fusion and callable(set_fusion_profile):
+            try:
+                set_fusion_profile("nominal", reason="self_healing_completed")
+            except Exception:
+                LOGGER.exception("failed to restore nominal localization fusion profile")
         try:
             self.telemetry.on_localization_recovery(None)
         except Exception:
             LOGGER.exception("failed to clear localization recovery state")
         self.task_executor.on_localization_recovered()
+
+    def _restore_fusion_when_absolute_recovers(self, timeout_seconds: float = 180.0) -> None:
+        """Leave LIO hold only after an absolute observer is healthy again."""
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while not self.stop_event.is_set() and time.monotonic() < deadline:
+            decision_getter = getattr(self.navigation, "localization_decision", None)
+            decision = decision_getter() if callable(decision_getter) else {}
+            if isinstance(decision, dict):
+                ndt_healthy = decision.get("ndt_healthy") is True
+                rtk_fixed = (
+                    decision.get("rtk_good_for_navigation") is True
+                    or (
+                        decision.get("rtk_usable") is True
+                        and str(decision.get("rtk_quality") or "").lower() == "fixed"
+                    )
+                )
+                if ndt_healthy or rtk_fixed:
+                    setter = getattr(self.navigation, "set_localization_fusion_profile", None)
+                    if callable(setter):
+                        setter("nominal", reason="absolute_observer_recovered")
+                    return
+            self.stop_event.wait(0.5)
 
     def _handle_task_localization_loss(self, reason: str = "localization_lost") -> None:
         """Stop motion, then run the same bounded search as 主动重定位.
@@ -1039,6 +1242,7 @@ class EdgeAgentApplication:
                 reason,
             )
             return
+        self._diagnose_self_healing(reason, level=0)
         # Alert before the early returns below: localization degrading is worth
         # reporting even when no task is running and there is nothing to pause.
         if not self._localization_alert_notified:
@@ -1055,6 +1259,9 @@ class EdgeAgentApplication:
         self.task_executor.on_localization_lost()
         if self._mapping_blocks_auto_relocalize():
             LOGGER.warning("localization lost during mapping; skipping auto relocalize")
+            self._complete_self_healing(
+                success=False, reason="mapping_active_auto_relocalization_suppressed"
+            )
             return
         if not self._localization_recovery_lock.acquire(blocking=False):
             return
@@ -1066,6 +1273,9 @@ class EdgeAgentApplication:
                 LOGGER.warning(
                     "localization recovery skipped; recovery ownership unavailable: %s",
                     getattr(self.task_executor, "recovery_snapshot", lambda: {})(),
+                )
+                self._complete_self_healing(
+                    success=False, reason="recovery_ownership_unavailable"
                 )
                 self._localization_recovery_lock.release()
                 return
@@ -1297,6 +1507,57 @@ class EdgeAgentApplication:
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
                 return
+            diagnosis = self._diagnose_self_healing(reason, level=0)
+            level_zero_action = self._begin_self_heal_action(
+                level=0, action_type=diagnosis.action_type
+            )
+            if diagnosis.wait_for_rtk:
+                self._hold_motion_for_relocalize()
+                if self._wait_for_rtk_recovery():
+                    self._finish_self_heal_action(
+                        level_zero_action, success=True, reason="rtk_recovered_during_wait"
+                    )
+                    return
+                self._finish_self_heal_action(
+                    level_zero_action, success=False, reason="rtk_wait_expired"
+                )
+                diagnosis = self._diagnose_self_healing(
+                    diagnosis.fault_label,
+                    episode_id=diagnosis.episode_id,
+                    level=1,
+                )
+                if diagnosis.use_lio_hold:
+                    profile_action = self._begin_self_heal_action(
+                        level=1, action_type="set_ukf_lio_hold"
+                    )
+                    setter = getattr(self.navigation, "set_localization_fusion_profile", None)
+                    result = setter(
+                        "lio_hold", reason=diagnosis.fault_label
+                    ) if callable(setter) else {"accepted": False, "message": "service unavailable"}
+                    accepted = bool(result.get("accepted"))
+                    self._finish_self_heal_action(
+                        profile_action,
+                        success=accepted,
+                        reason=str(result.get("message") or ""),
+                    )
+                    if accepted:
+                        # RTK/NDT are auxiliary anchors. Healthy FAST-LIO may
+                        # continue safely without waiting for either source to
+                        # improve, and the temporary profile rejects bad anchor
+                        # observations until health returns.
+                        self._handle_task_localization_recovered(restore_fusion=False)
+                        threading.Thread(
+                            target=self._restore_fusion_when_absolute_recovers,
+                            daemon=True,
+                            name="localization-fusion-profile-restore",
+                        ).start()
+                        return
+            else:
+                self._finish_self_heal_action(
+                    level_zero_action,
+                    success=False,
+                    reason="level_0_requires_active_relocalization",
+                )
             cycle_retry = max(
                 1.0,
                 (
@@ -1339,6 +1600,15 @@ class EdgeAgentApplication:
                                 "recovery_elapsed_seconds": round(elapsed, 1),
                             },
                         )
+                        self._complete_self_healing(
+                            success=False, reason="fixed_rtk_recovery_levels_exhausted"
+                        )
+                        safe_hold = getattr(self.task_executor, "enter_safe_hold", None)
+                        if callable(safe_hold):
+                            safe_hold(
+                                "LOCALIZATION_RECOVERY_EXHAUSTED",
+                                "定位自愈等级已耗尽，进入安全保持",
+                            )
                         return
                     LOGGER.warning(
                         "fixed RTK XY is available; skipping open-sky NDT search and retrying GPS in %.1fs",
@@ -1381,6 +1651,9 @@ class EdgeAgentApplication:
                             )
                             return
                         LOGGER.warning("localization lost; try waypoint seed index=%s x=%.3f y=%.3f yaw=%.3f", seed.get("waypoint_index"), seed["x"], seed["y"], seed["yaw"])
+                        local_action = self._begin_self_heal_action(
+                            level=1, action_type="local_relocalize"
+                        )
                         try:
                             self._hold_motion_for_relocalize()
                             if not callable(relocalize):
@@ -1390,9 +1663,19 @@ class EdgeAgentApplication:
                                 "max_attempts": 12,
                                 "_automatic_recovery": True,
                             })
+                            self._finish_self_heal_action(
+                                local_action,
+                                success=True,
+                                reason="local_relocalization_accepted",
+                            )
                             LOGGER.info("active relocalize accepted on cycle %d waypoint=%s", cycle, seed.get("waypoint_index"))
                             return
                         except Exception as exc:
+                            self._finish_self_heal_action(
+                                local_action,
+                                success=False,
+                                reason=str(getattr(exc, "code", "") or exc),
+                            )
                             error_code = getattr(exc, "code", "")
                             if error_code == "RELOCALIZATION_SUPERSEDED":
                                 LOGGER.info(
@@ -1435,6 +1718,36 @@ class EdgeAgentApplication:
                                 break
                             LOGGER.warning("active relocalize cycle %d waypoint=%s failed: %s", cycle, seed.get("waypoint_index"), exc)
                     if cycle == 1:
+                        level_two = self._diagnose_self_healing(
+                            reason,
+                            episode_id=diagnosis.episode_id,
+                            level=2,
+                        )
+                        search = getattr(self.navigation, "search_laser_feature", None)
+                        if level_two.search_laser and callable(search):
+                            search_action = self._begin_self_heal_action(
+                                level=2, action_type="search_laser_feature"
+                            )
+                            search_succeeded = False
+                            try:
+                                search_succeeded = bool(search(
+                                    max_distance_m=0.15,
+                                    timeout_seconds=4.0,
+                                    allow_rotation=not level_two.forbid_spin,
+                                ))
+                            except Exception as exc:
+                                LOGGER.warning("laser feature search failed: %s", exc)
+                            self._finish_self_heal_action(
+                                search_action,
+                                success=search_succeeded,
+                                reason=(
+                                    "ndt_recovered_during_feature_search"
+                                    if search_succeeded else "feature_search_exhausted"
+                                ),
+                            )
+                            if search_succeeded:
+                                self._handle_task_localization_recovered()
+                                return
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)
                         if callable(global_relocalize):
                             if self._operator_localization_active():
@@ -1443,10 +1756,23 @@ class EdgeAgentApplication:
                                 )
                                 return
                             try:
+                                global_action = self._begin_self_heal_action(
+                                    level=3, action_type="global_relocalize"
+                                )
                                 global_relocalize(wait_seconds=90.0, automatic=True)
+                                self._finish_self_heal_action(
+                                    global_action,
+                                    success=True,
+                                    reason="global_relocalization_accepted",
+                                )
                                 LOGGER.info("global relocalize accepted after waypoint seed failure")
                                 return
                             except Exception as exc:
+                                self._finish_self_heal_action(
+                                    locals().get("global_action", ""),
+                                    success=False,
+                                    reason=str(getattr(exc, "code", "") or exc),
+                                )
                                 LOGGER.warning("global relocalize fallback failed: %s", exc)
                 if not self.task_executor.is_paused_for_localization():
                     return
@@ -1469,6 +1795,15 @@ class EdgeAgentApplication:
                             "recovery_elapsed_seconds": round(elapsed, 1),
                         },
                     )
+                    self._complete_self_healing(
+                        success=False, reason="localization_recovery_levels_exhausted"
+                    )
+                    safe_hold = getattr(self.task_executor, "enter_safe_hold", None)
+                    if callable(safe_hold):
+                        safe_hold(
+                            "LOCALIZATION_RECOVERY_EXHAUSTED",
+                            "定位自愈等级已耗尽，进入安全保持",
+                        )
                     return
                 LOGGER.warning(
                     "localization recovery cycle %d%s exhausted after %.0fs; "

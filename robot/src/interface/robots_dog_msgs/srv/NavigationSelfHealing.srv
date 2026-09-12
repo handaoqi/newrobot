@@ -1,0 +1,29 @@
+# Edge owns diagnosis and level selection. BT nodes use this service only to
+# obtain/refresh the decision and to report action completion.
+uint8 DIAGNOSE=1
+uint8 STATUS=2
+uint8 ACTION_STARTED=3
+uint8 ACTION_FINISHED=4
+
+uint8 operation
+string episode_id
+string action_id
+string fault_label
+uint8 level
+string action_type
+bool success
+string detail
+---
+bool accepted
+string episode_id
+string action_id
+string fault_label
+string scene_mode
+uint8 level
+string action_type
+bool forbid_spin
+bool wait_for_rtk
+bool use_lio_hold
+bool search_laser
+bool recovered
+string reason
