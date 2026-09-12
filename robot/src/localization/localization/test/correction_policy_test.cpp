@@ -88,5 +88,53 @@ TEST(CorrectionPolicy, PreferFixedRtkWinsEvenOnConflictOrLowerVariance) {
   EXPECT_EQ(variance_with.reason, "ukf_prefer_fixed_rtk");
 }
 
+TEST(CorrectionPolicy, FloatRtkResidualGateIncludesTheConfiguredBoundary) {
+  EXPECT_TRUE(floatRtkResidualWithinGate(0.4000, 0.40));
+  EXPECT_TRUE(floatRtkResidualWithinGate(0.0, 0.40));
+  EXPECT_FALSE(floatRtkResidualWithinGate(0.4001, 0.40));
+  EXPECT_FALSE(floatRtkResidualWithinGate(-0.01, 0.40));
+}
+
+TEST(CorrectionPolicy, UkfWaypointUsesFixedThenNdtBandsThenFloatFusion) {
+  const auto fixed = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, true, 0.01, true, true, 0.10);
+  EXPECT_EQ(fixed.source, CorrectionSource::rtk);
+  EXPECT_EQ(fixed.reason, "ukf_prefer_fixed_rtk");
+
+  const auto high_quality_ndt = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, true, 0.0999, false, true, 0.10);
+  EXPECT_EQ(high_quality_ndt.source, CorrectionSource::ndt);
+  EXPECT_EQ(high_quality_ndt.reason, "ukf_high_quality_ndt");
+
+  const auto fused_at_lower_ndt_boundary = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, true, 0.1000, false, true, 0.10);
+  EXPECT_EQ(fused_at_lower_ndt_boundary.source, CorrectionSource::ukf_fused);
+
+  const auto fused_at_float_boundary = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, true, 0.3999, false,
+    floatRtkResidualWithinGate(0.4000, 0.40), 0.10);
+  EXPECT_EQ(fused_at_float_boundary.source, CorrectionSource::ukf_fused);
+
+  const auto outside_float_gate_uses_ndt_only = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, true, 0.3999, false,
+    floatRtkResidualWithinGate(0.4001, 0.40), 0.10, true, true);
+  EXPECT_EQ(outside_float_gate_uses_ndt_only.source, CorrectionSource::ndt);
+  EXPECT_EQ(
+    outside_float_gate_uses_ndt_only.reason, "ukf_float_outside_gate_ndt_only");
+
+  const auto no_ndt_at_upper_boundary = selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ukf, false, 0.40, false, false, 0.10);
+  EXPECT_EQ(no_ndt_at_upper_boundary.source, CorrectionSource::none);
+}
+
+TEST(CorrectionPolicy, StrictWaypointModesDoNotFallbackAcrossSources) {
+  EXPECT_EQ(selectWaypointCorrectionSource(
+    CorrectionPolicyMode::rtk, true, 0.01, false, true, 0.10).source,
+    CorrectionSource::none);
+  EXPECT_EQ(selectWaypointCorrectionSource(
+    CorrectionPolicyMode::ndt, false, 0.50, true, false, 0.10).source,
+    CorrectionSource::none);
+}
+
 }  // namespace
 }  // namespace localization

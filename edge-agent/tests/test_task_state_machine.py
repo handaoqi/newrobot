@@ -577,6 +577,71 @@ def test_waypoint_correction_transaction_is_idempotent_and_required(tmp_path):
     store.close()
 
 
+def test_explicit_no_correction_completion_bypasses_ndt_score_after_stop_recheck(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    cases = (
+        ("ndt", "ndt_no_correction_continue"),
+        ("rtk", "rtk_no_correction_continue"),
+        ("ukf", "ukf_no_correction_sources_meet_gate"),
+    )
+    for index, (mode, reason) in enumerate(cases):
+        transaction_id = f"task-7:waypoint:{index}:correction:1"
+        executor._active_correction_transaction_id = transaction_id
+        executor._active_correction_mode = mode
+        nav.localization_state = {
+            "active_source": "lio_imu",
+            "lio_healthy": True,
+            "ndt_score": 0.99,
+            "one_shot_correction": {
+                "transaction_id": transaction_id,
+                "mode": mode,
+                "status": "completed",
+                "selected_source": "none",
+                "reason": reason,
+            },
+        }
+        assert executor._absolute_localization_ready(timeout_seconds=0.05) is True
+
+    assert nav.stop_commands >= len(cases)
+    store.close()
+
+
+def test_no_correction_completion_still_requires_confirmed_stop(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.stopped = False
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    transaction_id = "task-7:waypoint:0:correction:1"
+    executor._active_correction_transaction_id = transaction_id
+    executor._active_correction_mode = "ndt"
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "one_shot_correction": {
+            "transaction_id": transaction_id,
+            "mode": "ndt",
+            "status": "completed",
+            "selected_source": "none",
+            "reason": "ndt_no_correction_continue",
+        },
+    }
+    assert executor._absolute_localization_ready(timeout_seconds=0.02) is False
+    assert nav.stop_commands > 0
+    store.close()
+
+
 def test_waypoint_correction_reuses_matching_live_transaction(tmp_path):
     class TransactionNavigation(FakeNavigation):
         def __init__(self):

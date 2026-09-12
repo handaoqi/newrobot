@@ -72,8 +72,16 @@ localization:
         stable_span_m: 0.35
         trusted_correction_translation_rate_mps: 1.0
         trusted_correction_rotation_rate_degps: 30.0
-        # UKF mode weights independently valid RTK/NDT observations by covariance.
-        prefer_fixed_for_correction: false
+        # At a stopped UKF waypoint a qualified fixed RTK observation is the
+        # default absolute anchor.  Floating RTK remains UKF-fusion-only.
+        prefer_fixed_for_correction: true
+      ukf_fusion:
+        # Below this NDT score, use NDT alone.  In the middle band, a bounded
+        # float RTK observation may be covariance-weighted with NDT.
+        high_quality_ndt_score: 0.10
+        # Hard maximum map-frame XY residual for a float RTK observation.
+        # The boundary is inclusive; values above it are never fused.
+        float_max_residual_m: 0.40
       correct_xy_variance: 0.010
       correct_z_variance: 0.020
       correct_orientation_variance: 0.001

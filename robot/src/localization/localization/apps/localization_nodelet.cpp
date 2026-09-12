@@ -354,7 +354,12 @@ public:
         "lio_primary.rtk_trust.trusted_correction_rotation_rate_degps", 30.0)
         * M_PI / 180.0));
     prefer_fixed_rtk_for_correction_ = declare_parameter<bool>(
-      "lio_primary.rtk_trust.prefer_fixed_for_correction", false);
+      "lio_primary.rtk_trust.prefer_fixed_for_correction", true);
+    ukf_high_quality_ndt_score_ = static_cast<float>(std::clamp(
+      declare_parameter<double>("lio_primary.ukf_fusion.high_quality_ndt_score", 0.10),
+      0.0, static_cast<double>(ndt_max_fitness_score_)));
+    ukf_float_max_residual_m_ = static_cast<float>(std::max(
+      0.0, declare_parameter<double>("lio_primary.ukf_fusion.float_max_residual_m", 0.40)));
 
 	    use_imu     = declare_parameter<bool>("use_imu", true);
 	    if (enable_lio_primary_ && use_imu) {
@@ -1162,6 +1167,7 @@ private:
     CorrectionPolicyMode mode = CorrectionPolicyMode::ndt;
     std::string status = "idle";
     std::string selected_source = "none";
+    std::string selection_reason = "none";
     std::string reason = "none";
     int64_t started_steady_ns = 0;
     int64_t completed_steady_ns = 0;
@@ -1755,7 +1761,13 @@ private:
       if (one_shot_correction_.active && one_shot_correction_.status == "smoothing") {
         one_shot_correction_.active = false;
         one_shot_correction_.status = "completed";
-        one_shot_correction_.reason = one_shot_correction_.selected_source == "ukf_fused"
+        one_shot_correction_.reason = one_shot_correction_.selected_source == "ndt_vgicp" &&
+            one_shot_correction_.selection_reason == "ukf_high_quality_ndt"
+          ? "ukf_high_quality_ndt"
+          : one_shot_correction_.selected_source == "ndt_vgicp" &&
+              one_shot_correction_.selection_reason == "ukf_float_outside_gate_ndt_only"
+            ? "ukf_float_outside_gate_ndt_only"
+          : one_shot_correction_.selected_source == "ukf_fused"
           ? "corrected_ukf_fused"
           : one_shot_correction_.selected_source == "rtk"
             ? "corrected_rtk"
@@ -2154,11 +2166,12 @@ private:
     }
     last_rtk_aux_observation_stamp_ns_ = observation.stamp_ns;
     const bool fixed_quality_ok = rtkCorrectionQualityOk(observation);
-    const bool float_quality_ok = rtkFloatQualityOk(observation);
-    const bool quality_ok = fixed_quality_ok || float_quality_ok;
-    if (!quality_ok) {
+    if (!fixed_quality_ok) {
       rtk_stability_window_.clear();
       rtk_self_stable_ = false;
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "fixed_rtk_required";
+      return false;
     }
     // Keep the RTK self-stability window alive even while a smooth correction
     // is in flight. Otherwise the 3s window expires mid-correction and the
@@ -2173,8 +2186,8 @@ private:
     const bool rtk_self_stable = fixed_quality_ok && updateRtkSelfStability(
       rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
     const bool trust_rtk = rtk_self_stable ||
-      (!force_correction && motion_phase_ == "moving" && fixed_quality_ok);
-    if (force_correction && quality_ok && !rtk_self_stable) {
+      (!force_correction && motion_phase_ == "moving");
+    if (force_correction && !rtk_self_stable) {
       rtk_drift_gate_.last_decision = "awaiting_rtk_self_stable";
       if (force_correction && one_shot_correction_.active) {
         one_shot_correction_.status = "waiting_source";
@@ -2219,11 +2232,6 @@ private:
         drift_yaw * 180.0 / M_PI,
         lio_max_correction_yaw_rad_ * 180.0 / M_PI);
     }
-    const bool float_within_gate = float_quality_ok && drift_xy <= 0.20f;
-    if (force_correction && !fixed_quality_ok && !float_within_gate) {
-      rtk_drift_gate_.last_decision = "float_rtk_outside_ukf_gate";
-      return false;
-    }
     const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const Eigen::Vector2f correction_xy =
@@ -2231,9 +2239,9 @@ private:
     // Fixed RTK: never hard-reject because LIO drifted far. Only wait for the
     // RTK self-stability window before applying oversized corrections.
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
-      rtk_drift_gate_, "RTK", quality_ok, drifted, rtk_position,
+      rtk_drift_gate_, "RTK", fixed_quality_ok, drifted, rtk_position,
       correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
-      observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/quality_ok,
+      observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/fixed_quality_ok,
       force_correction);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -2304,10 +2312,20 @@ private:
   bool maybeCorrectUkfFused(
       const PoseEstimator::MatchResult& match,
       const RtkObservation& observation,
+      const CorrectionCandidateSummary& float_rtk,
       const rclcpp::Time& stamp) {
+    if (motion_phase_ != "stationary") {
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "correction_requires_stationary";
+      return false;
+    }
     if (!pose_estimator || !match.transform_.allFinite() ||
-        !std::isfinite(match.fitness_score_) || match.fitness_score_ >= 0.40f ||
-        !rtkFloatQualityOk(observation)) {
+        !std::isfinite(match.fitness_score_) ||
+        match.fitness_score_ < ukf_high_quality_ndt_score_ ||
+        match.fitness_score_ >= ndt_max_fitness_score_ ||
+        !rtkFloatQualityOk(observation) || !float_rtk.eligible ||
+        !floatRtkResidualWithinGate(
+          float_rtk.residual_xy, ukf_float_max_residual_m_)) {
       return false;
     }
     const Eigen::Vector3f ndt_position = match.transform_.block<3, 1>(0, 3);
@@ -2392,7 +2410,8 @@ private:
     candidate.orientation_variance = noise.orientation_variance;
     candidate.residual_xy =
       (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm();
-    if (observation.quality == "float" && candidate.residual_xy > 0.20f) {
+    if (observation.quality == "float" &&
+        !floatRtkResidualWithinGate(candidate.residual_xy, ukf_float_max_residual_m_)) {
       candidate.eligible = false;
       return candidate;
     }
@@ -2433,6 +2452,29 @@ private:
       std::fabs((stamp - last_ndt_update_time_).seconds()) <= 1.0;
     const bool rtk_ready = rtkCorrectionQualityOk(observation);
     const bool rtk_float_ready = rtkFloatQualityOk(observation);
+    float float_rtk_residual_xy_m = -1.0f;
+    bool rtk_float_within_gate = false;
+    std::string float_rtk_gate_reason = "not_float_or_quality_rejected";
+    if (rtk_float_ready && pose_estimator) {
+      float_rtk_residual_xy_m =
+        (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm();
+      rtk_float_within_gate = floatRtkResidualWithinGate(
+        float_rtk_residual_xy_m, ukf_float_max_residual_m_);
+      float_rtk_gate_reason = rtk_float_within_gate
+        ? "within_gate" : "residual_exceeds_max";
+    } else if (rtk_float_ready) {
+      float_rtk_gate_reason = "lio_pose_unavailable";
+    }
+    const float ndt_score = match && std::isfinite(match->fitness_score_)
+      ? match->fitness_score_ : std::numeric_limits<float>::infinity();
+    last_float_rtk_residual_xy_m_ = float_rtk_residual_xy_m;
+    last_float_rtk_within_gate_ = rtk_float_within_gate;
+    last_float_rtk_gate_reason_ = float_rtk_gate_reason;
+    last_ndt_score_band_ = !match || !std::isfinite(ndt_score)
+      ? "unavailable"
+      : ndt_score < ukf_high_quality_ndt_score_
+        ? "high_quality"
+        : ndt_score < ndt_max_fitness_score_ ? "eligible" : "poor";
     const bool force_correction = one_shot_correction_.active;
     const CorrectionPolicyMode effective_mode = force_correction
       ? one_shot_correction_.mode : preferred_correction_mode_;
@@ -2440,7 +2482,7 @@ private:
       ? ndt_fresh
       : effective_mode == CorrectionPolicyMode::rtk
         ? rtk_ready
-        : (ndt_fresh || rtk_ready || rtk_float_ready);
+        : (ndt_fresh || rtk_ready || rtk_float_within_gate);
 
     // In LIO-hold mode both absolute observers have already failed their
     // quality gates.  Keep propagating the high-rate FAST-LIO pose and reject
@@ -2489,7 +2531,7 @@ private:
     if (ndt.eligible && !ndt_drifted && !force_correction) {
       maybeCorrectLioDrift(*match, stamp);
     }
-    if (rtk.eligible && !rtk_drifted && !force_correction) {
+    if (rtk_ready && rtk.eligible && !rtk_drifted && !force_correction) {
       maybeCorrectRtkDrift(observation);
     }
 
@@ -2497,47 +2539,30 @@ private:
       (force_correction || !ndt_drift_gate_.correction_latched);
     rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
       (force_correction || !rtk_drift_gate_.correction_latched);
-    CorrectionSelection selection;
-    const bool ukf_float_fusion = effective_mode == CorrectionPolicyMode::ukf &&
-      !rtk_ready && rtk_float_ready && ndt.eligible && match &&
-      match->fitness_score_ < 0.40f && match->fitness_score_ >= 0.08f;
-    const bool ukf_high_quality_ndt = effective_mode == CorrectionPolicyMode::ukf &&
-      !rtk_ready && !ukf_float_fusion && match && ndt.eligible && match->fitness_score_ < 0.08f;
-    if (ukf_float_fusion) {
-      selection = CorrectionSelection{CorrectionSource::ukf_fused, "corrected_ukf_fused"};
-    } else if (ukf_high_quality_ndt) {
-      selection = CorrectionSelection{CorrectionSource::ndt, "ukf_high_quality_ndt"};
-    } else if (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "ndt") {
-      selection = ndt.eligible
-        ? CorrectionSelection{CorrectionSource::ndt, "ukf_policy_prefer_ndt"}
-        : CorrectionSelection{};
-    } else {
-      selection = selectCorrectionSource(
-        effective_mode, ndt, rtk,
-        lio_drift_xy_m_, lio_drift_yaw_rad_,
-        lio_drift_xy_m_, lio_drift_yaw_rad_,
-        prefer_fixed_rtk_for_correction_ ||
-          (effective_mode == CorrectionPolicyMode::ukf && ukf_anchor_preference_ == "rtk"));
-    }
+    const bool fixed_rtk_eligible = rtk_ready && rtk.eligible;
+    const bool float_rtk_eligible = !rtk_ready && rtk_float_within_gate && rtk.eligible;
+    CorrectionSelection selection = selectWaypointCorrectionSource(
+      effective_mode, ndt.eligible, ndt_score, fixed_rtk_eligible,
+      float_rtk_eligible, ukf_high_quality_ndt_score_,
+      prefer_fixed_rtk_for_correction_, rtk_float_ready && !rtk_float_within_gate);
+    const bool ukf_float_fusion = selection.source == CorrectionSource::ukf_fused;
     last_correction_candidate_source_ = correctionSourceName(selection.source);
     last_correction_selection_reason_ = selection.reason;
+    if (force_correction) {
+      one_shot_correction_.selection_reason = selection.reason;
+    }
 
     bool corrected = false;
     if (ukf_float_fusion && match) {
       ndt_drift_gate_.resetConsecutive();
       rtk_drift_gate_.resetConsecutive();
-      corrected = maybeCorrectUkfFused(*match, observation, stamp);
+      corrected = maybeCorrectUkfFused(*match, observation, rtk, stamp);
     } else if (selection.source == CorrectionSource::ndt && match) {
       rtk_drift_gate_.resetConsecutive();
       corrected = maybeCorrectLioDrift(*match, stamp, force_correction);
     } else if (selection.source == CorrectionSource::rtk) {
       ndt_drift_gate_.resetConsecutive();
       corrected = maybeCorrectRtkDrift(observation, force_correction);
-      if (corrected && force_correction && observation.quality == "float" &&
-          one_shot_correction_.active) {
-        one_shot_correction_.selected_source = "ukf_fused";
-        one_shot_correction_.reason = "corrected_ukf_fused";
-      }
     } else {
       if (match && !ndt_quality_ok) {
         ndt_drift_gate_.resetConsecutive();
@@ -2548,35 +2573,31 @@ private:
         rtk_drift_gate_.last_decision = "quality_rejected";
       }
       if (force_correction) {
-        if (effective_mode == CorrectionPolicyMode::rtk &&
-            observation.usable && observation.quality != "fixed") {
-          // RTK mode must not wait indefinitely for a fixed solution. A
-          // floating/single-point sample is retained as diagnostic input; the
-          // continuous LIO/UKF estimate remains authoritative for this leg.
-          one_shot_correction_.active = false;
-          one_shot_correction_.status = "completed";
-          one_shot_correction_.selected_source = "none";
-          one_shot_correction_.reason = "rtk_no_correction_continue";
-          RCLCPP_WARN(get_logger(),
-            "RTK correction skipped without blocking: quality=%s; continuing on LIO/UKF",
-            observation.quality.c_str());
-        } else {
-        const bool rtk_float = observation.usable && observation.quality == "float" &&
-          pose_estimator && observation.position.allFinite() &&
-          (observation.position.head<2>() - pose_estimator->pos().head<2>()).norm() > 0.20f;
-        const bool ndt_poor = !match || !std::isfinite(match->fitness_score_) ||
-          match->fitness_score_ >= 0.40f;
-        if (effective_mode == CorrectionPolicyMode::ukf && rtk_float && ndt_poor) {
-          one_shot_correction_.active = false;
-          one_shot_correction_.status = "completed";
-          one_shot_correction_.selected_source = "none";
-          one_shot_correction_.reason = "ukf_no_correction_sources_meet_gate";
-          RCLCPP_WARN(get_logger(),
-            "UKF correction skipped without blocking: RTK float drift >0.20m, NDT score >=0.40");
-        } else {
+        if (motion_phase_ != "stationary") {
           one_shot_correction_.status = "waiting_source";
-          one_shot_correction_.reason = "waiting_for_eligible_anchor_observation";
-        }
+          one_shot_correction_.reason = "waiting_stationary";
+        } else {
+          // An exhausted absolute-source attempt is an explicit outcome, not
+          // a perpetual wait. The Edge execution layer separately requires a
+          // fresh healthy LIO sample and a confirmed physical stop before it
+          // departs on any of these no-correction completions.
+          one_shot_correction_.active = false;
+          one_shot_correction_.status = "completed";
+          one_shot_correction_.selected_source = "none";
+          one_shot_correction_.completed_steady_ns = steadyNowNanoseconds();
+          if (effective_mode == CorrectionPolicyMode::ndt) {
+            one_shot_correction_.reason = "ndt_no_correction_continue";
+          } else if (effective_mode == CorrectionPolicyMode::rtk) {
+            one_shot_correction_.reason = "rtk_no_correction_continue";
+          } else {
+            one_shot_correction_.reason = "ukf_no_correction_sources_meet_gate";
+          }
+          RCLCPP_WARN(get_logger(),
+            "Waypoint %s correction skipped without blocking: ndt_band=%s "
+            "float_rtk=%.3fm/%0.3fm gate=%s; continuing on LIO/UKF",
+            correctionPolicyModeName(effective_mode), last_ndt_score_band_.c_str(),
+            last_float_rtk_residual_xy_m_, ukf_float_max_residual_m_,
+            last_float_rtk_gate_reason_.c_str());
         }
       }
     }
@@ -3253,7 +3274,16 @@ private:
         << "\",\"policy_source_ready\":" << (policy_source_ready_ ? "true" : "false")
         << ",\"correction_candidate_source\":\"" << last_correction_candidate_source_
         << "\",\"correction_selection_reason\":\"" << last_correction_selection_reason_
-        << "\",\"anchor_filter\":{\"initialized\":"
+        << "\",\"correction_gates\":{\"ndt_score_band\":\""
+        << last_ndt_score_band_
+        << "\",\"ukf_high_quality_ndt_score\":" << ukf_high_quality_ndt_score_
+        << ",\"ndt_max_fitness_score\":" << ndt_max_fitness_score_
+        << ",\"float_rtk_residual_xy_m\":" << last_float_rtk_residual_xy_m_
+        << ",\"float_rtk_max_residual_m\":" << ukf_float_max_residual_m_
+        << ",\"float_rtk_within_gate\":"
+        << (last_float_rtk_within_gate_ ? "true" : "false")
+        << ",\"float_rtk_gate_reason\":\"" << last_float_rtk_gate_reason_ << "\"}"
+        << ",\"anchor_filter\":{\"initialized\":"
         << (anchor_filter_initialized ? "true" : "false")
         << ",\"source\":\"" << anchor_observation_source
         << "\",\"variance_x\":" << anchor_covariance.x()
@@ -3271,6 +3301,7 @@ private:
         << "\",\"mode\":\"" << correctionPolicyModeName(one_shot_correction_.mode)
         << "\",\"status\":\"" << one_shot_correction_.status
         << "\",\"selected_source\":\"" << one_shot_correction_.selected_source
+        << "\",\"selection_reason\":\"" << one_shot_correction_.selection_reason
         << "\",\"reason\":\"" << one_shot_correction_.reason << "\"}"
         << ",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
         << ",\"rtk_primary_allowed_by_policy\":"
@@ -6507,6 +6538,10 @@ private:
   bool policy_source_ready_ = false;
   std::string last_correction_candidate_source_ = "none";
   std::string last_correction_selection_reason_ = "idle";
+  std::string last_ndt_score_band_ = "unavailable";
+  float last_float_rtk_residual_xy_m_ = -1.0f;
+  bool last_float_rtk_within_gate_ = false;
+  std::string last_float_rtk_gate_reason_ = "not_evaluated";
   std::string active_source_ = "unavailable";
   std::string motion_phase_ = "stationary";
   bool bridge_active_ = false;
@@ -6785,6 +6820,8 @@ private:
   float lidar_odom_max_correspondence_distance_ = 1.00f;
   float lidar_odom_max_fitness_score_ = 0.50f;
   float ndt_max_fitness_score_ = 0.40f;
+  float ukf_high_quality_ndt_score_ = 0.10f;
+  float ukf_float_max_residual_m_ = 0.40f;
   bool scan_matching_refine_enable_ = true;
   float scan_matching_local_map_xy_radius_ = 18.0f;
   float scan_matching_local_map_z_radius_ = 4.0f;

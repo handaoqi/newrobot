@@ -113,6 +113,16 @@ ARRIVAL_ADJUST_PERIOD_SECONDS = 0.10
 ARRIVAL_ADJUST_STABLE_SAMPLES = 3
 # How long ABSOLUTE_LOCALIZATION_REQUIRED may wait before giving up the watch.
 ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS = 120.0
+# A completed one-shot correction may explicitly decide that no absolute
+# observation is safe to consume. These outcomes keep FAST-LIO/UKF as the
+# continuous estimate; they are not successful NDT/RTK corrections.
+NO_CORRECTION_CONTINUE_REASONS = frozenset(
+    {
+        "ukf_no_correction_sources_meet_gate",
+        "ndt_no_correction_continue",
+        "rtk_no_correction_continue",
+    }
+)
 # Patrol redispatches after a rejected FollowWaypoints goal. Keep this short —
 # send_waypoints already waited for Nav2 readiness.
 NAV_DISPATCH_RETRY_DEFAULT_SECONDS = 2.0
@@ -2970,6 +2980,20 @@ class TaskExecutor:
             and str(transaction.get("status") or "") == "completed"
         )
 
+    def _waypoint_no_correction_continue_reason(self, decision: dict) -> str | None:
+        """Return a matching explicit no-correction completion reason, if any."""
+        transaction_id = self._active_correction_transaction_id
+        transaction = decision.get("one_shot_correction")
+        if not transaction_id or not isinstance(transaction, dict):
+            return None
+        if (
+            str(transaction.get("transaction_id") or "") != transaction_id
+            or str(transaction.get("status") or "") != "completed"
+        ):
+            return None
+        reason = str(transaction.get("reason") or "")
+        return reason if reason in NO_CORRECTION_CONTINUE_REASONS else None
+
     def _cancel_waypoint_localization_correction(self) -> None:
         transaction_id = self._active_correction_transaction_id
         mode = self._active_correction_mode
@@ -4055,6 +4079,7 @@ class TaskExecutor:
             started_at = time.monotonic()
             while not stop.wait(0.5):
                 request_recovery = False
+                no_correction_reason = None
                 with self._lock:
                     if (
                         not self.context
@@ -4066,6 +4091,9 @@ class TaskExecutor:
                     transaction_completed = self._waypoint_correction_completed(decision)
                     if transaction_completed is not None:
                         self._retry_waypoint_localization_correction(decision)
+                        no_correction_reason = (
+                            self._waypoint_no_correction_continue_reason(decision)
+                        )
                         ready = bool(
                             transaction_completed
                             and decision.get("lio_healthy", True)
@@ -4115,6 +4143,11 @@ class TaskExecutor:
                             "waypoint NDT correction is waiting for a source but "
                             "no relocalization recovery callback is configured"
                         )
+                if ready and no_correction_reason is not None:
+                    # A transaction may finish while an older task instance is
+                    # already paused. Reconfirm zero motion before this watch
+                    # resumes it, matching the normal arrival path.
+                    ready = self._hold_final_pose(timeout_seconds=0.5)
                 if not ready:
                     if (
                         time.monotonic() - started_at
@@ -4166,18 +4199,38 @@ class TaskExecutor:
                 return False
             transaction_completed = self._waypoint_correction_completed(decision)
             if transaction_completed is not None:
+                no_correction_reason = self._waypoint_no_correction_continue_reason(
+                    decision
+                )
                 ndt_score_ok = True
-                if self._active_correction_mode == "ndt" and decision.get("ndt_score") is not None:
+                if (
+                    no_correction_reason is None
+                    and self._active_correction_mode == "ndt"
+                    and decision.get("ndt_score") is not None
+                ):
                     try:
                         ndt_score_ok = float(decision["ndt_score"]) <= self.arrival_ndt_max_fitness_score
                     except (TypeError, ValueError):
                         ndt_score_ok = False
+                stop_confirmed = True
+                if transaction_completed and no_correction_reason is not None:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    stop_confirmed = self._hold_final_pose(
+                        timeout_seconds=min(0.5, remaining)
+                    )
                 if (
                     transaction_completed
                     and bool(decision.get("lio_healthy", True))
                     and self._localization_sample_fresh(decision)
                     and ndt_score_ok
+                    and stop_confirmed
                 ):
+                    if no_correction_reason is not None:
+                        LOGGER.warning(
+                            "waypoint correction completed without absolute update reason=%s; "
+                            "continuing on fresh stopped LIO/UKF",
+                            no_correction_reason,
+                        )
                     return True
                 stop_motion = getattr(self.navigation, "stop_motion", None)
                 if callable(stop_motion):

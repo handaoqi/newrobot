@@ -80,6 +80,59 @@ struct CorrectionSelection {
   std::string reason = "no_eligible_source";
 };
 
+// Waypoint correction has deliberately stricter source ordering than the
+// continuous source arbiter.  A fixed RTK observation is authoritative at a
+// stopped waypoint.  Floating RTK is never a standalone source: it may only
+// join a borderline NDT observation in the UKF anchor fusion path.
+inline bool floatRtkResidualWithinGate(double residual_xy_m, double max_residual_xy_m) {
+  return std::isfinite(residual_xy_m) && std::isfinite(max_residual_xy_m) &&
+    max_residual_xy_m >= 0.0 && residual_xy_m >= 0.0 &&
+    residual_xy_m <= max_residual_xy_m;
+}
+
+inline CorrectionSelection selectWaypointCorrectionSource(
+    CorrectionPolicyMode mode,
+    bool ndt_eligible,
+    double ndt_fitness_score,
+    bool fixed_rtk_eligible,
+    bool float_rtk_eligible,
+    double high_quality_ndt_score,
+    bool prefer_fixed_rtk = true,
+    bool float_rtk_rejected_by_residual = false) {
+  if (mode == CorrectionPolicyMode::ndt) {
+    return ndt_eligible
+      ? CorrectionSelection{CorrectionSource::ndt, "ndt_policy_selected"}
+      : CorrectionSelection{};
+  }
+  if (mode == CorrectionPolicyMode::rtk) {
+    return fixed_rtk_eligible
+      ? CorrectionSelection{CorrectionSource::rtk, "rtk_policy_selected"}
+      : CorrectionSelection{};
+  }
+
+  // Fixed RTK is the UKF waypoint default.  This deliberately precedes the
+  // NDT score bands and any legacy anchor preference.
+  if (fixed_rtk_eligible && prefer_fixed_rtk) {
+    return {CorrectionSource::rtk, "ukf_prefer_fixed_rtk"};
+  }
+  if (!ndt_eligible || !std::isfinite(ndt_fitness_score)) {
+    return fixed_rtk_eligible
+      ? CorrectionSelection{CorrectionSource::rtk, "ukf_only_fixed_rtk_eligible"}
+      : CorrectionSelection{};
+  }
+  if (ndt_fitness_score < high_quality_ndt_score) {
+    return {CorrectionSource::ndt, "ukf_high_quality_ndt"};
+  }
+  if (float_rtk_eligible) {
+    return {CorrectionSource::ukf_fused, "corrected_ukf_fused"};
+  }
+  return {
+    CorrectionSource::ndt,
+    float_rtk_rejected_by_residual
+      ? "ukf_float_outside_gate_ndt_only" : "ukf_ndt_only_eligible",
+  };
+}
+
 inline double correctionCandidateMetric(
     const CorrectionCandidateSummary& candidate,
     double drift_xy_m,
