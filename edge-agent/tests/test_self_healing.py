@@ -111,6 +111,18 @@ def test_explicit_unhealthy_ndt_flag_is_not_overridden_by_a_borderline_score():
     assert diagnosis.recovered is False
 
 
+def test_initializing_localization_status_is_diagnosed_without_integer_conversion():
+    diagnosis = FaultDiagnoser().diagnose(
+        episode_id="episode",
+        requested_fault="navigation_failed",
+        route_snapshot={"scene_scope": "indoor"},
+        evidence=evidence(status="initializing", lio=False),
+    )
+
+    assert diagnosis.fault_label == FAULT_LOCALIZATION_LOST
+    assert diagnosis.recovered is False
+
+
 def test_navigation_failure_does_not_change_ukf_profile_only_because_anchors_are_weak():
     diagnosis = FaultDiagnoser().diagnose(
         episode_id="episode",

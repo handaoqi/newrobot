@@ -83,6 +83,14 @@ def _finite_score(value) -> float | None:
     return score if score == score and abs(score) != float("inf") else None
 
 
+def _localization_status_is_normal(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return int(value) == 3
+    return str(value or "").strip().lower() in {"3", "normal", "localized"}
+
+
 def _rtk_float_within_ukf_gate(decision: dict) -> bool:
     if decision.get("rtk_float_usable_for_ukf") is True:
         return True
@@ -158,7 +166,11 @@ class FaultDiagnoser:
             return FAULT_COLLISION_STOP
         if obstacle.get("stale") is True or evidence.get("sensor_stale") is True:
             return FAULT_SENSOR_STALE
-        if status is not None and int(status) != 3 and not (rtk_fixed or lio_healthy):
+        if (
+            status is not None
+            and not _localization_status_is_normal(status)
+            and not (rtk_fixed or lio_healthy)
+        ):
             return FAULT_LOCALIZATION_LOST
         if requested.startswith("ndt") and not ndt_healthy:
             return FAULT_NDT_DEGRADED
@@ -214,7 +226,9 @@ class FaultDiagnoser:
             and str(decision.get("rtk_quality") or "").lower() == "fixed"
         )
         rtk_float_within_gate = _rtk_float_within_ukf_gate(decision)
-        localization_normal = evidence.get("localization_status") == 3
+        localization_normal = _localization_status_is_normal(
+            evidence.get("localization_status")
+        )
         nav_progress = evidence.get("navigation_progress") is True
 
         recovered = False
