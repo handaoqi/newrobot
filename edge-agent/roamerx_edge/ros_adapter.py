@@ -2728,16 +2728,38 @@ class RosAdapter(Node):
                 remaining = quick_deadline - time.monotonic()
                 if remaining < 1.0:
                     break
-                attempts[index - 1] = self._probe_localization_seed(
+                started_attempt = self._begin_localization_attempt(
+                    index,
+                    seed,
+                    extra={"stage": source, "source": source},
+                )
+                attempts[index - 1] = started_attempt
+                session.update({
+                    "attempts": attempts,
+                    "active_candidate_number": index,
+                    "active_candidate_stage": source,
+                    "evaluated_candidate_count": index - 1,
+                    "live_pose": started_attempt.get("live_pose"),
+                })
+                # Publish before the blocking NDT/localization wait.  Without
+                # this snapshot the UI receives only the final result and
+                # keeps the candidate shown as waiting while it is being tried.
+                self._report_localization_attempts(session)
+                completed_attempt = self._probe_localization_seed(
                     seed,
                     generation,
                     wait_seconds=min(2.0, remaining),
                     index=index,
                     extra={"stage": source, "source": source},
                 )
+                attempts[index - 1] = self._finish_localization_attempt(
+                    completed_attempt, started_attempt
+                )
                 session.update({
                     "attempts": attempts,
                     "evaluated_candidate_count": index,
+                    "active_candidate_number": None,
+                    "active_candidate_stage": None,
                     "live_pose": self._current_live_pose(),
                 })
                 self._report_localization_attempts(session)
@@ -2865,7 +2887,9 @@ class RosAdapter(Node):
             "state": "running",
             "mode": "progressive_stationary_search",
             "strategy": strategy,
+            "selected_stage": "mapping_origin_bounded" if origin_seed is not None else None,
             "candidate_count": len(seeds) + (20 if origin_seed else 0),
+            "evaluated_candidate_count": 0,
             "stages": stages,
             "attempts": all_attempts,
             "best_match_pose": None,
@@ -2951,7 +2975,11 @@ class RosAdapter(Node):
                 "finished_at": skipped_at,
                 "error_code": "NO_ROUTE_WAYPOINTS",
             })
-        session.update(stages=stages, state="running")
+        session.update(
+            stages=stages,
+            state="running",
+            selected_stage="route_waypoints" if route_stage is not None else None,
+        )
         self._report_localization_attempts(session)
         self._trusted_pose_frozen = True
         try:
@@ -2973,16 +3001,38 @@ class RosAdapter(Node):
                     all_attempts.append(skipped)
                     waypoint_attempts.append(skipped)
                     continue
+                started_attempt = self._begin_localization_attempt(
+                    len(all_attempts) + 1,
+                    seed,
+                    extra={"stage": stage_name, "waypoint_index": waypoint_index},
+                )
+                all_attempts.append(started_attempt)
+                waypoint_attempts.append(started_attempt)
+                session.update(
+                    attempts=all_attempts,
+                    active_candidate_number=started_attempt["index"],
+                    active_candidate_stage=stage_name,
+                    evaluated_candidate_count=max(0, len(all_attempts) - 1),
+                    live_pose=started_attempt.get("live_pose"),
+                )
+                self._report_localization_attempts(session)
                 attempt = self._probe_localization_seed(
                     seed,
                     generation,
                     wait_seconds=min(per_seed_wait, remaining_local),
-                    index=len(all_attempts) + 1,
+                    index=started_attempt["index"],
                     extra={"stage": stage_name, "waypoint_index": waypoint_index},
                 )
-                all_attempts.append(attempt)
-                waypoint_attempts.append(attempt)
-                session.update(attempts=all_attempts, live_pose=self._current_live_pose())
+                attempt = self._finish_localization_attempt(attempt, started_attempt)
+                all_attempts[-1] = attempt
+                waypoint_attempts[-1] = attempt
+                session.update(
+                    attempts=all_attempts,
+                    active_candidate_number=None,
+                    active_candidate_stage=None,
+                    evaluated_candidate_count=len(all_attempts),
+                    live_pose=self._current_live_pose(),
+                )
                 self._report_localization_attempts(session)
             ranked = self._select_ranked_attempt(waypoint_attempts)
             if ranked is not None:
@@ -3158,6 +3208,7 @@ class RosAdapter(Node):
             "stages": [active_stage] if active_stage else [],
             "seed": {k: seed.get(k) for k in ("x", "y", "z", "yaw", "waypoint_index")},
             "candidate_count": max_attempts,
+            "evaluated_candidate_count": 0,
             "attempts": attempts,
             "best_match_pose": None,
             "best_ndt_candidate": None,
@@ -3172,7 +3223,27 @@ class RosAdapter(Node):
                 remaining = deadline - time.monotonic()
                 if remaining < 1.0:
                     break
-                attempts[index - 1] = self._probe_localization_seed(
+                started_attempt = self._begin_localization_attempt(
+                    index,
+                    candidate,
+                    extra={
+                        "source": seed.get("source", "operator_seed"),
+                        **({"stage": seed["stage"]} if seed.get("stage") else {}),
+                    },
+                )
+                attempts[index - 1] = started_attempt
+                session.update(
+                    attempts=attempts,
+                    active_candidate_number=index,
+                    active_candidate_stage=stage_key or None,
+                    evaluated_candidate_count=index - 1,
+                    live_pose=started_attempt.get("live_pose"),
+                )
+                # NDT verification waits for fresh localization samples.  Send
+                # the running candidate before entering that wait so the UI
+                # can switch this stage from "待执行" to "执行中" immediately.
+                self._report_localization_attempts(session, persist=persist_state)
+                completed_attempt = self._probe_localization_seed(
                     candidate,
                     generation,
                     wait_seconds=min(candidate_wait_seconds, remaining),
@@ -3182,8 +3253,16 @@ class RosAdapter(Node):
                         **({"stage": seed["stage"]} if seed.get("stage") else {}),
                     },
                 )
-                session["attempts"] = attempts
-                session["live_pose"] = self._current_live_pose()
+                attempts[index - 1] = self._finish_localization_attempt(
+                    completed_attempt, started_attempt
+                )
+                session.update(
+                    attempts=attempts,
+                    active_candidate_number=None,
+                    active_candidate_stage=None,
+                    evaluated_candidate_count=index,
+                    live_pose=self._current_live_pose(),
+                )
                 self._report_localization_attempts(session, persist=persist_state)
                 if self._candidate_is_optimal(
                     attempts[index - 1].get("ndt_candidate")
@@ -3282,6 +3361,33 @@ class RosAdapter(Node):
             "accepted": False,
         }
 
+    def _begin_localization_attempt(
+        self,
+        index: int,
+        candidate: dict,
+        *,
+        extra: dict | None = None,
+    ) -> dict:
+        """Create the progress snapshot sent immediately before NDT waits."""
+        attempt = self._waiting_attempt(index, candidate)
+        attempt.update(extra or {})
+        attempt.update({
+            "status": "verifying",
+            "started_at": now_iso(),
+            "live_pose": self._current_live_pose(),
+        })
+        return attempt
+
+    @staticmethod
+    def _finish_localization_attempt(attempt: dict, started_attempt: dict) -> dict:
+        """Keep an attempt's identity and start time across its final result."""
+        completed = dict(attempt or {})
+        completed.setdefault("index", started_attempt.get("index"))
+        completed.setdefault("seed_pose", started_attempt.get("seed_pose"))
+        completed.setdefault("started_at", started_attempt.get("started_at"))
+        completed.setdefault("finished_at", now_iso())
+        return completed
+
     def _probe_localization_seed(
         self,
         seed_pose: dict,
@@ -3324,7 +3430,12 @@ class RosAdapter(Node):
         attempt["ndt_candidate"] = candidate or None
         attempt["matched_pose"] = (candidate or {}).get("matched_pose")
         if candidate.get("eligible"):
-            attempt["status"] = "verifying"
+            # NDT verification for this seed has finished.  It is eligible
+            # for ranking but is not yet the committed localization result.
+            # Keep this distinct from the one candidate currently waiting for
+            # localization samples so every point has a clear completion
+            # event in the UI.
+            attempt["status"] = "qualified"
             attempt["eligible"] = True
             attempt.pop("reject_reason", None)
         else:
@@ -3449,7 +3560,7 @@ class RosAdapter(Node):
                 winner_index is None
                 and (item.get("ndt_candidate") or {}).get("matched_pose") == candidate.get("matched_pose")
             ):
-                item["status"] = "verifying"
+                item["status"] = "committing"
         state = {
             "state": "committing_best",
             "source": seed.get("source", "operator_seed"),

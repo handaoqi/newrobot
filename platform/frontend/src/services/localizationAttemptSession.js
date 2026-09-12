@@ -1,7 +1,9 @@
 export const ATTEMPT_STATUS_LABELS = {
   waiting: '等待',
-  started: '开始',
-  verifying: '验证中',
+  started: '执行中',
+  verifying: '执行中',
+  qualified: 'NDT通过，待提交',
+  committing: '提交中',
   accepted: '成功',
   rejected: '失败',
   failed: '失败',
@@ -179,6 +181,10 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     candidateCount: Number(raw.candidate_count ?? result.candidate_count ?? attemptSource.length),
     evaluatedCandidateCount: Number(raw.evaluated_candidate_count ?? result.evaluated_candidate_count ?? attemptSource.length),
     globalSearchStarted: Boolean(raw.global_search_started ?? result.global_search_started),
+    activeCandidateNumber: finiteNumber(
+      raw.active_candidate_number ?? result.active_candidate_number,
+    ),
+    activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     strategy: Array.isArray(raw.strategy)
@@ -238,6 +244,8 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     candidateCount: 0,
     evaluatedCandidateCount: 0,
     globalSearchStarted: false,
+    activeCandidateNumber: null,
+    activeCandidateStage: '',
     rtkDrift: null,
     bestNdtCommitted: false,
     optimalVerified: false,
@@ -305,7 +313,7 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
 }
 
 function inferredStageStatus(session, stageKey, attempts, stageRecord) {
-  if (attempts.some(attempt => attempt.status === 'verifying' || attempt.status === 'started')) return 'searching'
+  if (attempts.some(attempt => ['verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(attempt.status))) return 'searching'
   if (stageRecord?.status && timelineStatusClass(stageRecord.status) !== 'waiting') return stageRecord.status
   if (stageRecord?.status) return stageRecord.status
   if (attempts.some(attempt => attempt.status === 'accepted')) return 'accepted'
@@ -325,8 +333,15 @@ function timelineDetail(stageKey, status, attempts, session) {
     return status === 'done' ? '地图下发并应用完成' : '正在等待机器狗确认地图命令'
   }
   if (attempts.length) {
-    const evaluated = attempts.filter(attempt => attempt.status !== 'waiting').length
-    return `${meta.detail} · 已评估 ${evaluated}/${attempts.length} 个候选`
+    const active = attempts.find(attempt => (
+      ['verifying', 'started', 'running', 'executing', 'in_progress'].includes(attempt.status)
+    ))
+    const committing = attempts.find(attempt => attempt.status === 'committing')
+    const evaluated = attempts.filter(attempt => !['waiting', 'verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(attempt.status)).length
+    const activeText = active
+      ? `正在尝试 #${active.candidateNumber}`
+      : (committing ? `正在提交 #${committing.candidateNumber}` : '')
+    return `${meta.detail} · ${activeText ? `${activeText} · ` : ''}已完成 ${evaluated}/${attempts.length} 个候选`
   }
   return meta.detail
 }
@@ -534,7 +549,8 @@ export function shouldShowAttemptMarkers(session, now = Date.now()) {
 
 export function attemptStatusClass(status) {
   if (status === 'accepted') return 'accepted'
-  if (status === 'verifying' || status === 'started') return 'active'
+  if (status === 'qualified') return 'qualified'
+  if (['verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(status)) return 'active'
   if (status === 'rejected' || status === 'failed') return 'failed'
   if (status === 'skipped') return 'skipped'
   return 'waiting'

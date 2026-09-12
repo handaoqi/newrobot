@@ -2001,12 +2001,22 @@ function applyLocalizationAttemptCommand(command, extras = {}) {
 function localizationAttemptProgressText(session) {
   const candidateCount = Number(session?.candidateCount || 0)
   const evaluated = Number(session?.evaluatedCandidateCount || 0)
+  const activeAttempt = (session?.attempts || []).find(attempt => (
+    ['verifying', 'started', 'running', 'executing', 'in_progress'].includes(attempt.status)
+  ))
+  const committingAttempt = (session?.attempts || []).find(attempt => attempt.status === 'committing')
   if (session?.globalSearchStarted) return '全局关键帧匹配阶段'
   if (session?.commandType === 'nav.initial_pose') {
     return session?.source === 'rtk' ? 'RTK 固定解验证阶段' : '正在验证手选初始位姿'
   }
   if (candidateCount <= 0) return '正在准备定位候选列表'
-  return `已评估 ${evaluated} / ${candidateCount} 个候选 · 原点/航点候选阶段`
+  if (activeAttempt) {
+    return `正在尝试候选 #${activeAttempt.candidateNumber} · 已完成 ${evaluated} / ${candidateCount} 个候选`
+  }
+  if (committingAttempt) {
+    return `正在提交候选 #${committingAttempt.candidateNumber} · 已完成 ${evaluated} / ${candidateCount} 个候选`
+  }
+  return `已完成 ${evaluated} / ${candidateCount} 个候选 · 原点/航点候选阶段`
 }
 
 function restoreAttemptSessionFromStatus() {
@@ -5895,6 +5905,7 @@ async function handleDeleteRoute(route) {
   font-size: 0.7rem;
 }
 .localization-timeline-attempt.active { background: #fff7ed; }
+.localization-timeline-attempt.qualified { background: #f0f9ff; }
 .localization-timeline-attempt.accepted { background: #ecfdf5; }
 .localization-timeline-attempt.failed { background: #fef2f2; }
 .localization-timeline-attempt small { color: #64748b; }
@@ -5915,9 +5926,16 @@ async function handleDeleteRoute(route) {
   z-index: 2;
   pointer-events: none;
 }
-.localization-attempt-marker.active { background: #f59e0b; }
+.localization-attempt-marker.active { background: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.28); animation: localization-attempt-pulse 1s ease-in-out infinite; }
+.localization-attempt-marker.qualified { background: #0ea5e9; }
 .localization-attempt-marker.failed { background: #ef4444; }
 .localization-attempt-marker.accepted { background: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,0.28); }
+@keyframes localization-attempt-pulse {
+  50% { transform: translate(-50%, -50%) scale(1.18); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .localization-attempt-marker.active { animation: none; }
+}
 .robot-marker {
   position: absolute;
   width: 30px;

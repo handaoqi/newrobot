@@ -346,6 +346,8 @@ def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     adapter._last_trusted_pose = None
     localized = SimpleNamespace(x=0.4, y=0.1, z=0.0, yaw=0.2, localization_status="normal")
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: localized)
+    progress = []
+    adapter._attempt_progress_cb = lambda payload: progress.append(payload["localization_attempts"])
     calls = []
 
     def set_once(pose, generation):
@@ -392,6 +394,14 @@ def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     assert result["best_ndt_committed"] is True
     assert result["best_match_pose"]["x"] == 0.4
     assert [item["status"] for item in result["attempts"][:2]] == ["rejected", "accepted"]
+    assert [item.get("active_candidate_number") for item in progress if item.get("active_candidate_number")] == [1, 2, 3]
+    first_completed = next(
+        item for item in progress
+        if item.get("active_candidate_number") is None
+        and item["attempts"][0].get("status") == "qualified"
+    )
+    assert first_completed["evaluated_candidate_count"] == 1
+    assert first_completed["attempts"][0]["finished_at"] >= first_completed["attempts"][0]["started_at"]
 
 
 def test_quick_then_global_stops_on_strict_optimal_ndt_candidate():
@@ -628,16 +638,27 @@ def test_bounded_stage_progress_preserves_active_stage_and_timestamps():
             "stage": "mapping_origin_bounded",
             "stage_started_at": "2026-09-06T13:39:36.300Z",
             "max_attempts": 1,
-            "wait_seconds": 1,
+            "wait_seconds": 2,
             "candidate_wait_seconds": 1,
         }, 15, persist_state=False)
 
     assert progress[0]["localization_attempts"]["selected_stage"] == "mapping_origin_bounded"
     assert progress[0]["localization_attempts"]["stages"][0]["status"] == "searching"
+    running = next(
+        item["localization_attempts"]
+        for item in progress
+        if item["localization_attempts"].get("active_candidate_number") == 1
+    )
+    assert running["evaluated_candidate_count"] == 0
+    assert running["attempts"][0]["status"] == "verifying"
+    assert running["attempts"][0]["started_at"]
     final_stage = progress[-1]["localization_attempts"]["stages"][0]
     assert final_stage["status"] == "failed"
     assert final_stage["started_at"] == "2026-09-06T13:39:36.300Z"
     assert final_stage["finished_at"] >= final_stage["started_at"]
+    completed = progress[-1]["localization_attempts"]["attempts"][0]
+    assert completed["status"] == "rejected"
+    assert completed["finished_at"] >= completed["started_at"]
 
 
 def test_operator_initial_pose_commits_verified_ndt_match():

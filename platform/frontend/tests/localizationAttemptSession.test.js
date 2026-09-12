@@ -294,6 +294,9 @@ test('active attempts override a stale waiting stage record', () => {
         state: 'running',
         strategy: ['mapping_origin_bounded', 'route_waypoints'],
         selected_stage: 'mapping_origin_bounded',
+        active_candidate_number: 1,
+        active_candidate_stage: 'mapping_origin_bounded',
+        evaluated_candidate_count: 0,
         stages: [{
           stage: 'mapping_origin_bounded',
           status: 'waiting',
@@ -312,6 +315,11 @@ test('active attempts override a stale waiting stage record', () => {
   })
   const origin = localizationAttemptTimeline(session).find(item => item.key === 'mapping_origin_bounded')
   assert.equal(origin.status, 'active')
+  assert.equal(origin.statusLabel, '执行中')
+  assert.match(origin.detail, /正在尝试 #1/)
+  assert.equal(session.activeCandidateNumber, 1)
+  assert.equal(session.activeCandidateStage, 'mapping_origin_bounded')
+  assert.equal(attemptStatusClass(origin.attempts[0].status), 'active')
   assert.equal(origin.startedAt, '2026-09-06T13:39:36.300Z')
 })
 
