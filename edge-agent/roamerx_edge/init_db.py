@@ -17,6 +17,7 @@ EDGE_TABLES = {
     "agent_metadata",
     "self_heal_episodes",
     "self_heal_actions",
+    "self_heal_daily_summary",
 }
 
 

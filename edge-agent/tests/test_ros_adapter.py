@@ -83,6 +83,54 @@ def test_recovery_lease_service_rejects_unknown_generation(monkeypatch):
     assert response.exhausted is True
 
 
+def test_fusion_profile_request_carries_generation_guard(monkeypatch):
+    class FakeFusionProfileService:
+        class Request:
+            PROFILE_NOMINAL = 0
+            PROFILE_LIO_HOLD = 1
+            PROFILE_BALANCED = 2
+
+    class FakeClient:
+        def __init__(self):
+            self.request = None
+
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, request):
+            self.request = request
+            future = __import__("concurrent.futures").futures.Future()
+            future.set_result(SimpleNamespace(
+                accepted=True,
+                applied_profile=request.profile,
+                generation=42,
+                profile_name="balanced",
+                message="applied",
+            ))
+            return future
+
+    monkeypatch.setattr(
+        ros_adapter_module,
+        "SetLocalizationFusionProfile",
+        FakeFusionProfileService,
+    )
+    adapter = object.__new__(RosAdapter)
+    client = FakeClient()
+    adapter._localization_fusion_profile_client = client
+
+    result = adapter.set_localization_fusion_profile(
+        "balanced",
+        reason="absolute_recovered",
+        duration_seconds=5.0,
+        expected_generation=41,
+    )
+
+    assert client.request.profile == client.request.PROFILE_BALANCED
+    assert client.request.expected_generation == 41
+    assert client.request.duration_seconds == 5.0
+    assert result["generation"] == 42
+
+
 def test_fresh_normal_streak_ignores_samples_before_candidate():
     samples = [(10, 3), (11, 3), (12, 3)]
 

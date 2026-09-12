@@ -29,6 +29,10 @@ LOCALIZATION_FAULTS = {
 }
 
 
+class SelfHealingPolicyError(ValueError):
+    """A stale, skipped-level, or unauthorized recovery request."""
+
+
 @dataclass(frozen=True)
 class FaultDiagnosis:
     episode_id: str
@@ -56,6 +60,7 @@ class SelfHealingEpisode:
     action_type: str = ""
     active_action_id: str = ""
     rtk_stable_samples: int = 0
+    allowed_actions: tuple[str, ...] = ()
     finished: bool = False
 
 
@@ -76,6 +81,53 @@ def _finite_score(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return score if score == score and abs(score) != float("inf") else None
+
+
+def _rtk_float_within_ukf_gate(decision: dict) -> bool:
+    if decision.get("rtk_float_usable_for_ukf") is True:
+        return True
+    drift = decision.get("rtk_drift")
+    drift_xy = _finite_score(drift.get("xy_m")) if isinstance(drift, dict) else None
+    return (
+        decision.get("rtk_usable") is True
+        and str(decision.get("rtk_quality") or "").lower() == "float"
+        and drift_xy is not None
+        and drift_xy <= 0.20
+    )
+
+
+def compact_self_healing_evidence(evidence: dict | None) -> dict:
+    """Keep decision evidence useful without persisting plans or sample arrays."""
+
+    def scalar_fields(values) -> dict:
+        if not isinstance(values, dict):
+            return {}
+        compact = {}
+        for key, value in values.items():
+            if value is None or isinstance(value, (bool, int, float)):
+                compact[str(key)] = value
+            elif isinstance(value, str):
+                compact[str(key)] = value[:256]
+        return compact
+
+    source = evidence if isinstance(evidence, dict) else {}
+    compact = scalar_fields(source)
+    decision = source.get("localization_decision")
+    compact["localization_decision"] = scalar_fields(decision)
+    if isinstance(decision, dict):
+        for nested_key in ("rtk_drift", "ndt_drift", "one_shot_correction"):
+            nested = scalar_fields(decision.get(nested_key))
+            if nested:
+                compact["localization_decision"][nested_key] = nested
+    compact["obstacle"] = scalar_fields(source.get("obstacle"))
+    global_plan = (source.get("obstacle") or {}).get("global_plan")
+    if isinstance(global_plan, dict):
+        points = global_plan.get("points")
+        compact["obstacle"]["global_plan_updated"] = global_plan.get("updated") is True
+        compact["obstacle"]["global_plan_point_count"] = (
+            len(points) if isinstance(points, list) else 0
+        )
+    return compact
 
 
 class FaultDiagnoser:
@@ -161,6 +213,7 @@ class FaultDiagnoser:
             _bool(decision.get("rtk_usable"))
             and str(decision.get("rtk_quality") or "").lower() == "fixed"
         )
+        rtk_float_within_gate = _rtk_float_within_ukf_gate(decision)
         localization_normal = evidence.get("localization_status") == 3
         nav_progress = evidence.get("navigation_progress") is True
 
@@ -179,8 +232,11 @@ class FaultDiagnoser:
         level = min(3, max(0, int(level)))
         outdoor_rtk_policy = scene_mode in {"outdoor", "transition"}
         forbid_spin = outdoor_rtk_policy or fault == FAULT_RTK_TRANSIENT_LOSS
-        absolute_sources_poor = not rtk_fixed and not ndt_healthy
-        use_lio_hold = absolute_sources_poor and lio_healthy
+        absolute_sources_poor = not rtk_fixed and not rtk_float_within_gate and not ndt_healthy
+        # A navigation/controller failure must not silently alter localization
+        # fusion merely because both absolute observers happen to be weak.
+        # LIO hold is reserved for diagnosed localization-source failures.
+        use_lio_hold = fault in LOCALIZATION_FAULTS and absolute_sources_poor and lio_healthy
 
         if recovered:
             action = "exit_recovery"
@@ -249,6 +305,30 @@ class SelfHealingCoordinator:
         self.rtk_required_samples = max(1, int(rtk_required_samples))
         self._lock = threading.RLock()
         self._episode: SelfHealingEpisode | None = None
+        self._last_diagnosis: FaultDiagnosis | None = None
+        self._action_started_monotonic: dict[str, float] = {}
+
+    @staticmethod
+    def _allowed_actions(diagnosis: FaultDiagnosis) -> tuple[str, ...]:
+        if diagnosis.recovered:
+            return ()
+        if diagnosis.level <= 1:
+            return (diagnosis.action_type,)
+        if diagnosis.level == 2 and diagnosis.fault_label in LOCALIZATION_FAULTS:
+            if diagnosis.fault_label == FAULT_RTK_TRANSIENT_LOSS:
+                return ()
+            actions = ["search_laser_feature"]
+            if not diagnosis.forbid_spin:
+                actions.append("adaptive_spin")
+            return tuple(actions)
+        if diagnosis.level == 2:
+            return (
+                "bounded_reverse",
+                "bounded_bypass",
+                "bounded_lateral_left",
+                "bounded_lateral_right",
+            )
+        return (diagnosis.action_type,)
 
     def diagnose(
         self,
@@ -260,23 +340,31 @@ class SelfHealingCoordinator:
         level: int | None = None,
     ) -> FaultDiagnosis:
         with self._lock:
+            requested_level = 0 if level is None else int(level)
+            if requested_level < 0 or requested_level > 3:
+                raise SelfHealingPolicyError("recovery level must be between 0 and 3")
             episode = self._episode
+            if episode is not None and episode.finished and episode_id:
+                if episode.episode_id == episode_id and self._last_diagnosis is not None:
+                    return self._last_diagnosis
+                raise SelfHealingPolicyError("stale or unknown self-healing episode")
             if episode is not None and not episode.finished and episode_id and episode.episode_id != episode_id:
-                self.complete(success=False, reason="superseded_by_new_episode")
-                episode = self._episode
-            if episode is None or episode.finished or (episode_id and episode.episode_id != episode_id):
-                requested_episode_id = "" if episode is not None and episode.finished else episode_id
+                raise SelfHealingPolicyError("self-healing episode does not match the active episode")
+            if episode is None or episode.finished:
+                if requested_level != 0:
+                    raise SelfHealingPolicyError("a new self-healing episode must start at level 0")
                 scene_mode = normalize_scene_mode(route_snapshot)
                 normalized_fault = self.diagnoser.normalize_fault(
                     requested_fault, evidence, scene_mode
                 )
+                compact_evidence = compact_self_healing_evidence(evidence)
                 episode = SelfHealingEpisode(
-                    episode_id=requested_episode_id or str(uuid.uuid4()),
+                    episode_id=str(uuid.uuid4()),
                     fault_label=normalized_fault,
                     scene_mode=scene_mode,
                     started_wall_time=time.time(),
                     started_monotonic=time.monotonic(),
-                    evidence=dict(evidence),
+                    evidence=compact_evidence,
                 )
                 self._episode = episode
                 self.store.start_self_heal_episode(
@@ -285,12 +373,16 @@ class SelfHealingCoordinator:
                     scene_mode=episode.scene_mode,
                     task_execution_id=str(evidence.get("task_execution_id") or ""),
                     map_id=str(evidence.get("map_id") or ""),
-                    evidence=evidence,
+                    evidence=compact_evidence,
                 )
-                self._emit("self_healing.started", episode, {"evidence": evidence})
+                self._emit("self_healing.started", episode, {"evidence": compact_evidence})
+            elif requested_level > episode.current_level + 1:
+                raise SelfHealingPolicyError(
+                    f"recovery level jump rejected: current={episode.current_level} requested={requested_level}"
+                )
             if level is not None:
-                episode.current_level = min(3, max(episode.current_level, int(level)))
-            episode.evidence = dict(evidence)
+                episode.current_level = max(episode.current_level, requested_level)
+            episode.evidence = compact_self_healing_evidence(evidence)
             decision = evidence.get("localization_decision") or {}
             rtk_fixed = _bool(decision.get("rtk_good_for_navigation")) or (
                 _bool(decision.get("rtk_usable"))
@@ -309,9 +401,38 @@ class SelfHealingCoordinator:
             episode.fault_label = diagnosis.fault_label
             episode.scene_mode = diagnosis.scene_mode
             episode.action_type = diagnosis.action_type
+            episode.allowed_actions = self._allowed_actions(diagnosis)
+            self._last_diagnosis = diagnosis
             if diagnosis.recovered:
                 self.complete(success=True, reason=diagnosis.reason)
             return diagnosis
+
+    def authorize_action(
+        self,
+        *,
+        episode_id: str,
+        level: int,
+        action_type: str,
+    ) -> tuple[bool, str]:
+        """Authorize a concrete BT motion against the latest Edge decision."""
+        with self._lock:
+            episode = self._episode
+            if episode is None or episode.finished:
+                return False, "self-healing episode is not active"
+            if not episode_id or episode.episode_id != episode_id:
+                return False, "self-healing episode does not match the active episode"
+            if int(level) != episode.current_level:
+                return False, (
+                    f"action level does not match current level: "
+                    f"current={episode.current_level} requested={int(level)}"
+                )
+            normalized = str(action_type or "").strip()
+            if normalized not in episode.allowed_actions:
+                return False, (
+                    f"action {normalized or '<empty>'} is not allowed; "
+                    f"allowed={','.join(episode.allowed_actions) or '<none>'}"
+                )
+            return True, "action authorized by current diagnosis"
 
     def begin_action(self, *, level: int, action_type: str) -> str:
         with self._lock:
@@ -321,6 +442,7 @@ class SelfHealingCoordinator:
             self._episode.action_type = str(action_type)
             action_id = str(uuid.uuid4())
             self._episode.active_action_id = action_id
+            self._action_started_monotonic[action_id] = time.monotonic()
             self.store.start_self_heal_action(
                 action_id,
                 episode_id=self._episode.episode_id,
@@ -340,7 +462,16 @@ class SelfHealingCoordinator:
                 action_id = self._episode.active_action_id
             if not action_id:
                 return
-            self.store.finish_self_heal_action(action_id, success=success, reason=reason)
+            started = self._action_started_monotonic.pop(action_id, None)
+            duration_seconds = (
+                max(0.0, time.monotonic() - started) if started is not None else None
+            )
+            self.store.finish_self_heal_action(
+                action_id,
+                success=success,
+                reason=reason,
+                duration_seconds=duration_seconds,
+            )
             if self._episode is not None:
                 self._emit(
                     "self_healing.action_finished",
@@ -362,6 +493,12 @@ class SelfHealingCoordinator:
             episode = self._episode
             if episode is None or episode.finished:
                 return
+            if episode.active_action_id:
+                self.finish_action(
+                    episode.active_action_id,
+                    success=success,
+                    reason=f"episode_completed:{reason}",
+                )
             episode.finished = True
             elapsed = max(0.0, time.monotonic() - episode.started_monotonic)
             self.store.finish_self_heal_episode(
@@ -390,6 +527,7 @@ class SelfHealingCoordinator:
                 "level": episode.current_level,
                 "action_type": episode.action_type,
                 "action_id": episode.active_action_id,
+                "allowed_actions": list(episode.allowed_actions),
                 "finished": episode.finished,
             }
 

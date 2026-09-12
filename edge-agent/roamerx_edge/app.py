@@ -32,7 +32,11 @@ from .ros_adapter import ROS_AVAILABLE, RosAdapter, RosRuntime, rclpy
 from .rosbag_recorder import RosbagRecorder
 from .safety_policy import RuntimeSafetyState, SafetyPolicy
 from .sensor_control_adapter import SensorControlAdapter
-from .self_healing import FaultDiagnoser, SelfHealingCoordinator
+from .self_healing import (
+    FaultDiagnoser,
+    SelfHealingCoordinator,
+    SelfHealingPolicyError,
+)
 from .task_executor import TaskExecutor
 from .telemetry_collector import TelemetryCollector
 from .teleop_control_adapter import TeleopControlAdapter
@@ -50,6 +54,12 @@ class EdgeAgentApplication:
             trajectory_outbox_limit=config.storage.trajectory_outbox_limit,
             system_log_outbox_limit=config.storage.system_log_outbox_limit,
         )
+        reconciled = self.store.reconcile_unfinished_self_healing()
+        pruned = self.store.prune_self_healing()
+        if reconciled["episodes"] or reconciled["actions"]:
+            LOGGER.warning("reconciled unfinished self-healing records: %s", reconciled)
+        if pruned["episodes"] or pruned["actions"]:
+            LOGGER.info("pruned self-healing detail after daily aggregation: %s", pruned)
         self.stop_event = threading.Event()
         self.safety_state = RuntimeSafetyState(
             control_mode="autonomous",
@@ -95,6 +105,8 @@ class EdgeAgentApplication:
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
         self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
         self._localization_recovery_lock = threading.Lock()
+        self._fusion_profile_lock = threading.RLock()
+        self._active_fusion_profile_generation = 0
         self.map_set_coordinator = MapSetCoordinator(self.map_activation_adapter, self.navigation_stack_adapter)
         self.navigation_rosbag = RosbagRecorder(
             config.navigation_stack.rosbag_script,
@@ -222,6 +234,7 @@ class EdgeAgentApplication:
             audio_control_adapter=self.audio_control_adapter,
             structured_logs=self.structured_logs,
             navigation_boundary=self.navigation_boundary,
+            temporary_fusion_release_callback=self._restore_temporary_fusion_profile,
         )
         self.trajectory = TrajectoryBuffer(
             robot_id=config.robot.id,
@@ -239,6 +252,10 @@ class EdgeAgentApplication:
         if self.ros_runtime:
             self.ros_runtime.start()
             self.navigation.wait_until_ready(timeout_seconds=10.0)
+        # If Edge restarted while localization stayed alive, reconcile a
+        # non-nominal profile left by the previous process. The generation in
+        # /localization/decision makes this conditional and race-safe.
+        self._restore_temporary_fusion_profile("edge_startup_reconcile")
         self.mqtt.connect()
         if not self.mqtt.wait_connected(15):
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
@@ -264,6 +281,10 @@ class EdgeAgentApplication:
             thread.start()
 
     def stop(self) -> None:
+        # ROS is still available here, so release a temporary fusion lease
+        # before shutting its executor down. The localization-side TTL remains
+        # the final fallback if this best-effort call cannot complete.
+        self._restore_temporary_fusion_profile("edge_shutdown")
         self.stop_event.set()
         self.trajectory.flush_active()
         self.person_follow_controller.stop("edge_shutdown")
@@ -896,6 +917,8 @@ class EdgeAgentApplication:
                 "reason_code": event_payload.get("reason_code"),
                 "reason_message": event_payload.get("reason_message"),
             }
+        if event_type in {"task.cancelled", "task.completed", "task.failed", "task.safe_hold"}:
+            self._restore_temporary_fusion_profile(f"terminal_{event_type.replace('.', '_')}")
         coordinator = getattr(self, "self_healing", None)
         if coordinator is not None and event_type in {
             "task.progress", "task.completed", "task.failed", "task.safe_hold"
@@ -1119,24 +1142,51 @@ class EdgeAgentApplication:
         operation = int(request.get("operation", 0))
         episode_id = str(request.get("episode_id") or "")
         action_id = str(request.get("action_id") or "")
-        level = min(3, max(0, int(request.get("level", 0))))
+        level = int(request.get("level", 0))
         fault_label = str(request.get("fault_label") or "navigation_failed")
         action_type = str(request.get("action_type") or "")
         detail = str(request.get("detail") or "")
         if getattr(self, "self_healing", None) is None:
             return {"accepted": False, "reason": "self_healing_coordinator_unavailable"}
+        if operation in {2, 3, 4} and not episode_id:
+            return {"accepted": False, "reason": "active self-healing episode_id is required"}
         before = self.self_healing.snapshot()
-        if (
-            operation == 1
-            and before.get("action_id")
-            and level > int(before.get("level", 0))
-        ):
+        if operation == 4:  # ACTION_FINISHED
+            if (
+                not before
+                or before.get("finished")
+                or before.get("episode_id") != episode_id
+                or before.get("action_id") != action_id
+            ):
+                return {"accepted": False, "reason": "stale self-healing action completion"}
+            self.self_healing.finish_action(
+                action_id, success=bool(request.get("success")), reason=detail
+            )
+        try:
+            diagnosis = self._diagnose_self_healing(
+                fault_label,
+                episode_id=episode_id,
+                level=level,
+                evidence=request.get("evidence"),
+            )
+        except SelfHealingPolicyError as exc:
+            return {"accepted": False, "reason": str(exc)}
+        if operation == 1 and before.get("action_id") and level > int(before.get("level", 0)):
             self.self_healing.finish_action(
                 str(before["action_id"]),
                 success=False,
                 reason="advanced_to_next_recovery_level",
             )
         if operation == 3:  # ACTION_STARTED
+            authorized, authorization_reason = self.self_healing.authorize_action(
+                episode_id=diagnosis.episode_id,
+                level=level,
+                action_type=action_type,
+            )
+            if not authorized:
+                result = vars(diagnosis).copy()
+                result.update({"accepted": False, "reason": authorization_reason})
+                return result
             active = self.self_healing.snapshot()
             if active.get("action_id"):
                 self.self_healing.finish_action(
@@ -1145,18 +1195,6 @@ class EdgeAgentApplication:
                     reason="replaced_by_concrete_bt_action",
                 )
             action_id = self.self_healing.begin_action(level=level, action_type=action_type)
-        elif operation == 4:  # ACTION_FINISHED
-            self.self_healing.finish_action(
-                action_id,
-                success=bool(request.get("success")),
-                reason=detail,
-            )
-        diagnosis = self._diagnose_self_healing(
-            fault_label,
-            episode_id=episode_id,
-            level=level,
-            evidence=request.get("evidence"),
-        )
         if diagnosis.recovered:
             self.self_healing.finish_action(
                 str(before.get("action_id") or action_id),
@@ -1174,15 +1212,154 @@ class EdgeAgentApplication:
         result.update({"accepted": True, "action_id": action_id})
         return result
 
-    def _handle_task_localization_recovered(self, restore_fusion: bool = True) -> None:
+    def _fusion_profile_state_lock(self):
+        """Return the lease lock, including for lightweight injected tests."""
+        lock = getattr(self, "_fusion_profile_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._fusion_profile_lock = lock
+            self._active_fusion_profile_generation = 0
+        return lock
+
+    def _activate_lio_hold(self, reason: str) -> dict:
+        """Create one Edge-owned, generation-scoped LIO-hold lease."""
+        navigation = getattr(self, "navigation", None)
+        setter = getattr(navigation, "set_localization_fusion_profile", None)
+        if not callable(setter):
+            return {"accepted": False, "message": "service unavailable", "generation": 0}
+        with self._fusion_profile_state_lock():
+            expected = max(0, int(getattr(self, "_active_fusion_profile_generation", 0)))
+            if expected <= 0:
+                expected = self._reported_temporary_fusion_generation()
+            try:
+                result = setter(
+                    "lio_hold",
+                    reason=reason,
+                    duration_seconds=180.0,
+                    expected_generation=expected,
+                )
+            except Exception as exc:
+                LOGGER.exception("failed to activate temporary LIO-hold profile")
+                return {"accepted": False, "message": str(exc), "generation": expected}
+            result = result if isinstance(result, dict) else {}
+            generation = int(result.get("generation") or 0)
+            if bool(result.get("accepted")) and generation > 0:
+                self._active_fusion_profile_generation = generation
+                return result
+            if bool(result.get("accepted")):
+                # A generation-less response cannot be released safely. Undo
+                # it immediately instead of resuming a task with an orphaned
+                # temporary profile.
+                try:
+                    setter("nominal", reason="lio_hold_generation_missing")
+                except Exception:
+                    LOGGER.exception("failed to undo generation-less LIO hold")
+                return {
+                    **result,
+                    "accepted": False,
+                    "message": "LIO hold response did not include a valid generation",
+                }
+            return result
+
+    def _transition_temporary_fusion_profile(
+        self,
+        expected_generation: int,
+        profile: str,
+        *,
+        reason: str,
+        duration_seconds: float = 0.0,
+    ) -> dict:
+        """Change only the temporary fusion lease owned by this generation."""
+        expected_generation = max(0, int(expected_generation))
+        if expected_generation <= 0:
+            return {"accepted": False, "message": "no owned temporary fusion generation"}
+        navigation = getattr(self, "navigation", None)
+        setter = getattr(navigation, "set_localization_fusion_profile", None)
+        if not callable(setter):
+            return {"accepted": False, "message": "service unavailable"}
+        with self._fusion_profile_state_lock():
+            active = max(0, int(getattr(self, "_active_fusion_profile_generation", 0)))
+            if active != expected_generation:
+                return {"accepted": False, "message": "temporary fusion generation is no longer active"}
+            try:
+                result = setter(
+                    profile,
+                    reason=reason,
+                    duration_seconds=duration_seconds,
+                    expected_generation=expected_generation,
+                )
+            except Exception as exc:
+                LOGGER.exception("failed to transition temporary fusion profile to %s", profile)
+                return {"accepted": False, "message": str(exc)}
+            result = result if isinstance(result, dict) else {}
+            returned_generation = int(result.get("generation") or 0)
+            if bool(result.get("accepted")):
+                if profile == "nominal":
+                    self._active_fusion_profile_generation = 0
+                elif returned_generation > 0:
+                    self._active_fusion_profile_generation = returned_generation
+                else:
+                    self._active_fusion_profile_generation = 0
+            elif returned_generation and returned_generation != expected_generation:
+                # Another caller has already advanced the profile generation.
+                # Forget this lease; never retry against the newer generation.
+                self._active_fusion_profile_generation = 0
+            return result
+
+    def _reported_temporary_fusion_generation(self) -> int:
+        decision_getter = getattr(getattr(self, "navigation", None), "localization_decision", None)
+        try:
+            decision = decision_getter() if callable(decision_getter) else {}
+        except Exception:
+            LOGGER.exception("failed to read localization fusion profile state")
+            return 0
+        if not isinstance(decision, dict):
+            return 0
+        if str(decision.get("fusion_profile") or "nominal").lower() == "nominal":
+            return 0
+        return max(0, int(decision.get("fusion_profile_generation") or 0))
+
+    def _restore_temporary_fusion_profile(self, reason: str) -> bool:
+        """Best-effort restore without ever overwriting a newer profile lease."""
+        with self._fusion_profile_state_lock():
+            generation = max(
+                0,
+                int(getattr(self, "_active_fusion_profile_generation", 0)),
+            )
+            if generation <= 0:
+                generation = self._reported_temporary_fusion_generation()
+                if generation <= 0:
+                    return False
+                self._active_fusion_profile_generation = generation
+        result = self._transition_temporary_fusion_profile(
+            generation,
+            "nominal",
+            reason=reason,
+        )
+        return bool(result.get("accepted"))
+
+    def _forget_expired_fusion_generation(self, generation: int, wait_seconds: float) -> None:
+        if self.stop_event.wait(max(0.0, wait_seconds)):
+            return
+        reported_generation = self._reported_temporary_fusion_generation()
+        with self._fusion_profile_state_lock():
+            if (
+                int(getattr(self, "_active_fusion_profile_generation", 0)) == int(generation)
+                and reported_generation != int(generation)
+            ):
+                self._active_fusion_profile_generation = 0
+
+    def _handle_task_localization_recovered(
+        self,
+        restore_fusion: bool = True,
+        recovery_reason: str = "localization_health_recovered",
+    ) -> None:
         """Re-arm localization alerting, then resume the task as before."""
         self._localization_alert_notified = False
-        self._complete_self_healing(success=True, reason="localization_health_recovered")
-        navigation = getattr(self, "navigation", None)
-        set_fusion_profile = getattr(navigation, "set_localization_fusion_profile", None)
-        if restore_fusion and callable(set_fusion_profile):
+        self._complete_self_healing(success=True, reason=recovery_reason)
+        if restore_fusion:
             try:
-                set_fusion_profile("nominal", reason="self_healing_completed")
+                self._restore_temporary_fusion_profile("self_healing_completed")
             except Exception:
                 LOGGER.exception("failed to restore nominal localization fusion profile")
         try:
@@ -1191,9 +1368,17 @@ class EdgeAgentApplication:
             LOGGER.exception("failed to clear localization recovery state")
         self.task_executor.on_localization_recovered()
 
-    def _restore_fusion_when_absolute_recovers(self, timeout_seconds: float = 180.0) -> None:
-        """Leave LIO hold only after an absolute observer is healthy again."""
+    def _restore_fusion_when_absolute_recovers(
+        self,
+        profile_generation: int,
+        timeout_seconds: float = 180.0,
+        required_stable_samples: int = 3,
+    ) -> None:
+        """Conditionally release this LIO-hold generation after stable recovery."""
+        if profile_generation <= 0:
+            return
         deadline = time.monotonic() + max(1.0, timeout_seconds)
+        stable_samples = 0
         while not self.stop_event.is_set() and time.monotonic() < deadline:
             decision_getter = getattr(self.navigation, "localization_decision", None)
             decision = decision_getter() if callable(decision_getter) else {}
@@ -1206,12 +1391,30 @@ class EdgeAgentApplication:
                         and str(decision.get("rtk_quality") or "").lower() == "fixed"
                     )
                 )
-                if ndt_healthy or rtk_fixed:
-                    setter = getattr(self.navigation, "set_localization_fusion_profile", None)
-                    if callable(setter):
-                        setter("nominal", reason="absolute_observer_recovered")
+                stable_samples = stable_samples + 1 if ndt_healthy or rtk_fixed else 0
+                if stable_samples >= max(1, int(required_stable_samples)):
+                    result = self._transition_temporary_fusion_profile(
+                        profile_generation,
+                        "balanced",
+                        reason="absolute_observer_recovered_stable",
+                        duration_seconds=5.0,
+                    )
+                    balanced_generation = int(result.get("generation") or 0)
+                    if bool(result.get("accepted")) and balanced_generation > 0:
+                        threading.Thread(
+                            target=self._forget_expired_fusion_generation,
+                            args=(balanced_generation, 6.0),
+                            daemon=True,
+                            name="localization-balanced-profile-expiry",
+                        ).start()
                     return
             self.stop_event.wait(0.5)
+        if not self.stop_event.is_set():
+            self._transition_temporary_fusion_profile(
+                profile_generation,
+                "nominal",
+                reason="edge_lio_hold_timeout",
+            )
 
     def _handle_task_localization_loss(self, reason: str = "localization_lost") -> None:
         """Stop motion, then run the same bounded search as 主动重定位.
@@ -1530,11 +1733,9 @@ class EdgeAgentApplication:
                     profile_action = self._begin_self_heal_action(
                         level=1, action_type="set_ukf_lio_hold"
                     )
-                    setter = getattr(self.navigation, "set_localization_fusion_profile", None)
-                    result = setter(
-                        "lio_hold", reason=diagnosis.fault_label
-                    ) if callable(setter) else {"accepted": False, "message": "service unavailable"}
+                    result = self._activate_lio_hold(diagnosis.fault_label)
                     accepted = bool(result.get("accepted"))
+                    profile_generation = int(result.get("generation") or 0)
                     self._finish_self_heal_action(
                         profile_action,
                         success=accepted,
@@ -1545,9 +1746,13 @@ class EdgeAgentApplication:
                         # continue safely without waiting for either source to
                         # improve, and the temporary profile rejects bad anchor
                         # observations until health returns.
-                        self._handle_task_localization_recovered(restore_fusion=False)
+                        self._handle_task_localization_recovered(
+                            restore_fusion=False,
+                            recovery_reason="lio_hold_degraded_continuation",
+                        )
                         threading.Thread(
                             target=self._restore_fusion_when_absolute_recovers,
+                            args=(profile_generation,),
                             daemon=True,
                             name="localization-fusion-profile-restore",
                         ).start()

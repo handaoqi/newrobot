@@ -303,6 +303,9 @@
     <!-- ############################### DECORATOR NODES ############################## -->
     <Decorator ID="AdaptiveSpin">
       <input_port name="forbid_spin">Hard scene/fault rotation prohibition</input_port>
+      <input_port name="episode_id">Active Edge self-healing episode</input_port>
+      <input_port name="fault_label">Current normalized fault label</input_port>
+      <input_port name="permission_timeout_seconds">Fresh Edge permission timeout</input_port>
       <input_port name="score_threshold">NDT success threshold</input_port>
       <input_port name="max_age_seconds">Maximum NDT sample age</input_port>
     </Decorator>

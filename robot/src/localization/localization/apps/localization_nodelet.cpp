@@ -430,6 +430,10 @@ public:
       0.0, declare_parameter<double>("lio_primary.anchor_ukf.yaw_variance_per_rad", 0.01));
     lio_hold_covariance_scale_ = std::max(
       1.0, declare_parameter<double>("lio_primary.self_healing.lio_hold_covariance_scale", 4.0));
+    balanced_observation_variance_scale_ = std::max(
+      1.0,
+      declare_parameter<double>(
+        "lio_primary.self_healing.balanced_observation_variance_scale", 4.0));
     lio_pose_history_seconds_ = std::max(
       0.5, declare_parameter<double>("lio_primary.anchor_ukf.pose_history_seconds", 2.0));
     lio_observation_sync_tolerance_s_ = std::max(
@@ -1553,6 +1557,16 @@ private:
     }
   }
 
+  void applyFusionProfileObservationScale(CorrectionNoise& noise) const {
+    if (fusion_profile_.load() != kFusionProfileBalanced) {
+      return;
+    }
+    const float scale = static_cast<float>(balanced_observation_variance_scale_);
+    noise.horizontal_variance *= scale;
+    noise.vertical_variance *= scale;
+    noise.orientation_variance *= scale;
+  }
+
   CorrectionNoise scanMatchCorrectionNoise(
       const PoseEstimator::MatchResult& match) const {
     CorrectionNoise noise;
@@ -1560,6 +1574,7 @@ private:
     noise.vertical_variance = lio_correct_z_variance_;
     noise.orientation_variance = lio_correct_orientation_variance_;
     if (!lio_dynamic_covariance_enable_) {
+      applyFusionProfileObservationScale(noise);
       return noise;
     }
 
@@ -1587,6 +1602,7 @@ private:
       (lio_dynamic_z_variance_max_ - lio_correct_z_variance_);
     noise.orientation_variance = lio_correct_orientation_variance_ + penalty *
       (lio_dynamic_orientation_variance_max_ - lio_correct_orientation_variance_);
+    applyFusionProfileObservationScale(noise);
     return noise;
   }
 
@@ -1605,6 +1621,7 @@ private:
     noise.quality_penalty = static_cast<float>(std::clamp(
       observation.horizontal_std_m / std::max(gnss_max_horizontal_std_, 1.0e-3),
       0.0, 1.0));
+    applyFusionProfileObservationScale(noise);
     return noise;
   }
 
@@ -2673,12 +2690,28 @@ private:
     if (expiry_ns <= 0 || steadyNowNanoseconds() < expiry_ns) {
       return;
     }
-    const auto previous = fusion_profile_.exchange(kFusionProfileNominal);
-    fusion_profile_expires_steady_ns_.store(0);
+    uint8_t previous = kFusionProfileNominal;
+    uint64_t generation = fusion_profile_generation_.load();
+    {
+      // Serialize expiry with service updates. Without this lock an expired
+      // generation could overwrite a newer profile between the first expiry
+      // check and the exchange below.
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      const auto current_expiry_ns = fusion_profile_expires_steady_ns_.load();
+      if (current_expiry_ns <= 0 || steadyNowNanoseconds() < current_expiry_ns) {
+        return;
+      }
+      previous = fusion_profile_.exchange(kFusionProfileNominal);
+      fusion_profile_expires_steady_ns_.store(0);
+      if (previous != kFusionProfileNominal) {
+        generation = fusion_profile_generation_.fetch_add(1) + 1;
+      }
+    }
     if (previous != kFusionProfileNominal) {
       RCLCPP_INFO(
-        get_logger(), "temporary localization fusion profile %s expired; restored nominal",
-        fusionProfileName(previous));
+        get_logger(),
+        "temporary localization fusion profile %s expired; restored nominal generation=%lu",
+        fusionProfileName(previous), static_cast<unsigned long>(generation));
     }
   }
 
@@ -2691,6 +2724,7 @@ private:
         request->profile != Request::PROFILE_BALANCED)) {
       response->accepted = false;
       response->applied_profile = fusion_profile_.load();
+      response->generation = fusion_profile_generation_.load();
       response->profile_name = fusionProfileName(response->applied_profile);
       response->message = "unsupported localization fusion profile";
       return;
@@ -2700,8 +2734,20 @@ private:
         request->duration_seconds > 0.0F ?
         static_cast<double>(request->duration_seconds) : 10.0,
         1.0, 180.0);
+    uint64_t applied_generation = 0;
     {
       std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      const auto current_generation = fusion_profile_generation_.load();
+      if (request->expected_generation != 0 &&
+          request->expected_generation != current_generation) {
+        response->accepted = false;
+        response->applied_profile = fusion_profile_.load();
+        response->generation = current_generation;
+        response->profile_name = fusionProfileName(response->applied_profile);
+        response->message = "stale localization fusion profile generation";
+        return;
+      }
+      applied_generation = fusion_profile_generation_.fetch_add(1) + 1;
       fusion_profile_.store(request->profile);
       fusion_profile_expires_steady_ns_.store(
         duration_seconds > 0.0 ?
@@ -2715,6 +2761,7 @@ private:
     }
     response->accepted = true;
     response->applied_profile = request->profile;
+    response->generation = applied_generation;
     response->profile_name = fusionProfileName(request->profile);
     response->message = std::string("localization fusion profile applied: ") +
       response->profile_name +
@@ -3197,6 +3244,7 @@ private:
         << "\",\"correction_policy\":\"" << preferred_source_
         << "\",\"anchor_preference\":\"" << ukf_anchor_preference_
         << "\",\"fusion_profile\":\"" << fusionProfileName(fusion_profile_.load())
+        << "\",\"fusion_profile_generation\":" << fusion_profile_generation_.load()
         << "\",\"allowed_correction_sources\":\""
         << (preferred_correction_mode_ == CorrectionPolicyMode::ndt
           ? "ndt_vgicp"
@@ -6475,7 +6523,9 @@ private:
   static constexpr uint8_t kFusionProfileBalanced = 2;
   std::atomic<uint8_t> fusion_profile_{kFusionProfileNominal};
   std::atomic<std::int64_t> fusion_profile_expires_steady_ns_{0};
+  std::atomic<uint64_t> fusion_profile_generation_{0};
   double lio_hold_covariance_scale_ = 4.0;
+  double balanced_observation_variance_scale_ = 4.0;
   double bridge_max_odom_speed_mps_ = 1.5;
   double bridge_max_odom_yaw_rate_rps_ = 2.0;
   int absolute_recovery_samples_ = 3;

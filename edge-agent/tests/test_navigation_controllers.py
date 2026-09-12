@@ -60,6 +60,7 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         ]
         feature_searches = root.findall(".//SearchLaserFeature/DriveOnHeading")
         spins = root.findall(".//Spin")
+        adaptive_spins = root.findall(".//AdaptiveSpin")
         guarded_spins = root.findall(".//AdaptiveSpin/Spin")
         diagnoses = root.findall(".//FaultDiagnoseNode")
         smart_rtk_waits = root.findall(".//SmartRTKWait")
@@ -93,6 +94,10 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         assert len(feature_searches) == 1
         assert feature_searches[0].attrib["dist_to_travel"] == "0.12"
         assert spins == guarded_spins
+        assert len(adaptive_spins) == 1
+        assert adaptive_spins[0].attrib["episode_id"] == "{self_heal_episode}"
+        assert adaptive_spins[0].attrib["fault_label"] == "{self_heal_fault}"
+        assert adaptive_spins[0].attrib["permission_timeout_seconds"] == "1.0"
         assert len(diagnoses) >= 3
         assert len(smart_rtk_waits) == 1
         assert fusion_profiles[0].attrib["duration_seconds"] == "10.0"

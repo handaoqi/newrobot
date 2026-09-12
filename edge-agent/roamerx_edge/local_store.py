@@ -8,14 +8,23 @@ from typing import Any
 
 
 class LocalStore:
-    def __init__(self, path: str, *, trajectory_outbox_limit: int = 720, system_log_outbox_limit: int = 500) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        trajectory_outbox_limit: int = 720,
+        system_log_outbox_limit: int = 500,
+        self_heal_retention_days: int = 180,
+    ) -> None:
         self.path = path
         self.trajectory_outbox_limit = max(1, int(trajectory_outbox_limit))
         self.system_log_outbox_limit = max(1, int(system_log_outbox_limit))
+        self.self_heal_retention_days = max(1, int(self_heal_retention_days))
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys=ON")
         self._initialize()
 
     def close(self) -> None:
@@ -92,6 +101,7 @@ class LocalStore:
                     action_type TEXT NOT NULL,
                     success INTEGER,
                     reason TEXT NOT NULL DEFAULT '',
+                    duration_seconds REAL,
                     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     finished_at TEXT,
                     FOREIGN KEY(episode_id) REFERENCES self_heal_episodes(episode_id)
@@ -100,6 +110,15 @@ class LocalStore:
                     ON self_heal_actions(episode_id, level);
                 CREATE INDEX IF NOT EXISTS idx_self_heal_actions_type_success
                     ON self_heal_actions(action_type, success);
+                CREATE TABLE IF NOT EXISTS self_heal_daily_summary (
+                    summary_date TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    succeeded INTEGER NOT NULL DEFAULT 0,
+                    total_duration_seconds REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(summary_date, category, label)
+                );
                 """
             )
             task_columns = {
@@ -132,6 +151,16 @@ class LocalStore:
             if "arrival_micro_adjust_started_at" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN arrival_micro_adjust_started_at REAL"
+                )
+            action_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(self_heal_actions)"
+                ).fetchall()
+            }
+            if "duration_seconds" not in action_columns:
+                self._connection.execute(
+                    "ALTER TABLE self_heal_actions ADD COLUMN duration_seconds REAL"
                 )
             self._prune_trajectory_outbox_locked()
 
@@ -434,36 +463,188 @@ class LocalStore:
         *,
         success: bool,
         reason: str = "",
+        duration_seconds: float | None = None,
     ) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 UPDATE self_heal_actions
-                SET success=?, reason=?, finished_at=CURRENT_TIMESTAMP
+                SET success=?, reason=?, duration_seconds=COALESCE(?, duration_seconds),
+                    finished_at=CURRENT_TIMESTAMP
                 WHERE action_id=?
                 """,
-                (int(bool(success)), reason, action_id),
+                (
+                    int(bool(success)),
+                    reason,
+                    max(0.0, float(duration_seconds))
+                    if duration_seconds is not None else None,
+                    action_id,
+                ),
             )
+
+    def reconcile_unfinished_self_healing(
+        self, reason: str = "interrupted_by_restart"
+    ) -> dict:
+        """Close records left open when the previous Edge process exited."""
+        with self._lock, self._connection:
+            actions = self._connection.execute(
+                """
+                UPDATE self_heal_actions
+                SET success=0, reason=?,
+                    duration_seconds=MAX(
+                        0.0,
+                        (julianday(CURRENT_TIMESTAMP) - julianday(started_at)) * 86400.0
+                    ),
+                    finished_at=CURRENT_TIMESTAMP
+                WHERE finished_at IS NULL
+                """,
+                (reason,),
+            ).rowcount
+            episodes = self._connection.execute(
+                """
+                UPDATE self_heal_episodes
+                SET success=0,
+                    terminal_level=COALESCE(
+                        (SELECT level FROM self_heal_actions a
+                         WHERE a.episode_id=self_heal_episodes.episode_id
+                         ORDER BY a.rowid DESC LIMIT 1), terminal_level, 0),
+                    terminal_action=COALESCE(
+                        (SELECT action_type FROM self_heal_actions a
+                         WHERE a.episode_id=self_heal_episodes.episode_id
+                         ORDER BY a.rowid DESC LIMIT 1), terminal_action, ''),
+                    duration_seconds=MAX(
+                        0.0,
+                        (julianday(CURRENT_TIMESTAMP) - julianday(started_at)) * 86400.0
+                    ),
+                    reason=?, finished_at=CURRENT_TIMESTAMP
+                WHERE finished_at IS NULL
+                """,
+                (reason,),
+            ).rowcount
+        return {"episodes": episodes, "actions": actions}
+
+    def prune_self_healing(self, retention_days: int | None = None) -> dict:
+        """Aggregate and remove completed self-healing detail beyond retention."""
+        days = max(
+            1,
+            int(self.self_heal_retention_days if retention_days is None else retention_days),
+        )
+        cutoff = f"-{days} days"
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO self_heal_daily_summary(
+                    summary_date, category, label, total, succeeded,
+                    total_duration_seconds
+                )
+                SELECT date(started_at), 'fault', fault_label, COUNT(*),
+                       SUM(CASE WHEN success=1 THEN 1 ELSE 0 END),
+                       SUM(COALESCE(duration_seconds, 0.0))
+                FROM self_heal_episodes
+                WHERE finished_at IS NOT NULL
+                  AND started_at < datetime('now', ?)
+                GROUP BY date(started_at), fault_label
+                ON CONFLICT(summary_date, category, label) DO UPDATE SET
+                    total=total+excluded.total,
+                    succeeded=succeeded+excluded.succeeded,
+                    total_duration_seconds=
+                        total_duration_seconds+excluded.total_duration_seconds
+                """,
+                (cutoff,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO self_heal_daily_summary(
+                    summary_date, category, label, total, succeeded,
+                    total_duration_seconds
+                )
+                SELECT date(a.started_at), 'action', a.action_type, COUNT(*),
+                       SUM(CASE WHEN a.success=1 THEN 1 ELSE 0 END),
+                       SUM(COALESCE(a.duration_seconds, 0.0))
+                FROM self_heal_actions a
+                JOIN self_heal_episodes e ON e.episode_id=a.episode_id
+                WHERE e.finished_at IS NOT NULL
+                  AND e.started_at < datetime('now', ?)
+                GROUP BY date(a.started_at), a.action_type
+                ON CONFLICT(summary_date, category, label) DO UPDATE SET
+                    total=total+excluded.total,
+                    succeeded=succeeded+excluded.succeeded,
+                    total_duration_seconds=
+                        total_duration_seconds+excluded.total_duration_seconds
+                """,
+                (cutoff,),
+            )
+            actions = self._connection.execute(
+                """
+                DELETE FROM self_heal_actions
+                WHERE episode_id IN (
+                    SELECT episode_id FROM self_heal_episodes
+                    WHERE finished_at IS NOT NULL
+                      AND started_at < datetime('now', ?)
+                )
+                """,
+                (cutoff,),
+            ).rowcount
+            episodes = self._connection.execute(
+                """
+                DELETE FROM self_heal_episodes
+                WHERE finished_at IS NOT NULL
+                  AND started_at < datetime('now', ?)
+                """,
+                (cutoff,),
+            ).rowcount
+            foreign_key_violations = len(
+                self._connection.execute("PRAGMA foreign_key_check").fetchall()
+            )
+            if foreign_key_violations:
+                raise sqlite3.IntegrityError(
+                    f"self-healing retention left {foreign_key_violations} foreign-key violations"
+                )
+        return {
+            "episodes": episodes,
+            "actions": actions,
+            "retention_days": days,
+            "foreign_key_violations": 0,
+        }
 
     def self_heal_statistics(self) -> dict:
         episodes = self._connection.execute(
             """
-            SELECT fault_label, COUNT(*) AS total,
-                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS succeeded,
-                   AVG(duration_seconds) AS average_duration_seconds
-            FROM self_heal_episodes
-            WHERE finished_at IS NOT NULL
-            GROUP BY fault_label
+            WITH combined AS (
+                SELECT fault_label AS label, COUNT(*) AS total,
+                       SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS succeeded,
+                       SUM(COALESCE(duration_seconds, 0.0)) AS total_duration
+                FROM self_heal_episodes WHERE finished_at IS NOT NULL
+                GROUP BY fault_label
+                UNION ALL
+                SELECT label, total, succeeded, total_duration_seconds
+                FROM self_heal_daily_summary WHERE category='fault'
+            )
+            SELECT label AS fault_label, SUM(total) AS total,
+                   SUM(succeeded) AS succeeded,
+                   SUM(total_duration) / NULLIF(SUM(total), 0)
+                       AS average_duration_seconds
+            FROM combined GROUP BY label
             ORDER BY total DESC, fault_label
             """
         ).fetchall()
         actions = self._connection.execute(
             """
-            SELECT action_type, COUNT(*) AS total,
-                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS succeeded
-            FROM self_heal_actions
-            WHERE finished_at IS NOT NULL
-            GROUP BY action_type
+            WITH combined AS (
+                SELECT action_type AS label, COUNT(*) AS total,
+                       SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS succeeded,
+                       SUM(COALESCE(duration_seconds, 0.0)) AS total_duration
+                FROM self_heal_actions WHERE finished_at IS NOT NULL
+                GROUP BY action_type
+                UNION ALL
+                SELECT label, total, succeeded, total_duration_seconds
+                FROM self_heal_daily_summary WHERE category='action'
+            )
+            SELECT label AS action_type, SUM(total) AS total,
+                   SUM(succeeded) AS succeeded,
+                   SUM(total_duration) / NULLIF(SUM(total), 0)
+                       AS average_duration_seconds
+            FROM combined GROUP BY label
             ORDER BY total DESC, action_type
             """
         ).fetchall()

@@ -46,8 +46,9 @@ bool RecoveryLeaseScope::ensureActionReported()
   }
   if (!action_start_sent_) {
     if (!self_heal_client_->service_is_ready()) {
-      RCLCPP_WARN(node_->get_logger(), "Self-healing action service is unavailable");
+      RCLCPP_ERROR(node_->get_logger(), "Self-healing action service is unavailable; motion denied");
       action_reporting_unavailable_ = true;
+      action_authorization_failed_ = true;
       return true;
     }
     getInput("episode_id", episode_id_);
@@ -76,16 +77,18 @@ bool RecoveryLeaseScope::ensureActionReported()
     RCLCPP_WARN(node_->get_logger(), "Self-healing action report timed out");
     action_start_sent_ = false;
     action_reporting_unavailable_ = true;
+    action_authorization_failed_ = true;
     return true;
   }
   const auto response = action_start_future_.get();
   action_start_sent_ = false;
-  if (response && response->accepted) {
+  if (response && response->accepted && !response->action_id.empty()) {
     action_id_ = response->action_id;
     episode_id_ = response->episode_id;
     action_reported_ = true;
   } else {
     action_reporting_unavailable_ = true;
+    action_authorization_failed_ = true;
   }
   return true;
 }
@@ -130,6 +133,10 @@ BT::NodeStatus RecoveryLeaseScope::tick()
   if (!ensureActionReported()) {
     return BT::NodeStatus::RUNNING;
   }
+  if (action_authorization_failed_) {
+    requestRelease(false, "edge_action_authorization_failed");
+    return BT::NodeStatus::FAILURE;
+  }
 
   const auto child_status = child_node_->executeTick();
   if (child_status != BT::NodeStatus::RUNNING) {
@@ -172,6 +179,7 @@ void RecoveryLeaseScope::requestRelease(bool success, const std::string & detail
   action_start_sent_ = false;
   action_reported_ = false;
   action_reporting_unavailable_ = false;
+  action_authorization_failed_ = false;
   action_id_.clear();
 }
 

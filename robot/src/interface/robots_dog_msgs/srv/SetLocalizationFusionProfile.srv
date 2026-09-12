@@ -9,8 +9,12 @@ string reason
 # Non-nominal profiles must be temporary. A zero duration is accepted only
 # for PROFILE_NOMINAL; callers otherwise receive the server-side default.
 float32 duration_seconds
+# Zero creates/forces a new generation. A non-zero value makes the change
+# conditional so an old recovery watcher cannot overwrite a newer lease.
+uint64 expected_generation
 ---
 bool accepted
 uint8 applied_profile
+uint64 generation
 string profile_name
 string message

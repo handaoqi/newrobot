@@ -500,6 +500,100 @@ def test_recovered_callback_rearms_alerting_and_clears_recovery_state():
     assert resumed == [True]
 
 
+class FusionProfileNavigation:
+    def __init__(self, decisions=()):
+        self.decisions = list(decisions)
+        self.last_decision = {"fusion_profile": "lio_hold", "fusion_profile_generation": 7}
+        self.calls = []
+
+    def localization_decision(self):
+        if self.decisions:
+            self.last_decision = dict(self.decisions.pop(0))
+        return dict(self.last_decision)
+
+    def set_localization_fusion_profile(self, profile, **kwargs):
+        self.calls.append((profile, dict(kwargs)))
+        expected = int(kwargs.get("expected_generation") or 0)
+        if expected == 99:
+            return {
+                "accepted": False,
+                "generation": 100,
+                "message": "stale localization fusion profile generation",
+            }
+        generation = expected + 1 if expected else 7
+        self.last_decision = {
+            "fusion_profile": profile,
+            "fusion_profile_generation": generation,
+        }
+        return {"accepted": True, "generation": generation, "message": "applied"}
+
+
+def test_lio_hold_waits_for_three_consecutive_absolute_health_samples(monkeypatch):
+    decisions = [
+        {"ndt_healthy": True},
+        {"ndt_healthy": False},
+        {"rtk_good_for_navigation": True},
+        {"ndt_healthy": True},
+        {"ndt_healthy": True},
+    ]
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = FusionProfileNavigation(decisions)
+    application.stop_event = SimpleNamespace(is_set=lambda: False, wait=lambda _seconds: False)
+    application._fusion_profile_lock = threading.RLock()
+    application._active_fusion_profile_generation = 7
+
+    class NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(app_module.threading, "Thread", NoStartThread)
+
+    application._restore_fusion_when_absolute_recovers(
+        7, timeout_seconds=2.0, required_stable_samples=3
+    )
+
+    assert len(application.navigation.calls) == 1
+    profile, kwargs = application.navigation.calls[0]
+    assert profile == "balanced"
+    assert kwargs["duration_seconds"] == 5.0
+    assert kwargs["expected_generation"] == 7
+    assert application._active_fusion_profile_generation == 8
+
+
+def test_stale_fusion_restore_cannot_overwrite_a_newer_generation():
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = FusionProfileNavigation()
+    application._fusion_profile_lock = threading.RLock()
+    application._active_fusion_profile_generation = 99
+
+    result = application._transition_temporary_fusion_profile(
+        99,
+        "nominal",
+        reason="old_recovery_watcher",
+    )
+
+    assert result["accepted"] is False
+    assert application.navigation.calls[0][1]["expected_generation"] == 99
+    assert application._active_fusion_profile_generation == 0
+
+
+def test_terminal_restore_uses_reported_generation_when_edge_restarted():
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = FusionProfileNavigation()
+    application._fusion_profile_lock = threading.RLock()
+    application._active_fusion_profile_generation = 0
+
+    assert application._restore_temporary_fusion_profile("edge_startup_reconcile") is True
+
+    profile, kwargs = application.navigation.calls[0]
+    assert profile == "nominal"
+    assert kwargs["expected_generation"] == 7
+    assert application._active_fusion_profile_generation == 0
+
+
 def test_low_battery_retained_context_is_force_exited_immediately():
     application = object.__new__(EdgeAgentApplication)
     context = SimpleNamespace(task_execution_id="task-1", state="failed", docking={})

@@ -1022,15 +1022,18 @@ def test_manual_assist_uses_collision_monitored_pipeline_without_blocking_task(t
     executor = TaskExecutor(store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None)
     executor.has_active_task = lambda: True
     state = RuntimeSafetyState(localization_status="normal", nav_ready=True, control_mode="autonomous")
+    released_profiles = []
     processor = CommandProcessor(
         robot_id="rx-001", store=store, safety=SafetyPolicy(SafetyConfig(), state),
         task_executor=executor, publish_ack=lambda *args: None, publish_result=lambda *args: None,
         localization_adapter=navigation,
+        temporary_fusion_release_callback=released_profiles.append,
     )
 
     _, result = processor.handle_command(raw)
 
     assert state.control_mode == "manual_assist"
+    assert released_profiles == ["manual_control_takeover_enter"]
     assert result["payload"]["result"]["motion_topic"] == "/cmd_vel_assist"
     raw["message_type"] = "teleop.move_velocity"
     raw["payload"]["command_id"] = "11111111-1111-4111-8111-111111111111"

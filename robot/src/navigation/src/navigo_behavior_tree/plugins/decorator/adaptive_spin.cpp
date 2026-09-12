@@ -1,4 +1,6 @@
 #include <cmath>
+#include <chrono>
+#include <future>
 #include <functional>
 #include <memory>
 #include <string>
@@ -9,6 +11,8 @@
 namespace navigo_behavior_tree
 {
 
+using namespace std::chrono_literals;
+
 AdaptiveSpin::AdaptiveSpin(
   const std::string & name, const BT::NodeConfiguration & conf)
 : BT::DecoratorNode(name, conf)
@@ -17,14 +21,70 @@ AdaptiveSpin::AdaptiveSpin(
   subscription_ = node_->create_subscription<localization::msg::ScanMatchingStatus>(
     "/status", rclcpp::SensorDataQoS(),
     std::bind(&AdaptiveSpin::onScanMatchingStatus, this, std::placeholders::_1));
+  callback_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  callback_group_executor_.add_callback_group(callback_group_, node_->get_node_base_interface());
+  permission_client_ = node_->create_client<robots_dog_msgs::srv::NavigationSelfHealing>(
+    "/navigation/self_healing", rclcpp::ServicesQoS().get_rmw_qos_profile(), callback_group_);
 }
 
 BT::PortsList AdaptiveSpin::providedPorts()
 {
   return {
     BT::InputPort<bool>("forbid_spin", true, "Fail closed unless Edge permits rotation"),
+    BT::InputPort<std::string>("episode_id", std::string(""), "Active Edge self-healing episode"),
+    BT::InputPort<std::string>(
+      "fault_label", std::string("navigation_failed"), "Current normalized fault label"),
+    BT::InputPort<double>("permission_timeout_seconds", 1.0, "Fresh Edge permission timeout"),
     BT::InputPort<double>("score_threshold", 0.4, "Maximum healthy NDT score"),
     BT::InputPort<double>("max_age_seconds", 0.75, "Maximum NDT status age")};
+}
+
+void AdaptiveSpin::resetPermission()
+{
+  permission_sent_ = false;
+  permission_confirmed_ = false;
+  episode_id_.clear();
+  fault_label_.clear();
+}
+
+bool AdaptiveSpin::edgePermissionReady()
+{
+  if (permission_confirmed_) {
+    return true;
+  }
+  if (!permission_sent_) {
+    getInput("episode_id", episode_id_);
+    getInput("fault_label", fault_label_);
+    getInput("permission_timeout_seconds", permission_timeout_seconds_);
+    permission_timeout_seconds_ = std::max(0.1, std::min(2.0, permission_timeout_seconds_));
+    if (episode_id_.empty() || !permission_client_->service_is_ready()) {
+      return false;
+    }
+    auto request = std::make_shared<robots_dog_msgs::srv::NavigationSelfHealing::Request>();
+    request->operation = robots_dog_msgs::srv::NavigationSelfHealing::Request::STATUS;
+    request->episode_id = episode_id_;
+    request->fault_label = fault_label_;
+    request->level = 2;
+    permission_future_ = permission_client_->async_send_request(request).share();
+    permission_started_ = node_->now();
+    permission_sent_ = true;
+    return false;
+  }
+  callback_group_executor_.spin_some(0ms);
+  if (permission_future_.wait_for(0ms) != std::future_status::ready) {
+    if ((node_->now() - permission_started_).seconds() <= permission_timeout_seconds_) {
+      return false;
+    }
+    resetPermission();
+    return false;
+  }
+  const auto response = permission_future_.get();
+  permission_sent_ = false;
+  permission_confirmed_ = response && response->accepted &&
+    response->episode_id == episode_id_ && !response->recovered &&
+    !response->forbid_spin && response->level == 2 &&
+    response->action_type == "adaptive_spin";
+  return permission_confirmed_;
 }
 
 void AdaptiveSpin::onScanMatchingStatus(
@@ -58,9 +118,18 @@ BT::NodeStatus AdaptiveSpin::tick()
     if (child_node_ && child_node_->status() == BT::NodeStatus::RUNNING) {
       child_node_->halt();
     }
+    resetPermission();
     return BT::NodeStatus::FAILURE;
   }
   setStatus(BT::NodeStatus::RUNNING);
+  if (!permission_confirmed_) {
+    if (!edgePermissionReady()) {
+      // A pending request keeps the decorator running without ticking Spin.
+      // Inability to send, rejection, and timeout all leave no pending request
+      // and therefore fail closed.
+      return permission_sent_ ? BT::NodeStatus::RUNNING : BT::NodeStatus::FAILURE;
+    }
+  }
   if (ndtHealthy()) {
     if (child_node_ && child_node_->status() == BT::NodeStatus::RUNNING) {
       child_node_->halt();
@@ -83,6 +152,7 @@ void AdaptiveSpin::halt()
   if (child_node_) {
     child_node_->halt();
   }
+  resetPermission();
   setStatus(BT::NodeStatus::IDLE);
 }
 

@@ -36,6 +36,7 @@ class CommandProcessor:
         audio_control_adapter=None,
         structured_logs=None,
         navigation_boundary=None,
+        temporary_fusion_release_callback: Callable[[str], bool] | None = None,
     ) -> None:
         self.robot_id = robot_id
         self.store = store
@@ -52,6 +53,7 @@ class CommandProcessor:
         self.audio_control_adapter = audio_control_adapter
         self.structured_logs = structured_logs
         self.navigation_boundary = navigation_boundary
+        self.temporary_fusion_release_callback = temporary_fusion_release_callback
         self.publish_ack = publish_ack
         self.publish_result = publish_result
         self.publish_progress = publish_progress or (lambda *_args, **_kwargs: None)
@@ -61,6 +63,17 @@ class CommandProcessor:
         # own lock: two operator requests must never supersede one another.
         self._localization_command_lock = threading.Lock()
         self.skill_executor = TeleopSkillExecutor(localization_adapter) if localization_adapter else None
+
+    def _release_temporary_fusion_for_manual_control(self, action: str) -> None:
+        callback = self.temporary_fusion_release_callback
+        if not callable(callback):
+            return
+        try:
+            callback(f"manual_control_{action}")
+        except Exception:
+            # Manual takeover must remain available even if localization
+            # profile cleanup has to fall back to its in-node TTL.
+            LOGGER.exception("failed to release temporary fusion profile for %s", action)
 
     def handle_command(self, raw) -> tuple[dict, dict | None]:
         envelope = decode_message(raw)
@@ -764,6 +777,7 @@ class CommandProcessor:
                     "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
                 )
                 self.safety.state.control_mode = "manual_takeover"
+            self._release_temporary_fusion_for_manual_control(action)
         elif action == "takeover_exit":
             if self.safety.state.control_mode == "manual_assist":
                 result_payload = self._manual_assist_velocity(teleop_adapter)
@@ -777,6 +791,7 @@ class CommandProcessor:
                 "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
             )
             self.safety.state.control_mode = "manual_takeover"
+            self._release_temporary_fusion_for_manual_control(action)
         elif action == "lie_down":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("lie_down")
@@ -788,11 +803,13 @@ class CommandProcessor:
                 "shake_hand", {"greeting"}
             )
             self.safety.state.control_mode = "manual_takeover"
+            self._release_temporary_fusion_for_manual_control(action)
         elif action == "two_leg_stand":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "two_leg_stand", {"two_leg_standing"}
             )
             self.safety.state.control_mode = "manual_takeover"
+            self._release_temporary_fusion_for_manual_control(action)
         elif action == "move_stop":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("move_stop")
@@ -813,6 +830,7 @@ class CommandProcessor:
                 "stand": stand,
             }
             self.safety.state.control_mode = "manual_takeover"
+            self._release_temporary_fusion_for_manual_control(action)
         elif action == "person_follow_stop":
             if not self.person_follow_controller:
                 raise ProtocolError("PERSON_FOLLOW_UNAVAILABLE", "person follow controller is not configured")

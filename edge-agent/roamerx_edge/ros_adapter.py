@@ -888,6 +888,7 @@ class RosAdapter(Node):
         *,
         reason: str = "",
         duration_seconds: float = 180.0,
+        expected_generation: int = 0,
         timeout_seconds: float = 2.0,
     ) -> dict:
         client = self._localization_fusion_profile_client
@@ -914,6 +915,7 @@ class RosAdapter(Node):
             0.0 if request.profile == request.PROFILE_NOMINAL
             else max(1.0, min(180.0, float(duration_seconds)))
         )
+        request.expected_generation = max(0, int(expected_generation))
         future = client.call_async(request)
         completed = threading.Event()
         future.add_done_callback(lambda _: completed.set())
@@ -929,6 +931,7 @@ class RosAdapter(Node):
         return {
             "accepted": bool(response.accepted),
             "applied_profile": int(response.applied_profile),
+            "generation": int(response.generation),
             "profile_name": str(response.profile_name),
             "message": str(response.message),
         }

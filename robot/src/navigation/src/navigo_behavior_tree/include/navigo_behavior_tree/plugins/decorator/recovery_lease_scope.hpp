@@ -46,6 +46,7 @@ private:
   bool action_start_sent_{false};
   bool action_reported_{false};
   bool action_reporting_unavailable_{false};
+  bool action_authorization_failed_{false};
   rclcpp::Time acquire_started_;
   rclcpp::Time action_start_time_;
   std::chrono::milliseconds server_timeout_{1000};

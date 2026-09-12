@@ -49,6 +49,7 @@ void SetUkfWeight::on_tick()
   request_->reason = reason;
   request_->duration_seconds = request_->profile == Request::PROFILE_NOMINAL ?
     0.0F : static_cast<float>(std::max(1.0, std::min(180.0, duration_seconds)));
+  request_->expected_generation = 0;
 }
 
 BT::NodeStatus SetUkfWeight::on_completion(
