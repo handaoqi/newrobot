@@ -2470,11 +2470,15 @@ private:
     last_float_rtk_residual_xy_m_ = float_rtk_residual_xy_m;
     last_float_rtk_within_gate_ = rtk_float_within_gate;
     last_float_rtk_gate_reason_ = float_rtk_gate_reason;
-    last_ndt_score_band_ = !match || !std::isfinite(ndt_score)
-      ? "unavailable"
-      : ndt_score < ukf_high_quality_ndt_score_
-        ? "high_quality"
-        : ndt_score < ndt_max_fitness_score_ ? "eligible" : "poor";
+    // A decimated FAST-LIO callback with no NDT result means "not sampled in
+    // this frame", not that the last healthy NDT match disappeared.
+    if (match) {
+      last_ndt_score_band_ = !std::isfinite(ndt_score)
+        ? "unavailable"
+        : ndt_score < ukf_high_quality_ndt_score_
+          ? "high_quality"
+          : ndt_score < ndt_max_fitness_score_ ? "eligible" : "poor";
+    }
     const bool force_correction = one_shot_correction_.active;
     const CorrectionPolicyMode effective_mode = force_correction
       ? one_shot_correction_.mode : preferred_correction_mode_;
@@ -2483,6 +2487,19 @@ private:
       : effective_mode == CorrectionPolicyMode::rtk
         ? rtk_ready
         : (ndt_fresh || rtk_ready || rtk_float_within_gate);
+
+    // The scheduler requests a fresh NDT result for an active NDT waypoint
+    // transaction. Until that scan arrives, this is a pending measurement —
+    // never an exhausted source attempt eligible for no-correction fallback.
+    if (force_correction && effective_mode == CorrectionPolicyMode::ndt && !match) {
+      one_shot_correction_.status = "waiting_source";
+      one_shot_correction_.selected_source = "none";
+      one_shot_correction_.selection_reason = "waiting_for_fresh_ndt_measurement";
+      one_shot_correction_.reason = "waiting_for_fresh_ndt_measurement";
+      last_correction_candidate_source_ = "none";
+      last_correction_selection_reason_ = "waiting_for_fresh_ndt_measurement";
+      return;
+    }
 
     // In LIO-hold mode both absolute observers have already failed their
     // quality gates.  Keep propagating the high-rate FAST-LIO pose and reject
@@ -4143,6 +4160,12 @@ private:
       lio_stable_frame_count_ >= lio_stable_confirmation_frames_;
     schedule_input.correction_suppressed = pending_lio_correction_.active ||
       !lio_correction_cooldown_gate_.canStart(steadyNowNanoseconds());
+    // A waypoint NDT transaction needs a fresh registration result. Do not
+    // let a rate-limited FAST-LIO callback be interpreted as a failed match.
+    schedule_input.force_ndt_match = one_shot_correction_.active &&
+      one_shot_correction_.status == "waiting_source" &&
+      one_shot_correction_.mode == CorrectionPolicyMode::ndt &&
+      motion_phase_ == "stationary";
     schedule_input.motion_phase = motion_phase_;
     schedule_input.frame_index = ndt_frame_counter_;
     schedule_input.now_ns = schedule_now_ns;

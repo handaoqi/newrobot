@@ -642,6 +642,47 @@ def test_no_correction_completion_still_requires_confirmed_stop(tmp_path):
     store.close()
 
 
+def test_no_correction_completion_uses_full_zero_motion_confirmation_window(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    observed_timeouts = []
+
+    def is_stopped(timeout_seconds=None):
+        observed_timeouts.append(timeout_seconds)
+        # Model the production adapter: a 1 s continuous-zero window cannot
+        # be confirmed if the caller gives it a shorter timeout.
+        return float(timeout_seconds or 0.0) >= 1.0
+
+    nav.is_robot_stopped = is_stopped
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        stop_confirmation_seconds=1.0,
+    )
+    transaction_id = "task-7:waypoint:0:correction:1"
+    executor._active_correction_transaction_id = transaction_id
+    executor._active_correction_mode = "ndt"
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "one_shot_correction": {
+            "transaction_id": transaction_id,
+            "mode": "ndt",
+            "status": "completed",
+            "selected_source": "none",
+            "reason": "ndt_no_correction_continue",
+        },
+    }
+
+    # A short readiness probe must still run a complete safety confirmation.
+    assert executor._absolute_localization_ready(timeout_seconds=0.01) is True
+    assert observed_timeouts
+    assert observed_timeouts[0] >= 1.9
+    store.close()
+
+
 def test_waypoint_correction_reuses_matching_live_transaction(tmp_path):
     class TransactionNavigation(FakeNavigation):
         def __init__(self):

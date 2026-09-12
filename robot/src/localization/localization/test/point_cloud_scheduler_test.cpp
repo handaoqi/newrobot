@@ -100,6 +100,25 @@ TEST(PointCloudScheduler, StableLioRespectsWallClockRateOnStrideAlignedCloud) {
   EXPECT_TRUE(decision.run_ndt);
 }
 
+TEST(PointCloudScheduler, WaypointCorrectionForcesFreshNdtPastRateLimitAndCooldown) {
+  PointCloudScheduleConfig config;
+  PointCloudScheduleInput input;
+  input.initialized = true;
+  input.lio_primary_enabled = true;
+  input.lio_stable = true;
+  input.correction_suppressed = true;
+  input.force_ndt_match = true;
+  input.frame_index = 10;
+  input.last_ndt_start_ns = 1000000000LL;
+  input.now_ns = 1100000000LL;  // Normal 2 Hz cadence is not due yet.
+
+  const auto decision = decidePointCloudWork(config, input);
+  EXPECT_FALSE(decision.rate_due);
+  EXPECT_TRUE(decision.run_ndt);
+  EXPECT_TRUE(decision.needs_heavy_cloud);
+  EXPECT_EQ(decision.reason, "waypoint_correction_match");
+}
+
 TEST(PointCloudScheduler, StableLioRunsFirstCloudAfterRateDeadline) {
   PointCloudScheduleConfig config;
   PointCloudScheduleInput input;

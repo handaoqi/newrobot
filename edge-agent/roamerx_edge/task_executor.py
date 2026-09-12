@@ -78,6 +78,9 @@ HOLD_FINAL_POSE_TIMEOUT_SECONDS = 3.0
 # Outdoor patrol still needs to satisfy the 1s continuous-zero confirmation
 # gate. Keep a margin for the controller/collision-monitor command handoff.
 HOLD_FINAL_POSE_OUTDOOR_TIMEOUT_SECONDS = 2.0
+# A no-correction completion still needs a full continuous-zero confirmation.
+# Keep the existing 2 s safe window and grow it if configuration requires more.
+NO_CORRECTION_STOP_RECHECK_MIN_SECONDS = 2.0
 # Stopped at a waypoint: give RTK/NDT time to pull FAST-LIO back before leaving.
 WAYPOINT_SETTLE_TIMEOUT_SECONDS = 12.0
 # Outdoor clean arrival (no pending correction): brief health check only.
@@ -340,6 +343,7 @@ class TaskExecutor:
         arrival_ndt_max_fitness_score: float = 0.45,
         arrival_convergence_samples: int = 3,
         standup_confirmation_timeout_seconds: float = 12.0,
+        stop_confirmation_seconds: float = 1.0,
         navigation_dispatch_retry_seconds: float = NAV_DISPATCH_RETRY_DEFAULT_SECONDS,
         navigation_dispatch_retry_budget_seconds: float = 300.0,
         map_set_coordinator=None,
@@ -408,6 +412,7 @@ class TaskExecutor:
         )
         self.arrival_convergence_samples = max(1, int(arrival_convergence_samples))
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
+        self.stop_confirmation_seconds = max(0.0, float(stop_confirmation_seconds))
         self.navigation_dispatch_retry_seconds = max(0.5, float(navigation_dispatch_retry_seconds))
         self.navigation_dispatch_retry_budget_seconds = max(
             self.navigation_dispatch_retry_seconds,
@@ -2954,6 +2959,15 @@ class TaskExecutor:
     def _absolute_localization_wait_message(self, decision: dict) -> str:
         if self._active_correction_mode != "ndt":
             return "FAST-LIO 已到达航点，正在等待所配置的绝对定位校正源"
+        transaction = decision.get("one_shot_correction")
+        transaction = transaction if isinstance(transaction, dict) else {}
+        reason = str(transaction.get("reason") or "")
+        if reason == "waiting_for_fresh_ndt_measurement":
+            return "FAST-LIO 已到达航点，正在等待静止 NDT 补采样"
+        gates = decision.get("correction_gates")
+        gates = gates if isinstance(gates, dict) else {}
+        if str(gates.get("ndt_score_band") or "") == "unavailable":
+            return "FAST-LIO 已到达航点，尚未获得本次静止 NDT 采样，正在等待匹配"
         score = decision.get("ndt_score")
         inlier = decision.get("ndt_inlier_fraction")
         details = []
@@ -2967,6 +2981,17 @@ class TaskExecutor:
             pass
         suffix = f"（{'，'.join(details)}）" if details else ""
         return f"FAST-LIO 已到达航点，NDT 暂无合格匹配{suffix}，正在静止重定位"
+
+    def _no_correction_stop_recheck_timeout(self) -> float:
+        """Give each stop check enough time for continuous-zero confirmation.
+
+        RosAdapter begins its one-second zero-motion timer per invocation, so
+        the former 0.5-second probe could never pass for a stationary robot.
+        """
+        return max(
+            NO_CORRECTION_STOP_RECHECK_MIN_SECONDS,
+            self.stop_confirmation_seconds + 0.5,
+        )
 
     def _waypoint_correction_completed(self, decision: dict) -> bool | None:
         transaction_id = self._active_correction_transaction_id
@@ -4147,7 +4172,9 @@ class TaskExecutor:
                     # A transaction may finish while an older task instance is
                     # already paused. Reconfirm zero motion before this watch
                     # resumes it, matching the normal arrival path.
-                    ready = self._hold_final_pose(timeout_seconds=0.5)
+                    ready = self._hold_final_pose(
+                        timeout_seconds=self._no_correction_stop_recheck_timeout()
+                    )
                 if not ready:
                     if (
                         time.monotonic() - started_at
@@ -4214,9 +4241,8 @@ class TaskExecutor:
                         ndt_score_ok = False
                 stop_confirmed = True
                 if transaction_completed and no_correction_reason is not None:
-                    remaining = max(0.0, deadline - time.monotonic())
                     stop_confirmed = self._hold_final_pose(
-                        timeout_seconds=min(0.5, remaining)
+                        timeout_seconds=self._no_correction_stop_recheck_timeout()
                     )
                 if (
                     transaction_completed

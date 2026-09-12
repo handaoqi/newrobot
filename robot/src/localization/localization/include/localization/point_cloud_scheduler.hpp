@@ -24,6 +24,9 @@ struct PointCloudScheduleInput {
   bool lio_primary_enabled = false;
   bool lio_stable = false;
   bool correction_suppressed = false;
+  // A stopped waypoint transaction needs one fresh registration result. This
+  // must not be delayed by normal NDT rate limiting or correction cooldown.
+  bool force_ndt_match = false;
   std::string motion_phase = "stationary";
   std::uint64_t frame_index = 0;
   std::int64_t now_ns = 0;
@@ -88,13 +91,17 @@ inline PointCloudWorkDecision decidePointCloudWork(
   const bool cadence_due = clock_cadence_active ? decision.rate_due : decision.stride_due;
   const bool stable_correction_suppressed = input.lio_primary_enabled && input.lio_stable &&
     input.correction_suppressed;
-  decision.run_ndt = !input.lidar_matching_paused && !input.rtk_primary &&
-    !stable_correction_suppressed && cadence_due;
+  const bool force_ndt_match = input.force_ndt_match &&
+    !input.lidar_matching_paused && !input.rtk_primary;
+  decision.run_ndt = force_ndt_match || (!input.lidar_matching_paused &&
+    !input.rtk_primary && !stable_correction_suppressed && cadence_due);
   decision.needs_heavy_cloud = !input.lidar_matching_paused &&
     (decision.run_ndt || input.global_relocalization_requested ||
       input.lidar_odometry_required);
   if (input.lidar_matching_paused || input.rtk_primary) {
     decision.reason = "rtk_primary_paused";
+  } else if (force_ndt_match) {
+    decision.reason = "waypoint_correction_match";
   } else if (stable_correction_suppressed) {
     decision.reason = "correction_suppressed";
   } else if (clock_cadence_active && !decision.rate_due) {

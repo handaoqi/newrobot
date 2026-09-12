@@ -139,6 +139,7 @@ class EdgeAgentApplication:
             arrival_ndt_max_fitness_score=config.safety.arrival_ndt_max_fitness_score,
             arrival_convergence_samples=config.safety.arrival_convergence_samples,
             standup_confirmation_timeout_seconds=config.safety.standup_confirmation_timeout_seconds,
+            stop_confirmation_seconds=config.safety.stop_confirmation_seconds,
             map_set_coordinator=self.map_set_coordinator,
             obstacle_speech=config.obstacle_speech,
             waypoint_speech=config.waypoint_speech,
