@@ -36,7 +36,13 @@ class PatrolLoopService:
     STATUS_FRESH_SECONDS = 15
     LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     LOW_BATTERY_REARM_PERCENT = getattr(settings, "LOW_BATTERY_REARM_PERCENT", 25)
-    RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS = 180
+    # A Nav2 re-approach is an asynchronous Edge action, but its command
+    # result is immutable once acknowledged.  It normally completes (or
+    # returns to a safe hold) within the three re-approach budget.  Do not
+    # present it as a long localization operation when that later
+    # result cannot be written back to the original command.
+    RECOVERY_NAV2_REAPPROACH_TIMEOUT_SECONDS = 35
+    RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS = 70
     LOOP_ROSBAG_STOP_COMMAND = "diagnostics.nav_rosbag_stop"
 
     @staticmethod
@@ -102,10 +108,20 @@ class PatrolLoopService:
         for key in (
             "observation_blocker",
             "recovery_in_progress_started_at",
+            "recovery_in_progress_action",
+            "recovery_in_progress_timeout_seconds",
+            "recovery_in_progress_reason_message",
             "stop_scope",
         ):
             metadata.pop(key, None)
         session.metadata = metadata
+
+    @classmethod
+    def _recovery_in_progress_timeout(cls, recovery_action: str) -> int:
+        """Return an action-specific deadline for a terminal command result."""
+        if recovery_action == "nav2_reapproach":
+            return cls.RECOVERY_NAV2_REAPPROACH_TIMEOUT_SECONDS
+        return cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS
 
     @classmethod
     def _begin_recovery_stop(
@@ -838,9 +854,20 @@ class PatrolLoopService:
                 recovery_status = str(result.get("recovery_status") or "").lower()
                 if recovery_status == "in_progress":
                     metadata = cls._metadata(session)
+                    recovery_action = str(
+                        metadata.get("recovery_in_progress_action")
+                        or result.get("recovery_action")
+                        or ""
+                    )
+                    timeout_seconds = cls._recovery_in_progress_timeout(recovery_action)
                     started_at = metadata.get("recovery_in_progress_started_at")
                     if started_at is None:
                         metadata["recovery_in_progress_started_at"] = now.isoformat()
+                        metadata["recovery_in_progress_action"] = recovery_action
+                        metadata["recovery_in_progress_timeout_seconds"] = timeout_seconds
+                        metadata["recovery_in_progress_reason_message"] = str(
+                            result.get("reason_message") or session.recovery_reason_message or ""
+                        )
                         session.metadata = metadata
                         session.next_action_at = now + timedelta(seconds=1)
                         session.save(update_fields=["metadata", "next_action_at", "updated_at"])
@@ -850,26 +877,43 @@ class PatrolLoopService:
                             key=f"v{session.state_version}:in_progress:{session.recovery_attempt}",
                             reason_code=result.get("reason_code") or session.recovery_reason_code,
                             reason_message=result.get("reason_message") or "Edge 正在异步恢复",
+                            payload={
+                                "recovery_action": recovery_action,
+                                "timeout_seconds": timeout_seconds,
+                            },
                         )
                         return session
                     try:
                         elapsed = (now - datetime.fromisoformat(started_at)).total_seconds()
                     except (TypeError, ValueError):
-                        elapsed = cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS + 1
-                    if elapsed < cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS:
+                        elapsed = timeout_seconds + 1
+                    if elapsed < timeout_seconds:
                         session.next_action_at = now + timedelta(seconds=1)
                         session.save(update_fields=["next_action_at", "updated_at"])
                         return session
                     metadata.pop("recovery_in_progress_started_at", None)
+                    metadata.pop("recovery_in_progress_action", None)
+                    metadata.pop("recovery_in_progress_timeout_seconds", None)
+                    metadata.pop("recovery_in_progress_reason_message", None)
                     session.metadata = metadata
                     session.observation_started_at = None
+                    action_label = (
+                        "到点重接近"
+                        if recovery_action == "nav2_reapproach"
+                        else "Edge 异步恢复"
+                    )
                     return cls._set_state(
                         session,
                         "observing",
                         "loop.recovery_in_progress_timeout",
                         reason_code="RECOVERY_IN_PROGRESS_TIMEOUT",
-                        reason_message="Edge 异步恢复超时，重新进行安全观察",
+                        reason_message=f"{action_label}超时，重新进行安全观察",
                         next_action_at=now,
+                        payload={
+                            "recovery_action": recovery_action,
+                            "timeout_seconds": timeout_seconds,
+                            "elapsed_seconds": round(elapsed, 3),
+                        },
                     )
                 if recovery_status == "non_retryable":
                     return cls._begin_recovery_stop(

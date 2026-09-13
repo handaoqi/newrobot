@@ -431,6 +431,7 @@ class PatrolLoopServiceTests(TestCase):
         session = PatrolLoopService.process(session.id)
         self.assertEqual(session.state, "recovering")
         self.assertEqual(session.recovery_attempt, 1)
+        self.assertEqual(session.metadata["recovery_in_progress_timeout_seconds"], 70)
         session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
         session.save(update_fields=["next_action_at", "updated_at"])
         session = PatrolLoopService.process(session.id)
@@ -438,6 +439,47 @@ class PatrolLoopServiceTests(TestCase):
         self.assertEqual(session.state, "recovering")
         self.assertEqual(session.recovery_attempt, 1)
         self.assertEqual(RemoteCommand.objects.filter(command_type="task.recover.v1").count(), 1)
+
+    def test_nav2_reapproach_async_recovery_uses_short_action_deadline(self):
+        session = self.create_running_loop()
+        TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")
+        TaskExecutionService.transition(session.current_execution, "running", event_type="task.started")
+        TaskExecutionService.transition(
+            session.current_execution,
+            "paused",
+            event_type="task.safe_hold",
+            reason_code="ARRIVAL_POSE_CONVERGENCE_FAILED",
+        )
+        session = PatrolLoopService.process(session.id)
+        session.observation_started_at = timezone.now() - timezone.timedelta(seconds=6)
+        session.save(update_fields=["observation_started_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+        command = RemoteCommand.objects.get(command_type="task.recover.v1")
+        command.status = "succeeded"
+        command.result_payload = {
+            "final_task_state": "paused",
+            "recovery_status": "in_progress",
+            "recovery_action": "nav2_reapproach",
+            "reason_code": "ARRIVAL_POSE_CONVERGENCE_FAILED",
+        }
+        command.save(update_fields=["status", "result_payload", "updated_at"])
+
+        session = PatrolLoopService.process(session.id)
+        self.assertEqual(session.metadata["recovery_in_progress_action"], "nav2_reapproach")
+        self.assertEqual(session.metadata["recovery_in_progress_timeout_seconds"], 35)
+
+        session.metadata["recovery_in_progress_started_at"] = (
+            timezone.now() - timezone.timedelta(seconds=36)
+        ).isoformat()
+        session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
+        session.save(update_fields=["metadata", "next_action_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "observing")
+        timeout_event = session.events.get(event_type="loop.recovery_in_progress_timeout")
+        self.assertEqual(timeout_event.reason_code, "RECOVERY_IN_PROGRESS_TIMEOUT")
+        self.assertIn("到点重接近超时", timeout_event.reason_message)
+        self.assertNotIn("recovery_in_progress_started_at", session.metadata)
 
     def test_successful_recovery_clears_episode_before_the_next_fault(self):
         session = self.create_running_loop()

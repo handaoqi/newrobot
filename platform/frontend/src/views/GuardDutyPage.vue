@@ -501,6 +501,15 @@ const SERVER_LOOP_ACTIVE_STATES = new Set([
   'starting', 'running', 'resting', 'observing', 'recovering', 'paused', 'stopping',
 ])
 
+function recoveryActionLabel(session) {
+  const action = String(session?.metadata?.recovery_in_progress_action || '')
+  if (action === 'nav2_reapproach') return '到点重接近恢复'
+  if (action === 'precision_localization_recovery') return '精准定位恢复'
+  if (action === 'localization_recovery_in_progress') return '定位恢复'
+  if (action === 'resume_pending_waypoint') return '到点处理恢复'
+  return '恢复动作'
+}
+
 function serverLoopMessage(session) {
   if (!session) return '未启动循环巡检'
   if (session.state === 'observing') {
@@ -514,8 +523,14 @@ function serverLoopMessage(session) {
     return `异常观察中 ${remaining} 秒 · ${blockerText || session.recovery_reason_message || '等待安全条件稳定'}`
   }
   if (session.state === 'recovering') {
+    const started = new Date(session.metadata?.recovery_in_progress_started_at || '').getTime()
+    const timeout = Number(session.metadata?.recovery_in_progress_timeout_seconds)
+    if (Number.isFinite(started) && Number.isFinite(timeout) && timeout > 0) {
+      const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000))
+      return `${recoveryActionLabel(session)}进行中 · 第 ${session.recovery_attempt}/${session.recovery_max_attempts} 次（${elapsed}/${timeout} 秒）`
+    }
     if (session.metadata?.recovery_in_progress_started_at) {
-      return `定位恢复进行中 · 第 ${session.recovery_attempt}/${session.recovery_max_attempts} 次`
+      return `${recoveryActionLabel(session)}进行中 · 第 ${session.recovery_attempt}/${session.recovery_max_attempts} 次`
     }
     return `正在自愈 ${session.recovery_attempt}/${session.recovery_max_attempts} · ${session.recovery_reason_message || '恢复导航'}`
   }
