@@ -3233,6 +3233,117 @@ def test_post_yaw_arrival_adjustment_allows_residual_above_legacy_diagnostic_val
     store.close()
 
 
+def test_micro_adjust_recheck_preserves_final_yaw_latch_for_next_segment(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "xy_adjustment_recheck")
+    executor._hold_final_pose = lambda: True
+    executor._handle_lightweight_arrival = lambda *_args: False
+    executor._arrival_xy_is_stable = lambda *_args: False
+    executor._arrival_pose_errors = lambda *_args: (0.40, 0.0)
+    executor._arrival_pose_tolerances = lambda *_args: (0.30, 0.25)
+    executor._arrival_pose_within_combined_tolerance = lambda *_args: False
+    starts = []
+
+    def start_adjustment(point, index):
+        starts.append((index, executor._arrival_heading_completed_index))
+        return True
+
+    executor._start_arrival_adjustment = start_adjustment
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    assert starts == [(0, 0)]
+    assert executor.context.post_arrival_stage == "heading_aligned"
+    assert not any(event[0] == "task.safe_hold" for event in events)
+    executor.stop()
+    store.close()
+
+
+def test_micro_adjust_recheck_inside_xy_radius_waits_for_stability_not_another_move(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "xy_adjustment_recheck")
+    executor._hold_final_pose = lambda: True
+    executor._handle_lightweight_arrival = lambda *_args: False
+    executor._arrival_xy_is_stable = lambda *_args: False
+    executor._arrival_pose_errors = lambda *_args: (0.20, 0.0)
+    executor._arrival_pose_tolerances = lambda *_args: (0.30, 0.25)
+    executor._arrival_pose_within_combined_tolerance = lambda *_args: False
+    executor._start_arrival_adjustment = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("must not start another XY micro-adjustment inside tolerance")
+    )
+
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_CONFIRMATION_UNSTABLE"
+    assert nav.stop_commands >= 1
+    executor.stop()
+    store.close()
+
+
+def test_post_yaw_state_guard_is_not_reported_as_missing_micro_adjust_adapter(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_heading_completed_index = 0
+    # xy_verified is deliberately not a post-yaw micro-adjust stage.
+    executor._set_post_arrival_stage(0, "xy_verified")
+    executor._hold_final_pose = lambda: True
+    executor._handle_lightweight_arrival = lambda *_args: False
+    executor._arrival_pose_errors = lambda *_args: (0.40, 0.0)
+    executor._arrival_pose_tolerances = lambda *_args: (0.30, 0.25)
+    executor._arrival_pose_within_combined_tolerance = lambda *_args: False
+
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_MICRO_ADJUST_STATE_INVALID"
+    assert "接口不可用" not in safe_hold[1]["reason_message"]
+    executor.stop()
+    store.close()
+
+
 def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

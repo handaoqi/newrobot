@@ -3477,6 +3477,25 @@ class TaskExecutor:
             return "nav2_goal"
         return "cmd_vel"
 
+    def _arrival_micro_adjust_adapter_available(
+        self, waypoint: dict, reached_index: int
+    ) -> bool:
+        """Whether the selected post-yaw adjustment mechanism is present.
+
+        This deliberately answers only the adapter-capability question.  A
+        rejected state/budget gate must not be presented to operators as an
+        unavailable ROS interface.
+        """
+        if self._arrival_micro_adjust_mode_for(waypoint, reached_index) == "nav2_goal":
+            return bool(
+                callable(getattr(self.navigation, "set_arrival_micro_goal_profile", None))
+                and callable(getattr(self.navigation, "send_waypoints", None))
+            )
+        return bool(
+            callable(getattr(self.navigation, "arrival_adjust_velocity", None))
+            and callable(getattr(self.navigation, "directional_clearance", None))
+        )
+
     def _start_arrival_side_effects(
         self,
         waypoint_index: int,
@@ -3663,7 +3682,11 @@ class TaskExecutor:
             return self._start_arrival_nav2_goal_adjustment(waypoint, reached_index)
         velocity = getattr(self.navigation, "arrival_adjust_velocity", None)
         clearance = getattr(self.navigation, "directional_clearance", None)
-        if not callable(velocity) or not callable(clearance):
+        if not self._arrival_micro_adjust_adapter_available(waypoint, reached_index):
+            LOGGER.warning(
+                "arrival XY micro-adjust adapter is unavailable for waypoint %d",
+                reached_index,
+            )
             return False
         if self._arrival_adjustment_thread and self._arrival_adjustment_thread.is_alive():
             return self._arrival_adjustment_index == reached_index
@@ -5238,9 +5261,34 @@ class TaskExecutor:
                             # combined-pose gate start the next bounded
                             # segment.  Business arrival side effects stay
                             # latched and are never replayed here.
-                            self._set_post_arrival_stage(
-                                reached_index, "heading_aligned"
+                            # A bounded segment does not invalidate the final
+                            # yaw that preceded it.  The in-memory latch is
+                            # required by the next segment's state guard and
+                            # was previously left vulnerable to a duplicate
+                            # result/recheck callback.
+                            self._arrival_heading_completed_index = reached_index
+                            current_distance, _ = self._arrival_pose_errors(
+                                reached_waypoint, reached_index
                             )
+                            xy_tolerance, _ = self._arrival_pose_tolerances(
+                                reached_waypoint, reached_index
+                            )
+                            if (
+                                current_distance is not None
+                                and current_distance <= xy_tolerance
+                            ):
+                                # Motion has already reached the XY acceptance
+                                # circle. Do not issue another raw-velocity
+                                # segment merely because the short fresh-frame
+                                # verification window was incomplete.
+                                self.navigation.stop_motion()
+                                self._emit_safe_hold(
+                                    "ARRIVAL_CONFIRMATION_UNSTABLE",
+                                    "微调后已进入 XY 验收范围，但连续新鲜定位帧未通过；"
+                                    "保持停车等待重新确认",
+                                )
+                                return
+                            self._set_post_arrival_stage(reached_index, "heading_aligned")
                         elif post_arrival_active:
                             self._emit_safe_hold(
                                 "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
@@ -5397,10 +5445,18 @@ class TaskExecutor:
                             distance,
                             yaw_error,
                         )
-                        self._emit_safe_hold(
-                            "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
-                            "到达后 XY 微调接口不可用或未能启动，机器人保持停车",
-                        )
+                        if self._arrival_micro_adjust_adapter_available(
+                            reached_waypoint, reached_index
+                        ):
+                            self._emit_safe_hold(
+                                "ARRIVAL_MICRO_ADJUST_STATE_INVALID",
+                                "到达后 XY 微调状态门禁未满足，机器人保持停车",
+                            )
+                        else:
+                            self._emit_safe_hold(
+                                "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
+                                "到达后 XY 微调接口不可用，机器人保持停车",
+                            )
                         return
                     self._emit_safe_hold(
                         "ARRIVAL_POSE_CONVERGENCE_FAILED",
