@@ -48,6 +48,13 @@ function eventKey(event) {
   )
 }
 
+function eventArrivalKey(event) {
+  const payload = event?.payload || {}
+  const waypoint = payload.waypoint || {}
+  const identity = payload.execution_waypoint_index ?? waypoint.waypoint_id ?? waypoint.map_point_number
+  return `${payload.round_number ?? ''}:${identity ?? ''}`
+}
+
 function coordinateText(point) {
   const x = Number(point?.x)
   const y = Number(point?.y)
@@ -74,9 +81,21 @@ function eventDetail(event) {
   const target = coordinateText(payload.waypoint)
   const robot = coordinateText(payload.robot_pose)
   const reason = event?.reason_message || payload.reason_message || event?.reason_code || payload.reason_code || ''
+  const arrival = []
+  if (payload.arrival_mode === 'lightweight') arrival.push('轻量到达（跳过定位校正）')
+  if (payload.arrival_mode === 'full_correction') arrival.push('完整定位校正')
+  if (Number.isFinite(Number(payload.distance_m))) arrival.push(`偏差 ${Number(payload.distance_m).toFixed(2)}m`)
+  if (Number.isFinite(Number(payload.acceptance_tolerance_m))) {
+    arrival.push(`验收半径 ${Number(payload.acceptance_tolerance_m).toFixed(2)}m`)
+  }
+  if (Number.isFinite(Number(payload.reapproach_attempts))) {
+    arrival.push(`追加靠近 ${Number(payload.reapproach_attempts)} 次`)
+  }
+  if (payload.coarse_completed === true) arrival.push('两次靠近后按 0.50m 粗范围完成')
   return [
     target ? `目标 ${target}` : '',
     robot ? `机器狗 ${robot}` : '',
+    ...arrival,
     reason,
   ].filter(Boolean).join(' · ')
 }
@@ -92,6 +111,10 @@ function timelinePresentation(event, execution) {
   }
   if (eventType === 'task.waypoint_reached') {
     return { type: 'arrival', title: `${waypointLabel}已到达`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_confirmed') {
+    const suffix = event?.payload?.coarse_completed === true ? '（粗范围完成）' : ''
+    return { type: 'arrival', title: `${waypointLabel}验收完成${suffix}`, pointName: waypointLabel }
   }
   if (eventType === 'task.pausing') return { type: 'pause', title: '正在暂停预演' }
   if (eventType === 'task.paused') return { type: 'pause', title: '预演已暂停' }
@@ -136,6 +159,11 @@ export function buildTaskExecutionTimeline(execution, {
     || firstEventTimestamp
     || Date.now()
   const timeline = []
+  const confirmedArrivalKeys = new Set(
+    events
+      .filter(event => event.event_type === 'task.arrival_confirmed')
+      .map(eventArrivalKey),
+  )
 
   if (requestedTimestamp) {
     timeline.push({
@@ -149,6 +177,10 @@ export function buildTaskExecutionTimeline(execution, {
   }
 
   events.forEach((event) => {
+    if (
+      event.event_type === 'task.waypoint_reached'
+      && confirmedArrivalKeys.has(eventArrivalKey(event))
+    ) return
     const presentation = timelinePresentation(event, execution)
     if (!presentation) return
     const occurredAt = eventTimestamp(event) || startedAt

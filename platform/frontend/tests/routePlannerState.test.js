@@ -19,7 +19,24 @@ import {
   rtkQualityLabel,
   rtkSolutionStatusLabel,
   shouldShowBoundaryPolicyStatus,
+  waypointCorrectionModeLabel,
+  waypointRequiresFullCorrection,
 } from '../src/services/routePlannerState.js'
+
+test('waypoint arrival mode distinguishes plain intermediates from business stops', () => {
+  const plain = { arrival_policy: 'stop_and_confirm', dwell_seconds: 0, actions: [] }
+  assert.equal(waypointRequiresFullCorrection(plain, 1, 3), false)
+  assert.equal(waypointCorrectionModeLabel(plain, 1, 3), '轻量到达')
+  assert.equal(waypointRequiresFullCorrection(plain, 0, 3), true)
+  assert.equal(waypointRequiresFullCorrection(plain, 2, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, require_yaw: true }, 1, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, dwell_seconds: 1 }, 1, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, actions: [{}] }, 1, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, force_localization_correction: true }, 1, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, speech_template_id: 9, speech_mode: 'non_blocking' }, 1, 3), true)
+  assert.equal(waypointRequiresFullCorrection({ ...plain, speech_template_id: 9, speech_mode: 'disabled' }, 1, 3), false)
+  assert.equal(waypointCorrectionModeLabel({ arrival_policy: 'pass_through' }, 1, 3), '通过点')
+})
 
 test('heading input is normalized and converted only when valid', () => {
   assert.equal(normalizeHeadingDegrees(450), 90)

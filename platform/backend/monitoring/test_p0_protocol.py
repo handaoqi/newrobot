@@ -53,6 +53,8 @@ class ProtocolContractTests(SimpleTestCase):
 
     def test_accepts_arrival_stage_events(self):
         for message_type in (
+            "task.arrival_check",
+            "task.arrival_confirmed",
             "task.arrival_heading_aligning",
             "task.arrival_heading_aligned",
             "task.waypoint_postprocess_completed",
@@ -107,6 +109,16 @@ class ProtocolContractTests(SimpleTestCase):
             }
         )
         self.assertEqual(parse_message(payload).message_type, "task.start")
+
+    def test_force_localization_correction_requires_boolean(self):
+        payload = json.loads(self.fixture_path.read_text())
+        waypoint = payload["payload"]["command"]["route_snapshot"]["waypoints"][1]
+        waypoint["force_localization_correction"] = True
+        self.assertEqual(parse_message(payload).message_type, "task.start")
+        waypoint["force_localization_correction"] = "true"
+        with self.assertRaises(ProtocolError) as raised:
+            parse_message(payload)
+        self.assertEqual(raised.exception.code, "INVALID_MESSAGE")
 
     def test_accepts_nav_recover_command(self):
         payload = json.loads(self.fixture_path.read_text())

@@ -121,6 +121,13 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             )
             collision_stop_enabled = bool(raw.get("collision_stop_enabled", True))
             require_yaw = bool(raw.get("require_yaw", False))
+            force_localization_correction = raw.get(
+                "force_localization_correction", False
+            )
+            if not isinstance(force_localization_correction, bool):
+                raise TaskStateError(
+                    f"route waypoint {index} force_localization_correction must be boolean"
+                )
             arrival_policy = _normalize_arrival_policy(
                 raw.get("arrival_policy"), dwell_seconds=dwell_seconds,
                 require_yaw=require_yaw, actions=actions,
@@ -158,6 +165,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             collision_slowdown_enabled = True
             collision_stop_enabled = True
             require_yaw = False
+            force_localization_correction = False
             speech_mode = "disabled"
             arrival_policy = _normalize_arrival_policy(
                 None, dwell_seconds=0, require_yaw=False, actions=[],
@@ -186,6 +194,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "collision_slowdown_enabled": collision_slowdown_enabled,
                 "collision_stop_enabled": collision_stop_enabled,
                 "require_yaw": require_yaw,
+                "force_localization_correction": force_localization_correction,
                 "arrival_policy": arrival_policy,
                 "arrival_micro_adjust_mode": arrival_micro_adjust_mode,
                 "localization_anchor_preference": localization_anchor_preference,

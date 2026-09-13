@@ -281,7 +281,7 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "navigo_path_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.35
+      xy_goal_tolerance: 0.50
       # Patrol routes use waypoints as pass-through points. Do not require the
       # robot to match each waypoint's yaw, otherwise it can stall while turning.
       yaw_goal_tolerance: 3.14

@@ -233,6 +233,8 @@ class MessageHandlerTests(TestCase):
 
         for sequence, message_type in enumerate(
             (
+                "task.arrival_check",
+                "task.arrival_confirmed",
                 "task.arrival_heading_aligning",
                 "task.arrival_heading_aligned",
                 "task.waypoint_postprocess_completed",
@@ -263,6 +265,8 @@ class MessageHandlerTests(TestCase):
                 SystemLog.objects.filter(
                     task_execution=self.execution,
                     event_code__in={
+                        "task.arrival_check",
+                        "task.arrival_confirmed",
                         "task.arrival_heading_aligning",
                         "task.arrival_heading_aligned",
                         "task.waypoint_postprocess_completed",
@@ -270,6 +274,8 @@ class MessageHandlerTests(TestCase):
                 ).values_list("event_code", flat=True)
             ),
             {
+                "task.arrival_check",
+                "task.arrival_confirmed",
                 "task.arrival_heading_aligning",
                 "task.arrival_heading_aligned",
                 "task.waypoint_postprocess_completed",
@@ -278,15 +284,17 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(
             InboundMessage.objects.filter(
                 message_type__in={
+                    "task.arrival_check",
+                    "task.arrival_confirmed",
                     "task.arrival_heading_aligning",
                     "task.arrival_heading_aligned",
                     "task.waypoint_postprocess_completed",
                 },
                 process_status="processed",
             ).count(),
-            3,
+            5,
         )
-        self.assertEqual(publish_task_event.call_count, 3)
+        self.assertEqual(publish_task_event.call_count, 5)
 
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(

@@ -863,6 +863,8 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
     if envelope.message_type in {
         "task.arrival_pending_settle",
+        "task.arrival_check",
+        "task.arrival_confirmed",
         "task.arrival_correcting",
         "task.arrival_heading_aligning",
         "task.arrival_heading_aligned",

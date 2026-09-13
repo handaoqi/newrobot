@@ -67,9 +67,12 @@ safety:
   stop_confirmation_seconds: 1.0
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
-  final_waypoint_tolerance_m: 0.30
-  # Ordinary stop-and-confirm points may skip final yaw inside this radius.
-  arrival_degraded_tolerance_m: 0.60
+  # Every waypoint first reaches this Nav2 radius. Plain intermediate points
+  # can complete inside it only after two failed 0.30 m re-approaches.
+  coarse_goal_tolerance_m: 0.50
+  normal_arrival_tolerance_m: 0.30
+  precision_arrival_tolerance_m: 0.15
+  arrival_reapproach_max_attempts: 2
   # Used only at the final docking contact waypoint.
   docking_goal_tolerance_m: 0.08
   docking_goal_yaw_tolerance_rad: 0.0872665
@@ -84,7 +87,7 @@ safety:
   # Above this residual, do stationary precision localization before moving.
   arrival_nav2_reapproach_max_error_m: 1.50
   arrival_precision_recovery_retry_seconds: 5.0
-  arrival_micro_adjust_timeout_seconds: 30
+  arrival_adjust_timeout_seconds: 30
   arrival_micro_goal_tolerance_m: 0.15
   arrival_ndt_max_fitness_score: 0.40
   arrival_convergence_samples: 3

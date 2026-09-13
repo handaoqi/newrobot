@@ -119,10 +119,12 @@ class SafetyConfig:
     navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
-    # Ordinary stop-and-confirm points must be verified against the corrected
-    # map pose; this is intentionally stricter than Nav2's normal goal checker.
-    final_waypoint_tolerance_m: float = 0.30
-    arrival_degraded_tolerance_m: float = 0.60
+    # Every Nav2 leg first enters a coarse arrival circle. Business waypoints
+    # are then verified against the stricter policy-specific tolerances below.
+    coarse_goal_tolerance_m: float = 0.50
+    normal_arrival_tolerance_m: float = 0.30
+    precision_arrival_tolerance_m: float = 0.15
+    arrival_reapproach_max_attempts: int = 2
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
     # Arrival correction is split into bounded segments.  The legacy
@@ -454,12 +456,22 @@ class EdgeConfig:
     @classmethod
     def load(cls, path: str | Path) -> "EdgeConfig":
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        safety_raw = dict(raw.get("safety", {}))
+        # Translate deployed legacy names instead of making an older robot
+        # config fail to boot during a rolling Edge upgrade.
+        if "normal_arrival_tolerance_m" not in safety_raw:
+            legacy_normal = safety_raw.pop("final_waypoint_tolerance_m", None)
+            if legacy_normal is not None:
+                safety_raw["normal_arrival_tolerance_m"] = legacy_normal
+        else:
+            safety_raw.pop("final_waypoint_tolerance_m", None)
+        safety_raw.pop("arrival_degraded_tolerance_m", None)
         return cls(
             robot=RobotConfig(**raw["robot"]),
             mqtt=MqttConfig(**raw["mqtt"]),
             ros=RosConfig(**raw.get("ros", {})),
             telemetry=TelemetryConfig(**raw.get("telemetry", {})),
-            safety=SafetyConfig(**raw.get("safety", {})),
+            safety=SafetyConfig(**safety_raw),
             obstacle_speech=ObstacleSpeechConfig(**raw.get("obstacle_speech", {})),
             waypoint_speech=WaypointSpeechConfig(**raw.get("waypoint_speech", {})),
             storage=StorageConfig(**raw.get("storage", {})),

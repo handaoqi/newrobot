@@ -1112,7 +1112,7 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         for index, point in enumerate(value):
             if not isinstance(point, dict):
                 continue
-            for field in ("avoidance_to_next", "require_yaw", "rtk_primary_allowed"):
+            for field in ("avoidance_to_next", "require_yaw", "rtk_primary_allowed", "force_localization_correction"):
                 if field in point and not isinstance(point[field], bool):
                     raise serializers.ValidationError(f"途经点 {index + 1} 的 {field} 必须是布尔值")
             if "dwell_seconds" in point:

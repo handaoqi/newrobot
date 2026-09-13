@@ -84,6 +84,36 @@ test('falls back to execution index and removes duplicated events', () => {
   assert.equal(timeline[0].title, '6号点目标已下发')
 })
 
+test('arrival confirmation shows correction mode, retries, radius and coarse fallback', () => {
+  const timeline = buildTaskExecutionTimeline({
+    state: 'running',
+    route_snapshot: { waypoints: [{ map_point_number: 2 }] },
+    events: [
+      event(8, 'task.arrival_confirmed', 8, '2026-09-06T08:00:08+08:00', {
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 2, x: 2, y: 3 },
+        arrival_mode: 'lightweight',
+        localization_correction: 'skipped',
+        distance_m: 0.42,
+        acceptance_tolerance_m: 0.5,
+        reapproach_attempts: 2,
+        coarse_completed: true,
+      }),
+      event(9, 'task.waypoint_reached', 9, '2026-09-06T08:00:08+08:00', {
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 2, x: 2, y: 3 },
+      }),
+    ],
+  })
+
+  assert.equal(timeline.length, 1)
+  assert.equal(timeline[0].title, '2号点验收完成（粗范围完成）')
+  assert.match(timeline[0].detail, /轻量到达（跳过定位校正）/)
+  assert.match(timeline[0].detail, /偏差 0\.42m/)
+  assert.match(timeline[0].detail, /验收半径 0\.50m/)
+  assert.match(timeline[0].detail, /追加靠近 2 次/)
+})
+
 test('shows a request failure before an execution exists', () => {
   const timeline = buildTaskExecutionTimeline(null, {
     requestedAt: Date.parse('2026-09-06T08:00:00+08:00'),

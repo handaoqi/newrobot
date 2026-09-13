@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from roamerx_edge.leg_profile import LegProfile
 from roamerx_edge.local_store import LocalStore
-from roamerx_edge.task_executor import TaskExecutor, ARRIVAL_ACCEPT_INDOOR_LIO_M
+from roamerx_edge.task_executor import TaskExecutor
 
 
 class FakeNavigation:
@@ -66,7 +66,11 @@ def test_indoor_arrival_requires_click_proximity(tmp_path):
     )()
     waypoint = {"x": 1.0, "y": 1.0, "arrival_policy": "stop_and_confirm"}
     assert executor._arrival_within_tolerance(waypoint, 0) is True
-    nav.pose = SimpleNamespace(x=1.0 + ARRIVAL_ACCEPT_INDOOR_LIO_M + 0.1, y=1.0, yaw=0.0)
+    nav.pose = SimpleNamespace(
+        x=1.0 + executor.final_waypoint_tolerance_m + 0.1,
+        y=1.0,
+        yaw=0.0,
+    )
     assert executor._arrival_within_tolerance(waypoint, 0) is False
     store.close()
 

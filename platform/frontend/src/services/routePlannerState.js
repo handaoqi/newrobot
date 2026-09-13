@@ -3,6 +3,26 @@ export const MAP_ZOOM_MAX = 3
 export const MAP_ZOOM_STEP = 0.25
 export const KEYFRAME_PAGE_SIZE = 50
 
+export function waypointRequiresFullCorrection(point = {}, index = 0, total = 0) {
+  const policy = String(point.arrival_policy || 'stop_and_confirm').trim().toLowerCase()
+  if (policy === 'pass_through') return false
+  if (index === 0 || (total > 0 && index === total - 1)) return true
+  if (point.force_localization_correction === true || point.require_yaw === true) return true
+  if (Number(point.dwell_seconds || 0) > 0 || (point.actions || []).length > 0) return true
+  const speechMode = String(
+    point.speech_mode || (point.speech_template_id ? 'non_blocking' : 'disabled'),
+  ).trim().toLowerCase()
+  if (point.speech_template_id && speechMode !== 'disabled') return true
+  return ['precision', 'dock'].includes(policy)
+}
+
+export function waypointCorrectionModeLabel(point = {}, index = 0, total = 0) {
+  if (String(point.arrival_policy || '').trim().toLowerCase() === 'pass_through') {
+    return '通过点'
+  }
+  return waypointRequiresFullCorrection(point, index, total) ? '完整校正' : '轻量到达'
+}
+
 const RTK_QUALITY_ALIASES = {
   fixed: 'fixed',
   rtk_fixed: 'fixed',

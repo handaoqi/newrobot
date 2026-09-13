@@ -50,6 +50,8 @@ import {
   rtkQualityLabel,
   rtkSolutionStatusLabel,
   shouldShowBoundaryPolicyStatus,
+  waypointCorrectionModeLabel as correctionModeLabel,
+  waypointRequiresFullCorrection as requiresFullCorrection,
 } from '../services/routePlannerState'
 import {
   buildLocalizationLossMarkers,
@@ -829,6 +831,9 @@ function setWaypointSpeech(index, templateId) {
     speech_template_id: template?.id || null,
     speech_template_name: template?.name || '',
     speech_text: template?.text || '',
+    speech_mode: template
+      ? (current.speech_mode === 'blocking' ? 'blocking' : 'non_blocking')
+      : 'disabled',
   }
 }
 
@@ -860,6 +865,14 @@ function normalizeSpeechMode(value, point = {}) {
   const normalized = String(value || '').trim().toLowerCase()
   if (['blocking', 'non_blocking', 'disabled'].includes(normalized)) return normalized
   return point.speech_template_id ? 'non_blocking' : 'disabled'
+}
+
+function waypointRequiresFullCorrection(point, index) {
+  return requiresFullCorrection(point, index, waypoints.value.length)
+}
+
+function waypointCorrectionModeLabel(point, index) {
+  return correctionModeLabel(point, index, waypoints.value.length)
 }
 
 function setWaypointArrivalPolicy(index, policy) {
@@ -1562,8 +1575,10 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     collision_slowdown_enabled: point.collision_slowdown_enabled !== false && point.avoidance_to_next !== false,
     collision_stop_enabled: point.collision_stop_enabled !== false,
     require_yaw: point.require_yaw === true,
+    force_localization_correction: point.force_localization_correction === true,
     dwell_seconds: Math.max(0, Number(point.dwell_seconds || 0)),
     speech_mode: normalizeSpeechMode(point.speech_mode, point),
+    actions: Array.isArray(point.actions) ? point.actions : [],
   }
   const normalized = {
     x: Number(point.x),
@@ -1622,9 +1637,11 @@ function withWaypointYaw(points) {
       collision_slowdown_enabled: current.collision_slowdown_enabled !== false && current.avoidance_to_next !== false,
       collision_stop_enabled: current.collision_stop_enabled !== false,
       require_yaw: current.require_yaw === true,
+      force_localization_correction: current.force_localization_correction === true,
       dwell_seconds: Math.max(0, Number(current.dwell_seconds || 0)),
       speech_mode: normalizeSpeechMode(current.speech_mode, current),
       speech_text: current.speech_text || '',
+      actions: Array.isArray(current.actions) ? current.actions : [],
     }
   })
 }
@@ -3066,6 +3083,7 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     collision_slowdown_enabled: true,
     collision_stop_enabled: true,
     require_yaw: false,
+    force_localization_correction: false,
     dwell_seconds: 0,
     arrival_policy: 'stop_and_confirm',
     speech_mode: 'disabled',
@@ -3196,7 +3214,11 @@ async function handleDeleteRoute(route) {
                       <button type="button" class="waypoint-expand-toggle" @click="toggleWaypointExpanded(index)">
                         {{ isWaypointExpanded(index) ? '收起' : '展开' }}
                       </button>
-                      <span>{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                      <span class="waypoint-title">{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
+                      <span
+                        class="waypoint-correction-badge"
+                        :class="{ lightweight: !waypointRequiresFullCorrection(point, index) && (point.arrival_policy || 'stop_and_confirm') !== 'pass_through' }"
+                      >{{ waypointCorrectionModeLabel(point, index) }}</span>
                       <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
                     </div>
                     <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
@@ -3229,6 +3251,10 @@ async function handleDeleteRoute(route) {
                         <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
                         <span>到点转向</span>
                       </label>
+                      <label class="waypoint-check">
+                        <input type="checkbox" :checked="point.force_localization_correction === true" @change="setWaypointBoolean(index, 'force_localization_correction', $event.target.checked)" />
+                        <span>强制完整定位校正</span>
+                      </label>
                       <label>
                         <span>到点停留（秒）</span>
                         <input
@@ -3241,6 +3267,9 @@ async function handleDeleteRoute(route) {
                           @input="setWaypointDwell(index, $event.target.value)"
                         />
                       </label>
+                      <small class="waypoint-arrival-hint">
+                        到达模式：{{ waypointCorrectionModeLabel(point, index) }}；首次 0.50m 粗到达，轻量点按 0.30m 最多再靠近 2 次。
+                      </small>
                       <label>
                         <span>到点策略</span>
                         <select
@@ -4398,12 +4427,34 @@ async function handleDeleteRoute(route) {
   font-weight: 800;
 }
 
-.waypoint-title-row > span {
+.waypoint-title-row > .waypoint-title {
   min-width: 0;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.waypoint-correction-badge {
+  flex: 0 0 auto;
+  padding: 0.16rem 0.38rem;
+  border-radius: 999px;
+  color: #92400e;
+  background: #fef3c7;
+  font-size: 0.66rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.waypoint-correction-badge.lightweight {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.waypoint-arrival-hint {
+  grid-column: 1 / -1;
+  color: #475467;
+  line-height: 1.4;
 }
 
 .waypoint-delete-btn {

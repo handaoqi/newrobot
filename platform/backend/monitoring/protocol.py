@@ -100,6 +100,8 @@ UPLINK_MESSAGE_TYPES = {
     "task.cancelled",
     "task.interrupted",
     "task.arrival_pending_settle",
+    "task.arrival_check",
+    "task.arrival_confirmed",
     "task.arrival_correcting",
     "task.arrival_heading_aligning",
     "task.arrival_heading_aligned",
@@ -291,7 +293,7 @@ def _validate_task_start(command: dict[str, Any]) -> None:
         for coordinate in ("x", "y", "yaw"):
             if isinstance(waypoint.get(coordinate), bool) or not isinstance(waypoint.get(coordinate), (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {coordinate} must be numeric")
-        for field in ("avoidance_to_next", "require_yaw", "detour_enabled", "collision_slowdown_enabled", "collision_stop_enabled"):
+        for field in ("avoidance_to_next", "require_yaw", "detour_enabled", "collision_slowdown_enabled", "collision_stop_enabled", "force_localization_correction"):
             if field in waypoint and not isinstance(waypoint[field], bool):
                 raise ProtocolError("INVALID_MESSAGE", f"waypoint {field} must be boolean")
         if "arrival_policy" in waypoint and str(waypoint["arrival_policy"]).lower() not in {

@@ -4913,6 +4913,23 @@ class RosAdapter(Node):
             if enabled:
                 raise
 
+    def set_arrival_goal_tolerance(
+        self, tolerance_m: float, *, yaw_tolerance_rad: float = 0.25
+    ) -> None:
+        """Set and verify the Nav2 XY radius for the next waypoint goal."""
+        tolerance = max(0.01, float(tolerance_m))
+        self._set_remote_parameters(
+            "/controller_server",
+            {
+                "general_goal_checker.xy_goal_tolerance": tolerance,
+                "general_goal_checker.required_yaw_goal_tolerance": max(
+                    0.01, float(yaw_tolerance_rad)
+                ),
+            },
+            code="ARRIVAL_GOAL_TOLERANCE_FAILED",
+            attempts=4,
+        )
+
     def set_arrival_micro_goal_profile(
         self, *, enabled: bool, tolerance_m: float = 0.15
     ) -> None:

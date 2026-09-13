@@ -1606,6 +1606,27 @@ def test_disabling_goal_precision_does_not_raise_on_timeout(monkeypatch):
     adapter.set_goal_precision(enabled=False)
 
 
+def test_arrival_goal_tolerance_sets_xy_and_yaw_with_readback_path():
+    adapter = object.__new__(RosAdapter)
+    writes = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(
+        (node, values, kwargs)
+    )
+
+    adapter.set_arrival_goal_tolerance(0.50, yaw_tolerance_rad=0.25)
+
+    assert writes == [
+        (
+            "/controller_server",
+            {
+                "general_goal_checker.xy_goal_tolerance": 0.50,
+                "general_goal_checker.required_yaw_goal_tolerance": 0.25,
+            },
+            {"code": "ARRIVAL_GOAL_TOLERANCE_FAILED", "attempts": 4},
+        )
+    ]
+
+
 def test_zero_timeout_ready_probe_still_waits_for_action_discovery():
     assert RosAdapter._action_server_wait_timeout(0.0, 0.0) == 0.5
     assert RosAdapter._action_server_wait_timeout(10.0, 0.2) == 0.2

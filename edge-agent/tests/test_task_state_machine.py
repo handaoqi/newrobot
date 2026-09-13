@@ -37,6 +37,7 @@ class FakeNavigation:
         self.localization_policies = []
         self.waypoint_profiles = []
         self.goal_precisions = []
+        self.arrival_goal_tolerances = []
         self.docking_profiles = []
         self.live_profiles = []
         self.outdoor_profiles = []
@@ -160,6 +161,11 @@ class FakeNavigation:
 
     def set_goal_precision(self, *, enabled):
         self.goal_precisions.append(enabled)
+
+    def set_arrival_goal_tolerance(self, tolerance_m, *, yaw_tolerance_rad=0.25):
+        self.arrival_goal_tolerances.append(
+            (float(tolerance_m), float(yaw_tolerance_rad))
+        )
 
     def localization_decision(self):
         return dict(self.localization_state)
@@ -1293,6 +1299,182 @@ def test_reapproach_after_precision_recovery_allows_far_corrected_pose(tmp_path)
     assert executor.context.state == "running"
     assert executor.context.current_waypoint_index == 0
     assert executor._arrival_retry_counts[0] == 1
+    executor.stop()
+    store.close()
+
+
+def _set_middle_waypoint_as_active(executor, nav, *, distance_m, sample_age=0.1):
+    waypoint = executor.context.route_snapshot["waypoints"][1]
+    executor.context.current_waypoint_index = 1
+    executor._goal_offset = 1
+    executor._dispatched_count = 1
+    executor._last_target_index = 1
+    executor._last_reached_index = 0
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + float(distance_m),
+        y=float(waypoint["y"]),
+        yaw=3.141592653589793,
+    )
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "sample_age_seconds": sample_age,
+    }
+    return waypoint
+
+
+def test_plain_middle_waypoint_completes_inside_normal_radius_without_correction(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.25)
+    stationary_before = sum(phase == "stationary" for _, phase in nav.localization_policies)
+
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+
+    assert sum(phase == "stationary" for _, phase in nav.localization_policies) == stationary_before
+    confirmed = [event for event in events if event[0] == "task.arrival_confirmed"]
+    assert confirmed[-1][1]["coarse_completed"] is False
+    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.30
+    executor.stop()
+    store.close()
+
+
+def test_plain_middle_waypoint_reapproaches_twice_then_completes_in_coarse_radius(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.40)
+
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+    assert executor._arrival_retry_counts[1] == 1
+    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+    assert executor._arrival_retry_counts[1] == 2
+    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+
+    confirmed = [event for event in events if event[0] == "task.arrival_confirmed"]
+    assert confirmed[-1][1]["coarse_completed"] is True
+    assert confirmed[-1][1]["reapproach_attempts"] == 2
+    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.50
+    executor.stop()
+    store.close()
+
+
+def test_plain_middle_waypoint_outside_coarse_radius_enters_safe_hold(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.51)
+
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+    assert executor.context.state == "paused"
+    assert executor.context.last_safe_hold_code == "LIGHTWEIGHT_ARRIVAL_OUTSIDE_COARSE_RADIUS"
+    executor.stop()
+    store.close()
+
+
+def test_plain_middle_waypoint_with_stale_pose_enters_safe_hold(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = _set_middle_waypoint_as_active(
+        executor, nav, distance_m=0.20, sample_age=2.0
+    )
+
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+    assert executor.context.state == "paused"
+    assert executor.context.last_safe_hold_code == "LIGHTWEIGHT_ARRIVAL_POSE_UNAVAILABLE"
+    executor.stop()
+    store.close()
+
+
+def test_business_fields_and_execution_endpoints_require_full_correction(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    points = executor.context.route_snapshot["waypoints"]
+
+    assert executor._waypoint_requires_localization_correction(points[0], 0) is True
+    assert executor._waypoint_requires_localization_correction(points[-1], 2) is True
+    assert executor._waypoint_requires_localization_correction(points[1], 1) is False
+    executor.context.route_snapshot["initial_waypoint_index"] = 1
+    assert executor._waypoint_requires_localization_correction(points[1], 1) is True
+    executor.context.route_snapshot["initial_waypoint_index"] = 0
+    variants = [
+        {"force_localization_correction": True},
+        {"require_yaw": True},
+        {"dwell_seconds": 1.0},
+        {"actions": [{"type": "capture"}]},
+        {"speech_template_id": 7, "speech_mode": "non_blocking"},
+        {"arrival_policy": "precision"},
+        {"arrival_policy": "dock"},
+    ]
+    for changes in variants:
+        waypoint = {**points[1], **changes}
+        assert executor._waypoint_requires_localization_correction(waypoint, 1) is True
+    disabled_speech = {
+        **points[1],
+        "speech_template_id": 7,
+        "speech_mode": "disabled",
+    }
+    assert executor._waypoint_requires_localization_correction(disabled_speech, 1) is False
+    executor.stop()
+    store.close()
+
+
+def test_initial_and_reapproach_nav2_tolerances_include_docking_precision(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    assert nav.arrival_goal_tolerances[0] == (0.50, 0.25)
+
+    final = executor.context.route_snapshot["waypoints"][-1]
+    final["arrival_policy"] = "dock"
+    executor.context.docking = {"enabled": True, "final_waypoint_index": 2}
+    executor._arrival_reapproach_index = 2
+    assert executor._navigation_arrival_tolerance(2) == 0.08
+    executor._set_navigation_arrival_tolerance(2)
+    assert nav.arrival_goal_tolerances[-1] == (0.08, 0.0872665)
     executor.stop()
     store.close()
 
@@ -2882,7 +3064,9 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
         if event[0] == "task.progress"
         and event[1].get("milestone") == "waypoint_reached"
     ]
-    assert len(reached_events) == 1
+    # Business arrival must not be published until heading and the combined
+    # final-pose gate have both passed.
+    assert reached_events == []
     assert executor.context.post_arrival_waypoint_index == 0
     assert executor.context.post_arrival_stage == "heading_pending"
 
@@ -2910,6 +3094,13 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
     assert sum(ids(batch) == ["wp-1"] for batch in nav.sent) == 1
     assert ids(nav.sent[-1]) == ["wp-2"]
     assert executor.context.state == "running"
+    reached_events = [
+        event
+        for event in events
+        if event[0] == "task.progress"
+        and event[1].get("milestone") == "waypoint_reached"
+    ]
+    assert len(reached_events) == 1
     assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
     assert not any(event[0] == "task.safe_hold" for event in events)
     stages = [
@@ -2962,7 +3153,8 @@ def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
 
     assert executor.context.state == "paused"
     assert len(nav.sent) == 1
-    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
+    assert executor.context.arrival_side_effects_started is False
+    assert results == []
     store.close()
 
 
@@ -3473,10 +3665,17 @@ def test_docking_final_waypoint_requires_precise_position_and_heading(tmp_path):
     )
 
     executor.start_task(envelope)
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    nav.result("succeeded", "", {"missed_waypoints": []})
+    for _ in range(2):
+        target = nav.sent[-1][-1]
+        nav.pose = SimpleNamespace(
+            x=float(target["x"]),
+            y=float(target["y"]),
+            yaw=float(target.get("yaw") or 0.0),
+        )
+        nav.result("succeeded", "", {"missed_waypoints": []})
     assert nav.goal_precisions[-1] is True
     assert nav.waypoint_profiles[-1] == (False, True, True)
+    assert nav.arrival_goal_tolerances[-1] == (0.50, 0.25)
 
     final = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
     nav.pose = SimpleNamespace(x=final["x"] + 0.03, y=final["y"] - 0.02, yaw=final["yaw"] + 0.04)

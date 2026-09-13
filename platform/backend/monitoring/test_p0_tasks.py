@@ -100,6 +100,20 @@ class TaskExecutionTests(TestCase):
         self.assertIs(waypoint["require_yaw"], True)
         self.assertIs(waypoint["avoidance_to_next"], False)
 
+    def test_route_snapshot_preserves_forced_localization_correction(self):
+        self.route.waypoints = [
+            {
+                "x": 1,
+                "y": 2,
+                "yaw": 0,
+                "force_localization_correction": True,
+            }
+        ]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        waypoint = execution.route_snapshot["waypoints"][0]
+        self.assertIs(waypoint["force_localization_correction"], True)
+
 
     def test_route_snapshot_preserves_controller_settings(self):
         self.route.global_controller = "navfn"

@@ -59,6 +59,17 @@ def test_accepts_smac_hybrid_and_ilqr_waypoint():
     assert decoded["local_controller"] == "ilqr"
 
 
+def test_force_localization_correction_requires_boolean():
+    payload = json.loads(FIXTURE.read_text())
+    waypoint = payload["payload"]["command"]["route_snapshot"]["waypoints"][1]
+    waypoint["force_localization_correction"] = True
+    assert decode_message(payload).message_type == "task.start"
+    waypoint["force_localization_correction"] = "true"
+    with pytest.raises(ProtocolError) as exc:
+        decode_message(payload)
+    assert exc.value.code == "INVALID_MESSAGE"
+
+
 def test_accepts_nav_single_goal_global_controller():
     payload = json.loads(FIXTURE.read_text())
     payload["message_type"] = "nav.single_goal"
