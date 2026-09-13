@@ -3648,9 +3648,10 @@ async function handleDeleteRoute(route) {
                         <span>{{ step.statusLabel }}</span>
                       </div>
                       <small>{{ step.detail }}</small>
-                      <div class="localization-timeline-time">
+                      <div v-if="step.startedAt || step.finishedAt" class="localization-timeline-time">
                         开始 {{ formatDateTime(step.startedAt) }} · 完成 {{ formatDateTime(step.finishedAt) }}
                       </div>
+                      <div v-else class="localization-timeline-time">阶段时间未上报</div>
                       <div v-if="step.attempts.length" class="localization-timeline-attempts">
                         <div
                           v-for="attempt in step.attempts"

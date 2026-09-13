@@ -693,6 +693,7 @@ def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_
     navigation = ColdNavigation()
     stack = ColdStack(navigation)
     state = RuntimeSafetyState(localization_status="unknown", nav_ready=False)
+    progress = []
     processor = CommandProcessor(
         robot_id="rx-001",
         store=store,
@@ -702,6 +703,7 @@ def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_
         ),
         publish_ack=lambda *args: None,
         publish_result=lambda *args: None,
+        publish_progress=lambda *_args: progress.append(_args),
         localization_adapter=navigation,
         navigation_stack_adapter=stack,
     )
@@ -715,6 +717,8 @@ def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_
     assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
     assert payload["localization_bootstrap"]["action"] == "restart-localization"
     assert payload["navigation_start"]["action"] == "start"
+    assert payload["navigation_start"]["ready"] is True
+    assert progress[-1][1]["payload"]["result"]["navigation_start"]["ready"] is True
     assert state.nav_ready is True
     store.close()
 

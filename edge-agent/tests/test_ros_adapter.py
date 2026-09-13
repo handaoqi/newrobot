@@ -726,6 +726,8 @@ def test_active_relocalize_executes_the_one_meter_candidates():
     adapter._last_trusted_pose_report_monotonic = 0.0
     adapter._last_trusted_pose = None
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    progress = []
+    adapter._attempt_progress_cb = progress.append
     calls = []
 
     def reject(pose, generation):
@@ -845,6 +847,73 @@ def test_progressive_relocalize_falls_back_to_keyframe_global_match():
     assert result["selected_stage"] == "keyframe_global_match"
     assert result["localized_pose"]["x"] == 8.0
     assert result["stages"][-1]["status"] == "accepted"
+
+
+def test_progressive_relocalize_reports_handoff_failure_without_false_ndt_rejection():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 16
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter._last_trusted_pose = None
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    progress = []
+    adapter._attempt_progress_cb = progress.append
+    attempts = [
+        {
+            "index": index,
+            "stage": "mapping_origin_bounded",
+            "status": "failed" if index == 15 else "rejected",
+            "seed_pose": {"x": float(index), "y": 0.0, "yaw": 0.0},
+            "ndt_candidate": {
+                "eligible": index == 15,
+                "matching_error": 0.008 if index == 15 else 0.5,
+                "matched_pose": {"x": 1.5, "y": 2.5, "yaw": 0.2} if index == 15 else None,
+            },
+        }
+        for index in range(1, 19)
+    ] + [
+        {"index": 19, "stage": "mapping_origin_bounded", "status": "skipped", "reject_reason": "local_search_budget_exhausted"},
+        {"index": 20, "stage": "mapping_origin_bounded", "status": "skipped", "reject_reason": "local_search_budget_exhausted"},
+    ]
+
+    def failed_origin(_seed, _generation, *, persist_state):
+        raise ProtocolError(
+            "RELOCALIZATION_HANDOFF_FAILED",
+            "FAST-LIO did not become stable",
+            details={
+                "attempts": attempts,
+                "best_ndt_candidate": attempts[14]["ndt_candidate"],
+                "best_candidate_index": 15,
+                "best_candidate_stage": "mapping_origin_bounded",
+                "best_candidate_seed_pose": attempts[14]["seed_pose"],
+            },
+        )
+
+    adapter._active_relocalize_once = failed_origin
+    adapter._global_relocalize_once = lambda _wait, _generation: {
+        "localized_pose": {"x": 8.0, "y": 9.0, "yaw": 1.0},
+        "localization_status": "normal",
+    }
+
+    result = adapter.progressive_relocalize(
+        origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        waypoints=[],
+        wait_seconds=120.0,
+    )
+
+    origin = result["stages"][0]
+    assert origin["status"] == "failed"
+    assert "候选 #15 已通过 NDT 质量门限" in origin["error_message"]
+    assert "18 个" not in origin["error_message"]
+    assert origin["best_candidate_index"] == 15
+    origin_progress = next(
+        item["localization_attempts"]
+        for item in progress
+        if item["localization_attempts"].get("stages", [{}])[0].get("status") == "failed"
+    )
+    assert origin_progress["evaluated_candidate_count"] == 18
 
 
 def test_bounded_stage_progress_preserves_active_stage_and_timestamps():

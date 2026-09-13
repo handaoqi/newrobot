@@ -324,6 +324,37 @@ test('timeline does not timestamp future stages and keeps displayed times chrono
   assert.equal(global.finishedAt, null)
 })
 
+test('terminal stages without Edge timestamps remain unrecorded instead of using command completion time', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-no-synthetic-times',
+    command_type: 'nav.relocalize',
+    status: 'succeeded',
+    started_at: '2026-09-13T12:20:00.000Z',
+    finished_at: '2026-09-13T12:27:04.000Z',
+    result_payload: {
+      localization_attempts: {
+        state: 'accepted',
+        strategy: ['mapping_origin_bounded'],
+        stages: [{ stage: 'mapping_origin_bounded', status: 'accepted' }],
+      },
+      best_ndt_committed: true,
+      best_match_pose: { x: 1, y: 2, yaw: 0 },
+      navigation_start: { action: 'start', ready: true },
+    },
+  })
+
+  const timeline = localizationAttemptTimeline(session)
+  const origin = timeline.find(item => item.key === 'mapping_origin_bounded')
+  const commit = timeline.find(item => item.key === 'best_candidate_commit')
+  const navigation = timeline.find(item => item.key === 'navigation_start')
+  assert.equal(origin.startedAt, null)
+  assert.equal(origin.finishedAt, null)
+  assert.equal(commit.startedAt, null)
+  assert.equal(commit.finishedAt, null)
+  assert.equal(navigation.startedAt, null)
+  assert.equal(navigation.finishedAt, null)
+})
+
 test('active attempts override a stale waiting stage record', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-active-origin',
@@ -362,6 +393,47 @@ test('active attempts override a stale waiting stage record', () => {
   assert.equal(session.activeCandidateStage, 'mapping_origin_bounded')
   assert.equal(attemptStatusClass(origin.attempts[0].status), 'active')
   assert.equal(origin.startedAt, '2026-09-06T13:39:36.300Z')
+})
+
+test('completed origin stage is not revived by a stale committing candidate and names the committed point', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-handoff-failed',
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        strategy: ['mapping_origin_bounded', 'route_waypoints'],
+        stages: [{
+          stage: 'mapping_origin_bounded',
+          status: 'failed',
+          error_message: '建图原点候选 #15 已通过 NDT 质量门限，但提交后的 FAST-LIO 接管失败，已转入路线航点候选',
+        }],
+        best_ndt_committed: true,
+        best_candidate_index: 15,
+        best_candidate_stage: 'mapping_origin_bounded',
+        best_match_pose: { x: 1.2, y: 2.3, yaw: 0.4 },
+        best_ndt_candidate: { matching_error: 0.008, inlier_fraction: 0.99 },
+        attempts: [
+          { index: 15, stage: 'mapping_origin_bounded', status: 'committing', x: 1, y: 2, yaw: 0.3, matched_pose: { x: 1.2, y: 2.3, yaw: 0.4 }, matching_error: 0.008, inlier_fraction: 0.99 },
+          { index: 19, stage: 'mapping_origin_bounded', status: 'skipped', reject_reason: 'local_search_budget_exhausted' },
+          { index: 20, stage: 'mapping_origin_bounded', status: 'skipped', reject_reason: 'local_search_budget_exhausted' },
+        ],
+      },
+      navigation_start: { action: 'start', ready: true },
+    },
+  })
+
+  const timeline = localizationAttemptTimeline(session)
+  const origin = timeline.find(item => item.key === 'mapping_origin_bounded')
+  const commit = timeline.find(item => item.key === 'best_candidate_commit')
+  const navigation = timeline.find(item => item.key === 'navigation_start')
+  assert.equal(origin.status, 'failed')
+  assert.match(origin.detail, /候选 #15 已通过 NDT 质量门限/)
+  assert.equal(commit.status, 'done')
+  assert.match(commit.detail, /已提交候选 #15/)
+  assert.match(commit.detail, /NDT 0\.008/)
+  assert.equal(navigation.status, 'done')
 })
 
 test('manual initial-pose command does not display unrelated global-search stages', () => {

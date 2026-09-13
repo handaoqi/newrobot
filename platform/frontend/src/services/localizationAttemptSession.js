@@ -31,6 +31,8 @@ const ATTEMPT_REJECT_REASON_LABELS = {
   quality_gate: '未通过NDT质量门限',
   out_ranked: '已被更优候选替代',
   optimal_threshold_reached: '已有最优候选，未再尝试',
+  local_search_budget_exhausted: '局部搜索时间已用完，未执行',
+  lio_handoff_failed: 'FAST-LIO 接管失败',
   quick_search_budget_exhausted: '快速搜索时间已用完',
   LOCAL_SEARCH_BUDGET_EXHAUSTED: '局部搜索时间已用完',
   INITIAL_POSE_NOT_ACCEPTED: '初始位姿未通过定位验收',
@@ -376,6 +378,13 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
       raw.best_candidate_commit_finished_at,
       result.best_candidate_commit_finished_at,
     ),
+    bestCandidateIndex: finiteNumber(
+      raw.best_candidate_index ?? result.best_candidate_index,
+    ),
+    bestCandidateStage: raw.best_candidate_stage || result.best_candidate_stage || '',
+    bestCandidateSeedPose: finitePose(
+      raw.best_candidate_seed_pose || result.best_candidate_seed_pose,
+    ),
     selectedStage: raw.selected_stage || result.selected_stage || '',
     timelineHistory: Array.isArray(extras.timelineHistory) ? extras.timelineHistory : [],
   }
@@ -478,6 +487,11 @@ function stageAttemptsFor(session, stageKey, stageRecord = null) {
 }
 
 function inferredStageStatus(session, stageKey, attempts, stageRecord) {
+  // A completed stage is authoritative. A delayed candidate progress packet
+  // must not turn a rejected/failed stage back into "执行中".
+  if (stageRecord?.status && ['done', 'failed', 'skipped'].includes(timelineStatusClass(stageRecord.status))) {
+    return stageRecord.status
+  }
   if (attempts.some(attempt => ['verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(attempt.status))) return 'searching'
   if (stageRecord?.status && timelineStatusClass(stageRecord.status) !== 'waiting') return stageRecord.status
   if (stageRecord?.status) return stageRecord.status
@@ -502,23 +516,51 @@ function timelineDetail(stageKey, status, attempts, session, stageRecord = null)
       || session?.rtkVerification
     return formatRtkVerificationSummary(verification)
   }
+  if (stageKey === 'best_candidate_commit') {
+    if (timelineStatusClass(status) === 'waiting') return meta.detail
+    const selected = (session?.attempts || []).find(attempt => (
+      session?.bestCandidateIndex !== null
+      && session?.bestCandidateIndex !== undefined
+      && Number(attempt.candidateNumber) === Number(session.bestCandidateIndex)
+    ))
+    const candidateNumber = session?.bestCandidateIndex ?? selected?.candidateNumber
+    const pose = session?.bestMatchPose || selected?.matchedPose
+    const score = selected?.matchingError ?? finiteNumber(session?.bestNdtCandidate?.matching_error)
+    const inlier = selected?.inlierFraction ?? finiteNumber(session?.bestNdtCandidate?.inlier_fraction)
+    const source = session?.bestCandidateStage || selected?.stage || session?.source || 'NDT'
+    const committed = timelineStatusClass(status) === 'done'
+    const prefix = candidateNumber === null || candidateNumber === undefined
+      ? (committed ? '已提交最优候选' : '正在提交最优候选')
+      : `${committed ? '已提交' : '正在提交'}候选 #${candidateNumber}`
+    const metrics = [
+      `${prefix}（${source}）`,
+      ...(session?.bestCandidateSeedPose ? [`种子 ${formatAttemptPose(session.bestCandidateSeedPose)}`] : []),
+      `匹配位姿 ${formatAttemptPose(pose)}`,
+      `NDT ${formatAttemptMetric(score)}`,
+    ]
+    if (inlier !== null && inlier !== undefined) metrics.push(`内点 ${(Number(inlier) * 100).toFixed(1)}%`)
+    return metrics.join(' · ')
+  }
   if (attempts.length) {
+    const stageTerminal = ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))
     const active = attempts.find(attempt => (
       ['verifying', 'started', 'running', 'executing', 'in_progress'].includes(attempt.status)
     ))
     const committing = attempts.find(attempt => attempt.status === 'committing')
-    const evaluated = attempts.filter(attempt => !['waiting', 'verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(attempt.status)).length
-    const activeText = active
+    const evaluated = attempts.filter(attempt => (
+      ['qualified', 'accepted', 'rejected', 'failed', 'committing'].includes(attempt.status)
+    )).length
+    const skipped = attempts.filter(attempt => attempt.status === 'skipped').length
+    const activeText = stageTerminal ? '' : (active
       ? `正在尝试 #${active.candidateNumber}`
-      : (committing ? `正在提交 #${committing.candidateNumber}` : '')
-    return `${meta.detail} · ${activeText ? `${activeText} · ` : ''}已完成 ${evaluated}/${attempts.length} 个候选`
+      : (committing ? `正在提交 #${committing.candidateNumber}` : ''))
+    const skippedText = skipped ? ` · 已跳过 ${skipped}` : ''
+    return `${meta.detail} · ${activeText ? `${activeText} · ` : ''}已评估 ${evaluated}/${attempts.length} 个候选${skippedText}`
   }
   return meta.detail
 }
 
 function timelineStageTimes(stageKey, status, record, session) {
-  const commandStart = firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt)
-  const commandFinish = firstTimestamp(session?.commandFinishedAt)
   const historical = (session?.timelineHistory || []).find(item => item?.key === stageKey)
   let startedAt = firstTimestamp(record?.started_at, record?.startedAt)
   let finishedAt = firstTimestamp(record?.finished_at, record?.finishedAt)
@@ -534,38 +576,29 @@ function timelineStageTimes(stageKey, status, record, session) {
       startedAt,
       session?.localizationBootstrap?.started_at,
       session?.localizationBootstrap?.startedAt,
-      commandStart,
     )
     finishedAt = firstTimestamp(
       finishedAt,
       session?.localizationBootstrap?.finished_at,
       session?.localizationBootstrap?.finishedAt,
-      session?.localizationBootstrap ? startedAt : null,
     )
   } else if (stageKey === 'best_candidate_commit') {
-    startedAt = firstTimestamp(startedAt, session?.bestCandidateCommitStartedAt, commandStart)
-    finishedAt = firstTimestamp(finishedAt, session?.bestCandidateCommitFinishedAt, commandFinish)
+    startedAt = firstTimestamp(startedAt, session?.bestCandidateCommitStartedAt)
+    finishedAt = firstTimestamp(finishedAt, session?.bestCandidateCommitFinishedAt)
   } else if (stageKey === 'navigation_start') {
     startedAt = firstTimestamp(
       startedAt,
       session?.navigationStart?.started_at,
       session?.navigationStart?.startedAt,
-      commandStart,
     )
     finishedAt = firstTimestamp(
       finishedAt,
       session?.navigationStart?.finished_at,
       session?.navigationStart?.finishedAt,
-      session?.navigationStart ? commandFinish : null,
     )
   } else if (stageKey === 'map_transfer' && session?.phase !== 'transfer') {
-    startedAt = firstTimestamp(startedAt, historical?.startedAt, commandStart)
-    finishedAt = firstTimestamp(finishedAt, historical?.finishedAt, commandStart)
-  } else {
-    startedAt = firstTimestamp(startedAt, commandStart)
-  }
-  if (!finishedAt && ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))) {
-    finishedAt = startedAt
+    startedAt = firstTimestamp(startedAt, historical?.startedAt)
+    finishedAt = firstTimestamp(finishedAt, historical?.finishedAt)
   }
   return { startedAt, finishedAt }
 }
@@ -577,18 +610,13 @@ function timestampMillis(value) {
 }
 
 function orderedTimelineTimes(session, timeline) {
-  let cursor = timestampMillis(firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt))
+  let cursor = null
   return timeline.map(step => {
     let startedAt = step.startedAt
     let finishedAt = step.finishedAt
     let startedMillis = timestampMillis(startedAt)
     let finishedMillis = timestampMillis(finishedAt)
-    const status = timelineStatusClass(step.status)
 
-    if (startedMillis === null && status !== 'waiting') {
-      startedMillis = cursor
-      startedAt = startedMillis === null ? null : new Date(startedMillis).toISOString()
-    }
     if (startedMillis !== null && cursor !== null && startedMillis < cursor) {
       startedMillis = cursor
       startedAt = new Date(startedMillis).toISOString()
@@ -597,16 +625,6 @@ function orderedTimelineTimes(session, timeline) {
       finishedMillis = startedMillis
       finishedAt = new Date(finishedMillis).toISOString()
     }
-    if (
-      finishedMillis === null
-      && startedMillis !== null
-      && ['done', 'failed', 'skipped'].includes(status)
-    ) {
-      const commandFinish = timestampMillis(session?.commandFinishedAt)
-      finishedMillis = commandFinish === null ? startedMillis : Math.max(commandFinish, startedMillis)
-      finishedAt = new Date(finishedMillis).toISOString()
-    }
-
     if (finishedMillis !== null) cursor = finishedMillis
     else if (startedMillis !== null) cursor = Math.max(cursor ?? startedMillis, startedMillis)
 

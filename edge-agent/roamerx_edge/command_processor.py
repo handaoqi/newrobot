@@ -320,7 +320,7 @@ class CommandProcessor:
                 timeout_seconds=45.0,
                 message="Nav2 did not become ready after localization initialization",
             )
-            return result
+            return {**result, "ready": True}
         finally:
             self._navigation_command_lock.release()
 
@@ -645,6 +645,12 @@ class CommandProcessor:
                         "started_at": navigation_start.get("started_at") or navigation_started_at,
                         "finished_at": navigation_start.get("finished_at") or now_iso(),
                     }
+                    # The localization adapter's last progress frame is
+                    # emitted before Nav2 starts. Publish this terminal
+                    # transition as progress as well, otherwise a page that
+                    # is rendering the live command snapshot keeps the
+                    # navigation stage at "待执行" despite Nav2 being ready.
+                    self._emit_command_progress(envelope, started_at, result_payload)
                 self._structured(
                     "DEBUG", "relocalization" if envelope.message_type == "nav.relocalize" else "localization",
                     f"{envelope.message_type}.output", "定位算法输出",

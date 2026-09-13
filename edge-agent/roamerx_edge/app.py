@@ -46,6 +46,14 @@ from .system_telemetry import SystemTelemetryProbe
 LOGGER = logging.getLogger(__name__)
 
 
+# The USB audio services on the NX and 3588 do not necessarily become ready
+# at the same time as the Edge service.  Retry the boot-time unmute/volume
+# setup without delaying navigation or MQTT startup.
+BOOT_SPEAKER_VOLUME = 100
+BOOT_SPEAKER_RETRY_DELAYS_SECONDS = (0.0, 3.0, 10.0, 30.0)
+BOOT_SPEAKER_TARGETS = ("speaker_nx", "speaker_3588")
+
+
 class EdgeAgentApplication:
     def __init__(self, config: EdgeConfig, navigation=None, config_path: str = "config.yaml") -> None:
         self.config = config
@@ -267,6 +275,7 @@ class EdgeAgentApplication:
         self.system_telemetry.poll()
         self.charge_control_adapter.observe_power(self.telemetry.latest_power())
         self.power_mode_controller.refresh_service_status(self.telemetry.latest_power())
+        self._start_boot_speaker_volume_worker()
         self._publish_online()
         self.structured_logs.emit("INFO", "system", "edge.started", "Edge Agent 已启动")
         self.structured_logs.flush()
@@ -282,6 +291,46 @@ class EdgeAgentApplication:
         ]
         for thread in self._threads:
             thread.start()
+
+    def _start_boot_speaker_volume_worker(self) -> None:
+        """Restore both physical speakers to 100% after every Edge startup.
+
+        An Edge startup is part of every robot reboot.  Applying this from the
+        agent also covers a service restart and gives the 3588 PulseAudio
+        service time to appear after its own boot.
+        """
+        worker = threading.Thread(
+            target=self._set_boot_speaker_volumes,
+            daemon=True,
+            name="boot-speaker-volume",
+        )
+        self._threads.append(worker)
+        worker.start()
+
+    def _set_boot_speaker_volumes(self) -> None:
+        pending = set(BOOT_SPEAKER_TARGETS)
+        for retry_index, delay_seconds in enumerate(BOOT_SPEAKER_RETRY_DELAYS_SECONDS):
+            if delay_seconds and self.stop_event.wait(delay_seconds):
+                return
+            for target in tuple(pending):
+                try:
+                    self.audio_control_adapter.set_volume(target, BOOT_SPEAKER_VOLUME)
+                except Exception as exc:  # Retry transient USB/PulseAudio startup failures.
+                    LOGGER.warning(
+                        "boot speaker volume attempt %d failed for %s: %s",
+                        retry_index + 1,
+                        target,
+                        exc,
+                    )
+                else:
+                    pending.remove(target)
+                    LOGGER.info("boot speaker volume set: %s=%d%%", target, BOOT_SPEAKER_VOLUME)
+            if not pending:
+                return
+        LOGGER.error(
+            "boot speaker volume could not be set after retries: %s",
+            ", ".join(sorted(pending)),
+        )
 
     def stop(self) -> None:
         # ROS is still available here, so release a temporary fusion lease

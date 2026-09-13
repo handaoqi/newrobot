@@ -115,8 +115,22 @@ try:
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
+    # Keep module consumers importable in test/diagnostic environments without
+    # ROS. EdgeAgentApplication only calls rclpy when ROS_AVAILABLE is true.
+    rclpy = None  # type: ignore[assignment]
     Node = object
     GetParameters = None  # type: ignore
+
+    # Keep policy/profile helpers unit-testable when ROS Python messages are
+    # not installed. These are intentionally minimal stand-ins; the real
+    # message classes above are always used on the robot.
+    class String:  # type: ignore[no-redef]
+        def __init__(self):
+            self.data = ""
+
+    class Bool:  # type: ignore[no-redef]
+        def __init__(self):
+            self.data = False
 
 try:
     if ROS_AVAILABLE:
@@ -2311,6 +2325,7 @@ class RosAdapter(Node):
 
     @staticmethod
     def _skip_waiting_attempts(attempts: list[dict], reason: str) -> None:
+        finished_at = now_iso()
         for item in attempts:
             if item.get("status") != "waiting":
                 continue
@@ -2318,6 +2333,23 @@ class RosAdapter(Node):
             item["reject_reason"] = reason
             item["eligible"] = False
             item["accepted"] = False
+            item["finished_at"] = finished_at
+
+    @staticmethod
+    def _evaluated_localization_attempt_count(attempts: list[dict]) -> int:
+        """Count candidates that actually completed NDT evaluation.
+
+        ``waiting`` and ``skipped`` candidates were never evaluated. A
+        qualified or committing winner has completed NDT evaluation even while
+        its later FAST-LIO handoff is still pending.
+        """
+        return sum(
+            1
+            for item in attempts
+            if item.get("status") in {
+                "qualified", "committing", "accepted", "rejected", "failed",
+            }
+        )
 
     def set_initial_pose(self, pose: dict) -> dict:
         generation = self._start_localization_operation("operator_initial_pose")
@@ -3442,19 +3474,44 @@ class RosAdapter(Node):
                 details = dict(exc.details or {})
                 origin_attempts = list(details.get("attempts") or [])
                 all_attempts.extend(origin_attempts)
+                evaluated_count = self._evaluated_localization_attempt_count(origin_attempts)
+                skipped_count = sum(
+                    1 for item in origin_attempts if item.get("status") == "skipped"
+                )
+                best_candidate = dict(details.get("best_ndt_candidate") or {})
+                winner_index = details.get("best_candidate_index")
+                if exc.code == "RELOCALIZATION_HANDOFF_FAILED" and best_candidate.get("eligible"):
+                    winner_label = f" #{winner_index}" if winner_index is not None else ""
+                    origin_message = (
+                        f"建图原点候选{winner_label} 已通过 NDT 质量门限，但提交后的 "
+                        f"FAST-LIO 接管失败（{exc.message}），已转入路线航点候选"
+                    )
+                    origin_status = "failed"
+                else:
+                    skipped_detail = f"，另有 {skipped_count} 个因搜索预算结束跳过" if skipped_count else ""
+                    origin_message = (
+                        f"已评估 {evaluated_count} 个建图原点及周边候选{skipped_detail}，"
+                        "均未通过 NDT 质量门限，已转入路线航点候选"
+                    ) if origin_attempts else exc.message
+                    origin_status = "rejected"
                 origin_stage.update({
-                    "status": "rejected",
+                    "status": origin_status,
                     "finished_at": now_iso(),
                     "error_code": exc.code,
-                    "error_message": (
-                        f"已评估 {len(origin_attempts)} 个建图原点及周边候选，均未通过 NDT 质量门限，"
-                        "已转入路线航点候选"
-                    ) if origin_attempts else exc.message,
+                    "error_message": origin_message,
                     "attempts": origin_attempts,
-                    "best_ndt_candidate": details.get("best_ndt_candidate"),
+                    "best_ndt_candidate": best_candidate or None,
+                    "best_candidate_index": winner_index,
+                    "best_candidate_stage": details.get("best_candidate_stage"),
+                    "best_candidate_seed_pose": details.get("best_candidate_seed_pose"),
                     "timed_out": details.get("timed_out", False),
                 })
-                session.update(attempts=all_attempts, stages=stages, state="running")
+                session.update(
+                    attempts=all_attempts,
+                    stages=stages,
+                    state="running",
+                    evaluated_candidate_count=self._evaluated_localization_attempt_count(all_attempts),
+                )
                 self._report_localization_attempts(session)
 
         local_budget = max(0.0, deadline - time.monotonic() - 60.0)
@@ -3795,6 +3852,17 @@ class RosAdapter(Node):
                     })
                     self._report_localization_attempts(session, persist=persist_state)
                     break
+            budget_exhausted = any(item.get("status") == "waiting" for item in attempts)
+            if budget_exhausted:
+                # A timed out bounded search must never leave future points
+                # visually "waiting" after the stage has already moved on.
+                self._skip_waiting_attempts(attempts, "local_search_budget_exhausted")
+                session.update(
+                    attempts=attempts,
+                    evaluated_candidate_count=self._evaluated_localization_attempt_count(attempts),
+                    timed_out=True,
+                )
+                self._report_localization_attempts(session, persist=persist_state)
             ranked = self._select_ranked_attempt(attempts)
             if ranked is None:
                 self._restore_official_pose(official_snapshot, generation)
@@ -3804,7 +3872,7 @@ class RosAdapter(Node):
                     "best_ndt_candidate": self._best_diagnostic_candidate(attempts),
                     "live_pose": self._current_live_pose(),
                     "localization_status": getattr(latest, "localization_status", None),
-                    "timed_out": sum(1 for item in attempts if item.get("status") != "waiting") < max_attempts,
+                    "timed_out": budget_exhausted,
                 })
                 if active_stage is not None:
                     active_stage.update({
@@ -3816,7 +3884,7 @@ class RosAdapter(Node):
                 self._report_localization_attempts(session, persist=persist_state)
                 raise ProtocolError(
                     "ACTIVE_RELOCALIZATION_FAILED",
-                    f"stationary search exhausted {sum(1 for item in attempts if item.get('status') != 'waiting')} candidates; "
+                    f"stationary search exhausted {self._evaluated_localization_attempt_count(attempts)} candidates; "
                     f"localization_status={getattr(latest, 'localization_status', 'unknown')}",
                     details=session,
                 )
@@ -3847,9 +3915,7 @@ class RosAdapter(Node):
                 "attempts": attempts,
                 "early_stopped": early_stopped,
                 "stop_reason": "ndt_optimal_score" if early_stopped else "bounded_search_best",
-                "evaluated_candidate_count": sum(
-                    1 for item in attempts if item.get("status") != "skipped"
-                ),
+                "evaluated_candidate_count": self._evaluated_localization_attempt_count(attempts),
                 "candidate_count": max_attempts,
                 "best_candidate_commit_started_at": commit_started_at,
                 "best_candidate_commit_finished_at": commit_finished_at,
@@ -4105,11 +4171,26 @@ class RosAdapter(Node):
         attempts: list[dict],
     ) -> dict:
         best_pose = dict(candidate["matched_pose"])
+        commit_started_at = now_iso()
         winner_index = next(
             (item.get("index") for item in attempts if (item.get("ndt_candidate") or {}) is candidate
              or (item.get("ndt_candidate") or {}).get("matched_pose") == candidate.get("matched_pose")),
             None,
         )
+        winner_attempt = next(
+            (item for item in attempts if item.get("index") == winner_index),
+            None,
+        )
+        commit_metadata = {
+            "best_candidate_index": winner_index,
+            "best_candidate_stage": (
+                (winner_attempt or {}).get("stage")
+                or seed.get("stage")
+                or seed.get("source")
+                or "operator_seed"
+            ),
+            "best_candidate_seed_pose": dict((winner_attempt or {}).get("seed_pose") or {}),
+        }
         for item in attempts:
             if item.get("index") == winner_index or (
                 winner_index is None
@@ -4123,6 +4204,8 @@ class RosAdapter(Node):
             "best_ndt_candidate": candidate,
             "best_match_pose": best_pose,
             "live_pose": self._current_live_pose(),
+            "best_candidate_commit_started_at": commit_started_at,
+            **commit_metadata,
         }
         self._report_localization_attempts(state)
         try:
@@ -4139,6 +4222,17 @@ class RosAdapter(Node):
         except ProtocolError as exc:
             if exc.code == "RELOCALIZATION_SUPERSEDED":
                 raise
+            for item in attempts:
+                if item.get("index") != winner_index:
+                    continue
+                item.update({
+                    "status": "failed",
+                    "accepted": False,
+                    "reject_reason": "lio_handoff_failed",
+                    "error_code": exc.code,
+                    "error_message": exc.message,
+                    "finished_at": now_iso(),
+                })
             details = {
                 "mode": "stationary_bounded_search",
                 "source": seed.get("source", "operator_seed"),
@@ -4148,6 +4242,9 @@ class RosAdapter(Node):
                 "best_ndt_committed": True,
                 "handoff_pending": True,
                 "motion_commanded": False,
+                "best_candidate_commit_started_at": commit_started_at,
+                "best_candidate_commit_finished_at": now_iso(),
+                **commit_metadata,
             }
             self._report_localization_attempts({**details, "state": "handoff_failed"})
             raise ProtocolError(
@@ -4175,6 +4272,9 @@ class RosAdapter(Node):
             "localized_pose": result["localized_pose"],
             "localization_status": result["localization_status"],
             "motion_commanded": False,
+            "best_candidate_commit_started_at": commit_started_at,
+            "best_candidate_commit_finished_at": now_iso(),
+            **commit_metadata,
         }
         latest = self.telemetry.latest_pose()
         if self._trusted_pose_cb and latest:
