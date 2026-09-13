@@ -235,7 +235,7 @@ def main() -> int:
         preintegration_count = copy_preintegrations(source, output, rows)
         converter = WORKSPACE / "install" / "robot_slam" / "lib" / "robot_slam" / "pcd2grid_streaming"
         subprocess.run(
-            [str(converter), str(output / "map.pcd"), str(output / "map"), "0.05", "0.05", "0.75", "200000000"],
+            [str(converter), str(output / "map.pcd"), str(output / "map"), "0.05", "0.50", "0.75", "200000000", "3", "1"],
             check=True,
         )
         generate_map_preview(output / "map.pgm", output / "map_preview.png")

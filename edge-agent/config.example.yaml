@@ -142,6 +142,11 @@ mapping:
   auto_loop_optimization_enabled: false
   localization_scan_context_check_binary: /home/dogrobot/robot/install/localization/lib/localization/localization_scan_context_check
   pcd2grid_binary: /home/dogrobot/robot/install/robot_slam/lib/robot_slam/pcd2grid_streaming
+  # 5–50 cm continuous terrain is handled as traversable by navigation.
+  navigation_grid_min_height_m: 0.50
+  navigation_grid_max_height_m: 0.75
+  navigation_grid_min_points_per_cell: 3
+  navigation_grid_support_radius_cells: 1
   log_dir: /tmp/roamerx_mapping_logs
   map_dir: "/home/dogrobot/runtime/nx-edge/data/jszr/map"
   ros_setup: "/opt/ros/humble/setup.bash"

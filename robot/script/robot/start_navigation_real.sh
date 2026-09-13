@@ -4,7 +4,17 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/home/dogrobot/robot}"
 SCRIPT_DIR="${SCRIPT_DIR:-${PROJECT_DIR}/script/robot}"
 RUNTIME_DATA_ROOT="${ROAMERX_DATA_ROOT:-/home/dogrobot/runtime/nx-edge/data/jszr}"
-MAP_YAML="${MAP_YAML:-${RUNTIME_DATA_ROOT}/map/map.yaml}"
+MAP_YAML="${MAP_YAML:-}"
+if [ -z "${MAP_YAML}" ]; then
+  # New maps already write map.yaml with traversable-terrain semantics.  For
+  # legacy maps, use an explicitly generated sidecar grid when present so the
+  # original map remains available for immediate rollback.
+  if [ -f "${RUNTIME_DATA_ROOT}/map/map_traversable.yaml" ]; then
+    MAP_YAML="${RUNTIME_DATA_ROOT}/map/map_traversable.yaml"
+  else
+    MAP_YAML="${RUNTIME_DATA_ROOT}/map/map.yaml"
+  fi
+fi
 PCD_MAP="${PCD_MAP:-}"
 LOG_DIR="${LOG_DIR:-/tmp/roamerx_nav_logs}"
 PLATFORM="${PLATFORM:-NX_XG3588}"

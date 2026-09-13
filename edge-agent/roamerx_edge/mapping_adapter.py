@@ -577,6 +577,10 @@ class MappingAdapter:
                 list(command.get("selected_candidates") or []),
                 thresholds,
                 grid_converter=self.config.pcd2grid_binary,
+                navigation_grid_min_height_m=self.config.navigation_grid_min_height_m,
+                navigation_grid_max_height_m=self.config.navigation_grid_max_height_m,
+                navigation_grid_min_points_per_cell=self.config.navigation_grid_min_points_per_cell,
+                navigation_grid_support_radius_cells=self.config.navigation_grid_support_radius_cells,
             )
             self._run_post_save_localization_validation(output_dir)
             package_command = dict(command)

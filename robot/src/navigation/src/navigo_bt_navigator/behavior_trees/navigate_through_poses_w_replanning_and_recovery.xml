@@ -22,7 +22,7 @@
             <Fallback name="SmoothPathWithFallback">
               <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="{selected_smoother}" max_smoothing_duration="0.25" check_for_collisions="true"/>
               <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother" max_smoothing_duration="0.25" check_for_collisions="true"/>
-              <AlwaysSuccess/>
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="passthrough_smoother" max_smoothing_duration="0.25" check_for_collisions="true"/>
             </Fallback>
           </Sequence>
         </RateController>

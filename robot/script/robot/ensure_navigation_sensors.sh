@@ -25,11 +25,21 @@ set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
+# Restart an older converter instead of silently retaining its previous height
+# policy after a navigation-only restart.
+if pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1 \
+  && ! pgrep -f 'pointcloud_to_laserscan_node.*min_height:=0.50' >/dev/null 2>&1; then
+  pkill -TERM -f 'pointcloud_to_laserscan_node.*laser_scan_raw' || true
+  for _ in {1..20}; do
+    pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+fi
 if ! pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1; then
   setsid ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node --ros-args \
     -r cloud_in:=/front_lidar -r scan:=/laser_scan_raw \
     -p target_frame:=base_link -p transform_tolerance:=0.35 \
-    -p min_height:=0.05 -p max_height:=1.60 \
+    -p min_height:=0.50 -p max_height:=1.60 \
     -p angle_min:=-3.14159 -p angle_max:=3.14159 -p angle_increment:=0.0087 \
     -p scan_time:=0.1 -p range_min:=0.18 -p range_max:=4.0 \
     -p use_inf:=true -p inf_epsilon:=1.0 \

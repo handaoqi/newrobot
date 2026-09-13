@@ -29,7 +29,6 @@ int main(int argc, char** argv)
     if (argc > 8)
         options.support_radius_cells = static_cast<std::uint8_t>(std::clamp(std::stoi(argv[8]), 0, 8));
 
-    rclcpp::init(argc, argv);
     robot::slam::Pcd2Grid converter(options);
     std::string error;
     const bool ok = converter.runFromBinaryPcd(
@@ -42,7 +41,6 @@ int main(int argc, char** argv)
                 std::cout << "progress=" << percent << "%\r" << std::flush;
             }
         }, &error);
-    rclcpp::shutdown();
     if (!ok)
     {
         std::cerr << "\nerror: " << error << '\n';

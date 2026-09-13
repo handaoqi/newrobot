@@ -675,6 +675,10 @@ def optimize_reviewed_loop_closures(
     thresholds: dict[str, Any],
     *,
     grid_converter: str | Path,
+    navigation_grid_min_height_m: float = 0.50,
+    navigation_grid_max_height_m: float = 0.75,
+    navigation_grid_min_points_per_cell: int = 3,
+    navigation_grid_support_radius_cells: int = 1,
 ) -> dict[str, Any]:
     """Apply operator-confirmed loops to an immutable copied map directory.
 
@@ -810,7 +814,12 @@ def optimize_reviewed_loop_closures(
     if not converter.is_file():
         raise RuntimeError(f"grid converter not found: {converter}")
     subprocess.run(
-        [str(converter), str(root / "map.pcd"), str(root / "map"), "0.05", "0.05", "0.75", "200000000"],
+        [
+            str(converter), str(root / "map.pcd"), str(root / "map"), "0.05",
+            str(navigation_grid_min_height_m), str(navigation_grid_max_height_m),
+            "200000000", str(navigation_grid_min_points_per_cell),
+            str(navigation_grid_support_radius_cells),
+        ],
         check=True, capture_output=True, text=True, timeout=1800,
     )
     with (root / "map.txt").open("w", encoding="utf-8") as stream:

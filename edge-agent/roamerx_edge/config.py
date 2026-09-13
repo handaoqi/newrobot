@@ -270,6 +270,13 @@ class MappingConfig:
     pcd2grid_binary: str = (
         "/home/dogrobot/robot/install/robot_slam/lib/robot_slam/pcd2grid_streaming"
     )
+    # Navigation projects only obstacles above the height a quadruped can
+    # deliberately traverse.  Keep this in one Edge config so offline loop
+    # optimization produces the same PGM semantics as a freshly saved map.
+    navigation_grid_min_height_m: float = 0.50
+    navigation_grid_max_height_m: float = 0.75
+    navigation_grid_min_points_per_cell: int = 3
+    navigation_grid_support_radius_cells: int = 1
     auto_activate_uploaded_map: bool = True
     # A cloud map must remain usable for 3D NDT localization on a robot that
     # does not already have the source session directory.

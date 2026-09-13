@@ -124,6 +124,28 @@ def test_navigation_map_reload_rejects_unsuccessful_service_response(tmp_path, m
     assert captured.value.details["yaml_path"] == "/maps/map.yaml"
 
 
+def test_navigation_map_reload_prefers_legacy_traversable_sidecar(tmp_path, monkeypatch):
+    raw_yaml = tmp_path / "map.yaml"
+    raw_yaml.write_text("image: map.pgm\n", encoding="utf-8")
+    traversable_yaml = tmp_path / "map_traversable.yaml"
+    traversable_yaml.write_text("image: map_traversable.pgm\n", encoding="utf-8")
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    calls = []
+
+    def successful_run(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="result: 0", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", successful_run)
+
+    result = adapter.reload_navigation_map(str(raw_yaml))
+
+    assert result["traversable_grid"] is True
+    assert result["requested_yaml_path"] == str(raw_yaml)
+    assert result["yaml_path"] == str(traversable_yaml)
+    assert str(traversable_yaml) in calls[0][-1]
+
+
 
 def _ready_status_stdout(*, localization_status: str = "3") -> str:
     return (

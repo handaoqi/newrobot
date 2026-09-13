@@ -94,6 +94,9 @@ class NavigationStackAdapter:
 
     def reload_navigation_map(self, yaml_path: str) -> dict:
         """Reload the occupancy grid held by a running Nav2 map server."""
+        requested_path = Path(yaml_path)
+        traversable_path = requested_path.with_name("map_traversable.yaml")
+        effective_path = traversable_path if traversable_path.is_file() else requested_path
         script = (
             "source /opt/ros/humble/setup.bash && "
             "source /home/dogrobot/robot/install/setup.bash && "
@@ -101,13 +104,17 @@ class NavigationStackAdapter:
             "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}; "
             "timeout 25 ros2 service call /map_server/load_map "
             "nav2_msgs/srv/LoadMap "
-            + shlex.quote("{map_url: '" + yaml_path + "'}")
+            + shlex.quote("{map_url: '" + str(effective_path) + "'}")
         )
         return self._run_map_reload_command(
             "reload_navigation_map",
             script,
             error_code="NAVIGATION_MAP_RELOAD_FAILED",
-            payload={"yaml_path": yaml_path},
+            payload={
+                "yaml_path": str(effective_path),
+                "requested_yaml_path": yaml_path,
+                "traversable_grid": effective_path == traversable_path,
+            },
             success_markers=("result=0", "result: 0"),
         )
 
