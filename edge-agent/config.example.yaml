@@ -67,10 +67,11 @@ safety:
   stop_confirmation_seconds: 1.0
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
-  # Every waypoint first reaches this Nav2 radius. Plain intermediate points
-  # must then enter the 0.30 m radius within three re-approaches.
+  # Every waypoint first reaches this Nav2 radius. Every stopping waypoint is
+  # then stationary-corrected and must enter the 0.20 m radius within three
+  # re-approaches; only pass_through skips that physical-arrival transaction.
   coarse_goal_tolerance_m: 0.50
-  normal_arrival_tolerance_m: 0.30
+  normal_arrival_tolerance_m: 0.20
   precision_arrival_tolerance_m: 0.15
   arrival_reapproach_max_attempts: 3
   # Used only at the final docking contact waypoint.

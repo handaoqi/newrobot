@@ -119,10 +119,11 @@ class SafetyConfig:
     navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
-    # Every Nav2 leg first enters a coarse arrival circle. Business waypoints
-    # are then verified against the stricter policy-specific tolerances below.
+    # Every Nav2 leg first enters a coarse arrival circle. Every stopping
+    # waypoint is then stationary-corrected and verified against the stricter
+    # policy-specific tolerances below.
     coarse_goal_tolerance_m: float = 0.50
-    normal_arrival_tolerance_m: float = 0.30
+    normal_arrival_tolerance_m: float = 0.20
     precision_arrival_tolerance_m: float = 0.15
     arrival_reapproach_max_attempts: int = 3
     docking_goal_tolerance_m: float = 0.08

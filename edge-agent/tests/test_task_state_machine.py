@@ -1179,7 +1179,7 @@ def test_arrival_within_tolerance_rejects_rtk_far_from_click(tmp_path):
     waypoint = {"x": 10.0, "y": 10.0}
     # LIO is on the click, but RTK says the dog is 2.5 m away.
     assert executor._arrival_within_tolerance(waypoint, 2) is False
-    nav.localization_state["rtk_x"] = 10.2
+    nav.localization_state["rtk_x"] = 10.15
     nav.localization_state["rtk_y"] = 10.1
     assert executor._arrival_within_tolerance(waypoint, 2) is True
     store.close()
@@ -1323,7 +1323,7 @@ def _set_middle_waypoint_as_active(executor, nav, *, distance_m, sample_age=0.1)
     return waypoint
 
 
-def test_plain_middle_waypoint_completes_inside_normal_radius_without_correction(tmp_path):
+def test_stop_and_confirm_middle_waypoint_never_uses_lightweight_arrival(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     events = []
@@ -1335,78 +1335,14 @@ def test_plain_middle_waypoint_completes_inside_normal_radius_without_correction
     )
     executor.start_task(command("task.start"))
     waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.25)
-    stationary_before = sum(phase == "stationary" for _, phase in nav.localization_policies)
-
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-
-    assert sum(phase == "stationary" for _, phase in nav.localization_policies) == stationary_before
-    confirmed = [event for event in events if event[0] == "task.arrival_confirmed"]
-    assert confirmed[-1][1]["coarse_completed"] is False
-    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.30
-    executor.stop()
-    store.close()
-
-
-def test_plain_middle_waypoint_reapproaches_three_times_then_completes_inside_normal_radius(tmp_path):
-    store = LocalStore(str(tmp_path / "edge.db"))
-    nav = FakeNavigation()
-    events = []
-    executor = TaskExecutor(
-        store,
-        nav,
-        event_callback=lambda *args: events.append(args),
-        start_result_callback=lambda *args: None,
-    )
-    executor.start_task(command("task.start"))
-    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.40)
-
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-    assert executor._arrival_retry_counts[1] == 1
-    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-    assert executor._arrival_retry_counts[1] == 2
-    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-    assert executor._arrival_retry_counts[1] == 3
-    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
-
-    nav.pose.x = float(waypoint["x"]) + 0.29
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-
-    confirmed = [event for event in events if event[0] == "task.arrival_confirmed"]
-    assert confirmed[-1][1]["coarse_completed"] is False
-    assert confirmed[-1][1]["reapproach_attempts"] == 3
-    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.30
-    executor.stop()
-    store.close()
-
-
-def test_plain_middle_waypoint_three_failed_reapproaches_enter_safe_hold(tmp_path):
-    store = LocalStore(str(tmp_path / "edge.db"))
-    nav = FakeNavigation()
-    events = []
-    executor = TaskExecutor(
-        store,
-        nav,
-        event_callback=lambda *args: events.append(args),
-        start_result_callback=lambda *args: None,
-    )
-    executor.start_task(command("task.start"))
-    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.40)
-
-    for expected_attempt in (1, 2, 3):
-        assert executor._handle_lightweight_arrival(1, waypoint) is True
-        assert executor._arrival_retry_counts[1] == expected_attempt
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-
-    assert executor.context.state == "paused"
-    assert executor.context.last_safe_hold_code == "PHYSICAL_REAPPROACH_EXHAUSTED"
+    assert executor._waypoint_requires_localization_correction(waypoint, 1) is True
+    assert executor._handle_lightweight_arrival(1, waypoint) is False
     assert not [event for event in events if event[0] == "task.arrival_confirmed"]
     executor.stop()
     store.close()
 
 
-def test_plain_middle_waypoint_outside_coarse_radius_enters_safe_hold(tmp_path):
+def test_pass_through_middle_waypoint_is_the_only_correction_opt_out(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -1416,37 +1352,15 @@ def test_plain_middle_waypoint_outside_coarse_radius_enters_safe_hold(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(command("task.start"))
-    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.51)
+    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.40)
+    waypoint["arrival_policy"] = "pass_through"
 
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-    assert executor.context.state == "paused"
-    assert executor.context.last_safe_hold_code == "LIGHTWEIGHT_ARRIVAL_OUTSIDE_COARSE_RADIUS"
+    assert executor._waypoint_requires_localization_correction(waypoint, 1) is False
     executor.stop()
     store.close()
 
 
-def test_plain_middle_waypoint_with_stale_pose_enters_safe_hold(tmp_path):
-    store = LocalStore(str(tmp_path / "edge.db"))
-    nav = FakeNavigation()
-    executor = TaskExecutor(
-        store,
-        nav,
-        event_callback=lambda *args: None,
-        start_result_callback=lambda *args: None,
-    )
-    executor.start_task(command("task.start"))
-    waypoint = _set_middle_waypoint_as_active(
-        executor, nav, distance_m=0.20, sample_age=2.0
-    )
-
-    assert executor._handle_lightweight_arrival(1, waypoint) is True
-    assert executor.context.state == "paused"
-    assert executor.context.last_safe_hold_code == "LIGHTWEIGHT_ARRIVAL_POSE_UNAVAILABLE"
-    executor.stop()
-    store.close()
-
-
-def test_business_fields_and_execution_endpoints_require_full_correction(tmp_path):
+def test_every_non_pass_through_waypoint_requires_full_correction(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -1460,10 +1374,7 @@ def test_business_fields_and_execution_endpoints_require_full_correction(tmp_pat
 
     assert executor._waypoint_requires_localization_correction(points[0], 0) is True
     assert executor._waypoint_requires_localization_correction(points[-1], 2) is True
-    assert executor._waypoint_requires_localization_correction(points[1], 1) is False
-    executor.context.route_snapshot["initial_waypoint_index"] = 1
     assert executor._waypoint_requires_localization_correction(points[1], 1) is True
-    executor.context.route_snapshot["initial_waypoint_index"] = 0
     variants = [
         {"force_localization_correction": True},
         {"require_yaw": True},
@@ -1476,12 +1387,8 @@ def test_business_fields_and_execution_endpoints_require_full_correction(tmp_pat
     for changes in variants:
         waypoint = {**points[1], **changes}
         assert executor._waypoint_requires_localization_correction(waypoint, 1) is True
-    disabled_speech = {
-        **points[1],
-        "speech_template_id": 7,
-        "speech_mode": "disabled",
-    }
-    assert executor._waypoint_requires_localization_correction(disabled_speech, 1) is False
+    pass_through = {**points[1], "arrival_policy": "pass_through"}
+    assert executor._waypoint_requires_localization_correction(pass_through, 1) is False
     executor.stop()
     store.close()
 
@@ -1497,6 +1404,11 @@ def test_initial_and_reapproach_nav2_tolerances_include_docking_precision(tmp_pa
     )
     executor.start_task(command("task.start"))
     assert nav.arrival_goal_tolerances[0] == (0.50, 0.25)
+
+    executor._arrival_reapproach_index = 1
+    assert executor._navigation_arrival_tolerance(1) == 0.20
+    executor._set_navigation_arrival_tolerance(1)
+    assert nav.arrival_goal_tolerances[-1] == (0.20, 0.25)
 
     final = executor.context.route_snapshot["waypoints"][-1]
     final["arrival_policy"] = "dock"
@@ -2662,7 +2574,7 @@ def test_outdoor_final_pose_error_rejects_rtk_off_click(tmp_path):
     code, message = executor._final_pose_error()
     assert code == "FINAL_POSE_OUT_OF_TOLERANCE"
     assert "RTK" in message
-    nav.localization_state["rtk_x"] = float(last_wp["x"]) + 0.2
+    nav.localization_state["rtk_x"] = float(last_wp["x"]) + 0.19
     nav.localization_state["rtk_y"] = float(last_wp["y"])
     assert executor._final_pose_error() is None
     store.close()
@@ -3071,6 +2983,11 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
         nav,
         event_callback=lambda *args: events.append(args),
         start_result_callback=lambda *args: None,
+        # This test exercises the bounded post-yaw cmd_vel path with its
+        # historic 0.60 m travel budget.  The production default for ordinary
+        # stopping points is tighter (0.20 m) and intentionally reserves
+        # Nav2 re-approach for larger residuals.
+        normal_arrival_tolerance_m=0.30,
     )
 
     executor.start_task(envelope)

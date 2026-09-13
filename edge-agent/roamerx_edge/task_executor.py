@@ -323,7 +323,7 @@ class TaskExecutor:
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
         coarse_goal_tolerance_m: float = 0.50,
-        normal_arrival_tolerance_m: float = 0.30,
+        normal_arrival_tolerance_m: float = 0.20,
         precision_arrival_tolerance_m: float = 0.15,
         arrival_reapproach_max_attempts: int = 3,
         docking_goal_tolerance_m: float = 0.08,
@@ -5968,42 +5968,15 @@ class TaskExecutor:
     def _waypoint_requires_localization_correction(
         self, waypoint: dict, waypoint_index: int
     ) -> bool:
-        """Classify business stops without changing legacy arrival policies."""
-        if self._arrival_policy(waypoint, waypoint_index) == "pass_through":
-            return False
-        try:
-            first_index = int(
-                self.context.route_snapshot.get("initial_waypoint_index", 0)
-            )
-        except (AttributeError, TypeError, ValueError):
-            first_index = 0
-        if waypoint_index == first_index or self._is_last_route_waypoint(waypoint_index):
-            return True
-        if bool(waypoint.get("force_localization_correction", False)):
-            return True
-        if bool(waypoint.get("require_yaw", False)):
-            return True
-        try:
-            if float(waypoint.get("dwell_seconds") or 0.0) > 0.0:
-                return True
-        except (TypeError, ValueError):
-            return True
-        if list(waypoint.get("actions") or []):
-            return True
-        speech_mode = str(waypoint.get("speech_mode") or "").strip().lower()
-        if speech_mode not in {"blocking", "non_blocking", "disabled"}:
-            speech_mode = (
-                "non_blocking"
-                if waypoint.get("speech_template_id") not in {None, ""}
-                else "disabled"
-            )
-        speech_enabled = (
-            waypoint.get("speech_template_id") not in {None, ""}
-            and speech_mode != "disabled"
-        )
-        if speech_enabled:
-            return True
-        return self._arrival_policy(waypoint, waypoint_index) in {"precision", "dock"}
+        """Every intentional stop must correct before it can be confirmed.
+
+        A coarse 0.50 m Nav2 success is only a safe stationary point for
+        localization; it is never a business arrival.  In particular, an
+        ordinary middle click must not be accepted from a drifting LIO pose.
+        ``pass_through`` remains the sole opt-out because it deliberately
+        represents route geometry rather than a physical stopping point.
+        """
+        return self._arrival_policy(waypoint, waypoint_index) != "pass_through"
 
     def _complete_lightweight_arrival(
         self,
