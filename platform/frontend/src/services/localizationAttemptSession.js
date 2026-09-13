@@ -256,6 +256,7 @@ function normalizeAttempt(attempt, index) {
     // display identity shared by the map marker and the stage list.
     index: displayNumber,
     candidateNumber: displayNumber,
+    candidateLabel: String(attempt?.candidate_label ?? attempt?.candidateLabel ?? ''),
     status: String(attempt?.status || 'waiting'),
     seedPose: seed,
     livePose: finitePose(attempt?.live_pose || attempt?.livePose),
@@ -385,6 +386,15 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     bestCandidateSeedPose: finitePose(
       raw.best_candidate_seed_pose || result.best_candidate_seed_pose,
     ),
+    bestCandidateLabel: String(
+      raw.best_candidate_label
+      ?? result.best_candidate_label
+      ?? '',
+    ),
+    bestCandidateNdt: raw.best_candidate_ndt || result.best_candidate_ndt || null,
+    bestCandidateHandoffPending: Boolean(
+      raw.handoff_pending ?? result.handoff_pending,
+    ),
     selectedStage: raw.selected_stage || result.selected_stage || '',
     timelineHistory: Array.isArray(extras.timelineHistory) ? extras.timelineHistory : [],
   }
@@ -429,6 +439,12 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     navigationStart: null,
     bestCandidateCommitStartedAt: null,
     bestCandidateCommitFinishedAt: null,
+    bestCandidateIndex: null,
+    bestCandidateStage: '',
+    bestCandidateSeedPose: null,
+    bestCandidateLabel: '',
+    bestCandidateNdt: null,
+    bestCandidateHandoffPending: false,
     selectedStage: '',
     timelineHistory: [],
   }
@@ -534,6 +550,7 @@ function timelineDetail(stageKey, status, attempts, session, stageRecord = null)
       : `${committed ? '已提交' : '正在提交'}候选 #${candidateNumber}`
     const metrics = [
       `${prefix}（${source}）`,
+      ...(session?.bestCandidateLabel ? [`候选点 ${session.bestCandidateLabel}`] : []),
       ...(session?.bestCandidateSeedPose ? [`种子 ${formatAttemptPose(session.bestCandidateSeedPose)}`] : []),
       `匹配位姿 ${formatAttemptPose(pose)}`,
       `NDT ${formatAttemptMetric(score)}`,

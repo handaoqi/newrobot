@@ -17,9 +17,12 @@ export function createRelocalizationMarker(pose, {
   commandId = '',
   occurredAt = new Date().toISOString(),
   verification = '',
+  candidateNumber = null,
+  candidateLabel = '',
 } = {}) {
   const normalized = finitePose(pose)
   if (!normalized) return null
+  const normalizedCandidateNumber = Number(candidateNumber)
   return {
     id: `${Date.parse(occurredAt) || Date.now()}-${Math.round(normalized.x * 1000)}-${Math.round(normalized.y * 1000)}`,
     ...normalized,
@@ -28,6 +31,10 @@ export function createRelocalizationMarker(pose, {
     commandId: String(commandId || ''),
     occurredAt,
     verification: String(verification || ''),
+    candidateNumber: Number.isInteger(normalizedCandidateNumber) && normalizedCandidateNumber > 0
+      ? normalizedCandidateNumber
+      : null,
+    candidateLabel: String(candidateLabel || ''),
   }
 }
 
@@ -73,6 +80,9 @@ export function writeStoredRelocalizationMarkers(robotId, markers) {
 export function relocalizationMarkerTitle(marker) {
   const source = marker?.source || marker?.commandType || '重定位'
   const time = marker?.occurredAt ? new Date(marker.occurredAt).toLocaleString('zh-CN', { hour12: false }) : '—'
+  const candidate = Number.isInteger(Number(marker?.candidateNumber)) && Number(marker.candidateNumber) > 0
+    ? ` · 最优候选 #${Number(marker.candidateNumber)}${marker?.candidateLabel ? `（${marker.candidateLabel}）` : ''}`
+    : ''
   const verification = marker?.verification ? ` · ${marker.verification}` : ''
-  return `${source} · x ${Number(marker.x).toFixed(3)} / y ${Number(marker.y).toFixed(3)}${verification} · ${time}`
+  return `${source}${candidate} · x ${Number(marker.x).toFixed(3)} / y ${Number(marker.y).toFixed(3)}${verification} · ${time}`
 }

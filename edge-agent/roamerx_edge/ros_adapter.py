@@ -3286,7 +3286,10 @@ class RosAdapter(Node):
                 candidate = dict(ranked.get("ndt_candidate") or {})
                 committed = self._commit_best_relocalization_candidate(
                     generation,
-                    {"source": ranked.get("stage") or "quick_initialization"},
+                    {
+                        "source": ranked.get("stage") or "quick_initialization",
+                        "selected_candidate_index": ranked.get("index"),
+                    },
                     candidate,
                     attempts,
                 )
@@ -3511,6 +3514,19 @@ class RosAdapter(Node):
                     stages=stages,
                     state="running",
                     evaluated_candidate_count=self._evaluated_localization_attempt_count(all_attempts),
+                    # Keep a failed handoff visible while the next stage is
+                    # searched.  Otherwise the next progress packet erases
+                    # exactly which origin candidate was submitted and its
+                    # NDT evidence from the operator-facing result.
+                    best_ndt_candidate=best_candidate or session.get("best_ndt_candidate"),
+                    best_match_pose=details.get("best_match_pose") or session.get("best_match_pose"),
+                    best_ndt_committed=bool(details.get("best_ndt_committed", False)),
+                    best_candidate_index=winner_index,
+                    best_candidate_stage=details.get("best_candidate_stage"),
+                    best_candidate_seed_pose=details.get("best_candidate_seed_pose"),
+                    best_candidate_label=details.get("best_candidate_label"),
+                    best_candidate_ndt=details.get("best_candidate_ndt"),
+                    handoff_pending=bool(details.get("handoff_pending", False)),
                 )
                 self._report_localization_attempts(session)
 
@@ -3611,6 +3627,7 @@ class RosAdapter(Node):
                     {
                         "source": ranked.get("stage") or "route_waypoint",
                         "waypoint_index": ranked.get("waypoint_index"),
+                        "selected_candidate_index": ranked.get("index"),
                     },
                     candidate,
                     all_attempts,
@@ -3898,7 +3915,16 @@ class RosAdapter(Node):
             self._report_localization_attempts(session, persist=persist_state)
             self._trusted_pose_frozen = False
             committed = self._commit_best_relocalization_candidate(
-                generation, seed, best_candidate, attempts
+                generation,
+                {
+                    **seed,
+                    # The NDT output can be identical for two seed hypotheses.
+                    # Preserve the selected attempt identity instead of trying
+                    # to recover it from an equal matched pose at commit time.
+                    "selected_candidate_index": ranked.get("index"),
+                },
+                best_candidate,
+                attempts,
             )
             commit_finished_at = now_iso()
             if active_stage is not None:
@@ -3935,6 +3961,10 @@ class RosAdapter(Node):
         }
         return {
             "index": index,
+            # Keep an explicit display identity in the progress protocol.
+            # `index` remains for compatibility with stored older sessions.
+            "candidate_number": index,
+            "candidate_label": str(candidate.get("candidate_label") or ""),
             "status": "waiting",
             "seed_pose": seed_pose,
             "x": candidate.get("x"),
@@ -4172,11 +4202,17 @@ class RosAdapter(Node):
     ) -> dict:
         best_pose = dict(candidate["matched_pose"])
         commit_started_at = now_iso()
-        winner_index = next(
-            (item.get("index") for item in attempts if (item.get("ndt_candidate") or {}) is candidate
-             or (item.get("ndt_candidate") or {}).get("matched_pose") == candidate.get("matched_pose")),
-            None,
-        )
+        requested_winner_index = seed.get("selected_candidate_index")
+        try:
+            winner_index = int(requested_winner_index) if requested_winner_index is not None else None
+        except (TypeError, ValueError):
+            winner_index = None
+        if winner_index is None:
+            winner_index = next(
+                (item.get("index") for item in attempts if (item.get("ndt_candidate") or {}) is candidate
+                 or (item.get("ndt_candidate") or {}).get("matched_pose") == candidate.get("matched_pose")),
+                None,
+            )
         winner_attempt = next(
             (item for item in attempts if item.get("index") == winner_index),
             None,
@@ -4190,6 +4226,14 @@ class RosAdapter(Node):
                 or "operator_seed"
             ),
             "best_candidate_seed_pose": dict((winner_attempt or {}).get("seed_pose") or {}),
+            "best_candidate_label": str((winner_attempt or {}).get("candidate_label") or ""),
+            "best_candidate_ndt": {
+                "matching_error": candidate.get("matching_error"),
+                "inlier_fraction": candidate.get("inlier_fraction"),
+                "has_converged": candidate.get("has_converged"),
+                "stable_frames": candidate.get("stable_frames"),
+                "required_stable_frames": candidate.get("required_stable_frames"),
+            },
         }
         for item in attempts:
             if item.get("index") == winner_index or (
@@ -4313,18 +4357,25 @@ class RosAdapter(Node):
         def normalize(angle: float) -> float:
             return math.atan2(math.sin(angle), math.cos(angle))
 
+        yaw_hypotheses = (
+            (0.0, "中心点·原始航向"),
+            (math.pi / 4, "中心点·左转 45°"),
+            (-math.pi / 4, "中心点·右转 45°"),
+            (math.pi / 2, "中心点·左转 90°"),
+            (-math.pi / 2, "中心点·右转 90°"),
+            (3 * math.pi / 4, "中心点·左转 135°"),
+            (-3 * math.pi / 4, "中心点·右转 135°"),
+            (math.pi, "中心点·反向 180°"),
+        )
         candidates = [
-            {"x": x, "y": y, "z": z, "yaw": normalize(yaw + offset)}
-            for offset in (
-                0.0,
-                math.pi / 4,
-                -math.pi / 4,
-                math.pi / 2,
-                -math.pi / 2,
-                3 * math.pi / 4,
-                -3 * math.pi / 4,
-                math.pi,
-            )
+            {
+                "x": x,
+                "y": y,
+                "z": z,
+                "yaw": normalize(yaw + offset),
+                "candidate_label": label,
+            }
+            for offset, label in yaw_hypotheses
         ]
         # Expand the position search in bounded rings.  The first ring keeps
         # the correction local; the outer rings recover a robot that stopped
@@ -4332,8 +4383,19 @@ class RosAdapter(Node):
         # pose jump.
         for radius in (0.3, 0.6, 1.0):
             candidates.extend(
-                {"x": x + dx * radius, "y": y + dy * radius, "z": z, "yaw": normalize(yaw)}
-                for dx, dy in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+                {
+                    "x": x + dx * radius,
+                    "y": y + dy * radius,
+                    "z": z,
+                    "yaw": normalize(yaw),
+                    "candidate_label": f"周边 {direction} {radius:.1f} m",
+                }
+                for dx, dy, direction in (
+                    (1.0, 0.0, "+X"),
+                    (-1.0, 0.0, "-X"),
+                    (0.0, 1.0, "+Y"),
+                    (0.0, -1.0, "-Y"),
+                )
             )
         return candidates
 

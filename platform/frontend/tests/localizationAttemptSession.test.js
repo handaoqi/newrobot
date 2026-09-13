@@ -412,10 +412,13 @@ test('completed origin stage is not revived by a stale committing candidate and 
         best_ndt_committed: true,
         best_candidate_index: 15,
         best_candidate_stage: 'mapping_origin_bounded',
+        best_candidate_label: '周边 -Y 0.6 m',
+        best_candidate_ndt: { matching_error: 0.008, inlier_fraction: 0.99, has_converged: true },
+        handoff_pending: true,
         best_match_pose: { x: 1.2, y: 2.3, yaw: 0.4 },
         best_ndt_candidate: { matching_error: 0.008, inlier_fraction: 0.99 },
         attempts: [
-          { index: 15, stage: 'mapping_origin_bounded', status: 'committing', x: 1, y: 2, yaw: 0.3, matched_pose: { x: 1.2, y: 2.3, yaw: 0.4 }, matching_error: 0.008, inlier_fraction: 0.99 },
+          { index: 15, candidate_label: '周边 -Y 0.6 m', stage: 'mapping_origin_bounded', status: 'committing', x: 1, y: 2, yaw: 0.3, matched_pose: { x: 1.2, y: 2.3, yaw: 0.4 }, matching_error: 0.008, inlier_fraction: 0.99 },
           { index: 19, stage: 'mapping_origin_bounded', status: 'skipped', reject_reason: 'local_search_budget_exhausted' },
           { index: 20, stage: 'mapping_origin_bounded', status: 'skipped', reject_reason: 'local_search_budget_exhausted' },
         ],
@@ -432,7 +435,12 @@ test('completed origin stage is not revived by a stale committing candidate and 
   assert.match(origin.detail, /候选 #15 已通过 NDT 质量门限/)
   assert.equal(commit.status, 'done')
   assert.match(commit.detail, /已提交候选 #15/)
+  assert.match(commit.detail, /候选点 周边 -Y 0\.6 m/)
   assert.match(commit.detail, /NDT 0\.008/)
+  assert.equal(session.bestCandidateIndex, 15)
+  assert.equal(session.bestCandidateLabel, '周边 -Y 0.6 m')
+  assert.equal(session.bestCandidateHandoffPending, true)
+  assert.equal(session.attempts[0].candidateLabel, '周边 -Y 0.6 m')
   assert.equal(navigation.status, 'done')
 })
 

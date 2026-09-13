@@ -36,5 +36,12 @@ test('relocalization markers dedupe repeated command ids and nearby poses', () =
     occurredAt: new Date(Date.parse(first[0].occurredAt) + 20_000).toISOString(),
   })
   assert.equal(laterRuntime.length, 2)
-  assert.match(relocalizationMarkerTitle(createRelocalizationMarker({ x: 4, y: 5, yaw: 1.1 })), /x 4.000/)
+  const selected = createRelocalizationMarker({ x: 4, y: 5, yaw: 1.1 }, {
+    candidateNumber: 7,
+    candidateLabel: '周边 +Y 0.6 m',
+  })
+  assert.equal(selected.candidateNumber, 7)
+  assert.equal(selected.candidateLabel, '周边 +Y 0.6 m')
+  assert.match(relocalizationMarkerTitle(selected), /最优候选 #7（周边 \+Y 0.6 m）/)
+  assert.match(relocalizationMarkerTitle(selected), /x 4.000/)
 })

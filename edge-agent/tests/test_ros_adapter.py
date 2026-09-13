@@ -199,6 +199,9 @@ def test_fresh_normal_streak_requires_consecutive_successes():
 def test_relocalization_candidates_cover_full_yaw_and_nearby_positions():
     candidates = RosAdapter._relocalization_candidates(4.0, 5.0, 0.0, 0.0)
 
+    assert candidates[0]["candidate_label"] == "中心点·原始航向"
+    assert candidates[1]["candidate_label"] == "中心点·左转 45°"
+    assert candidates[8]["candidate_label"] == "周边 +X 0.3 m"
     center_yaws = {
         round(candidate["yaw"], 6)
         for candidate in candidates
@@ -428,6 +431,9 @@ def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     assert calls[-1][0]["x"] == 0.4
     assert result["best_ndt_committed"] is True
     assert result["best_match_pose"]["x"] == 0.4
+    assert result["best_candidate_index"] == 2
+    assert result["best_candidate_label"] == "中心点·左转 45°"
+    assert result["best_candidate_ndt"]["matching_error"] == pytest.approx(0.08)
     assert [item["status"] for item in result["attempts"][:2]] == ["rejected", "accepted"]
     assert [item.get("active_candidate_number") for item in progress if item.get("active_candidate_number")] == [1, 2, 3]
     first_completed = next(
@@ -437,6 +443,7 @@ def test_active_relocalize_ranks_all_eligible_candidates_before_commit():
     )
     assert first_completed["evaluated_candidate_count"] == 1
     assert first_completed["attempts"][0]["finished_at"] >= first_completed["attempts"][0]["started_at"]
+    assert first_completed["attempts"][0]["candidate_label"] == "中心点·原始航向"
 
 
 def test_quick_then_global_stops_on_strict_optimal_ndt_candidate():
@@ -888,6 +895,14 @@ def test_progressive_relocalize_reports_handoff_failure_without_false_ndt_reject
                 "best_candidate_index": 15,
                 "best_candidate_stage": "mapping_origin_bounded",
                 "best_candidate_seed_pose": attempts[14]["seed_pose"],
+                "best_candidate_label": "周边 -Y 0.6 m",
+                "best_candidate_ndt": {
+                    "matching_error": 0.008,
+                    "inlier_fraction": 0.91,
+                    "has_converged": True,
+                },
+                "best_ndt_committed": True,
+                "handoff_pending": True,
             },
         )
 
@@ -914,6 +929,10 @@ def test_progressive_relocalize_reports_handoff_failure_without_false_ndt_reject
         if item["localization_attempts"].get("stages", [{}])[0].get("status") == "failed"
     )
     assert origin_progress["evaluated_candidate_count"] == 18
+    assert origin_progress["best_candidate_index"] == 15
+    assert origin_progress["best_candidate_label"] == "周边 -Y 0.6 m"
+    assert origin_progress["best_candidate_ndt"]["matching_error"] == pytest.approx(0.008)
+    assert origin_progress["handoff_pending"] is True
 
 
 def test_bounded_stage_progress_preserves_active_stage_and_timestamps():

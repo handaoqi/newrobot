@@ -1995,9 +1995,11 @@ function maybeRegisterAttemptRelocalizationMarker(session) {
     source: session.source || session.commandType || '定位尝试',
     commandType: session.commandType || '',
     commandId,
+    candidateNumber: session.bestCandidateIndex,
+    candidateLabel: session.bestCandidateLabel,
     verification: session.rtkDrift?.verified
       ? `RTK漂移 ${formatAttemptMetric(session.rtkDrift.xy_m)}m`
-      : `NDT ${formatAttemptMetric(session.bestNdtCandidate?.matching_error)} < 0.01`,
+      : `NDT ${formatAttemptMetric(session.bestCandidateNdt?.matching_error ?? session.bestNdtCandidate?.matching_error)} < 0.01`,
   })
 }
 
@@ -2032,10 +2034,13 @@ function localizationAttemptProgressText(session) {
   }
   if (candidateCount <= 0) return '正在准备定位候选列表'
   if (activeAttempt) {
-    return `正在尝试候选 #${activeAttempt.candidateNumber} · 已完成 ${evaluated} / ${candidateCount} 个候选`
+    const label = activeAttempt.candidateLabel ? `（${activeAttempt.candidateLabel}）` : ''
+    return `正在验证候选 #${activeAttempt.candidateNumber}${label} · 已完成 ${evaluated} / ${candidateCount} 个候选`
   }
   if (committingAttempt) {
-    return `正在提交候选 #${committingAttempt.candidateNumber} · 已完成 ${evaluated} / ${candidateCount} 个候选`
+    const label = committingAttempt.candidateLabel ? `（${committingAttempt.candidateLabel}）` : ''
+    const score = formatAttemptMetric(committingAttempt.matchingError)
+    return `正在提交最优定位结果：候选 #${committingAttempt.candidateNumber}${label} · NDT ${score}`
   }
   return `已完成 ${evaluated} / ${candidateCount} 个候选 · 原点/航点候选阶段`
 }
@@ -3655,14 +3660,28 @@ async function handleDeleteRoute(route) {
                     · 绝对稳定 {{ localizationAttemptSession.rtkVerification.handoff.absoluteStable ? '是' : '否' }}
                   </p>
                 </div>
-                <p v-if="localizationAttemptSession.bestMatchPose">
-                  最优位姿 {{ formatAttemptPose(localizationAttemptSession.bestMatchPose) }}
-                  <span v-if="localizationAttemptSession.bestNdtCandidate">
-                    · 来源 {{ localizationAttemptSession.source || 'NDT' }}
-                    · NDT {{ formatAttemptMetric(localizationAttemptSession.bestNdtCandidate.matching_error) }}
-                    · 内点 {{ localizationAttemptSession.bestNdtCandidate.inlier_fraction == null ? '—' : `${(Number(localizationAttemptSession.bestNdtCandidate.inlier_fraction) * 100).toFixed(1)}%` }}
+                <div
+                  v-if="localizationAttemptSession.bestNdtCandidate || localizationAttemptSession.bestCandidateIndex != null"
+                  class="localization-best-candidate"
+                  :class="localizationAttemptSession.bestNdtCommitted ? 'committed' : 'pending'"
+                >
+                  <strong>{{ localizationAttemptSession.bestNdtCommitted ? (localizationAttemptSession.bestCandidateHandoffPending ? '最优NDT已提交，FAST-LIO接管失败' : '已提交最优定位结果') : '最优定位候选' }}</strong>
+                  <span v-if="localizationAttemptSession.bestCandidateIndex != null">
+                    候选 #{{ localizationAttemptSession.bestCandidateIndex }}
                   </span>
-                </p>
+                  <span v-if="localizationAttemptSession.bestCandidateLabel">· {{ localizationAttemptSession.bestCandidateLabel }}</span>
+                  <small v-if="localizationAttemptSession.bestCandidateSeedPose">
+                    种子 {{ formatAttemptPose(localizationAttemptSession.bestCandidateSeedPose) }}
+                  </small>
+                  <small v-if="localizationAttemptSession.bestMatchPose">
+                    最优位姿 {{ formatAttemptPose(localizationAttemptSession.bestMatchPose) }}
+                  </small>
+                  <small v-if="localizationAttemptSession.bestNdtCandidate || localizationAttemptSession.bestCandidateNdt">
+                    NDT score {{ formatAttemptMetric(localizationAttemptSession.bestCandidateNdt?.matching_error ?? localizationAttemptSession.bestNdtCandidate?.matching_error) }}
+                    · 内点 {{ (localizationAttemptSession.bestCandidateNdt?.inlier_fraction ?? localizationAttemptSession.bestNdtCandidate?.inlier_fraction) == null ? '—' : `${(Number(localizationAttemptSession.bestCandidateNdt?.inlier_fraction ?? localizationAttemptSession.bestNdtCandidate?.inlier_fraction) * 100).toFixed(1)}%` }}
+                    · 收敛 {{ (localizationAttemptSession.bestCandidateNdt?.has_converged ?? localizationAttemptSession.bestNdtCandidate?.has_converged) === true ? '是' : ((localizationAttemptSession.bestCandidateNdt?.has_converged ?? localizationAttemptSession.bestNdtCandidate?.has_converged) === false ? '否' : '—') }}
+                  </small>
+                </div>
                 <ol v-if="localizationAttemptSession" class="localization-attempt-timeline">
                   <li
                     v-for="(step, stepIndex) in localizationAttemptTimeline(localizationAttemptSession)"
@@ -3690,6 +3709,7 @@ async function handleDeleteRoute(route) {
                         >
                           <b>#{{ attempt.candidateNumber }}</b>
                           <span>{{ attemptStatusLabel(attempt.status) }}</span>
+                          <small v-if="attempt.candidateLabel">{{ attempt.candidateLabel }}</small>
                           <small>{{ formatAttemptPose(attempt.seedPose) }}</small>
                           <small v-if="attempt.matchingError !== null || ['rejected', 'failed'].includes(attempt.status)">NDT {{ formatAttemptMetric(attempt.matchingError) }}</small>
                           <small v-if="attempt.inlierFraction !== null || ['rejected', 'failed'].includes(attempt.status)">内点 {{ attempt.inlierFraction === null ? '—' : `${(attempt.inlierFraction * 100).toFixed(1)}%` }}</small>
@@ -3921,7 +3941,7 @@ async function handleDeleteRoute(route) {
                       class="localization-attempt-marker"
                       :class="attemptStatusClass(attempt.status)"
                       :style="attemptMarkerPosition(attempt)"
-                      :title="`候选 ${attempt.candidateNumber} ${attemptStatusLabel(attempt.status)} ${formatAttemptPose(attempt.seedPose)}`"
+                      :title="`候选 ${attempt.candidateNumber}${attempt.candidateLabel ? `（${attempt.candidateLabel}）` : ''} ${attemptStatusLabel(attempt.status)} ${formatAttemptPose(attempt.seedPose)}`"
                     >
                       {{ attempt.candidateNumber }}
                     </div>
@@ -3932,7 +3952,7 @@ async function handleDeleteRoute(route) {
                       :style="waypointDisplayPosition(marker)"
                       :title="relocalizationMarkerTitle(marker)"
                     >
-                      <i :style="relocalizationHeadingStyle(marker)"></i><small>{{ marker.sequence }}</small>
+                      <i :style="relocalizationHeadingStyle(marker)"></i><small>{{ marker.candidateNumber || marker.sequence }}</small>
                     </div>
                     <div v-if="robotDisplayPosition()" class="robot-marker" :class="{ untrusted: !robotMapPoint()?.trusted }" :style="robotDisplayPosition()" :title="robotMarkerTitle()">
                       <RobotDogIcon :size="28" />
@@ -5933,6 +5953,28 @@ async function handleDeleteRoute(route) {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
   background: #f8fafc;
+}
+.localization-best-candidate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.45rem;
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #bfdbfe;
+  border-radius: 7px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  font-size: 0.76rem;
+}
+.localization-best-candidate.committed {
+  border-color: #86efac;
+  background: #ecfdf5;
+  color: #166534;
+}
+.localization-best-candidate small {
+  color: inherit;
+  opacity: 0.9;
 }
 .localization-attempt-toggle {
   width: 100%;
