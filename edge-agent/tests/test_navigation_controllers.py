@@ -62,6 +62,11 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         spins = root.findall(".//Spin")
         adaptive_spins = root.findall(".//AdaptiveSpin")
         guarded_spins = root.findall(".//AdaptiveSpin/Spin")
+        spin_lease_scopes = [
+            node
+            for node in root.findall(".//RecoveryLeaseScope")
+            if node.attrib.get("reason") == "navigation_recovery_spin"
+        ]
         diagnoses = root.findall(".//FaultDiagnoseNode")
         smart_rtk_waits = root.findall(".//SmartRTKWait")
         fusion_profiles = root.findall(".//SetUkfWeight")
@@ -85,7 +90,9 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         assert smoother_selector is not None
         assert smoother_selector.attrib["default_smoother"] == "savitzky_golay"
         assert [node.attrib["smoother_id"] for node in smoothers] == [
-            "{selected_smoother}", "simple_smoother"
+            "{selected_smoother}",
+            "simple_smoother",
+            "passthrough_smoother",
         ]
         assert len(backups) == 1
         assert {node.attrib["lateral_dist"] for node in lateral_recoveries} == {
@@ -95,6 +102,8 @@ def test_default_navigation_trees_use_runtime_controller_selectors():
         assert feature_searches[0].attrib["dist_to_travel"] == "0.12"
         assert spins == guarded_spins
         assert len(adaptive_spins) == 1
+        assert len(spin_lease_scopes) == 1
+        assert spin_lease_scopes[0].attrib["skip_if_forbidden"] == "{forbid_spin}"
         assert adaptive_spins[0].attrib["episode_id"] == "{self_heal_episode}"
         assert adaptive_spins[0].attrib["fault_label"] == "{self_heal_fault}"
         assert adaptive_spins[0].attrib["permission_timeout_seconds"] == "1.0"

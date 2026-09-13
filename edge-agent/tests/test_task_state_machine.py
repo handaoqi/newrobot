@@ -1340,6 +1340,78 @@ def test_reapproach_rejected_arrival_redispatches_same_waypoint(tmp_path):
     store.close()
 
 
+def test_fine_reapproach_does_not_run_departure_heading_turn(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = executor.context.route_snapshot["waypoints"][0]
+    # Inside the 0.50 m coarse radius but outside the 0.20 m final radius,
+    # and deliberately facing away from the click. This is a fine XY
+    # re-approach, not a departure toward a new leg.
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.40,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+    before = len(nav.sent)
+
+    assert executor._reapproach_rejected_arrival(0) is True
+    assert len(nav.sent) == before + 1
+    assert executor._departure_heading_index is None
+    assert nav.teleop == []
+    executor.stop()
+    store.close()
+
+
+def test_expired_bt_recovery_lease_is_reclaimed_only_after_stop_confirmation(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        bt_recovery_lease_timeout_seconds=0.1,
+    )
+    lease = executor.acquire_recovery("BT_NAVIGATOR", "navigation_recovery_spin")
+    assert lease is not None
+
+    deadline = time.monotonic() + 1.0
+    while executor.recovery_snapshot()["owner"] != "NONE" and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert executor.recovery_snapshot()["owner"] == "NONE"
+    assert nav.stop_commands >= 1
+    executor.stop()
+    store.close()
+
+
+def test_navigation_cancel_reclaims_confirmed_stopped_bt_recovery_lease(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    lease = executor.acquire_recovery("BT_NAVIGATOR", "navigation_recovery_spin")
+    assert lease is not None
+
+    assert executor._cancel_active_navigation(timeout_seconds=0.1) is True
+    assert executor.recovery_snapshot()["owner"] == "NONE"
+    assert nav.cancelled == 1
+    assert nav.stop_commands >= 1
+    executor.stop()
+    store.close()
+
+
 def test_initial_xy_failure_never_starts_cmd_vel_adjustment(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -1391,6 +1463,76 @@ def test_reapproach_above_one_point_five_metres_requires_localization_recovery(t
     assert recovery_requests == ["arrival_precision_recovery"]
     safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
     assert safe_hold[1]["reason_code"] == "ARRIVAL_XY_UNVERIFIED"
+    executor.stop()
+    store.close()
+
+
+def test_normal_waypoint_accepts_fresh_coarse_pose_after_three_reapproaches(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    results = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"arrival_policy": "stop_and_confirm", "require_yaw": False})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.40,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_retry_counts[0] = executor.arrival_reapproach_max_attempts
+
+    assert executor._reapproach_rejected_arrival(0) is True
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
+    accepted = [event for event in events if event[0] == "task.arrival_degraded_accepted"]
+    assert accepted[-1][1]["distance_m"] == 0.4
+    confirmed = [
+        event
+        for event in events
+        if event[0] == "task.progress" and event[1].get("milestone") == "arrival_confirmed"
+    ][-1]
+    assert confirmed[1]["coarse_completed"] is True
+    executor.stop()
+    store.close()
+
+
+def test_precision_waypoint_does_not_relax_after_three_reapproaches(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"arrival_policy": "precision", "require_yaw": False})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.40,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+    executor._arrival_retry_counts[0] = executor.arrival_reapproach_max_attempts
+
+    assert executor._reapproach_rejected_arrival(0) is True
+    assert executor.context.state == "paused"
+    assert not any(event[0] == "task.arrival_degraded_accepted" for event in events)
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "PHYSICAL_REAPPROACH_EXHAUSTED"
     executor.stop()
     store.close()
 

@@ -97,6 +97,24 @@ class RecoveryArbiter:
             self._lease = None
             return True
 
+    def release_generation(self, owner: str, generation: int) -> bool:
+        """Release only the currently held lease identified by its generation.
+
+        A late ROS service reply must never be able to release a newer BT
+        recovery action.  This is used only after Edge has stopped the robot
+        and confirmed zero motion for an expired/cancelled BT lease.
+        """
+        with self._lock:
+            lease = self._lease
+            if (
+                lease is None
+                or lease.owner != str(owner)
+                or lease.generation != int(generation)
+            ):
+                return False
+            self._lease = None
+            return True
+
     def force_release(self) -> None:
         with self._lock:
             self._lease = None

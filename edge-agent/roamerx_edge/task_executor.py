@@ -81,6 +81,10 @@ HOLD_FINAL_POSE_OUTDOOR_TIMEOUT_SECONDS = 2.0
 # A no-correction completion still needs a full continuous-zero confirmation.
 # Keep the existing 2 s safe window and grow it if configuration requires more.
 NO_CORRECTION_STOP_RECHECK_MIN_SECONDS = 2.0
+# BT movement recoveries in the deployed trees have a maximum six-second
+# action allowance. Leave room for action cancellation and the lease RPC, then
+# reclaim only after Edge has confirmed a zero-motion state.
+BT_RECOVERY_LEASE_TIMEOUT_SECONDS = 10.0
 # Stopped at a waypoint: give RTK/NDT time to pull FAST-LIO back before leaving.
 WAYPOINT_SETTLE_TIMEOUT_SECONDS = 12.0
 # Outdoor clean arrival (no pending correction): brief health check only.
@@ -325,6 +329,10 @@ class TaskContext:
     post_arrival_waypoint_index: int | None = None
     post_arrival_stage: str = ""
     arrival_side_effects_started: bool = False
+    # Set only after the configured Nav2 re-approach budget is exhausted for a
+    # normal stopping waypoint. It keeps the accepted 0.50 m coarse radius
+    # durable through final-yaw/post-processing and final task completion.
+    arrival_coarse_fallback_accepted: bool = False
     arrival_micro_adjust_total_m: float = 0.0
     arrival_micro_adjust_steps: int = 0
     arrival_micro_adjust_started_at: float | None = None
@@ -377,6 +385,7 @@ class TaskExecutor:
         arrival_convergence_samples: int = 3,
         standup_confirmation_timeout_seconds: float = 12.0,
         stop_confirmation_seconds: float = 1.0,
+        bt_recovery_lease_timeout_seconds: float = BT_RECOVERY_LEASE_TIMEOUT_SECONDS,
         navigation_dispatch_retry_seconds: float = NAV_DISPATCH_RETRY_DEFAULT_SECONDS,
         navigation_dispatch_retry_budget_seconds: float = 300.0,
         map_set_coordinator=None,
@@ -454,6 +463,9 @@ class TaskExecutor:
         self.arrival_convergence_samples = max(1, int(arrival_convergence_samples))
         self.standup_confirmation_timeout_seconds = standup_confirmation_timeout_seconds
         self.stop_confirmation_seconds = max(0.0, float(stop_confirmation_seconds))
+        self.bt_recovery_lease_timeout_seconds = max(
+            0.1, float(bt_recovery_lease_timeout_seconds)
+        )
         self.navigation_dispatch_retry_seconds = max(0.5, float(navigation_dispatch_retry_seconds))
         self.navigation_dispatch_retry_budget_seconds = max(
             self.navigation_dispatch_retry_seconds,
@@ -506,6 +518,7 @@ class TaskExecutor:
         self._obstacle_episode_id = None
         self._obstacle_recovery_active = False
         self._recovery_arbiter = RecoveryArbiter()
+        self._bt_recovery_lease_timers: dict[int, threading.Timer] = {}
         self._action_registry = WaypointActionRegistry()
         self._emitted_event_keys: set[str] = set()
         self._correction_generation = 0
@@ -559,12 +572,98 @@ class TaskExecutor:
             self._emit_safe_hold("RECOVERY_BUDGET_EXHAUSTED", "自愈预算耗尽，进入安全保持")
             return None
         lease = self._recovery_arbiter.acquire(owner, reason, distance_m=distance_m)
+        if lease is not None and lease.owner == "BT_NAVIGATOR":
+            self._arm_bt_recovery_lease_timeout(lease.generation)
         if lease is None and self._recovery_arbiter.budget_exhausted():
             self._emit_safe_hold("RECOVERY_BUDGET_EXHAUSTED", "自愈预算耗尽，进入安全保持")
         return lease
 
     def release_recovery(self, lease) -> bool:
-        return self._recovery_arbiter.release(lease)
+        released = self._recovery_arbiter.release(lease)
+        if released and getattr(lease, "owner", "") == "BT_NAVIGATOR":
+            self._cancel_bt_recovery_lease_timeout(int(lease.generation))
+        return released
+
+    def _cancel_bt_recovery_lease_timeout(self, generation: int) -> None:
+        timer = self._bt_recovery_lease_timers.pop(int(generation), None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_all_bt_recovery_lease_timeouts(self) -> None:
+        timers = list(self._bt_recovery_lease_timers.values())
+        self._bt_recovery_lease_timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    def _release_bt_recovery_lease_after_stop(self, generation: int, *, trigger: str) -> bool:
+        """Reclaim a cancelled/expired BT lease only after confirmed stop."""
+        snapshot = self._recovery_arbiter.snapshot()
+        if (
+            snapshot.get("owner") != "BT_NAVIGATOR"
+            or int(snapshot.get("recovery_generation") or 0) != int(generation)
+        ):
+            self._cancel_bt_recovery_lease_timeout(generation)
+            return False
+        stop_motion = getattr(self.navigation, "stop_motion", None)
+        if callable(stop_motion):
+            stop_motion()
+        is_stopped = getattr(self.navigation, "is_robot_stopped", None)
+        if callable(is_stopped):
+            timeout = max(1.0, self.stop_confirmation_seconds + 0.5)
+            try:
+                try:
+                    stopped = bool(is_stopped(timeout_seconds=timeout))
+                except TypeError:
+                    stopped = bool(is_stopped())
+            except Exception:
+                LOGGER.warning("unable to confirm stop before BT lease reclaim", exc_info=True)
+                stopped = False
+            if not stopped:
+                return False
+        reclaimer = getattr(self.navigation, "reclaim_recovery_lease", None)
+        if callable(reclaimer):
+            try:
+                released = bool(reclaimer(int(generation)))
+            except Exception:
+                LOGGER.warning("BT recovery lease reclaim transport failed", exc_info=True)
+                released = False
+        else:
+            released = self._recovery_arbiter.release_generation(
+                "BT_NAVIGATOR", int(generation)
+            )
+        if released:
+            self._cancel_bt_recovery_lease_timeout(generation)
+            LOGGER.warning(
+                "reclaimed BT recovery lease generation=%s after %s and confirmed stop",
+                generation,
+                trigger,
+            )
+        return released
+
+    def _on_bt_recovery_lease_timeout(self, generation: int) -> None:
+        with self._lock:
+            if self._release_bt_recovery_lease_after_stop(generation, trigger="lease_timeout"):
+                return
+            snapshot = self._recovery_arbiter.snapshot()
+            if (
+                snapshot.get("owner") == "BT_NAVIGATOR"
+                and int(snapshot.get("recovery_generation") or 0) == int(generation)
+            ):
+                timer = threading.Timer(1.0, self._on_bt_recovery_lease_timeout, args=(generation,))
+                timer.daemon = True
+                self._bt_recovery_lease_timers[int(generation)] = timer
+                timer.start()
+
+    def _arm_bt_recovery_lease_timeout(self, generation: int) -> None:
+        self._cancel_bt_recovery_lease_timeout(generation)
+        timer = threading.Timer(
+            self.bt_recovery_lease_timeout_seconds,
+            self._on_bt_recovery_lease_timeout,
+            args=(generation,),
+        )
+        timer.daemon = True
+        self._bt_recovery_lease_timers[int(generation)] = timer
+        timer.start()
 
     def recovery_snapshot(self) -> dict:
         return self._recovery_arbiter.snapshot()
@@ -1602,6 +1701,7 @@ class TaskExecutor:
             self._action_registry.reset()
             self._recovery_arbiter.reset_budget()
             self._recovery_arbiter.force_release()
+            self._cancel_all_bt_recovery_lease_timeouts()
             self._correction_generation = 0
             self._correction_completed_at_mono = None
             self._active_correction_transaction_id = None
@@ -2041,13 +2141,22 @@ class TaskExecutor:
             return True
         try:
             if timeout_seconds is None:
-                return bool(cancel())
-            return bool(cancel(timeout_seconds=timeout_seconds))
+                cancelled = bool(cancel())
+            else:
+                cancelled = bool(cancel(timeout_seconds=timeout_seconds))
         except TypeError:
-            return bool(cancel())
+            cancelled = bool(cancel())
         except Exception:
             LOGGER.warning("Nav2 cancel raised", exc_info=True)
             return False
+        if cancelled:
+            snapshot = self._recovery_arbiter.snapshot()
+            if snapshot.get("owner") == "BT_NAVIGATOR":
+                self._release_bt_recovery_lease_after_stop(
+                    int(snapshot.get("recovery_generation") or 0),
+                    trigger="navigation_cancelled",
+                )
+        return cancelled
 
     def _clear_departure_heading(self, *, cancel_navigation: bool = False) -> None:
         """Drop an in-flight pre-leg spin so a later redispatch owns Nav2."""
@@ -3308,12 +3417,7 @@ class TaskExecutor:
             return True
         lio_dist = self._distance_to_waypoint(waypoint)
         if not self._outdoor_navigation_profile():
-            if policy == "precision":
-                limit = self.precision_arrival_tolerance_m
-            elif policy == "dock" and self._is_docking_task():
-                limit = float(self.docking_goal_tolerance_m)
-            else:
-                limit = self.final_waypoint_tolerance_m
+            limit, _ = self._arrival_pose_tolerances(waypoint, reached_index)
             if lio_dist is None:
                 LOGGER.warning(
                     "waypoint %d arrival rejected: indoor pose unavailable for click check",
@@ -3540,6 +3644,8 @@ class TaskExecutor:
         yaw_tolerance = (
             ARRIVAL_HEADING_ALIGN_RAD if bool(waypoint.get("require_yaw", False)) else None
         )
+        if self._coarse_arrival_fallback_active(reached_index):
+            return self.coarse_goal_tolerance_m, yaw_tolerance
         return self.final_waypoint_tolerance_m, yaw_tolerance
 
     def _arrival_pose_errors(
@@ -3603,6 +3709,19 @@ class TaskExecutor:
         active_index = self.context.post_arrival_waypoint_index
         return waypoint_index is None or active_index == waypoint_index
 
+    def _coarse_arrival_fallback_active(self, waypoint_index: int) -> bool:
+        """Whether this stopping waypoint has exhausted fine re-approaches.
+
+        The relaxed radius is deliberately scoped to the one waypoint that
+        consumed its three Nav2 fine re-approaches. It never applies to a
+        precision or docking policy, which cannot enter the fallback.
+        """
+        return bool(
+            self.context
+            and bool(getattr(self.context, "arrival_coarse_fallback_accepted", False))
+            and self.context.post_arrival_waypoint_index == waypoint_index
+        )
+
     def _set_post_arrival_stage(self, waypoint_index: int, stage: str) -> None:
         if not self.context:
             return
@@ -3616,6 +3735,7 @@ class TaskExecutor:
         self.context.post_arrival_waypoint_index = None
         self.context.post_arrival_stage = ""
         self.context.arrival_side_effects_started = False
+        self.context.arrival_coarse_fallback_accepted = False
         self._reset_arrival_micro_adjustment()
 
     def _reset_arrival_micro_adjustment(self) -> None:
@@ -4290,6 +4410,50 @@ class TaskExecutor:
             )
             return True
         if retries >= self.arrival_reapproach_max_attempts:
+            # Nav2 first reaches the 0.50 m coarse circle, then all three
+            # re-approaches use the normal 0.20 m (or precision) radius. Do
+            # not leave a normal patrol waypoint parked forever when the
+            # corrected, fresh pose consistently remains inside that original
+            # coarse circle. Precision and docking targets retain their
+            # stricter contract.
+            policy = self._arrival_policy(waypoint, reached_index)
+            if (
+                policy == "stop_and_confirm"
+                and not self._is_docking_task()
+                and distance <= self.coarse_goal_tolerance_m
+                and self._localization_sample_fresh()
+            ):
+                self._arrival_retry_counts.pop(reached_index, None)
+                self._arrival_reapproach_index = None
+                self._cancel_arrival_adjustment(reset_state=True)
+                self._arrival_convergence_attempts.pop(reached_index, None)
+                self._arrival_correction_completed_index = reached_index
+                self.context.arrival_coarse_fallback_accepted = True
+                self._set_post_arrival_stage(reached_index, "xy_verified")
+                self._emit_idempotent(
+                    "task.arrival_degraded_accepted",
+                    event_type_key="arrival_coarse_fallback_accepted",
+                    waypoint_id=str(waypoint.get("waypoint_id") or reached_index),
+                    code="ARRIVAL_FINE_REAPPROACH_EXHAUSTED",
+                    message=(
+                        "三次精细重靠近后仍未进入精细半径；"
+                        "已在 0.50 米粗到达半径内放行"
+                    ),
+                    extra={
+                        "distance_m": round(distance, 3),
+                        "fine_tolerance_m": self.final_waypoint_tolerance_m,
+                        "coarse_tolerance_m": self.coarse_goal_tolerance_m,
+                        "reapproach_attempts": retries,
+                    },
+                )
+                # Re-enter only the final-yaw/combined confirmation phase.
+                # The durable coarse-fallback marker changes its XY tolerance
+                # to 0.50 m, while still requiring three fresh final poses and
+                # the waypoint's requested yaw.
+                self.on_navigation_result(
+                    "succeeded", generation=self._nav_goal_generation
+                )
+                return True
             LOGGER.warning(
                 "waypoint %d still off-click after %d re-approaches",
                 reached_index,
@@ -4315,7 +4479,13 @@ class TaskExecutor:
         self.context.state = "running"
         self.context.state_version += 1
         self._persist()
-        self._send_from(reached_index)
+        # This is a correction of the current click, not a new cruise leg.
+        # _send_from() first faces the target direction and therefore turns in
+        # place whenever the residual is still larger than the tiny
+        # already-at-click guard. A coarse-arrived robot that merely needs
+        # 0.20 m fine XY convergence must instead keep its heading and let the
+        # single fine-tolerance Nav2 goal translate/replan as needed.
+        self._dispatch_navigation(reached_index)
         return True
 
     def _cancel_absolute_localization_resume_watch(self) -> None:
@@ -5669,7 +5839,9 @@ class TaskExecutor:
                         "distance_m": round(distance, 3) if distance is not None else None,
                         "acceptance_tolerance_m": xy_tolerance,
                         "reapproach_attempts": retries,
-                        "coarse_completed": False,
+                        "coarse_completed": self._coarse_arrival_fallback_active(
+                            reached_index
+                        ),
                     },
                 )
                 self._waypoint_localization_ready_index = reached_index
@@ -5797,12 +5969,12 @@ class TaskExecutor:
             elif self._departure_heading_index is None and self._dispatch_departure_heading(reached_index):
                 return
             next_waypoint_index = reached_index + 1
-            self._clear_post_arrival_state()
             self.context.current_waypoint_index = next_waypoint_index
             self.context.state_version += 1
-            self._persist()
             total_waypoints = len(self.context.route_snapshot["waypoints"])
             if next_waypoint_index < total_waypoints:
+                self._clear_post_arrival_state()
+                self._persist()
                 self._arrival_heading_completed_index = None
                 if self._segments:
                     current_segment = self._segments[self.context.current_segment_index]
@@ -5820,6 +5992,10 @@ class TaskExecutor:
                 self._send_from(next_waypoint_index)
                 return
             pose_error = self._final_pose_error()
+            # Keep a terminal waypoint's coarse-fallback marker until the
+            # final pose gate has evaluated the same accepted tolerance.
+            self._clear_post_arrival_state()
+            self._persist()
             self._arrival_heading_completed_index = None
             self._restore_navigation_profile()
             if pose_error:
@@ -6786,6 +6962,8 @@ class TaskExecutor:
         tolerance = (
             self.docking_goal_tolerance_m
             if self._is_docking_task()
+            else self.coarse_goal_tolerance_m
+            if self._coarse_arrival_fallback_active(len(waypoints) - 1)
             else self.final_waypoint_tolerance_m
         )
         if distance > tolerance:

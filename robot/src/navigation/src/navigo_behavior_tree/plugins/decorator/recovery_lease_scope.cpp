@@ -36,6 +36,9 @@ BT::PortsList RecoveryLeaseScope::providedPorts()
     BT::InputPort<std::string>("episode_id", std::string(""), "Self-healing episode"),
     BT::InputPort<unsigned>("level", 2u, "Recovery level"),
     BT::InputPort<std::string>("action_type", std::string(""), "Concrete action type"),
+    BT::InputPort<bool>(
+      "skip_if_forbidden", false,
+      "Fail before acquiring this recovery lease when the action is forbidden"),
     BT::InputPort<std::chrono::milliseconds>("server_timeout")};
 }
 
@@ -95,6 +98,18 @@ bool RecoveryLeaseScope::ensureActionReported()
 
 BT::NodeStatus RecoveryLeaseScope::tick()
 {
+  bool skip_if_forbidden = false;
+  getInput("skip_if_forbidden", skip_if_forbidden);
+  if (skip_if_forbidden) {
+    // Do not publish an ownership record for an action that policy has
+    // already forbidden. This avoids a transient/stale BT_NAVIGATOR spin
+    // lease in outdoor and transition scenes.
+    if (child_node_ && child_node_->status() == BT::NodeStatus::RUNNING) {
+      child_node_->halt();
+    }
+    requestRelease(false, "action_forbidden_by_policy");
+    return BT::NodeStatus::FAILURE;
+  }
   setStatus(BT::NodeStatus::RUNNING);
   if (!acquired_) {
     if (!acquire_sent_) {

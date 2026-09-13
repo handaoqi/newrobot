@@ -1185,6 +1185,18 @@ class RosAdapter(Node):
 
         return self._fill_recovery_lease_response(response, granted=False, snapshot=snapshot)
 
+    def reclaim_recovery_lease(self, generation: int) -> bool:
+        """Drop an expired BT lease after TaskExecutor confirmed zero motion.
+
+        The BT release RPC is intentionally asynchronous. If a navigator goal
+        is cancelled while that RPC is lost, retain neither the adapter's old
+        generation mapping nor the Edge movement ownership.
+        """
+        lease = self._bt_recovery_leases.pop(int(generation), None)
+        if lease is None or not self._recovery_lease_release_cb:
+            return False
+        return bool(self._recovery_lease_release_cb(lease))
+
     def set_mapping_divergence_callback(self, callback: Callable) -> None:
         self._mapping_divergence_cb = callback
 

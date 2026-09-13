@@ -62,7 +62,8 @@
             </RecoveryLeaseScope>
           </Sequence>
           <RecoveryLeaseScope owner="BT_NAVIGATOR" reason="navigation_recovery_spin"
-            episode_id="{self_heal_episode}" level="2" action_type="adaptive_spin">
+            episode_id="{self_heal_episode}" level="2" action_type="adaptive_spin"
+            skip_if_forbidden="{forbid_spin}">
             <AdaptiveSpin forbid_spin="{forbid_spin}" episode_id="{self_heal_episode}"
               fault_label="{self_heal_fault}" permission_timeout_seconds="1.0"
               score_threshold="0.4" max_age_seconds="0.75">

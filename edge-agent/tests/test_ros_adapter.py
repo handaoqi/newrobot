@@ -83,6 +83,19 @@ def test_recovery_lease_service_rejects_unknown_generation(monkeypatch):
     assert response.exhausted is True
 
 
+def test_reclaim_recovery_lease_releases_only_the_matching_bt_generation():
+    adapter = object.__new__(RosAdapter)
+    lease = SimpleNamespace(owner="BT_NAVIGATOR", generation=17)
+    adapter._bt_recovery_leases = {17: lease}
+    released = []
+    adapter._recovery_lease_release_cb = lambda value: released.append(value) or True
+
+    assert adapter.reclaim_recovery_lease(17) is True
+    assert released == [lease]
+    assert adapter._bt_recovery_leases == {}
+    assert adapter.reclaim_recovery_lease(17) is False
+
+
 def test_fusion_profile_request_carries_generation_guard(monkeypatch):
     class FakeFusionProfileService:
         class Request:
