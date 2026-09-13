@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <localization/correction_policy.hpp>
+#include <localization/online_anchor_correction_policy.hpp>
 
 namespace localization {
 namespace {
@@ -134,6 +135,46 @@ TEST(CorrectionPolicy, StrictWaypointModesDoNotFallbackAcrossSources) {
   EXPECT_EQ(selectWaypointCorrectionSource(
     CorrectionPolicyMode::ndt, false, 0.50, true, false, 0.10).source,
     CorrectionSource::none);
+}
+
+TEST(OnlineAnchorCorrectionPolicy, RequiresAnEligibleLowSpeedCruise) {
+  OnlineAnchorCorrectionConfig config;
+  OnlineAnchorCorrectionInput input;
+  input.policy_allowed = true;
+  input.moving = true;
+  input.lio_fresh = true;
+  input.nominal_profile = true;
+  input.motion_valid = true;
+  input.linear_speed_mps = 0.15;
+  input.yaw_rate_radps = 0.10;
+
+  EXPECT_TRUE(onlineAnchorCorrectionAllowed(config, input));
+  EXPECT_EQ(onlineAnchorCorrectionRejectionReason(config, input), "allowed");
+
+  input.linear_speed_mps = 0.151;
+  EXPECT_FALSE(onlineAnchorCorrectionAllowed(config, input));
+  EXPECT_EQ(onlineAnchorCorrectionRejectionReason(config, input), "linear_speed_exceeded");
+
+  input.linear_speed_mps = 0.10;
+  input.yaw_rate_radps = 0.101;
+  EXPECT_FALSE(onlineAnchorCorrectionAllowed(config, input));
+  EXPECT_EQ(onlineAnchorCorrectionRejectionReason(config, input), "yaw_rate_exceeded");
+
+  input.yaw_rate_radps = 0.05;
+  input.smoothing_active = true;
+  EXPECT_FALSE(onlineAnchorCorrectionAllowed(config, input));
+  EXPECT_EQ(onlineAnchorCorrectionRejectionReason(config, input), "correction_already_active");
+}
+
+TEST(OnlineAnchorCorrectionPolicy, KeepsResidualBandAndSafetyBoundaryDistinct) {
+  OnlineAnchorCorrectionConfig config;
+  EXPECT_TRUE(onlineAnchorCorrectionResidualInRange(config, 0.30, 0.0));
+  EXPECT_TRUE(onlineAnchorCorrectionResidualInRange(config, 0.0, 5.0 * M_PI / 180.0));
+  EXPECT_FALSE(onlineAnchorCorrectionResidualInRange(config, 0.299, 0.0));
+  EXPECT_FALSE(onlineAnchorCorrectionResidualInRange(config, 1.00, 0.0));
+  EXPECT_TRUE(onlineAnchorCorrectionResidualSevere(config, 1.00, 0.0));
+  EXPECT_TRUE(onlineAnchorCorrectionResidualSevere(config, 0.0, 10.0 * M_PI / 180.0));
+  EXPECT_FALSE(onlineAnchorCorrectionResidualSevere(config, 0.99, 9.9 * M_PI / 180.0));
 }
 
 }  // namespace

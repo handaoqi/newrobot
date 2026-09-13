@@ -60,6 +60,7 @@
 #include <localization/point_cloud_scheduler.hpp>
 #include <localization/correction_cooldown_gate.hpp>
 #include <localization/correction_policy.hpp>
+#include <localization/online_anchor_correction_policy.hpp>
 #include <localization/global_relocalization_policy.hpp>
 #include <localization/lio_motion_guard.hpp>
 #include <localization/rtk_primary_policy.hpp>
@@ -331,6 +332,45 @@ public:
     lio_correction_completion_rotation_rad_ = static_cast<float>(std::max(
       0.001, declare_parameter<double>("lio_primary.correction_smoothing.completion_rotation_deg", 0.25)
         * M_PI / 180.0));
+    online_anchor_correction_config_.enable = declare_parameter<bool>(
+      "lio_primary.online_anchor_correction.enable", true);
+    online_anchor_correction_config_.max_linear_speed_mps = std::max(
+      0.01, declare_parameter<double>(
+        "lio_primary.online_anchor_correction.max_linear_speed_mps", 0.15));
+    online_anchor_correction_config_.max_yaw_rate_radps = std::max(
+      0.01, declare_parameter<double>(
+        "lio_primary.online_anchor_correction.max_yaw_rate_radps", 0.10));
+    online_ndt_max_fitness_score_ = static_cast<float>(std::clamp(
+      declare_parameter<double>(
+        "lio_primary.online_anchor_correction.ndt_max_fitness_score", 0.10),
+      0.001, static_cast<double>(ndt_max_fitness_score_)));
+    online_ndt_min_inlier_fraction_ = static_cast<float>(std::clamp(
+      declare_parameter<double>(
+        "lio_primary.online_anchor_correction.ndt_min_inlier_fraction", 0.50),
+      0.05, 1.0));
+    online_observation_max_age_s_ = std::max(
+      0.05, declare_parameter<double>(
+        "lio_primary.online_anchor_correction.max_observation_age_seconds", 0.50));
+    online_anchor_correction_config_.min_residual_xy_m = std::max(
+      static_cast<double>(lio_drift_xy_m_), declare_parameter<double>(
+        "lio_primary.online_anchor_correction.min_residual_xy_m", 0.30));
+    online_anchor_correction_config_.max_residual_xy_m = std::max(
+      online_anchor_correction_config_.min_residual_xy_m + 0.01,
+      declare_parameter<double>(
+        "lio_primary.online_anchor_correction.max_residual_xy_m", 1.00));
+    online_anchor_correction_config_.min_residual_yaw_rad = std::max(
+      static_cast<double>(lio_drift_yaw_rad_), declare_parameter<double>(
+        "lio_primary.online_anchor_correction.min_residual_yaw_deg", 5.0) * M_PI / 180.0);
+    online_anchor_correction_config_.max_residual_yaw_rad = std::max(
+      online_anchor_correction_config_.min_residual_yaw_rad + 0.01,
+      declare_parameter<double>(
+        "lio_primary.online_anchor_correction.max_residual_yaw_deg", 10.0) * M_PI / 180.0);
+    online_correction_translation_rate_mps_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>(
+        "lio_primary.online_anchor_correction.translation_rate_mps", 0.05)));
+    online_correction_rotation_rate_radps_ = static_cast<float>(std::max(
+      0.01, declare_parameter<double>(
+        "lio_primary.online_anchor_correction.rotation_rate_degps", 3.0) * M_PI / 180.0));
     lio_correction_min_interval_s_ = std::max(
       0.0, declare_parameter<double>("lio_primary.correction_gate.min_interval_seconds", 3.0));
     lio_correction_post_suppression_s_ = std::max(
@@ -1312,6 +1352,74 @@ private:
     return std::isfinite(age) && std::fabs(age) <= lio_max_age_s_;
   }
 
+  bool currentLioMotion(
+      double& linear_speed_mps, double& yaw_rate_radps) const {
+    linear_speed_mps = std::numeric_limits<double>::infinity();
+    yaw_rate_radps = std::numeric_limits<double>::infinity();
+    std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+    if (lio_pose_history_.size() < 2) {
+      return false;
+    }
+    const auto& previous = lio_pose_history_[lio_pose_history_.size() - 2];
+    const auto& current = lio_pose_history_.back();
+    const double dt = static_cast<double>(current.stamp_ns - previous.stamp_ns) * 1.0e-9;
+    if (!std::isfinite(dt) || dt <= 1.0e-4 || dt > 0.5) {
+      return false;
+    }
+    const Eigen::Isometry3f delta = previous.pose.inverse() * current.pose;
+    if (!delta.matrix().allFinite()) {
+      return false;
+    }
+    linear_speed_mps = delta.translation().head<2>().norm() / dt;
+    const double previous_yaw = yawFromRotation(previous.pose.rotation());
+    const double current_yaw = yawFromRotation(current.pose.rotation());
+    yaw_rate_radps = std::fabs(yawDifference(current_yaw, previous_yaw)) / dt;
+    return std::isfinite(linear_speed_mps) && std::isfinite(yaw_rate_radps);
+  }
+
+  bool onlineAnchorCorrectionPolicyActive() const {
+    return online_anchor_correction_allowed_by_policy_ && motion_phase_ == "moving";
+  }
+
+  bool onlineAnchorCorrectionAllowed(
+      const rclcpp::Time& stamp,
+      std::string* rejection_reason = nullptr,
+      double* linear_speed_mps = nullptr,
+      double* yaw_rate_radps = nullptr) const {
+    double linear_speed = std::numeric_limits<double>::infinity();
+    double yaw_rate = std::numeric_limits<double>::infinity();
+    const bool motion_valid = currentLioMotion(linear_speed, yaw_rate);
+    const localization::OnlineAnchorCorrectionInput input{
+      online_anchor_correction_allowed_by_policy_,
+      motion_phase_ == "moving",
+      lioOdomFresh(stamp),
+      lio_motion_anomaly_active_.load(),
+      pending_lio_correction_.active,
+      fusion_profile_.load() == kFusionProfileNominal,
+      motion_valid,
+      linear_speed,
+      yaw_rate,
+    };
+    const std::string reason = localization::onlineAnchorCorrectionRejectionReason(
+      online_anchor_correction_config_, input);
+    if (rejection_reason) {
+      *rejection_reason = reason;
+    }
+    if (linear_speed_mps) {
+      *linear_speed_mps = linear_speed;
+    }
+    if (yaw_rate_radps) {
+      *yaw_rate_radps = yaw_rate;
+    }
+    return reason == "allowed";
+  }
+
+  void setLioAbsoluteDisagreement(bool active, const char* reason) {
+    lio_large_absolute_disagreement_ = active;
+    lio_large_absolute_disagreement_reason_ = active
+      ? (reason ? reason : "absolute_observation_disagreement") : "none";
+  }
+
   void beginLioHandoff(const char* source) {
     if (!enable_lio_primary_) {
       return;
@@ -1827,6 +1935,7 @@ private:
       pending_lio_correction_.active = false;
       last_correction_completed_steady_ns_ = steadyNowNanoseconds();
       lio_correction_cooldown_gate_.markCompleted(last_correction_completed_steady_ns_);
+      setLioAbsoluteDisagreement(false, nullptr);
       if (one_shot_correction_.active && one_shot_correction_.status == "smoothing") {
         one_shot_correction_.active = false;
         one_shot_correction_.status = "completed";
@@ -1876,10 +1985,14 @@ private:
     if (lio_has_previous_pose_) {
       const Eigen::Isometry3f delta = previous_lio_pose_.inverse() * T_lio;
       if (!delta.matrix().allFinite() || delta.translation().norm() > lio_max_step_m_) {
+        LioMotionGuardResult anomaly;
+        anomaly.anomaly = true;
+        anomaly.reason = delta.matrix().allFinite()
+          ? "translation_step_exceeded" : "non_finite_lio_pose";
+        latchLioMotionAnomaly(anomaly);
         RCLCPP_WARN(get_logger(),
-          "Rejecting FAST-LIO2 step of %.2fm; waiting to re-anchor on the next healthy scan",
+          "Rejecting FAST-LIO2 step of %.2fm; entering safe relocalization",
           delta.translation().norm());
-        resetLioAnchor();
         return false;
       }
     }
@@ -2140,9 +2253,14 @@ private:
       const PoseEstimator::MatchResult& match, const rclcpp::Time& stamp,
       bool force_correction = false) {
     lio_corrected_this_frame_ = false;
-    if (motion_phase_ != "stationary") {
+    const bool online_context = onlineAnchorCorrectionPolicyActive();
+    std::string online_rejection_reason = "stationary";
+    const bool online_allowed = motion_phase_ == "moving" &&
+      onlineAnchorCorrectionAllowed(stamp, &online_rejection_reason);
+    if (motion_phase_ != "stationary" && (force_correction || !online_allowed)) {
       ndt_drift_gate_.resetConsecutive();
-      ndt_drift_gate_.last_decision = "correction_requires_stationary";
+      ndt_drift_gate_.last_decision = online_context
+        ? online_rejection_reason : "correction_requires_stationary";
       return false;
     }
     if (!pose_estimator || pending_lio_correction_.active ||
@@ -2154,6 +2272,14 @@ private:
         last_ndt_inlier_fraction_ < 0.05f) {
       ndt_drift_gate_.resetConsecutive();
       ndt_drift_gate_.last_decision = "quality_rejected";
+      return false;
+    }
+    if (online_allowed && (match.fitness_score_ >= online_ndt_max_fitness_score_ ||
+        last_ndt_inlier_fraction_ < online_ndt_min_inlier_fraction_ ||
+        last_ndt_update_time_.nanoseconds() <= 0 ||
+        std::fabs((stamp - last_ndt_update_time_).seconds()) > online_observation_max_age_s_)) {
+      ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "online_ndt_quality_rejected";
       return false;
     }
     const Eigen::Vector3f ndt_position = match.transform_.block<3, 1>(0, 3);
@@ -2180,9 +2306,26 @@ private:
     }
     const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
+    const float trusted_drift_yaw = yaw_trusted ? drift_yaw : 0.0f;
+    if (online_context && localization::onlineAnchorCorrectionResidualSevere(
+          online_anchor_correction_config_, drift_xy, trusted_drift_yaw)) {
+      setLioAbsoluteDisagreement(true, "high_quality_ndt_residual");
+      ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "online_ndt_residual_severe";
+      return false;
+    }
+    if (online_allowed && !localization::onlineAnchorCorrectionResidualInRange(
+          online_anchor_correction_config_, drift_xy, trusted_drift_yaw)) {
+      ndt_drift_gate_.resetConsecutive();
+      ndt_drift_gate_.last_decision = "online_ndt_residual_outside_band";
+      return false;
+    }
+    if (online_context) {
+      setLioAbsoluteDisagreement(false, nullptr);
+    }
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       ndt_drift_gate_, "NDT/VGICP", true, drifted, ndt_position,
-      correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
+      correction_xy, drift_xy, trusted_drift_yaw,
       stamp.nanoseconds(), false, false, force_correction);
     if (status == AuxiliaryGateStatus::pending) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -2206,7 +2349,9 @@ private:
     }
     if (!scheduleLioAnchorCorrection(
           target_map_T_base, noise, "NDT/VGICP", stamp,
-          -1.0f, -1.0f, force_correction)) {
+          online_allowed ? online_correction_translation_rate_mps_ : -1.0f,
+          online_allowed ? online_correction_rotation_rate_radps_ : -1.0f,
+          force_correction)) {
       ndt_drift_gate_.resetConsecutive();
       ndt_drift_gate_.last_decision = "correction_schedule_rejected";
       return false;
@@ -2220,8 +2365,9 @@ private:
       one_shot_correction_.reason = "accepted_ndt_anchor_observation";
     }
     RCLCPP_WARN(get_logger(),
-      "NDT/VGICP queued smooth LIO correction: xy=%.3fm yaw=%.1fdeg score=%.3f "
+      "NDT/VGICP queued %s LIO correction: xy=%.3fm yaw=%.1fdeg score=%.3f "
       "inlier=%.3f Rxy=%.4f Ryaw=%.5f method=%s heading=%s",
+      online_allowed ? "online smooth" : "smooth",
       drift_xy, yaw_trusted ? drift_yaw * 180.0 / M_PI : 0.0, match.fitness_score_,
       last_ndt_inlier_fraction_, noise.horizontal_variance,
       noise.orientation_variance, match.method_.c_str(),
@@ -2231,9 +2377,16 @@ private:
 
   bool maybeCorrectRtkDrift(
       const RtkObservation& observation, bool force_correction = false) {
-    if (motion_phase_ != "stationary") {
+    const rclcpp::Time correction_stamp =
+      timeOnStampClock(observation.stamp_ns, get_clock()->now());
+    const bool online_context = onlineAnchorCorrectionPolicyActive();
+    std::string online_rejection_reason = "stationary";
+    const bool online_allowed = motion_phase_ == "moving" &&
+      onlineAnchorCorrectionAllowed(correction_stamp, &online_rejection_reason);
+    if (motion_phase_ != "stationary" && (force_correction || !online_allowed)) {
       rtk_drift_gate_.resetConsecutive();
-      rtk_drift_gate_.last_decision = "correction_requires_stationary";
+      rtk_drift_gate_.last_decision = online_context
+        ? online_rejection_reason : "correction_requires_stationary";
       return false;
     }
     if (observation.stamp_ns <= 0 ||
@@ -2261,14 +2414,17 @@ private:
     }
     const bool rtk_self_stable = fixed_quality_ok && updateRtkSelfStability(
       rtk_position_for_stability, observation.stamp_ns, source_step_for_stability);
-    const bool trust_rtk = rtk_self_stable ||
-      (!force_correction && motion_phase_ == "moving");
+    const bool trust_rtk = rtk_self_stable;
     if (force_correction && !rtk_self_stable) {
       rtk_drift_gate_.last_decision = "awaiting_rtk_self_stable";
       if (force_correction && one_shot_correction_.active) {
         one_shot_correction_.status = "waiting_source";
         one_shot_correction_.reason = "waiting_for_fixed_rtk_stability_window";
       }
+      return false;
+    }
+    if (online_allowed && !rtk_self_stable) {
+      rtk_drift_gate_.last_decision = "online_rtk_waiting_self_stable";
       return false;
     }
     if (!pose_estimator || lio_corrected_this_frame_ ||
@@ -2312,11 +2468,29 @@ private:
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
     const Eigen::Vector2f correction_xy =
       rtk_position.head<2>() - ukf_position.head<2>();
+    const float trusted_drift_yaw = yaw_trusted ? drift_yaw : 0.0f;
+    if (online_context && rtk_self_stable &&
+        localization::onlineAnchorCorrectionResidualSevere(
+          online_anchor_correction_config_, drift_xy, trusted_drift_yaw)) {
+      setLioAbsoluteDisagreement(true, "self_stable_fixed_rtk_residual");
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "online_rtk_residual_severe";
+      return false;
+    }
+    if (online_allowed && !localization::onlineAnchorCorrectionResidualInRange(
+          online_anchor_correction_config_, drift_xy, trusted_drift_yaw)) {
+      rtk_drift_gate_.resetConsecutive();
+      rtk_drift_gate_.last_decision = "online_rtk_residual_outside_band";
+      return false;
+    }
+    if (online_context && rtk_self_stable) {
+      setLioAbsoluteDisagreement(false, nullptr);
+    }
     // Fixed RTK: never hard-reject because LIO drifted far. Only wait for the
     // RTK self-stability window before applying oversized corrections.
     const AuxiliaryGateStatus status = evaluateAuxiliaryDriftGate(
       rtk_drift_gate_, "RTK", fixed_quality_ok, drifted, rtk_position,
-      correction_xy, drift_xy, yaw_trusted ? drift_yaw : 0.0f,
+      correction_xy, drift_xy, trusted_drift_yaw,
       observation.stamp_ns, trust_rtk, /*ignore_lio_residual_cap=*/fixed_quality_ok,
       force_correction);
     if (status == AuxiliaryGateStatus::pending) {
@@ -2349,14 +2523,16 @@ private:
     target_map_T_base.translation() = rtk_position;
     target_map_T_base.linear() = orientation.normalized().toRotationMatrix();
     const float translation_rate = trust_rtk
-      ? rtk_trusted_correction_translation_rate_mps_
+      ? (online_allowed ? online_correction_translation_rate_mps_
+                        : rtk_trusted_correction_translation_rate_mps_)
       : lio_correction_translation_rate_mps_;
     const float rotation_rate = (trust_rtk && yaw_trusted)
-      ? rtk_trusted_correction_rotation_rate_radps_
+      ? (online_allowed ? online_correction_rotation_rate_radps_
+                        : rtk_trusted_correction_rotation_rate_radps_)
       : lio_correction_rotation_rate_radps_;
     if (!scheduleLioAnchorCorrection(
           target_map_T_base, noise, "RTK",
-          timeOnStampClock(observation.stamp_ns, get_clock()->now()),
+          correction_stamp,
           translation_rate, rotation_rate,
           /*bypass_cooldown=*/trust_rtk || force_correction)) {
       rtk_drift_gate_.resetConsecutive();
@@ -2613,6 +2789,51 @@ private:
       }
     }
 
+    // Detect a proven absolute disagreement even when the robot is currently
+    // too fast to apply a gentle online correction.  Waiting for a waypoint
+    // after a 1 m map mismatch is unsafe; Edge will consume this decision and
+    // stop before starting its normal relocalization flow.
+    if (!force_correction && motion_phase_ == "moving") {
+      // Safety observation is deliberately independent of the route's online
+      // correction permission.  Final approach, recovery and avoidance do
+      // not allow a moving anchor update, but a proven 1 m disagreement there
+      // is still unsafe and must stop the task before it continues farther.
+      const CorrectionCandidateSummary ndt_safety = match
+        ? ndtCorrectionCandidate(*match, ndt_quality_ok, stamp)
+        : CorrectionCandidateSummary{};
+      const bool high_quality_ndt = ndt_safety.eligible &&
+        ndt_score < online_ndt_max_fitness_score_ &&
+        last_ndt_inlier_fraction_ >= online_ndt_min_inlier_fraction_ &&
+        std::fabs((stamp - last_ndt_update_time_).seconds()) <= online_observation_max_age_s_;
+      if (high_quality_ndt) {
+        if (localization::onlineAnchorCorrectionResidualSevere(
+              online_anchor_correction_config_,
+              ndt_safety.residual_xy, ndt_safety.residual_yaw)) {
+          setLioAbsoluteDisagreement(true, "high_quality_ndt_residual");
+        } else {
+          setLioAbsoluteDisagreement(false, nullptr);
+        }
+      } else if (rtk_ready) {
+        const CorrectionCandidateSummary rtk_safety = rtkCorrectionCandidate(observation);
+        if (rtk_safety.eligible) {
+          float source_step = 0.0f;
+          if (rtk_drift_gate_.has_prev_source) {
+            source_step = (observation.position.head<2>() -
+              rtk_drift_gate_.prev_source_xy.head<2>()).norm();
+          }
+          const bool rtk_self_stable = updateRtkSelfStability(
+            observation.position, observation.stamp_ns, source_step);
+          if (rtk_self_stable && localization::onlineAnchorCorrectionResidualSevere(
+                online_anchor_correction_config_, rtk_safety.residual_xy,
+                rtk_safety.yaw_valid ? rtk_safety.residual_yaw : 0.0f)) {
+            setLioAbsoluteDisagreement(true, "self_stable_fixed_rtk_residual");
+          } else if (rtk_self_stable) {
+            setLioAbsoluteDisagreement(false, nullptr);
+          }
+        }
+      }
+    }
+
     const bool ndt_drifted = ndt.eligible &&
       (ndt.residual_xy >= lio_drift_xy_m_ || ndt.residual_yaw >= lio_drift_yaw_rad_);
     const bool rtk_drifted = rtk.eligible &&
@@ -2633,7 +2854,10 @@ private:
     rtk.eligible = rtk.eligible && (force_correction || rtk_drifted) &&
       (force_correction || !rtk_drift_gate_.correction_latched);
     const bool fixed_rtk_eligible = rtk_ready && rtk.eligible;
-    const bool float_rtk_eligible = !rtk_ready && rtk_float_within_gate && rtk.eligible;
+    // Float RTK remains a stopped-waypoint UKF observation only. It must not
+    // become an online anchor source merely because the route policy is UKF.
+    const bool float_rtk_eligible = motion_phase_ == "stationary" &&
+      !rtk_ready && rtk_float_within_gate && rtk.eligible;
     CorrectionSelection selection = selectWaypointCorrectionSource(
       effective_mode, ndt.eligible, ndt_score, fixed_rtk_eligible,
       float_rtk_eligible, ukf_high_quality_ndt_score_,
@@ -2916,11 +3140,17 @@ private:
     }
     motion_phase_ = command.find("moving") != std::string::npos ? "moving" : "stationary";
     bool rtk_primary_allowed = false;
-    if (mode_end != std::string::npos) {
-      const auto primary_begin = command.find(':', mode_end + 1);
-      if (primary_begin != std::string::npos) {
-        const std::string primary_value = command.substr(primary_begin + 1);
-        rtk_primary_allowed = primary_value == "1" || primary_value == "true";
+    bool online_anchor_correction_allowed = false;
+    if (anchor_end != std::string::npos) {
+      const auto online_begin = command.find(':', anchor_end + 1);
+      const std::string primary_value = command.substr(
+        anchor_end + 1, online_begin == std::string::npos
+          ? std::string::npos : online_begin - anchor_end - 1);
+      rtk_primary_allowed = primary_value == "1" || primary_value == "true";
+      if (online_begin != std::string::npos) {
+        const std::string online_value = command.substr(online_begin + 1);
+        online_anchor_correction_allowed =
+          online_value == "1" || online_value == "true";
       }
     }
     // RTK may become the continuous source only at an explicitly opted-in
@@ -2928,6 +3158,8 @@ private:
     // latch; losing that evidence immediately returns to FAST-LIO.
     rtk_primary_allowed_by_policy_ =
       rtk_primary_allowed && next_mode == CorrectionPolicyMode::rtk && motion_phase_ == "moving";
+    online_anchor_correction_allowed_by_policy_ =
+      online_anchor_correction_allowed && motion_phase_ == "moving";
     ukf_anchor_preference_ = next_mode == CorrectionPolicyMode::ukf
       ? anchor_preference : "balanced";
     if (motion_phase_ == "stationary") {
@@ -2936,6 +3168,7 @@ private:
       absolute_stable_count_ = 0;
       absolute_stable_ = false;
       stable_source_.clear();
+      setLioAbsoluteDisagreement(false, nullptr);
     }
   }
 
@@ -3351,6 +3584,14 @@ private:
       lio_motion_anomaly_yaw_step_rad = lio_motion_anomaly_yaw_step_rad_;
       lio_motion_anomaly_yaw_rate_radps = lio_motion_anomaly_yaw_rate_radps_;
     }
+    double online_linear_speed_mps = std::numeric_limits<double>::infinity();
+    double online_yaw_rate_radps = std::numeric_limits<double>::infinity();
+    std::string online_rejection_reason;
+    const bool online_anchor_correction_eligible = onlineAnchorCorrectionAllowed(
+      stamp, &online_rejection_reason, &online_linear_speed_mps, &online_yaw_rate_radps);
+    const bool lio_fresh = lioOdomFresh(stamp);
+    const char* lio_health = (lio_motion_anomaly_active || !lio_fresh)
+      ? "fault" : lio_large_absolute_disagreement_ ? "degraded" : "healthy";
     std_msgs::msg::String message;
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
@@ -3400,6 +3641,29 @@ private:
         << ",\"rtk_auto_primary\":" << (rtk_auto_primary_latched_ ? "true" : "false")
         << ",\"rtk_primary_allowed_by_policy\":"
         << (rtk_primary_allowed_by_policy_ ? "true" : "false")
+        << ",\"online_anchor_correction_allowed_by_policy\":"
+        << (online_anchor_correction_allowed_by_policy_ ? "true" : "false")
+        << ",\"online_anchor_correction_eligible\":"
+        << (online_anchor_correction_eligible ? "true" : "false")
+        << ",\"online_anchor_correction_rejection_reason\":\""
+        << online_rejection_reason << "\""
+        << ",\"online_lio_linear_speed_mps\":";
+    if (std::isfinite(online_linear_speed_mps)) {
+      out << online_linear_speed_mps;
+    } else {
+      out << "null";
+    }
+    out << ",\"online_lio_yaw_rate_radps\":";
+    if (std::isfinite(online_yaw_rate_radps)) {
+      out << online_yaw_rate_radps;
+    } else {
+      out << "null";
+    }
+    out << ",\"lio_health\":\"" << lio_health << "\""
+        << ",\"lio_large_absolute_disagreement\":"
+        << (lio_large_absolute_disagreement_ ? "true" : "false")
+        << ",\"lio_large_absolute_disagreement_reason\":\""
+        << lio_large_absolute_disagreement_reason_ << "\""
         << ",\"rtk_good_for_navigation\":" << (rtkGoodForNavigation(rtk) ? "true" : "false")
         << ",\"rtk_position_good_for_navigation\":"
         << (rtkPositionGoodForNavigation(rtk) ? "true" : "false")
@@ -3416,7 +3680,7 @@ private:
         << ",\"single_continuous_source_enforced\":"
         << ((enable_lio_primary_ && !rtk_auto_primary_latched_) ? "true" : "false")
         << ",\"lio_healthy\":"
-        << (lioOdomFresh(stamp) && !lio_motion_anomaly_active ? "true" : "false")
+        << (lio_fresh && !lio_motion_anomaly_active ? "true" : "false")
         << ",\"lio_anchored\":" << (lio_anchor_valid_.load() ? "true" : "false")
         << ",\"lio_motion_anomaly\":" << (lio_motion_anomaly_active ? "true" : "false")
         << ",\"lio_motion_anomaly_reason\":\"" << lio_motion_anomaly_reason << "\""
@@ -4553,7 +4817,11 @@ private:
     // make a centimetre-grade fix look stale (|lidar-gnss| > max_age), unlatch
     // skip, run open-sky NDT, and pause the patrol task.
     updateRtkAutoPrimary(currentRtkObservation(latestGnssStamp(frame_stamp)), frame_stamp);
-    const bool rtk_primary = false;
+    // The default remains FAST-LIO.  This branch is reachable only after the
+    // Edge has explicitly allowed an outdoor RTK leg and the fixed+heading
+    // latch has accumulated its configured evidence.
+    const bool rtk_primary = localization::rtkPrimaryShouldDrive(
+      source_arbiter_enable_, bridge_active_, rtk_auto_primary_latched_);
     const bool lio_primary = enable_lio_primary_ && is_init_success_ &&
       has_trusted_ndt_pose_ && !rtk_primary && !bridge_active_ &&
       !lio_motion_anomaly_active_ &&
@@ -6633,6 +6901,7 @@ private:
   bool source_arbiter_enable_ = true;
   bool prefer_fixed_rtk_ = false;
   bool rtk_primary_allowed_by_policy_ = false;
+  bool online_anchor_correction_allowed_by_policy_ = false;
   int rtk_primary_promote_samples_ = 20;
   int rtk_primary_demote_samples_ = 8;
   double rtk_primary_handoff_suppress_s_ = 2.5;
@@ -6877,6 +7146,15 @@ private:
   float lio_correction_rotation_rate_radps_ = 8.0f * static_cast<float>(M_PI) / 180.0f;
   float lio_correction_completion_translation_m_ = 0.01f;
   float lio_correction_completion_rotation_rad_ = 0.25f * static_cast<float>(M_PI) / 180.0f;
+  localization::OnlineAnchorCorrectionConfig online_anchor_correction_config_;
+  float online_ndt_max_fitness_score_ = 0.10f;
+  float online_ndt_min_inlier_fraction_ = 0.50f;
+  double online_observation_max_age_s_ = 0.50;
+  float online_correction_translation_rate_mps_ = 0.05f;
+  float online_correction_rotation_rate_radps_ =
+    3.0f * static_cast<float>(M_PI) / 180.0f;
+  bool lio_large_absolute_disagreement_ = false;
+  std::string lio_large_absolute_disagreement_reason_ = "none";
   double lio_correction_min_interval_s_ = 3.0;
   double lio_correction_post_suppression_s_ = 3.0;
   int lio_stable_frame_count_ = 0;

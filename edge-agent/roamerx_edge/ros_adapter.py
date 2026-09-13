@@ -250,6 +250,7 @@ class RosAdapter(Node):
         self._localization_lost_count = 0
         self._localization_failure_notified = False
         self._lio_motion_anomaly_notified = False
+        self._lio_absolute_disagreement_notified = False
         self._ndt_failure_count = 0
         self._ndt_failure_notified = False
         self._localization_recovery_pending = False
@@ -555,23 +556,32 @@ class RosAdapter(Node):
                 ) + 1
                 decision_condition.notify_all()
         anomaly = bool(payload.get("lio_motion_anomaly"))
-        if not anomaly:
+        disagreement = bool(payload.get("lio_large_absolute_disagreement"))
+        if not anomaly and not disagreement:
             self._lio_motion_anomaly_notified = False
+            self._lio_absolute_disagreement_notified = False
             return
 
+        already_notified = (
+            getattr(self, "_lio_motion_anomaly_notified", False) if anomaly
+            else getattr(self, "_lio_absolute_disagreement_notified", False)
+        )
         if (
-            self._lio_motion_anomaly_notified
+            already_notified
             or not self._localization_failure_cb
         ):
             return
-        self._lio_motion_anomaly_notified = True
+        if anomaly:
+            self._lio_motion_anomaly_notified = True
+        else:
+            self._lio_absolute_disagreement_notified = True
         self._localization_failure_notified = True
         self._localization_recovery_armed = True
         threading.Thread(
             target=self._localization_failure_cb,
-            args=("lio_motion_anomaly",),
+            args=("lio_motion_anomaly" if anomaly else "lio_absolute_disagreement",),
             daemon=True,
-            name="lio-motion-anomaly-handler",
+            name="lio-localization-fault-handler",
         ).start()
 
     def set_log_context_provider(self, provider: Callable | None) -> None:
@@ -813,6 +823,7 @@ class RosAdapter(Node):
         phase: str,
         anchor_preference: str = "balanced",
         rtk_primary_allowed: bool = False,
+        online_anchor_correction_allowed: bool = False,
     ) -> dict:
         normalized_source = str(source).strip().lower()
         source = normalized_source if normalized_source in {"ndt", "rtk", "ukf"} else "ndt"
@@ -821,11 +832,17 @@ class RosAdapter(Node):
         if anchor_preference not in {"ndt", "rtk", "balanced"}:
             anchor_preference = "balanced"
         rtk_primary_allowed = bool(rtk_primary_allowed) and source == "rtk"
+        online_anchor_correction_allowed = (
+            bool(online_anchor_correction_allowed) and phase == "moving"
+        )
         msg = String()
         # Keep the original first two fields intact for older localization
         # nodes; newer nodes consume the anchor preference and explicit RTK
         # primary opt-in after the second colon.
-        msg.data = f"{phase}:{source}:{anchor_preference}:{int(rtk_primary_allowed)}"
+        msg.data = (
+            f"{phase}:{source}:{anchor_preference}:{int(rtk_primary_allowed)}:"
+            f"{int(online_anchor_correction_allowed)}"
+        )
         self._localization_policy_pub.publish(msg)
         return {
             "topic": "/localization/policy",
@@ -833,6 +850,7 @@ class RosAdapter(Node):
             "phase": phase,
             "anchor_preference": anchor_preference,
             "rtk_primary_allowed": rtk_primary_allowed,
+            "online_anchor_correction_allowed": online_anchor_correction_allowed,
         }
 
     def localization_decision(self) -> dict:

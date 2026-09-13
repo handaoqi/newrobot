@@ -141,6 +141,7 @@ def test_lio_motion_anomaly_bypasses_localization_loss_debounce():
     adapter = object.__new__(RosAdapter)
     adapter.telemetry = FakeTelemetry()
     adapter._lio_motion_anomaly_notified = False
+    adapter._lio_absolute_disagreement_notified = False
     adapter._localization_failure_notified = False
     adapter._localization_recovery_armed = False
     triggered = threading.Event()
@@ -165,6 +166,7 @@ def test_lio_motion_anomaly_stops_navigation_even_when_rtk_xy_is_fixed():
     adapter = object.__new__(RosAdapter)
     adapter.telemetry = FakeTelemetry()
     adapter._lio_motion_anomaly_notified = False
+    adapter._lio_absolute_disagreement_notified = False
     adapter._localization_failure_notified = False
     adapter._localization_recovery_armed = False
     triggered = threading.Event()
@@ -1013,8 +1015,47 @@ def test_localization_policy_preserves_ukf_mode():
         "phase": "moving",
         "anchor_preference": "balanced",
         "rtk_primary_allowed": False,
+        "online_anchor_correction_allowed": False,
     }
-    assert published[0].data == "moving:ukf:balanced:0"
+    assert published[0].data == "moving:ukf:balanced:0:0"
+
+
+def test_localization_policy_carries_online_anchor_opt_in_only_while_moving():
+    published = []
+    adapter = object.__new__(RosAdapter)
+    adapter._localization_policy_pub = SimpleNamespace(publish=published.append)
+
+    result = adapter.set_localization_policy("ndt", "moving", online_anchor_correction_allowed=True)
+
+    assert result["online_anchor_correction_allowed"] is True
+    assert published[0].data == "moving:ndt:balanced:0:1"
+
+    result = adapter.set_localization_policy("ndt", "stationary", online_anchor_correction_allowed=True)
+    assert result["online_anchor_correction_allowed"] is False
+    assert published[1].data == "stationary:ndt:balanced:0:0"
+
+
+def test_lio_absolute_disagreement_starts_relocalization_once():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry()
+    adapter._lio_motion_anomaly_notified = False
+    adapter._lio_absolute_disagreement_notified = False
+    adapter._localization_failure_notified = False
+    adapter._localization_recovery_armed = False
+    triggered = threading.Event()
+    reasons = []
+    adapter._localization_failure_cb = lambda reason: (reasons.append(reason), triggered.set())
+    message = SimpleNamespace(
+        data='{"lio_large_absolute_disagreement":true,'
+        '"lio_large_absolute_disagreement_reason":"high_quality_ndt_residual"}'
+    )
+
+    adapter._on_localization_decision(message)
+    adapter._on_localization_decision(message)
+
+    assert triggered.wait(1.0)
+    assert reasons == ["lio_absolute_disagreement"]
+    assert adapter._localization_recovery_armed is True
 
 
 def test_good_rtk_ignores_ndt_degradation_before_active_source_switches():

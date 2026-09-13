@@ -173,6 +173,28 @@ def test_recovery_skips_rtk_reseed_when_gps_pose_is_already_driving(monkeypatch)
     assert application._localization_recovery_lock.acquire(blocking=False)
 
 
+def test_large_lio_absolute_disagreement_forces_fixed_rtk_reseed(monkeypatch):
+    application = object.__new__(EdgeAgentApplication)
+    application.navigation = RtkNavigation()
+    application.navigation.localization_decision = lambda: {
+        "active_source": "rtk_imu",
+        "rtk_good_for_navigation": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+    application.task_executor = FakeTaskExecutor()
+    application.navigation_stack_adapter = SimpleNamespace(restarts=0)
+    _wire_recovery_collaborators(application)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
+
+    application._recover_task_localization("lio_absolute_disagreement")
+
+    assert application.navigation.rtk_calls == 1
+    assert application.navigation.relocalize_calls == 0
+    assert application.task_executor.recovered == 1
+
+
 def test_lio_motion_anomaly_stops_even_while_outdoor_rtk_xy_is_fixed():
     application = object.__new__(EdgeAgentApplication)
     application.task_executor = IdleTaskExecutor()

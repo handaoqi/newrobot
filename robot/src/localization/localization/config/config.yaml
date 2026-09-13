@@ -66,7 +66,9 @@ localization:
       # RTK source jumps (>max_correction_jump_m) are untrusted.
       # Self-stable fixed RTK also trusts dual-antenna heading (bypasses the
       # 30 deg yaw gate) so XY-only corrections cannot leave a yaw death spiral.
-      # RTK and NDT remain anchor observations; neither becomes the continuous pose.
+      # NDT remains an anchor observation. Fixed RTK becomes the continuous
+      # pose only for an explicitly permitted outdoor RTK leg after its latch
+      # is stable; all other legs keep FAST-LIO continuous.
       rtk_trust:
         stable_window_seconds: 1.0
         stable_span_m: 0.35
@@ -104,6 +106,23 @@ localization:
         rotation_rate_degps: 8.0
         completion_translation_m: 0.01
         completion_rotation_deg: 0.25
+      # A normal cruise leg may slowly re-anchor a proven LIO drift.  This is
+      # deliberately narrower and slower than a stopped waypoint correction:
+      # high-speed motion, turns, final approach and recovery keep the policy
+      # field false and therefore cannot update map->lio online.
+      online_anchor_correction:
+        enable: true
+        max_linear_speed_mps: 0.15
+        max_yaw_rate_radps: 0.10
+        ndt_max_fitness_score: 0.10
+        ndt_min_inlier_fraction: 0.50
+        max_observation_age_seconds: 0.50
+        min_residual_xy_m: 0.30
+        max_residual_xy_m: 1.00
+        min_residual_yaw_deg: 5.0
+        max_residual_yaw_deg: 10.0
+        translation_rate_mps: 0.05
+        rotation_rate_degps: 3.0
       correction_gate:
         # Shared by NDT/VGICP and RTK so auxiliary sources cannot ping-pong.
         # Keep near the 1s RTK trust window so fixed RTK can keep regulating
@@ -168,8 +187,8 @@ localization:
 
     source_arbiter:
       enable: true
-      # FAST-LIO is the only continuous pose source indoors and outdoors.
-      # RTK and NDT may update only the low-frequency map->lio anchor.
+      # FAST-LIO is the default continuous pose source. NDT is always an
+      # anchor observation; fixed RTK needs an explicit outdoor-leg opt-in.
       prefer_fixed_rtk: false
       # Legacy handoff parameters remain for configuration compatibility.
       rtk_primary_promote_samples: 20

@@ -252,6 +252,7 @@ class NavigationAdapter(Protocol):
         phase: str,
         anchor_preference: str = "balanced",
         rtk_primary_allowed: bool = False,
+        online_anchor_correction_allowed: bool = False,
     ) -> dict: ...
     def localization_decision(self) -> dict: ...
     def localization_diagnostics(self) -> dict: ...
@@ -490,7 +491,7 @@ class TaskExecutor:
         self._patrol_final_approach_applied = False
         self._last_target_index = -1
         self._last_reached_index = -1
-        self._last_localization_policy: tuple[str, str, str, bool] | None = None
+        self._last_localization_policy: tuple[str, str, str, bool, bool] | None = None
         self._speech_waiting_index: int | None = None
         self._speech_wait_finished = False
         self._speech_wait_thread: threading.Thread | None = None
@@ -2718,6 +2719,10 @@ class TaskExecutor:
         self.context.current_waypoint_index = index
         self.context.state = "running"
         self.context.state_version += 1
+        # The first leg publishes its policy before `send_waypoints` is known
+        # to be accepted. Re-publish after the state transition so the normal
+        # cruise-only online anchor gate is enabled for that first leg too.
+        self._set_localization_policy(policy_waypoint, "moving")
         self._persist()
         self._emit(
             "task.started",
@@ -2773,12 +2778,42 @@ class TaskExecutor:
         ).strip().lower()
         if anchor_preference not in {"ndt", "rtk", "balanced"}:
             anchor_preference = "balanced"
-        rtk_primary_allowed = bool(waypoint.get("rtk_primary_allowed", False)) and mode == "rtk"
-        policy = (mode, phase, anchor_preference, rtk_primary_allowed)
+        rtk_primary_allowed = (
+            bool(waypoint.get("rtk_primary_allowed", False))
+            and mode == "rtk"
+            and phase == "moving"
+            and self._outdoor_navigation_profile()
+        )
+        # The localization node independently enforces LIO freshness, source
+        # quality, low-speed motion and one active anchor update.  The Edge
+        # owns task-level exclusions: final approach, recovery, safety pause
+        # and obstacle handling must never start an online map->lio update.
+        online_anchor_correction_allowed = (
+            phase == "moving"
+            and bool(self.context)
+            and self.context.state == "running"
+            and not self._patrol_final_approach_applied
+            and not self._bypass_active
+            and not self._obstacle_recovery_active
+            and not self._paused_for_localization
+        )
+        policy = (
+            mode,
+            phase,
+            anchor_preference,
+            rtk_primary_allowed,
+            online_anchor_correction_allowed,
+        )
         if policy == self._last_localization_policy:
             return
         try:
-            setter(mode, phase, anchor_preference, rtk_primary_allowed)
+            setter(
+                mode,
+                phase,
+                anchor_preference,
+                rtk_primary_allowed,
+                online_anchor_correction_allowed,
+            )
         except TypeError:
             # Test/simulation adapters published before policy metadata was
             # introduced retain the two-argument contract.

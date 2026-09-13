@@ -117,8 +117,10 @@ class EdgeAgentApplication:
             navigation,
             event_callback=self._publish_task_event,
             start_result_callback=self._publish_start_result,
-            final_waypoint_tolerance_m=config.safety.final_waypoint_tolerance_m,
-            arrival_degraded_tolerance_m=config.safety.arrival_degraded_tolerance_m,
+            coarse_goal_tolerance_m=config.safety.coarse_goal_tolerance_m,
+            normal_arrival_tolerance_m=config.safety.normal_arrival_tolerance_m,
+            precision_arrival_tolerance_m=config.safety.precision_arrival_tolerance_m,
+            arrival_reapproach_max_attempts=config.safety.arrival_reapproach_max_attempts,
             docking_goal_tolerance_m=config.safety.docking_goal_tolerance_m,
             docking_goal_yaw_tolerance_rad=config.safety.docking_goal_yaw_tolerance_rad,
             arrival_adjust_max_distance_m=config.safety.arrival_adjust_max_distance_m,
@@ -1579,14 +1581,19 @@ class EdgeAgentApplication:
             )
         return seed
 
-    def _attempt_rtk_recovery(self) -> bool:
-        if self._rtk_pose_is_driving():
+    def _attempt_rtk_recovery(self, *, force_reseed: bool = False) -> bool:
+        if self._rtk_pose_is_driving() and not force_reseed:
             LOGGER.info("automatic recovery left the GPS pose in place; resuming the task")
             self._handle_task_localization_recovered()
             return True
+        if force_reseed and self._rtk_good_for_navigation():
+            if self._recover_with_fixed_rtk():
+                self._handle_task_localization_recovered()
+                return True
+            return False
         # LIO-primary outdoor mode: fixed RTK XY is already correcting the pose.
         # Do not force a dual-antenna reseeding cycle when heading is flickering.
-        if self._rtk_position_good_for_navigation():
+        if self._rtk_position_good_for_navigation() and not force_reseed:
             getter = getattr(self.navigation, "localization_decision", None)
             decision = getter() if callable(getter) else {}
             source = str((decision or {}).get("active_source") or "")
@@ -1728,11 +1735,15 @@ class EdgeAgentApplication:
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
                 return
+            force_absolute_recovery = str(reason) in {
+                "lio_motion_anomaly",
+                "lio_absolute_disagreement",
+            }
             diagnosis = self._diagnose_self_healing(reason, level=0)
             level_zero_action = self._begin_self_heal_action(
                 level=0, action_type=diagnosis.action_type
             )
-            if diagnosis.wait_for_rtk:
+            if diagnosis.wait_for_rtk and not force_absolute_recovery:
                 self._hold_motion_for_relocalize()
                 if self._wait_for_rtk_recovery():
                     self._finish_self_heal_action(
@@ -1798,47 +1809,58 @@ class EdgeAgentApplication:
                 cycle += 1
                 if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
                     try:
-                        if self._attempt_rtk_recovery():
+                        if self._attempt_rtk_recovery(
+                            force_reseed=force_absolute_recovery
+                        ):
                             return
                     except Exception as exc:
                         LOGGER.warning("fixed RTK recovery failed: %s", exc)
                     if not self.task_executor.is_paused_for_localization():
                         return
-                    elapsed = time.time() - started_at
-                    self._report_localization_recovery_state(reason, cycle, elapsed, max_cycles)
-                    if max_cycles and cycle >= max_cycles:
-                        LOGGER.error(
-                            "localization recovery gave up after %d cycles (%.0fs); escalating",
-                            cycle,
-                            elapsed,
+                    if force_absolute_recovery:
+                        # A fixed XY observation without heading cannot reset
+                        # LIO safely. Continue with bounded NDT relocalization
+                        # instead of resuming the disagreed map pose.
+                        LOGGER.warning(
+                            "absolute LIO disagreement remains; fixed RTK is not "
+                            "eligible for a reseed, trying bounded relocalization"
                         )
-                        self._emit_localization_alert(
-                            "localization_recovery_failed",
-                            "critical",
-                            "LOCALIZATION_RECOVERY_FAILED",
-                            "定位恢复失败，需人工介入",
-                            {
-                                **self._localization_alert_attributes(reason),
-                                "recovery_cycles": cycle,
-                                "recovery_elapsed_seconds": round(elapsed, 1),
-                            },
-                        )
-                        self._complete_self_healing(
-                            success=False, reason="fixed_rtk_recovery_levels_exhausted"
-                        )
-                        safe_hold = getattr(self.task_executor, "enter_safe_hold", None)
-                        if callable(safe_hold):
-                            safe_hold(
-                                "LOCALIZATION_RECOVERY_EXHAUSTED",
-                                "定位自愈等级已耗尽，进入安全保持",
+                    else:
+                        elapsed = time.time() - started_at
+                        self._report_localization_recovery_state(reason, cycle, elapsed, max_cycles)
+                        if max_cycles and cycle >= max_cycles:
+                            LOGGER.error(
+                                "localization recovery gave up after %d cycles (%.0fs); escalating",
+                                cycle,
+                                elapsed,
                             )
-                        return
-                    LOGGER.warning(
-                        "fixed RTK XY is available; skipping open-sky NDT search and retrying GPS in %.1fs",
-                        cycle_retry,
-                    )
-                    time.sleep(cycle_retry)
-                    continue
+                            self._emit_localization_alert(
+                                "localization_recovery_failed",
+                                "critical",
+                                "LOCALIZATION_RECOVERY_FAILED",
+                                "定位恢复失败，需人工介入",
+                                {
+                                    **self._localization_alert_attributes(reason),
+                                    "recovery_cycles": cycle,
+                                    "recovery_elapsed_seconds": round(elapsed, 1),
+                                },
+                            )
+                            self._complete_self_healing(
+                                success=False, reason="fixed_rtk_recovery_levels_exhausted"
+                            )
+                            safe_hold = getattr(self.task_executor, "enter_safe_hold", None)
+                            if callable(safe_hold):
+                                safe_hold(
+                                    "LOCALIZATION_RECOVERY_EXHAUSTED",
+                                    "定位自愈等级已耗尽，进入安全保持",
+                                )
+                            return
+                        LOGGER.warning(
+                            "fixed RTK XY is available; skipping open-sky NDT search and retrying GPS in %.1fs",
+                            cycle_retry,
+                        )
+                        time.sleep(cycle_retry)
+                        continue
                 if self._wait_for_rtk_recovery():
                     return
                 primary_seed = self._localization_recovery_seed()

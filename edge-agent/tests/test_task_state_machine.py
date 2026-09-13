@@ -1096,6 +1096,51 @@ def test_outdoor_stationary_policy_preserves_configured_ukf_mode(tmp_path):
     store.close()
 
 
+def test_moving_policy_enables_online_anchor_only_for_normal_running_leg(tmp_path):
+    class PolicyNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.full_localization_policies = []
+
+        def set_localization_policy(
+            self,
+            source,
+            phase,
+            anchor_preference="balanced",
+            rtk_primary_allowed=False,
+            online_anchor_correction_allowed=False,
+        ):
+            self.full_localization_policies.append(
+                (
+                    source,
+                    phase,
+                    anchor_preference,
+                    rtk_primary_allowed,
+                    online_anchor_correction_allowed,
+                )
+            )
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = PolicyNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = type("Ctx", (), {"state": "running", "task_type": "patrol"})()
+
+    executor._set_localization_policy({"localization_mode": "ndt"}, "moving")
+
+    assert nav.full_localization_policies[-1] == ("ndt", "moving", "ndt", False, True)
+
+    executor._patrol_final_approach_applied = True
+    executor._set_localization_policy({"localization_mode": "ndt"}, "moving")
+
+    assert nav.full_localization_policies[-1] == ("ndt", "moving", "ndt", False, False)
+    store.close()
+
+
 def test_arrival_within_tolerance_rejects_rtk_far_from_click(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
