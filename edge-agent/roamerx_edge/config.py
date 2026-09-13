@@ -124,7 +124,7 @@ class SafetyConfig:
     coarse_goal_tolerance_m: float = 0.50
     normal_arrival_tolerance_m: float = 0.30
     precision_arrival_tolerance_m: float = 0.15
-    arrival_reapproach_max_attempts: int = 2
+    arrival_reapproach_max_attempts: int = 3
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
     # Arrival correction is split into bounded segments.  The legacy
@@ -208,16 +208,23 @@ class SceneSemanticsConfig:
     """
 
     enabled: bool = False
+    backend: str = "autoware_tensorrt"
     model_path: str = "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1.onnx"
     engine_path: str = "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1_fp16.engine"
-    asset_catalog_path: str = "/home/dogrobot/runtime/nx-edge/install/share/scene-assets/catalog.json"
+    asset_catalog_path: str = "/home/dogrobot/platform/frontend/public/scene-assets/catalog.json"
+    bundle_path: str = "/home/dogrobot/runtime/nx-edge/install/models/scene/autoware-ptv3-v4"
+    plugin_path: str = ""
+    inference_binary_path: str = "/home/dogrobot/runtime/nx-edge/install/ptv3/bin/roamerx_ptv3_cli"
+    enable_detection: bool = True
     model_version: str = "ptv3-park-v1"
     confidence_threshold: float = 0.80
     min_support_frames: int = 3
     voxel_size_m: float = 0.10
     tile_size_m: float = 20.0
     tile_overlap_m: float = 1.0
-    max_points: int = 1_000_000
+    # Keep the offline semantic pass inside the Orin memory budget. Navigation
+    # continues to use the complete 2D/3D map; this only bounds PTv3 input.
+    max_points: int = 50_000
     nice_level: int = 10
 
 

@@ -68,11 +68,11 @@ safety:
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
   # Every waypoint first reaches this Nav2 radius. Plain intermediate points
-  # can complete inside it only after two failed 0.30 m re-approaches.
+  # must then enter the 0.30 m radius within three re-approaches.
   coarse_goal_tolerance_m: 0.50
   normal_arrival_tolerance_m: 0.30
   precision_arrival_tolerance_m: 0.15
-  arrival_reapproach_max_attempts: 2
+  arrival_reapproach_max_attempts: 3
   # Used only at the final docking contact waypoint.
   docking_goal_tolerance_m: 0.08
   docking_goal_yaw_tolerance_rad: 0.0872665
@@ -127,16 +127,21 @@ media:
 scene_semantics:
   # Enable after the PTv3 ONNX model and catalog are installed on the Orin.
   enabled: false
+  backend: "autoware_tensorrt"
   model_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1.onnx"
   engine_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/ptv3_park_v1_fp16.engine"
-  asset_catalog_path: "/home/dogrobot/runtime/nx-edge/install/share/scene-assets/catalog.json"
-  model_version: "ptv3-park-v1"
+  asset_catalog_path: "/home/dogrobot/platform/frontend/public/scene-assets/catalog.json"
+  bundle_path: "/home/dogrobot/runtime/nx-edge/install/models/scene/autoware-ptv3-v4"
+  plugin_path: ""
+  inference_binary_path: "/home/dogrobot/runtime/nx-edge/install/ptv3/bin/roamerx_ptv3_cli"
+  enable_detection: true
+  model_version: "autoware-ptv3-v4"
   confidence_threshold: 0.80
   min_support_frames: 3
   voxel_size_m: 0.10
   tile_size_m: 20.0
   tile_overlap_m: 1.0
-  max_points: 1000000
+  max_points: 50000
   nice_level: 10
 
 mapping:

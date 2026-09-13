@@ -203,7 +203,7 @@ sudo chmod 0640 /opt/roamerx/shared/center.env
 
 ```bash
 cd /home/dogrobot
-deploy/cloud/deploy.sh
+deploy/platform/deploy.sh
 ```
 
 该入口会调用 `platform/scripts/deploy_cloud_platform.sh`，在本机构建 `platform/frontend`，同步：
@@ -599,12 +599,12 @@ ssh 3588 'test -x /usr/local/sbin/roamerx-charge-pile-controller && echo charge-
 ## 10. 参考入口
 
 - `/home/dogrobot/AGENT.md`：本地开发与部署目录的简明约定。
-- `/home/dogrobot/deploy/cloud/deploy.sh`、`platform/scripts/deploy_cloud_platform.sh`：云端发布入口。
+- `/home/dogrobot/deploy/platform/deploy.sh`、`platform/scripts/deploy_cloud_platform.sh`：云端发布入口。
 - `/home/dogrobot/runtime/platform/bin/platformctl`：Docker 平台构建、启动、状态、日志、备份和验收入口。
 - `/home/dogrobot/runtime/nx-edge/bin/nxctl`：NX 服务状态与运行时验收入口。
-- `/home/dogrobot/runtime/3588-motion/scripts/deploy.sh`：3588 管理覆盖层部署入口。
-- `/home/dogrobot/deploy/robot/deploy.sh`：NX 发布包装器。
-- `/home/dogrobot/deploy/controller/README.md`：3588 厂商镜像边界。
+- `/home/dogrobot/deploy/3588-motion/deploy.sh`：3588 管理覆盖层部署入口。
+- `/home/dogrobot/deploy/nx-edge/deploy.sh`：NX 发布包装器。
+- `/home/dogrobot/deploy/3588-motion/README.md`：3588 厂商镜像与发布边界。
 - `/home/dogrobot/docs/`：统一的项目架构分析和人工操作手册入口。
 - `/home/dogrobot/platform/docs/`：平台组件级 API、数据字段和实现说明。
 - `/home/dogrobot/robot/AGENTS.md`、`robot/STARTUP_GUIDE.md`：真实机器人运行约束与 ROS 启动说明。

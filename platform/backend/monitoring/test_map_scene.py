@@ -6,10 +6,11 @@ from io import BytesIO
 
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
-from .models import MapData, MapNavigationBoundary
+from .models import MapData, MapNavigationBoundary, MapSceneBuild, Robot
 
 
 def pcd_bytes(points):
@@ -94,6 +95,7 @@ class MapSceneApiTests(APITestCase):
                 "model_version": "randla-local-v1",
                 "instances": [
                     {"id": "tree-1", "asset_id": "tree.deciduous", "confidence": 0.91, "position": [1, 2, 0]},
+                    {"id": "cone-1", "asset_id": "traffic-cone.standard", "class_name": "traffic_cone", "confidence": 0.93, "position": [2, 3, 0]},
                     {"id": "wall-weak", "asset_id": "wall.straight", "confidence": 0.61, "position": [3, 4, 0]},
                     {"id": "person", "asset_id": "person.adult", "confidence": 0.99, "position": [5, 6, 0]},
                 ],
@@ -101,7 +103,7 @@ class MapSceneApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([item["id"] for item in response.data["static_assets"]], ["tree-1"])
+        self.assertEqual([item["id"] for item in response.data["static_assets"]], ["tree-1", "cone-1"])
         self.assertEqual(response.data["semantic_build"]["status"], "ready")
         response = self.client.get(f"/api/maps/{self.map.id}/scene/")
         self.assertEqual(response.status_code, 200)
@@ -183,3 +185,43 @@ class MapSceneApiTests(APITestCase):
         self.client.force_authenticate(self.user)
         response = self.client.get(f"/api/maps/{broken.id}/scene-cloud/")
         self.assertEqual(response.status_code, 422)
+
+    def test_scene_input_build_and_street_block_artifact_flow(self):
+        from monitoring.services.scene_build_service import run_scene_build
+
+        self.client.force_authenticate(self.user)
+        points = [(x * 0.25, y * 0.25, 0.0, 1.0) for x in range(40) for y in range(16)]
+        points += [(x * 0.25, 6 + y * 0.25, z, 1.0) for x in range(16) for y in range(12) for z in (0.0, 4.0)]
+        upload = self.client.post(
+            f"/api/maps/{self.map.id}/scene-inputs/",
+            {
+                "point_cloud": SimpleUploadedFile("yard.pcd", pcd_bytes(points)),
+                "references": SimpleUploadedFile("front.jpg", b"fake", content_type="image/jpeg"),
+            },
+            format="multipart",
+        )
+        self.assertEqual(upload.status_code, 201)
+        self.assertEqual(len(upload.data["references"]), 1)
+        started = self.client.post(
+            f"/api/maps/{self.map.id}/scene-builds/",
+            {"scene_input_id": upload.data["id"], "engine": "server_code", "use_ptv3": False},
+            format="json",
+        )
+        self.assertEqual(started.status_code, 202)
+        build = MapSceneBuild.objects.get(pk=started.data["id"])
+        self.assertEqual(build.state, "queued")
+        self.assertIsNone(build.robot_id)
+        run_scene_build(build)
+        scene = self.client.get(f"/api/maps/{self.map.id}/scene/")
+        self.assertTrue(scene.data["street_block"]["available"])
+        self.assertEqual(scene.data["scene_build"]["status"], "ready")
+        build.refresh_from_db()
+        building = next(node for node in build.manifest["nodes"] if node["category"] == "building")
+        checked = self.client.post(
+            f"/api/maps/{self.map.id}/scene-builds/{build.id}/review/",
+            {"node_id": building["id"], "action": "correct"},
+            format="json",
+        )
+        self.assertEqual(checked.status_code, 200)
+        self.assertEqual(checked.data["metrics"]["publish_precision"], 1.0)
+        self.assertFalse(checked.data["metrics"]["publish_precision_verified"])

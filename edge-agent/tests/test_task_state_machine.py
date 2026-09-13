@@ -1347,7 +1347,7 @@ def test_plain_middle_waypoint_completes_inside_normal_radius_without_correction
     store.close()
 
 
-def test_plain_middle_waypoint_reapproaches_twice_then_completes_in_coarse_radius(tmp_path):
+def test_plain_middle_waypoint_reapproaches_three_times_then_completes_inside_normal_radius(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     events = []
@@ -1367,11 +1367,41 @@ def test_plain_middle_waypoint_reapproaches_twice_then_completes_in_coarse_radiu
     assert executor._arrival_retry_counts[1] == 2
     assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
     assert executor._handle_lightweight_arrival(1, waypoint) is True
+    assert executor._arrival_retry_counts[1] == 3
+    assert nav.arrival_goal_tolerances[-1] == (0.30, 0.25)
+
+    nav.pose.x = float(waypoint["x"]) + 0.29
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
 
     confirmed = [event for event in events if event[0] == "task.arrival_confirmed"]
-    assert confirmed[-1][1]["coarse_completed"] is True
-    assert confirmed[-1][1]["reapproach_attempts"] == 2
-    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.50
+    assert confirmed[-1][1]["coarse_completed"] is False
+    assert confirmed[-1][1]["reapproach_attempts"] == 3
+    assert confirmed[-1][1]["acceptance_tolerance_m"] == 0.30
+    executor.stop()
+    store.close()
+
+
+def test_plain_middle_waypoint_three_failed_reapproaches_enter_safe_hold(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    waypoint = _set_middle_waypoint_as_active(executor, nav, distance_m=0.40)
+
+    for expected_attempt in (1, 2, 3):
+        assert executor._handle_lightweight_arrival(1, waypoint) is True
+        assert executor._arrival_retry_counts[1] == expected_attempt
+    assert executor._handle_lightweight_arrival(1, waypoint) is True
+
+    assert executor.context.state == "paused"
+    assert executor.context.last_safe_hold_code == "PHYSICAL_REAPPROACH_EXHAUSTED"
+    assert not [event for event in events if event[0] == "task.arrival_confirmed"]
     executor.stop()
     store.close()
 
@@ -2591,7 +2621,7 @@ def test_outdoor_final_waypoint_off_click_does_not_complete(tmp_path):
         "rtk_x": float(last_wp["x"]) + 3.0,
         "rtk_y": float(last_wp["y"]),
     }
-    executor._arrival_retry_counts[last_index] = 2
+    executor._arrival_retry_counts[last_index] = executor.arrival_reapproach_max_attempts
     executor.context.current_waypoint_index = last_index
     executor._goal_offset = last_index
     executor._dispatched_count = 1

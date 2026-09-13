@@ -9,7 +9,7 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true ;;
-    --help) echo "Usage: deploy/3588/deploy.sh [--dry-run]"; exit 0 ;;
+    --help) echo "Usage: deploy/3588-motion/deploy.sh [--dry-run]"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift

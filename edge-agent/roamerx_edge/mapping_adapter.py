@@ -98,7 +98,13 @@ from .media_client import MediaClient
 from .origin_lock import OriginLockMonitor, OriginSample
 from .protocol import ProtocolError, now_iso
 from .rtk_origin import build_origin_sample
-from .scene_semantic_runner import SceneSemanticError, run_scene_semantics, write_scene_semantics
+from .scene_semantic_runner import (
+    SceneSemanticError,
+    run_autoware_scene_semantics,
+    run_scene_semantics,
+    write_scene_semantics,
+)
+from .street_block_builder import build_street_block
 
 
 @dataclass
@@ -621,13 +627,24 @@ class MappingAdapter:
         interfere with map saving or navigation. This command validates and
         uploads its small, versioned output once the runner has produced it.
         """
-        source_value = command.get("map_dir") or self._find_latest_session_dir(require_complete=True)
+        scene_build_id = str(command.get("scene_build_id") or "")
+        scene_input = command.get("scene_input") if isinstance(command.get("scene_input"), dict) else {}
+        if scene_build_id and scene_input.get("point_cloud_url"):
+            source_value = Path(tempfile.gettempdir()) / f"roamerx-scene-build-{scene_build_id}"
+            source_value.mkdir(parents=True, exist_ok=True)
+        else:
+            source_value = command.get("map_dir") or self._find_latest_session_dir(require_complete=True)
         source_dir = Path(source_value).expanduser() if source_value else None
         if source_dir is None or not source_dir.is_dir():
             raise ProtocolError("SCENE_SEMANTIC_MAP_MISSING", "没有可用于语义处理的本地完整地图")
         sidecar = source_dir / "scene_semantics.json"
-        if not sidecar.is_file():
-            return self._start_scene_semantics(source_dir, str(command.get("map_id") or ""), str(command.get("map_sha256") or ""))
+        if not sidecar.is_file() or bool(command.get("force", False)):
+            return self._start_scene_semantics(
+                source_dir,
+                str(command.get("map_id") or ""),
+                str(command.get("map_sha256") or ""),
+                build_context=command if scene_build_id else None,
+            )
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -654,7 +671,7 @@ class MappingAdapter:
         with self._scene_semantics_lock:
             return dict(self._scene_semantics_job)
 
-    def _start_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str) -> dict:
+    def _start_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str, build_context: dict | None = None) -> dict:
         config = self._scene_semantics_config
         if config is None or not config.enabled:
             return {"status": "unavailable", "reason": "scene semantics is disabled", "map_dir": str(source_dir)}
@@ -669,32 +686,63 @@ class MappingAdapter:
             }
             self._scene_semantics_thread = threading.Thread(
                 target=self._run_scene_semantics,
-                args=(source_dir, map_id, map_sha256),
+                args=(source_dir, map_id, map_sha256, build_context),
                 name="scene-semantic-runner",
                 daemon=True,
             )
             self._scene_semantics_thread.start()
             return dict(self._scene_semantics_job)
 
-    def _run_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str) -> None:
+    def _run_scene_semantics(self, source_dir: Path, map_id: str, map_sha256: str, build_context: dict | None = None) -> None:
         config = self._scene_semantics_config
+        publish_threshold = max(float(config.confidence_threshold), 0.901) if build_context else float(config.confidence_threshold)
         with self._scene_semantics_lock:
             self._scene_semantics_job["status"] = "running"
         try:
-            payload = run_scene_semantics(
-                source_dir,
-                model_path=config.model_path,
-                model_version=config.model_version,
-                confidence_threshold=config.confidence_threshold,
-                min_support_frames=config.min_support_frames,
-                voxel_size_m=config.voxel_size_m,
-                max_points=config.max_points,
-                asset_catalog_path=config.asset_catalog_path,
-                map_sha256=map_sha256,
-            )
+            build_url = str((build_context or {}).get("scene_artifact_upload_url") or "")
+            if build_url:
+                self.media_client.update_scene_build(build_url, "staging", 10)
+            if build_context and isinstance(build_context.get("scene_input"), dict):
+                self.media_client.download_scene_inputs(build_context["scene_input"], source_dir)
+            if build_url:
+                self.media_client.update_scene_build(build_url, "ptv3", 25)
+            if str(getattr(config, "backend", "onnxruntime")).lower() == "autoware_tensorrt":
+                payload = run_autoware_scene_semantics(
+                    source_dir,
+                    bundle_path=config.bundle_path,
+                    plugin_path=config.plugin_path,
+                    inference_binary_path=config.inference_binary_path,
+                    model_version=config.model_version,
+                    confidence_threshold=publish_threshold,
+                    min_support_frames=config.min_support_frames,
+                    max_points=config.max_points,
+                    enable_detection=config.enable_detection,
+                    asset_catalog_path=config.asset_catalog_path,
+                    map_sha256=map_sha256,
+                )
+            else:
+                payload = run_scene_semantics(
+                    source_dir,
+                    model_path=config.model_path,
+                    model_version=config.model_version,
+                    confidence_threshold=publish_threshold,
+                    min_support_frames=config.min_support_frames,
+                    voxel_size_m=config.voxel_size_m,
+                    max_points=config.max_points,
+                    asset_catalog_path=config.asset_catalog_path,
+                    map_sha256=map_sha256,
+                )
             sidecar = source_dir / "scene_semantics.json"
             write_scene_semantics(sidecar, payload)
             upload_result = self.media_client.upload_scene_semantics(map_id, payload) if map_id else None
+            street_block_upload = None
+            if build_context and build_context.get("scene_artifact_upload_url"):
+                self.media_client.update_scene_build(build_url, "geometry_and_color", 75)
+                artifact, street_manifest = build_street_block(source_dir, payload)
+                self.media_client.update_scene_build(build_url, "uploading", 90)
+                street_block_upload = self.media_client.upload_scene_artifact(
+                    str(build_context["scene_artifact_upload_url"]), artifact, street_manifest
+                )
             with self._scene_semantics_lock:
                 self._scene_semantics_job = {
                     "status": payload.get("status", "ready"),
@@ -704,9 +752,16 @@ class MappingAdapter:
                     "instance_count": len(payload.get("instances", [])),
                     "review_count": len(payload.get("review_candidates", [])),
                     "upload_result": upload_result,
+                    "street_block_upload": street_block_upload,
                 }
-        except (SceneSemanticError, OSError, ValueError) as exc:
+        except Exception as exc:
             LOGGER.exception("scene semantic inference failed for %s", source_dir)
+            build_url = str((build_context or {}).get("scene_artifact_upload_url") or "")
+            if build_url:
+                try:
+                    self.media_client.update_scene_build(build_url, "failed", 99, str(exc))
+                except Exception:
+                    LOGGER.exception("failed to report street-block build failure")
             with self._scene_semantics_lock:
                 self._scene_semantics_job = {
                     "status": "failed",

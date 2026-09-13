@@ -5,5 +5,10 @@
     "key": "",
     "securityJsCode": "",
     "version": "2.0"
+  },
+  "satellite": {
+    "enabled": true,
+    "tileUrl": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    "attribution": "Imagery © Esri"
   }
 }

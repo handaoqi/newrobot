@@ -1,0 +1,23 @@
+# RTAB-Map visual replay profile.
+# This profile is for the human-facing replay branch only. It must not publish
+# /map or replace FAST-LIO/Nav2's navigation map in production.
+rtabmap:
+  mode: offline_replay
+  navigation_authoritative: false
+  ros2_launch: >-
+    ros2 launch rtabmap_launch rtabmap.launch.py
+    use_sim_time:=true localization:=false rtabmap_viz:=false rviz:=false
+    subscribe_rgb:=true subscribe_scan:=true subscribe_scan_cloud:=false
+    compressed:=true rgb_topic:=/camera/front/image
+    scan_topic:=/scan camera_info_topic:=/camera/front/camera_info
+    frame_id:=base_link database_path:=~/.ros/rtabmap_visual_replay.db
+  outputs:
+    database: rtabmap_visual_replay.db
+    colored_cloud: map_cloud.pcd
+    visual_manifest: visual_manifest.json
+    orthophoto: rgb_orthophoto.png
+  contract:
+    navigation_authoritative: false
+    requires_true_rgb: true
+    requires_camera_info: true
+    requires_depth_or_lidar_geometry: true

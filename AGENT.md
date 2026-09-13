@@ -35,7 +35,7 @@
 | `dev-agent/` | 源码从 `/home/dogrobot/dev-agent/` 运行 | 不发布 | Codex 主会话归档在 `runtime/nx-edge/data/codex/sessions/`，恢复说明见 `runtime/nx-edge/docs/CODEX_SESSION_BACKUP.md`。 |
 | `mcp_server/` | 顶层目录仅含测试，不发布运行代码 | 不发布 | 运行代码来自 `robot/mcp_server/`；现役 MCP service 从 `/home/dogrobot/robot/mcp_server/` 启动。 |
 | `platform/` | 不发布到 NX | 不发布 | Docker 方式发布到云端 `/opt/roamerx/source/platform`，状态在 `/opt/roamerx/runtime/platform`。 |
-| `deploy/`、`scripts/` | 从 `/home/dogrobot` 执行，不常驻部署 | 不发布 | `deploy/robot/deploy.sh` 只发布 `robot/` 与 `edge-agent/`。 |
+| `deploy/`、`scripts/` | 从 `/home/dogrobot` 执行，不常驻部署 | 不发布 | `deploy/nx-edge/deploy.sh` 发布 `robot/` 与 `edge-agent/`；`deploy/3588-motion/` 只发布 3588 运控覆盖层。 |
 | `backup/`、`patrol_data/` | 不发布 | 不发布 | 分别为私有备份和测试 rosbag；禁止覆盖设备。 |
 
 ## 3588 的例外资产

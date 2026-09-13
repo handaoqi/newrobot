@@ -48,7 +48,9 @@ const assetModelRequests = new Map()
 let assetCatalog = normalizeSceneAssetCatalog(null)
 let assetCatalogUrl = ''
 let assetCatalogRequest = null
-let semanticRenderToken = 0
+let staticRenderToken = 0
+let dynamicRenderToken = 0
+let streetBlockRenderToken = 0
 let mounted = false
 
 function bounds() {
@@ -112,7 +114,7 @@ async function loadAssetCatalog() {
     })
     .finally(() => { assetCatalogRequest = null })
   await assetCatalogRequest
-  if (mounted) await updateAssetGroups()
+  if (mounted) { await updateStaticAssets(); await updateDynamicAssets() }
   return assetCatalog
 }
 
@@ -164,8 +166,9 @@ function updateCloudBuffer() {
     if (!points.material.vertexColors) points.material.color.set('#5bb8ff')
     groups.globalCloud.add(points)
     const position = points.geometry.getAttribute('position')
+    const semanticAssets = filterStaticSceneAssets(props.staticAssets)
     emit('asset-inference', {
-      assets: filterStaticSceneAssets(props.staticAssets),
+      assets: semanticAssets,
       pointCount: position?.count || 0,
       source: 'semantic_artifact',
       status: props.manifest?.semantic_build?.status || 'unavailable',
@@ -287,36 +290,62 @@ function primitiveFor(item) {
   return mesh
 }
 
-async function updateAssetGroups() {
-  const token = ++semanticRenderToken
-  const staticItems = filterStaticSceneAssets(props.staticAssets)
-  const groupSpecs = [
-    { name: 'staticAssets', items: staticItems, dynamic: false },
-    { name: 'dynamicObjects', items: props.dynamicObjects.filter(isDynamicSceneObject), dynamic: true },
-  ]
-  for (const { name, items, dynamic } of groupSpecs) {
-    clearGroup(name)
-    for (const [index, item] of items.entries()) {
-      const normalized = normalizeSceneAssetInstance({ ...item, dynamic }, index)
-      const assetId = sceneAssetIdForClass(normalized.assetId, assetCatalog) || sceneAssetIdForClass(normalized.className, assetCatalog)
-      const model = await loadAssetModel(assetId)
-      if (!mounted || token !== semanticRenderToken) return
-      if (model) {
-        model.userData.sceneAssetInstance = true
-        applyInstanceTransform(model, { ...normalized, assetId })
-        groups[name].add(model)
-      } else {
-        groups[name].add(primitiveFor(normalized))
-      }
-    }
+async function renderAssets(name, items, dynamic, token) {
+  clearGroup(name)
+  for (const [index, item] of items.entries()) {
+    const normalized = normalizeSceneAssetInstance({ ...item, dynamic }, index)
+    const assetId = sceneAssetIdForClass(normalized.assetId, assetCatalog) || sceneAssetIdForClass(normalized.className, assetCatalog)
+    const model = await loadAssetModel(assetId)
+    const current = dynamic ? dynamicRenderToken : staticRenderToken
+    if (!mounted || token !== current) return
+    if (model) {
+      model.userData.sceneAssetInstance = true
+      applyInstanceTransform(model, { ...normalized, assetId })
+      groups[name].add(model)
+    } else groups[name].add(primitiveFor(normalized))
   }
   updateVisibility()
+}
+
+function updateStaticAssets() {
+  const token = ++staticRenderToken
+  return renderAssets('staticAssets', filterStaticSceneAssets(props.staticAssets), false, token)
+}
+
+function updateDynamicAssets() {
+  const token = ++dynamicRenderToken
+  return renderAssets('dynamicObjects', props.dynamicObjects.filter(isDynamicSceneObject), true, token)
+}
+
+async function updateStreetBlock() {
+  const token = ++streetBlockRenderToken
+  clearGroup('streetBlock')
+  const url = props.manifest?.street_block?.available ? props.manifest.street_block.url : ''
+  if (!url) { updateVisibility(); return }
+  try {
+    const authToken = localStorage.getItem('inspection_token')
+    const response = await fetch(url, { headers: authToken ? { Authorization: `Token ${authToken}` } : {} })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const buffer = await response.arrayBuffer()
+    const gltf = await new Promise((resolve, reject) => assetLoader.parse(buffer, '', resolve, reject))
+    if (!mounted || token !== streetBlockRenderToken) return
+    gltf.scene.userData.streetBlock = true
+    groups.streetBlock.add(gltf.scene)
+    updateVisibility()
+  } catch (cause) {
+    if (token === streetBlockRenderToken) emit('error', `街区模型加载失败：${cause.message}`)
+  }
 }
 
 function updateVisibility() {
   for (const [name, group] of Object.entries(groups)) {
     const streetBlock = props.mapMode === 'street-block'
-    group.visible = props.layers[name] !== false && !(streetBlock && name === 'globalCloud')
+    const modeVisible = name === 'globalCloud'
+      ? !streetBlock
+      : ['staticAssets', 'streetBlock', 'dynamicObjects'].includes(name)
+        ? streetBlock
+        : true
+    group.visible = props.layers[name === 'streetBlock' ? 'staticAssets' : name] !== false && modeVisible
   }
 }
 
@@ -405,7 +434,7 @@ onMounted(() => {
   const directional = new THREE.DirectionalLight('#ffffff', 2.2)
   directional.position.set(6, -4, 10)
   scene.add(directional)
-  for (const name of ['occupancy', 'globalCloud', 'localCloud', 'obstacles', 'route', 'trail', 'corrections', 'boundary', 'robot', 'staticAssets', 'dynamicObjects']) {
+  for (const name of ['occupancy', 'globalCloud', 'localCloud', 'obstacles', 'route', 'trail', 'corrections', 'boundary', 'robot', 'staticAssets', 'streetBlock', 'dynamicObjects']) {
     groups[name] = new THREE.Group(); groups[name].name = name; scene.add(groups[name])
   }
   const grid = new THREE.GridHelper(60, 60, '#284c68', '#173044')
@@ -414,11 +443,11 @@ onMounted(() => {
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(host.value)
   host.value.addEventListener('wheel', onWheel, { passive: true })
-  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateAssetGroups(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
+  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateStaticAssets(); void updateDynamicAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
   animationFrame = requestAnimationFrame(animate)
 })
 
-watch(() => props.manifest, () => { updateOccupancy(); void updateAssetGroups(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
+watch(() => props.manifest, () => { updateOccupancy(); void updateStaticAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
 watch(() => props.cloudBuffer, updateCloudBuffer)
 watch(() => props.liveCloud, updateLiveCloud)
 watch(() => props.obstacles, updateObstacles)
@@ -426,9 +455,9 @@ watch(() => props.trail, updateTrail, { deep: true })
 watch(() => props.correction, updateCorrection, { deep: true })
 watch(() => props.robotPose, () => { updateRobot(); if (['dog', 'follow'].includes(props.cameraPreset)) setCamera() }, { deep: true })
 watch(() => props.waypoints, updateRoute, { deep: true })
-watch(() => props.staticAssets, () => { void updateAssetGroups() }, { deep: true })
-watch(() => props.dynamicObjects, () => { void updateAssetGroups() }, { deep: true })
-watch(() => props.mapMode, () => { void updateAssetGroups(); updateVisibility() })
+watch(() => props.staticAssets, () => { void updateStaticAssets() }, { deep: true })
+watch(() => props.dynamicObjects, () => { void updateDynamicAssets() }, { deep: true })
+watch(() => props.mapMode, updateVisibility)
 watch(() => props.layers, updateVisibility, { deep: true })
 watch(() => [props.mode, props.cameraPreset], () => {
   zoom.value = props.mode === '3d' ? Math.max(zoom.value, .56) : Math.min(zoom.value, .44)
@@ -437,7 +466,9 @@ watch(() => [props.mode, props.cameraPreset], () => {
 
 onBeforeUnmount(() => {
   mounted = false
-  semanticRenderToken += 1
+  staticRenderToken += 1
+  dynamicRenderToken += 1
+  streetBlockRenderToken += 1
   cancelAnimationFrame(animationFrame)
   resizeObserver?.disconnect()
   host.value?.removeEventListener('wheel', onWheel)

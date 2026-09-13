@@ -13,7 +13,7 @@
    盘点云端、NX、3588 的部署入口，明确与 `runtime/`、systemd、Docker 的边界、前置条件和回滚方式。
 
 3. **统一部署目录**（已实现并完成本地验证：2026-08-21）
-   已新增 `deploy/platform/`、`deploy/nx-edge/`、`deploy/3588/` 正式入口；`runtime/` 中旧部署脚本改为兼容转发入口。bash 语法检查和三端 dry-run 已通过；真实端点部署留待发布阶段。
+   已新增 `deploy/platform/`、`deploy/nx-edge/`、`deploy/3588-motion/` 正式入口；`runtime/` 中旧部署脚本改为兼容转发入口。bash 语法检查和三端 dry-run 已通过；真实端点部署留待发布阶段。
 
 4. **三端数据备份**（已实现并完成 dry-run 验证：2026-08-21）
    已新增 `deploy/backup/backup-all.sh`、校验脚本和临时目录恢复验证脚本。标准备份包含配置、数据库、地图和状态；日志、rosbag/MCAP、缓存、模型、媒体和构建产物只进入排除范围，不复制到标准备份。真实备份留待确认 SSH 和现场状态后执行。
@@ -47,7 +47,7 @@
 ## 本轮执行记录
 
 - 工作区冻结基线：当前 `main` 工作区存在用户未提交改动，执行过程中不得回退或覆盖。
-- 新增部署入口：`deploy/platform/`、`deploy/nx-edge/`、`deploy/3588/`。
+- 新增部署入口：`deploy/platform/`、`deploy/nx-edge/`、`deploy/3588-motion/`。
 - 新增备份入口：`deploy/backup/backup-all.sh`、`verify-backup.sh`、`restore-check.sh`。
 - Edge Agent 全量测试：110 项通过。
 - 后端 `monitoring` 全量测试：90 项通过。

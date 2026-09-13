@@ -124,11 +124,16 @@ if "$DEPLOY_BACKEND"; then
     --exclude='data/' \
     --exclude='media/' \
     "$PROJECT_DIR/backend/" "$CLOUD_HOST:$REMOTE_ROOT/backend/"
+  echo "[deploy] Installing scene build worker unit..."
+  scp "$PROJECT_DIR/deploy/systemd/roamerx-scene-build-worker.service" \
+    "$CLOUD_HOST:/etc/systemd/system/roamerx-scene-build-worker.service" >/dev/null
+  ssh "$CLOUD_HOST" "systemctl daemon-reload && systemctl enable roamerx-scene-build-worker.service >/dev/null"
   echo "[deploy] Applying database migrations..."
   ssh "$CLOUD_HOST" bash -s -- "$REMOTE_ROOT" <<'REMOTE_MIGRATION_SCRIPT'
 set -euo pipefail
 remote_root="$1"
 services=(
+  roamerx-scene-build-worker.service
   roamerx-patrol-loop-supervisor.service
   roamerx-patrol-scheduler.service
   roamerx-device-worker.service

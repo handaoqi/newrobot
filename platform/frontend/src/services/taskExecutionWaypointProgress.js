@@ -91,7 +91,7 @@ function eventDetail(event) {
   if (Number.isFinite(Number(payload.reapproach_attempts))) {
     arrival.push(`追加靠近 ${Number(payload.reapproach_attempts)} 次`)
   }
-  if (payload.coarse_completed === true) arrival.push('两次靠近后按 0.50m 粗范围完成')
+  if (payload.coarse_completed === true) arrival.push('旧策略：按 0.50m 粗范围完成')
   return [
     target ? `目标 ${target}` : '',
     robot ? `机器狗 ${robot}` : '',

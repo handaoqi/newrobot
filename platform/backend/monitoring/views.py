@@ -53,6 +53,9 @@ from .models import (
     ScheduleRun,
     TrajectoryPoint,
     MapData,
+    MapSceneBuild,
+    MapSceneInput,
+    MapSceneReference,
     MapNavigationBoundary,
     MapSet,
     MapSetMember,
@@ -2715,6 +2718,281 @@ class MapDataSceneView(APIView):
     def get(self, request, pk):
         map_data = get_object_or_404(MapData, pk=pk)
         return Response(build_scene_manifest(map_data))
+
+
+def _scene_input_payload(request, scene_input: MapSceneInput) -> dict:
+    def file_url(kind, field):
+        return request.build_absolute_uri(
+            f"/api/maps/{scene_input.map_data_id}/scene-inputs/{scene_input.id}/files/{kind}/"
+        ) if field else ""
+
+    return {
+        "id": str(scene_input.id),
+        "map_id": scene_input.map_data_id,
+        "point_cloud_url": file_url("point-cloud", scene_input.point_cloud),
+        "calibration_url": file_url("calibration", scene_input.calibration),
+        "trajectory_url": file_url("trajectory", scene_input.trajectory),
+        "metadata": scene_input.metadata,
+        "references": [
+            {
+                "id": str(item.id),
+                "kind": item.kind,
+                "name": item.original_name,
+                "content_type": item.content_type,
+                "size_bytes": item.size_bytes,
+                "url": request.build_absolute_uri(
+                    f"/api/maps/{scene_input.map_data_id}/scene-references/{item.id}/file/"
+                ),
+            }
+            for item in scene_input.references.all()
+        ],
+        "created_at": scene_input.created_at.isoformat() if scene_input.created_at else "",
+    }
+
+
+def _scene_build_payload(request, build: MapSceneBuild) -> dict:
+    config = build.config if isinstance(build.config, dict) else {}
+    return {
+        "id": str(build.id),
+        "map_id": build.map_data_id,
+        "scene_input_id": str(build.scene_input_id or ""),
+        "robot_id": build.robot_id,
+        "state": build.state,
+        "stage": build.stage,
+        "progress_percent": build.progress_percent,
+        "command_id": str(build.command_id or ""),
+        "config": config,
+        "engine": str(config.get("engine") or "edge_ptv3"),
+        "semantic_source": str(build.manifest.get("semantic_source") or "") if isinstance(build.manifest, dict) else "",
+        "warnings": build.manifest.get("warnings", []) if isinstance(build.manifest, dict) else [],
+        "metrics": build.metrics,
+        "manifest": build.manifest,
+        "error_message": build.error_message,
+        "artifact_url": request.build_absolute_uri(
+            f"/api/maps/{build.map_data_id}/scene-builds/{build.id}/artifact/"
+        ) if build.artifact else "",
+        "created_at": build.created_at,
+        "updated_at": build.updated_at,
+    }
+
+
+class MapSceneInputView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        rows = map_data.scene_inputs.prefetch_related("references")[:20]
+        return Response([_scene_input_payload(request, item) for item in rows])
+
+    def post(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        point_cloud = request.FILES.get("point_cloud")
+        calibration = request.FILES.get("calibration")
+        trajectory = request.FILES.get("trajectory")
+        references = request.FILES.getlist("references")
+        if not point_cloud and not references and not calibration and not trajectory:
+            return Response({"detail": "请至少上传一种场景输入"}, status=status.HTTP_400_BAD_REQUEST)
+        if point_cloud and not point_cloud.name.lower().endswith(".pcd"):
+            return Response({"detail": "点云仅支持 PCD"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            metadata = json.loads(request.data.get("metadata") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return Response({"detail": "metadata 不是合法 JSON"}, status=status.HTTP_400_BAD_REQUEST)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if point_cloud:
+            digest = hashlib.sha256()
+            for chunk in point_cloud.chunks():
+                digest.update(chunk)
+            point_cloud.seek(0)
+            metadata["point_cloud_sha256"] = digest.hexdigest()
+        scene_input = MapSceneInput.objects.create(
+            map_data=map_data,
+            point_cloud=point_cloud,
+            calibration=calibration,
+            trajectory=trajectory,
+            metadata=metadata,
+            created_by=request.user,
+        )
+        for upload in references:
+            content_type = str(upload.content_type or "")
+            suffix = upload.name.lower()
+            if content_type.startswith("image/") or suffix.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                kind = "image"
+            elif content_type.startswith("video/") or suffix.endswith((".mp4", ".mov", ".mkv")):
+                kind = "video"
+            elif suffix.endswith((".mcap", ".bag", ".db", ".db3")):
+                kind = "recording"
+            else:
+                continue
+            MapSceneReference.objects.create(
+                scene_input=scene_input,
+                kind=kind,
+                file=upload,
+                original_name=upload.name[:256],
+                content_type=content_type[:128],
+                size_bytes=upload.size,
+            )
+        scene_input = MapSceneInput.objects.prefetch_related("references").get(pk=scene_input.pk)
+        return Response(_scene_input_payload(request, scene_input), status=status.HTTP_201_CREATED)
+
+
+class MapSceneInputFileView(APIView):
+    permission_classes = [IsAuthenticatedOrDeviceCredential]
+
+    def get(self, request, pk, input_id, kind):
+        scene_input = get_object_or_404(MapSceneInput, pk=input_id, map_data_id=pk)
+        field = {"point-cloud": scene_input.point_cloud, "calibration": scene_input.calibration, "trajectory": scene_input.trajectory}.get(kind)
+        if not field:
+            return Response({"detail": "文件不存在"}, status=status.HTTP_404_NOT_FOUND)
+        return FileResponse(field.open("rb"), as_attachment=True, filename=field.name.rsplit("/", 1)[-1])
+
+
+class MapSceneReferenceFileView(APIView):
+    permission_classes = [IsAuthenticatedOrDeviceCredential]
+
+    def get(self, request, pk, reference_id):
+        item = get_object_or_404(MapSceneReference, pk=reference_id, scene_input__map_data_id=pk)
+        return FileResponse(item.file.open("rb"), as_attachment=True, filename=item.original_name)
+
+
+class MapSceneBuildView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        build = map_data.scene_builds.first()
+        if not build:
+            return Response({"state": "unavailable", "progress_percent": 0})
+        return Response(_scene_build_payload(request, build))
+
+    def post(self, request, pk):
+        map_data = get_object_or_404(MapData, pk=pk)
+        scene_input = None
+        if request.data.get("scene_input_id"):
+            scene_input = get_object_or_404(MapSceneInput, pk=request.data["scene_input_id"], map_data=map_data)
+        if scene_input is None and not map_data.package_file:
+            return Response({"detail": "请上传 PCD，或选择包含点云的地图包"}, status=status.HTTP_400_BAD_REQUEST)
+        use_ptv3 = bool(request.data.get("use_ptv3", False))
+        build = MapSceneBuild.objects.create(
+            map_data=map_data,
+            scene_input=scene_input,
+            robot=None,
+            requested_by=request.user,
+            state="queued",
+            stage="queued",
+            progress_percent=0,
+            config={
+                "engine": "server_code",
+                "use_ptv3": use_ptv3,
+                "grid_resolution_m": 0.35,
+                "color_mode": "approximate_material",
+            },
+        )
+        return Response(_scene_build_payload(request, build), status=status.HTTP_202_ACCEPTED)
+
+
+class MapSceneBuildAnchorView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk, build_id):
+        build = get_object_or_404(MapSceneBuild, pk=build_id, map_data_id=pk)
+        anchors = request.data.get("anchors")
+        if not isinstance(anchors, list) or len(anchors) < 3:
+            return Response({"detail": "至少需要三个对应点"}, status=status.HTTP_400_BAD_REQUEST)
+        build.anchors = anchors
+        build.save(update_fields=["anchors", "updated_at"])
+        return Response(_scene_build_payload(request, build))
+
+
+class MapSceneBuildReviewView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk, build_id):
+        build = get_object_or_404(MapSceneBuild, pk=build_id, map_data_id=pk)
+        node_id = str(request.data.get("node_id") or "")
+        action = str(request.data.get("action") or "")
+        nodes = build.manifest.get("nodes") if isinstance(build.manifest.get("nodes"), list) else []
+        eligible = [item for item in nodes if isinstance(item, dict) and not str(item.get("id") or "").startswith("road-link-")]
+        if node_id not in {str(item.get("id") or "") for item in eligible}:
+            return Response({"detail": "未找到可抽检的发布实例"}, status=status.HTTP_404_NOT_FOUND)
+        if action not in {"correct", "incorrect"}:
+            return Response({"detail": "action 必须是 correct 或 incorrect"}, status=status.HTTP_400_BAD_REQUEST)
+        config = dict(build.config or {})
+        labels = dict(config.get("validation_labels") or {})
+        labels[node_id] = action == "correct"
+        config["validation_labels"] = labels
+        required = min(100, len(eligible))
+        precision = sum(value is True for value in labels.values()) / max(1, len(labels))
+        quality = dict(build.metrics or {})
+        quality.update({
+            "publish_precision_samples": len(labels),
+            "publish_precision_required_samples": required,
+            "publish_precision": precision,
+            "publish_precision_verified": len(labels) >= required and precision > 0.90,
+            "validation_labels": labels,
+        })
+        manifest = dict(build.manifest or {})
+        manifest["quality"] = quality
+        build.config = config
+        build.metrics = quality
+        build.manifest = manifest
+        build.save(update_fields=["config", "metrics", "manifest", "updated_at"])
+        return Response(_scene_build_payload(request, build))
+
+
+class MapSceneBuildArtifactView(APIView):
+    permission_classes = [IsAuthenticatedOrDeviceCredential]
+
+    def get(self, request, pk, build_id):
+        build = get_object_or_404(MapSceneBuild, pk=build_id, map_data_id=pk)
+        if not build.artifact:
+            return Response({"detail": "街区模型尚未生成"}, status=status.HTTP_404_NOT_FOUND)
+        return FileResponse(build.artifact.open("rb"), content_type="model/gltf-binary")
+
+    def post(self, request, pk, build_id):
+        build = get_object_or_404(MapSceneBuild, pk=build_id, map_data_id=pk)
+        if getattr(request, "device_robot", None) is not None and build.robot_id != request.device_robot.id:
+            return Response({"detail": "设备凭证与构建任务不匹配"}, status=status.HTTP_403_FORBIDDEN)
+        artifact = request.FILES.get("artifact")
+        if not artifact:
+            stage = str(request.data.get("stage") or "running")[:64]
+            try:
+                progress = max(build.progress_percent, min(99, int(request.data.get("progress_percent") or build.progress_percent)))
+            except (TypeError, ValueError):
+                progress = build.progress_percent
+            build.state = "failed" if stage == "failed" else "running"
+            build.stage = stage
+            build.progress_percent = progress
+            build.error_message = str(request.data.get("error_message") or "")
+            build.finished_at = timezone.now() if build.state == "failed" else None
+            build.save()
+            return Response(_scene_build_payload(request, build))
+        try:
+            manifest = json.loads(request.data.get("manifest") or "{}")
+        except json.JSONDecodeError:
+            return Response({"detail": "manifest 不是合法 JSON"}, status=status.HTTP_400_BAD_REQUEST)
+        build.artifact.save(f"street-block-{build.id}.glb", artifact, save=False)
+        build.manifest = manifest if isinstance(manifest, dict) else {}
+        build.metrics = build.manifest.get("quality") if isinstance(build.manifest.get("quality"), dict) else {}
+        build.state = "review" if int(build.manifest.get("review_count") or 0) else "ready"
+        build.stage = "review" if build.state == "review" else "completed"
+        build.progress_percent = 100
+        build.finished_at = timezone.now()
+        build.error_message = ""
+        build.save()
+
+        description = _parse_map_description(build.map_data)
+        scene = description.get("scene_manifest") if isinstance(description.get("scene_manifest"), dict) else {}
+        scene["street_block"] = {
+            **build.manifest,
+            "available": True,
+            "build_id": str(build.id),
+            "url": f"/api/maps/{pk}/scene-builds/{build.id}/artifact/",
+        }
+        description["scene_manifest"] = scene
+        build.map_data.description = json.dumps(description, ensure_ascii=False)
+        build.map_data.save(update_fields=["description", "updated_at"])
+        return Response(_scene_build_payload(request, build))
 
 
 class MapDataSceneSemanticsView(APIView):

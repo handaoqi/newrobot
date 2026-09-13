@@ -36,13 +36,13 @@ export const ASSET_REGISTRY = Object.freeze({
   person: { label: '行人', aliases: ['pedestrian'], color: '#f59e0b', kind: 'person', dynamic: true },
   bicycle: { label: '自行车', aliases: ['bike', '自行车'], color: '#38bdf8', kind: 'bicycle', dynamic: true },
   vehicle: { label: '车辆', aliases: ['car', 'truck', 'bus', 'motorcycle'], color: '#ef4444', kind: 'vehicle', dynamic: true },
-  wall: { label: '墙体', aliases: [], color: '#94a3b8', kind: 'wall', dynamic: false },
+  wall: { label: '墙体', aliases: ['vertical_thin', 'vertical-thin'], color: '#94a3b8', kind: 'wall', dynamic: false },
   building: { label: '建筑', aliases: [], color: '#64748b', kind: 'building', dynamic: false },
   tree: { label: '树木', aliases: ['bush', 'shrub', 'conifer', 'pine'], color: '#22c55e', kind: 'tree', dynamic: false },
-  road: { label: '道路', aliases: ['path', 'walkway', 'crossroad', 'intersection'], color: '#64748b', kind: 'road', dynamic: false },
+  road: { label: '道路', aliases: ['path', 'walkway', 'crossroad', 'intersection', 'drivable_flat', 'non_drivable_flat'], color: '#64748b', kind: 'road', dynamic: false },
   barrier: { label: '隔离设施', aliases: ['barrier', 'traffic_cone', 'traffic-cone'], color: '#fb923c', kind: 'barrier', dynamic: false },
   vegetation: { label: '地被植被', aliases: ['vegetation', 'groundcover'], color: '#4ade80', kind: 'vegetation', dynamic: false },
-  debris: { label: '杂物', aliases: ['debris'], color: '#a8a29e', kind: 'debris', dynamic: false },
+  debris: { label: '杂物', aliases: ['debris', 'static_clutter'], color: '#a8a29e', kind: 'debris', dynamic: false },
   unknown_obstacle: { label: '未知障碍', aliases: ['unknown'], color: '#a78bfa', kind: 'obstacle', dynamic: true },
 })
 

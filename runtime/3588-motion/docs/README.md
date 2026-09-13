@@ -9,7 +9,7 @@ Deploy from NX without starting motion:
 
 ```bash
 cd /home/dogrobot
-deploy/3588/deploy.sh
+deploy/3588-motion/deploy.sh
 ssh 3588 /home/firefly/dogrobot-runtime/bin/motionctl init-state
 ssh 3588 /home/firefly/dogrobot-runtime/scripts/verify.sh
 ```

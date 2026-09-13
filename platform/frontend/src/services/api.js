@@ -438,6 +438,17 @@ export async function fetchRobotMappingStatus(robotId, { signal } = {}) {
   return request(`/robots/${robotId}/mapping/status/`, { signal })
 }
 
+export async function startRobotSceneSemantics(robotId, mapId, { force = false } = {}) {
+  return request(`/robots/${robotId}/mapping/scene-semantics/`, {
+    method: 'POST',
+    body: JSON.stringify({ map_id: String(mapId), force }),
+  })
+}
+
+export async function fetchMapSceneSemanticsStatus(mapId, { signal } = {}) {
+  return request(`/maps/${mapId}/scene-semantics/status/`, { signal })
+}
+
 export async function fetchRobotNavigationStatus(robotId, { signal, summary = false } = {}) {
   const query = summary ? '?view=summary' : ''
   return request(`/robots/${robotId}/navigation/status/${query}`, {
@@ -608,6 +619,33 @@ export async function fetchMapMappingTrace(mapId) {
 
 export async function fetchMapScene(mapId, { signal } = {}) {
   return request(`/maps/${mapId}/scene/`, { signal })
+}
+
+export async function uploadMapSceneInput(mapId, { pointCloud, calibration, trajectory, references = [] }) {
+  const body = new FormData()
+  if (pointCloud) body.append('point_cloud', pointCloud)
+  if (calibration) body.append('calibration', calibration)
+  if (trajectory) body.append('trajectory', trajectory)
+  references.forEach(file => body.append('references', file))
+  body.append('metadata', JSON.stringify({ alignment: trajectory ? 'trajectory' : 'anchors' }))
+  return request(`/maps/${mapId}/scene-inputs/`, { method: 'POST', body, headers: {}, timeoutMs: 30 * 60 * 1000 })
+}
+
+export async function startMapSceneBuild(mapId, sceneInputId = '', { usePtv3 = false } = {}) {
+  return request(`/maps/${mapId}/scene-builds/`, {
+    method: 'POST',
+    body: JSON.stringify({ scene_input_id: sceneInputId, engine: 'server_code', use_ptv3: usePtv3 }),
+  })
+}
+
+export async function fetchCurrentMapSceneBuild(mapId, { signal } = {}) {
+  return request(`/maps/${mapId}/scene-builds/current/`, { signal })
+}
+
+export async function reviewMapSceneBuild(mapId, buildId, nodeId, action) {
+  return request(`/maps/${mapId}/scene-builds/${buildId}/review/`, {
+    method: 'POST', body: JSON.stringify({ node_id: nodeId, action }),
+  })
 }
 
 export async function reviewMapSceneSemantics(mapId, candidateId, action, assetId = '') {

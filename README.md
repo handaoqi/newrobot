@@ -13,10 +13,11 @@ platform, edge control, and deployment tooling.
 - `platform/backend/`: Django API, device worker, scheduler, and persistence.
 - `platform/frontend/`: Vue operator interface.
 - `platform/bot-version/`: video inference, streaming, and alert reporting.
-- `deploy/`: stable entry points for robot, cloud, and RK3588 deployment.
+- `deploy/`: stable entry points for NX Edge, cloud platform, RK3588 motion,
+  and recovery operations.
 
-Runtime data and credentials are intentionally excluded. Maps live under
-Runtime data is stored under `/home/dogrobot/runtime/nx-edge`, with maps in
+Runtime data and credentials are intentionally excluded. Runtime data is stored
+under `/home/dogrobot/runtime/nx-edge`, with maps in
 `/home/dogrobot/runtime/nx-edge/data/jszr/map` and rosbags in
 `/home/dogrobot/runtime/nx-edge/data/rosbags`. Cloud state remains on the
 cloud host under `/opt/roamerx/shared`.
@@ -48,7 +49,7 @@ Deploy using the stable wrappers:
 ```bash
 deploy/nx-edge/deploy.sh --host robot@ROBOT_IP --build
 deploy/platform/deploy.sh
-deploy/3588/deploy.sh
+deploy/3588-motion/deploy.sh
 deploy/backup/backup-all.sh
 ```
 

@@ -3268,7 +3268,7 @@ async function handleDeleteRoute(route) {
                         />
                       </label>
                       <small class="waypoint-arrival-hint">
-                        到达模式：{{ waypointCorrectionModeLabel(point, index) }}；首次 0.50m 粗到达，轻量点按 0.30m 最多再靠近 2 次。
+                        到达模式：{{ waypointCorrectionModeLabel(point, index) }}；首次 0.50m 粗到达，随后按 0.30m 最多细靠近 3 次，仍未达标则安全保持。启用到点转向时，转向造成的 XY 偏移会在避障与新鲜定位约束下分段微调。
                       </small>
                       <label>
                         <span>到点策略</span>

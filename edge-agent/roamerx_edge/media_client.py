@@ -77,6 +77,59 @@ class MediaClient:
         response.raise_for_status()
         return response.json()
 
+    def download_scene_inputs(self, payload: dict, destination: str | Path) -> Path:
+        """Download a cloud-staged scene input into the isolated build directory."""
+        root = Path(destination)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "references").mkdir(exist_ok=True)
+        files = [
+            (payload.get("point_cloud_url"), root / "map.pcd"),
+            (payload.get("calibration_url"), root / "calibration.yaml"),
+            (payload.get("trajectory_url"), root / "trajectory.csv"),
+        ]
+        for index, item in enumerate(payload.get("references") or []):
+            if isinstance(item, dict) and item.get("url"):
+                suffix = Path(str(item.get("name") or "")).suffix or ".bin"
+                files.append((item["url"], root / "references" / f"{index:04d}{suffix}"))
+        headers = {"X-Device-Id": self.config.device_id, "X-Device-Key": self.config.device_key}
+        for url, path in files:
+            if not url:
+                continue
+            with requests.get(str(url), headers=headers, stream=True, timeout=(30, 1800), proxies=_DIRECT) as response:
+                response.raise_for_status()
+                with path.open("wb") as stream:
+                    for chunk in response.iter_content(1024 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+        return root
+
+    def upload_scene_artifact(self, url: str, artifact: str | Path, manifest: dict) -> dict:
+        path = Path(artifact)
+        headers = {"X-Device-Id": self.config.device_id, "X-Device-Key": self.config.device_key}
+        with path.open("rb") as stream:
+            response = requests.post(
+                url,
+                data={"manifest": json.dumps(manifest, ensure_ascii=False)},
+                files={"artifact": (path.name, stream, "model/gltf-binary")},
+                headers=headers,
+                timeout=(30, 1800),
+                proxies=_DIRECT,
+            )
+        response.raise_for_status()
+        return response.json()
+
+    def update_scene_build(self, url: str, stage: str, progress_percent: int, error_message: str = "") -> dict:
+        headers = {"X-Device-Id": self.config.device_id, "X-Device-Key": self.config.device_key}
+        response = requests.post(
+            url,
+            data={"stage": stage, "progress_percent": str(progress_percent), "error_message": error_message},
+            headers=headers,
+            timeout=60,
+            proxies=_DIRECT,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def _upload(self, path: str, media_type: str, event_id: str, task_execution_id: str | None) -> dict:
         file_path = Path(path)
         digest = hashlib.sha256(file_path.read_bytes()).hexdigest()

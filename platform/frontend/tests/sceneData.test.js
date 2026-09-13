@@ -15,6 +15,9 @@ test('semantic zoom uses hysteresis and known aliases use stable assets', () => 
   assert.equal(assetForClass('car').key, 'vehicle')
   assert.equal(assetForClass('tree.deciduous').key, 'tree')
   assert.equal(assetForClass('road.curve90').key, 'road')
+  assert.equal(assetForClass('vertical_thin').key, 'wall')
+  assert.equal(assetForClass('drivable_flat').key, 'road')
+  assert.equal(assetForClass('traffic_cone').key, 'barrier')
   assert.equal(assetForClass('not-trained').key, 'unknown_obstacle')
 })
 
@@ -85,12 +88,14 @@ test('scene modes keep static assets separate from motion-gated objects', () => 
     { asset_id: 'building.kiosk' },
     { class_name: 'tree' },
     { class_name: 'road' },
+    { class_name: 'vertical_thin', asset_id: 'wall.vertical-thin' },
+    { class_name: 'drivable_flat', asset_id: 'road.straight' },
     { class_name: 'person' },
     { class_name: 'vehicle' },
     { class_name: 'unknown_obstacle' },
   ]
   assert.deepEqual(filterStaticSceneAssets(items).map(item => item.asset_id || item.class_name), [
-    'wall.straight', 'building.kiosk', 'tree', 'road',
+    'wall.straight', 'building.kiosk', 'tree', 'road', 'wall.vertical-thin', 'road.straight',
   ])
   assert.deepEqual(filterDynamicSceneObjects(items).map(item => item.class_name), [])
   assert.deepEqual(filterDynamicSceneObjects(items, { robotMoving: true }).map(item => item.class_name), ['person', 'vehicle'])

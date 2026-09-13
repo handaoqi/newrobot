@@ -13,7 +13,7 @@ TASK_COMMAND_TYPES = {
     "task.cancel", "task.force_exit", "task.recover.v1",
 }
 MAPPING_COMMAND_TYPES = {
-    "mapping.start", "mapping.save", "mapping.cancel", "mapping.status",
+    "mapping.start", "mapping.save", "mapping.cancel", "mapping.status", "mapping.scene_semantics",
     "mapping.origin_start", "mapping.origin_cancel", "mapping.origin_extract_global", "mapping.slam_start", "mapping.begin",
 }
 NAV_COMMAND_TYPES = {

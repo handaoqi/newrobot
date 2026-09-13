@@ -23,6 +23,7 @@ COMMAND_TYPES = {
     "mapping.save",
     "mapping.cancel",
     "mapping.status",
+    "mapping.scene_semantics",
     "mapping.origin_start",
     "mapping.origin_cancel",
     "mapping.origin_extract_global",

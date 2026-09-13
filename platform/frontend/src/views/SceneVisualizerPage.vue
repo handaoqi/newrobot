@@ -6,8 +6,10 @@ import AmapSatelliteViewport from '../components/scene/AmapSatelliteViewport.vue
 import SystemLogPanel from '../components/SystemLogPanel.vue'
 import {
   fetchMapScene, fetchMapSceneCloud, fetchMapSummaries, fetchRobotNavigationStatus,
-  fetchRobotPersonDetections, fetchRobotStatus, fetchRobots, fetchRouteDetail, reviewMapSceneSemantics,
-  fetchRouteSummaries,
+  fetchRobotCommand, fetchRobotPersonDetections, fetchRobotStatus, fetchRobots, fetchRouteDetail, reviewMapSceneSemantics,
+  fetchMapSceneSemanticsStatus, fetchRouteSummaries, startRobotSceneSemantics,
+  fetchCurrentMapSceneBuild, startMapSceneBuild, uploadMapSceneInput,
+  reviewMapSceneBuild,
 } from '../services/api'
 import { openLiveMessageSource, scanBagMessages } from '../services/rosStream'
 import {
@@ -29,6 +31,16 @@ const liveUrl = ref(localStorage.getItem(LIVE_URL_KEY) || `${location.protocol =
 const manifest = ref(null)
 const cloudBuffer = ref(null)
 const assetInference = ref({ status: 'unavailable', pointCount: 0, source: 'semantic_artifact' })
+const semanticJob = ref({ status: 'unavailable', message: '' })
+const semanticCommandId = ref('')
+const sceneInput = ref(null)
+const sceneBuild = ref({ state: 'unavailable', stage: '', progress_percent: 0 })
+const scenePointCloud = ref(null)
+const sceneCalibration = ref(null)
+const sceneTrajectory = ref(null)
+const sceneReferences = ref([])
+const sceneUploadBusy = ref(false)
+const sceneUsePtv3 = ref(false)
 const liveCloud = ref(null)
 const obstacles = ref(null)
 const streamPose = ref(null)
@@ -59,6 +71,8 @@ const bagTime = ref(0)
 const bagEvents = ref([])
 let liveSource = null
 let pollTimer = null
+let semanticTimer = null
+let sceneBuildTimer = null
 let pollController = null
 let lastLiveCloudAt = -Infinity
 let pendingCloud = null
@@ -81,8 +95,17 @@ const dataAge = computed(() => {
 })
 const sourceLabel = computed(() => ({ live: '实时机器狗', map: '平台离线地图包', bag: '本地 MCAP' }[sourceMode.value]))
 const staticAssets = computed(() => filterStaticSceneAssets(manifest.value?.static_assets || []))
-const viewportStaticAssets = computed(() => staticAssets.value)
+const viewportStaticAssets = computed(() => manifest.value?.street_block?.available ? [] : staticAssets.value)
 const reviewCandidates = computed(() => manifest.value?.semantic_review?.candidates || [])
+const ptv3Reusable = computed(() => (
+  ['ready', 'review'].includes(semanticJob.value?.status)
+  && !scenePointCloud.value
+  && !sceneInput.value?.point_cloud_url
+))
+const precisionAuditItem = computed(() => {
+  const labels = sceneBuild.value?.manifest?.quality?.validation_labels || sceneBuild.value?.config?.validation_labels || {}
+  return (sceneBuild.value?.manifest?.nodes || []).find(item => !String(item.id || '').startsWith('road-link-') && !(item.id in labels)) || null
+})
 const robotMoving = computed(() => isRobotMoving({
   ...status.value,
   speed_mps: Number.isFinite(Number(status.value.speed_mps)) ? status.value.speed_mps : streamPose.value?.speed_mps,
@@ -178,6 +201,10 @@ function statusTone(value) {
   return 'warn'
 }
 
+function semanticStatusLabel(value) {
+  return ({ unavailable: '未启用', queued: '等待执行', running: '推理中', processing: '处理中', review: '待审核', ready: '已完成', failed: '失败' }[value] || value || '未知')
+}
+
 async function loadCatalogs() {
   loading.value = true
   error.value = ''
@@ -198,18 +225,156 @@ async function loadCatalogs() {
 }
 
 async function loadScene() {
+  if (semanticTimer) { window.clearInterval(semanticTimer); semanticTimer = null }
   cloudBuffer.value = null
   manifest.value = null
   assetInference.value = { status: 'unavailable', pointCount: 0, source: 'semantic_artifact' }
+  semanticJob.value = { status: 'unavailable', message: '' }
+  semanticCommandId.value = ''
   if (!selectedMapId.value) return
   sceneLoading.value = true
   try {
     manifest.value = await fetchMapScene(selectedMapId.value)
+    semanticJob.value = { ...(manifest.value.semantic_build || {}) }
+    sceneBuild.value = { ...(manifest.value.scene_build || { state: 'unavailable', progress_percent: 0 }) }
     if (manifest.value.cloud?.available) cloudBuffer.value = await fetchMapSceneCloud(selectedMapId.value)
   } catch (cause) {
     error.value = cause.message || '地图场景加载失败'
   } finally {
     sceneLoading.value = false
+  }
+}
+
+async function refreshSemanticStatus() {
+  if (!selectedMapId.value) return
+  try {
+    const [result, command] = await Promise.all([
+      fetchMapSceneSemanticsStatus(selectedMapId.value),
+      semanticCommandId.value && selectedRobotId.value
+        ? fetchRobotCommand(selectedRobotId.value, semanticCommandId.value)
+        : Promise.resolve(null),
+    ])
+    const manifestStatus = result.semantic_build?.status || 'unavailable'
+    const commandResult = command?.result_payload?.semantic_job || command?.result_payload || {}
+    const commandSemanticStatus = String(commandResult.status || '')
+    const commandState = {
+      created: 'queued', published: 'queued', accepted: 'queued', executing: 'running',
+      succeeded: commandSemanticStatus === 'unavailable'
+        ? 'unavailable'
+        : commandSemanticStatus === 'validated'
+          ? 'ready'
+          : ['review', 'ready', 'failed'].includes(manifestStatus)
+            ? manifestStatus
+            : ['queued', 'running', 'processing', 'review', 'ready', 'failed'].includes(commandSemanticStatus)
+              ? commandSemanticStatus
+            : manifestStatus === 'unavailable' ? 'processing' : manifestStatus,
+      failed: 'failed', rejected: 'failed', cancelled: 'failed', timed_out: 'failed', expired: 'failed',
+    }[command?.status]
+    semanticJob.value = commandState
+      ? { ...(result.semantic_build || {}), status: commandState, message: command?.error_message || command?.ack_reason_message || '' }
+      : { ...(result.semantic_build || {}) }
+    if (['failed', 'rejected', 'timed_out', 'expired'].includes(command?.status)) {
+      semanticJob.value.message ||= '机器狗未完成 PTv3 语义建图'
+    }
+    if (['ready', 'review', 'failed', 'unavailable'].includes(semanticJob.value.status)) {
+      if (semanticTimer) { window.clearInterval(semanticTimer); semanticTimer = null }
+      if (semanticJob.value.status !== 'failed') await loadScene()
+    }
+  } catch (cause) {
+    semanticJob.value = { status: 'failed', message: cause.message || '语义任务状态读取失败' }
+  }
+}
+
+async function runSemanticBuild(force = false) {
+  if (!selectedRobotId.value || !selectedMapId.value) return
+  if (['queued', 'running', 'processing'].includes(semanticJob.value.status)) return
+  try {
+    semanticJob.value = { status: 'queued', message: '已提交，等待机器狗执行' }
+    const result = await startRobotSceneSemantics(selectedRobotId.value, selectedMapId.value, { force })
+    semanticCommandId.value = String(result.command_id || '')
+    await refreshSemanticStatus()
+    if (semanticTimer) window.clearInterval(semanticTimer)
+    semanticTimer = window.setInterval(refreshSemanticStatus, 2000)
+  } catch (cause) {
+    semanticJob.value = { status: 'failed', message: cause.message || 'PTv3 任务提交失败' }
+    error.value = semanticJob.value.message
+  }
+}
+
+async function uploadSceneMaterial() {
+  if (!selectedMapId.value) return null
+  if (!scenePointCloud.value && !sceneCalibration.value && !sceneTrajectory.value && !sceneReferences.value.length) {
+    error.value = '请选择点云、参考图片/视频或轨迹文件'
+    return null
+  }
+  sceneUploadBusy.value = true
+  try {
+    sceneInput.value = await uploadMapSceneInput(selectedMapId.value, {
+      pointCloud: scenePointCloud.value,
+      calibration: sceneCalibration.value,
+      trajectory: sceneTrajectory.value,
+      references: sceneReferences.value,
+    })
+    return sceneInput.value
+  } catch (cause) {
+    error.value = cause.message || '场景资料上传失败'
+    return null
+  } finally {
+    sceneUploadBusy.value = false
+  }
+}
+
+async function refreshStreetBlockBuild() {
+  if (!selectedMapId.value) return
+  try {
+    sceneBuild.value = await fetchCurrentMapSceneBuild(selectedMapId.value)
+    if (['ready', 'review', 'failed'].includes(sceneBuild.value.state)) {
+      if (sceneBuildTimer) { window.clearInterval(sceneBuildTimer); sceneBuildTimer = null }
+      if (sceneBuild.value.state !== 'failed') {
+        await loadScene()
+        selectMapMode('street-block')
+      }
+    }
+  } catch (cause) {
+    error.value = cause.message || '街区构建状态读取失败'
+  }
+}
+
+async function startStreetBlockBuild() {
+  if (!selectedMapId.value || ['queued', 'running'].includes(sceneBuild.value.state)) return
+  let input = sceneInput.value
+  if (scenePointCloud.value || sceneCalibration.value || sceneTrajectory.value || sceneReferences.value.length) {
+    input = await uploadSceneMaterial()
+    if (!input) return
+  }
+  try {
+    sceneBuild.value = await startMapSceneBuild(selectedMapId.value, input?.id || '', {
+      usePtv3: sceneUsePtv3.value && ptv3Reusable.value,
+    })
+    if (sceneBuildTimer) window.clearInterval(sceneBuildTimer)
+    sceneBuildTimer = window.setInterval(refreshStreetBlockBuild, 2000)
+  } catch (cause) {
+    error.value = cause.message || '街区地图任务提交失败'
+  }
+}
+
+function selectSingleFile(event, target) {
+  const file = event.target.files?.[0] || null
+  if (target === 'pointCloud') scenePointCloud.value = file
+  else if (target === 'trajectory') sceneTrajectory.value = file
+  else if (target === 'calibration') sceneCalibration.value = file
+}
+
+function selectReferenceFiles(event) {
+  sceneReferences.value = Array.from(event.target.files || [])
+}
+
+async function auditPublishedNode(action) {
+  if (!precisionAuditItem.value || !sceneBuild.value.id) return
+  try {
+    sceneBuild.value = await reviewMapSceneBuild(selectedMapId.value, sceneBuild.value.id, precisionAuditItem.value.id, action)
+  } catch (cause) {
+    error.value = cause.message || '发布实例抽检失败'
   }
 }
 
@@ -395,7 +560,14 @@ function locateLog(item) {
 }
 
 watch(selectedMapId, () => {
+  sceneInput.value = null
+  scenePointCloud.value = null
+  sceneCalibration.value = null
+  sceneTrajectory.value = null
+  sceneReferences.value = []
+  sceneUsePtv3.value = false
   loadScene()
+  refreshSemanticStatus()
   const matching = routes.value.find(item => String(item.map_data) === String(selectedMapId.value))
   if (matching) selectedRouteId.value = String(matching.id)
 })
@@ -414,6 +586,8 @@ onBeforeUnmount(() => {
   stopLive()
   pollController?.abort()
   if (pollTimer) window.clearInterval(pollTimer)
+  if (semanticTimer) window.clearInterval(semanticTimer)
+  if (sceneBuildTimer) window.clearInterval(sceneBuildTimer)
 })
 </script>
 
@@ -508,9 +682,33 @@ onBeforeUnmount(() => {
             <h3>场景图层</h3>
           <div class="layer-list"><label v-for="(_, key) in layers" :key="key"><input v-model="layers[key]" type="checkbox"/><span>{{ {occupancy:'2D占据图',globalCloud:'3D伪彩地图',localCloud:'实时局部点云',obstacles:'障碍物',route:'路线/航点',trail:'定位尾迹',corrections:'融合校正',staticAssets:'街区静态资产',dynamicObjects:'实时行人车辆',boundary:'导航边界'}[key] }}</span></label></div>
           <div class="readonly-note boundary-note">边界仅用于可视化核对：草稿 v{{ manifest?.boundary?.revision || 0 }} / 生效 v{{ manifest?.boundary?.active_revision || 0 }} · {{ manifest?.boundary?.apply_status || '未配置' }}。编辑、校验和发布请到<a href="/dashboard/tasks/routes">路径规划</a>。</div>
+          <div class="readonly-note visual-map-note">彩色回放：{{ manifest?.visual_artifacts?.available ? '已生成 RGB 正射图（仅供人类查看）' : '未生成' }} · 导航仍使用 2D 栅格 / 3D 稀疏点云</div>
           <h3>基础资产与当前识别</h3>
           <div v-if="mapMode === 'street-block'" class="readonly-note asset-inference-note">
             静态资产 {{ viewportStaticAssets.length }} 个 · {{ manifest?.semantic_build?.status === 'ready' ? '高置信度语义清单' : manifest?.semantic_build?.status === 'processing' ? '语义识别处理中' : '未生成可靠语义模型' }}<span v-if="assetInference.pointCount"> · {{ assetInference.pointCount.toLocaleString() }} 点</span>
+          </div>
+          <div class="semantic-build-box">
+            <div><strong>PTv3 语义建图</strong><span :class="statusTone(semanticJob.status)">{{ semanticStatusLabel(semanticJob.status) }}</span></div>
+            <small v-if="semanticJob.model_version">模型 {{ semanticJob.model_version }} · {{ semanticJob.instance_count || 0 }} 个资产</small>
+            <small v-if="semanticJob.message" class="semantic-message">{{ semanticJob.message }}</small>
+            <div class="semantic-actions"><button type="button" :disabled="['queued','running','processing'].includes(semanticJob.status)" @click="runSemanticBuild(false)">{{ ['queued','running','processing'].includes(semanticJob.status) ? 'PTv3 推理中…' : '运行 PTv3' }}</button><button type="button" class="secondary" @click="runSemanticBuild(true)">强制重跑</button><button type="button" class="secondary" @click="refreshSemanticStatus">刷新</button></div>
+          </div>
+          <div class="street-build-box">
+            <div class="street-build-head"><strong>服务器代码生成街区地图</strong><span :class="statusTone(sceneBuild.state === 'ready' ? 'ok' : sceneBuild.state === 'failed' ? 'unavailable' : '')">{{ {unavailable:'未生成',queued:'排队中',running:'生成中',review:'待审核',ready:'已完成',failed:'失败'}[sceneBuild.state] || sceneBuild.state }}</span></div>
+            <p>服务器根据点云自动提取连续道路、独立建筑和树木；图片/视频仅提供近似材质色，不修改导航地图。</p>
+            <div class="scene-upload-grid">
+              <label>3D点云（可选，默认使用地图包）<input type="file" accept=".pcd" @change="selectSingleFile($event, 'pointCloud')" /></label>
+              <label>参考图片/视频（可选、多选）<input type="file" multiple accept="image/*,video/mp4,video/quicktime" @change="selectReferenceFiles" /></label>
+              <label>相机位姿轨迹 CSV（可选）<input type="file" accept=".csv" @change="selectSingleFile($event, 'trajectory')" /></label>
+              <label class="ptv3-option"><input v-model="sceneUsePtv3" type="checkbox" :disabled="!ptv3Reusable" /><span><strong>使用已有 PTv3 结果</strong><small>{{ ptv3Reusable ? '只辅助判断类别，几何仍由代码生成' : '请先对当前地图运行 PTv3；独立上传的 PCD 暂不复用' }}</small></span></label>
+            </div>
+            <div v-if="sceneBuild.state === 'running'" class="build-progress"><i :style="{width:`${sceneBuild.progress_percent || 0}%`}"></i><span>{{ sceneBuild.stage || 'processing' }} · {{ sceneBuild.progress_percent || 0 }}%</span></div>
+            <small v-if="sceneInput">已上传 {{ sceneInput.references?.length || 0 }} 个参考媒体<span v-if="sceneInput.point_cloud_url"> · 独立点云</span></small>
+            <small v-for="warning in (sceneBuild.warnings || [])" :key="warning" class="semantic-warning">{{ warning }}</small>
+            <small v-if="sceneBuild.error_message" class="semantic-message">{{ sceneBuild.error_message }}</small>
+            <div v-if="sceneBuild.metrics?.publish_precision_verified" class="precision-pass">抽检精确率 {{ number(sceneBuild.metrics.publish_precision * 100, 1, '%') }} · 已达到 &gt;90%</div>
+            <div v-else-if="precisionAuditItem" class="precision-audit"><span>高置信实例抽检：{{ precisionAuditItem.category }} · {{ precisionAuditItem.id }}</span><small>{{ sceneBuild.metrics?.publish_precision_samples || 0 }} / {{ sceneBuild.metrics?.publish_precision_required_samples || '待计算' }}</small><div><button type="button" @click="auditPublishedNode('correct')">识别正确</button><button type="button" class="reject" @click="auditPublishedNode('incorrect')">识别错误</button></div></div>
+            <div class="semantic-actions"><button type="button" :disabled="sceneUploadBusy || ['queued','running'].includes(sceneBuild.state)" @click="startStreetBlockBuild">{{ sceneUploadBusy ? '上传中…' : ['queued','running'].includes(sceneBuild.state) ? '服务器生成中…' : '生成街区地图' }}</button><button type="button" class="secondary" @click="refreshStreetBlockBuild">刷新</button></div>
           </div>
           <div class="asset-grid"><span v-for="(asset,key) in ASSET_REGISTRY" :key="key"><i :style="{background:asset.color}"></i>{{ asset.label }}</span></div>
           <div v-if="reviewCandidates.length" class="review-box">
@@ -546,6 +744,43 @@ onBeforeUnmount(() => {
 .boundary-note { margin-top:10px;line-height:1.55 }.boundary-note a { margin-left:3px;color:var(--cyan) }.motion-note { margin-top:10px;line-height:1.45 }
 .layer-list { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.layer-list label { display:flex;gap:7px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px;font-size:10px }.asset-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:6px }.asset-grid span { display:flex;gap:7px;align-items:center;font-size:10px }.asset-grid i,.object-list i { width:9px;height:9px;border-radius:2px }.object-list { display:grid;gap:6px;margin-top:12px }.object-list article { display:flex;gap:8px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:7px }.object-list div { display:grid;gap:2px }.object-list strong,.object-list small { font-size:10px }.object-list small,.empty,.projection-pending { color:var(--muted) }.empty { font-size:11px;line-height:1.5 }.projection-pending { display:block;margin-top:9px;font-size:10px }.file-picker { position:absolute;width:1px;height:1px;opacity:0;pointer-events:none }
 .review-box { display:grid; gap:7px; margin-top:12px; padding:10px; border:1px solid #7c5b22; border-radius:8px; background:rgba(124,91,34,.1) }.review-box h3 { margin:0; font-size:12px }.review-item { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:7px; border:1px solid var(--line); border-radius:7px }.review-item div { display:grid; gap:2px; min-width:0 }.review-item small { color:var(--muted); font-size:9px }.review-item button { padding:4px 7px; border:0; border-radius:5px; color:#fff; background:#087aa0; cursor:pointer; font-size:10px }.review-item button.reject { margin-left:4px; background:#6b3440 }
+.semantic-build-box { display:grid; gap:6px; margin-top:10px; padding:10px; border:1px solid #245b72; border-radius:8px; background:rgba(8,122,160,.08) }.semantic-build-box>div:first-child { display:flex; justify-content:space-between; gap:8px; align-items:center; font-size:11px }.semantic-build-box small { color:var(--muted); font-size:10px; line-height:1.4 }.semantic-message { overflow-wrap:anywhere }.semantic-actions { display:flex; flex-wrap:wrap; gap:5px }.semantic-actions button { padding:5px 8px; border:0; border-radius:5px; color:#fff; background:#087aa0; cursor:pointer; font-size:10px }.semantic-actions button.secondary { color:var(--muted); background:var(--panel-soft); border:1px solid var(--line) }.semantic-actions button:disabled { cursor:wait; opacity:.6 }
+.street-build-box { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid #2f6b55;border-radius:8px;background:rgba(34,197,94,.05) }.street-build-head { display:flex;justify-content:space-between;gap:8px;font-size:11px }.street-build-box p { margin:0;color:var(--muted);font-size:10px;line-height:1.5 }.scene-upload-grid { display:grid;grid-template-columns:1fr 1fr;gap:6px }.scene-upload-grid label { display:grid;gap:4px;padding:7px;border:1px solid var(--line);border-radius:7px;color:var(--muted);font-size:9px }.scene-upload-grid input { width:100%;font-size:9px;color:var(--text) }.build-progress { position:relative;height:21px;overflow:hidden;border:1px solid var(--line);border-radius:6px;background:var(--panel-soft) }.build-progress i { position:absolute;inset:0 auto 0 0;background:rgba(34,197,94,.3);transition:width .25s }.build-progress span { position:relative;display:grid;place-content:center;height:100%;font-size:9px }
+.scene-upload-grid .ptv3-option { display:flex;align-items:center;gap:7px }.scene-upload-grid .ptv3-option input { width:auto }.ptv3-option span { display:grid;gap:2px }.ptv3-option small { color:var(--muted);font-size:8px }.semantic-warning { color:#facc15!important }
+.precision-pass { padding:7px;border-radius:6px;color:#86efac;background:rgba(34,197,94,.12);font-size:10px }.precision-audit { display:grid;gap:5px;padding:7px;border:1px solid #7c5b22;border-radius:7px;font-size:9px }.precision-audit small { color:var(--muted) }.precision-audit button { margin-right:5px;padding:4px 7px;border:0;border-radius:5px;color:#fff;background:#087aa0;font-size:9px }.precision-audit button.reject { background:#6b3440 }
 @media (max-width: 1250px) { .scene-workspace { grid-template-columns: minmax(0,1.35fr) minmax(330px,.85fr); }.control-bar { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 900px) { .scene-head { align-items:stretch;flex-direction:column }.source-tabs { align-self:flex-start }.scene-workspace { grid-template-columns:1fr;min-height:0 }.viewport-wrap { min-height:430px }.diagnostic-card { max-height:600px }.control-bar { grid-template-columns:1fr 1fr }.runtime-state { grid-column:1/-1 } }
+.scene-workspace {
+  height: clamp(480px, calc(100vh - 250px), 720px);
+  min-height: 0;
+}
+
+.viewport-card,
+.diagnostic-card {
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+}
+
+.diagnostic-body {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .scene-workspace {
+    height: auto;
+  }
+
+  .viewport-card {
+    height: auto;
+  }
+
+  .diagnostic-card {
+    height: min(600px, calc(100vh - 220px));
+    min-height: 420px;
+    max-height: 600px;
+  }
+}
 </style>

@@ -19,4 +19,11 @@ Every runtime has the same contract:
 - `docs/`: runtime-specific operations documentation.
 - `install/`: dependency manifests, models and external vendor installation packages.
 
+Source trees and build directories do not belong under `runtime/`.  In
+particular, `runtime/nx-edge/src/` is a locally ignored temporary PTv3
+workspace, not a deployable runtime interface; do not add files there or
+commit it.  Reproducible source belongs under a top-level source component,
+while deployed models and binaries belong under the relevant `install/`
+directory.
+
 Never commit real credentials, databases, maps, rosbag files or generated logs.

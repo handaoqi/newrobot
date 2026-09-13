@@ -54,6 +54,14 @@ services:
       mqtt:
         condition: service_healthy
 
+  scene-build-worker:
+    <<: *backend
+    container_name: roamerx-scene-build-worker
+    command: ["python", "manage.py", "run_scene_build_worker"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
   patrol-scheduler:
     <<: *backend
     container_name: roamerx-patrol-scheduler

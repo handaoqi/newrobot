@@ -325,7 +325,7 @@ class TaskExecutor:
         coarse_goal_tolerance_m: float = 0.50,
         normal_arrival_tolerance_m: float = 0.30,
         precision_arrival_tolerance_m: float = 0.15,
-        arrival_reapproach_max_attempts: int = 2,
+        arrival_reapproach_max_attempts: int = 3,
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         arrival_adjust_max_distance_m: float = 0.50,
@@ -6011,7 +6011,6 @@ class TaskExecutor:
         waypoint: dict,
         *,
         distance_m: float,
-        coarse_completed: bool,
     ) -> None:
         retries = int(self._arrival_retry_counts.pop(reached_index, 0))
         self._arrival_reapproach_index = None
@@ -6020,21 +6019,13 @@ class TaskExecutor:
             "task.arrival_confirmed",
             event_type_key="lightweight_arrival_confirmed",
             waypoint_id=str(waypoint.get("waypoint_id") or reached_index),
-            message=(
-                "普通中间点两次靠近后在粗到达范围内完成"
-                if coarse_completed
-                else "普通中间点已在精细半径内完成"
-            ),
+            message="普通中间点已在精细半径内完成",
             extra={
                 "arrival_mode": "lightweight",
                 "distance_m": round(distance_m, 3),
-                "acceptance_tolerance_m": (
-                    self.coarse_goal_tolerance_m
-                    if coarse_completed
-                    else self.final_waypoint_tolerance_m
-                ),
+                "acceptance_tolerance_m": self.final_waypoint_tolerance_m,
                 "reapproach_attempts": retries,
-                "coarse_completed": coarse_completed,
+                "coarse_completed": False,
             },
         )
         self._start_arrival_side_effects(
@@ -6044,13 +6035,9 @@ class TaskExecutor:
                 "arrival_mode": "lightweight",
                 "localization_correction": "skipped",
                 "distance_m": round(distance_m, 3),
-                "acceptance_tolerance_m": (
-                    self.coarse_goal_tolerance_m
-                    if coarse_completed
-                    else self.final_waypoint_tolerance_m
-                ),
+                "acceptance_tolerance_m": self.final_waypoint_tolerance_m,
                 "reapproach_attempts": retries,
-                "coarse_completed": coarse_completed,
+                "coarse_completed": False,
             },
         )
         self._waypoint_localization_ready_index = reached_index
@@ -6090,7 +6077,6 @@ class TaskExecutor:
                 reached_index,
                 waypoint,
                 distance_m=distance,
-                coarse_completed=False,
             )
             return True
         if distance > self.coarse_goal_tolerance_m:
@@ -6100,16 +6086,7 @@ class TaskExecutor:
                 f" {self.coarse_goal_tolerance_m:.2f} 米",
             )
             return True
-        if retries < self.arrival_reapproach_max_attempts:
-            self._reapproach_rejected_arrival(reached_index)
-            return True
-        self._complete_lightweight_arrival(
-            reached_index,
-            waypoint,
-            distance_m=distance,
-            coarse_completed=True,
-        )
-        return True
+        return self._reapproach_rejected_arrival(reached_index)
 
     def _navigation_arrival_tolerance(self, waypoint_index: int) -> float:
         """Return the Nav2 radius for this dispatch, not the final verdict."""

@@ -674,6 +674,84 @@ class MapData(BaseTimestampModel):
         return self.name
 
 
+class MapSceneInput(BaseTimestampModel):
+    """User supplied point cloud and camera alignment inputs for a street-block build."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    map_data = models.ForeignKey(MapData, related_name="scene_inputs", on_delete=models.CASCADE)
+    point_cloud = models.FileField(upload_to="maps/scene-inputs/point-clouds/", null=True, blank=True)
+    calibration = models.FileField(upload_to="maps/scene-inputs/calibration/", null=True, blank=True)
+    trajectory = models.FileField(upload_to="maps/scene-inputs/trajectories/", null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="map_scene_inputs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
+class MapSceneReference(BaseTimestampModel):
+    KIND_CHOICES = [("image", "图片"), ("video", "视频"), ("recording", "RTAB/ROS录制")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scene_input = models.ForeignKey(MapSceneInput, related_name="references", on_delete=models.CASCADE)
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    file = models.FileField(upload_to="maps/scene-inputs/references/")
+    original_name = models.CharField(max_length=256)
+    content_type = models.CharField(max_length=128, blank=True)
+    size_bytes = models.PositiveBigIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+
+class MapSceneBuild(BaseTimestampModel):
+    STATE_CHOICES = [
+        ("queued", "等待执行"),
+        ("running", "执行中"),
+        ("review", "待审核"),
+        ("ready", "已完成"),
+        ("failed", "失败"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    map_data = models.ForeignKey(MapData, related_name="scene_builds", on_delete=models.CASCADE)
+    scene_input = models.ForeignKey(
+        MapSceneInput, related_name="builds", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    robot = models.ForeignKey(
+        Robot, related_name="scene_builds", on_delete=models.PROTECT, null=True, blank=True
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="map_scene_builds",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default="queued")
+    stage = models.CharField(max_length=64, default="queued")
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    command_id = models.UUIDField(null=True, blank=True)
+    config = models.JSONField(default=dict, blank=True)
+    anchors = models.JSONField(default=list, blank=True)
+    metrics = models.JSONField(default=dict, blank=True)
+    manifest = models.JSONField(default=dict, blank=True)
+    artifact = models.FileField(upload_to="maps/scene-builds/", null=True, blank=True)
+    error_message = models.TextField(blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["map_data", "-created_at"], name="scene_build_map_idx")]
+
+
 class MapSet(BaseTimestampModel):
     """A globally ordered set of overlapping local navigation maps."""
 
@@ -989,6 +1067,7 @@ class RemoteCommand(BaseTimestampModel):
         ("mapping.save", "停止并保存地图"),
         ("mapping.cancel", "取消建图"),
         ("mapping.status", "查询建图状态"),
+        ("mapping.scene_semantics", "运行场景语义建图"),
         ("mapping.origin_start", "锁定 ENU 原点"),
         ("mapping.origin_cancel", "取消原点锁定"),
         ("mapping.origin_extract_global", "提取全局 ENU"),

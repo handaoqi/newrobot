@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import math
 import shutil
@@ -22,8 +23,32 @@ _STATIC_ASSET_CATEGORIES = frozenset(("wall", "building", "tree", "road", "barri
 SCENE_SEMANTICS_SCHEMA = "roamerx.scene-semantics.v1"
 
 
+def _canonical_scene_category(value) -> str:
+    """Normalize PTv3 labels and asset ids before static/dynamic filtering."""
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "trafficcone": "traffic_cone",
+        "verticalthin": "vertical_thin",
+        "staticclutter": "static_clutter",
+        "groundcover": "vegetation",
+        "drivable_flat": "road",
+        "non_drivable_flat": "road",
+        "vertical_thin": "wall",
+        "static_clutter": "debris",
+    }
+    return aliases.get(normalized, normalized)
+
+
 class SceneArtifactError(ValueError):
     pass
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _description(map_data) -> dict:
@@ -182,7 +207,7 @@ def _scene_static_assets(scene: dict) -> list[dict]:
         asset_id = str(raw.get("asset_id") or raw.get("asset") or raw.get("class_name") or "").strip()
         if not asset_id:
             continue
-        category = asset_id.lower().split(".", 1)[0]
+        category = _canonical_scene_category(raw.get("class_name") or asset_id.split(".", 1)[0])
         if category not in _STATIC_ASSET_CATEGORIES:
             continue
         confidence = _finite_number(raw.get("confidence"), 1.0)
@@ -257,9 +282,13 @@ def _scene_geo_reference(description: dict) -> dict:
 
 
 def scene_cloud_path(map_data, *, max_points: int = SCENE_POINT_CAP) -> tuple[Path, str, int]:
-    if not map_data.package_file:
+    scene_input = map_data.scene_inputs.exclude(point_cloud="").first()
+    uploaded_cloud = None
+    if scene_input and scene_input.point_cloud and scene_input.point_cloud.name.lower().endswith(".pcd"):
+        uploaded_cloud = Path(scene_input.point_cloud.path)
+    if not map_data.package_file and uploaded_cloud is None:
         raise SceneArtifactError("地图没有三维点云包")
-    checksum = _package_sha256(map_data)
+    checksum = _sha256_path(uploaded_cloud) if uploaded_cloud else _package_sha256(map_data)
     cache_dir = Path(settings.MEDIA_ROOT) / "maps" / "scene-cache" / str(map_data.pk) / checksum
     cache_path = cache_dir / f"scene-{max_points}.pcd"
     meta_path = cache_dir / f"scene-{max_points}.json"
@@ -270,11 +299,20 @@ def scene_cloud_path(map_data, *, max_points: int = SCENE_POINT_CAP) -> tuple[Pa
     cache_dir.mkdir(parents=True, exist_ok=True)
     temporary = cache_path.with_suffix(".partial")
     try:
-        with zipfile.ZipFile(map_data.package_file.path) as archive:
+        if uploaded_cloud:
+            source_context = uploaded_cloud.open("rb")
+            member = uploaded_cloud.name
+            archive_context = contextlib.nullcontext()
+        else:
+            archive_context = zipfile.ZipFile(map_data.package_file.path)
+            archive = archive_context.__enter__()
             member = _cloud_member(archive)
             if not member:
+                archive_context.__exit__(None, None, None)
                 raise SceneArtifactError("地图包缺少 map.pcd 或 scene_preview.pcd")
-            with archive.open(member) as source, temporary.open("wb") as target:
+            source_context = archive.open(member)
+        try:
+            with source_context as source, temporary.open("wb") as target:
                 header_lines, header = _parse_pcd_header(source)
                 data_kind = header.get("DATA", "").lower()
                 if data_kind == "binary":
@@ -289,6 +327,9 @@ def scene_cloud_path(map_data, *, max_points: int = SCENE_POINT_CAP) -> tuple[Pa
                     shutil.copyfileobj(source, target, length=2 * 1024 * 1024)
                 else:
                     raise SceneArtifactError("压缩PCD必须先生成 scene_preview.pcd")
+        finally:
+            if not uploaded_cloud:
+                archive_context.__exit__(None, None, None)
         temporary.replace(cache_path)
         meta_path.write_text(json.dumps({"point_count": point_count, "source": member}), encoding="utf-8")
         return cache_path, checksum, point_count
@@ -308,7 +349,7 @@ def build_scene_manifest(map_data) -> dict:
     max_x = min_x + float(map_data.width or 0) * float(map_data.resolution or 0.05)
     max_y = min_y + float(map_data.height or 0) * float(map_data.resolution or 0.05)
     package_names = description.get("package_files") if isinstance(description.get("package_files"), list) else []
-    cloud_available = any(PurePosixPath(str(name)).name in _PCD_NAMES for name in package_names)
+    cloud_available = map_data.scene_inputs.exclude(point_cloud="").exists() or any(PurePosixPath(str(name)).name in _PCD_NAMES for name in package_names)
     if not cloud_available and map_data.package_file:
         try:
             with zipfile.ZipFile(map_data.package_file.path) as archive:
@@ -335,6 +376,15 @@ def build_scene_manifest(map_data) -> dict:
     semantics = scene.get("scene_semantics") if isinstance(scene.get("scene_semantics"), dict) else {}
     semantic_status = str(semantics.get("status") or ("ready" if _scene_static_assets(scene) else "unavailable"))
     review_candidates = semantics.get("review_candidates") if isinstance(semantics.get("review_candidates"), list) else []
+    raw_visual = scene.get("visual_artifacts") if isinstance(scene.get("visual_artifacts"), dict) else {}
+    latest_build = map_data.scene_builds.first()
+    street_block = scene.get("street_block") if isinstance(scene.get("street_block"), dict) else {}
+    visual_artifacts = {
+        "schema": str(raw_visual.get("schema") or "roamerx.visual-map.v1"),
+        "available": bool(raw_visual.get("available", bool(raw_visual.get("artifacts")))),
+        "navigation_authoritative": False,
+        "artifacts": raw_visual.get("artifacts") if isinstance(raw_visual.get("artifacts"), dict) else {},
+    }
     return {
         "schema": SCENE_SCHEMA,
         "map_id": map_data.pk,
@@ -369,6 +419,16 @@ def build_scene_manifest(map_data) -> dict:
             "pending_count": len(review_candidates),
             "candidates": review_candidates,
         },
+        "scene_build": {
+            "id": str(latest_build.id) if latest_build else "",
+            "status": latest_build.state if latest_build else "unavailable",
+            "stage": latest_build.stage if latest_build else "",
+            "progress_percent": latest_build.progress_percent if latest_build else 0,
+            "metrics": latest_build.metrics if latest_build else {},
+            "error_message": latest_build.error_message if latest_build else "",
+        },
+        "street_block": street_block,
+        "visual_artifacts": visual_artifacts,
         "geo_reference": _scene_geo_reference(description),
         "boundary": boundary,
         "package_checksum": str(description.get("package_sha256") or ""),

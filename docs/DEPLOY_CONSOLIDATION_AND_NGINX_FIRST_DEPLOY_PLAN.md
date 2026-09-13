@@ -12,15 +12,15 @@ deploy/
 └── backup/     # 三端备份
 ```
 
-将 `deploy/controller/README.md` 合并到 `deploy/3588/README.md`，删除空的 `deploy/controller/`。`cloud/`、`robot/` 暂留一个版本作为兼容转发入口并输出弃用提示。
+将控制器说明整理到 `deploy/3588-motion/README.md`，删除旧控制器说明目录。旧云端和 NX 兼容入口已移除，文档直接引用正式入口。
 
 ## 2. 实施改造
 
 ### 2.1 目录与入口收敛
 
-- `deploy/3588/` 成为控制器唯一正式入口，包含说明、部署和验证脚本。
+- `deploy/3588-motion/` 成为控制器唯一正式入口，包含说明、部署和验证脚本。
 - 控制器只部署项目管理的充电桩、运动控制覆盖层和状态验证，不覆盖厂商固件、凭据、GENISOM SDK及 `robot-launch`。
-- `deploy/cloud/deploy.sh` 转发到 `platform/deploy.sh`，`deploy/robot/deploy.sh` 转发到 `nx-edge/deploy.sh`；文档不再引用兼容入口。
+- 正式入口为 `deploy/platform/deploy.sh`、`deploy/nx-edge/deploy.sh` 和 `deploy/3588-motion/deploy.sh`；文档不再引用已删除的兼容入口。
 - `platform/deploy/`、`edge-agent/systemd/`、`robot/systemd/` 等继续作为组件资源源文件，根目录 `deploy/` 只负责安装编排。
 
 ### 2.2 云平台与Nginx首次部署
@@ -74,13 +74,13 @@ deploy/
   - 3588：`/home/firefly/dogrobot-runtime/release.json`
 - `verify.sh` 检查运行文件与发布清单一致；不一致时部署失败，建图启动额外返回 `MAPPING_DEPLOYMENT_MISMATCH`。
 - 所有dry-run打印完整rsync、安装、enable、restart、Nginx和健康检查命令，但不写文件、不连接服务。
-- 兼容入口保留一个发布周期；随后删除 `deploy/cloud/` 和 `deploy/robot/`。
+- 旧云端和 NX 兼容入口已删除。
 
 ## 4. 测试与验收
 
 - Shell脚本通过 `bash -n`、ShellCheck和参数错误测试。
 - dry-run断言三端无文件、服务或远端状态变化。
-- 目录测试确认 `deploy/controller/` 已删除、README已进入 `deploy/3588/`、旧入口仍能正确转发。
+- 目录测试确认旧控制器说明目录已删除、README位于 `deploy/3588-motion/`，且文档只引用正式入口。
 - Docker执行 `compose config --quiet`，验证旧systemd云服务处于停止状态。
 - Nginx首次部署验证：
   - 8088仅本机可访问；

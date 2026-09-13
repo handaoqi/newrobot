@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 roamerx-semantic-projection = "roamerx_edge.semantic_projection_node:main"
+roamerx-rgb-replay-map = "roamerx_edge.visual_map_artifacts:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

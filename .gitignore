@@ -72,6 +72,10 @@ known_hosts*
 # Temporary Livox SDK source/build workspace. The reproducible source patch is
 # tracked under robot/patches instead.
 /runtime/livox-sdk2-system-spdlog/
+# Temporary PTv3 source/build workspace.  Runtime accepts only deployed models
+# and binaries under install/; reproducible source must live in a top-level
+# source component.
+/runtime/nx-edge/src/
 /vscode:/
 /vscode-remote:/
 /roamerx-platform-docker-validation-*.tar.gz
