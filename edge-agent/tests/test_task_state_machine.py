@@ -3271,6 +3271,66 @@ def test_arrival_adjustment_obstacle_stops_and_safe_pauses(tmp_path):
     store.close()
 
 
+def test_arrival_adjustment_ignores_rear_obstacle_beyond_required_travel(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    results = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"require_yaw": True, "yaw": 0.0})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(envelope)
+    # The target lies behind the final yaw.  From 0.40 m away, the 0.20 m
+    # acceptance radius requires only 0.22 m of translation plus the 0.05 m
+    # stopping margin, not the legacy 0.45 m lookahead to the click centre.
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.40,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+    clearance_distances = []
+
+    def clearance(vx, vy, travel_distance_m, *, max_scan_age_seconds=0.5):
+        clearance_distances.append((vx, vy, travel_distance_m))
+        if abs(vx) > 0.0 or abs(vy) > 0.0:
+            # Simulate a rear point at 0.30 m: it is outside the repaired
+            # finite sweep, but would have blocked the old 0.45 m lookahead.
+            nav.pose = SimpleNamespace(
+                x=float(waypoint["x"]) + 0.15,
+                y=float(waypoint["y"]),
+                yaw=0.0,
+            )
+            return {"clear": travel_distance_m <= 0.30, "reason": "obstacle"}
+        return {"clear": True, "reason": "rotation_only"}
+
+    nav.directional_clearance = clearance
+    executor.context.arrival_side_effects_started = True
+    executor._arrival_heading_completed_index = 0
+    executor._set_post_arrival_stage(0, "heading_aligned")
+
+    assert executor._start_arrival_adjustment(waypoint, 0) is True
+    deadline = time.time() + 2.0
+    while (executor.context.state == "running" or not results) and time.time() < deadline:
+        time.sleep(0.02)
+
+    moving_clearance = next(
+        travel_distance_m
+        for vx, vy, travel_distance_m in clearance_distances
+        if abs(vx) > 0.0 or abs(vy) > 0.0
+    )
+    assert abs(moving_clearance - 0.27) <= 0.01
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
+    executor.stop()
+    store.close()
+
+
 def test_nav2_micro_goal_requires_post_action_pose_revalidation(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

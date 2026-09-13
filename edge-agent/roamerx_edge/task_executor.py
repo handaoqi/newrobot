@@ -109,6 +109,11 @@ REVERSE_SKIP_LIO_RTK_DRIFT_M = 0.50
 ARRIVAL_CONVERGENCE_MAX_ATTEMPTS = 2
 ARRIVAL_ADJUST_PERIOD_SECONDS = 0.10
 ARRIVAL_ADJUST_STABLE_SAMPLES = 3
+# A fine adjustment stops inside the acceptance radius, not at the click
+# centre.  Reserve a short extra distance for one velocity period and braking,
+# but do not reject an obstacle that lies beyond the bounded movement needed
+# to enter that radius.
+ARRIVAL_ADJUST_STOPPING_MARGIN_M = 0.05
 # How long ABSOLUTE_LOCALIZATION_REQUIRED may wait before giving up the watch.
 ABSOLUTE_LOCALIZATION_RESUME_WATCH_SECONDS = 120.0
 # A completed one-shot correction may explicitly decide that no absolute
@@ -3909,12 +3914,23 @@ class TaskExecutor:
                             -self.arrival_adjust_yaw_rate_rps,
                             min(self.arrival_adjust_yaw_rate_rps, yaw_error * 0.8),
                         )
+                        # Keep the final yaw while translating only as far as
+                        # needed to enter the XY acceptance radius.  Checking
+                        # up to the click centre falsely treats a rear object
+                        # beyond the actual bounded micro-move as a collision.
+                        # With no translation, directional_clearance() returns
+                        # rotation_only, so an obstacle behind the final yaw
+                        # cannot pause a pure yaw correction.
+                        required_translation_m = max(
+                            0.0, distance - xy_control_tolerance
+                        )
                         observation = clearance(
                             vx,
                             vy,
                             min(
                                 self.arrival_adjust_clearance_lookahead_m,
-                                distance + 0.05,
+                                required_translation_m
+                                + ARRIVAL_ADJUST_STOPPING_MARGIN_M,
                             ),
                             max_scan_age_seconds=self.arrival_adjust_scan_max_age_seconds,
                         ) or {}
