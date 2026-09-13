@@ -725,6 +725,29 @@ def test_lio_handoff_requires_a_new_ready_generation():
     assert decision["active_source"] == "lio_imu"
 
 
+def test_lio_handoff_accepts_readable_normal_telemetry_status():
+    adapter = object.__new__(RosAdapter)
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter.telemetry = SimpleNamespace(
+        latest_pose=lambda: SimpleNamespace(localization_status="normal", x=1.0, y=2.0)
+    )
+    adapter._localization_decision = lambda: {
+        "handoff_anchor_generation": 6,
+        "handoff_state": "ready",
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "lio_anchored": True,
+        "absolute_stable": True,
+    }
+
+    latest, decision = adapter._wait_for_lio_handoff(
+        after_generation=5, timeout_seconds=0.01, generation=7
+    )
+
+    assert latest.localization_status == "normal"
+    assert decision["handoff_state"] == "ready"
+
+
 def test_active_relocalize_executes_the_one_meter_candidates():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 12
@@ -1088,6 +1111,28 @@ def test_only_absolute_ndt_or_rtk_decision_is_trusted():
         "policy_source_ready": False,
     }
     assert adapter._absolute_localization_stable() is True
+
+
+def test_task_startup_handoff_requires_fast_lio_imu_after_absolute_correction():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "ndt_imu",
+        "absolute_stable": True,
+        "lio_healthy": True,
+        "lio_anchored": True,
+    })
+    assert adapter._fast_lio_handoff_ready() is False
+
+    adapter.telemetry.decision = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "lio_healthy": True,
+        "lio_anchored": True,
+    }
+    assert adapter._fast_lio_handoff_ready() is True
+
+    adapter.telemetry.decision["lio_anchored"] = False
+    assert adapter._fast_lio_handoff_ready() is False
 
 
 def test_localization_policy_preserves_ukf_mode():

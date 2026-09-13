@@ -61,9 +61,8 @@ import {
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
 import { expectedLegacyMapVersion } from '../services/mapActivationState'
 import {
-  buildProgressiveLocalizationPayload,
   initializeProgressiveLocalization,
-  progressiveLocalizationTimeoutMs,
+  localizationCommandVerified,
 } from '../services/progressiveLocalization'
 import {
   attemptMarkerPose,
@@ -2135,6 +2134,22 @@ async function initializeLocalization() {
     navStatus.value = initialization.activation.navigationStatus
     const completedLocalization = initialization.command
     const outcome = applyInitialPoseOutcome(completedLocalization)
+    if (localizationCommandVerified(completedLocalization)) {
+      // The Edge command only succeeds after its own absolute-pose and
+      // FAST-LIO handoff checks.  Status replication can arrive later than
+      // the command result, so it must not keep this page at
+      // `waiting_convergence` or turn a verified initialization into a UI
+      // timeout.
+      localizationInitState.value = 'done'
+      localizationInitMessage.value = initialPoseOutcomeMessage('定位初始化已完成，FAST-LIO连续定位与导航栈已确认', outcome)
+      try {
+        await refreshNavigationStatus()
+      } catch {
+        // The command result remains the authoritative completion evidence;
+        // the regular poller will reconcile delayed platform telemetry.
+      }
+      return
+    }
     localizationInitState.value = 'waiting_convergence'
     localizationInitMessage.value = initialPoseOutcomeMessage('命令已完成，等待定位状态同步', outcome)
     for (let index = 0; index < 35; index += 1) {
@@ -2180,33 +2195,49 @@ async function activeRelocalize() {
   try {
     const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
     const coordinateMode = selectedMap.value?.coordinate_mode || ''
-    const manuallySelected = manualInitialPose.value
-      ? [{
-        x: Number(manualInitialPose.value.x),
-        y: Number(manualInitialPose.value.y),
-        yaw: Number(manualInitialPose.value.yaw || 0),
-      }]
-      : []
-    const payload = buildProgressiveLocalizationPayload({
+    // Active relocalization deliberately uses the same source-selection and
+    // candidate order as map activation and initial setup.  A manually
+    // clicked pose remains available through the explicit initial-pose
+    // action; it must not silently become the first outdoor fallback when
+    // RTK is float or unavailable.
+    const activation = await activateRouteMap({
       mapId: selectedMap.value?.id,
+      robotId,
       mapVersion: selectedMapVersion(),
-      waypoints: [...manuallySelected, ...waypoints.value],
+      traceId,
+      onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => applyLocalizationAttemptCommand(event.command, event),
+    })
+    const initialization = await initializeProgressiveLocalization({
+      mapId: selectedMap.value?.id,
+      robotId,
+      mapVersion: selectedMapVersion(),
       sceneScope,
       coordinateMode,
-    })
-    payload.seed_source = 'quick_then_global'
-    payload.scene_scope = sceneScope
-    payload.coordinate_mode = coordinateMode
-    const command = await sendRobotNavigationCommand(robotId, 'relocalize', payload, { traceId })
-    const completed = await waitForRobotCommand(robotId, command, {
-      timeoutMs: progressiveLocalizationTimeoutMs(payload),
-      onProgress: latest => {
-        localizationInitMessage.value = `正在按原点/航点/全局顺序搜索定位候选 · ${latest.status || 'created'}`
-        applyLocalizationAttemptCommand(latest, { phase: 'localization', showCandidates: true })
+      waypoints: waypoints.value,
+      existingActivation: activation,
+      onProgress: message => { localizationInitMessage.value = message },
+      onCommand: event => applyLocalizationAttemptCommand(event.command, event),
+      dependencies: {
+        activateRouteMap,
+        sendRobotNavigationCommand,
+        waitForRobotCommand,
       },
+      traceId,
     })
+    const completed = initialization.command
     applyLocalizationAttemptCommand(completed, { phase: 'localization', showCandidates: true })
-    const outcome = applyInitialPoseOutcome(completed, manualInitialPose.value)
+    const outcome = applyInitialPoseOutcome(completed)
+    if (localizationCommandVerified(completed)) {
+      localizationInitState.value = 'done'
+      localizationInitMessage.value = initialPoseOutcomeMessage('主动重定位完成，FAST-LIO连续定位与导航栈已确认', outcome)
+      try {
+        await refreshNavigationStatus()
+      } catch {
+        // Keep the verified command outcome while delayed telemetry catches up.
+      }
+      return
+    }
     for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
       await refreshNavigationStatus()

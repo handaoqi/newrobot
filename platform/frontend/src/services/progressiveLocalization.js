@@ -44,16 +44,62 @@ export function progressiveLocalizationTimeoutMs(payload) {
 
 const OUTDOOR_SCENES = new Set(['outdoor', 'transition'])
 const RTK_FALLBACK_CODES = new Set([
+  // A fixed-quality flag is not enough to seed the map: Edge also requires
+  // three fresh position-and-heading samples inside its self-stability gate.
+  // A timeout there is a normal localization fallback, not an operator error.
+  'RTK_FIXED_NOT_STABLE',
   'RTK_INITIAL_POSE_UNAVAILABLE',
   'RTK_INITIAL_POSE_TIMEOUT',
   'RTK_POSE_UNAVAILABLE',
   'RTK_INITIAL_POSE_NOT_CONVERGED',
+  'LIO_HANDOFF_TIMEOUT',
 ])
 
 export function shouldInitializeFromRtk({ sceneScope, coordinateMode } = {}) {
   const scene = String(sceneScope || '').trim().toLowerCase()
   const coordinates = String(coordinateMode || '').trim().toLowerCase()
-  return OUTDOOR_SCENES.has(scene) && coordinates !== 'local_only'
+  // Only a map explicitly built with a fixed RTK origin may start the RTK
+  // initialization transaction.  Unknown metadata must fail closed to the
+  // NDT progressive path, and indoor maps always skip this stage.
+  return OUTDOOR_SCENES.has(scene) && coordinates === 'rtk_fixed'
+}
+
+function localizationDecision(navigationStatus) {
+  const status = navigationStatus?.status || {}
+  const quality = status.localization_quality || {}
+  const decision = quality.decision || status.localization?.decision || {}
+  return decision && typeof decision === 'object' ? decision : {}
+}
+
+/**
+ * A map configured for RTK does not imply that the live receiver has a
+ * usable fixed solution.  Only start the RTK command when the latest Edge
+ * decision says that position *and* heading passed its navigation gate.
+ * Unknown/stale status deliberately takes the deterministic NDT search path.
+ */
+export function rtkFixedForInitialization(navigationStatus) {
+  const decision = localizationDecision(navigationStatus)
+  if (decision.rtk_good_for_navigation === true) return true
+  return decision.rtk_usable === true
+    && String(decision.rtk_quality || '').trim().toLowerCase() === 'fixed'
+    && decision.rtk_heading_usable === true
+}
+
+/**
+ * Edge returns a successful localization command only after its initial-pose
+ * contract has verified the continuous FAST-LIO handoff and (when requested)
+ * Nav2 readiness.  Do not turn that authoritative result into a 70 s UI-only
+ * "waiting convergence" failure because telemetry replication lags.
+ */
+export function localizationCommandVerified(command) {
+  const status = String(command?.status || '').trim().toLowerCase()
+  if (!['succeeded', 'accepted', 'completed'].includes(status)) return false
+  const result = command?.result_payload
+  if (!result || typeof result !== 'object') return false
+  if (result.handoff_pending === true) return false
+  const attempts = result.localization_attempts
+  if (attempts?.state === 'handoff_failed') return false
+  return true
 }
 
 function commandErrorCode(error) {
@@ -101,7 +147,13 @@ export async function initializeProgressiveLocalization({
   })()
 
   let rtkAttempt = null
-  if (shouldInitializeFromRtk({ sceneScope, coordinateMode })) {
+  const rtkConfigured = shouldInitializeFromRtk({ sceneScope, coordinateMode })
+  const rtkFixed = rtkFixedForInitialization(activation.navigationStatus)
+  if (rtkConfigured && !rtkFixed) {
+    rtkAttempt = { status: 'skipped', errorCode: 'RTK_NOT_FIXED' }
+    onProgress('RTK当前不是可用固定解，跳过RTK初始位姿，直接搜索建图原点、附近候选和航点')
+  }
+  if (rtkConfigured && rtkFixed) {
     onProgress('室外地图已下发，正在使用RTK固定解设置初始姿态并进行本地NDT验证')
     try {
       const rtkPayload = {
@@ -131,7 +183,7 @@ export async function initializeProgressiveLocalization({
       const errorCode = commandErrorCode(error)
       if (!RTK_FALLBACK_CODES.has(errorCode)) throw error
       rtkAttempt = { status: 'failed', errorCode }
-      onProgress(`RTK固定解不可用或漂移未达标（${errorCode}），转入快速定位`)
+      onProgress(`RTK固定解不可用、稳定性不足或FAST-LIO交接未完成（${errorCode}），转入渐进定位`)
     }
   }
 
@@ -152,7 +204,7 @@ export async function initializeProgressiveLocalization({
     payload,
     command,
     selectedSource: 'progressive',
-    rtkAttempted: Boolean(rtkAttempt),
+    rtkAttempted: rtkAttempt?.status !== 'skipped',
     rtkAttempt,
   }
 }

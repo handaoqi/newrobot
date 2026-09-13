@@ -1218,10 +1218,7 @@ class RosAdapter(Node):
         latest = self.telemetry.latest_pose()
         if not (
             latest
-            and decision.get("active_source") == "lio_imu"
-            and decision.get("lio_healthy") is True
-            and decision.get("lio_anchored") is True
-            and decision.get("absolute_stable") is True
+            and self._fast_lio_handoff_ready(decision)
         ):
             raise ProtocolError(
                 "LIO_HANDOFF_TIMEOUT",
@@ -1444,6 +1441,25 @@ class RosAdapter(Node):
         return bool(
             source in {"ndt_imu", "rtk_imu", "lio_imu"}
             and decision.get("absolute_stable")
+            and (policy_source_ready is None or policy_source_ready is True)
+        )
+
+    def _fast_lio_handoff_ready(self, decision: dict | None = None) -> bool:
+        """Whether FAST-LIO + IMU is the settled continuous pose source.
+
+        RTK and NDT are stationary absolute-correction inputs. They may
+        verify a candidate, but task startup and any successful initial-pose
+        command must wait until the corrected anchor has handed ownership back
+        to FAST-LIO + IMU. This prevents Nav2 from starting on an NDT/RTK
+        transient frame.
+        """
+        decision = decision if isinstance(decision, dict) else self._localization_decision()
+        policy_source_ready = decision.get("policy_source_ready")
+        return bool(
+            decision.get("active_source") == "lio_imu"
+            and decision.get("lio_healthy") is True
+            and decision.get("lio_anchored") is True
+            and decision.get("absolute_stable") is True
             and (policy_source_ready is None or policy_source_ready is True)
         )
 
@@ -2456,7 +2472,7 @@ class RosAdapter(Node):
                 timeout_seconds=wait_seconds,
                 generation=generation,
             )
-            accepted = bool(latest is not None and self._absolute_localization_stable())
+            accepted = bool(latest is not None and self._fast_lio_handoff_ready())
         elif require_absolute:
             deadline = time.monotonic() + wait_seconds
             latest = self.telemetry.latest_pose()
@@ -2466,14 +2482,14 @@ class RosAdapter(Node):
                 if (
                     latest
                     and latest.localization_status == "normal"
-                    and self._absolute_localization_stable()
+                    and self._fast_lio_handoff_ready()
                 ):
                     break
                 time.sleep(0.2)
             accepted = bool(
                 latest
                 and latest.localization_status == "normal"
-                and self._absolute_localization_stable()
+                and self._fast_lio_handoff_ready()
             )
         elif required_normal_samples > 0:
             latest = self._wait_for_fresh_normal_samples(
@@ -2844,10 +2860,35 @@ class RosAdapter(Node):
                 and decision.get("absolute_stable") is True
             )
             latest = self.telemetry.latest_pose()
-            if ready and latest and int(getattr(latest, "localization_status", 0)) == 3:
+            if ready and latest and self._localization_status_is_normal(
+                getattr(latest, "localization_status", None)
+            ):
                 return latest, decision
             time.sleep(0.1)
         return None, last_decision
+
+    @staticmethod
+    def _localization_status_is_normal(status) -> bool:
+        """Accept both ROS numeric status=3 and telemetry's readable value.
+
+        ROS callbacks carry the numeric localization status, while the
+        telemetry snapshot deliberately exposes ``normal`` / ``lost`` for
+        operators. RTK handoff can be evaluated from either representation;
+        parsing the latter with ``int()`` used to turn a successful handoff
+        into ``INITIALIZATION_FAILED``.
+        """
+        if isinstance(status, str):
+            normalized = status.strip().lower()
+            if normalized == "normal":
+                return True
+            try:
+                return int(normalized) == 3
+            except ValueError:
+                return False
+        try:
+            return int(status) == 3
+        except (TypeError, ValueError):
+            return False
 
     def _set_initial_pose_from_rtk_once(
         self,

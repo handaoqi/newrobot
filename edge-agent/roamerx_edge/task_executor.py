@@ -98,6 +98,18 @@ ARRIVAL_CONFIRMATION_INTERVAL_SECONDS = 0.01
 PRECISION_ARRIVAL_YAW_TOLERANCE_RAD = 0.25
 # Match localization lio_primary.drift_xy_m default; above this, wait for correction.
 WAYPOINT_CORRECTION_DRIFT_M = 0.30
+# A fixed-quality status alone is insufficient for the RTK initial-pose
+# transaction.  These failures mean there is no safe RTK seed for this start;
+# the deterministic map-origin -> route -> global NDT path must take over
+# instead of trying a saved or manually selected pose first.
+RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES = frozenset({
+    "RTK_FIXED_NOT_STABLE",
+    "RTK_INITIAL_POSE_UNAVAILABLE",
+    "RTK_INITIAL_POSE_TIMEOUT",
+    "RTK_POSE_UNAVAILABLE",
+    "RTK_INITIAL_POSE_NOT_CONVERGED",
+    "LIO_HANDOFF_TIMEOUT",
+})
 # Outdoor reverse/start checks keep a looser LIO envelope while RTK performs
 # the authoritative click check. Arrival verdicts use configured tolerances.
 ARRIVAL_ACCEPT_LIO_M = 1.0
@@ -355,6 +367,7 @@ class TaskExecutor:
         navigation_dispatch_retry_seconds: float = NAV_DISPATCH_RETRY_DEFAULT_SECONDS,
         navigation_dispatch_retry_budget_seconds: float = 300.0,
         map_set_coordinator=None,
+        map_activation_adapter=None,
         obstacle_speech=None,
         waypoint_speech=None,
         rosbag_recorder=None,
@@ -434,6 +447,7 @@ class TaskExecutor:
             float(navigation_dispatch_retry_budget_seconds),
         )
         self.map_set_coordinator = map_set_coordinator
+        self.map_activation_adapter = map_activation_adapter
         self.obstacle_speech = obstacle_speech
         self.waypoint_speech = waypoint_speech
         self.rosbag_recorder = rosbag_recorder
@@ -1823,29 +1837,95 @@ class TaskExecutor:
         if callable(accept_trusted):
             accept_trusted()
 
+    def _progressive_startup_relocalize(self, points: list[dict]) -> None:
+        """Run the cold-start search in its fixed, map-scoped order.
+
+        Outdoor routes cannot safely treat a float/unavailable RTK position as
+        a reason to verify a remembered or operator-clicked seed.  The ROS
+        adapter owns the stationary sequence and its quality/handoff gate:
+        mapping origin and surrounding candidates, each route waypoint, then
+        keyframe-global matching.
+        """
+        relocalize = getattr(self.navigation, "progressive_relocalize", None)
+        if not callable(relocalize):
+            raise ProtocolError(
+                "PROGRESSIVE_RELOCALIZATION_UNAVAILABLE",
+                "outdoor RTK fallback requires mapping-origin progressive relocalization",
+            )
+
+        origin = None
+        if self.map_activation_adapter is not None:
+            try:
+                origin = self.map_activation_adapter.mapping_start_pose()
+            except ProtocolError as exc:
+                origin = {
+                    "unavailable_error_code": exc.code,
+                    "unavailable_error_message": exc.message,
+                }
+            except Exception as exc:
+                origin = {
+                    "unavailable_error_code": "MAPPING_START_POSE_INVALID",
+                    "unavailable_error_message": str(exc),
+                }
+
+        waypoints = []
+        for raw in points:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                waypoints.append({
+                    "x": float(raw["x"]),
+                    "y": float(raw["y"]),
+                    "yaw": float(raw.get("yaw", 0.0) or 0.0),
+                })
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning("skipping invalid route waypoint in startup progressive search")
+
+        LOGGER.info(
+            "startup localization running progressive search: mapping origin, %d route waypoint(s), global fallback",
+            len(waypoints),
+        )
+        relocalize(origin=origin, waypoints=waypoints, wait_seconds=180.0)
+
     def _initialize_before_navigation(self) -> None:
         """Require a verified absolute pose before the first Nav2 goal."""
         if not self.context or self.context.state != "accepted":
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
         decision = self._localization_decision()
-        if self._outdoor_navigation_profile() and self._rtk_good_for_navigation():
-            seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
-            if not callable(seed_rtk):
-                raise ProtocolError(
-                    "INITIALIZATION_FAILED",
-                    "fixed RTK is available but GPS initialization is unavailable",
+        outdoor = self._outdoor_navigation_profile()
+        points = self.context.route_snapshot.get("waypoints") or []
+        if outdoor:
+            if self._rtk_good_for_navigation():
+                seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
+                if not callable(seed_rtk):
+                    raise ProtocolError(
+                        "INITIALIZATION_FAILED",
+                        "fixed RTK is available but GPS initialization is unavailable",
+                    )
+                try:
+                    LOGGER.info("startup localization verifying and seeding fixed RTK before FAST-LIO handoff")
+                    seed_rtk()
+                    return
+                except ProtocolError as exc:
+                    if exc.code not in RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES:
+                        raise
+                    LOGGER.warning(
+                        "fixed RTK startup verification failed (%s); using mapping-origin progressive localization: %s",
+                        exc.code,
+                        exc.message,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "fixed RTK startup initialization raised %s; using mapping-origin progressive localization",
+                        exc,
+                    )
+            else:
+                LOGGER.info(
+                    "startup RTK is not a usable fixed position-and-heading solution; "
+                    "skipping manual/trusted seed and using progressive localization"
                 )
-            try:
-                LOGGER.info("startup localization verifying and seeding fixed RTK before FAST-LIO handoff")
-                seed_rtk()
-                return
-            except ProtocolError:
-                raise
-            except Exception as exc:
-                raise ProtocolError(
-                    "INITIALIZATION_FAILED",
-                    f"fixed RTK was available but GPS pose was not accepted: {exc}",
-                ) from exc
+            self._progressive_startup_relocalize(points)
+            return
         if not self._outdoor_navigation_profile() and self._startup_localization_already_ready(
             decision
         ):
@@ -1855,7 +1935,6 @@ class TaskExecutor:
                 self._reported_localization_status() or "unspecified",
             )
             return
-        points = self.context.route_snapshot.get("waypoints") or []
         index = min(max(0, self.context.current_waypoint_index), max(0, len(points) - 1))
         candidate_indexes = [index, index - 1, index + 1, 0, len(points) - 1]
         relocalize = getattr(self.navigation, "active_relocalize", None)

@@ -43,6 +43,7 @@ class FakeNavigation:
         self.outdoor_profiles = []
         self.global_controllers = []
         self.localization_state = {"active_source": "ndt_imu", "absolute_stable": True}
+        self.progressive_relocalize_requests = []
 
     def prepare_for_navigation(self, timeout_seconds=12):
         self.stand_requests += 1
@@ -169,6 +170,15 @@ class FakeNavigation:
 
     def localization_decision(self):
         return dict(self.localization_state)
+
+    def progressive_relocalize(self, *, origin, waypoints, wait_seconds=180.0):
+        request = {
+            "origin": dict(origin or {}),
+            "waypoints": [dict(point) for point in waypoints],
+            "wait_seconds": float(wait_seconds),
+        }
+        self.progressive_relocalize_requests.append(request)
+        return {"accepted": True, "selected_stage": "mapping_origin_bounded"}
 
 
 class FakeBlockedNavigation(FakeNavigation):
@@ -1532,15 +1542,27 @@ def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
 
     def set_initial_pose_from_rtk(wait_seconds=30.0):
         nav.rtk_calls += 1
-        nav.localization_state["active_source"] = "rtk_imu"
+        nav.localization_state["active_source"] = "lio_imu"
+        nav.localization_state["lio_healthy"] = True
+        nav.localization_state["lio_anchored"] = True
         nav.localization_state["absolute_stable"] = True
         return {"source": "rtk_fixed"}
+
+    nav.startup_handoff_calls = 0
+
+    def accept_startup_trusted_pose():
+        nav.startup_handoff_calls += 1
+        assert nav.localization_state["active_source"] == "lio_imu"
+        assert nav.localization_state["lio_healthy"] is True
+        assert nav.localization_state["lio_anchored"] is True
+        assert nav.localization_state["absolute_stable"] is True
 
     def active_relocalize(seed):
         nav.relocalize_calls.append(dict(seed))
         raise AssertionError("open-sky NDT must not run when RTK is good")
 
     nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    nav.accept_startup_trusted_pose = accept_startup_trusted_pose
     nav.active_relocalize = active_relocalize
     executor = TaskExecutor(
         store,
@@ -1557,6 +1579,7 @@ def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
     assert nav.rtk_calls == 1
+    assert nav.startup_handoff_calls == 1
     assert nav.relocalize_calls == []
     store.close()
 
@@ -1641,13 +1664,6 @@ def test_startup_falls_back_to_ndt_when_rtk_is_poor(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.localization_state = {"active_source": "unavailable", "absolute_stable": False}
-    nav.relocalize_calls = []
-
-    def active_relocalize(seed):
-        nav.relocalize_calls.append(dict(seed))
-        return {"accepted": True}
-
-    nav.active_relocalize = active_relocalize
     executor = TaskExecutor(
         store,
         nav,
@@ -1662,7 +1678,10 @@ def test_startup_falls_back_to_ndt_when_rtk_is_poor(tmp_path):
     envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
-    assert nav.relocalize_calls[0]["source"] == "startup_trusted"
+    assert len(nav.progressive_relocalize_requests) == 1
+    request = nav.progressive_relocalize_requests[0]
+    assert request["origin"] == {}
+    assert request["waypoints"][0]["x"] == 1.0
     store.close()
 
 
@@ -1737,13 +1756,6 @@ def test_outdoor_poor_rtk_still_reseeds_even_when_lio_looks_stable(tmp_path):
         "rtk_quality": "float",
         "rtk_usable": False,
     }
-    nav.relocalize_calls = []
-
-    def active_relocalize(seed):
-        nav.relocalize_calls.append(dict(seed))
-        return {"accepted": True}
-
-    nav.active_relocalize = active_relocalize
     envelope = command("task.start")
     envelope.payload["command"]["map"].update(
         {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
@@ -1757,7 +1769,55 @@ def test_outdoor_poor_rtk_still_reseeds_even_when_lio_looks_stable(tmp_path):
     )
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
-    assert nav.relocalize_calls[0]["source"] == "startup_trusted"
+    assert len(nav.progressive_relocalize_requests) == 1
+    store.close()
+
+
+def test_outdoor_fixed_rtk_stability_failure_uses_mapping_origin_progressive_search(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {
+        "active_source": "unavailable",
+        "absolute_stable": False,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+    nav.rtk_calls = 0
+
+    def set_initial_pose_from_rtk(wait_seconds=30.0):
+        nav.rtk_calls += 1
+        raise ProtocolError(
+            "RTK_FIXED_NOT_STABLE",
+            "only 2/3 consecutive fixed RTK samples arrived before timeout",
+        )
+
+    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    mapping = SimpleNamespace(
+        mapping_start_pose=lambda: {"x": 8.0, "y": 9.0, "z": 0.0, "yaw": 0.4}
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        map_activation_adapter=mapping,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a", "map_version": "v1", "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    executor.prepare_task_start(envelope)
+    executor.initialize_before_navigation()
+
+    assert nav.rtk_calls == 1
+    assert len(nav.progressive_relocalize_requests) == 1
+    request = nav.progressive_relocalize_requests[0]
+    assert request["origin"]["x"] == 8.0
+    assert request["waypoints"][0]["x"] == 1.0
+    assert request["wait_seconds"] == 180.0
     store.close()
 
 

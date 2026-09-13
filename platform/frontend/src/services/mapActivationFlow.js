@@ -9,7 +9,10 @@ import {
   navigationMapIdentity,
   navigationReadyForMap,
 } from './mapActivationState.js'
-import { initializeProgressiveLocalization } from './progressiveLocalization.js'
+import {
+  initializeProgressiveLocalization,
+  localizationCommandVerified,
+} from './progressiveLocalization.js'
 
 const TERMINAL_COMMAND_STATES = new Set([
   'succeeded',
@@ -112,7 +115,7 @@ export async function activateAndRelocalizeMap({
   }
 
   onProgress('地图已应用，正在按统一流程搜索定位候选')
-  await initializeProgressiveLocalization({
+  const initialization = await initializeProgressiveLocalization({
     mapId,
     robotId,
     mapVersion,
@@ -130,7 +133,16 @@ export async function activateAndRelocalizeMap({
     },
   })
 
+  // A successful Edge localization command is emitted only after the
+  // selected source has passed its own handoff contract and Nav2 readiness
+  // has been checked.  Do not turn delayed status replication into a second,
+  // contradictory UI convergence timeout.
+  const commandVerified = localizationCommandVerified(initialization.command)
   navigationStatus = await fetchRobotNavigationStatus(robotId)
+  if (commandVerified) {
+    onProgress('定位命令已验证完成，等待遥测状态同步')
+    return { ...activation, navigationStatus, initialization }
+  }
   if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {
     onProgress('定位已恢复，正在启动导航栈')
     const startCommand = await sendRobotNavigationCommand(robotId, 'start', {

@@ -151,6 +151,7 @@ class EdgeAgentApplication:
             standup_confirmation_timeout_seconds=config.safety.standup_confirmation_timeout_seconds,
             stop_confirmation_seconds=config.safety.stop_confirmation_seconds,
             map_set_coordinator=self.map_set_coordinator,
+            map_activation_adapter=self.map_activation_adapter,
             obstacle_speech=config.obstacle_speech,
             waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,

@@ -83,6 +83,20 @@ test('saving a route prepares its map, localization and navigation stack', () =>
   assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
 })
 
+test('active relocalization reuses map activation source selection instead of quick/manual search', () => {
+  const source = readFileSync(fileURLToPath(
+    new URL('../src/views/RoutePlannerPage.vue', import.meta.url),
+  ), 'utf8')
+  const handler = source.match(
+    /async function activeRelocalize\(\) \{([\s\S]*?)\n\}\n\nasync function handleExecuteRoute/,
+  )?.[1] || ''
+
+  assert.match(handler, /await activateRouteMap\(/)
+  assert.match(handler, /await initializeProgressiveLocalization\(/)
+  assert.doesNotMatch(handler, /quick_then_global/)
+  assert.doesNotMatch(handler, /manuallySelected/)
+})
+
 test('navigation test hints describe the implemented localization gates and fallback order', () => {
   const source = readFileSync(fileURLToPath(
     new URL('../src/views/RoutePlannerPage.vue', import.meta.url),

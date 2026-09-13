@@ -4,7 +4,9 @@ import test from 'node:test'
 import {
   buildProgressiveLocalizationPayload,
   initializeProgressiveLocalization,
+  localizationCommandVerified,
   progressiveLocalizationTimeoutMs,
+  rtkFixedForInitialization,
   shouldInitializeFromRtk,
 } from '../src/services/progressiveLocalization.js'
 
@@ -102,7 +104,19 @@ test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before prog
     sceneScope: 'outdoor',
     coordinateMode: 'rtk_fixed',
     dependencies: {
-      activateRouteMap: async () => ({ navigationStatus: {} }),
+      activateRouteMap: async () => ({
+        navigationStatus: {
+          status: {
+            localization_quality: {
+              decision: {
+                rtk_usable: true,
+                rtk_quality: 'fixed',
+                rtk_heading_usable: true,
+              },
+            },
+          },
+        },
+      }),
       sendRobotNavigationCommand: async (robotId, action, payload) => {
         calls.push(['send', robotId, action, payload])
         return { id: 'rtk-command', status: 'created' }
@@ -140,7 +154,19 @@ test('outdoor RTK failure falls back to quick search with global fallback', asyn
     waypoints: [{ x: 4, y: 5, yaw: 0.2 }],
     onProgress: message => progress.push(message),
     dependencies: {
-      activateRouteMap: async () => ({ navigationStatus: {} }),
+      activateRouteMap: async () => ({
+        navigationStatus: {
+          status: {
+            localization_quality: {
+              decision: {
+                rtk_usable: true,
+                rtk_quality: 'fixed',
+                rtk_heading_usable: true,
+              },
+            },
+          },
+        },
+      }),
       sendRobotNavigationCommand: async (robotId, action, payload) => {
         calls.push(['send', action, payload])
         return { id: `${action}-${calls.length}`, status: 'created' }
@@ -148,7 +174,7 @@ test('outdoor RTK failure falls back to quick search with global fallback', asyn
       waitForRobotCommand: async (_robotId, command) => {
         if (command.id.startsWith('initial-pose')) {
           const error = new Error('RTK unavailable')
-          error.command = { error_code: 'RTK_POSE_UNAVAILABLE' }
+          error.command = { error_code: 'RTK_FIXED_NOT_STABLE' }
           throw error
         }
         return { ...command, status: 'succeeded' }
@@ -160,15 +186,82 @@ test('outdoor RTK failure falls back to quick search with global fallback', asyn
   assert.equal(calls[1][2].seed_source, 'progressive')
   assert.equal(calls[1][2].waypoints[0].x, 4)
   assert.equal(result.selectedSource, 'progressive')
-  assert.equal(result.rtkAttempt.errorCode, 'RTK_POSE_UNAVAILABLE')
-  assert.ok(progress.some(message => message.includes('转入快速定位')))
+  assert.equal(result.rtkAttempt.errorCode, 'RTK_FIXED_NOT_STABLE')
+  assert.ok(progress.some(message => message.includes('转入渐进定位')))
   assert.ok(progress.some(message => message.includes('全局搜索')))
+})
+
+test('outdoor non-fixed RTK skips the manual RTK command and starts progressive search', async () => {
+  const calls = []
+  const progress = []
+  const result = await initializeProgressiveLocalization({
+    mapId: 12,
+    robotId: 3,
+    mapVersion: 'v12',
+    sceneScope: 'outdoor',
+    coordinateMode: 'rtk_fixed',
+    waypoints: [{ x: 4, y: 5, yaw: 0.2 }],
+    onProgress: message => progress.push(message),
+    dependencies: {
+      activateRouteMap: async () => ({
+        navigationStatus: {
+          status: {
+            localization_quality: {
+              decision: {
+                rtk_usable: true,
+                rtk_quality: 'float',
+                rtk_heading_usable: false,
+              },
+            },
+          },
+        },
+      }),
+      sendRobotNavigationCommand: async (_robotId, action, payload) => {
+        calls.push([action, payload])
+        return { id: `${action}-command`, status: 'created' }
+      },
+      waitForRobotCommand: async (_robotId, command) => ({ ...command, status: 'succeeded' }),
+    },
+  })
+
+  assert.deepEqual(calls.map(call => call[0]), ['relocalize'])
+  assert.equal(calls[0][1].seed_source, 'progressive')
+  assert.equal(result.rtkAttempted, false)
+  assert.equal(result.rtkAttempt.errorCode, 'RTK_NOT_FIXED')
+  assert.ok(progress.some(message => message.includes('跳过RTK初始位姿')))
+})
+
+test('RTK initialization needs fixed position and heading evidence from Edge', () => {
+  assert.equal(rtkFixedForInitialization({
+    status: { localization_quality: { decision: {
+      rtk_usable: true, rtk_quality: 'fixed', rtk_heading_usable: true,
+    } } },
+  }), true)
+  assert.equal(rtkFixedForInitialization({
+    status: { localization_quality: { decision: {
+      rtk_usable: true, rtk_quality: 'float', rtk_heading_usable: true,
+    } } },
+  }), false)
+  assert.equal(rtkFixedForInitialization({ status: {} }), false)
+})
+
+test('a successful Edge localization result is authoritative even before telemetry replication', () => {
+  assert.equal(localizationCommandVerified({
+    status: 'succeeded',
+    result_payload: { localization_attempts: { state: 'accepted' } },
+  }), true)
+  assert.equal(localizationCommandVerified({
+    status: 'succeeded',
+    result_payload: { handoff_pending: true },
+  }), false)
+  assert.equal(localizationCommandVerified({ status: 'running', result_payload: {} }), false)
 })
 
 test('local-only maps never attempt RTK even when scene metadata is inconsistent', () => {
   assert.equal(shouldInitializeFromRtk({ sceneScope: 'outdoor', coordinateMode: 'local_only' }), false)
   assert.equal(shouldInitializeFromRtk({ sceneScope: 'outdoor', coordinateMode: 'rtk_fixed' }), true)
   assert.equal(shouldInitializeFromRtk({ sceneScope: 'indoor', coordinateMode: 'rtk_fixed' }), false)
+  assert.equal(shouldInitializeFromRtk({ sceneScope: 'transition', coordinateMode: 'unknown' }), false)
 })
 
 test('operator conflicts do not silently fall back from outdoor RTK initialization', async () => {
@@ -181,7 +274,19 @@ test('operator conflicts do not silently fall back from outdoor RTK initializati
       sceneScope: 'outdoor',
       coordinateMode: 'rtk_fixed',
       dependencies: {
-        activateRouteMap: async () => ({ navigationStatus: {} }),
+        activateRouteMap: async () => ({
+          navigationStatus: {
+            status: {
+              localization_quality: {
+                decision: {
+                  rtk_usable: true,
+                  rtk_quality: 'fixed',
+                  rtk_heading_usable: true,
+                },
+              },
+            },
+          },
+        }),
         sendRobotNavigationCommand: async (_robotId, action) => {
           actions.push(action)
           return { id: 'rtk-command', status: 'created' }

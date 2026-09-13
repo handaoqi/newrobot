@@ -63,7 +63,10 @@ import {
   waitForGuardDutyLoopRepair,
 } from '../services/guardDutyLoopNavRepair'
 import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
-import { initializeProgressiveLocalization } from '../services/progressiveLocalization'
+import {
+  initializeProgressiveLocalization,
+  localizationCommandVerified,
+} from '../services/progressiveLocalization'
 import {
   LOCALIZATION_ATTEMPT_COMMAND_TYPES,
   beginStoredAttemptSession,
@@ -863,6 +866,21 @@ async function initializeLocalization() {
     })
     navigationStatus.value = initialization.activation.navigationStatus
     const command = initialization.command
+
+    if (localizationCommandVerified(command)) {
+      localizationInitState.value = 'success'
+      localizationInitMessage.value = initialization.selectedSource === 'rtk_fixed'
+        ? 'RTK固定解、本地NDT验证、FAST-LIO连续定位与导航栈已确认'
+        : '建图原点/附近候选/航点或全局搜索已完成，FAST-LIO连续定位与导航栈已确认'
+      try {
+        await refreshLocalizationStatus({ sync: false })
+      } catch {
+        // The successful Edge command is authoritative; telemetry polling
+        // will reconcile a delayed center-side status snapshot.
+      }
+      showToast('定位初始化成功')
+      return
+    }
 
     for (let attempt = 0; attempt < 25 && runId === localizationRunId; attempt += 1) {
       await sleep(3000)
