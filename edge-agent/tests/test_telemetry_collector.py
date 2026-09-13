@@ -31,6 +31,34 @@ def test_status_timestamp_advances_without_new_localization(monkeypatch):
     assert first["localization"]["fresh"] is True
 
 
+def test_wait_for_pose_update_requires_a_new_localization_frame(monkeypatch):
+    timestamps = iter(("pose-1", "pose-2"))
+    monkeypatch.setattr("roamerx_edge.telemetry_collector.now_iso", lambda: next(timestamps))
+    collector = TelemetryCollector(
+        SimpleNamespace(current_map_id="1", current_map_version="v1"),
+        RuntimeSafetyState(),
+    )
+
+    def message(x):
+        return SimpleNamespace(
+            status=3,
+            pos=SimpleNamespace(x=x, y=2.0, z=0.0),
+            rpy=SimpleNamespace(z=0.5),
+            speed=0.0,
+            coord_type=0,
+        )
+
+    collector.on_localization(message(1.0))
+    first = collector.latest_pose()
+    assert collector.wait_for_pose_update(first.sampled_at, timeout_seconds=0.001) is None
+
+    collector.on_localization(message(3.0))
+    updated = collector.wait_for_pose_update(first.sampled_at, timeout_seconds=0.001)
+    assert updated is not None
+    assert updated.sampled_at == "pose-2"
+    assert updated.x == 3.0
+
+
 def test_localization_normal_timer_resets_on_every_non_normal_state(monkeypatch):
     monotonic_values = iter((10.0, 11.0, 12.0, 20.0))
     monkeypatch.setattr(

@@ -67,6 +67,10 @@ class TelemetryCollector:
         self.robot = robot
         self.safety_state = safety_state
         self._lock = threading.Lock()
+        # Arrival confirmation waits for this notification instead of polling
+        # a cached pose timestamp. Each notify is a real /localization_info
+        # update carrying the final map-frame pose.
+        self._pose_update_condition = threading.Condition(self._lock)
         self._pose: PoseSnapshot | None = None
         self._pose_sampled_monotonic = 0.0
         self._localization_quality: LocalizationQualitySnapshot | None = None
@@ -233,7 +237,7 @@ class TelemetryCollector:
     def on_localization(self, msg) -> None:
         status = LOCALIZATION_STATUS.get(int(msg.status), "unknown")
         sampled_monotonic = time.monotonic()
-        with self._lock:
+        with self._pose_update_condition:
             previous_status = self.safety_state.localization_status
             self._pose = PoseSnapshot(
                 sampled_at=now_iso(),
@@ -254,6 +258,7 @@ class TelemetryCollector:
                     self.safety_state.localization_normal_since_monotonic = sampled_monotonic
             else:
                 self.safety_state.localization_normal_since_monotonic = 0.0
+            self._pose_update_condition.notify_all()
 
     def on_scan_matching_status(self, msg, *, include_predictions: bool = True) -> None:
         translation = getattr(getattr(msg, "relative_pose", None), "translation", None)
@@ -385,6 +390,23 @@ class TelemetryCollector:
     def latest_pose(self) -> PoseSnapshot | None:
         with self._lock:
             return self._pose
+
+    def wait_for_pose_update(
+        self, after_sampled_at: str | None, timeout_seconds: float = 1.0
+    ) -> PoseSnapshot | None:
+        """Wait for a newer final localization pose without busy polling."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        with self._pose_update_condition:
+            while True:
+                pose = self._pose
+                if pose is not None and (
+                    after_sampled_at is None or pose.sampled_at != after_sampled_at
+                ):
+                    return pose
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._pose_update_condition.wait(timeout=remaining)
 
     def latest_power(self) -> dict:
         with self._lock:

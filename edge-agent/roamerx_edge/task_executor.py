@@ -92,8 +92,9 @@ ARRIVAL_POSE_MAX_AGE_SECONDS = 1.5
 # it can advance the route.  Precision/docking points use a longer run.
 ARRIVAL_CONFIRMATION_FRAMES = 3
 PRECISION_CONFIRMATION_FRAMES = 5
-# Keep the confirmation gate non-blocking enough for the Nav2 result callback;
-# the samples are still read independently and must be consecutive/fresh.
+# Wait for /localization_info updates where available. The polling value is a
+# compatibility fallback for older adapters without that wait API.
+ARRIVAL_CONFIRMATION_SAMPLE_WAIT_SECONDS = 1.0
 ARRIVAL_CONFIRMATION_INTERVAL_SECONDS = 0.01
 PRECISION_ARRIVAL_YAW_TOLERANCE_RAD = 0.25
 # Match localization lio_primary.drift_xy_m default; above this, wait for correction.
@@ -255,6 +256,9 @@ class NavigationAdapter(Protocol):
     def stop_motion(self) -> None: ...
     def is_robot_stopped(self) -> bool: ...
     def latest_pose(self): ...
+    def wait_for_pose_update(
+        self, after_sampled_at: str | None, timeout_seconds: float = 1.0
+    ): ...
     def latest_trusted_pose(self): ...
     def invalidate_last_trusted_pose(self) -> None: ...
     def accept_startup_trusted_pose(self) -> None: ...
@@ -326,6 +330,15 @@ class TaskContext:
     arrival_micro_adjust_started_at: float | None = None
     last_safe_hold_code: str = ""
     last_safe_hold_message: str = ""
+
+
+@dataclass(frozen=True)
+class ArrivalStabilityResult:
+    stable: bool
+    reason: str
+    consecutive_frames: int
+    fresh_frames: int
+    within_tolerance_frames: int
 
 
 class TaskExecutor:
@@ -3316,14 +3329,36 @@ class TaskExecutor:
                 )
                 return False
             return True
-        if lio_dist is not None and lio_dist > self.final_waypoint_tolerance_m:
+        xy_limit, _ = self._arrival_pose_tolerances(waypoint, reached_index)
+        if lio_dist is None or lio_dist > xy_limit:
             LOGGER.warning(
-                "waypoint %d arrival rejected: LIO is %.2fm from click (limit %.2fm)",
+                "waypoint %d arrival rejected: LIO is %s from click (limit %.2fm)",
                 reached_index,
-                lio_dist,
-                self.final_waypoint_tolerance_m,
+                f"{lio_dist:.2f}m" if lio_dist is not None else "unavailable",
+                xy_limit,
             )
             return False
+
+        # A stopped NDT/UKF waypoint has already requested its own absolute
+        # correction transaction before this final gate is reached. Its
+        # selected source may be NDT, NDT+float-RTK fusion, or the explicit
+        # no-correction continuation on fresh stopped LIO/UKF. Requiring an
+        # additional raw fixed-RTK-to-click comparison here overrides that
+        # selection and makes source disagreement look like a physical XY
+        # error, repeatedly sending Nav2 back to the same click.
+        #
+        # RTK policy is intentionally different: fixed RTK is its configured
+        # absolute source, so retain the raw RTK click proof below. The
+        # surrounding arrival transaction blocks progression until a selected
+        # source has completed (or explicitly chose no-correction-continue).
+        mode = (
+            waypoint_localization_mode(waypoint.get("localization_mode"))
+            if waypoint.get("localization_mode") is not None
+            else "rtk"
+        )
+        if mode != "rtk":
+            return True
+
         decision = self._localization_decision()
         rtk_ok = (
             decision.get("rtk_position_good_for_navigation") is True
@@ -3346,23 +3381,61 @@ class TaskExecutor:
             )
             return False
         rtk_dist = hypot(rtk_xy[0] - click[0], rtk_xy[1] - click[1])
-        if rtk_dist > self.final_waypoint_tolerance_m:
+        if rtk_dist > xy_limit:
             LOGGER.warning(
                 "waypoint %d arrival rejected: RTK is %.2fm from click (limit %.2fm); "
                 "LIO-only arrival is not trusted",
                 reached_index,
                 rtk_dist,
-                self.final_waypoint_tolerance_m,
+                xy_limit,
             )
             return False
         return True
 
-    def _arrival_pose_is_stable(self, waypoint: dict, reached_index: int) -> bool:
-        """Require consecutive fresh post-correction samples before release.
+    def _arrival_convergence_failure_message(
+        self, waypoint: dict, reached_index: int
+    ) -> str:
+        """Describe only the acceptance dimensions that this waypoint uses."""
+        _, yaw_tolerance = self._arrival_pose_tolerances(waypoint, reached_index)
+        if yaw_tolerance is None:
+            return "航点位置未满足验收条件"
+        return "航点位置与航向无法同时满足验收条件"
 
-        Nav2 success and one good pose are not sufficient evidence for a
-        business arrival.  This gate deliberately samples the current pose
-        again instead of reusing the pose that caused the correction to end.
+    @staticmethod
+    def _arrival_sample_marker(pose, decision: dict) -> str | None:
+        marker = getattr(pose, "sampled_at", None) if pose is not None else None
+        if marker is None and isinstance(decision.get("localization"), dict):
+            marker = decision["localization"].get("sampled_at")
+        if marker is None:
+            marker = decision.get("sampled_at")
+        return str(marker) if marker is not None else None
+
+    def _wait_for_arrival_pose_update(
+        self, after_sampled_at: str | None, timeout_seconds: float
+    ):
+        waiter = getattr(self.navigation, "wait_for_pose_update", None)
+        if callable(waiter):
+            try:
+                return waiter(
+                    after_sampled_at=after_sampled_at,
+                    timeout_seconds=timeout_seconds,
+                )
+            except TypeError:
+                # Older adapters can be upgraded independently from Edge.
+                return waiter(after_sampled_at, timeout_seconds)
+            except Exception:
+                LOGGER.warning("waiting for a fresh localization pose failed", exc_info=True)
+        time.sleep(min(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS, max(0.0, timeout_seconds)))
+        return self.navigation.latest_pose() if self.navigation else None
+
+    def _arrival_stability_result(
+        self, waypoint: dict, reached_index: int, *, xy_only: bool
+    ) -> ArrivalStabilityResult:
+        """Observe consecutive *new* final poses after stationary correction.
+
+        A missing or stale localization stream is not evidence that the robot
+        is off-click. Only fresh frames that all prove XY is out of tolerance
+        may result in physical re-approach; every other failure stays parked.
         """
         policy = self._arrival_policy(waypoint, reached_index)
         required = (
@@ -3370,42 +3443,87 @@ class TaskExecutor:
             if policy in {"precision", "dock"}
             else self.arrival_convergence_samples
         )
-        deadline = time.monotonic() + max(
-            0.5,
-            required * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS * 4,
+        wait_for_update = callable(getattr(self.navigation, "wait_for_pose_update", None))
+        timeout = (
+            max(2.0, required * ARRIVAL_CONFIRMATION_SAMPLE_WAIT_SECONDS)
+            if wait_for_update
+            else max(0.5, required * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS * 4)
         )
+        deadline = time.monotonic() + timeout
+        initial_pose = self.navigation.latest_pose() if self.navigation else None
+        initial_decision = self._localization_decision()
+        last_sample_marker = self._arrival_sample_marker(initial_pose, initial_decision)
         stable = 0
-        last_sample_marker = None
-        while time.monotonic() <= deadline:
+        fresh_frames = 0
+        within_tolerance_frames = 0
+        observed_new_frame = False
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            pose = self._wait_for_arrival_pose_update(
+                last_sample_marker,
+                min(ARRIVAL_CONFIRMATION_SAMPLE_WAIT_SECONDS, remaining),
+            )
             decision = self._localization_decision()
-            pose = self.navigation.latest_pose()
-            sample_marker = getattr(pose, "sampled_at", None) if pose is not None else None
-            if sample_marker is None and isinstance(decision.get("localization"), dict):
-                sample_marker = decision["localization"].get("sampled_at")
-            if sample_marker is None:
-                sample_marker = decision.get("sampled_at")
-            if sample_marker is not None and sample_marker == last_sample_marker:
-                time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
+            sample_marker = self._arrival_sample_marker(pose, decision)
+            if pose is None or sample_marker is None or sample_marker == last_sample_marker:
                 continue
             last_sample_marker = sample_marker
+            observed_new_frame = True
             fresh = self._localization_sample_fresh(decision)
-            valid = pose is not None and self._arrival_pose_within_combined_tolerance(
-                waypoint, reached_index
+            valid = (
+                self._arrival_xy_within_policy_tolerance(waypoint, reached_index)
+                if xy_only
+                else self._arrival_pose_within_combined_tolerance(waypoint, reached_index)
             )
+            if fresh:
+                fresh_frames += 1
             if fresh and valid:
+                within_tolerance_frames += 1
                 stable += 1
                 if stable >= required:
-                    return True
+                    return ArrivalStabilityResult(
+                        stable=True,
+                        reason="stable",
+                        consecutive_frames=stable,
+                        fresh_frames=fresh_frames,
+                        within_tolerance_frames=within_tolerance_frames,
+                    )
             else:
                 stable = 0
-            time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
+
+        if not observed_new_frame:
+            reason = "no_fresh_samples"
+        elif fresh_frames == 0:
+            reason = "stale_samples"
+        elif within_tolerance_frames == 0:
+            reason = "outside_tolerance"
+        else:
+            reason = "inconsistent_samples"
         LOGGER.warning(
-            "waypoint %d arrival confirmation was not stable: %d/%d fresh frames",
+            "waypoint %d %s confirmation was not stable: %d/%d consecutive "
+            "(reason=%s fresh=%d within_tolerance=%d)",
             reached_index,
+            "XY" if xy_only else "pose",
             stable,
             required,
+            reason,
+            fresh_frames,
+            within_tolerance_frames,
         )
-        return False
+        return ArrivalStabilityResult(
+            stable=False,
+            reason=reason,
+            consecutive_frames=stable,
+            fresh_frames=fresh_frames,
+            within_tolerance_frames=within_tolerance_frames,
+        )
+
+    def _arrival_pose_is_stable(self, waypoint: dict, reached_index: int) -> bool:
+        """Require consecutive fresh post-correction samples before release."""
+        return self._arrival_stability_result(
+            waypoint, reached_index, xy_only=False
+        ).stable
 
     def _arrival_pose_tolerances(
         self, waypoint: dict, reached_index: int
@@ -3475,49 +3593,9 @@ class TaskExecutor:
 
     def _arrival_xy_is_stable(self, waypoint: dict, reached_index: int) -> bool:
         """Confirm corrected XY over consecutive fresh localization samples."""
-        required = (
-            PRECISION_CONFIRMATION_FRAMES
-            if self._arrival_policy(waypoint, reached_index) in {"precision", "dock"}
-            else self.arrival_convergence_samples
-        )
-        deadline = time.monotonic() + max(
-            0.5,
-            required
-            * ARRIVAL_CONFIRMATION_INTERVAL_SECONDS
-            * 4,
-        )
-        stable = 0
-        last_sample_marker = None
-        while time.monotonic() <= deadline:
-            decision = self._localization_decision()
-            pose = self.navigation.latest_pose() if self.navigation else None
-            sample_marker = getattr(pose, "sampled_at", None) if pose is not None else None
-            if sample_marker is None and isinstance(decision.get("localization"), dict):
-                sample_marker = decision["localization"].get("sampled_at")
-            if sample_marker is None:
-                sample_marker = decision.get("sampled_at")
-            if sample_marker is not None and sample_marker == last_sample_marker:
-                time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
-                continue
-            last_sample_marker = sample_marker
-            if self._localization_sample_fresh(
-                decision
-            ) and self._arrival_xy_within_policy_tolerance(
-                waypoint, reached_index
-            ):
-                stable += 1
-                if stable >= required:
-                    return True
-            else:
-                stable = 0
-            time.sleep(ARRIVAL_CONFIRMATION_INTERVAL_SECONDS)
-        LOGGER.warning(
-            "waypoint %d corrected XY was not stable: %d/%d fresh frames",
-            reached_index,
-            stable,
-            required,
-        )
-        return False
+        result = self._arrival_stability_result(waypoint, reached_index, xy_only=True)
+        self._last_arrival_xy_stability_result = result
+        return result.stable
 
     def _post_arrival_active(self, waypoint_index: int | None = None) -> bool:
         if not self.context or not self.context.post_arrival_stage:
@@ -4089,7 +4167,8 @@ class TaskExecutor:
                 return
             self._emit_safe_hold(
                 "ARRIVAL_POSE_CONVERGENCE_FAILED",
-                failure_message or "到点位姿无法安全地同时满足位置和航向要求",
+                failure_message
+                or self._arrival_convergence_failure_message(waypoint, reached_index),
             )
 
     def _is_last_route_waypoint(self, index: int) -> bool:
@@ -5329,9 +5408,23 @@ class TaskExecutor:
                     self._emit_arrival_stage(
                         reached_index, "position_approach", "正在按校正后位置确认航点"
                     )
-                    if not self._arrival_xy_is_stable(
-                        reached_waypoint, reached_index
-                    ):
+                    self._last_arrival_xy_stability_result = None
+                    if not self._arrival_xy_is_stable(reached_waypoint, reached_index):
+                        stability = getattr(self, "_last_arrival_xy_stability_result", None)
+                        # Only fresh frames which all prove that XY is outside
+                        # tolerance may physically re-approach the click. A
+                        # missing/stale/inconsistent stream has no trustworthy
+                        # direction to drive, so it must remain parked.
+                        if (
+                            isinstance(stability, ArrivalStabilityResult)
+                            and stability.reason != "outside_tolerance"
+                        ):
+                            self._emit_safe_hold(
+                                "ARRIVAL_LOCALIZATION_EVIDENCE_UNAVAILABLE",
+                                "到点后未取得连续新鲜定位帧，禁止重新靠近；"
+                                "机器人保持停车等待定位恢复",
+                            )
+                            return
                         if requires_micro_recheck:
                             # A bounded cmd_vel segment intentionally stops
                             # every 0.15 m for a fresh localization check.
@@ -5539,7 +5632,9 @@ class TaskExecutor:
                         return
                     self._emit_safe_hold(
                         "ARRIVAL_POSE_CONVERGENCE_FAILED",
-                        "航点位置与航向无法同时满足验收条件",
+                        self._arrival_convergence_failure_message(
+                            reached_waypoint, reached_index
+                        ),
                     )
                     return
                 if not self._arrival_pose_is_stable(reached_waypoint, reached_index):

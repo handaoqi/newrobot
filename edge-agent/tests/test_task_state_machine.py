@@ -7,7 +7,11 @@ import time
 
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.protocol import ProtocolError, decode_message
-from roamerx_edge.task_executor import TaskExecutor, straighten_pass_through_waypoints
+from roamerx_edge.task_executor import (
+    ArrivalStabilityResult,
+    TaskExecutor,
+    straighten_pass_through_waypoints,
+)
 
 
 class FakeNavigation:
@@ -1013,6 +1017,7 @@ def test_arrival_confirmation_requires_consecutive_fresh_samples(tmp_path):
     assert executor._arrival_pose_is_stable(waypoint, 0) is True
     nav.pose.sampled_at = "fixed-sample"
     assert executor._arrival_xy_is_stable(waypoint, 0) is False
+    assert executor._last_arrival_xy_stability_result.reason == "no_fresh_samples"
 
     pose_calls = 0
 
@@ -1026,6 +1031,47 @@ def test_arrival_confirmation_requires_consecutive_fresh_samples(tmp_path):
     assert executor._arrival_xy_is_stable(waypoint, 0) is True
     nav.localization_state["sample_age_seconds"] = 2.0
     assert executor._arrival_pose_is_stable(waypoint, 0) is False
+    store.close()
+
+
+def test_missing_arrival_frames_hold_without_reapproach_or_departure_spin(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    executor._arrival_correction_completed_index = 0
+    executor._hold_final_pose = lambda: True
+    executor._handle_lightweight_arrival = lambda *_args: False
+
+    def missing_frames(*_args):
+        executor._last_arrival_xy_stability_result = ArrivalStabilityResult(
+            stable=False,
+            reason="no_fresh_samples",
+            consecutive_frames=0,
+            fresh_frames=0,
+            within_tolerance_frames=0,
+        )
+        return False
+
+    executor._arrival_xy_is_stable = missing_frames
+    executor._reapproach_rejected_arrival = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("missing localization evidence must not re-approach")
+    )
+    before_sent = len(nav.sent)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+
+    assert executor.context.state == "paused"
+    assert len(nav.sent) == before_sent
+    assert nav.teleop == []
+    safe_hold = [event for event in events if event[0] == "task.safe_hold"][-1]
+    assert safe_hold[1]["reason_code"] == "ARRIVAL_LOCALIZATION_EVIDENCE_UNAVAILABLE"
+    executor.stop()
     store.close()
 
 
@@ -1192,6 +1238,77 @@ def test_arrival_within_tolerance_rejects_rtk_far_from_click(tmp_path):
     nav.localization_state["rtk_x"] = 10.15
     nav.localization_state["rtk_y"] = 10.1
     assert executor._arrival_within_tolerance(waypoint, 2) is True
+    store.close()
+
+
+def test_outdoor_ukf_and_ndt_arrival_do_not_override_selected_pose_with_raw_rtk(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.pose = SimpleNamespace(x=10.0, y=10.0, yaw=0.0)
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "rtk_quality": "fixed",
+        "rtk_position_good_for_navigation": True,
+        # The raw fixed-RTK observation disagrees with the already selected
+        # stationary NDT/UKF correction by 0.34 m. It is diagnostic data, not
+        # an extra arrival source for these two policies.
+        "rtk_x": 10.34,
+        "rtk_y": 10.0,
+    }
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = type(
+        "Ctx",
+        (),
+        {
+            "route_snapshot": {
+                "scene_scope": "outdoor",
+                "map": {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"},
+                "waypoints": [{"x": 10.0, "y": 10.0}],
+            },
+            "task_type": "patrol",
+        },
+    )()
+    waypoint = {"x": 10.0, "y": 10.0, "arrival_policy": "stop_and_confirm"}
+
+    assert executor._arrival_within_tolerance(
+        {**waypoint, "localization_mode": "ukf"}, 0
+    ) is True
+    assert executor._arrival_within_tolerance(
+        {**waypoint, "localization_mode": "ndt"}, 0
+    ) is True
+    # RTK mode remains an absolute fixed-RTK click verification policy.
+    assert executor._arrival_within_tolerance(
+        {**waypoint, "localization_mode": "rtk"}, 0
+    ) is False
+    store.close()
+
+
+def test_arrival_failure_message_omits_heading_when_waypoint_does_not_require_yaw(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    assert executor._arrival_convergence_failure_message(
+        {"x": 1.0, "y": 2.0, "arrival_policy": "stop_and_confirm"}, 0
+    ) == "航点位置未满足验收条件"
+    assert executor._arrival_convergence_failure_message(
+        {
+            "x": 1.0,
+            "y": 2.0,
+            "yaw": 0.0,
+            "arrival_policy": "stop_and_confirm",
+            "require_yaw": True,
+        },
+        0,
+    ) == "航点位置与航向无法同时满足验收条件"
     store.close()
 
 

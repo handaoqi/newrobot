@@ -1918,6 +1918,15 @@ class RosAdapter(Node):
     def latest_pose(self):
         return self.telemetry.latest_pose()
 
+    def wait_for_pose_update(
+        self, after_sampled_at: str | None, timeout_seconds: float = 1.0
+    ):
+        """Wait for a new final localization pose for arrival confirmation."""
+        waiter = getattr(self.telemetry, "wait_for_pose_update", None)
+        if callable(waiter):
+            return waiter(after_sampled_at, timeout_seconds=timeout_seconds)
+        return self.telemetry.latest_pose()
+
     def teleop_velocity(self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0) -> dict:
         msg = Twist()
         msg.linear.x = float(vx)
