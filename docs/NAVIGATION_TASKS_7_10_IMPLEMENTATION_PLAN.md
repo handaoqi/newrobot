@@ -5,6 +5,11 @@
 - 明确不在本次范围：任务 6（MPPI/RPP `wz` 振荡观察与调参）
 - 当前阶段：提交推送与 NX 部署完成；云端源码已暂存但首次 Docker 切换待单独批准；低速实机验收待执行
 
+## 后续增强计划
+
+- 任务 9/10 的三阶段障碍提示、最多三次受限后退/横移恢复、劝阻与安全观察闭环已形成独立计划，当前为待实施状态：[`OBSTACLE_THREE_STAGE_ALERT_AND_RECOVERY_PLAN.md`](./OBSTACLE_THREE_STAGE_ALERT_AND_RECOVERY_PLAN.md)。
+- 该后续计划不改变本文件中已经完成并部署的任务 7–10 基线状态，也不包含任务 6 的 MPPI/RPP `wz` 抑振工作。
+
 ## 完成状态
 
 | 任务 | 实施内容 | 状态 | 验收证据 |
