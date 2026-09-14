@@ -265,6 +265,45 @@ class PatrolLoopServiceTests(TestCase):
         self.assertEqual(session.metadata["observation_blocker"]["code"], "EMERGENCY_STOP")
         self.assertEqual(session.recovery_attempt, 0)
 
+    def test_observation_uses_collision_monitor_not_localization_pose_speed(self):
+        self.status.speed_mps = 0.20  # Scan matching jitter must not block a stopped robot.
+        self.status.raw_payload = {
+            "navigation": {
+                "actual_planar_speed_mps": 0.0,
+                "actual_turn_speed_rps": 0.0,
+                "actual_velocity_sample_age_seconds": 8.0,
+            },
+            "localization": {"fresh": True, "sample_age_seconds": 0.1},
+        }
+        self.status.save(update_fields=["speed_mps", "raw_payload"])
+
+        safe, code, message = PatrolLoopService._observation_safety(
+            PatrolLoopSession(robot=self.robot)
+        )
+
+        self.assertTrue(safe)
+        self.assertEqual((code, message), ("", ""))
+
+    def test_observation_reports_stale_edge_ros_data_instead_of_false_motion(self):
+        self.status.speed_mps = 0.0737
+        self.status.raw_payload = {
+            "navigation": {
+                "actual_planar_speed_mps": 0.0,
+                "actual_turn_speed_rps": 0.0,
+                "actual_velocity_sample_age_seconds": 60.0,
+            },
+            "localization": {"fresh": False, "sample_age_seconds": 60.0},
+        }
+        self.status.save(update_fields=["speed_mps", "raw_payload"])
+
+        safe, code, message = PatrolLoopService._observation_safety(
+            PatrolLoopSession(robot=self.robot)
+        )
+
+        self.assertFalse(safe)
+        self.assertEqual(code, "EDGE_ROS_DATA_STALE")
+        self.assertIn("ROS", message)
+
     def test_manual_pause_never_auto_resumes(self):
         session = self.create_running_loop()
         session = PatrolLoopService.pause(session, self.user)

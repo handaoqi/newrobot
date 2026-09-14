@@ -4966,14 +4966,64 @@ class TaskExecutor:
         """Resume a system-held task after the center's five-second gate."""
         with self._lock:
             self._assert_execution(execution_id)
+            # A delayed center command can arrive after Edge has already
+            # resumed the task.  Never cancel or zero a live replacement goal
+            # just to acknowledge that obsolete recovery command.
+            if self.context.state == "running":
+                return {
+                    "final_task_state": "running",
+                    "state_version": self.context.state_version,
+                    "recovery_action": "already_recovered",
+                    "recovery_status": "already_running",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
+
+            # A localization-loss pause can race a Nav2/BT velocity update.
+            # Zeroing /cmd_vel alone is not sufficient: an uncancelled goal
+            # may immediately cause Collision Monitor to publish a non-zero
+            # command again.  Invalidate local callbacks and cancel that goal
+            # before opening the confirmed-stop window.
+            self._cancel_arrival_adjustment()
+            self._clear_departure_heading(cancel_navigation=False)
+            navigation_cancelled = self._cancel_active_navigation(timeout_seconds=2.0)
+
             # Recovery may be requested long after the original pause. Refresh
-            # the zero command first so the confirmation is based on a current
-            # collision-monitor output rather than an expired/stale sample.
+            # the zero command after cancellation so the confirmation is based
+            # on a current collision-monitor output rather than a stale sample.
             stop_motion = getattr(self.navigation, "stop_motion", None)
             if callable(stop_motion):
                 stop_motion()
             if not self.navigation.is_robot_stopped():
-                raise ProtocolError("ROBOT_NOT_STOPPED", "recovery requires a confirmed stop")
+                snapshot_getter = getattr(self.navigation, "obstacle_monitor_snapshot", None)
+                try:
+                    observation = snapshot_getter() if callable(snapshot_getter) else {}
+                except Exception:
+                    LOGGER.warning("failed to collect stop-confirmation evidence", exc_info=True)
+                    observation = {}
+                observation = observation if isinstance(observation, dict) else {}
+                evidence = {
+                    "navigation_cancelled": navigation_cancelled,
+                    "stop_confirmation_seconds": self.stop_confirmation_seconds,
+                    "actual_planar_speed_mps": observation.get("actual_planar_speed_mps"),
+                    "actual_turn_speed_rps": observation.get("actual_turn_speed_rps"),
+                    "actual_velocity_sample_age_seconds": observation.get(
+                        "actual_velocity_sample_age_seconds"
+                    ),
+                    "requested_planar_speed_mps": observation.get("requested_planar_speed_mps"),
+                    "requested_turn_speed_rps": observation.get("requested_turn_speed_rps"),
+                    "requested_velocity_sample_age_seconds": observation.get(
+                        "requested_velocity_sample_age_seconds"
+                    ),
+                }
+                raise ProtocolError(
+                    "ROBOT_NOT_STOPPED",
+                    "recovery requires a confirmed stop"
+                    f" (nav_cancelled={navigation_cancelled}; "
+                    f"actual_planar_speed_mps={evidence['actual_planar_speed_mps']}; "
+                    f"actual_turn_speed_rps={evidence['actual_turn_speed_rps']})",
+                    details={"stop_confirmation": evidence},
+                )
             if self._recovery_arbiter.budget_exhausted():
                 return {
                     "final_task_state": self.context.state,
@@ -4986,15 +5036,6 @@ class TaskExecutor:
                     "recovery_episode_id": recovery_episode_id,
                     "attempt": int(attempt),
                     "recovery": self._recovery_arbiter.snapshot(),
-                }
-            if self.context.state == "running":
-                return {
-                    "final_task_state": "running",
-                    "state_version": self.context.state_version,
-                    "recovery_action": "already_recovered",
-                    "recovery_status": "already_running",
-                    "recovery_episode_id": recovery_episode_id,
-                    "attempt": int(attempt),
                 }
             code = str(
                 self.context.last_safe_hold_code or trigger_reason_code or "TASK_INTERRUPTED"

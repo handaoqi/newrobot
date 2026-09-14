@@ -122,6 +122,16 @@ class FakeNavigation:
     def is_robot_stopped(self):
         return self.stopped
 
+    def obstacle_monitor_snapshot(self):
+        return {
+            "requested_planar_speed_mps": 0.20,
+            "requested_turn_speed_rps": 0.10,
+            "requested_velocity_sample_age_seconds": 0.02,
+            "actual_planar_speed_mps": 0.12,
+            "actual_turn_speed_rps": 0.08,
+            "actual_velocity_sample_age_seconds": 0.01,
+        }
+
     def latest_pose(self):
         # Production pose snapshots carry a changing sampled_at marker.  Give
         # the fake the same contract so consecutive-arrival confirmation tests
@@ -381,7 +391,66 @@ def test_center_recovery_resumes_the_persisted_pending_waypoint(tmp_path):
     assert result["recovery_status"] == "recovered"
     assert result["recovery_episode_id"] == "episode-1"
     assert executor.context.current_waypoint_index == 0
+    assert nav.cancelled == 2  # pause + recovery must cancel a stale Nav2 goal.
     assert nav.stop_commands >= 2  # pause + recovery confirmation refresh
+    store.close()
+
+
+def test_center_recovery_keeps_stop_gate_and_reports_motion_evidence(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    executor.pause_task(execution_id)
+    nav.stopped = False
+
+    try:
+        executor.recover_task(
+            execution_id,
+            trigger_reason_code="NAV_STACK_NOT_READY",
+            recovery_episode_id="episode-stop-gate",
+            attempt=1,
+        )
+        assert False, "recovery must not bypass a failed stop confirmation"
+    except ProtocolError as exc:
+        assert exc.code == "ROBOT_NOT_STOPPED"
+        assert exc.details["stop_confirmation"]["navigation_cancelled"] is True
+        assert exc.details["stop_confirmation"]["actual_planar_speed_mps"] == 0.12
+        assert "actual_planar_speed_mps=0.12" in exc.message
+    finally:
+        store.close()
+
+
+def test_delayed_center_recovery_does_not_stop_an_already_resumed_task(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    stops_before = nav.stop_commands
+    cancels_before = nav.cancelled
+
+    result = executor.recover_task(
+        execution_id,
+        trigger_reason_code="LOCALIZATION_LOST",
+        recovery_episode_id="episode-delayed",
+        attempt=1,
+    )
+
+    assert result["recovery_status"] == "already_running"
+    assert nav.stop_commands == stops_before
+    assert nav.cancelled == cancels_before
     store.close()
 
 

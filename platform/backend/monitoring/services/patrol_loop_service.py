@@ -32,7 +32,12 @@ class PatrolLoopError(ValueError):
 class PatrolLoopService:
     OBSERVATION_SECONDS = 5
     MAX_RECOVERY_ATTEMPTS = 10
-    STOP_SPEED_MPS = 0.05
+    # Match the Edge confirmed-stop gate.  The pose speed produced by scan
+    # matching is intentionally not authoritative here: it can be non-zero
+    # while a stationary robot's map pose jitters.
+    STOP_SPEED_MPS = 0.03
+    STOP_TURN_RPS = 0.05
+    EDGE_ROS_STALE_SECONDS = 15
     STATUS_FRESH_SECONDS = 15
     LOW_BATTERY_PERCENT = getattr(settings, "LOW_BATTERY_STOP_PERCENT", 20)
     LOW_BATTERY_REARM_PERCENT = getattr(settings, "LOW_BATTERY_REARM_PERCENT", 25)
@@ -535,6 +540,60 @@ class PatrolLoopService:
         if latest.power_available and latest.battery_percent is not None:
             if int(latest.battery_percent) < cls.LOW_BATTERY_PERCENT:
                 return False, "LOW_BATTERY", "电量低于巡逻阈值"
+        raw_payload = latest.raw_payload if isinstance(latest.raw_payload, dict) else {}
+        navigation = raw_payload.get("navigation")
+        navigation = navigation if isinstance(navigation, dict) else {}
+        actual_planar = navigation.get("actual_planar_speed_mps")
+        actual_turn = navigation.get("actual_turn_speed_rps")
+        if actual_planar is not None and actual_turn is not None:
+            try:
+                actual_planar = abs(float(actual_planar))
+                actual_turn = abs(float(actual_turn))
+            except (TypeError, ValueError):
+                actual_planar = actual_turn = None
+            if actual_planar is not None:
+                localization = raw_payload.get("localization")
+                localization = localization if isinstance(localization, dict) else {}
+                motion_age = navigation.get("actual_velocity_sample_age_seconds")
+                localization_age = localization.get("sample_age_seconds")
+                try:
+                    motion_age = float(motion_age) if motion_age is not None else None
+                except (TypeError, ValueError):
+                    motion_age = None
+                try:
+                    localization_age = (
+                        float(localization_age) if localization_age is not None else None
+                    )
+                except (TypeError, ValueError):
+                    localization_age = None
+                # Collision Monitor may suppress repeated zero commands, so a
+                # stale *zero* alone is valid.  If its age and the localization
+                # age are both stale, however, Edge's ROS callback cache has
+                # stopped advancing.  Do not display that as robot movement.
+                if (
+                    motion_age is not None
+                    and motion_age > cls.EDGE_ROS_STALE_SECONDS
+                    and (
+                        localization.get("fresh") is False
+                        or (
+                            localization_age is not None
+                            and localization_age > cls.EDGE_ROS_STALE_SECONDS
+                        )
+                    )
+                ):
+                    return (
+                        False,
+                        "EDGE_ROS_DATA_STALE",
+                        "Edge ROS 运动与定位观测已过期，等待 Edge 恢复数据更新",
+                    )
+                if (
+                    actual_planar > cls.STOP_SPEED_MPS
+                    or actual_turn > cls.STOP_TURN_RPS
+                ):
+                    return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
+                return True, "", ""
+        # Compatibility fallback for old Edge payloads that do not yet carry
+        # Collision Monitor's actual /cmd_vel observation.
         if latest.speed_mps is None or abs(float(latest.speed_mps)) > cls.STOP_SPEED_MPS:
             return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
         return True, "", ""
