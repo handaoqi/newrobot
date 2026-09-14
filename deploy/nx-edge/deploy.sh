@@ -87,9 +87,6 @@ rsync -a --delete \
   --exclude='config.yaml' --exclude='data/' --exclude='*.log' \
   "$REPO_ROOT/edge-agent/" "$(target_path "$EDGE_RELEASE_DIR/edge-agent/")"
 
-PREVIOUS_EDGE_RELEASE="$(remote_exec "readlink -f '$EDGE_CURRENT_LINK' 2>/dev/null || true")"
-remote_exec "candidate='$EDGE_RUNTIME_DIR/.current-edge-$EDGE_RELEASE_ID'; ln -sfn '$EDGE_RELEASE_DIR' \"\$candidate\"; mv -Tf \"\$candidate\" '$EDGE_CURRENT_LINK'"
-
 if "$BUILD"; then
   if ! "$DEPLOY_ROBOT"; then
     echo "--build cannot be combined with --edge-only" >&2
@@ -126,9 +123,12 @@ if "$INSTALL_SERVICE"; then
   remote_exec "sudo install -m 0755 /tmp/roamerx-5g-share /usr/local/sbin/roamerx-5g-share && sudo systemctl daemon-reload && sudo systemctl enable roamerx-edge-agent roamerx-teleop-bridge roamerx-dev-agent roamerx-local-asr roamerx-bike-bot roamerx-robot-mcp roamerx-zenoh roamerx-5g-share"
 fi
 
-remote_exec "python3 '$EDGE_CURRENT_LINK/edge-agent/tools/write_mapping_deployment_manifest.py' --repo '$TARGET_REPO_ROOT' --output '$EDGE_RUNTIME_DIR/conf/mapping-deployment.json'"
+remote_exec "python3 '$EDGE_RELEASE_DIR/edge-agent/tools/write_mapping_deployment_manifest.py' --repo '$TARGET_REPO_ROOT' --output '$EDGE_RUNTIME_DIR/conf/mapping-deployment.json'"
 
+PREVIOUS_EDGE_RELEASE="$(remote_exec "readlink -f '$EDGE_CURRENT_LINK' 2>/dev/null || true")"
+EDGE_RELEASE_STATUS="staged"
 if "$RESTART_EDGE"; then
+  remote_exec "candidate='$EDGE_RUNTIME_DIR/.current-edge-$EDGE_RELEASE_ID'; ln -sfn '$EDGE_RELEASE_DIR' \"\$candidate\"; mv -Tf \"\$candidate\" '$EDGE_CURRENT_LINK'"
   if ! remote_exec "EDGE_DB_PATH='$EDGE_RUNTIME_DIR/data/edge-agent/edge.db' bash '$EDGE_CURRENT_LINK/edge-agent/tools/restart-edge-agent-safely' && sleep 3 && systemctl is-active --quiet roamerx-edge-agent.service && main_pid=\$(systemctl show roamerx-edge-agent.service -p MainPID --value) && test \"\$(readlink -f /proc/\$main_pid/cwd)\" = \"\$(readlink -f '$EDGE_CURRENT_LINK/edge-agent')\""; then
     if [[ -n "$PREVIOUS_EDGE_RELEASE" ]]; then
       echo "Edge release health check failed; rolling back to $PREVIOUS_EDGE_RELEASE" >&2
@@ -136,6 +136,12 @@ if "$RESTART_EDGE"; then
     fi
     exit 76
   fi
+  EDGE_RELEASE_STATUS="activated"
+elif [[ -z "$PREVIOUS_EDGE_RELEASE" ]]; then
+  # First installation needs a valid persistent target even when activation
+  # is intentionally deferred until the service's next start.
+  remote_exec "candidate='$EDGE_RUNTIME_DIR/.current-edge-$EDGE_RELEASE_ID'; ln -sfn '$EDGE_RELEASE_DIR' \"\$candidate\"; mv -Tf \"\$candidate\" '$EDGE_CURRENT_LINK'"
+  EDGE_RELEASE_STATUS="selected for first start"
 fi
 
-echo "NX code deployed to ${ROBOT_HOST:+$ROBOT_HOST:}$ROBOT_PROJECT_DIR (edge release $EDGE_RELEASE_ID)"
+echo "NX code deployed to ${ROBOT_HOST:+$ROBOT_HOST:}$ROBOT_PROJECT_DIR (edge release $EDGE_RELEASE_ID, $EDGE_RELEASE_STATUS)"
