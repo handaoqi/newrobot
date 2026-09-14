@@ -331,6 +331,62 @@ class MessageHandlerTests(TestCase):
         self.execution.refresh_from_db()
         self.assertEqual(self.execution.state, "resuming")
 
+    def test_failed_recovery_does_not_terminalize_paused_execution(self):
+        TaskExecutionService.transition(
+            self.execution,
+            "accepted",
+            event_type="test.accepted",
+            state_version=2,
+        )
+        TaskExecutionService.transition(
+            self.execution,
+            "running",
+            event_type="test.running",
+            state_version=3,
+        )
+        TaskExecutionService.transition(
+            self.execution,
+            "paused",
+            event_type="test.paused",
+            state_version=4,
+        )
+        self.execution.refresh_from_db()
+        recovery_command = CommandService.create_task_recovery(
+            self.execution,
+            episode_id=uuid.uuid4(),
+            attempt=1,
+            reason_code="LOCALIZATION_LOST",
+            reason_message="定位恢复中",
+        )
+
+        result = self.envelope(
+            "command.result",
+            {
+                "command_id": str(recovery_command.id),
+                "task_execution_id": str(self.execution.id),
+                "status": "failed",
+                "started_at": timezone.now().isoformat(),
+                "finished_at": timezone.now().isoformat(),
+                "error_code": "ROBOT_NOT_STOPPED",
+                "error_message": "recovery requires a confirmed stop",
+                "result": {},
+            },
+            sequence=4,
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/result", result)
+
+        self.execution.refresh_from_db()
+        recovery_command.refresh_from_db()
+        self.assertEqual(recovery_command.status, "failed")
+        self.assertEqual(self.execution.state, "paused")
+        self.assertEqual(self.execution.state_version, 4)
+        self.assertFalse(
+            TaskExecutionEvent.objects.filter(
+                task_execution=self.execution,
+                event_type="command.result",
+            ).exists()
+        )
+
     def test_blocked_resume_persists_edge_pause_reason(self):
         TaskExecutionService.transition(
             self.execution,

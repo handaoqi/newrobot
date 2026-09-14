@@ -805,6 +805,19 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
                         payload=payload,
                     )
                 final_state = None
+            elif command.command_type == "task.recover.v1":
+                # A failed recovery attempt is not a terminal task result.
+                # The loop deliberately returns to its observation window and
+                # may retry after the stop/localization interlock is healthy.
+                # Treating this command result as ``task.failed`` destroys
+                # the persisted waypoint context, so the Continue action can
+                # no longer recover the active loop.
+                #
+                # A real terminal state is still honored above when Edge
+                # explicitly provides ``final_task_state``.  task.force_exit
+                # is intentionally outside this exception and remains the
+                # only command that ends a task unconditionally.
+                final_state = None
             else:
                 final_state = "timed_out" if command.error_code in {"COMMAND_EXPIRED", "COMMAND_TIMED_OUT"} else "failed"
         if final_state and final_state != execution.state:
