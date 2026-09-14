@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  arrivalPolicyDescription,
   appendConfirmedInspectionPoint,
   clampMapZoom,
   headingBetweenMapPoints,
@@ -19,23 +20,14 @@ import {
   rtkQualityLabel,
   rtkSolutionStatusLabel,
   shouldShowBoundaryPolicyStatus,
-  waypointCorrectionModeLabel,
-  waypointRequiresFullCorrection,
 } from '../src/services/routePlannerState.js'
 
-test('waypoint arrival mode distinguishes plain intermediates from business stops', () => {
-  const plain = { arrival_policy: 'stop_and_confirm', dwell_seconds: 0, actions: [] }
-  assert.equal(waypointRequiresFullCorrection(plain, 1, 3), false)
-  assert.equal(waypointCorrectionModeLabel(plain, 1, 3), '轻量到达')
-  assert.equal(waypointRequiresFullCorrection(plain, 0, 3), true)
-  assert.equal(waypointRequiresFullCorrection(plain, 2, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, require_yaw: true }, 1, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, dwell_seconds: 1 }, 1, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, actions: [{}] }, 1, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, force_localization_correction: true }, 1, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, speech_template_id: 9, speech_mode: 'non_blocking' }, 1, 3), true)
-  assert.equal(waypointRequiresFullCorrection({ ...plain, speech_template_id: 9, speech_mode: 'disabled' }, 1, 3), false)
-  assert.equal(waypointCorrectionModeLabel({ arrival_policy: 'pass_through' }, 1, 3), '通过点')
+test('arrival-policy descriptions match the selected strategy and fail closed', () => {
+  assert.equal(arrivalPolicyDescription('pass_through'), '连续通过，不停车、不校正，也不执行停留、语音或动作。')
+  assert.equal(arrivalPolicyDescription('stop_and_confirm'), '停车后完成定位校正与到点确认，再执行后续事项。')
+  assert.equal(arrivalPolicyDescription('precision'), '停车校正后按更严格的位置和航向验收；不满足则安全处理。')
+  assert.equal(arrivalPolicyDescription('dock'), '用于对接终点，执行专用低速对接及严格位置、航向确认。')
+  assert.equal(arrivalPolicyDescription('unknown'), '停车后完成定位校正与到点确认，再执行后续事项。')
 })
 
 test('heading input is normalized and converted only when valid', () => {

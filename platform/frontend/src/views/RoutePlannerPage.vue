@@ -36,6 +36,7 @@ import {
   MAP_ZOOM_MIN,
   MAP_ZOOM_STEP,
   appendConfirmedInspectionPoint,
+  arrivalPolicyDescription,
   clampMapZoom,
   headingBetweenMapPoints,
   headingDegreesToRadians,
@@ -50,8 +51,6 @@ import {
   rtkQualityLabel,
   rtkSolutionStatusLabel,
   shouldShowBoundaryPolicyStatus,
-  waypointCorrectionModeLabel as correctionModeLabel,
-  waypointRequiresFullCorrection as requiresFullCorrection,
 } from '../services/routePlannerState'
 import {
   buildLocalizationLossMarkers,
@@ -864,14 +863,6 @@ function normalizeSpeechMode(value, point = {}) {
   const normalized = String(value || '').trim().toLowerCase()
   if (['blocking', 'non_blocking', 'disabled'].includes(normalized)) return normalized
   return point.speech_template_id ? 'non_blocking' : 'disabled'
-}
-
-function waypointRequiresFullCorrection(point, index) {
-  return requiresFullCorrection(point, index, waypoints.value.length)
-}
-
-function waypointCorrectionModeLabel(point, index) {
-  return correctionModeLabel(point, index, waypoints.value.length)
 }
 
 function setWaypointArrivalPolicy(index, policy) {
@@ -3251,10 +3242,6 @@ async function handleDeleteRoute(route) {
                         {{ isWaypointExpanded(index) ? '收起' : '展开' }}
                       </button>
                       <span class="waypoint-title">{{ waypointNames[index] }}: {{ waypointDisplayText(point) }}</span>
-                      <span
-                        class="waypoint-correction-badge"
-                        :class="{ lightweight: !waypointRequiresFullCorrection(point, index) && (point.arrival_policy || 'stop_and_confirm') !== 'pass_through' }"
-                      >{{ waypointCorrectionModeLabel(point, index) }}</span>
                       <button type="button" class="btn btn-sm btn-danger waypoint-delete-btn" @click="removeWaypoint(index)">删除</button>
                     </div>
                     <div v-if="isWaypointExpanded(index)" class="waypoint-main waypoint-details">
@@ -3262,13 +3249,14 @@ async function handleDeleteRoute(route) {
                         <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
                         <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
                       </div>
-                      <label class="waypoint-heading-row">
+                      <div class="waypoint-heading-row" role="group" aria-label="方向与到点转向">
                         <span>方向</span>
                         <div class="waypoint-heading-input">
                           <input
                             type="number"
                             step="1"
                             inputmode="decimal"
+                            aria-label="方向"
                             :value="waypointYawDrafts[index]"
                             @input="setWaypointYawDraft(index, $event.target.value)"
                             @keydown.enter.prevent="confirmWaypointYaw(index)"
@@ -3280,17 +3268,13 @@ async function handleDeleteRoute(route) {
                             :class="{ confirmed: waypointYawConfirmed[index] }"
                             @click="confirmWaypointYaw(index)"
                           >{{ waypointYawConfirmed[index] ? '已确认' : '确认' }}</button>
+                          <label class="waypoint-heading-turn">
+                            <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
+                            <span>到点转向</span>
+                          </label>
                         </div>
-                      </label>
+                      </div>
                       <small v-if="waypointYawErrors[index]" class="waypoint-field-error">{{ waypointYawErrors[index] }}</small>
-                      <label class="waypoint-check">
-                        <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
-                        <span>到点转向</span>
-                      </label>
-                      <label class="waypoint-check">
-                        <input type="checkbox" :checked="point.force_localization_correction === true" @change="setWaypointBoolean(index, 'force_localization_correction', $event.target.checked)" />
-                        <span>强制完整定位校正</span>
-                      </label>
                       <label>
                         <span>到点停留（秒）</span>
                         <input
@@ -3303,9 +3287,6 @@ async function handleDeleteRoute(route) {
                           @input="setWaypointDwell(index, $event.target.value)"
                         />
                       </label>
-                      <small class="waypoint-arrival-hint">
-                        到达模式：{{ waypointCorrectionModeLabel(point, index) }}；首次 0.50m 粗到达，随后按 0.30m 最多细靠近 3 次，仍未达标则安全保持。启用到点转向时，转向造成的 XY 偏移会在避障与新鲜定位约束下分段微调。
-                      </small>
                       <label>
                         <span>到点策略</span>
                         <select
@@ -3317,20 +3298,10 @@ async function handleDeleteRoute(route) {
                           </option>
                         </select>
                       </label>
+                      <small class="waypoint-arrival-hint">{{ arrivalPolicyDescription(point.arrival_policy) }}</small>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
                         <span>到下个点避障（绕行+减速；硬急停）</span>
-                      </label>
-                      <label>
-                        <span>语音模式</span>
-                        <select
-                          :value="point.speech_mode || (point.speech_template_id ? 'non_blocking' : 'disabled')"
-                          @change="waypoints[index] = { ...point, speech_mode: $event.target.value }"
-                        >
-                          <option value="blocking">阻塞下一段</option>
-                          <option value="non_blocking">非阻塞（推荐）</option>
-                          <option value="disabled">关闭</option>
-                        </select>
                       </label>
                       <label>
                         <span>局部控制器</span>
@@ -3357,6 +3328,17 @@ async function handleDeleteRoute(route) {
                           <option value="ndt">NDT / FastVGICP 校正</option>
                           <option value="ukf">UKF（NDT / RTK 动态择优校正）</option>
                           <option value="rtk" :disabled="mapIsLocalOnly">RTK（固定解校正）</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>语音模式</span>
+                        <select
+                          :value="point.speech_mode || (point.speech_template_id ? 'non_blocking' : 'disabled')"
+                          @change="waypoints[index] = { ...point, speech_mode: $event.target.value }"
+                        >
+                          <option value="blocking">阻塞下一段</option>
+                          <option value="non_blocking">非阻塞（推荐）</option>
+                          <option value="disabled">关闭</option>
                         </select>
                       </label>
                       <label>
@@ -4486,26 +4468,15 @@ async function handleDeleteRoute(route) {
   white-space: nowrap;
 }
 
-.waypoint-correction-badge {
-  flex: 0 0 auto;
-  padding: 0.16rem 0.38rem;
-  border-radius: 999px;
-  color: #92400e;
-  background: #fef3c7;
-  font-size: 0.66rem;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.waypoint-correction-badge.lightweight {
-  color: #166534;
-  background: #dcfce7;
-}
-
 .waypoint-arrival-hint {
   grid-column: 1 / -1;
   color: #475467;
   line-height: 1.4;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: normal !important;
 }
 
 .waypoint-delete-btn {
@@ -4537,7 +4508,7 @@ async function handleDeleteRoute(route) {
 
 .waypoint-heading-input {
   display: grid;
-  grid-template-columns: minmax(96px, 1fr) 18px auto;
+  grid-template-columns: minmax(96px, 1fr) 18px auto auto;
   align-items: center;
   gap: 0.3rem;
   width: 100%;
@@ -4551,10 +4522,28 @@ async function handleDeleteRoute(route) {
   border-radius: 4px;
 }
 
-.waypoint-main label.waypoint-heading-row {
+.waypoint-heading-row {
+  display: grid;
   grid-template-columns: 44px minmax(0, 1fr);
   align-items: center;
   gap: 0.4rem;
+  color: #667085;
+  font-size: 0.78rem;
+}
+
+.waypoint-main label.waypoint-heading-turn {
+  display: flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 0.25rem;
+  color: #475467;
+  white-space: nowrap;
+}
+
+.waypoint-heading-turn input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 
 .heading-unit {
@@ -6691,7 +6680,7 @@ async function handleDeleteRoute(route) {
   .map-origin-legend { gap: 0.35rem; }
   .map-origin-legend-item { font-size: 0; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
-  .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto; }
+  .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto auto; }
   .waypoint-heading-input input { min-width: 0; }
   .waypoint-list { height: auto; }
   .drill-timeline-panel { max-height: 54px; padding: 0.7rem; }
