@@ -207,7 +207,11 @@ class ScheduleService:
             return run
 
         try:
-            execution = TaskExecutionService.create_execution(schedule.task_template, operator)
+            execution = TaskExecutionService.create_execution(
+                schedule.task_template,
+                operator,
+                execution_source="scheduler",
+            )
             command = CommandService.create(execution, "task.start", operator)
         except TaskStateError as exc:
             run.status = "failed"

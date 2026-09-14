@@ -101,6 +101,7 @@ def dispatch_docking_task(
             task,
             operator,
             loop_session_id=(uuid.UUID(low_battery_episode_id) if low_battery_episode_id else None),
+            execution_source="auto_docking",
         )
         command = CommandService.create(
             execution,

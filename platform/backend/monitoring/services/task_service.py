@@ -319,6 +319,7 @@ class TaskExecutionService:
         loop_session_id=None,
         round_number: int = 1,
         route_snapshot: dict | None = None,
+        execution_source: str = "task_center",
     ) -> TaskExecution:
         robot = Robot.objects.select_for_update().get(pk=task.robot_id)
         active = TaskExecution.objects.filter(robot=robot, state__in=TaskExecution.ACTIVE_STATES).order_by("-created_at").first()
@@ -352,6 +353,7 @@ class TaskExecutionService:
             or "local_only"
         )
         snapshot["map"] = snapshot_map
+        snapshot["execution_source"] = str(execution_source or "task_center")
         try:
             execution = TaskExecution.objects.create(
                 task=task,
@@ -375,6 +377,7 @@ class TaskExecutionService:
             occurred_at=timezone.now(),
             payload={
                 "source": "center",
+                "execution_source": snapshot["execution_source"],
                 "loop_session_id": str(execution.loop_session_id) if execution.loop_session_id else None,
                 "round_number": execution.round_number,
             },

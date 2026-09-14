@@ -10,6 +10,7 @@ import {
   fetchRobotNavigationStatus,
   fetchRobotStatus,
   fetchTaskExecution,
+  fetchTaskExecutions,
   fetchTaskTrajectory,
   fetchRobots,
   fetchRouteSummaries,
@@ -135,6 +136,11 @@ const routeExecuteBusy = ref(false)
 const lastExecution = ref(null)
 const taskMapExecution = ref(null)
 const taskMapTrajectory = ref([])
+const taskExecutionHistory = ref([])
+const taskExecutionHistoryLoading = ref(false)
+const taskExecutionHistoryError = ref('')
+const selectedTaskExecutionId = ref('')
+const executionHistoryDismissed = ref(false)
 const initialPoseMode = ref(false)
 const manualInitialPose = ref(null)
 const initialPoseStep = ref('position')
@@ -226,6 +232,7 @@ let initialSelectionApplied = false
 let attemptMarkerTimer = null
 let localizationAttemptClockTimer = null
 let routeLoadSequence = 0
+let taskExecutionLoadSequence = 0
 
 const GLOBAL_CONTROLLER_OPTIONS = [
   { value: 'theta_star', label: 'Theta*（ThetaStar）' },
@@ -275,11 +282,13 @@ const timelineRunning = computed(() => (
   drillTimelineMode.value === 'execution' ? routeExecutionRunning.value : drillRunning.value
 ))
 const drillTimelineSourceLabel = computed(() => (
-  drillTimelineMode.value === 'execution' ? '真实预演' : '模拟演练'
+  drillTimelineMode.value === 'execution'
+    ? (taskMapExecution.value?.execution_source_label || '真实任务')
+    : '模拟演练'
 ))
 const drillTimelineEmptyText = computed(() => (
   drillTimelineMode.value === 'execution'
-    ? '路线下发后，这里会按顺序显示航点目标下发和实际到达过程。'
+    ? '尚无可显示的任务阶段；执行状态、航点、定位、避障和错误日志会统一记录在这里。'
     : '点击“演练开始”后，这里会记录模拟移动、到达点位和播报内容。'
 ))
 const drillTimelineSummary = computed(() => {
@@ -396,6 +405,12 @@ watch(() => displayedDrillTimeline.value.at(-1)?.id, () => {
 })
 
 watch(() => selectedMap.value?.id, async (mapId) => {
+  // Localization attempts are map-scoped. Never carry a terminal RTK/NDT
+  // result from the previously selected map into this map's task flow.
+  localizationAttemptSession.value = null
+  relocalizationMarkers.value = []
+  const robotId = selectedRobot.value?.id
+  if (robotId) clearStoredAttemptSession(robotId)
   boundaryEditing.value = false
   boundaryDraftPoints.value = []
   selectedLogPoint.value = null
@@ -589,6 +604,7 @@ function startNewRouteEditor() {
   lastExecution.value = null
   taskMapExecution.value = null
   taskMapTrajectory.value = []
+  resetTaskExecutionHistory()
   routeForm.value = {
     ...routeForm.value,
     name: '',
@@ -636,6 +652,7 @@ async function handleMapSelect(map) {
   lastExecution.value = null
   taskMapExecution.value = null
   taskMapTrajectory.value = []
+  resetTaskExecutionHistory()
   resetWaypointExpansion()
   waypoints.value = []
   waypointNames.value = []
@@ -1140,13 +1157,22 @@ function syncExecutionTimelineClock(execution = taskMapExecution.value) {
   else startDrillClock()
 }
 
-function openExecutionTimeline(execution = null, requestedAt = Date.now()) {
+function openExecutionTimeline(execution = null, requestedAt = null) {
   if (drillRunning.value) stopDrill(false)
   drillTimelineMode.value = 'execution'
   drillTimelineOpen.value = true
-  routePreviewRequestedAt.value = Number(requestedAt) || Date.now()
+  routePreviewRequestedAt.value = requestedAt === null ? 0 : (Number(requestedAt) || Date.now())
   routePreviewError.value = ''
   syncExecutionTimelineClock(execution)
+}
+
+function resetTaskExecutionHistory() {
+  taskExecutionLoadSequence += 1
+  taskExecutionHistory.value = []
+  taskExecutionHistoryLoading.value = false
+  taskExecutionHistoryError.value = ''
+  selectedTaskExecutionId.value = ''
+  executionHistoryDismissed.value = false
 }
 
 function clearDisplayedDrillTimeline() {
@@ -1159,6 +1185,7 @@ function clearDisplayedDrillTimeline() {
     drillStartedAt = null
     stopDrillClock()
     drillTimelineOpen.value = false
+    executionHistoryDismissed.value = true
     return
   }
   clearDrillTimeline()
@@ -1522,6 +1549,7 @@ async function handleLoadRoute(route) {
   if (loadSequence !== routeLoadSequence) return
   if (String(selectedRoute.value?.id || '') !== String(hydratedRoute.id || '')) {
     resetDrillTimelineView()
+    resetTaskExecutionHistory()
   }
   selectedRoute.value = hydratedRoute
   lastExecution.value = hydratedRoute.latest_execution || null
@@ -1883,36 +1911,91 @@ async function refreshNavigationStatus({ signal } = {}) {
   }
 }
 
-async function refreshTaskMapExecution() {
-  const executionId = navStatus.value?.status?.task_execution_id || lastExecution.value?.id
+async function refreshTaskMapExecution({ preferredExecutionId = '', forceOpen = false } = {}) {
+  const robotId = selectedRobot.value?.id || selectedMap.value?.robot
+  const routeId = selectedRoute.value?.id || ''
+  const loadSequence = ++taskExecutionLoadSequence
+  taskExecutionHistoryLoading.value = true
+  taskExecutionHistoryError.value = ''
+
+  let history = taskExecutionHistory.value
+  if (robotId) {
+    try {
+      history = await fetchTaskExecutions({
+        robot_id: robotId,
+        route_id: routeId,
+        limit: 20,
+      })
+      if (loadSequence !== taskExecutionLoadSequence) return
+      taskExecutionHistory.value = Array.isArray(history) ? history : []
+      history = taskExecutionHistory.value
+    } catch (error) {
+      if (loadSequence !== taskExecutionLoadSequence) return
+      taskExecutionHistoryError.value = error.message || '任务执行记录加载失败'
+    }
+  }
+
+  const knownIds = new Set(history.map(item => String(item.id)))
+  const liveExecutionId = String(navStatus.value?.status?.task_execution_id || '')
+  let executionId = String(preferredExecutionId || selectedTaskExecutionId.value || '')
+  if (executionId && history.length && !knownIds.has(executionId)) executionId = ''
+  if (!executionId && liveExecutionId && (!routeId || knownIds.has(liveExecutionId))) {
+    executionId = liveExecutionId
+  }
+  if (!executionId && lastExecution.value?.id && (!history.length || knownIds.has(String(lastExecution.value.id)))) {
+    executionId = String(lastExecution.value.id)
+  }
+  if (!executionId && history[0]?.id) executionId = String(history[0].id)
+
   if (!executionId) {
-    taskMapExecution.value = null
-    taskMapTrajectory.value = []
+    if (loadSequence === taskExecutionLoadSequence) {
+      taskMapExecution.value = null
+      taskMapTrajectory.value = []
+      selectedTaskExecutionId.value = ''
+      taskExecutionHistoryLoading.value = false
+    }
     return
   }
+
+  selectedTaskExecutionId.value = executionId
   try {
     const [detail, track] = await Promise.all([
       fetchTaskExecution(executionId),
       fetchTaskTrajectory(executionId),
     ])
+    if (loadSequence !== taskExecutionLoadSequence) return
     taskMapExecution.value = detail
     taskMapTrajectory.value = track.points || []
     const executionMatchesRoute = !detail?.route
-      || !selectedRoute.value?.id
-      || String(detail.route) === String(selectedRoute.value.id)
-    if (taskExecutionIsActive(detail) && executionMatchesRoute && !drillRunning.value) {
-      if (drillTimelineMode.value !== 'execution') {
-        const createdAt = Date.parse(detail.created_at || detail.started_at || '')
-        openExecutionTimeline(detail, Number.isFinite(createdAt) ? createdAt : Date.now())
-      } else {
-        syncExecutionTimelineClock(detail)
-      }
-    } else if (drillTimelineMode.value === 'execution') {
-      syncExecutionTimelineClock(detail)
+      || !routeId
+      || String(detail.route) === String(routeId)
+    const shouldAutoOpen = executionMatchesRoute
+      && !drillRunning.value
+      && (
+        forceOpen
+        || taskExecutionIsActive(detail)
+        || (!executionHistoryDismissed.value && drillTimelineMode.value !== 'execution' && !drillTimeline.value.length)
+      )
+    if (shouldAutoOpen && drillTimelineMode.value !== 'execution') openExecutionTimeline(detail)
+    else if (drillTimelineMode.value === 'execution') syncExecutionTimelineClock(detail)
+  } catch (error) {
+    if (loadSequence === taskExecutionLoadSequence) {
+      taskExecutionHistoryError.value = error.message || '任务执行详情加载失败'
     }
-  } catch {
-    // Navigation status remains useful even if a historical execution was removed.
+  } finally {
+    if (loadSequence === taskExecutionLoadSequence) taskExecutionHistoryLoading.value = false
   }
+}
+
+async function handleTaskExecutionHistorySelect(executionId) {
+  if (!executionId) return
+  selectedTaskExecutionId.value = String(executionId)
+  executionHistoryDismissed.value = false
+  routePreviewRequestedAt.value = 0
+  routePreviewError.value = ''
+  drillTimelineMode.value = 'execution'
+  drillTimelineOpen.value = true
+  await refreshTaskMapExecution({ preferredExecutionId: executionId, forceOpen: true })
 }
 
 async function sendNavigationCommand(action) {
@@ -2076,6 +2159,21 @@ function restoreAttemptSessionFromStatus() {
   const robotId = selectedRobot.value?.id
   const command = navStatus.value?.localization_command
   if (command?.result_payload) {
+    const result = command.result_payload || {}
+    const raw = result.localization_attempts || {}
+    const payload = command.payload || {}
+    const routeMap = payload.route_snapshot?.map || payload.map || {}
+    const commandMapId = String(result.map_id ?? raw.map_id ?? routeMap.map_id ?? payload.map_id ?? '')
+    const commandMapVersion = String(result.map_version ?? raw.map_version ?? routeMap.map_version ?? payload.map_version ?? '')
+    const selectedMapId = String(selectedMap.value?.id || '')
+    const selectedMapVersionValue = String(selectedMapVersion() || '')
+    // Historical commands without map identity are unsafe to restore after a
+    // map switch; wait for a fresh map-scoped command instead.
+    if (!selectedMapId || !commandMapId || commandMapId !== selectedMapId
+      || (selectedMapVersionValue && commandMapVersion && commandMapVersion !== selectedMapVersionValue)
+      || (selectedMapVersionValue && !commandMapVersion)) {
+      return
+    }
     applyLocalizationAttemptCommand(command, {
       phase: 'localization',
       showCandidates: true,
@@ -2083,7 +2181,11 @@ function restoreAttemptSessionFromStatus() {
     return
   }
   const stored = readStoredAttemptSession(robotId)
-  if (stored?.attempts?.length) {
+  const storedMapId = String(stored?.mapId || '')
+  const storedMapVersion = String(stored?.mapVersion || '')
+  if (stored?.attempts?.length
+    && storedMapId === String(selectedMap.value?.id || '')
+    && (!selectedMapVersion() || storedMapVersion === String(selectedMapVersion()))) {
     localizationAttemptSession.value = withAttemptMarkerExpiry(stored)
     scheduleAttemptMarkerRefresh(localizationAttemptSession.value)
   }
@@ -2307,6 +2409,8 @@ async function handleExecuteRoute() {
   taskMapExecution.value = null
   taskMapTrajectory.value = []
   lastExecution.value = null
+  selectedTaskExecutionId.value = ''
+  executionHistoryDismissed.value = false
   routeExecuteBusy.value = true
   navError.value = ''
   try {
@@ -2315,6 +2419,7 @@ async function handleExecuteRoute() {
       traceId,
     })
     taskMapExecution.value = lastExecution.value
+    selectedTaskExecutionId.value = String(lastExecution.value.id)
     taskMapTrajectory.value = []
     syncExecutionTimelineClock(lastExecution.value)
     await refreshNavigationStatus()
@@ -2367,6 +2472,32 @@ function formatExecutionCreatedAt(value) {
   return Number.isNaN(date.getTime())
     ? value
     : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function taskExecutionStateLabel(state) {
+  return ({
+    created: '已创建',
+    dispatching: '下发中',
+    accepted: '已接受',
+    running: '执行中',
+    pausing: '暂停中',
+    paused: '已暂停',
+    resuming: '恢复中',
+    cancelling: '取消中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+    timed_out: '超时',
+    interrupted: '中断',
+    rejected: '已拒绝',
+  })[state] || state || '未知状态'
+}
+
+function taskExecutionHistoryOption(execution) {
+  const occurredAt = formatExecutionCreatedAt(execution.created_at)
+  const source = execution.execution_source_label || '任务中心'
+  const round = Number(execution.round_number || 1)
+  return `${occurredAt} · ${source} · 第${round}轮 · ${taskExecutionStateLabel(execution.state)}`
 }
 
 function routeExecutionOptionText(route) {
@@ -3454,7 +3585,7 @@ async function handleDeleteRoute(route) {
               <div class="drill-timeline-header">
                 <div>
                   <span>演练记录</span>
-                  <strong>时间轴 · {{ drillTimelineSourceLabel }}</strong>
+                  <strong>任务执行时间轴 · {{ drillTimelineSourceLabel }}</strong>
                 </div>
                 <div class="drill-timeline-actions">
                   <button class="btn btn-sm" :disabled="timelineRunning || !displayedDrillTimeline.length" @click="clearDisplayedDrillTimeline">
@@ -3464,6 +3595,32 @@ async function handleDeleteRoute(route) {
                     {{ drillTimelineOpen ? '折叠' : '展开' }}
                   </button>
                 </div>
+              </div>
+              <div v-if="drillTimelineOpen" class="task-execution-history-toolbar">
+                <select
+                  :value="selectedTaskExecutionId"
+                  :disabled="taskExecutionHistoryLoading && !taskExecutionHistory.length"
+                  aria-label="选择任务执行记录"
+                  @change="handleTaskExecutionHistorySelect($event.target.value)"
+                >
+                  <option value="" disabled>
+                    {{ taskExecutionHistoryLoading ? '正在加载任务执行记录…' : '暂无任务执行记录' }}
+                  </option>
+                  <option v-for="execution in taskExecutionHistory" :key="execution.id" :value="execution.id">
+                    {{ taskExecutionHistoryOption(execution) }}
+                  </option>
+                </select>
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  :disabled="!selectedTaskExecutionId || (taskExecutionHistoryLoading && !taskExecutionHistory.length)"
+                  @click="handleTaskExecutionHistorySelect(selectedTaskExecutionId)"
+                >
+                  查看记录
+                </button>
+                <small v-if="taskExecutionHistoryError" class="task-execution-history-error">
+                  {{ taskExecutionHistoryError }}
+                </small>
               </div>
               <div v-if="drillTimelineOpen" class="drill-timeline-summary">
                 <div v-for="item in drillTimelineSummary" :key="item.label">
@@ -5423,6 +5580,30 @@ async function handleDeleteRoute(route) {
   font-size: 1.05rem;
 }
 
+.task-execution-history-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  margin-top: 0.65rem;
+}
+
+.task-execution-history-toolbar select {
+  min-width: 0;
+  height: 32px;
+  padding: 0 0.45rem;
+  border: 1px solid #fdba74;
+  border-radius: 6px;
+  color: #7c2d12;
+  background: #fffaf5;
+  font-size: 0.72rem;
+}
+
+.task-execution-history-error {
+  grid-column: 1 / -1;
+  color: #b42318;
+  font-size: 0.7rem;
+}
+
 .drill-timeline-summary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -6744,6 +6925,12 @@ async function handleDeleteRoute(route) {
 
 [data-theme="dark"] .drill-timeline-summary div {
   background: rgba(255, 196, 92, 0.12);
+}
+
+[data-theme="dark"] .task-execution-history-toolbar select {
+  color: #ffe7bd;
+  border-color: rgba(255, 196, 92, 0.42);
+  background: var(--input-bg);
 }
 
 [data-theme="dark"] .drill-timeline-empty,

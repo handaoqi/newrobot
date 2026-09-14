@@ -23,11 +23,19 @@ const ACTIVE_EXECUTION_STATES = new Set([
 ])
 
 const TERMINAL_EVENT_PRESENTATION = {
-  'task.completed': { type: 'complete', title: '预演完成' },
-  'task.cancelled': { type: 'stop', title: '预演已取消' },
-  'task.failed': { type: 'error', title: '预演失败' },
-  'task.timed_out': { type: 'error', title: '预演超时' },
-  'task.rejected': { type: 'error', title: '预演被拒绝' },
+  'task.completed': { type: 'complete', title: '任务执行完成' },
+  'task.cancelled': { type: 'stop', title: '任务执行已取消' },
+  'task.failed': { type: 'error', title: '任务执行失败' },
+  'task.timed_out': { type: 'error', title: '任务执行超时' },
+  'task.rejected': { type: 'error', title: '任务执行被拒绝' },
+}
+
+const TERMINAL_STATE_PRESENTATION = {
+  completed: TERMINAL_EVENT_PRESENTATION['task.completed'],
+  cancelled: TERMINAL_EVENT_PRESENTATION['task.cancelled'],
+  failed: TERMINAL_EVENT_PRESENTATION['task.failed'],
+  timed_out: TERMINAL_EVENT_PRESENTATION['task.timed_out'],
+  rejected: TERMINAL_EVENT_PRESENTATION['task.rejected'],
 }
 
 function eventTimestamp(event) {
@@ -106,12 +114,40 @@ function eventDetail(event) {
   ].filter(Boolean).join(' · ')
 }
 
+function executionFailureDetail(execution) {
+  const failedCommand = [...(execution?.commands || [])]
+    .reverse()
+    .find(command => ['failed', 'timed_out', 'rejected', 'expired'].includes(String(command?.status || '')))
+  const code = execution?.failure_code || failedCommand?.error_code || failedCommand?.ack_reason_code || ''
+  const message = execution?.failure_message || failedCommand?.error_message || failedCommand?.ack_reason_message || ''
+  return [code, message].filter(Boolean).join(' · ')
+}
+
+function systemLogDetail(log) {
+  const data = log?.data || {}
+  const reason = data.reason_message || data.error_message || data.reason_code || data.error_code || ''
+  const parts = [log?.event_code || '', reason]
+  if (log?.waypoint_index !== null && log?.waypoint_index !== undefined) {
+    parts.push(`航点序号 ${Number(log.waypoint_index) + 1}`)
+  }
+  if (Number(log?.repeat_count || 1) > 1) parts.push(`重复 ${Number(log.repeat_count)} 次`)
+  return [...new Set(parts.filter(Boolean))].join(' · ')
+}
+
+function systemLogPresentation(log) {
+  const level = String(log?.level || 'INFO').toUpperCase()
+  return {
+    type: level === 'ERROR' ? 'error' : level === 'WARNING' ? 'pause' : 'diagnostic',
+    title: log?.message || log?.event_code || '任务诊断事件',
+  }
+}
+
 function timelinePresentation(event, execution) {
   const eventType = String(event?.event_type || '')
   const waypointLabel = eventWaypointLabel(event, execution)
-  if (eventType === 'task.created') return { type: 'created', title: '预演任务已创建' }
+  if (eventType === 'task.created') return { type: 'created', title: '任务执行已创建' }
   if (eventType === 'task.accepted') return { type: 'accepted', title: '机器狗已接受任务' }
-  if (eventType === 'task.started') return { type: 'start', title: '预演开始' }
+  if (eventType === 'task.started') return { type: 'start', title: '任务执行开始' }
   if (eventType === 'task.target_dispatched') {
     return { type: 'target', title: `${waypointLabel}目标已下发`, pointName: waypointLabel }
   }
@@ -137,12 +173,12 @@ function timelinePresentation(event, execution) {
   if (eventType === 'task.arrival_correcting') {
     return { type: 'pause', title: `${waypointLabel}静止定位校正`, pointName: waypointLabel }
   }
-  if (eventType === 'task.pausing') return { type: 'pause', title: '正在暂停预演' }
-  if (eventType === 'task.paused') return { type: 'pause', title: '预演已暂停' }
-  if (eventType === 'task.resuming') return { type: 'resume', title: '正在恢复预演' }
-  if (eventType === 'task.resumed') return { type: 'resume', title: '预演已恢复' }
-  if (eventType === 'task.cancelling') return { type: 'stop', title: '正在取消预演' }
-  if (eventType === 'task.interrupted') return { type: 'pause', title: '预演已中断' }
+  if (eventType === 'task.pausing') return { type: 'pause', title: '正在暂停任务' }
+  if (eventType === 'task.paused') return { type: 'pause', title: '任务已暂停' }
+  if (eventType === 'task.resuming') return { type: 'resume', title: '正在恢复任务' }
+  if (eventType === 'task.resumed') return { type: 'resume', title: '任务已恢复' }
+  if (eventType === 'task.cancelling') return { type: 'stop', title: '正在取消任务' }
+  if (eventType === 'task.interrupted') return { type: 'pause', title: '任务已中断' }
   return TERMINAL_EVENT_PRESENTATION[eventType] || null
 }
 
@@ -214,6 +250,42 @@ export function buildTaskExecutionTimeline(execution, {
       stateVersion: event.state_version,
     })
   })
+
+  const eventTypes = new Set(events.map(event => String(event?.event_type || '')))
+  ;(execution?.system_logs || []).forEach((log) => {
+    // State events already carry a richer, protocol-level representation.
+    if (eventTypes.has(String(log?.event_code || ''))) return
+    const occurredAt = Date.parse(log?.occurred_at || log?.received_at || '')
+    const timestamp = Number.isFinite(occurredAt) ? occurredAt : startedAt
+    timeline.push({
+      id: `system-log-${log?.id || `${log?.event_code || 'event'}-${timestamp}`}`,
+      ...systemLogPresentation(log),
+      detail: systemLogDetail(log),
+      occurredAt: timestamp,
+      elapsedSeconds: Math.max(0, (timestamp - startedAt) / 1000),
+    })
+  })
+
+  const terminalPresentation = TERMINAL_STATE_PRESENTATION[String(execution?.state || '')]
+  const hasTerminalEvent = events.some(event => TERMINAL_EVENT_PRESENTATION[event?.event_type])
+  if (terminalPresentation && !hasTerminalEvent) {
+    const finishedAt = Date.parse(execution?.finished_at || execution?.updated_at || '')
+    const occurredAt = Number.isFinite(finishedAt) ? finishedAt : startedAt
+    timeline.push({
+      id: `execution-terminal-${execution?.id || execution?.state}`,
+      ...terminalPresentation,
+      detail: executionFailureDetail(execution),
+      occurredAt,
+      elapsedSeconds: Math.max(0, (occurredAt - startedAt) / 1000),
+    })
+  }
+
+  timeline.forEach((item, index) => { item.timelineOrder = index })
+  timeline.sort((left, right) => (
+    Number(left.occurredAt || 0) - Number(right.occurredAt || 0)
+    || left.timelineOrder - right.timelineOrder
+  ))
+  timeline.forEach((item) => { delete item.timelineOrder })
 
   return timeline
 }

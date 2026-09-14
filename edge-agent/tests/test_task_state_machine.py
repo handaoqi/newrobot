@@ -2083,6 +2083,9 @@ def test_indoor_startup_keeps_an_already_stable_fixed_rtk_pose(tmp_path):
     }
     nav.rtk_calls = 0
     nav.set_initial_pose_from_rtk = lambda wait_seconds=30.0: setattr(nav, "rtk_calls", nav.rtk_calls + 1)
+    nav.accept_startup_trusted_pose = lambda: (_ for _ in ()).throw(
+        AssertionError("stable indoor startup must not require a fresh FAST-LIO handoff")
+    )
     executor = TaskExecutor(
         store,
         nav,

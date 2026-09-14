@@ -1578,6 +1578,63 @@ class TaskExecutionEventSerializer(serializers.ModelSerializer):
         ]
 
 
+def _task_execution_source(obj):
+    """Return the durable UI entry point for old and new executions."""
+    snapshot = obj.route_snapshot if isinstance(obj.route_snapshot, dict) else {}
+    recorded = str(snapshot.get("execution_source") or "").strip()
+    labels = {
+        "route_planner": "路径规划页",
+        "task_center": "任务中心",
+        "guard_duty": "保安值守",
+        "scheduler": "定时计划",
+        "auto_docking": "自动回充",
+    }
+    if recorded in labels:
+        return recorded, labels[recorded]
+
+    # Backfill a useful source label for historical rows created before the
+    # entry point was embedded in the route snapshot.
+    description = str(getattr(obj.task, "description", "") or "")
+    if "路径规划页面直接执行路线自动创建" in description:
+        return "route_planner", labels["route_planner"]
+    if "回充" in description:
+        return "auto_docking", labels["auto_docking"]
+    if obj.loop_session_id:
+        return "guard_duty", labels["guard_duty"]
+    prefetched = getattr(obj, "_prefetched_objects_cache", {}).get("schedule_runs")
+    has_schedule = bool(prefetched) if prefetched is not None else obj.schedule_runs.exists()
+    if has_schedule:
+        return "scheduler", labels["scheduler"]
+    return "task_center", labels["task_center"]
+
+
+class TaskExecutionSummarySerializer(serializers.ModelSerializer):
+    robot_name = serializers.CharField(source="robot.name", read_only=True)
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+    task_name = serializers.CharField(source="task.name", read_only=True)
+    route_name = serializers.CharField(source="route.name", read_only=True, allow_null=True)
+    map_name = serializers.CharField(source="map_data.name", read_only=True, allow_null=True)
+    execution_source = serializers.SerializerMethodField()
+    execution_source_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaskExecution
+        fields = [
+            "id", "task", "task_name", "robot", "robot_name", "robot_code",
+            "route", "route_name", "map_data", "map_name", "loop_session_id",
+            "round_number", "state", "state_version", "current_waypoint_index",
+            "completed_waypoints", "total_waypoints", "started_at", "finished_at",
+            "failure_code", "failure_message", "execution_source",
+            "execution_source_label", "created_at", "updated_at",
+        ]
+
+    def get_execution_source(self, obj):
+        return _task_execution_source(obj)[0]
+
+    def get_execution_source_label(self, obj):
+        return _task_execution_source(obj)[1]
+
+
 class TaskExecutionSerializer(serializers.ModelSerializer):
     robot_name = serializers.CharField(source="robot.name", read_only=True)
     robot_code = serializers.CharField(source="robot.code", read_only=True)
@@ -1586,6 +1643,8 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
     map_name = serializers.CharField(source="map_data.name", read_only=True, allow_null=True)
     events = TaskExecutionEventSerializer(many=True, read_only=True)
     commands = RemoteCommandSerializer(many=True, read_only=True)
+    execution_source = serializers.SerializerMethodField()
+    execution_source_label = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskExecution
@@ -1617,12 +1676,20 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
             "paused_at",
             "failure_code",
             "failure_message",
+            "execution_source",
+            "execution_source_label",
             "last_edge_event_at",
             "created_at",
             "updated_at",
             "events",
             "commands",
         ]
+
+    def get_execution_source(self, obj):
+        return _task_execution_source(obj)[0]
+
+    def get_execution_source_label(self, obj):
+        return _task_execution_source(obj)[1]
 
 
 class TaskExecutionActionSerializer(serializers.Serializer):

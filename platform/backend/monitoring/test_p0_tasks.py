@@ -15,6 +15,7 @@ from .models import (
     Robot,
     SpeechCategory,
     SpeechTemplate,
+    SystemLog,
     TaskExecution,
 )
 from .services.command_service import CommandService
@@ -589,6 +590,64 @@ class TaskExecutionTests(TestCase):
         self.assertEqual(response.data["route"], self.route.id)
         self.assertEqual(RemoteCommand.objects.count(), 1)
         self.assertTrue(PatrolTask.objects.filter(route=self.route, name=f"路线快速执行 - {self.route.name}").exists())
+        self.assertEqual(response.data["execution_source"], "route_planner")
+        self.assertEqual(response.data["execution_source_label"], "路径规划页")
+
+    def test_task_execution_history_unifies_route_planner_and_guard_duty_entries(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        route_execution = client.post(f"/api/routes/{self.route.id}/execute/", {}, format="json")
+        self.assertEqual(route_execution.status_code, 201)
+        TaskExecution.objects.filter(pk=route_execution.data["id"]).update(
+            state="completed",
+            finished_at=timezone.now(),
+        )
+
+        loop_id = uuid.uuid4()
+        guard_execution = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {
+                "loop_execution": True,
+                "loop_session_id": str(loop_id),
+                "round_number": 2,
+            },
+            format="json",
+        )
+        self.assertEqual(guard_execution.status_code, 201)
+
+        response = client.get(
+            "/api/task-executions/",
+            {"robot_id": self.robot.id, "route_id": self.route.id, "limit": 20},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.data], [
+            guard_execution.data["id"],
+            route_execution.data["id"],
+        ])
+        self.assertEqual(response.data[0]["execution_source"], "guard_duty")
+        self.assertEqual(response.data[0]["execution_source_label"], "保安值守")
+        self.assertEqual(response.data[1]["execution_source"], "route_planner")
+
+    def test_task_execution_detail_includes_bounded_structured_debug_logs(self):
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        SystemLog.objects.create(
+            robot=self.robot,
+            level="ERROR",
+            module="navigation",
+            event_code="task.arrival.failed",
+            message="航点细靠近失败",
+            task_execution=execution,
+            route=self.route,
+            map_data=self.map,
+            data={"reason_code": "ARRIVAL_GOAL_TOLERANCE_FAILED"},
+        )
+
+        response = APIClient().get(f"/api/task-executions/{execution.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["system_logs"]), 1)
+        self.assertEqual(response.data["system_logs"][0]["event_code"], "task.arrival.failed")
 
     def test_low_battery_route_execute_is_rejected_before_quick_task_creation(self):
         self.robot.battery_level = 19

@@ -649,6 +649,7 @@ class PatrolLoopService:
                 loop_session_id=session.id,
                 round_number=round_number,
                 route_snapshot=session.route_snapshot,
+                execution_source="guard_duty",
             )
             CommandService.create(
                 execution,

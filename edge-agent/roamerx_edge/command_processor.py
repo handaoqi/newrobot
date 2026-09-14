@@ -687,8 +687,14 @@ class CommandProcessor:
                     else:
                         seed = self._resolve_localization_seed(command)
                         result_payload = self.localization_adapter.active_relocalize(seed)
+                # Every localization snapshot must identify its map.  The
+                # route planner uses this identity to reject terminal results
+                # from a previously selected map.
+                result_payload = dict(result_payload or {})
+                route_map = (command.get("route_snapshot") or {}).get("map") or {}
+                result_payload.setdefault("map_id", command.get("map_id") or route_map.get("map_id"))
+                result_payload.setdefault("map_version", command.get("map_version") or route_map.get("map_version"))
                 if localization_bootstrap is not None:
-                    result_payload = dict(result_payload or {})
                     result_payload["localization_bootstrap"] = localization_bootstrap
                 progressive_initialization = (
                     envelope.message_type == "nav.relocalize"

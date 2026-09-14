@@ -429,6 +429,14 @@ export async function fetchTaskExecution(executionId) {
   return request(`/task-executions/${executionId}/`)
 }
 
+export async function fetchTaskExecutions(filters = {}) {
+  const query = new URLSearchParams()
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') query.set(key, String(value))
+  })
+  return request(`/task-executions/${query.toString() ? `?${query}` : ''}`)
+}
+
 export async function sendTaskExecutionAction(executionId, action) {
   return request(`/task-executions/${executionId}/${action}/`, {
     method: 'POST',

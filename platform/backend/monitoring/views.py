@@ -124,6 +124,7 @@ from .serializers import (
     RobotStatusSerializer,
     TaskExecutionActionSerializer,
     TaskExecutionSerializer,
+    TaskExecutionSummarySerializer,
     TrajectoryPointSerializer,
     ScheduleRunSerializer,
     SystemLogSerializer,
@@ -4801,6 +4802,7 @@ def _create_and_dispatch_execution(
     round_number,
     command_options,
     trace_id=None,
+    execution_source="task_center",
 ):
     """Create one task.start command, replaying the same loop round safely.
 
@@ -4819,6 +4821,7 @@ def _create_and_dispatch_execution(
                     operator,
                     loop_session_id=loop_session_id,
                     round_number=round_number,
+                    execution_source=execution_source,
                 )
                 CommandService.create(
                     execution,
@@ -4917,6 +4920,7 @@ class PatrolRouteExecuteView(APIView):
                     "loop_total": loop_total,
                 },
                 trace_id=_request_trace_id(request),
+                execution_source="route_planner",
             )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
@@ -5362,6 +5366,7 @@ class PatrolTaskExecuteView(APIView):
                     "record_rosbag": record_rosbag,
                     "loop_execution": loop_execution,
                 },
+                execution_source="guard_duty" if loop_execution else "task_center",
             )
         except TaskStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
@@ -5463,17 +5468,56 @@ class PatrolLoopSessionStopView(PatrolLoopSessionActionView):
     action = "stop"
 
 
+class TaskExecutionListView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        queryset = TaskExecution.objects.select_related(
+            "task", "robot", "route", "map_data"
+        ).prefetch_related("schedule_runs")
+        filters = {
+            "robot_id": request.query_params.get("robot_id") or request.query_params.get("robot"),
+            "route_id": request.query_params.get("route_id") or request.query_params.get("route"),
+            "map_data_id": request.query_params.get("map_id") or request.query_params.get("map"),
+        }
+        for field, value in filters.items():
+            if not value:
+                continue
+            try:
+                queryset = queryset.filter(**{field: int(value)})
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": f"{field.removesuffix('_id')} 参数无效"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        state_filter = str(request.query_params.get("state") or "").strip()
+        if state_filter:
+            queryset = queryset.filter(state=state_filter)
+        try:
+            limit = min(50, max(1, int(request.query_params.get("limit", 20))))
+        except (TypeError, ValueError):
+            return Response({"detail": "limit 参数无效"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(TaskExecutionSummarySerializer(queryset[:limit], many=True).data)
+
+
 class TaskExecutionDetailView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, execution_id):
         execution = get_object_or_404(
             TaskExecution.objects.select_related("task", "robot", "route", "map_data").prefetch_related(
-                "events", "commands__events"
+                "events", "commands__events", "schedule_runs"
             ),
             pk=execution_id,
         )
-        return Response(TaskExecutionSerializer(execution).data)
+        data = TaskExecutionSerializer(execution).data
+        # The task state stream intentionally stays compact.  Structured logs
+        # hold the detailed arrival/localization/avoidance stages needed for a
+        # historical debug replay.  Return the newest bounded window here only;
+        # other serializer call sites must not accidentally expand every task.
+        logs = list(execution.system_logs.order_by("-occurred_at", "-id")[:200])
+        data["system_logs"] = SystemLogSerializer(logs, many=True).data
+        return Response(data)
 
 
 class TaskExecutionCommandView(APIView):

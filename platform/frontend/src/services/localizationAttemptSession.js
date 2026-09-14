@@ -256,6 +256,22 @@ function commandResult(command) {
     : {}
 }
 
+function commandMapIdentity(command, result = commandResult(command)) {
+  const raw = result?.localization_attempts && typeof result.localization_attempts === 'object'
+    ? result.localization_attempts
+    : {}
+  const payload = command?.payload && typeof command.payload === 'object' ? command.payload : {}
+  const route = payload.route_snapshot && typeof payload.route_snapshot === 'object'
+    ? payload.route_snapshot : {}
+  const map = payload.map && typeof payload.map === 'object'
+    ? payload.map
+    : (route.map && typeof route.map === 'object' ? route.map : {})
+  return {
+    mapId: String(result.map_id ?? raw.map_id ?? map.map_id ?? payload.map_id ?? ''),
+    mapVersion: String(result.map_version ?? raw.map_version ?? map.map_version ?? payload.map_version ?? ''),
+  }
+}
+
 function normalizeAttempt(attempt, index) {
   const candidate = attempt?.ndt_candidate && typeof attempt.ndt_candidate === 'object'
     ? attempt.ndt_candidate
@@ -317,6 +333,7 @@ export function withAttemptMarkerExpiry(session, now = Date.now()) {
 export function localizationAttemptSessionFromCommand(command, extras = {}) {
   if (!command) return null
   const result = commandResult(command)
+  const mapIdentity = commandMapIdentity(command, result)
   const raw = result.localization_attempts && typeof result.localization_attempts === 'object'
     ? result.localization_attempts
     : {}
@@ -342,6 +359,8 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     || finitePose(raw.best_ndt_candidate?.matched_pose)
     || finitePose(result.best_ndt_candidate?.matched_pose)
   const session = {
+    mapId: mapIdentity.mapId,
+    mapVersion: mapIdentity.mapVersion,
     commandId: String(command.id || extras.commandId || ''),
     commandType: command.command_type || extras.commandType || '',
     commandIssuedAt: firstTimestamp(command.issued_at, command.created_at),
@@ -425,6 +444,8 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
 
 export function emptyAttemptSession({ phase = 'localization', commandType = '', commandId = '' } = {}) {
   return {
+    mapId: '',
+    mapVersion: '',
     commandId: String(commandId || ''),
     commandType,
     commandIssuedAt: null,

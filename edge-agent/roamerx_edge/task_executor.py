@@ -2012,6 +2012,11 @@ class TaskExecutor:
 
     def initialize_before_navigation(self) -> None:
         self._initialize_before_navigation()
+        if getattr(self, "_startup_localization_reused_stable", False):
+            LOGGER.info(
+                "startup localization reused stable FAST-LIO+IMU pose; skipping fresh handoff acceptance"
+            )
+            return
         accept_trusted = getattr(self.navigation, "accept_startup_trusted_pose", None)
         if callable(accept_trusted):
             accept_trusted()
@@ -2068,6 +2073,7 @@ class TaskExecutor:
 
     def _initialize_before_navigation(self) -> None:
         """Require a verified absolute pose before the first Nav2 goal."""
+        self._startup_localization_reused_stable = False
         if not self.context or self.context.state != "accepted":
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
         decision = self._localization_decision()
@@ -2104,6 +2110,7 @@ class TaskExecutor:
         if not self._outdoor_navigation_profile() and self._startup_localization_already_ready(
             decision
         ):
+            self._startup_localization_reused_stable = True
             LOGGER.info(
                 "startup localization already stable (source=%s status=%s); skipping reseeding",
                 decision.get("active_source"),

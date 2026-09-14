@@ -53,11 +53,11 @@ test('builds an ordered real preview timeline from durable task events', () => {
 
   assert.deepEqual(timeline.map(item => item.title), [
     '路线下发中',
-    '预演任务已创建',
+    '任务执行已创建',
     '3号点目标已下发',
     '3号点已到达',
     '1号点目标已下发',
-    '预演完成',
+    '任务执行完成',
   ])
   assert.match(timeline[3].detail, /目标 x 3\.00 \/ y 4\.00/)
   assert.match(timeline[3].detail, /机器狗 x 3\.02 \/ y 3\.98/)
@@ -167,4 +167,36 @@ test('identifies active and terminal execution states', () => {
   assert.equal(taskExecutionIsActive({ state: 'paused' }), true)
   assert.equal(taskExecutionIsActive({ state: 'completed' }), false)
   assert.equal(taskExecutionIsActive({ state: 'failed' }), false)
+})
+
+test('adds persisted diagnostic logs and a missing terminal failure event', () => {
+  const timeline = buildTaskExecutionTimeline({
+    id: 'execution-from-guard-duty',
+    state: 'failed',
+    created_at: '2026-09-14T21:40:00+08:00',
+    finished_at: '2026-09-14T21:41:00+08:00',
+    failure_code: 'ROBOT_STANDUP_FAILED',
+    failure_message: 'recovery requires a confirmed stop',
+    events: [
+      event(1, 'task.created', 0, '2026-09-14T21:40:00+08:00'),
+    ],
+    system_logs: [{
+      id: 'log-1',
+      level: 'WARNING',
+      event_code: 'task.safe_hold',
+      message: '等待安全条件满足',
+      occurred_at: '2026-09-14T21:40:30+08:00',
+      repeat_count: 3,
+      data: { reason_code: 'ROBOT_NOT_STOPPED' },
+    }],
+  })
+
+  assert.deepEqual(timeline.map(item => item.title), [
+    '任务执行已创建',
+    '等待安全条件满足',
+    '任务执行失败',
+  ])
+  assert.match(timeline[1].detail, /task\.safe_hold/)
+  assert.match(timeline[1].detail, /重复 3 次/)
+  assert.equal(timeline[2].detail, 'ROBOT_STANDUP_FAILED · recovery requires a confirmed stop')
 })
