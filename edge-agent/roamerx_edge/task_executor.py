@@ -4951,6 +4951,20 @@ class TaskExecutor:
                     ),
                 }
             self._send_from(resume_index)
+            # A pre-leg heading action returns before _dispatch_navigation(),
+            # so that path used to leave the persisted Edge state at
+            # ``resuming`` even though a motion goal had already been accepted.
+            # Publish the same running state as an accepted cruise goal before
+            # releasing this lock.  A delayed center recovery command will
+            # then be recognized as obsolete instead of cancelling the turn.
+            if (
+                self.context.state == "resuming"
+                and self._departure_heading_index is not None
+            ):
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
             return {
                 "final_task_state": "running",
                 "state_version": self.context.state_version,

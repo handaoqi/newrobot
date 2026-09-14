@@ -454,6 +454,48 @@ def test_delayed_center_recovery_does_not_stop_an_already_resumed_task(tmp_path)
     store.close()
 
 
+def test_preleg_heading_is_running_before_delayed_center_recovery(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # Keep the heading action pending under Nav2 so the test can inspect the
+    # state between accepted spin and the following cruise goal.
+    nav.teleop_velocity = None
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    nav.feedback(1, None)
+    execution_id = executor.context.task_execution_id
+    executor.pause_task(execution_id)
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.0)
+
+    resumed = executor.resume_task(execution_id, 1)
+
+    assert resumed["final_task_state"] == "running"
+    assert executor.context.state == "running"
+    assert executor._departure_heading_index is not None
+    assert any(event[0] == "task.resumed" for event in events)
+    stops_before = nav.stop_commands
+    cancels_before = nav.cancelled
+
+    recovery = executor.recover_task(
+        execution_id,
+        trigger_reason_code="LOCALIZATION_LOST",
+        recovery_episode_id="episode-delayed-heading",
+        attempt=1,
+    )
+
+    assert recovery["recovery_status"] == "already_running"
+    assert nav.stop_commands == stops_before
+    assert nav.cancelled == cancels_before
+    executor._clear_departure_heading(cancel_navigation=False)
+    store.close()
+
+
 def test_center_recovery_reapproaches_instead_of_skipping_final_yaw(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

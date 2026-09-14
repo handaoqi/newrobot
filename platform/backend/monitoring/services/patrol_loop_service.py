@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 import logging
 from datetime import datetime, timedelta
+from math import isfinite
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -543,6 +544,16 @@ class PatrolLoopService:
         raw_payload = latest.raw_payload if isinstance(latest.raw_payload, dict) else {}
         navigation = raw_payload.get("navigation")
         navigation = navigation if isinstance(navigation, dict) else {}
+        modern_velocity_contract = (
+            navigation.get("observation_schema") == "roamerx.navigation-observation.v1"
+            or "actual_velocity_observed" in navigation
+        )
+        if navigation.get("actual_velocity_observed") is False:
+            return (
+                False,
+                "EDGE_ROS_DATA_UNAVAILABLE",
+                "Edge 尚未收到实际速度观测，不能确认机器人已停车",
+            )
         actual_planar = navigation.get("actual_planar_speed_mps")
         actual_turn = navigation.get("actual_turn_speed_rps")
         if actual_planar is not None and actual_turn is not None:
@@ -551,7 +562,11 @@ class PatrolLoopService:
                 actual_turn = abs(float(actual_turn))
             except (TypeError, ValueError):
                 actual_planar = actual_turn = None
-            if actual_planar is not None:
+            if (
+                actual_planar is not None
+                and isfinite(actual_planar)
+                and isfinite(actual_turn)
+            ):
                 localization = raw_payload.get("localization")
                 localization = localization if isinstance(localization, dict) else {}
                 motion_age = navigation.get("actual_velocity_sample_age_seconds")
@@ -566,20 +581,36 @@ class PatrolLoopService:
                     )
                 except (TypeError, ValueError):
                     localization_age = None
+                if motion_age is None or not isfinite(motion_age) or motion_age < 0.0:
+                    return (
+                        False,
+                        "EDGE_ROS_DATA_UNAVAILABLE",
+                        "Edge 实际速度观测缺少有效时间戳，不能确认机器人已停车",
+                    )
+                localization_fresh_flag = localization.get("fresh")
+                if localization_fresh_flag is False:
+                    localization_current = False
+                elif localization_fresh_flag is True:
+                    localization_current = (
+                        localization_age is None
+                        or (
+                            isfinite(localization_age)
+                            and 0.0 <= localization_age <= cls.EDGE_ROS_STALE_SECONDS
+                        )
+                    )
+                else:
+                    localization_current = bool(
+                        localization_age is not None
+                        and isfinite(localization_age)
+                        and 0.0 <= localization_age <= cls.EDGE_ROS_STALE_SECONDS
+                    )
                 # Collision Monitor may suppress repeated zero commands, so a
                 # stale *zero* alone is valid.  If its age and the localization
                 # age are both stale, however, Edge's ROS callback cache has
                 # stopped advancing.  Do not display that as robot movement.
                 if (
-                    motion_age is not None
-                    and motion_age > cls.EDGE_ROS_STALE_SECONDS
-                    and (
-                        localization.get("fresh") is False
-                        or (
-                            localization_age is not None
-                            and localization_age > cls.EDGE_ROS_STALE_SECONDS
-                        )
-                    )
+                    motion_age > cls.EDGE_ROS_STALE_SECONDS
+                    and not localization_current
                 ):
                     return (
                         False,
@@ -592,6 +623,12 @@ class PatrolLoopService:
                 ):
                     return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
                 return True, "", ""
+        if modern_velocity_contract:
+            return (
+                False,
+                "EDGE_ROS_DATA_UNAVAILABLE",
+                "Edge 实际速度观测字段不完整，不能确认机器人已停车",
+            )
         # Compatibility fallback for old Edge payloads that do not yet carry
         # Collision Monitor's actual /cmd_vel observation.
         if latest.speed_mps is None or abs(float(latest.speed_mps)) > cls.STOP_SPEED_MPS:

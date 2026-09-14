@@ -54,6 +54,19 @@ BOOT_SPEAKER_RETRY_DELAYS_SECONDS = (0.0, 3.0, 10.0, 30.0)
 BOOT_SPEAKER_TARGETS = ("speaker_nx", "speaker_3588")
 
 
+def navigation_status_observation(snapshot: object) -> dict:
+    """Attach an explicit presence contract to cached navigation telemetry."""
+    navigation = dict(snapshot) if isinstance(snapshot, dict) else {}
+    navigation["observation_schema"] = "roamerx.navigation-observation.v1"
+    navigation["actual_velocity_observed"] = (
+        navigation.get("actual_velocity_sample_age_seconds") is not None
+    )
+    navigation["requested_velocity_observed"] = (
+        navigation.get("requested_velocity_sample_age_seconds") is not None
+    )
+    return navigation
+
+
 class EdgeAgentApplication:
     def __init__(self, config: EdgeConfig, navigation=None, config_path: str = "config.yaml") -> None:
         self.config = config
@@ -583,7 +596,12 @@ class EdgeAgentApplication:
                 snapshot["map_set"] = self.map_set_coordinator.status()
                 snapshot["mapping"] = mapping_status
                 obstacle_snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
-                snapshot["navigation"] = obstacle_snapshot() if callable(obstacle_snapshot) else {}
+                navigation = obstacle_snapshot() if callable(obstacle_snapshot) else {}
+                # Default zero-valued velocity fields do not prove that ROS
+                # delivered an actual /cmd_vel sample.  Publish this presence
+                # bit explicitly so the center never mistakes an uninitialized
+                # cache for a confirmed stop after an Edge restart.
+                snapshot["navigation"] = navigation_status_observation(navigation)
                 snapshot["power_mode"] = self.power_mode_controller.snapshot()
                 self.mqtt.publish_status(snapshot)
                 pose = self.telemetry.latest_pose()

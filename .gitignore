@@ -76,6 +76,8 @@ known_hosts*
 # and binaries under install/; reproducible source must live in a top-level
 # source component.
 /runtime/nx-edge/src/
+/runtime/nx-edge/releases/
+/runtime/nx-edge/current-edge
 /vscode:/
 /vscode-remote:/
 /roamerx-platform-docker-validation-*.tar.gz

@@ -304,6 +304,47 @@ class PatrolLoopServiceTests(TestCase):
         self.assertEqual(code, "EDGE_ROS_DATA_STALE")
         self.assertIn("ROS", message)
 
+    def test_observation_rejects_uninitialized_zero_velocity_cache(self):
+        self.status.speed_mps = 0.0
+        self.status.raw_payload = {
+            "navigation": {
+                "observation_schema": "roamerx.navigation-observation.v1",
+                "actual_velocity_observed": False,
+                "actual_planar_speed_mps": 0.0,
+                "actual_turn_speed_rps": 0.0,
+                "actual_velocity_sample_age_seconds": None,
+            },
+            "localization": {"fresh": False, "sample_age_seconds": None},
+        }
+        self.status.save(update_fields=["speed_mps", "raw_payload"])
+
+        safe, code, message = PatrolLoopService._observation_safety(
+            PatrolLoopSession(robot=self.robot)
+        )
+
+        self.assertFalse(safe)
+        self.assertEqual(code, "EDGE_ROS_DATA_UNAVAILABLE")
+        self.assertIn("速度观测", message)
+
+    def test_observation_rejects_stale_zero_when_localization_freshness_is_unknown(self):
+        self.status.speed_mps = 0.0
+        self.status.raw_payload = {
+            "navigation": {
+                "actual_planar_speed_mps": 0.0,
+                "actual_turn_speed_rps": 0.0,
+                "actual_velocity_sample_age_seconds": 60.0,
+            },
+            "localization": {},
+        }
+        self.status.save(update_fields=["speed_mps", "raw_payload"])
+
+        safe, code, _message = PatrolLoopService._observation_safety(
+            PatrolLoopSession(robot=self.robot)
+        )
+
+        self.assertFalse(safe)
+        self.assertEqual(code, "EDGE_ROS_DATA_STALE")
+
     def test_manual_pause_never_auto_resumes(self):
         session = self.create_running_loop()
         session = PatrolLoopService.pause(session, self.user)
