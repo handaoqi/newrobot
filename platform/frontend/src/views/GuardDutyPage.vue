@@ -48,6 +48,7 @@ import {
 } from '../utils/guardDutyLoopStop'
 import { resolveBatteryPercent } from '../utils/battery'
 import {
+  LOW_BATTERY_STOP_PERCENT,
   isLowBatteryBlocked,
   isLowBatteryStopAlert,
   isLowBatteryTaskError,
@@ -493,13 +494,23 @@ function eventImage(event) {
   return event?.annotated_snapshot_url || event?.snapshot_url || ''
 }
 
-function stopForLowBattery({ notify = true } = {}) {
+function eventBatteryPercent(event) {
+  const value = event?.battery_percent
+    ?? event?.attributes?.battery_percent
+    ?? event?.raw_detection?.battery_percent
+  const percent = Number(value)
+  return Number.isFinite(percent) ? percent : null
+}
+
+function stopForLowBattery({ notify = true, batteryPercentOverride = null } = {}) {
   loopActive.value = false
   loopState.value = 'stopped'
   loopStoppedAt.value = Date.now()
   loopRestUntil.value = 0
   loopCurrentExecutionId.value = ''
-  loopMessage.value = lowBatteryGuardMessage(batteryPercent.value)
+  loopMessage.value = lowBatteryGuardMessage(
+    batteryPercentOverride ?? batteryPercent.value,
+  )
   persistLoopState()
   releaseLoopOwnership()
   if (notify) showToast(loopMessage.value, { variant: 'alert', duration: 8000 })
@@ -547,7 +558,12 @@ function serverLoopMessage(session) {
   }
   if (session.state === 'paused') return '循环已人工暂停，等待明确继续'
   if (session.state === 'resting') return `第 ${session.current_round} 轮完成，等待下一轮`
-  if (session.state === 'low_battery_stopped') return lowBatteryGuardMessage(batteryPercent.value)
+  if (session.state === 'low_battery_stopped') {
+    // This is a historical terminal session. Do not describe a recovered
+    // 73% battery as a current low-battery stop.
+    if (!lowBatteryBlocked.value) return '上一轮循环曾因低电量停止，当前电量已恢复'
+    return lowBatteryGuardMessage(batteryPercent.value)
+  }
   if (session.state === 'completed') return '循环巡检已按设定时长完成'
   if (session.state === 'cancelled') return '循环已停止'
   if (session.state === 'failed') return session.last_error || '循环执行失败'
@@ -599,7 +615,14 @@ function reconcileLowBatteryState() {
   const happenedDuringLoop = loopActive.value
     && Number.isFinite(detectedAt)
     && detectedAt >= loopStartedAt.value
-  if (lowBatteryBlocked.value || happenedDuringLoop) stopForLowBattery({ notify: false })
+  const eventPercent = eventBatteryPercent(recentLowBattery)
+  const eventWasLow = eventPercent !== null && eventPercent < LOW_BATTERY_STOP_PERCENT
+  const eventIsRecent = Number.isFinite(detectedAt)
+    && Date.now() - detectedAt <= 10 * 60 * 1000
+  if (lowBatteryBlocked.value || (happenedDuringLoop && (eventWasLow || eventPercent === null))
+    || (eventWasLow && eventIsRecent && loopActive.value)) {
+    stopForLowBattery({ notify: false, batteryPercentOverride: eventPercent })
+  }
 }
 
 function addRealtimeEvent(event) {
@@ -607,7 +630,11 @@ function addRealtimeEvent(event) {
   const robot = latestRobot.value
   if (!robot || (event.robot_code && event.robot_code !== robot.code)) return
   const isLowBattery = isLowBatteryStopAlert(event)
-  if (isLowBattery) stopForLowBattery({ notify: false })
+  const detectedBatteryPercent = eventBatteryPercent(event)
+  if (isLowBattery && (detectedBatteryPercent === null
+    || detectedBatteryPercent < LOW_BATTERY_STOP_PERCENT)) {
+    stopForLowBattery({ notify: false, batteryPercentOverride: detectedBatteryPercent })
+  }
   const current = robot.recent_events || []
   if (current.some((item) => item.id === event.id)) return
   robot.recent_events = [event, ...current].slice(0, 5)

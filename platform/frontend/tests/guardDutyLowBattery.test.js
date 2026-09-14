@@ -32,5 +32,6 @@ test('builds the operator warning shown below task loop controls', () => {
 
   const source = readFileSync(new URL('../src/views/GuardDutyPage.vue', import.meta.url), 'utf8')
   assert.match(source, /<p class="guard-loop-message">\{\{ loopMessage \}\}<\/p>/)
-  assert.match(source, /loopMessage\.value = lowBatteryGuardMessage\(batteryPercent\.value\)/)
+  assert.match(source, /return lowBatteryGuardMessage\(batteryPercent\.value\)/)
+  assert.match(source, /上一轮循环曾因低电量停止，当前电量已恢复/)
 })
