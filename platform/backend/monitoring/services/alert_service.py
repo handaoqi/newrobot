@@ -18,6 +18,8 @@ def is_bicycle_detection(detection: dict) -> bool:
     }
     if values & {
         "bicycle",
+        "car",
+        "motorcycle",
         "bike",
         "自行车",
         "vehicle_illegal_parking",

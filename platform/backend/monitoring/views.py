@@ -20,6 +20,7 @@ from django.db import IntegrityError, OperationalError, close_old_connections, t
 from django.db.models import Case, Count, IntegerField, Max, Min, Prefetch, Q, When
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
+from django.urls import reverse
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from rest_framework import permissions, status
@@ -31,6 +32,8 @@ from rest_framework.views import APIView
 
 from .models import (
     AlertSkillBinding,
+    BicycleDetectionTestImage,
+    BicycleDetectionTestRun,
     InspectionEvent,
     CalendarDay,
     DebugLogSession,
@@ -77,8 +80,14 @@ from .services.map_scene_service import SceneArtifactError, build_scene_manifest
 from .services.system_log_service import emit_center_log
 from .services import asr_service, tts_service
 from .services.alert_skill_service import resolve_alert_template
+from .services.bicycle_detection_test_service import (
+    create_photo_detection_alert,
+    expire_stalled_bicycle_detection_tests,
+    purge_expired_bicycle_detection_tests,
+)
 from .serializers import (
     AlertSkillBindingSerializer,
+    BicycleDetectionTestRunSerializer,
     AlertSkillPreviewSerializer,
     EventSerializer,
     DebugLogSessionSerializer,
@@ -1873,7 +1882,230 @@ class EventHandleView(APIView):
                 "updated_at",
             ]
         )
-        return Response(EventSerializer(event, context={"request": request}).data)
+        serialized = EventSerializer(event, context={"request": request}).data
+        event_broker.publish(
+            "inspection_event_updated",
+            {"event": serialized, "robot": {"id": event.robot_id, "code": event.robot.code}},
+        )
+        return Response(serialized)
+
+
+BICYCLE_TEST_MAX_IMAGES = 20
+BICYCLE_TEST_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+BICYCLE_TEST_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _device_robot_for_bicycle_test(request):
+    requested_code = (
+        request.query_params.get("robot_code")
+        or request.headers.get("X-Device-Code")
+        or ""
+    ).strip()
+    robot = getattr(request, "device_robot", None)
+    if robot and requested_code and robot.code != requested_code:
+        raise ValidationError("设备凭证与 robot_code 不匹配")
+    if robot is not None:
+        return robot
+    if not requested_code:
+        raise ValidationError("robot_code is required")
+    return get_object_or_404(Robot, code=requested_code)
+
+
+class BicycleDetectionTestRunView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        purge_expired_bicycle_detection_tests()
+        expire_stalled_bicycle_detection_tests()
+        try:
+            robot_id = int(request.data.get("robot_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "robot_id 必须是有效机器狗编号"}, status=status.HTTP_400_BAD_REQUEST)
+        robot = get_object_or_404(Robot, id=robot_id)
+        files = request.FILES.getlist("files")
+        if not files:
+            return Response({"detail": "请选择至少一张图片"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(files) > BICYCLE_TEST_MAX_IMAGES:
+            return Response({"detail": f"一次最多上传 {BICYCLE_TEST_MAX_IMAGES} 张图片"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from PIL import Image, UnidentifiedImageError
+
+        for uploaded in files:
+            if uploaded.size > BICYCLE_TEST_MAX_IMAGE_BYTES:
+                return Response({"detail": f"{uploaded.name} 超过 10 MB 限制"}, status=status.HTTP_400_BAD_REQUEST)
+            if uploaded.content_type not in BICYCLE_TEST_IMAGE_TYPES:
+                return Response({"detail": f"{uploaded.name} 仅支持 JPG、PNG、WebP"}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                Image.open(uploaded).verify()
+                uploaded.seek(0)
+            except (UnidentifiedImageError, OSError):
+                return Response({"detail": f"{uploaded.name} 不是有效图片"}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            run = BicycleDetectionTestRun.objects.create(
+                robot=robot,
+                created_by=request.user,
+                expires_at=timezone.now() + timedelta(hours=24),
+            )
+            for index, uploaded in enumerate(files, start=1):
+                BicycleDetectionTestImage.objects.create(
+                    run=run,
+                    sequence=index,
+                    original_name=(uploaded.name or f"image-{index}")[:255],
+                    source_file=uploaded,
+                )
+        run = BicycleDetectionTestRun.objects.select_related("robot").prefetch_related("images").get(id=run.id)
+        return Response(
+            BicycleDetectionTestRunSerializer(run, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BicycleDetectionTestRunDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, run_id):
+        purge_expired_bicycle_detection_tests()
+        expire_stalled_bicycle_detection_tests()
+        run = get_object_or_404(
+            BicycleDetectionTestRun.objects.select_related("robot").prefetch_related("images"), id=run_id
+        )
+        return Response(BicycleDetectionTestRunSerializer(run, context={"request": request}).data)
+
+
+class DeviceBicycleDetectionTestPollView(APIView):
+    permission_classes = [IsAudioDeviceCredential]
+
+    def get(self, request):
+        purge_expired_bicycle_detection_tests()
+        expire_stalled_bicycle_detection_tests()
+        try:
+            robot = _device_robot_for_bicycle_test(request)
+        except ValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        now = timezone.now()
+        with transaction.atomic():
+            image = (
+                BicycleDetectionTestImage.objects.select_for_update(skip_locked=True)
+                .select_related("run", "run__robot")
+                .filter(
+                    run__robot=robot,
+                    run__status__in=["queued", "running"],
+                    run__expires_at__gt=now,
+                    status="queued",
+                )
+                .order_by("run__created_at", "sequence")
+                .first()
+            )
+            if image is None:
+                return Response(status=status.HTTP_204_NO_CONTENT)
+            image.status = "running"
+            image.started_at = now
+            image.save(update_fields=["status", "started_at", "updated_at"])
+            run = image.run
+            if run.status == "queued":
+                run.status = "running"
+                run.started_at = now
+                run.save(update_fields=["status", "started_at", "updated_at"])
+        input_path = reverse(
+            "device-bicycle-detection-test-input",
+            kwargs={"run_id": image.run_id, "image_id": image.id},
+        )
+        return Response({
+            "run_id": str(image.run_id),
+            "image_id": str(image.id),
+            "original_name": image.original_name,
+            "image_url": request.build_absolute_uri(input_path),
+            "expires_at": image.run.expires_at,
+        })
+
+
+class DeviceBicycleDetectionTestInputView(APIView):
+    permission_classes = [IsAudioDeviceCredential]
+
+    def get(self, request, run_id, image_id):
+        try:
+            robot = _device_robot_for_bicycle_test(request)
+        except ValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        image = get_object_or_404(
+            BicycleDetectionTestImage.objects.select_related("run"),
+            id=image_id,
+            run_id=run_id,
+            run__robot=robot,
+            status="running",
+            run__expires_at__gt=timezone.now(),
+        )
+        return FileResponse(image.source_file.open("rb"), content_type="application/octet-stream")
+
+
+class DeviceBicycleDetectionTestReportView(APIView):
+    permission_classes = [IsAudioDeviceCredential]
+
+    def post(self, request, run_id, image_id):
+        try:
+            robot = _device_robot_for_bicycle_test(request)
+        except ValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        status_value = str(request.data.get("status") or "").strip()
+        if status_value not in {"finished", "failed"}:
+            return Response({"detail": "status 必须为 finished 或 failed"}, status=status.HTTP_400_BAD_REQUEST)
+        raw_diagnostics = request.data.get("diagnostics") or {}
+        if isinstance(raw_diagnostics, str):
+            try:
+                raw_diagnostics = json.loads(raw_diagnostics)
+            except json.JSONDecodeError:
+                return Response({"detail": "diagnostics 必须是 JSON 对象"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(raw_diagnostics, dict):
+            return Response({"detail": "diagnostics 必须是 JSON 对象"}, status=status.HTTP_400_BAD_REQUEST)
+        annotated = request.FILES.get("annotated_image")
+        if annotated is not None:
+            if annotated.size > BICYCLE_TEST_MAX_IMAGE_BYTES or annotated.content_type not in BICYCLE_TEST_IMAGE_TYPES:
+                return Response({"detail": "标注图必须是 10 MB 内的 JPG、PNG 或 WebP"}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            image = get_object_or_404(
+                BicycleDetectionTestImage.objects.select_for_update().select_related("run", "run__robot"),
+                id=image_id,
+                run_id=run_id,
+                run__robot=robot,
+            )
+            # Device retries after a timeout must preserve the first complete
+            # diagnostic result and its one-to-one alert association.
+            if image.status in {"finished", "failed"}:
+                return Response({"ok": True, "alert_event_id": image.alert_event_id, "duplicate": True})
+            now = timezone.now()
+            image.status = status_value
+            image.result_code = str(request.data.get("result_code") or "")[:32]
+            image.detected_class = str(request.data.get("detected_class") or "")[:32]
+            image.confidence = request.data.get("confidence") or None
+            image.bbox = raw_diagnostics.get("bbox") if isinstance(raw_diagnostics.get("bbox"), dict) else {}
+            image.bbox_area = raw_diagnostics.get("bbox_area") or None
+            image.diagnostics = raw_diagnostics
+            image.error_message = str(request.data.get("error_message") or "")
+            image.finished_at = now
+            if annotated is not None:
+                image.annotated_file = annotated
+            image.save()
+
+            alert_event, alert_created = create_photo_detection_alert(image) if status_value == "finished" else (None, False)
+            run = image.run
+            remaining = run.images.filter(status__in=["queued", "running"]).exists()
+            if not remaining:
+                any_finished = run.images.filter(status="finished").exists()
+                run.status = "finished" if any_finished else "failed"
+                run.finished_at = now
+                run.error_message = "" if any_finished else "所有图片处理失败"
+                run.save(update_fields=["status", "finished_at", "error_message", "updated_at"])
+
+        if alert_created:
+            event_broker.publish(
+                "inspection_event_created",
+                {
+                    "event": EventSerializer(alert_event, context={"request": request}).data,
+                    "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
+                },
+            )
+        return Response({"ok": True, "alert_event_id": alert_event.id if alert_event else None})
 
 
 class TaskListView(APIView):

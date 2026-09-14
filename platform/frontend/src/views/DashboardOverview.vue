@@ -713,6 +713,9 @@ function setupAlertStream() {
       duration: 5200,
     })
   })
+  alertEventSource.addEventListener('inspection_event_updated', (message) => {
+    try { updateRealtimeEvent(JSON.parse(message.data || '{}').event) } catch {}
+  })
 }
 
 function addRealtimeEvent(event) {
@@ -738,6 +741,9 @@ function addRealtimeEvent(event) {
 
   if (overview.value?.summary) {
     overview.value.summary.today_alert_count = (overview.value.summary.today_alert_count || 0) + 1
+    if (event.status === 'pending') {
+      overview.value.summary.pending_event_count = (overview.value.summary.pending_event_count || 0) + 1
+    }
   }
   if (overview.value?.header) {
     overview.value.header.today_alerts = (overview.value.header.today_alerts || 0) + 1
@@ -745,6 +751,24 @@ function addRealtimeEvent(event) {
   if (selectedRobot.value && selectedRobot.value.code === event.robot_code) {
     selectedRobot.value.today_alerts = (selectedRobot.value.today_alerts || 0) + 1
   }
+}
+
+function updateRealtimeEvent(event) {
+  if (!event?.id) return
+  const updateRobotEvents = (robot) => {
+    const items = robot?.recent_events
+    if (!items || (robot.code && event.robot_code && robot.code !== event.robot_code)) return
+    const index = items.findIndex((item) => item.id === event.id)
+    if (index < 0) return
+    const previous = items[index]
+    items[index] = event
+    if (overview.value?.summary && previous.status !== event.status) {
+      if (previous.status === 'pending') overview.value.summary.pending_event_count = Math.max(0, (overview.value.summary.pending_event_count || 0) - 1)
+      if (event.status === 'pending') overview.value.summary.pending_event_count = (overview.value.summary.pending_event_count || 0) + 1
+    }
+  }
+  updateRobotEvents(selectedRobot.value)
+  updateRobotEvents(overview.value?.latest_robot)
 }
 
 function closeAlertStream() {

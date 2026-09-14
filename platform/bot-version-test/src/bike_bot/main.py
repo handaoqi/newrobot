@@ -20,6 +20,7 @@ from .runtime import RuntimeState
 from .sdk import RobotSdkClient
 from .stream import StreamPusher
 from .telemetry import TelemetryClient
+from .vision_diagnostics import vision_diagnostic_worker
 
 LOGGER = logging.getLogger(__name__)
 PERF_LOG_INTERVAL_SECONDS = 10.0
@@ -527,9 +528,7 @@ def detection_worker(
             live_tracks = [
                 track
                 for track in (result.tracked_objects or [])
-                if str(track.label).lower() in {
-                    "bicycle", "bike", "自行车", "car", "truck", "bus", "motorcycle",
-                }
+                if str(track.label).lower() in {"bicycle", "car", "motorcycle"}
             ]
             if person_detection_enabled:
                 if person_detector is not None:
@@ -767,6 +766,14 @@ def main() -> None:
                 args=(stop_event, detector, person_detector, client, runtime_state, error_queue),
                 daemon=False,
                 name="detection-worker",
+            )
+        )
+        threads.append(
+            threading.Thread(
+                target=vision_diagnostic_worker,
+                args=(stop_event, detector, config),
+                daemon=False,
+                name="bicycle-diagnostic-worker",
             )
         )
     threads.append(

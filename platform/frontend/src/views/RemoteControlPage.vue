@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createAsyncPoller, useAsyncPoller } from '../composables/useAsyncPoller'
+import { API_BASE } from '../services/api/client.js'
 
 import AppToast from '../components/AppToast.vue'
 import LiveVideoPlayer from '../components/LiveVideoPlayer.vue'
@@ -46,6 +47,7 @@ let holdPromise = null
 let statusRefreshing = false
 let robotLoadController = null
 let robotListLoadVersion = 0
+let alertEventSource = null
 
 const HOLD_REPEAT_MS = 150
 const SPEED_MODES = [
@@ -87,6 +89,8 @@ const personDetections = computed(() => (personDetectionState.value?.detections 
 ))
 const selectedPerson = computed(() => personDetections.value.find((item) => item.track_id === selectedPersonTrackId.value) || null)
 const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
+const recentAlerts = computed(() => selectedRobot.value?.recent_events || [])
+const todayAlertCount = computed(() => Number(selectedRobot.value?.today_alerts || 0))
 
 function showVideoNotice({ message, variant }) {
   showToast(message, variant ? { variant } : undefined)
@@ -94,6 +98,32 @@ function showVideoNotice({ message, variant }) {
 
 function fallbackToSnapshot() {
   streamUnavailable.value = true
+}
+
+function applyRealtimeAlert(event, { created = false } = {}) {
+  const robot = selectedRobot.value
+  if (!event?.id || !robot || (event.robot_code && event.robot_code !== robot.code)) return
+  const items = robot.recent_events || []
+  const index = items.findIndex((item) => item.id === event.id)
+  if (index >= 0) items[index] = event
+  else if (created) {
+    robot.recent_events = [event, ...items].slice(0, 5)
+    robot.today_alerts = todayAlertCount.value + 1
+    showToast('收到新的现场告警', { variant: 'alert', duration: 5200 })
+  }
+}
+
+function openAlertStream() {
+  const token = localStorage.getItem('inspection_token')
+  if (!token || typeof EventSource === 'undefined') return
+  alertEventSource?.close()
+  alertEventSource = new EventSource(`${API_BASE}/events/stream/?token=${encodeURIComponent(token)}`)
+  alertEventSource.addEventListener('inspection_event_created', (message) => {
+    try { applyRealtimeAlert(JSON.parse(message.data || '{}').event, { created: true }) } catch {}
+  })
+  alertEventSource.addEventListener('inspection_event_updated', (message) => {
+    try { applyRealtimeAlert(JSON.parse(message.data || '{}').event) } catch {}
+  })
 }
 
 const motionActions = computed(() => [
@@ -539,6 +569,7 @@ onMounted(() => {
   document.addEventListener('contextmenu', preventRemoteGesture, { capture: true })
   document.addEventListener('selectstart', preventRemoteGesture, { capture: true })
   document.addEventListener('dragstart', preventRemoteGesture, { capture: true })
+  openAlertStream()
   // Render the control shell immediately. Device discovery is independent of
   // the page layout, and must not leave the whole remote-control page blank
   // while the cloud request is waiting on a slow network.
@@ -559,6 +590,8 @@ onBeforeUnmount(async () => {
   robotListLoadVersion += 1
   robotLoadController?.abort()
   robotLoadController = null
+  alertEventSource?.close()
+  alertEventSource = null
   await stopFollowing('页面关闭，跟随已停止')
   await stopHoldAction()
 })
@@ -629,6 +662,15 @@ watch(liveSourceKey, () => {
             {{ followActive ? '停止跟随' : '开始跟随' }}
           </button>
         </div>
+        <section class="remote-alert-panel" aria-label="实时告警">
+          <div><strong>实时告警</strong><span>今日 {{ todayAlertCount }} 条</span></div>
+          <article v-if="recentAlerts[0]" class="remote-alert-main">
+            <img v-if="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :src="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :alt="recentAlerts[0].title" />
+            <span><strong>{{ recentAlerts[0].title || recentAlerts[0].event_type }}</strong><small>{{ recentAlerts[0].detected_at }}</small></span>
+          </article>
+          <p v-else>当前没有新的现场告警</p>
+          <small v-for="event in recentAlerts.slice(1, 4)" :key="event.id">{{ event.title || event.event_type }}</small>
+        </section>
       </section>
 
       <section class="panel remote-console">
@@ -1365,6 +1407,15 @@ watch(liveSourceKey, () => {
     font-size: 11px;
   }
 }
+
+.remote-alert-panel { display: grid; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.remote-alert-panel > div { display: flex; justify-content: space-between; gap: 10px; }
+.remote-alert-panel > div span, .remote-alert-panel > p, .remote-alert-panel > small, .remote-alert-main small { color: var(--muted); font-size: 12px; }
+.remote-alert-panel > p { margin: 0; }
+.remote-alert-main { display: grid; grid-template-columns: 70px minmax(0, 1fr); align-items: center; gap: 9px; }
+.remote-alert-main img { width: 70px; height: 50px; object-fit: cover; border-radius: 5px; background: #172b37; }
+.remote-alert-main span { display: grid; gap: 3px; min-width: 0; }
+.remote-alert-main strong, .remote-alert-panel > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 1180px) {
   .remote-control-page,

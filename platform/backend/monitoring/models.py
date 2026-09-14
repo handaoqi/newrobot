@@ -536,6 +536,69 @@ class RobotCommand(BaseTimestampModel):
         return f"{self.robot.code} {self.action} {self.status}"
 
 
+class BicycleDetectionTestRun(BaseTimestampModel):
+    """Temporary operator-requested image diagnostics; never an alert record."""
+
+    STATUS_CHOICES = [
+        ("queued", "待执行"),
+        ("running", "执行中"),
+        ("finished", "已完成"),
+        ("failed", "失败"),
+        ("expired", "已过期"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    robot = models.ForeignKey(Robot, related_name="bicycle_detection_test_runs", on_delete=models.CASCADE)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="bicycle_detection_test_runs",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="queued")
+    error_message = models.TextField(blank=True)
+    expires_at = models.DateTimeField()
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["robot", "status", "expires_at"])]
+
+
+class BicycleDetectionTestImage(BaseTimestampModel):
+    STATUS_CHOICES = BicycleDetectionTestRun.STATUS_CHOICES
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(BicycleDetectionTestRun, related_name="images", on_delete=models.CASCADE)
+    sequence = models.PositiveSmallIntegerField()
+    original_name = models.CharField(max_length=255)
+    source_file = models.FileField(upload_to="bicycle-detection-tests/%Y/%m/%d/input/")
+    annotated_file = models.FileField(upload_to="bicycle-detection-tests/%Y/%m/%d/output/", blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="queued")
+    result_code = models.CharField(max_length=32, blank=True)
+    detected_class = models.CharField(max_length=32, blank=True)
+    confidence = models.FloatField(null=True, blank=True)
+    bbox = models.JSONField(default=dict, blank=True)
+    bbox_area = models.PositiveIntegerField(null=True, blank=True)
+    diagnostics = models.JSONField(default=dict, blank=True)
+    alert_event = models.OneToOneField(
+        "InspectionEvent",
+        related_name="photo_detection_test_image",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    error_message = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [models.UniqueConstraint(fields=["run", "sequence"], name="uniq_bicycle_test_run_sequence")]
+
+
 class SpeechCategory(BaseTimestampModel):
     name = models.CharField(max_length=64, unique=True)
 

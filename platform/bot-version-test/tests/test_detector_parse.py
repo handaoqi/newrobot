@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,7 +12,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from bike_bot.config import ModelConfig
-from bike_bot.detector import CPU_PROVIDER, CUDA_PROVIDER, YoloDetector, parse_yolo_predictions
+from bike_bot.detector import COCO80_CLASS_NAMES, CPU_PROVIDER, CUDA_PROVIDER, RawDetection, VEHICLE_ALERT_CLASSES, YoloDetector, parse_yolo_predictions
 
 
 def _parse(predictions, **overrides):
@@ -98,6 +99,19 @@ def test_unknown_class_id_falls_back_to_index() -> None:
     assert detections[0].label == "2"
 
 
+def test_coco_vehicle_indexes_keep_their_real_labels() -> None:
+    predictions = np.zeros((3, 84), dtype=np.float32)
+    for class_id in (1, 2, 3):
+        scores = [0.0] * 80
+        scores[class_id] = 0.95
+        predictions[class_id - 1] = _box_row(100 * class_id, 100, 40, 40, scores)
+
+    detections = _parse(predictions, class_names=list(COCO80_CLASS_NAMES))
+
+    assert {item.label for item in detections} == {"bicycle", "car", "motorcycle"}
+    assert {item.label for item in detections} == VEHICLE_ALERT_CLASSES
+
+
 class _FakeOrt:
     def __init__(self, providers):
         self._providers = providers
@@ -121,3 +135,47 @@ def test_cuda_provider_remains_available_when_cpu_fallback_is_disabled() -> None
     assert detector._cuda_cpu_providers(_FakeOrt([CUDA_PROVIDER, CPU_PROVIDER])) == [
         CUDA_PROVIDER
     ]
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        (RawDetection("bicycle", (0, 0, 40, 40), 0.8), "passed_single_frame"),
+        (RawDetection("car", (0, 0, 40, 40), 0.5), "below_confidence"),
+        (RawDetection("motorcycle", (0, 0, 20, 20), 0.8), "below_min_box_area"),
+        (None, "not_detected"),
+    ],
+)
+def test_single_frame_diagnostic_explains_each_gate(candidate, expected) -> None:
+    detector = object.__new__(YoloDetector)
+    detector.model_config = SimpleNamespace(path="model.onnx", image_size=512, confidence=0.6)
+    detector.config = SimpleNamespace(
+        detection=SimpleNamespace(min_box_area=1600, event_confirm_frames=3, event_cooldown_seconds=10)
+    )
+    detector.last_timing = SimpleNamespace(providers="TensorrtExecutionProvider")
+    detector._predict = lambda frame, confidence=None: [] if candidate is None else [candidate]
+
+    result, _ = detector.diagnose_image(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert result["result_code"] == expected
+    if candidate is not None:
+        assert result["detected_class"] == candidate.label
+
+
+def test_single_frame_diagnostic_returns_every_vehicle_alert_box() -> None:
+    detector = object.__new__(YoloDetector)
+    detector.model_config = SimpleNamespace(path="model.onnx", image_size=512, confidence=0.6)
+    detector.config = SimpleNamespace(
+        detection=SimpleNamespace(min_box_area=1600, event_confirm_frames=3, event_cooldown_seconds=10)
+    )
+    detector.last_timing = SimpleNamespace(providers="TensorrtExecutionProvider")
+    detector._predict = lambda frame, confidence=None: [
+        RawDetection("bicycle", (0, 0, 40, 40), 0.92),
+        RawDetection("motorcycle", (45, 0, 40, 40), 0.88),
+        RawDetection("person", (80, 0, 40, 40), 0.99),
+    ]
+
+    result, _ = detector.diagnose_image(np.zeros((100, 160, 3), dtype=np.uint8))
+
+    assert result["detected_class"] == "bicycle"
+    assert [item["detected_class"] for item in result["detections"]] == ["bicycle", "motorcycle"]

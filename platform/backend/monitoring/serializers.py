@@ -15,6 +15,8 @@ import yaml
 
 from .models import (
     AlertSkillBinding,
+    BicycleDetectionTestImage,
+    BicycleDetectionTestRun,
     CalendarDay,
     CommandEvent,
     DebugLogSession,
@@ -73,8 +75,8 @@ def _snapshot_path(snapshot_url: str) -> Path | None:
         return None
 
     relative_path = path.removeprefix(media_url).lstrip("/")
-    candidate = (settings.MEDIA_ROOT / relative_path).resolve()
-    media_root = settings.MEDIA_ROOT.resolve()
+    media_root = Path(settings.MEDIA_ROOT).resolve()
+    candidate = (media_root / relative_path).resolve()
     if media_root not in candidate.parents and candidate != media_root:
         return None
     return candidate if candidate.exists() else None
@@ -131,7 +133,7 @@ def build_annotated_snapshot(event: InspectionEvent) -> str:
     if not source_path:
         return event.snapshot_url
 
-    target_dir = settings.MEDIA_ROOT / "annotated-events"
+    target_dir = Path(settings.MEDIA_ROOT) / "annotated-events"
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / f"event-{event.id}.jpg"
     if target_path.exists() and target_path.stat().st_mtime >= source_path.stat().st_mtime:
@@ -315,6 +317,48 @@ class EventSerializer(serializers.ModelSerializer):
             return f"{parsed.scheme}://{parsed.netloc}{annotated_url}"
         return annotated_url
 
+
+class BicycleDetectionTestImageSerializer(serializers.ModelSerializer):
+    source_url = serializers.SerializerMethodField()
+    annotated_url = serializers.SerializerMethodField()
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    alert_event_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = BicycleDetectionTestImage
+        fields = [
+            "id", "sequence", "original_name", "status", "status_label", "result_code",
+            "detected_class", "confidence", "bbox", "bbox_area", "diagnostics",
+            "alert_event_id", "error_message", "source_url", "annotated_url", "started_at", "finished_at",
+        ]
+
+    def _url(self, obj, field_name: str) -> str:
+        field = getattr(obj, field_name, None)
+        if not field:
+            return ""
+        request = self.context.get("request")
+        url = field.url
+        return request.build_absolute_uri(url) if request else url
+
+    def get_source_url(self, obj):
+        return self._url(obj, "source_file")
+
+    def get_annotated_url(self, obj):
+        return self._url(obj, "annotated_file")
+
+
+class BicycleDetectionTestRunSerializer(serializers.ModelSerializer):
+    robot_code = serializers.CharField(source="robot.code", read_only=True)
+    robot_name = serializers.CharField(source="robot.name", read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    images = BicycleDetectionTestImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BicycleDetectionTestRun
+        fields = [
+            "id", "robot", "robot_code", "robot_name", "status", "status_label",
+            "error_message", "expires_at", "started_at", "finished_at", "created_at", "images",
+        ]
 
 class PatrolTaskSerializer(serializers.ModelSerializer):
     robot_name = serializers.CharField(source="robot.name", read_only=True)

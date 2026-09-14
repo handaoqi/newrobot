@@ -48,7 +48,9 @@ model:
   tensorrt_engine_cache_path: /home/dogrobot/runtime/nx-edge/data/vision/trt-cache/yolo11n
   # Keep true for service continuity; false makes provider degradation fail closed.
   allow_cpu_fallback: true
-  classes: [person, bicycle]
+  # Business target classes.  ONNX output indexes always use the built-in
+  # COCO-80 table, not this filtered list.
+  classes: [person, bicycle, car, motorcycle]
 
 detection:
   event_type: vehicle_illegal_parking
@@ -56,12 +58,12 @@ detection:
   risk_level: medium
   event_cooldown_seconds: 10
   event_confirm_frames: 3
-  min_box_area: 4000
+  min_box_area: 1600
   tracking_enabled: true
   tracker_iou_threshold: 0.3
   track_ttl_seconds: 30
   duplicate_alert_seconds: 10
-  event_classes: [bicycle]
+  event_classes: [bicycle, car, motorcycle]
   # 2 Hz detection; alarm after 3 consecutive bicycle frames, then pause 10s.
   person_detection_enabled: true
   person_report_interval_seconds: 0.4

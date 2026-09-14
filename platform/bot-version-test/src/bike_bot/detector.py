@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +22,23 @@ LOGGER = logging.getLogger(__name__)
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 TENSORRT_PROVIDER = "TensorrtExecutionProvider"
+
+# yolo11n.onnx deployed on the robot is a COCO-80 detection model.  Keep this
+# table separate from the configured *business* target classes: aliases such
+# as "自行车" must never shift the model-output class indexes.
+COCO80_CLASS_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass",
+    "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+    "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+    "teddy bear", "hair drier", "toothbrush",
+)
+VEHICLE_ALERT_CLASSES = frozenset({"bicycle", "car", "motorcycle"})
 
 
 def _gstreamer_escape(value: str) -> str:
@@ -279,12 +297,13 @@ class YoloDetector:
     ) -> None:
         self.config = config
         self.model_config = model_config or config.model
-        classes = self.model_config.classes or ["bicycle"]
+        classes = self.model_config.classes or list(VEHICLE_ALERT_CLASSES)
         self.target_labels = {item.lower() for item in (target_labels or classes)}
         configured_event_labels = event_labels if event_labels is not None else (config.detection.event_classes or classes)
         self.event_labels = {item.lower() for item in configured_event_labels}
         self.emit_events = emit_events
-        self.class_names = [item.lower() for item in classes]
+        self.class_names = list(COCO80_CLASS_NAMES)
+        self._inference_lock = threading.RLock()
         self.model_backend = self._resolve_backend(self.model_config.backend, self.model_config.path)
         self.last_timing = InferenceTiming()
         self._onnx_providers_label = ""
@@ -357,6 +376,7 @@ class YoloDetector:
                 )
                 session = self._onnxruntime_session_with_fallback(ort, session_options)
             self.inference_providers = list(session.get_providers())
+            self._validate_onnx_output_classes(session)
             self._onnx_providers_label = ",".join(self.inference_providers)
             if not self.gpu_inference_active and not self.model_config.allow_cpu_fallback:
                 raise RuntimeError(
@@ -398,6 +418,24 @@ class YoloDetector:
             return YOLO(self.model_config.path)
 
         raise ValueError(f"unsupported model backend: {self.model_backend}")
+
+    def _validate_onnx_output_classes(self, session) -> None:
+        """Fail fast when a model is not compatible with the COCO-80 table."""
+        outputs = session.get_outputs()
+        if not outputs:
+            raise RuntimeError("ONNX model has no outputs")
+        shape = list(getattr(outputs[0], "shape", []) or [])
+        numeric = [int(value) for value in shape if isinstance(value, int) and value > 4]
+        feature_count = next((value for value in numeric if value >= 5 and value <= 256), None)
+        if feature_count is None:
+            LOGGER.warning("cannot validate ONNX output classes shape=%s", shape)
+            return
+        class_count = feature_count - 4
+        if class_count != len(self.class_names):
+            raise RuntimeError(
+                "ONNX class count does not match deployed COCO mapping: "
+                f"model={class_count} mapping={len(self.class_names)}"
+            )
 
     def _cuda_cpu_providers(self, ort) -> list[str]:
         available = set(ort.get_available_providers())
@@ -638,17 +676,18 @@ class YoloDetector:
             tracked_objects=tracked_targets,
         )
 
-    def _predict(self, frame) -> list[RawDetection]:
-        if self.model_backend == "opencv_dnn":
-            return self._predict_opencv_dnn(frame)
-        if self.model_backend == "onnxruntime":
-            return self._predict_onnxruntime(frame)
-        return self._predict_ultralytics(frame)
+    def _predict(self, frame, *, confidence: float | None = None) -> list[RawDetection]:
+        with self._inference_lock:
+            if self.model_backend == "opencv_dnn":
+                return self._predict_opencv_dnn(frame, confidence=confidence)
+            if self.model_backend == "onnxruntime":
+                return self._predict_onnxruntime(frame, confidence=confidence)
+            return self._predict_ultralytics(frame, confidence=confidence)
 
-    def _predict_ultralytics(self, frame) -> list[RawDetection]:
+    def _predict_ultralytics(self, frame, *, confidence: float | None = None) -> list[RawDetection]:
         results = self.model.predict(
             frame,
-            conf=self.model_config.confidence,
+            conf=self.model_config.confidence if confidence is None else confidence,
             imgsz=self.model_config.image_size,
             device=self.model_config.device or None,
             verbose=False,
@@ -672,7 +711,7 @@ class YoloDetector:
         self.last_timing = InferenceTiming(providers="ultralytics")
         return raw_detections
 
-    def _predict_opencv_dnn(self, frame) -> list[RawDetection]:
+    def _predict_opencv_dnn(self, frame, *, confidence: float | None = None) -> list[RawDetection]:
         preprocess_started = time.perf_counter()
         input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
@@ -689,7 +728,7 @@ class YoloDetector:
         session_run_seconds = time.perf_counter() - run_started
         predictions = outputs[0] if isinstance(outputs, tuple) else outputs
         parse_started = time.perf_counter()
-        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y, confidence=confidence)
         self.last_timing = InferenceTiming(
             preprocess_seconds=preprocess_seconds,
             session_run_seconds=session_run_seconds,
@@ -698,7 +737,7 @@ class YoloDetector:
         )
         return detections
 
-    def _predict_onnxruntime(self, frame) -> list[RawDetection]:
+    def _predict_onnxruntime(self, frame, *, confidence: float | None = None) -> list[RawDetection]:
         preprocess_started = time.perf_counter()
         input_image, scale, pad_x, pad_y = letterbox(frame, self.model_config.image_size)
         blob = cv2.dnn.blobFromImage(
@@ -715,7 +754,7 @@ class YoloDetector:
         predictions = self.model.run([output_name], {input_name: blob})[0]
         session_run_seconds = time.perf_counter() - run_started
         parse_started = time.perf_counter()
-        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y)
+        detections = self._parse_yolo_predictions(predictions, frame, scale, pad_x, pad_y, confidence=confidence)
         self.last_timing = InferenceTiming(
             preprocess_seconds=preprocess_seconds,
             session_run_seconds=session_run_seconds,
@@ -724,7 +763,9 @@ class YoloDetector:
         )
         return detections
 
-    def _parse_yolo_predictions(self, predictions, frame, scale: float, pad_x: int, pad_y: int) -> list[RawDetection]:
+    def _parse_yolo_predictions(
+        self, predictions, frame, scale: float, pad_x: int, pad_y: int, *, confidence: float | None = None
+    ) -> list[RawDetection]:
         frame_h, frame_w = frame.shape[:2]
         return parse_yolo_predictions(
             predictions,
@@ -733,10 +774,85 @@ class YoloDetector:
             scale=scale,
             pad_x=pad_x,
             pad_y=pad_y,
-            confidence=self.model_config.confidence,
+            confidence=self.model_config.confidence if confidence is None else confidence,
             nms_iou_threshold=self.model_config.nms_iou_threshold,
             class_names=self.class_names,
         )
+
+    def diagnose_image(self, frame) -> tuple[dict, Any]:
+        """Run a side-effect-free one-frame diagnosis for the vehicle alert group.
+
+        All bicycle/car/motorcycle boxes are returned and drawn.  The legacy
+        top-level result remains the highest-confidence target so callers
+        which expect one summary keep working.
+        """
+        probe_confidence = 0.01
+        candidates = [
+            item for item in self._predict(frame, confidence=probe_confidence)
+            if item.label in VEHICLE_ALERT_CLASSES
+        ]
+        annotated = frame.copy()
+        result = {
+            "provider": self.last_timing.providers,
+            "model_path": self.model_config.path,
+            "image_size": self.model_config.image_size,
+            "confidence_threshold": self.model_config.confidence,
+            "min_box_area": self.config.detection.min_box_area,
+            "confirm_frames": self.config.detection.event_confirm_frames,
+            "event_cooldown_seconds": self.config.detection.event_cooldown_seconds,
+            "probe_confidence": probe_confidence,
+        }
+        if not candidates:
+            result.update({"result_code": "not_detected", "bbox": {}, "bbox_area": 0})
+            return result, annotated
+
+        detections = []
+        for candidate in candidates:
+            x, y, width, height = candidate.bbox
+            area = width * height
+            if candidate.confidence < self.model_config.confidence:
+                result_code, color = "below_confidence", (0, 165, 255)
+            elif area < self.config.detection.min_box_area:
+                result_code, color = "below_min_box_area", (0, 165, 255)
+            else:
+                result_code, color = "passed_single_frame", (0, 220, 0)
+            detections.append({
+                "detected_class": candidate.label,
+                "confidence": round(candidate.confidence, 4),
+                "bbox": {"x": x, "y": y, "width": width, "height": height},
+                "bbox_area": area,
+                "result_code": result_code,
+            })
+            cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 2)
+            cv2.putText(
+                annotated,
+                f"{candidate.label} {candidate.confidence:.2f} {area}px2 {result_code}",
+                (x, max(24, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        best = max(candidates, key=lambda item: item.confidence)
+        x, y, width, height = best.bbox
+        area = width * height
+        result.update({
+            "detected_class": best.label,
+            "confidence": round(best.confidence, 4),
+            "bbox": {"x": x, "y": y, "width": width, "height": height},
+            "bbox_area": area,
+        })
+        if best.confidence < self.model_config.confidence:
+            result_code, color = "below_confidence", (0, 165, 255)
+        elif area < self.config.detection.min_box_area:
+            result_code, color = "below_min_box_area", (0, 165, 255)
+        else:
+            result_code, color = "passed_single_frame", (0, 220, 0)
+        result["result_code"] = result_code
+        result["detections"] = detections
+        return result, annotated
 
     def enrich_with_snapshot(self, event: FrameEvent) -> FrameEvent:
         snapshot = self.snapshot_manager.save(event.frame)

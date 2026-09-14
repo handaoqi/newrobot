@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
-import { fetchEvents, handleEvent } from '../services/api'
+import { createBicycleDetectionTest, fetchBicycleDetectionTest, fetchEvents, fetchRobots, handleEvent } from '../services/api'
 
 const route = useRoute()
 
@@ -48,6 +48,13 @@ const detectedTo = ref('')
 const timeFilterError = ref('')
 const calendarMonth = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
 const fullscreenImage = ref(null)
+const testRobots = ref([])
+const testRobotId = ref('')
+const testFiles = ref([])
+const testRun = ref(null)
+const testSubmitting = ref(false)
+const testError = ref('')
+let testPollTimer = null
 const pageSize = 8
 const eventImages = ['/images/event-1.jpg', '/images/event-2.jpg', '/images/event-3.jpg']
 let previousBodyOverflow = ''
@@ -308,6 +315,84 @@ function closeFullscreenImage() {
   document.body.style.overflow = previousBodyOverflow
 }
 
+function formatDiagnosticConfidence(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : '--'
+}
+
+function diagnosticClassLabel(value) {
+  const labels = {
+    bicycle: '自行车',
+    car: '汽车',
+    motorcycle: '摩托车',
+  }
+  return labels[value] || value || '--'
+}
+
+function diagnosticClasses(item) {
+  const detections = item?.diagnostics?.detections
+  if (Array.isArray(detections) && detections.length) {
+    return detections.map((detection) => diagnosticClassLabel(detection.detected_class)).join('、')
+  }
+  return diagnosticClassLabel(item?.detected_class)
+}
+
+function diagnosticResultLabel(item) {
+  const labels = {
+    passed_single_frame: '通过当前单帧门限',
+    below_confidence: '置信度不足',
+    below_min_box_area: '检测框面积不足',
+    not_detected: '未检出告警业务组目标',
+    failed: '识别失败',
+  }
+  return labels[item?.result_code] || item?.status_label || item?.status || '等待处理'
+}
+
+function stopDiagnosticPolling() {
+  if (testPollTimer) window.clearInterval(testPollTimer)
+  testPollTimer = null
+}
+
+async function refreshDiagnosticRun() {
+  if (!testRun.value?.id) return
+  try {
+    const next = await fetchBicycleDetectionTest(testRun.value.id)
+    testRun.value = next
+    if (['finished', 'failed', 'expired'].includes(next.status)) stopDiagnosticPolling()
+  } catch (error) {
+    testError.value = error.message || '照片测试状态获取失败'
+    stopDiagnosticPolling()
+  }
+}
+
+function handleDiagnosticFiles(event) {
+  testError.value = ''
+  testFiles.value = Array.from(event.target.files || [])
+}
+
+async function submitDiagnosticTest() {
+  if (testSubmitting.value) return
+  if (!testRobotId.value) {
+    testError.value = '请选择用于测试的机器狗'
+    return
+  }
+  if (!testFiles.value.length) {
+    testError.value = '请选择 JPG、PNG 或 WebP 图片'
+    return
+  }
+  testSubmitting.value = true
+  testError.value = ''
+  stopDiagnosticPolling()
+  try {
+    testRun.value = await createBicycleDetectionTest(testRobotId.value, testFiles.value)
+    testPollTimer = window.setInterval(refreshDiagnosticRun, 1000)
+  } catch (error) {
+    testError.value = error.message || '照片测试任务创建失败'
+  } finally {
+    testSubmitting.value = false
+  }
+}
+
 function handleFullscreenKeydown(event) {
   if (event.key === 'Escape' && fullscreenImage.value) {
     closeFullscreenImage()
@@ -343,16 +428,53 @@ watch(() => route.query.status, (value) => {
 onMounted(() => {
   document.addEventListener('keydown', handleFullscreenKeydown)
   loadEvents()
+  fetchRobots().then((robots) => {
+    testRobots.value = robots || []
+    testRobotId.value = String(testRobots.value.find((robot) => robot.status === 'online')?.id || testRobots.value[0]?.id || '')
+  }).catch(() => { testError.value = '机器狗列表加载失败' })
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', handleFullscreenKeydown)
+  stopDiagnosticPolling()
   if (fullscreenImage.value) document.body.style.overflow = previousBodyOverflow
 })
 </script>
 
 <template>
   <section class="page-section">
+    <section class="bicycle-diagnostic-panel" aria-label="自行车照片识别测试">
+      <div>
+        <strong>自行车照片识别测试</strong>
+        <p>按所选机器狗当前部署的模型与阈值测试；同图全部目标均标框。通过门限的上传图片会创建一条正式照片告警；不触发现场语音或机器狗动作。</p>
+      </div>
+      <div class="bicycle-diagnostic-controls">
+        <select v-model="testRobotId" aria-label="测试机器狗">
+          <option value="" disabled>选择机器狗</option>
+          <option v-for="robot in testRobots" :key="robot.id" :value="String(robot.id)">{{ robot.name }}（{{ robot.code }}）</option>
+        </select>
+        <input type="file" multiple accept="image/jpeg,image/png,image/webp" @change="handleDiagnosticFiles" />
+        <button type="button" class="event-search-btn" :disabled="testSubmitting" @click="submitDiagnosticTest">
+          {{ testSubmitting ? '创建中...' : `测试${testFiles.length ? `（${testFiles.length}张）` : ''}` }}
+        </button>
+      </div>
+      <small v-if="testError" class="bicycle-diagnostic-error">{{ testError }}</small>
+      <div v-if="testRun" class="bicycle-diagnostic-results">
+        <span>任务 {{ testRun.status_label }} · {{ testRun.robot_name }}</span>
+        <article v-for="item in testRun.images" :key="item.id" class="bicycle-diagnostic-item">
+          <img v-if="item.annotated_url || item.source_url" :src="item.annotated_url || item.source_url" :alt="item.original_name" />
+          <div>
+            <strong>{{ item.original_name }}</strong>
+            <p>{{ diagnosticResultLabel(item) }} · 识别种类：{{ diagnosticClasses(item) }} · {{ formatDiagnosticConfidence(item.confidence) }}</p>
+            <small v-if="item.diagnostics?.detections?.length > 1">共标识 {{ item.diagnostics.detections.length }} 个目标框</small>
+            <small v-if="item.alert_event_id" class="bicycle-diagnostic-alert">已创建正式告警 #{{ item.alert_event_id }}</small>
+            <small v-if="item.bbox_area">面积 {{ item.bbox_area }} px² / 门限 {{ item.diagnostics?.min_box_area }} px²</small>
+            <small v-else-if="item.error_message">{{ item.error_message }}</small>
+          </div>
+        </article>
+      </div>
+    </section>
+
     <div class="filter-row">
       <div class="segmented-control" role="tablist" aria-label="事件状态筛选">
         <div class="segmented-thumb" :style="segmentStyle"></div>
@@ -515,6 +637,10 @@ onBeforeUnmount(() => {
             <strong>识别置信度</strong>
             <p>{{ selectedEvent.confidence }}%</p>
           </div>
+          <div class="detail-card" v-if="selectedEvent.object_class">
+            <strong>识别种类</strong>
+            <p>{{ diagnosticClassLabel(selectedEvent.object_class) }}</p>
+          </div>
           <div class="detail-card" v-if="selectedEvent.stream_id">
             <strong>关联视频流</strong>
             <p>{{ selectedEvent.stream_id }} / {{ selectedEvent.camera_id || 'front' }}</p>
@@ -604,3 +730,17 @@ onBeforeUnmount(() => {
     </Teleport>
   </section>
 </template>
+
+<style scoped>
+.bicycle-diagnostic-panel { display: grid; gap: 12px; margin-bottom: 16px; padding: 16px; border: 1px solid var(--line, #cbd8de); border-radius: 12px; background: var(--panel, #fff); }
+.bicycle-diagnostic-panel p { margin: 5px 0 0; color: var(--muted, #6c7a85); font-size: 13px; }
+.bicycle-diagnostic-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.bicycle-diagnostic-controls select, .bicycle-diagnostic-controls input { min-height: 36px; max-width: 100%; }
+.bicycle-diagnostic-error { color: var(--danger, #b8322c); }
+.bicycle-diagnostic-results { display: grid; gap: 8px; border-top: 1px solid var(--line, #d9e2e7); padding-top: 10px; }
+.bicycle-diagnostic-item { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line, #edf1f3); }
+.bicycle-diagnostic-item img { width: 110px; height: 72px; object-fit: cover; border-radius: 5px; background: #172b37; }
+.bicycle-diagnostic-item p, .bicycle-diagnostic-item small { display: block; margin: 4px 0 0; color: var(--muted, #6c7a85); font-size: 12px; }
+.bicycle-diagnostic-item .bicycle-diagnostic-alert { color: #087d47; font-weight: 700; }
+@media (max-width: 640px) { .bicycle-diagnostic-item { grid-template-columns: 84px minmax(0, 1fr); } .bicycle-diagnostic-item img { width: 84px; height: 58px; } }
+</style>

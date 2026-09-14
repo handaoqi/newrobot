@@ -14,6 +14,10 @@ from monitoring.services.retention_service import (
     weekly_cleanup_due,
 )
 from monitoring.services.schedule_service import ScheduleService
+from monitoring.services.bicycle_detection_test_service import (
+    expire_stalled_bicycle_detection_tests,
+    purge_expired_bicycle_detection_tests,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +89,18 @@ class Command(BaseCommand):
                 )
         except Exception:
             LOGGER.exception("robot telemetry retention scan failed")
+        try:
+            deleted = purge_expired_bicycle_detection_tests(now=now)
+            if deleted:
+                LOGGER.info("pruned expired bicycle detection test runs: %s", deleted)
+        except Exception:
+            LOGGER.exception("bicycle detection test retention scan failed")
+        try:
+            expired = expire_stalled_bicycle_detection_tests(now=now)
+            if expired:
+                LOGGER.info("expired stalled bicycle detection test runs: %s", expired)
+        except Exception:
+            LOGGER.exception("bicycle detection test timeout scan failed")
 
     def _run_weekly_retention(self, now) -> None:
         try:

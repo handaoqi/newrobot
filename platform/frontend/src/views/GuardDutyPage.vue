@@ -640,6 +640,22 @@ function openAlertStream() {
       addRealtimeEvent(JSON.parse(message.data || '{}').event)
     } catch {}
   })
+  alertEventSource.addEventListener('inspection_event_updated', (message) => {
+    try { updateRealtimeEvent(JSON.parse(message.data || '{}').event) } catch {}
+  })
+}
+
+function updateRealtimeEvent(event) {
+  if (!event?.id || !latestRobot.value || (event.robot_code && event.robot_code !== latestRobot.value.code)) return
+  const items = latestRobot.value.recent_events || []
+  const index = items.findIndex((item) => item.id === event.id)
+  if (index < 0) return
+  const previous = items[index]
+  items[index] = event
+  if (previous.status !== event.status && overview.value?.summary) {
+    if (previous.status === 'pending') overview.value.summary.pending_event_count = Math.max(0, pendingEventCount.value - 1)
+    if (event.status === 'pending') overview.value.summary.pending_event_count = pendingEventCount.value + 1
+  }
 }
 
 async function chooseRobot(robotId) {

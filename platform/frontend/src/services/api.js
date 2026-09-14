@@ -45,6 +45,20 @@ export async function fetchEvents({
   return request(`/events/${query}`)
 }
 
+export async function createBicycleDetectionTest(robotId, files) {
+  const formData = new FormData()
+  formData.append('robot_id', String(robotId))
+  for (const file of files) formData.append('files', file)
+  return request('/events/bicycle-detection-tests/', {
+    method: 'POST',
+    body: formData,
+  })
+}
+
+export async function fetchBicycleDetectionTest(runId) {
+  return request(`/events/bicycle-detection-tests/${runId}/`)
+}
+
 export async function fetchRobots({ force = false } = {}) {
   const load = () => request('/robots/', { timeoutMs: ROBOT_LIST_TIMEOUT_MS })
   return force ? load() : listCache.get('robots', load)
