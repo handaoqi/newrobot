@@ -399,6 +399,8 @@ class TaskExecutor:
         obstacle_evidence=None,
         docking_arrived_handler=None,
         localization_recovery_callback: Callable[[str], None] | None = None,
+        localization_recovery_cancel_callback: Callable[[], None] | None = None,
+        localization_operation_active_callback: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.navigation = navigation
@@ -483,6 +485,8 @@ class TaskExecutor:
         self.obstacle_evidence = obstacle_evidence
         self.docking_arrived_handler = docking_arrived_handler
         self.localization_recovery_callback = localization_recovery_callback
+        self.localization_recovery_cancel_callback = localization_recovery_cancel_callback
+        self.localization_operation_active_callback = localization_operation_active_callback
         self._rosbag_state: dict = {}
         self._segments = []
         self._lock = threading.RLock()
@@ -1646,6 +1650,12 @@ class TaskExecutor:
     def prepare_task_start(self, envelope: MessageEnvelope) -> None:
         """Persist an accepted task before its command acknowledgement is sent."""
         with self._lock:
+            operation_active = self.localization_operation_active_callback
+            if callable(operation_active) and operation_active():
+                raise ProtocolError(
+                    "LOCALIZATION_COMMAND_BUSY",
+                    "an operator localization request is still running; task start is deferred",
+                )
             self._cancel_waypoint_dwell()
             command = envelope.payload["command"]
             route = dict(command["route_snapshot"])
@@ -2193,6 +2203,19 @@ class TaskExecutor:
     def _invalidate_nav_results(self) -> None:
         """Drop in-flight Nav2 callbacks so a cancelled goal cannot advance the route."""
         self._nav_goal_generation += 1
+
+    def _cancel_localization_recovery(self) -> None:
+        """Invalidate an application-owned recovery worker before task teardown.
+
+        Recovery runs outside the task lock and can otherwise observe a stale
+        paused context while a new loop round is already being prepared.
+        """
+        callback = self.localization_recovery_cancel_callback
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                LOGGER.exception("failed to cancel localization recovery during task teardown")
 
     def _bind_nav_result(self):
         generation = self._nav_goal_generation + 1
@@ -5274,6 +5297,7 @@ class TaskExecutor:
     ) -> dict:
         """Idempotently clear any local motion task, regardless of its state."""
         with self._lock:
+            self._cancel_localization_recovery()
             self._clear_nav_dispatch_retry()
             self._cancel_waypoint_localization_correction()
             self._cancel_arrival_adjustment(reset_state=True)
@@ -5335,6 +5359,7 @@ class TaskExecutor:
 
     def cancel_task(self, execution_id: str) -> dict:
         with self._lock:
+            self._cancel_localization_recovery()
             self._assert_execution(execution_id)
             self._clear_nav_dispatch_retry()
             self._stop_obstacle_monitor()
@@ -6226,6 +6251,7 @@ class TaskExecutor:
                     self._fail("DOCK_CHARGE_START_FAILED", str(exc))
                     return
             # Stop/clear control ownership before exposing a terminal state.
+            self._cancel_localization_recovery()
             self._finalize_navigation_control()
             self._stop_task_rosbag()
             self._navigation_prepared = False
@@ -7242,6 +7268,7 @@ class TaskExecutor:
     def _fail(self, code: str, message: str) -> None:
         if not self.context:
             return
+        self._cancel_localization_recovery()
         self._cancel_waypoint_localization_correction()
         self._cancel_arrival_adjustment(reset_state=True)
         self._clear_nav_dispatch_retry()

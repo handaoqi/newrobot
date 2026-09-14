@@ -779,6 +779,16 @@ class RosAdapter(Node):
                 f"localization operation {generation} was superseded by {current}",
             )
 
+    def cancel_localization_operations(self) -> None:
+        """Invalidate in-flight localization workers owned by a finished task."""
+        with self._localization_operation_lock:
+            self._localization_operation_generation += 1
+            self._localization_failure_notified = False
+        LOGGER.info(
+            "invalidated in-flight localization operations generation=%s",
+            self._localization_operation_generation,
+        )
+
     def _on_origin_fix(self, msg) -> None:
         self._rtk_origin_cache.update(
             "fix",
@@ -5090,28 +5100,39 @@ class RosAdapter(Node):
             return False
 
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool:
-        if self._goal_handle is not None:
-            future = self._goal_handle.cancel_goal_async()
-        else:
-            # Edge may have restarted after it sent a goal. In that case the
-            # local handle is gone while Nav2 continues executing the goal.
-            # A default CancelGoal request cancels every goal on this action.
-            client = self._persistent_service_client(
-                CancelGoal,
-                f"{self._nav_cancel_action}/_action/cancel_goal",
-            )
-            if not client.wait_for_service(timeout_sec=min(timeout_seconds, 2.0)):
-                LOGGER.error("%s cancel service is unavailable", self._nav_cancel_action)
-                return False
-            future = client.call_async(CancelGoal.Request())
-        completed = threading.Event()
-        future.add_done_callback(lambda _: completed.set())
-        completed.wait(timeout=timeout_seconds)
-        response = future.result() if future.done() else None
-        cancelled = bool(response and response.goals_canceling)
-        if not cancelled:
-            LOGGER.error("%s cancellation was not acknowledged", self._nav_cancel_action)
-        return cancelled
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        last_failure = "not acknowledged"
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                if self._goal_handle is not None:
+                    future = self._goal_handle.cancel_goal_async()
+                else:
+                    # Edge may have restarted after it sent a goal. In that
+                    # case the local handle is gone while Nav2 continues
+                    # executing the goal; cancel every goal on this action.
+                    client = self._persistent_service_client(
+                        CancelGoal,
+                        f"{self._nav_cancel_action}/_action/cancel_goal",
+                    )
+                    if not client.wait_for_service(timeout_sec=min(remaining, 2.0)):
+                        last_failure = "cancel service unavailable"
+                        break
+                    future = client.call_async(CancelGoal.Request())
+                completed = threading.Event()
+                future.add_done_callback(lambda _: completed.set())
+                completed.wait(timeout=min(remaining, 2.0))
+                response = future.result() if future.done() else None
+                if bool(response and response.goals_canceling):
+                    return True
+                last_failure = "not acknowledged"
+            except Exception as exc:
+                last_failure = str(exc)
+                LOGGER.warning("%s cancellation attempt failed: %s", self._nav_cancel_action, exc)
+            if time.monotonic() < deadline:
+                time.sleep(min(0.10, max(0.0, deadline - time.monotonic())))
+        LOGGER.error("%s cancellation was not acknowledged: %s", self._nav_cancel_action, last_failure)
+        return False
 
     def stop_motion(self) -> None:
         """Publish an explicit zero command after a navigation goal is cancelled."""

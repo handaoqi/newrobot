@@ -132,6 +132,11 @@ class EdgeAgentApplication:
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
         self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
         self._localization_recovery_lock = threading.Lock()
+        # A recovery worker may outlive the task callback that started it.  A
+        # monotonically increasing generation makes every terminal task state
+        # invalidate stale callbacks before a new loop round is launched.
+        self._localization_recovery_generation_lock = threading.Lock()
+        self._localization_recovery_generation = 0
         self._fusion_profile_lock = threading.RLock()
         self._active_fusion_profile_generation = 0
         self.map_set_coordinator = MapSetCoordinator(self.map_activation_adapter, self.navigation_stack_adapter)
@@ -176,6 +181,10 @@ class EdgeAgentApplication:
             rosbag_recorder=self.navigation_rosbag,
             obstacle_evidence=self.obstacle_evidence.schedule,
             localization_recovery_callback=self._handle_task_localization_loss,
+            localization_recovery_cancel_callback=self._cancel_task_localization_recovery,
+            localization_operation_active_callback=getattr(
+                navigation, "operator_localization_active", None
+            ),
         )
         self.self_healing = SelfHealingCoordinator(
             store=self.store,
@@ -1573,6 +1582,18 @@ class EdgeAgentApplication:
                 self._localization_alert_attributes(reason),
             )
         self.task_executor.on_localization_lost()
+        # A localization transition can arrive after force-exit/failed task
+        # cleanup. It is still useful to notify the task state machine, but
+        # must never create a new self-heal episode without an active owner.
+        if (
+            hasattr(self, "_localization_recovery_generation_lock")
+            and not self.task_executor.has_active_task()
+        ):
+            LOGGER.info(
+                "localization transition ignored because no active task remains: %s",
+                reason,
+            )
+            return
         if self._mapping_blocks_auto_relocalize():
             LOGGER.warning("localization lost during mapping; skipping auto relocalize")
             self._complete_self_healing(
@@ -1595,9 +1616,17 @@ class EdgeAgentApplication:
                 )
                 self._localization_recovery_lock.release()
                 return
+        generation_lock = getattr(self, "_localization_recovery_generation_lock", None)
+        if generation_lock is None:
+            generation_lock = threading.Lock()
+            self._localization_recovery_generation_lock = generation_lock
+        with generation_lock:
+            recovery_generation = int(
+                getattr(self, "_localization_recovery_generation", 0)
+            )
         threading.Thread(
             target=self._recover_task_localization,
-            args=(reason, lease),
+            args=(reason, lease, recovery_generation),
             daemon=True,
             name="task-localization-restart",
         ).start()
@@ -1823,8 +1852,55 @@ class EdgeAgentApplication:
         LOGGER.info("automatic recovery accepted a fixed RTK pose")
         return True
 
-    def _recover_task_localization(self, reason: str = "localization_lost", lease=None) -> None:
+    def _cancel_task_localization_recovery(self) -> None:
+        """Invalidate and interrupt every recovery started by the old task."""
+        lock = getattr(self, "_localization_recovery_generation_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._localization_recovery_generation_lock = lock
+        with self._localization_recovery_generation_lock:
+            self._localization_recovery_generation = int(
+                getattr(self, "_localization_recovery_generation", 0)
+            ) + 1
+            generation = self._localization_recovery_generation
+        invalidate = getattr(self.navigation, "cancel_localization_operations", None)
+        if callable(invalidate):
+            try:
+                invalidate()
+            except Exception:
+                LOGGER.exception("failed to invalidate localization operations generation=%s", generation)
+        LOGGER.info("localization recovery invalidated at task teardown generation=%s", generation)
+
+    def _localization_recovery_cancelled(self, generation: int) -> bool:
+        stop_event = getattr(self, "stop_event", None)
+        if stop_event is not None and stop_event.is_set():
+            return True
+        lock = getattr(self, "_localization_recovery_generation_lock", None)
+        if lock is None:
+            return False
+        with self._localization_recovery_generation_lock:
+            return int(generation) != int(
+                getattr(self, "_localization_recovery_generation", 0)
+            )
+
+    def _recover_task_localization(
+        self,
+        reason: str = "localization_lost",
+        lease=None,
+        recovery_generation: int | None = None,
+    ) -> None:
+        if recovery_generation is None:
+            lock = getattr(self, "_localization_recovery_generation_lock", None)
+            if lock is None:
+                recovery_generation = 0
+            else:
+                with lock:
+                    recovery_generation = int(
+                        getattr(self, "_localization_recovery_generation", 0)
+                    )
         try:
+            if self._localization_recovery_cancelled(recovery_generation):
+                return
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
                 return
@@ -1898,6 +1974,9 @@ class EdgeAgentApplication:
             started_at = time.time()
             first_cycle = True
             while first_cycle or self.task_executor.is_paused_for_localization():
+                if self._localization_recovery_cancelled(recovery_generation):
+                    LOGGER.info("localization recovery cancelled by task teardown")
+                    return
                 first_cycle = False
                 cycle += 1
                 if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
@@ -1983,6 +2062,8 @@ class EdgeAgentApplication:
                         return
                     relocalize = getattr(self.navigation, "active_relocalize", None)
                     for seed in seeds:
+                        if self._localization_recovery_cancelled(recovery_generation):
+                            return
                         if self._operator_localization_active():
                             LOGGER.info(
                                 "automatic relocalization stopped before it could preempt an operator request"
@@ -2151,7 +2232,13 @@ class EdgeAgentApplication:
                     elapsed,
                     cycle_retry,
                 )
-                time.sleep(cycle_retry)
+                if self._localization_recovery_cancelled(recovery_generation):
+                    return
+                stop_event = getattr(self, "stop_event", None)
+                if stop_event is None:
+                    time.sleep(cycle_retry)
+                else:
+                    stop_event.wait(cycle_retry)
         except Exception:
             LOGGER.exception("task localization recovery worker failed; task remains paused")
         finally:
