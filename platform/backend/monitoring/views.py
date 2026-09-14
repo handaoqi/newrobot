@@ -97,6 +97,7 @@ from .serializers import (
     PatrolTaskSerializer,
     PatrolTaskCreateSerializer,
     PatrolLoopSessionCreateSerializer,
+    PatrolLoopEventSerializer,
     PatrolLoopSessionSerializer,
     PatrolScheduleSerializer,
     RobotCommandCreateSerializer,
@@ -5506,7 +5507,7 @@ class TaskExecutionDetailView(APIView):
     def get(self, request, execution_id):
         execution = get_object_or_404(
             TaskExecution.objects.select_related("task", "robot", "route", "map_data").prefetch_related(
-                "events", "commands__events", "schedule_runs"
+                "events", "commands__events", "schedule_runs", "loop_events"
             ),
             pk=execution_id,
         )
@@ -5517,6 +5518,7 @@ class TaskExecutionDetailView(APIView):
         # other serializer call sites must not accidentally expand every task.
         logs = list(execution.system_logs.order_by("-occurred_at", "-id")[:200])
         data["system_logs"] = SystemLogSerializer(logs, many=True).data
+        data["loop_events"] = PatrolLoopEventSerializer(execution.loop_events.all()[:100], many=True).data
         return Response(data)
 
 

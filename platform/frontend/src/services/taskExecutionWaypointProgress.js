@@ -142,6 +142,14 @@ function systemLogPresentation(log) {
   }
 }
 
+function loopEventPresentation(event) {
+  const state = String(event?.state || '')
+  return {
+    type: state === 'failed' ? 'error' : ['observing', 'recovering', 'paused'].includes(state) ? 'pause' : 'diagnostic',
+    title: event?.reason_message || `循环任务：${event?.event_type || state || '状态更新'}`,
+  }
+}
+
 function timelinePresentation(event, execution) {
   const eventType = String(event?.event_type || '')
   const waypointLabel = eventWaypointLabel(event, execution)
@@ -261,6 +269,23 @@ export function buildTaskExecutionTimeline(execution, {
       id: `system-log-${log?.id || `${log?.event_code || 'event'}-${timestamp}`}`,
       ...systemLogPresentation(log),
       detail: systemLogDetail(log),
+      occurredAt: timestamp,
+      elapsedSeconds: Math.max(0, (timestamp - startedAt) / 1000),
+    })
+  })
+
+  ;(execution?.loop_events || []).forEach((event) => {
+    const occurredAt = Date.parse(event?.occurred_at || '')
+    const timestamp = Number.isFinite(occurredAt) ? occurredAt : startedAt
+    const detail = [
+      event?.event_type || '',
+      event?.reason_code || '',
+      Number(event?.recovery_attempt || 0) > 0 ? `自愈第 ${Number(event.recovery_attempt)} 次` : '',
+    ].filter(Boolean).join(' · ')
+    timeline.push({
+      id: `loop-event-${event?.id || `${event?.event_type || 'event'}-${timestamp}`}`,
+      ...loopEventPresentation(event),
+      detail,
       occurredAt: timestamp,
       elapsedSeconds: Math.max(0, (timestamp - startedAt) / 1000),
     })
