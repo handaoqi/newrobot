@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -121,7 +122,10 @@ class EdgeAgentApplication:
                 self.structured_logs,
                 config.ros_callback_optimization,
             )
-            self.ros_runtime = RosRuntime(navigation)
+            self.ros_runtime = RosRuntime(
+                navigation,
+                unexpected_exit_callback=self._terminate_after_ros_executor_exit,
+            )
         self.navigation = navigation
         self.map_activation_adapter = MapActivationAdapter(config, self.safety_state, config_path)
         self.navigation_stack_adapter = NavigationStackAdapter(config.navigation_stack)
@@ -248,6 +252,7 @@ class EdgeAgentApplication:
             task_executor=self.task_executor,
             publish_ack=self.mqtt.publish_ack,
             publish_result=self.mqtt.publish_result,
+            publish_progress=self.mqtt.publish_progress,
             mapping_adapter=self.mapping_adapter,
             map_activation_adapter=self.map_activation_adapter,
             navigation_stack_adapter=self.navigation_stack_adapter,
@@ -271,6 +276,21 @@ class EdgeAgentApplication:
         self.alerts = AlertBridge(self.telemetry, self.task_executor, self.mqtt.publish_alert)
         self.mqtt.set_handlers(self.commands.handle_command, self._handle_sync_message)
         self._threads: list[threading.Thread] = []
+
+    @staticmethod
+    def _terminate_after_ros_executor_exit(reason: str) -> None:
+        """Let systemd replace an Edge process whose ROS callbacks have stopped.
+
+        Keeping MQTT online with a dead executor is unsafe because every cached
+        pose and RTK sample then looks like a real, merely stale observation.
+        The deployed unit uses ``Restart=always`` and ``RestartSec=5``; a
+        non-zero immediate exit is therefore the bounded recovery mechanism.
+        """
+        LOGGER.critical(
+            "ROS executor exited unexpectedly: %s; terminating Edge for systemd restart",
+            reason,
+        )
+        os._exit(70)
 
     def start(self) -> None:
         self.power_mode_controller.reconcile_startup()

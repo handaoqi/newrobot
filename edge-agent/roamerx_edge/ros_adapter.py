@@ -52,10 +52,10 @@ def follow_path_patrol_params(
     vx_max = 0.15 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
     )
-    # Do not back away from a terminal click or make a high-rate orbit while
-    # the goal checker is settling.  Reverse and large yaw corrections are
-    # reserved for the explicit recovery controller.
-    vx_min = 0.0 if final_approach else -0.12
+    # A clear final click can sit still while the goal checker settles.
+    # With the local obstacle layer on, DiffDrive has to reverse a little to
+    # turn around a mark; leaving vx_min at 0 freezes the dog on the spot.
+    vx_min = 0.0 if final_approach and not local_obstacles else -0.12
     wz_max = 0.35 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).wz_rps
     )
@@ -86,11 +86,13 @@ def follow_path_patrol_params(
         # deliberate detour instead of weaving along the RTK reference line.
         "FollowPath.CostCritic.cost_weight": 8.0 if outdoor else 18.0,
         # Indoor local detours use a low-weight tangent pull to return smoothly
-        # after clearing an obstacle. Outdoor RTK keeps it off to avoid turning
-        # small GPS/polyline noise into left-right weaving.
+        # after clearing an obstacle. Outdoor RTK keeps it off even on the last
+        # metre; PathAlign on a final outdoor click overrode CostCritic and
+        # drove the dog straight into the mark instead of around it.
         "FollowPath.PathAlignCritic.enabled": bool(
             not require_yaw
-            and (final_approach or (local_obstacles and not outdoor))
+            and not outdoor
+            and (final_approach or local_obstacles)
         ),
         "FollowPath.PathAlignCritic.cost_weight": 4.0 if local_obstacles else 12.0,
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
@@ -252,6 +254,12 @@ class RosAdapter(Node):
         # cancel, lifecycle, or parameter futures on this node.
         self._nav_action_callback_group = ReentrantCallbackGroup()
         self._nav_service_callback_group = ReentrantCallbackGroup()
+        # Service clients belong to the node for its full lifetime. Reusing
+        # them avoids destroying handles that may still be present in the
+        # executor wait set after a timeout.
+        self._service_clients: dict[tuple[object, str], object] = {}
+        self._service_clients_lock = threading.Lock()
+        self._ros_executor_alive_provider: Callable[[], bool] | None = None
         self._latest_odometry = None
         self._odometry_sequence = 0
         self._odometry_consumed_sequence = 0
@@ -1867,13 +1875,33 @@ class RosAdapter(Node):
         except Exception:
             LOGGER.debug("destroy_client failed", exc_info=True)
 
+    def _persistent_service_client(self, service_type, service_name: str):
+        """Return one node-lifetime client for a service endpoint."""
+        key = (service_type, str(service_name))
+        lock = getattr(self, "_service_clients_lock", None)
+        if lock is None:
+            self._service_clients_lock = threading.Lock()
+            lock = self._service_clients_lock
+        with lock:
+            clients = getattr(self, "_service_clients", None)
+            if clients is None:
+                self._service_clients = {}
+                clients = self._service_clients
+            client = clients.get(key)
+            if client is None:
+                client = self.create_client(
+                    service_type,
+                    service_name,
+                    callback_group=self._nav_service_callback_group,
+                )
+                clients[key] = client
+            return client
+
     def _lifecycle_node_is_active(self, node_name: str) -> bool:
-        client = self.create_client(
+        client = self._persistent_service_client(
             GetState,
             f"{node_name}/get_state",
-            callback_group=self._nav_service_callback_group,
         )
-        future = None
         try:
             if not client.wait_for_service(timeout_sec=0.25):
                 return False
@@ -1884,8 +1912,6 @@ class RosAdapter(Node):
             return int(future.result().current_state.id) == 3
         except Exception:
             return False
-        finally:
-            self._destroy_client_if_idle(client, future)
 
     # Patrol goal dispatch: prefer fail-fast + Edge retry over a 30s stand.
     _NAV_SEND_READY_TIMEOUT_SECONDS = 5.0
@@ -2425,6 +2451,7 @@ class RosAdapter(Node):
             item["reject_reason"] = reason
             item["eligible"] = False
             item["accepted"] = False
+            item["updated_at"] = finished_at
             item["finished_at"] = finished_at
 
     @staticmethod
@@ -2711,7 +2738,12 @@ class RosAdapter(Node):
             ),
         }
 
-    def _new_rtk_verification(self, decision: dict) -> dict:
+    def _new_rtk_verification(
+        self,
+        decision: dict,
+        *,
+        started_at: str | None = None,
+    ) -> dict:
         required = max(1, int(getattr(
             self.safety_config, "localization_rtk_required_samples", 3
         )))
@@ -2719,6 +2751,8 @@ class RosAdapter(Node):
             self.safety_config, "localization_rtk_max_drift_m", 0.30
         ))
         return {
+            "started_at": started_at or now_iso(),
+            "updated_at": now_iso(),
             "status": "verifying",
             "verified": False,
             "conclusion_code": "awaiting_fresh_rtk_samples",
@@ -2742,11 +2776,20 @@ class RosAdapter(Node):
         error_code: str = "",
         error_message: str = "",
     ) -> None:
+        updated_at = now_iso()
+        verification.setdefault("started_at", updated_at)
+        verification["updated_at"] = updated_at
+        if stage_status in {"accepted", "rejected", "failed"}:
+            verification.setdefault("finished_at", updated_at)
         stage = {
             "stage": "rtk_fixed",
             "status": stage_status,
+            "started_at": verification["started_at"],
+            "updated_at": updated_at,
             "rtk_verification": verification,
         }
+        if verification.get("finished_at"):
+            stage["finished_at"] = verification["finished_at"]
         if error_code:
             stage["error_code"] = error_code
         if error_message:
@@ -2771,6 +2814,7 @@ class RosAdapter(Node):
         timeout_seconds: float,
         generation: int,
         on_update: Callable[[dict], None] | None = None,
+        started_at: str | None = None,
     ) -> dict:
         """Verify RTK from consecutive RTK samples, never from LIO agreement."""
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
@@ -2785,7 +2829,10 @@ class RosAdapter(Node):
         sample_count = 0
         sample_history = []
         last_decision = self._localization_decision()
-        latest_result = self._new_rtk_verification(last_decision)
+        latest_result = self._new_rtk_verification(
+            last_decision,
+            started_at=started_at,
+        )
         while time.monotonic() < deadline:
             self._assert_localization_operation(generation)
             decision = self._localization_decision()
@@ -2795,11 +2842,14 @@ class RosAdapter(Node):
             ) else {}
             try:
                 stamp_ns = int(drift.get("sample_stamp_ns") or 0)
-                x = float(decision.get("rtk_x"))
-                y = float(decision.get("rtk_y"))
             except (TypeError, ValueError):
                 stamp_ns = 0
-                x = y = float("nan")
+            x_value = self._finite_or_none(decision.get("rtk_x"))
+            y_value = self._finite_or_none(decision.get("rtk_y"))
+            yaw_value = self._finite_or_none(decision.get("rtk_yaw"))
+            x = x_value if x_value is not None else float("nan")
+            y = y_value if y_value is not None else float("nan")
+            yaw = yaw_value if yaw_value is not None else float("nan")
             if stamp_ns > last_stamp:
                 last_stamp = stamp_ns
                 sample_count += 1
@@ -2824,6 +2874,11 @@ class RosAdapter(Node):
                         "actual": [x, y] if math.isfinite(x) and math.isfinite(y) else None,
                         "expected": "finite map x/y",
                         "passed": math.isfinite(x) and math.isfinite(y),
+                    },
+                    "map_heading_finite": {
+                        "actual": yaw if math.isfinite(yaw) else None,
+                        "expected": "finite map yaw",
+                        "passed": math.isfinite(yaw),
                     },
                 }
                 reject_reasons = [
@@ -2868,6 +2923,8 @@ class RosAdapter(Node):
                 sample_history.append(observation)
                 sample_history = sample_history[-12:]
                 latest_result = {
+                    "started_at": latest_result.get("started_at") or started_at or now_iso(),
+                    "updated_at": now_iso(),
                     "sample_stamp_ns": stamp_ns,
                     "source": "rtk_self_stability",
                     "span_m": span,
@@ -2883,13 +2940,29 @@ class RosAdapter(Node):
                     "last_sample": observation,
                     "sample_history": list(sample_history),
                 }
+                terminal_rejection = (
+                    not accepted
+                    or (len(samples) >= required and span > max_span)
+                )
+                if terminal_rejection:
+                    rejected_at = now_iso()
+                    latest_result.update({
+                        "status": "rejected",
+                        "verified": False,
+                        "updated_at": rejected_at,
+                        "finished_at": rejected_at,
+                    })
                 if callable(on_update):
                     on_update(latest_result)
                 if verified:
                     return latest_result
+                if terminal_rejection:
+                    return latest_result
             time.sleep(0.1)
         latest_result = {
             **latest_result,
+            "updated_at": now_iso(),
+            "finished_at": now_iso(),
             "status": "rejected",
             "verified": False,
             "timed_out": True,
@@ -2908,6 +2981,73 @@ class RosAdapter(Node):
         if callable(on_update):
             on_update(latest_result)
         return latest_result
+
+    def _rtk_pose_from_verification(self, verification: dict) -> dict | None:
+        sample = verification.get("last_sample") if isinstance(verification, dict) else None
+        sample = sample if isinstance(sample, dict) else {}
+        x = self._finite_or_none(sample.get("map_x"))
+        y = self._finite_or_none(sample.get("map_y"))
+        yaw = self._finite_or_none(sample.get("map_yaw"))
+        if x is None or y is None or yaw is None:
+            return None
+        return {
+            "x": x,
+            "y": y,
+            "z": 0.0,
+            "yaw": yaw,
+            "candidate_label": "RTK固定解定位点",
+        }
+
+    def _rtk_still_fixed_for_commit(self) -> bool:
+        decision = self._localization_decision()
+        return bool(
+            decision.get("rtk_usable") is True
+            and str(decision.get("rtk_quality") or "").lower() == "fixed"
+            and decision.get("rtk_heading_usable") is True
+            and self._finite_or_none(decision.get("rtk_x")) is not None
+            and self._finite_or_none(decision.get("rtk_y")) is not None
+            and self._finite_or_none(decision.get("rtk_yaw")) is not None
+        )
+
+    def _lio_handoff_diagnostics(self, decision: dict, *, accepted: bool) -> dict:
+        nested = decision.get("localization") if isinstance(
+            decision.get("localization"), dict
+        ) else {}
+        sample_age = self._finite_or_none(
+            decision.get("sample_age_seconds", nested.get("sample_age_seconds"))
+        )
+        provider = getattr(self, "_ros_executor_alive_provider", None)
+        try:
+            executor_alive = bool(provider()) if callable(provider) else None
+        except Exception:
+            executor_alive = False
+        reason = ""
+        if not accepted:
+            if executor_alive is False:
+                reason = "ros_executor_not_alive"
+            elif decision.get("active_source") != "lio_imu":
+                reason = "active_source_not_lio_imu"
+            elif decision.get("lio_healthy") is not True:
+                reason = "lio_not_healthy"
+            elif decision.get("lio_anchored") is not True:
+                reason = "lio_anchor_not_ready"
+            elif decision.get("absolute_stable") is not True:
+                reason = "absolute_pose_not_stable"
+            elif decision.get("handoff_state") != "ready":
+                reason = "handoff_state_not_ready"
+            else:
+                reason = "fresh_lio_frame_not_confirmed"
+        return {
+            "ros_executor_alive": executor_alive,
+            "localization_frame_age_seconds": sample_age,
+            "anchor_generation": decision.get("handoff_anchor_generation"),
+            "active_source": decision.get("active_source"),
+            "handoff_state": decision.get("handoff_state"),
+            "lio_healthy": decision.get("lio_healthy"),
+            "lio_anchored": decision.get("lio_anchored"),
+            "absolute_stable": decision.get("absolute_stable"),
+            "handoff_failure_reason": reason,
+        }
 
     def _wait_for_lio_handoff(
         self,
@@ -2988,12 +3128,6 @@ class RosAdapter(Node):
                 "/localization/seed_from_rtk service is unavailable",
                 details={"rtk_verification": verification},
             )
-        try:
-            previous_handoff_generation = int(
-                previous_decision.get("handoff_anchor_generation") or 0
-            )
-        except (TypeError, ValueError):
-            previous_handoff_generation = 0
         deadline = time.monotonic() + max(1.0, float(wait_seconds))
         last_progress_at = 0.0
 
@@ -3009,6 +3143,7 @@ class RosAdapter(Node):
             timeout_seconds=max(0.0, deadline - time.monotonic()),
             generation=generation,
             on_update=report_progress,
+            started_at=verification.get("started_at"),
         )
         if not stability or not stability.get("verified"):
             verification = stability or verification
@@ -3028,21 +3163,173 @@ class RosAdapter(Node):
                 },
             )
         verification = stability
-        future = self._rtk_initial_pose_client.call_async(Trigger.Request())
-        completed = threading.Event()
-        future.add_done_callback(lambda _future: completed.set())
-        if not completed.wait(timeout=5.0) or not future.done():
+
+        # RTK has provided the authoritative map pose. Before committing that
+        # anchor, run exactly one bounded NDT observation at the same position
+        # so operators get a numbered location and concrete geometric quality.
+        # This cross-check is evidence only: a still-valid fixed RTK solution
+        # remains authoritative even when NDT is weak or unavailable outdoors.
+        rtk_seed = self._rtk_pose_from_verification(verification)
+        if rtk_seed is None:
             self._report_rtk_verification(
                 verification,
                 state="failed",
                 stage_status="failed",
-                error_code="RTK_INITIAL_POSE_TIMEOUT",
-                error_message="RTK initial pose service timed out after RTK verification passed",
+                error_code="RTK_POSE_UNAVAILABLE",
+                error_message="verified RTK did not provide finite map x/y/yaw",
             )
+            raise ProtocolError(
+                "RTK_POSE_UNAVAILABLE",
+                "verified RTK did not provide finite map x/y/yaw",
+                details={
+                    "rtk_stability": verification,
+                    "rtk_verification": verification,
+                },
+            )
+
+        attempt_started = self._begin_localization_attempt(
+            1,
+            rtk_seed,
+            extra={"stage": "rtk_fixed", "source": "rtk_ndt_crosscheck"},
+        )
+        attempts = [attempt_started]
+        stage = {
+            "stage": "rtk_fixed",
+            "status": "verifying",
+            "started_at": verification.get("started_at") or now_iso(),
+            "updated_at": now_iso(),
+            "rtk_verification": verification,
+            "attempts": attempts,
+        }
+        transaction = {
+            "state": "running",
+            "mode": "rtk_fixed_initialization",
+            "selected_stage": "rtk_fixed",
+            "strategy": ["rtk_fixed"],
+            "stages": [stage],
+            "attempts": attempts,
+            "candidate_count": 1,
+            "evaluated_candidate_count": 0,
+            "active_candidate_number": 1,
+            "active_candidate_stage": "rtk_fixed",
+            "motion_commanded": False,
+            "rtk_verification": verification,
+            "rtk_stability": verification,
+        }
+        self._report_localization_attempts(transaction)
+
+        handoff_settle = float(getattr(
+            self.safety_config, "localization_handoff_settle_seconds", 8.0
+        ))
+        probe_wait = min(
+            5.0,
+            max(1.0, deadline - time.monotonic() - handoff_settle),
+        )
+        trusted_was_frozen = bool(getattr(self, "_trusted_pose_frozen", False))
+        self._trusted_pose_frozen = True
+        try:
+            attempt = self._probe_localization_seed(
+                rtk_seed,
+                generation,
+                wait_seconds=probe_wait,
+                index=1,
+                extra={"stage": "rtk_fixed", "source": "rtk_ndt_crosscheck"},
+                require_ndt_observation=True,
+            )
+        finally:
+            self._trusted_pose_frozen = trusted_was_frozen
+        attempt = self._finish_localization_attempt(attempt, attempt_started)
+        attempts[0] = attempt
+        ndt_candidate = dict(attempt.get("ndt_candidate") or {})
+        ndt_summary = {
+            "matching_error": attempt.get("matching_error"),
+            "inlier_fraction": attempt.get("inlier_fraction"),
+            "has_converged": attempt.get("has_converged"),
+            "stable_frames": attempt.get("stable_frames"),
+            "required_stable_frames": attempt.get("required_stable_frames"),
+            "reject_reason": attempt.get("reject_reason"),
+        }
+        stage.update({"updated_at": now_iso(), "attempts": attempts})
+        transaction.update({
+            "attempts": attempts,
+            "evaluated_candidate_count": 1,
+            "active_candidate_number": None,
+            "active_candidate_stage": None,
+            "best_candidate_index": 1,
+            "best_candidate_stage": "rtk_fixed",
+            "best_candidate_seed_pose": self._pose_payload(rtk_seed),
+            "best_candidate_label": rtk_seed["candidate_label"],
+            "best_candidate_ndt": ndt_summary,
+            "best_ndt_candidate": ndt_candidate or None,
+            "best_match_pose": attempt.get("matched_pose") or self._pose_payload(rtk_seed),
+            "ndt_crosscheck_passed": bool(attempt.get("eligible")),
+        })
+        self._report_localization_attempts(transaction)
+
+        if not self._rtk_still_fixed_for_commit():
+            failed_at = now_iso()
+            verification.update({
+                "status": "rejected",
+                "verified": False,
+                "finished_at": failed_at,
+                "updated_at": failed_at,
+                "conclusion_code": "rtk_lost_before_commit",
+                "conclusion": "RTK fixed quality was lost before the verified result could be committed",
+            })
+            stage.update({
+                "status": "rejected",
+                "updated_at": failed_at,
+                "finished_at": failed_at,
+                "error_code": "RTK_FIXED_NOT_STABLE",
+                "error_message": verification["conclusion"],
+                "rtk_verification": verification,
+            })
+            transaction.update({
+                "state": "failed",
+                "rtk_verification": verification,
+                "rtk_stability": verification,
+            })
+            self._report_localization_attempts(transaction)
+            raise ProtocolError(
+                "RTK_FIXED_NOT_STABLE",
+                verification["conclusion"],
+                details={
+                    "rtk_stability": verification,
+                    "rtk_verification": verification,
+                    "localization_attempts": copy.deepcopy(transaction),
+                },
+            )
+
+        # Capture the generation after the transient NDT probe. Only a newer
+        # generation can prove that /seed_from_rtk performed the final commit.
+        pre_commit_decision = self._localization_decision()
+        try:
+            previous_handoff_generation = int(
+                pre_commit_decision.get("handoff_anchor_generation") or 0
+            )
+        except (TypeError, ValueError):
+            previous_handoff_generation = 0
+        future = self._rtk_initial_pose_client.call_async(Trigger.Request())
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(timeout=5.0) or not future.done():
+            failed_at = now_iso()
+            stage.update({
+                "status": "failed",
+                "updated_at": failed_at,
+                "finished_at": failed_at,
+                "error_code": "RTK_INITIAL_POSE_TIMEOUT",
+                "error_message": "RTK initial pose service timed out after RTK verification passed",
+            })
+            transaction["state"] = "failed"
+            self._report_localization_attempts(transaction)
             raise ProtocolError(
                 "RTK_INITIAL_POSE_TIMEOUT",
                 "RTK initial pose service timed out",
-                details={"rtk_verification": verification},
+                details={
+                    "rtk_verification": verification,
+                    "localization_attempts": copy.deepcopy(transaction),
+                },
             )
         response = future.result()
         self._assert_localization_operation(generation)
@@ -3050,17 +3337,23 @@ class RosAdapter(Node):
             error_message = (
                 response.message if response else "RTK initial pose service returned no response"
             )
-            self._report_rtk_verification(
-                verification,
-                state="failed",
-                stage_status="failed",
-                error_code="RTK_POSE_UNAVAILABLE",
-                error_message=error_message,
-            )
+            failed_at = now_iso()
+            stage.update({
+                "status": "failed",
+                "updated_at": failed_at,
+                "finished_at": failed_at,
+                "error_code": "RTK_POSE_UNAVAILABLE",
+                "error_message": error_message,
+            })
+            transaction["state"] = "failed"
+            self._report_localization_attempts(transaction)
             raise ProtocolError(
                 "RTK_POSE_UNAVAILABLE",
                 error_message,
-                details={"rtk_verification": verification},
+                details={
+                    "rtk_verification": verification,
+                    "localization_attempts": copy.deepcopy(transaction),
+                },
             )
         handoff_timeout = min(
             max(0.0, deadline - time.monotonic()),
@@ -3076,20 +3369,32 @@ class RosAdapter(Node):
                 "status": "failed",
                 "conclusion_code": "lio_handoff_timeout",
                 "conclusion": "RTK seed passed, but no fresh stable FAST-LIO handoff was verified",
-                "active_source": handoff_decision.get("active_source"),
-                "handoff_state": handoff_decision.get("handoff_state"),
-                "lio_healthy": handoff_decision.get("lio_healthy"),
-                "lio_anchored": handoff_decision.get("lio_anchored"),
-                "absolute_stable": handoff_decision.get("absolute_stable"),
+                **self._lio_handoff_diagnostics(handoff_decision, accepted=False),
             }
-            verification = {**verification, "handoff": handoff}
-            self._report_rtk_verification(
-                verification,
-                state="failed",
-                stage_status="failed",
-                error_code="LIO_HANDOFF_TIMEOUT",
-                error_message=handoff["conclusion"],
-            )
+            failed_at = now_iso()
+            verification = {
+                **verification,
+                "handoff": handoff,
+                "status": "failed",
+                "updated_at": failed_at,
+                "finished_at": failed_at,
+            }
+            stage.update({
+                "status": "failed",
+                "updated_at": failed_at,
+                "finished_at": failed_at,
+                "error_code": "LIO_HANDOFF_TIMEOUT",
+                "error_message": handoff["conclusion"],
+                "rtk_verification": verification,
+            })
+            transaction.update({
+                "state": "failed",
+                "handoff_pending": True,
+                "rtk_verification": verification,
+                "rtk_stability": verification,
+                "handoff_diagnostics": handoff,
+            })
+            self._report_localization_attempts(transaction)
             raise ProtocolError(
                 "LIO_HANDOFF_TIMEOUT",
                 "fixed RTK pose was accepted but FAST-LIO did not become the fresh continuous source",
@@ -3097,19 +3402,21 @@ class RosAdapter(Node):
                     "rtk_stability": verification,
                     "rtk_verification": verification,
                     "localization_decision": handoff_decision,
+                    "handoff_diagnostics": handoff,
+                    "localization_attempts": copy.deepcopy(transaction),
                 },
             )
+        accepted_at = now_iso()
         verification = {
             **verification,
+            "status": "accepted",
+            "updated_at": accepted_at,
+            "finished_at": accepted_at,
             "handoff": {
                 "status": "accepted",
                 "conclusion_code": "lio_imu_handoff_verified",
                 "conclusion": "RTK absolute seed accepted; fresh FAST-LIO + IMU is the continuous pose source",
-                "active_source": handoff_decision.get("active_source"),
-                "handoff_state": handoff_decision.get("handoff_state"),
-                "lio_healthy": handoff_decision.get("lio_healthy"),
-                "lio_anchored": handoff_decision.get("lio_anchored"),
-                "absolute_stable": handoff_decision.get("absolute_stable"),
+                **self._lio_handoff_diagnostics(handoff_decision, accepted=True),
             },
         }
         localized_pose = {
@@ -3118,51 +3425,48 @@ class RosAdapter(Node):
             "z": latest.z,
             "yaw": latest.yaw,
         }
-        attempt = {
-            "index": 1,
-            "stage": "rtk_fixed",
+        attempt["rtk_fixed_committed"] = True
+        stage.update({
             "status": "accepted",
-            "accepted": True,
-            "eligible": True,
-            "seed_pose": localized_pose,
-            "matched_pose": localized_pose,
-            "rtk_quality": "fixed",
+            "updated_at": accepted_at,
+            "finished_at": accepted_at,
+            "rtk_verification": verification,
+            "attempts": attempts,
+        })
+        best_match_pose = attempt.get("matched_pose") or self._pose_payload(rtk_seed)
+        transaction.update({
+            "state": "accepted",
+            "stop_reason": "rtk_fixed_ndt_crosscheck_then_lio_handoff",
+            "early_stopped": True,
+            "rtk_fixed_committed": True,
+            "localized_pose": localized_pose,
+            "best_match_pose": best_match_pose,
+            "best_ndt_candidate": ndt_candidate or None,
             "rtk_stability": stability,
             "rtk_verification": verification,
-        }
+            "handoff_diagnostics": verification["handoff"],
+        })
         result = {
             "source": "rtk_fixed",
             "service": "/localization/seed_from_rtk",
             "message": response.message,
             "localization_status": latest.localization_status,
             "localized_pose": localized_pose,
-            "best_match_pose": localized_pose,
+            "best_match_pose": best_match_pose,
+            "best_ndt_candidate": ndt_candidate or None,
+            "best_candidate_index": 1,
+            "best_candidate_stage": "rtk_fixed",
+            "best_candidate_seed_pose": self._pose_payload(rtk_seed),
+            "best_candidate_label": rtk_seed["candidate_label"],
+            "best_candidate_ndt": ndt_summary,
+            "ndt_crosscheck_passed": bool(attempt.get("eligible")),
+            "rtk_fixed_committed": True,
             "rtk_stability": stability,
             "rtk_verification": verification,
-            "localization_attempts": {
-                "state": "accepted",
-                "mode": "rtk_fixed_initialization",
-                "selected_stage": "rtk_fixed",
-                "stop_reason": "rtk_fixed_stable_then_lio_handoff",
-                "early_stopped": True,
-                "candidate_count": 1,
-                "evaluated_candidate_count": 1,
-                "attempts": [attempt],
-                "best_match_pose": localized_pose,
-                "rtk_stability": stability,
-                "rtk_verification": verification,
-                "stages": [{
-                    "stage": "rtk_fixed",
-                    "status": "accepted",
-                    "rtk_verification": verification,
-                }],
-            },
+            "handoff_diagnostics": verification["handoff"],
+            "localization_attempts": transaction,
         }
-        self._report_rtk_verification(
-            verification,
-            state="accepted",
-            stage_status="accepted",
-        )
+        self._report_localization_attempts(transaction)
         return result
 
     def global_relocalize(self, wait_seconds: float = 90.0, *, automatic: bool = False) -> dict:
@@ -3251,11 +3555,17 @@ class RosAdapter(Node):
         rtk_verification = None
 
         if manual_seed is None and outdoor:
+            rtk_stage_started_at = now_iso()
             self._report_localization_attempts({
                 "state": "running",
                 "mode": "quick_then_global",
                 "selected_stage": "rtk_fixed",
-                "stages": [{"stage": "rtk_fixed", "status": "verifying"}],
+                "stages": [{
+                    "stage": "rtk_fixed",
+                    "status": "verifying",
+                    "started_at": rtk_stage_started_at,
+                    "updated_at": rtk_stage_started_at,
+                }],
                 "attempts": [],
                 "candidate_count": 0,
                 "motion_commanded": False,
@@ -3281,6 +3591,13 @@ class RosAdapter(Node):
                 rejected_stage = {
                     "stage": "rtk_fixed",
                     "status": "rejected",
+                    "started_at": (
+                        (rtk_verification or {}).get("started_at")
+                        if isinstance(rtk_verification, dict)
+                        else rtk_stage_started_at
+                    ) or rtk_stage_started_at,
+                    "updated_at": now_iso(),
+                    "finished_at": now_iso(),
                     "error_code": exc.code,
                     "error_message": exc.message,
                 }
@@ -3327,12 +3644,19 @@ class RosAdapter(Node):
             {**self._waiting_attempt(index, seed), "stage": source, "source": source}
             for index, (source, seed) in enumerate(seeds, start=1)
         ]
+        quick_started_at = now_iso()
+        quick_stage = {
+            "stage": "quick_initialization",
+            "status": "searching",
+            "started_at": quick_started_at,
+            "updated_at": quick_started_at,
+        }
         session = {
             "state": "running",
             "mode": "quick_then_global",
             "selected_stage": "quick_initialization",
             "strategy": ["rtk_fixed", "last_trusted", "mapping_origin_local", "keyframe_global_match"],
-            "stages": stages + [{"stage": "quick_initialization", "status": "searching"}],
+            "stages": stages + [quick_stage],
             "attempts": attempts,
             "candidate_count": len(attempts),
             "evaluated_candidate_count": 0,
@@ -3398,6 +3722,12 @@ class RosAdapter(Node):
                 self._skip_waiting_attempts(attempts, "quick_search_budget_exhausted")
             ranked = self._select_ranked_attempt(attempts)
             if ranked is not None:
+                quick_finished_at = now_iso()
+                quick_stage.update({
+                    "status": "accepted",
+                    "updated_at": quick_finished_at,
+                    "finished_at": quick_finished_at,
+                })
                 self._mark_out_ranked_attempts(attempts, ranked)
                 self._trusted_pose_frozen = False
                 candidate = dict(ranked.get("ndt_candidate") or {})
@@ -3429,9 +3759,20 @@ class RosAdapter(Node):
         finally:
             self._trusted_pose_frozen = False
 
-        session["stages"][-1]["status"] = "failed"
+        quick_finished_at = now_iso()
+        quick_stage.update({
+            "status": "failed",
+            "updated_at": quick_finished_at,
+            "finished_at": quick_finished_at,
+        })
         session["best_ndt_candidate"] = self._best_diagnostic_candidate(attempts)
-        session["stages"].append({"stage": "keyframe_global_match", "status": "searching"})
+        global_started_at = now_iso()
+        session["stages"].append({
+            "stage": "keyframe_global_match",
+            "status": "searching",
+            "started_at": global_started_at,
+            "updated_at": global_started_at,
+        })
         session.update({
             "state": "global_searching",
             "selected_stage": "keyframe_global_match",
@@ -3448,6 +3789,7 @@ class RosAdapter(Node):
             failed_at = now_iso()
             session["stages"][-1].update({
                 "status": "failed",
+                "updated_at": failed_at,
                 "finished_at": failed_at,
                 "error_code": exc.code,
                 "error_message": exc.message,
@@ -3470,7 +3812,12 @@ class RosAdapter(Node):
                 f"quick NDT candidates and global relocalization failed: {exc.message}",
                 details=session,
             ) from exc
-        session["stages"][-1]["status"] = "accepted"
+        global_finished_at = now_iso()
+        session["stages"][-1].update({
+            "status": "accepted",
+            "updated_at": global_finished_at,
+            "finished_at": global_finished_at,
+        })
         payload = {
             **global_result,
             "mode": "quick_then_global",
@@ -3517,6 +3864,7 @@ class RosAdapter(Node):
                 "status": "searching",
                 "started_at": now_iso(),
             }
+            origin_stage["updated_at"] = origin_stage["started_at"]
             stages.append(origin_stage)
         else:
             unavailable_at = now_iso()
@@ -3524,6 +3872,7 @@ class RosAdapter(Node):
                 "stage": "mapping_origin_bounded",
                 "status": "unavailable",
                 "started_at": unavailable_at,
+                "updated_at": unavailable_at,
                 "finished_at": unavailable_at,
                 "error_code": (origin or {}).get("unavailable_error_code", "MAPPING_START_POSE_MISSING"),
                 "error_message": (origin or {}).get(
@@ -3573,6 +3922,7 @@ class RosAdapter(Node):
                 }, generation, persist_state=False)
                 origin_stage.update({
                     "status": "accepted",
+                    "updated_at": now_iso(),
                     "finished_at": now_iso(),
                     "attempts": result.get("attempts", []),
                     "best_ndt_candidate": result.get("best_ndt_candidate"),
@@ -3616,6 +3966,7 @@ class RosAdapter(Node):
                     origin_status = "rejected"
                 origin_stage.update({
                     "status": origin_status,
+                    "updated_at": now_iso(),
                     "finished_at": now_iso(),
                     "error_code": exc.code,
                     "error_message": origin_message,
@@ -3657,6 +4008,7 @@ class RosAdapter(Node):
                 "status": "searching",
                 "started_at": now_iso(),
             }
+            route_stage["updated_at"] = route_stage["started_at"]
             stages.append(route_stage)
         else:
             skipped_at = now_iso()
@@ -3664,6 +4016,7 @@ class RosAdapter(Node):
                 "stage": "route_waypoints",
                 "status": "skipped",
                 "started_at": skipped_at,
+                "updated_at": skipped_at,
                 "finished_at": skipped_at,
                 "error_code": "NO_ROUTE_WAYPOINTS",
             })
@@ -3679,11 +4032,15 @@ class RosAdapter(Node):
                 self._assert_localization_operation(generation)
                 remaining_local = deadline - time.monotonic() - 60.0
                 if remaining_local < 1.0:
+                    skipped_at = now_iso()
                     skipped = {
                         "index": len(all_attempts) + 1,
                         "stage": stage_name,
                         "waypoint_index": waypoint_index,
                         "status": "failed",
+                        "started_at": skipped_at,
+                        "updated_at": skipped_at,
+                        "finished_at": skipped_at,
                         "reject_reason": "LOCAL_SEARCH_BUDGET_EXHAUSTED",
                         "error_code": "LOCAL_SEARCH_BUDGET_EXHAUSTED",
                         "seed_pose": {
@@ -3732,6 +4089,7 @@ class RosAdapter(Node):
                 candidate = dict(ranked.get("ndt_candidate") or {})
                 route_stage.update({
                     "status": "accepted",
+                    "updated_at": now_iso(),
                     "finished_at": now_iso(),
                     "waypoint_index": ranked.get("waypoint_index"),
                     "attempts": waypoint_attempts,
@@ -3768,7 +4126,12 @@ class RosAdapter(Node):
             self._trusted_pose_frozen = False
 
         if route_stage is not None:
-            route_stage.update({"status": "rejected", "finished_at": now_iso()})
+            route_finished_at = now_iso()
+            route_stage.update({
+                "status": "rejected",
+                "updated_at": route_finished_at,
+                "finished_at": route_finished_at,
+            })
 
         session["best_ndt_candidate"] = self._best_diagnostic_candidate(all_attempts)
 
@@ -3777,6 +4140,7 @@ class RosAdapter(Node):
             "status": "searching",
             "started_at": now_iso(),
         }
+        global_stage["updated_at"] = global_stage["started_at"]
         stages.append(global_stage)
         session.update(state="global_searching", stages=stages, attempts=all_attempts)
         self._report_localization_attempts(session)
@@ -3787,6 +4151,7 @@ class RosAdapter(Node):
         except ProtocolError as exc:
             global_stage.update({
                 "status": "failed",
+                "updated_at": now_iso(),
                 "finished_at": now_iso(),
                 "error_code": exc.code,
                 "error_message": exc.message,
@@ -3815,7 +4180,13 @@ class RosAdapter(Node):
                 "origin, all route waypoints, and keyframe/global matching failed",
                 details=details,
             ) from exc
-        global_stage.update({"status": "accepted", "finished_at": now_iso(), "message": global_result.get("message")})
+        global_finished_at = now_iso()
+        global_stage.update({
+            "status": "accepted",
+            "updated_at": global_finished_at,
+            "finished_at": global_finished_at,
+            "message": global_result.get("message"),
+        })
         payload = {
             **global_result,
             "mode": "progressive_stationary_search",
@@ -3906,6 +4277,7 @@ class RosAdapter(Node):
                 "status": "searching",
                 "started_at": seed.get("stage_started_at") or now_iso(),
             }
+            active_stage["updated_at"] = active_stage["started_at"]
         attempts = [
             {**self._waiting_attempt(index, candidate), **attempt_metadata}
             for index, candidate in enumerate(candidates[:max_attempts], start=1)
@@ -4009,9 +4381,11 @@ class RosAdapter(Node):
                     "timed_out": budget_exhausted,
                 })
                 if active_stage is not None:
+                    stage_finished_at = now_iso()
                     active_stage.update({
                         "status": "failed",
-                        "finished_at": now_iso(),
+                        "updated_at": stage_finished_at,
+                        "finished_at": stage_finished_at,
                         "attempts": attempts,
                         "timed_out": session["timed_out"],
                     })
@@ -4047,6 +4421,7 @@ class RosAdapter(Node):
             if active_stage is not None:
                 active_stage.update({
                     "status": "accepted",
+                    "updated_at": commit_finished_at,
                     "finished_at": commit_finished_at,
                     "attempts": attempts,
                     "best_ndt_candidate": best_candidate,
@@ -4107,6 +4482,7 @@ class RosAdapter(Node):
         attempt.update({
             "status": "verifying",
             "started_at": now_iso(),
+            "updated_at": now_iso(),
             "live_pose": self._current_live_pose(),
         })
         return attempt
@@ -4119,6 +4495,7 @@ class RosAdapter(Node):
         completed.setdefault("seed_pose", started_attempt.get("seed_pose"))
         completed.setdefault("started_at", started_attempt.get("started_at"))
         completed.setdefault("finished_at", now_iso())
+        completed["updated_at"] = completed.get("finished_at") or now_iso()
         return completed
 
     def _probe_localization_seed(
@@ -4129,6 +4506,7 @@ class RosAdapter(Node):
         wait_seconds: float,
         index: int,
         extra: dict | None = None,
+        require_ndt_observation: bool = False,
     ) -> dict:
         attempt = self._waiting_attempt(index, seed_pose)
         attempt.update(extra or {})
@@ -4150,7 +4528,11 @@ class RosAdapter(Node):
             localized = result.get("localized_pose")
             if isinstance(localized, dict) and not candidate.get("matched_pose"):
                 candidate["matched_pose"] = dict(localized)
-            if isinstance(localized, dict) and "eligible" not in candidate:
+            if (
+                not require_ndt_observation
+                and isinstance(localized, dict)
+                and "eligible" not in candidate
+            ):
                 candidate["eligible"] = True
                 candidate.setdefault("stable_frames", 3)
         except ProtocolError as exc:
@@ -4523,12 +4905,10 @@ class RosAdapter(Node):
         except ImportError:
             LOGGER.warning("nav2_msgs ClearEntireCostmap is unavailable")
             return False
-        client = self.create_client(
+        client = self._persistent_service_client(
             ClearEntireCostmap,
             "/local_costmap/clear_entirely_local_costmap",
-            callback_group=self._nav_service_callback_group,
         )
-        future = None
         try:
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 0.5)):
                 return False
@@ -4539,8 +4919,6 @@ class RosAdapter(Node):
         except Exception:
             LOGGER.warning("local costmap clear request failed", exc_info=True)
             return False
-        finally:
-            self._destroy_client_if_idle(client, future)
 
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool:
         if self._goal_handle is not None:
@@ -4549,13 +4927,11 @@ class RosAdapter(Node):
             # Edge may have restarted after it sent a goal. In that case the
             # local handle is gone while Nav2 continues executing the goal.
             # A default CancelGoal request cancels every goal on this action.
-            client = self.create_client(
+            client = self._persistent_service_client(
                 CancelGoal,
                 f"{self._nav_cancel_action}/_action/cancel_goal",
-                callback_group=self._nav_service_callback_group,
             )
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 2.0)):
-                self.destroy_client(client)
                 LOGGER.error("%s cancel service is unavailable", self._nav_cancel_action)
                 return False
             future = client.call_async(CancelGoal.Request())
@@ -5272,12 +5648,10 @@ class RosAdapter(Node):
             raise ProtocolError(code, "ROS get_parameters unavailable")
         last_error = ""
         for _ in range(max(1, attempts)):
-            client = self.create_client(
+            client = self._persistent_service_client(
                 GetParameters,
                 f"{node_name}/get_parameters",
-                callback_group=self._nav_service_callback_group,
             )
-            future = None
             try:
                 if not client.wait_for_service(timeout_sec=0.35):
                     last_error = f"{node_name} get_parameters service is unavailable"
@@ -5296,8 +5670,6 @@ class RosAdapter(Node):
                 return result
             except Exception as exc:
                 last_error = str(exc)
-            finally:
-                self._destroy_client_if_idle(client, future)
             time.sleep(0.05)
         raise ProtocolError(code, last_error or f"unable to get parameters on {node_name}")
 
@@ -5343,12 +5715,10 @@ class RosAdapter(Node):
         last_error = ""
         service_missing = False
         for _ in range(max(1, attempts)):
-            client = self.create_client(
+            client = self._persistent_service_client(
                 SetParameters,
                 f"{node_name}/set_parameters",
-                callback_group=self._nav_service_callback_group,
             )
-            future = None
             try:
                 if not client.wait_for_service(timeout_sec=0.25):
                     last_error = f"{node_name} parameter service is unavailable"
@@ -5386,8 +5756,6 @@ class RosAdapter(Node):
                     service_missing = False
             except Exception as exc:
                 last_error = str(exc)
-            finally:
-                self._destroy_client_if_idle(client, future)
             time.sleep(0.05)
         if service_missing:
             self._mark_remote_param_unavailable(node_name)
@@ -5489,7 +5857,13 @@ class RosAdapter(Node):
 
 
 class RosRuntime:
-    def __init__(self, node: RosAdapter) -> None:
+    _MAX_CONSECUTIVE_SPIN_FAILURES = 20
+
+    def __init__(
+        self,
+        node: RosAdapter,
+        unexpected_exit_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self.node = node
         # Safety pose and /cmd_vel callbacks have their own callback group.
         # Reserve executor capacity for them when control/telemetry callbacks
@@ -5498,20 +5872,55 @@ class RosRuntime:
         self.executor = MultiThreadedExecutor(num_threads=5)
         self.executor.add_node(node)
         self._stopped = threading.Event()
+        self._unexpected_exit_callback = unexpected_exit_callback
+        self._exit_reason = "not_started"
         self.thread = threading.Thread(target=self._spin, daemon=True, name="ros-executor")
+        node._ros_executor_alive_provider = self.is_alive
+
+    def is_alive(self) -> bool:
+        return bool(self.thread.is_alive() and not self._stopped.is_set())
 
     def _spin(self) -> None:
         # spin() itself dies on the first callback exception. A destroyed
         # service client used to raise InvalidHandle here and freeze every
         # pose, speed, and status callback until Edge was restarted.
-        while not self._stopped.is_set():
-            if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
-                break
-            try:
-                self.executor.spin_once(timeout_sec=0.1)
-            except Exception:
-                LOGGER.exception("ROS executor callback failed; keeping subscriptions alive")
-                time.sleep(0.05)
+        consecutive_failures = 0
+        self._exit_reason = "running"
+        try:
+            while not self._stopped.is_set():
+                if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
+                    self._exit_reason = "rclpy_context_not_ok"
+                    break
+                try:
+                    self.executor.spin_once(timeout_sec=0.1)
+                    consecutive_failures = 0
+                except Exception as exc:
+                    # A callback/service race can throw once without
+                    # invalidating the executor. Retry it, but do not leave a
+                    # permanently broken wait set spinning forever while MQTT
+                    # continues to report online.
+                    consecutive_failures += 1
+                    LOGGER.exception(
+                        "ROS executor callback failed (%d/%d); keeping subscriptions alive",
+                        consecutive_failures,
+                        self._MAX_CONSECUTIVE_SPIN_FAILURES,
+                    )
+                    if consecutive_failures >= self._MAX_CONSECUTIVE_SPIN_FAILURES:
+                        self._exit_reason = (
+                            f"consecutive_spin_failures:{type(exc).__name__}"
+                        )
+                        break
+                    time.sleep(0.05)
+        except BaseException as exc:
+            self._exit_reason = f"executor_thread_terminated:{type(exc).__name__}"
+            raise
+        finally:
+            if not self._stopped.is_set():
+                callback = self._unexpected_exit_callback
+                reason = self._exit_reason or "executor_spin_ended"
+                LOGGER.critical("ROS executor stopped unexpectedly: %s", reason)
+                if callable(callback):
+                    callback(reason)
 
     def start(self) -> None:
         self.thread.start()

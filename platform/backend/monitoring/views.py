@@ -1931,8 +1931,9 @@ class TelemetryIngestView(APIView):
         robot.stream_id = stream_id
         robot.play_urls = video.get("play_urls") or robot.play_urls
         # Telemetry, like Edge alerts, registers only bicycle business events.
+        # The Edge confirms three consecutive frames first; AlertService adds a
+        # durable 10-second merge gate for retries/restarts/alternate ingress.
         bicycle_detections = [d for d in payload.get("detections", []) if is_bicycle_detection(d)]
-        robot.today_alerts += len(bicycle_detections)
         robot.save()
 
         telemetry = RobotTelemetry.objects.create(
@@ -1954,32 +1955,18 @@ class TelemetryIngestView(APIView):
         frame_height = video.get("frame_height")
         queued_audio_command_ids = []
         for detection in bicycle_detections:
-            bbox = detection.get("bbox") or {}
-            event = InspectionEvent.objects.create(
-                robot=robot,
-                title=detection.get("label") or detection.get("type") or "AI识别事件",
-                event_type=detection.get("type", "generic_detection"),
+            event, created = AlertService.ingest_telemetry_bicycle_detection(
+                robot,
+                detection,
                 location=payload["position"]["name"],
-                detected_at=detection.get("event_time") or payload["reported_at"],
-                confidence=round(float(detection.get("confidence", 0)) * 100, 2)
-                if float(detection.get("confidence", 0)) <= 1
-                else detection.get("confidence", 0),
-                risk_level=detection.get("risk_level", "medium"),
-                status="pending",
-                snapshot_url=detection.get("snapshot_url", ""),
-                description=f"板端识别上报: {detection.get('label') or detection.get('type')}",
-                camera_id=detection.get("camera_id") or camera_id,
-                stream_id=detection.get("stream_id") or stream_id,
-                object_class=detection.get("object_class", ""),
-                track_id=detection.get("track_id", ""),
-                bbox_x=bbox.get("x"),
-                bbox_y=bbox.get("y"),
-                bbox_width=bbox.get("width"),
-                bbox_height=bbox.get("height"),
+                reported_at=payload["reported_at"],
+                camera_id=camera_id,
+                stream_id=stream_id,
                 frame_width=frame_width,
                 frame_height=frame_height,
-                raw_detection=detection,
             )
+            if not created:
+                continue
             event_broker.publish(
                 "inspection_event_created",
                 {

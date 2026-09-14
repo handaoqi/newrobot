@@ -252,6 +252,43 @@ class PatrolLoopServiceTests(TestCase):
         command = RemoteCommand.objects.get(command_type="task.recover.v1")
         self.assertEqual(command.payload["observation_seconds"], 5)
 
+    def test_start_ack_timeout_waits_for_edge_instead_of_recovering(self):
+        session = self.create_running_loop()
+        start_command = session.current_execution.commands.get(command_type="task.start")
+        CommandService.mark_timeout(start_command)
+
+        session = PatrolLoopService.process(session.id)
+        self.assertEqual(session.state, "observing")
+        self.assertEqual(session.recovery_reason_code, "COMMAND_TIMED_OUT")
+
+        session.observation_started_at = timezone.now() - timezone.timedelta(seconds=6)
+        session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
+        session.save(update_fields=["observation_started_at", "next_action_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "observing")
+        self.assertFalse(RemoteCommand.objects.filter(command_type="task.recover.v1").exists())
+
+    def test_start_ack_timeout_resumes_after_edge_accepts(self):
+        session = self.create_running_loop()
+        start_command = session.current_execution.commands.get(command_type="task.start")
+        CommandService.mark_timeout(start_command)
+        session = PatrolLoopService.process(session.id)
+        self.assertEqual(session.state, "observing")
+
+        TaskExecutionService.reconcile_edge_active_after_center_timeout(
+            session.current_execution,
+            "accepted",
+            edge_state_version=2,
+        )
+        session.next_action_at = timezone.now() - timezone.timedelta(seconds=1)
+        session.save(update_fields=["next_action_at", "updated_at"])
+        session = PatrolLoopService.process(session.id)
+
+        self.assertEqual(session.state, "running")
+        self.assertEqual(session.recovery_reason_code, "")
+        self.assertFalse(RemoteCommand.objects.filter(command_type="task.recover.v1").exists())
+
     def test_interlock_during_observation_resets_the_five_second_window(self):
         session = self.create_running_loop()
         TaskExecutionService.transition(session.current_execution, "accepted", event_type="command.ack")

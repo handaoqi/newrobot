@@ -199,7 +199,7 @@ class EdgeMqttClient:
         )
 
     def publish_ack(self, command_id: str, payload: dict) -> None:
-        self.publish(self._topic(f"commands/{command_id}/ack"), payload, qos=1)
+        self.publish(self._topic(f"commands/{command_id}/ack"), payload, qos=1, wait=True)
 
     def publish_result(self, command_id: str, payload: dict) -> None:
         self.publish(self._topic(f"commands/{command_id}/result"), payload, qos=1)
@@ -207,7 +207,15 @@ class EdgeMqttClient:
     def publish_progress(self, command_id: str, payload: dict) -> None:
         self.publish(self._topic(f"commands/{command_id}/progress"), payload, qos=1)
 
-    def publish(self, topic: str, payload: dict, *, qos: int, retain: bool = False) -> None:
+    def publish(
+        self,
+        topic: str,
+        payload: dict,
+        *,
+        qos: int,
+        retain: bool = False,
+        wait: bool = False,
+    ) -> None:
         if not self._connected.is_set():
             if qos == 0:
                 return
@@ -221,6 +229,18 @@ class EdgeMqttClient:
             return
         info = self.client.publish(topic, encode_message(payload), qos=qos, retain=retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            self.store.enqueue_outbox(topic, payload, qos=qos, retain=retain)
+            return
+        if not wait or qos < 1:
+            return
+        waiter = getattr(info, "wait_for_publish", None)
+        try:
+            if callable(waiter):
+                waiter(timeout=5.0)
+        except Exception:
+            LOGGER.warning("MQTT publish wait failed topic=%s", topic, exc_info=True)
+        published = getattr(info, "is_published", None)
+        if callable(published) and not published():
             self.store.enqueue_outbox(topic, payload, qos=qos, retain=retain)
 
     def replay_outbox(self) -> int:

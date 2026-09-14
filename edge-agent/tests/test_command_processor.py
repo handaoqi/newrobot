@@ -307,6 +307,68 @@ def test_task_start_persists_ack_before_smart_initialization(tmp_path):
     store.close()
 
 
+def test_task_start_forwards_localization_attempt_progress(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    store = LocalStore(str(tmp_path / "edge.db"))
+
+    class ProgressNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.attempt_progress_callback = None
+
+        def set_attempt_progress_callback(self, callback):
+            self.attempt_progress_callback = callback
+
+    navigation = ProgressNavigation()
+    executor = TaskExecutor(
+        store,
+        navigation,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    def initialize():
+        navigation.attempt_progress_callback({
+            "state": "running",
+            "selected_stage": "rtk_fixed",
+            "attempts": [{"candidate_number": 1, "status": "verifying"}],
+        })
+
+    executor.initialize_before_navigation = initialize
+    state = RuntimeSafetyState(
+        localization_status="normal",
+        localization_normal_since_monotonic=time.monotonic() - 10.0,
+        nav_ready=True,
+        control_mode="autonomous",
+        current_map_id="site-a-main",
+        current_map_version="v1",
+    )
+    progress = []
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        publish_progress=lambda *args: progress.append(args),
+        localization_adapter=navigation,
+    )
+
+    processor.handle_command(raw)
+
+    localization_progress = next(
+        payload for _, payload in progress
+        if payload["payload"]["result"].get("selected_stage") == "rtk_fixed"
+    )
+    assert localization_progress["payload"]["result"]["attempts"][0]["candidate_number"] == 1
+    assert progress[-1][1]["payload"]["result"]["selected_stage"] == "navigation_start"
+    assert progress[-1][1]["payload"]["result"]["navigation_start"]["status"] == "accepted"
+    assert progress[-1][1]["payload"]["result"]["navigation_start"]["finished_at"]
+    assert navigation.attempt_progress_callback is None
+    store.close()
+
+
 def test_task_start_repairs_nav_stack_only_when_not_ready(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     store = LocalStore(str(tmp_path / "edge.db"))

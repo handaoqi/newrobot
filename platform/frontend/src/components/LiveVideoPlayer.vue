@@ -3,6 +3,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { fetchRobotStreamAudioCommand, setRobotStreamAudioCapture } from '../services/api'
 import { normalizeLivePlayUrls } from '../services/liveVideoUrl'
+import {
+  SNAPSHOT_CLIP_DURATION_MS,
+  captureFileStamp,
+  captureVideoFrameBlob,
+  recordVideoElementClip,
+} from '../utils/liveVideoCapture'
 
 const props = defineProps({
   playUrls: { type: Object, default: () => ({}) },
@@ -41,6 +47,8 @@ let playerSetupTimer = null
 let audioReconnectTimer = null
 let streamRetryTimer = null
 let streamRetryAttempt = 0
+let clipCaptureActive = false
+let clipCaptureRecorder = null
 
 function loadMediaModules() {
   if (!mediaModulesPromise) {
@@ -212,7 +220,7 @@ function seekLatestFrame() {
 }
 
 function keepLivePlaying() {
-  if (playbackMode.value !== 'live') return
+  if (playbackMode.value !== 'live' || clipCaptureActive) return
   const element = videoRef.value
   if (!element) return
   seekLatestFrame()
@@ -535,14 +543,48 @@ watch(() => props.robotId, () => {
   setBrowserAudioMuted(true)
 })
 
+async function captureSnapshotAndClip({
+  durationMs = SNAPSHOT_CLIP_DURATION_MS,
+  onSnapshot,
+} = {}) {
+  const element = videoRef.value
+  if (clipCaptureActive) throw new Error('正在截取视频，请稍候')
+  if (!element || !hasStream.value || streamLoading.value) {
+    throw new Error('当前没有可截图的画面')
+  }
+  clipCaptureActive = true
+  stopLiveGuard()
+  const wasPaused = element.paused
+  const stamp = captureFileStamp()
+  try {
+    const imageBlob = await captureVideoFrameBlob(element)
+    onSnapshot?.({ imageBlob, stamp })
+    if (wasPaused) await element.play().catch(() => {})
+    const videoBlob = await recordVideoElementClip(element, {
+      durationMs,
+      onRecorder: (recorder) => { clipCaptureRecorder = recorder },
+    })
+    if (wasPaused) element.pause()
+    return { imageBlob, videoBlob, stamp }
+  } finally {
+    clipCaptureRecorder = null
+    clipCaptureActive = false
+    if (playbackMode.value === 'live') startLiveGuard()
+  }
+}
+
 onMounted(() => { void setupPlayer() })
 onBeforeUnmount(() => {
   clearAudioReconnectTimer()
   clearStreamRetryTimer()
+  if (clipCaptureRecorder && clipCaptureRecorder.state !== 'inactive') {
+    clipCaptureRecorder.stop()
+  }
+  clipCaptureActive = false
   destroyPlayers()
 })
 
-defineExpose({ returnToLive })
+defineExpose({ returnToLive, captureSnapshotAndClip })
 </script>
 
 <template>

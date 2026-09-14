@@ -91,6 +91,7 @@ import {
   isLatestTrajectoryResponse,
 } from '../utils/guardDutySpeed'
 import { guardDutyExecutionReason } from '../utils/guardDutyPauseReason'
+import { captureExtensionForMime, downloadBlob } from '../utils/liveVideoCapture'
 
 const overview = ref(null)
 const robots = ref([])
@@ -133,6 +134,9 @@ const liveSpeechSending = ref(false)
 const liveRecording = ref(false)
 const liveRecordingSeconds = ref(0)
 const streamUnavailable = ref(false)
+const livePlayerRef = ref(null)
+const snapshotBusy = ref(false)
+const snapshotCountdown = ref(0)
 const { toastMessage, toastVariant, visible, showToast } = useToast()
 const router = useRouter()
 
@@ -154,6 +158,7 @@ let liveRecordingStream = null
 let liveRecordingTimer = null
 let liveRecordingChunks = []
 let trajectoryRequestGeneration = 0
+let snapshotCountdownTimer = null
 
 const failedCommandStatuses = new Set(['rejected', 'failed', 'cancelled', 'timed_out', 'expired'])
 const activeCommandStatuses = new Set(['created', 'published', 'accepted', 'executing'])
@@ -853,7 +858,7 @@ async function initializeLocalization() {
       mapId,
       robotId: robot.id,
       mapVersion,
-      sceneScope: routeData.value?.scene_scope || mapData.value?.scene_scope || 'indoor',
+      sceneScope: mapData.value?.scene_scope || routeData.value?.scene_scope || 'indoor',
       coordinateMode: mapData.value?.coordinate_mode || '',
       waypoints: routeData.value?.waypoints || [],
       onProgress: message => { localizationInitMessage.value = message },
@@ -1610,6 +1615,41 @@ function handleStreamError() {
   }, 8000)
 }
 
+function clearSnapshotCountdown() {
+  if (!snapshotCountdownTimer) return
+  window.clearInterval(snapshotCountdownTimer)
+  snapshotCountdownTimer = null
+  snapshotCountdown.value = 0
+}
+
+async function captureVideoSnapshot() {
+  if (snapshotBusy.value) return
+  const player = livePlayerRef.value
+  if (!player?.captureSnapshotAndClip) {
+    showToast('当前没有可截图的画面', { variant: 'alert' })
+    return
+  }
+  snapshotBusy.value = true
+  snapshotCountdown.value = 3
+  snapshotCountdownTimer = window.setInterval(() => {
+    snapshotCountdown.value = Math.max(0, snapshotCountdown.value - 1)
+  }, 1000)
+  try {
+    const { videoBlob, stamp } = await player.captureSnapshotAndClip({
+      onSnapshot: ({ imageBlob, stamp: imageStamp }) => {
+        downloadBlob(imageBlob, `${imageStamp}.jpg`)
+      },
+    })
+    downloadBlob(videoBlob, `${stamp}.${captureExtensionForMime(videoBlob.type)}`)
+    showToast('已保存截图和3秒视频')
+  } catch (error) {
+    showToast(error.message || '视频截图失败', { variant: 'alert' })
+  } finally {
+    clearSnapshotCountdown()
+    snapshotBusy.value = false
+  }
+}
+
 onMounted(async () => {
   let loaded = false
   try {
@@ -1647,6 +1687,7 @@ onBeforeUnmount(() => {
     liveMediaRecorder.stop()
   }
   cleanupLiveRecorder()
+  clearSnapshotCountdown()
   alertEventSource?.close()
 })
 
@@ -1674,6 +1715,7 @@ watch(playUrlKey, () => {
         <section class="guard-video-panel">
           <div class="guard-video-stage">
             <LiveVideoPlayer
+              ref="livePlayerRef"
               :play-urls="playUrls"
               :robot-id="latestRobot?.id"
               :available="hasStream"
@@ -1694,6 +1736,15 @@ watch(playUrlKey, () => {
                   <strong>{{ latestRobot?.name || latestRobot?.code || '机器狗' }}</strong>
                   <span>{{ latestRobot?.location || '位置未知' }}</span>
                 </div>
+                <button
+                  v-if="hasStream"
+                  type="button"
+                  class="guard-snapshot"
+                  :disabled="snapshotBusy || dataLoading"
+                  @click="captureVideoSnapshot"
+                >
+                  {{ snapshotBusy ? `截取中 ${snapshotCountdown}s` : '视频截图' }}
+                </button>
               </template>
             </LiveVideoPlayer>
           </div>
@@ -1962,6 +2013,8 @@ watch(playUrlKey, () => {
 .guard-video-empty span { color: #9fb0ba; font-size: 13px; }
 .guard-video-label { position: absolute; left: 18px; top: 18px; display: grid; gap: 4px; padding: 10px 12px; color: #fff; background: rgba(12, 25, 34, .78); }
 .guard-video-label span { color: #c5d1d8; font-size: 13px; }
+.guard-snapshot { position: absolute; z-index: 12; top: 68px; right: 18px; min-height: 42px; padding: 0 16px; border: 1px solid rgba(255, 255, 255, .4); color: #fff; background: rgba(10, 29, 41, .82); font: inherit; font-weight: 800; white-space: nowrap; cursor: pointer; }
+.guard-snapshot:disabled { cursor: wait; opacity: .72; }
 .guard-listen-toggle { position: absolute; top: 18px; right: 18px; min-height: 42px; padding: 0 16px; border: 1px solid rgba(255, 255, 255, .4); color: #fff; background: rgba(10, 29, 41, .82); font: inherit; font-weight: 800; cursor: pointer; }
 .guard-listen-toggle.active { border-color: #52d99c; background: rgba(16, 110, 73, .9); }
 .guard-playback-controls { position: absolute; top: 18px; left: 50%; z-index: 2; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 9px; background: rgba(10, 29, 41, .82); transform: translateX(-50%); }
@@ -2218,6 +2271,15 @@ watch(playUrlKey, () => {
 }
 :global([data-theme="dark"] .guard-page .guard-route-summary > div > span) {
   color: rgba(255, 255, 255, .82);
+}
+@media (max-width: 720px) {
+  .guard-snapshot {
+    top: 56px;
+    right: 12px;
+    min-height: 36px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
 }
 @media (min-width: 981px) {
   .guard-video-label {
@@ -2543,7 +2605,8 @@ watch(playUrlKey, () => {
   .guard-alert-actions > button,
   .guard-live-text-send,
   .guard-live-microphone button,
-  .guard-playback-controls button { min-height: 44px; }
+  .guard-playback-controls button,
+  .guard-snapshot { min-height: 44px; }
   .guard-map-stage, .guard-map-empty { min-height: 300px; }
 }
 @media (min-width: 1200px) and (max-width: 2048px) and (min-height: 900px) and (max-height: 1280px) and (orientation: landscape) {
@@ -2555,7 +2618,8 @@ watch(playUrlKey, () => {
   .guard-primary,
   .guard-secondary,
   .guard-danger,
-  .guard-initialize {
+  .guard-initialize,
+  .guard-snapshot {
     min-height: 44px;
   }
 }
@@ -2575,5 +2639,6 @@ watch(playUrlKey, () => {
   .guard-loop-inline .guard-runtime-grid > div:nth-child(odd) { border-right: 1px solid #e5eaed; }
   .guard-loop-inline .guard-runtime-status { grid-column: 1 / -1; border-right: 0; border-bottom: 0; }
   .guard-playback-controls { top: 70px; white-space: nowrap; }
+  .guard-snapshot { top: 56px; right: 12px; min-height: 36px; padding: 0 10px; font-size: 12px; }
 }
 </style>

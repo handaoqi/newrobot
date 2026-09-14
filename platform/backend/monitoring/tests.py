@@ -152,6 +152,7 @@ class MonitoringApiTests(TestCase):
         self.authenticate()
         robot = Robot.objects.first()
         before_count = InspectionEvent.objects.count()
+        before_alerts = robot.today_alerts
         response = self.client.post(
             "/api/telemetry/ingest/",
             {
@@ -233,6 +234,12 @@ class MonitoringApiTests(TestCase):
         self.assertEqual(second_response.status_code, 201)
         self.assertEqual(second_response.data["audio_commands_queued"], [])
         self.assertEqual(RobotCommand.objects.filter(payload__source="vision_bicycle_auto").count(), 1)
+        self.assertEqual(InspectionEvent.objects.count(), before_count + 1)
+        event = InspectionEvent.objects.order_by("-created_at").first()
+        self.assertEqual(event.raw_detection["alert_aggregation"]["merged_reports"], 2)
+        self.assertEqual(event.raw_detection["alert_aggregation"]["cooldown_seconds"], 10)
+        robot.refresh_from_db()
+        self.assertEqual(robot.today_alerts, before_alerts + 1)
         synthesize_speech.assert_called_once()
 
     def test_telemetry_ingest_does_not_register_non_bicycle_detection(self):

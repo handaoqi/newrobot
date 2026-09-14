@@ -156,9 +156,71 @@ class CommandProcessor:
                 # Initialization can actively relocalize and may take up to 90s.
                 # Persist and publish the acceptance first so an Edge restart in
                 # that window cannot leave the center stuck in `dispatching`.
-                if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
-                    self.task_executor.initialize_before_navigation()
-                self.task_executor.launch_prepared_task()
+                set_progress = getattr(
+                    self.localization_adapter, "set_attempt_progress_callback", None
+                )
+                try:
+                    if callable(set_progress):
+                        set_progress(
+                            lambda payload: self._emit_command_progress(
+                                envelope, started_at, payload
+                            )
+                        )
+                    if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
+                        self.task_executor.initialize_before_navigation()
+                finally:
+                    if callable(set_progress):
+                        set_progress(None)
+                navigation_started_at = now_iso()
+                self._emit_command_progress(
+                    envelope,
+                    started_at,
+                    {
+                        "state": "running",
+                        "selected_stage": "navigation_start",
+                        "navigation_start": {
+                            "status": "starting",
+                            "started_at": navigation_started_at,
+                            "updated_at": navigation_started_at,
+                        },
+                    },
+                )
+                try:
+                    self.task_executor.launch_prepared_task()
+                except Exception as exc:
+                    navigation_failed_at = now_iso()
+                    self._emit_command_progress(
+                        envelope,
+                        started_at,
+                        {
+                            "state": "failed",
+                            "selected_stage": "navigation_start",
+                            "navigation_start": {
+                                "status": "failed",
+                                "started_at": navigation_started_at,
+                                "updated_at": navigation_failed_at,
+                                "finished_at": navigation_failed_at,
+                                "error_code": str(getattr(exc, "code", "") or "NAVIGATION_START_FAILED"),
+                                "error_message": str(getattr(exc, "message", "") or exc),
+                            },
+                        },
+                    )
+                    raise
+                navigation_finished_at = now_iso()
+                self._emit_command_progress(
+                    envelope,
+                    started_at,
+                    {
+                        "state": "accepted",
+                        "selected_stage": "navigation_start",
+                        "navigation_start": {
+                            "status": "accepted",
+                            "started_at": navigation_started_at,
+                            "updated_at": navigation_finished_at,
+                            "finished_at": navigation_finished_at,
+                        },
+                    },
+                )
             if result:
                 self.store.save_command_result(command_id, result)
                 self.publish_result(command_id, result)

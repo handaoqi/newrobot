@@ -79,7 +79,7 @@ test('saving a route prepares its map, localization and navigation stack', () =>
   assert.doesNotMatch(saveHandler, /await activateRouteMap\(/)
   assert.match(saveHandler, /beginLocalizationAttemptSession\(\{ phase: 'transfer', commandType: 'map\.activate' \}\)/)
   assert.match(saveHandler, /onCommand: event => applyLocalizationAttemptCommand\(event\.command, event\)/)
-  assert.match(saveHandler, /sceneScope: routeForm\.value\.scene_scope/)
+  assert.match(saveHandler, /sceneScope: selectedMap\.value\?\.scene_scope \|\| routeForm\.value\.scene_scope/)
   assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
 })
 

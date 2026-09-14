@@ -114,7 +114,6 @@ RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES = frozenset({
     "RTK_INITIAL_POSE_TIMEOUT",
     "RTK_POSE_UNAVAILABLE",
     "RTK_INITIAL_POSE_NOT_CONVERGED",
-    "LIO_HANDOFF_TIMEOUT",
 })
 # Outdoor reverse/start checks keep a looser LIO envelope while RTK performs
 # the authoritative click check. Arrival verdicts use configured tolerances.
@@ -606,8 +605,11 @@ class TaskExecutor:
         ):
             self._cancel_bt_recovery_lease_timeout(generation)
             return False
+        # Lease timeout exists for a lost BT RELEASE, not to abort spin/backup.
+        # Forcing zero velocity here cancelled the only motion that can leave
+        # an obstacle, then the next recovery acquired the same frozen state.
         stop_motion = getattr(self.navigation, "stop_motion", None)
-        if callable(stop_motion):
+        if trigger != "lease_timeout" and callable(stop_motion):
             stop_motion()
         is_stopped = getattr(self.navigation, "is_robot_stopped", None)
         if callable(is_stopped):
@@ -1738,12 +1740,12 @@ class TaskExecutor:
             }
         constraints = constraints_from_manifest(
             manifest,
-            requested_scene_scope=str(route.get("scene_scope") or map_info.get("scene_scope") or ""),
+            requested_scene_scope=str(map_info.get("scene_scope") or route.get("scene_scope") or ""),
         )
         try:
             validate_route_against_map(
                 constraints,
-                scene_scope=str(route.get("scene_scope") or constraints.get("scene_scope") or ""),
+                scene_scope=str(map_info.get("scene_scope") or constraints.get("scene_scope") or ""),
                 waypoints=route.get("waypoints") or [],
             )
         except MapConstraintError as exc:
@@ -2010,15 +2012,12 @@ class TaskExecutor:
         outdoor = self._outdoor_navigation_profile()
         points = self.context.route_snapshot.get("waypoints") or []
         if outdoor:
-            if self._rtk_good_for_navigation():
-                seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
-                if not callable(seed_rtk):
-                    raise ProtocolError(
-                        "INITIALIZATION_FAILED",
-                        "fixed RTK is available but GPS initialization is unavailable",
-                    )
+            seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
+            if callable(seed_rtk):
                 try:
-                    LOGGER.info("startup localization verifying and seeding fixed RTK before FAST-LIO handoff")
+                    LOGGER.info(
+                        "startup localization checking live RTK before progressive fallback"
+                    )
                     seed_rtk()
                     return
                 except ProtocolError as exc:
@@ -2035,9 +2034,8 @@ class TaskExecutor:
                         exc,
                     )
             else:
-                LOGGER.info(
-                    "startup RTK is not a usable fixed position-and-heading solution; "
-                    "skipping manual/trusted seed and using progressive localization"
+                LOGGER.warning(
+                    "startup RTK verification API is unavailable; using progressive localization"
                 )
             self._progressive_startup_relocalize(points)
             return
@@ -4994,6 +4992,17 @@ class TaskExecutor:
                     "recovery_episode_id": recovery_episode_id,
                     "attempt": int(attempt),
                 }
+            if self.context.state == "accepted":
+                return {
+                    "final_task_state": "accepted",
+                    "state_version": self.context.state_version,
+                    "recovery_action": "task_start_initializing",
+                    "recovery_status": "in_progress",
+                    "reason_code": "TASK_START_INITIALIZING",
+                    "reason_message": "启动指令仍在初始化，等待导航开始后再恢复",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
 
             # A localization-loss pause can race a Nav2/BT velocity update.
             # Zeroing /cmd_vel alone is not sufficient: an uncancelled goal
@@ -5578,13 +5587,12 @@ class TaskExecutor:
                 # switching to the stationary NDT/RTK policy, otherwise the
                 # first correction sample can be taken while the body is
                 # still moving and create an avoidable TF correction.
-                self._emit_idempotent(
-                    "task.arrival_pending_settle",
-                    event_type_key="arrival_pending_settle",
-                    waypoint_id=str(reached_waypoint.get("waypoint_id") or reached_index),
-                    message="Nav2已到目标附近，等待停车稳定",
-                )
-                if not self._hold_final_pose():
+                waypoint_id = str(reached_waypoint.get("waypoint_id") or reached_index)
+                if not self._hold_final_pose(
+                    stage_callback=lambda stage, details: self._emit_arrival_stop_stage(
+                        reached_index, waypoint_id, stage, details
+                    )
+                ):
                     self._emit_safe_hold(
                         "ARRIVAL_STOP_NOT_CONFIRMED",
                         "Nav2 到点后未确认零速，禁止进入定位校正与到点验收",
@@ -6751,8 +6759,8 @@ class TaskExecutor:
             return False
         map_info = self.context.route_snapshot.get("map") or {}
         scene_scope = str(
-            self.context.route_snapshot.get("scene_scope")
-            or map_info.get("scene_scope")
+            map_info.get("scene_scope")
+            or self.context.route_snapshot.get("scene_scope")
             or ""
         ).lower()
         coordinate_mode = str(map_info.get("coordinate_mode") or "").lower()
@@ -6991,7 +6999,11 @@ class TaskExecutor:
                 self._obstacle_progress_anchor_at = None
             self._send_from(self.context.current_waypoint_index)
 
-    def _hold_final_pose(self, timeout_seconds: float | None = None) -> bool:
+    def _hold_final_pose(
+        self,
+        timeout_seconds: float | None = None,
+        stage_callback: Callable[[str, dict], None] | None = None,
+    ) -> bool:
         """Stop the dog before measuring the last waypoint.
 
         Nav2's checker does not require zero velocity, and a quadruped still
@@ -7004,11 +7016,34 @@ class TaskExecutor:
                 if self._outdoor_navigation_profile()
                 else HOLD_FINAL_POSE_TIMEOUT_SECONDS
             )
+        started_at = time.monotonic()
+
+        def report(stage: str, **details) -> None:
+            if not callable(stage_callback):
+                return
+            try:
+                stage_callback(
+                    stage,
+                    {
+                        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                        "stop_confirmation_seconds": self.stop_confirmation_seconds,
+                        "timeout_seconds": timeout_seconds,
+                        **details,
+                    },
+                )
+            except Exception:
+                # Stage reporting is diagnostic only; a delivery failure must
+                # never weaken the parking gate.
+                LOGGER.warning("failed to report arrival stop stage", exc_info=True)
+
+        report("nav2_stopping")
         stop_motion = getattr(self.navigation, "stop_motion", None)
         if callable(stop_motion):
             stop_motion()
+        report("zero_confirming")
         is_stopped = getattr(self.navigation, "is_robot_stopped", None)
         if not callable(is_stopped):
+            report("zero_confirmed", confirmation_source="adapter_unavailable")
             return True
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         while time.monotonic() <= deadline:
@@ -7019,14 +7054,39 @@ class TaskExecutor:
                 except TypeError:
                     stopped = bool(is_stopped())
                 if stopped:
+                    report("zero_confirmed", confirmation_source="collision_monitor")
                     return True
             except Exception:
                 LOGGER.exception("robot stop confirmation failed")
+                report("zero_timeout", failure_reason="confirmation_exception")
                 return False
             if callable(stop_motion):
                 stop_motion()
             time.sleep(0.05)
+        report("zero_timeout", failure_reason="confirmation_timeout")
         return False
+
+    def _emit_arrival_stop_stage(
+        self, reached_index: int, waypoint_id: str, stage: str, details: dict
+    ) -> None:
+        messages = {
+            "nav2_stopping": "Nav2 已到目标附近，等待 Nav2 控制输出停止",
+            "zero_confirming": "Nav2 控制输出已停止，正在连续确认零速 1 秒",
+            "zero_confirmed": "零速已连续确认 1 秒，进入静止定位校正",
+            "zero_timeout": "零速确认超时，禁止进入定位校正与到点验收",
+        }
+        self._emit_idempotent(
+            f"task.arrival_{stage}",
+            event_type_key=f"arrival_{stage}",
+            waypoint_id=waypoint_id,
+            code="ARRIVAL_STOP_CONFIRMATION",
+            message=messages[stage],
+            extra={
+                "arrival_stage": stage,
+                "execution_waypoint_index": reached_index,
+                **details,
+            },
+        )
 
     def _final_pose_error(self) -> tuple[str, str] | None:
         if not self.context:

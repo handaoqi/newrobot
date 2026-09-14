@@ -324,7 +324,7 @@ test('timeline does not timestamp future stages and keeps displayed times chrono
   assert.equal(global.finishedAt, null)
 })
 
-test('terminal stages without Edge timestamps remain unrecorded instead of using command completion time', () => {
+test('legacy terminal stages fall back to command timestamps', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-no-synthetic-times',
     command_type: 'nav.relocalize',
@@ -347,12 +347,12 @@ test('terminal stages without Edge timestamps remain unrecorded instead of using
   const origin = timeline.find(item => item.key === 'mapping_origin_bounded')
   const commit = timeline.find(item => item.key === 'best_candidate_commit')
   const navigation = timeline.find(item => item.key === 'navigation_start')
-  assert.equal(origin.startedAt, null)
-  assert.equal(origin.finishedAt, null)
-  assert.equal(commit.startedAt, null)
-  assert.equal(commit.finishedAt, null)
-  assert.equal(navigation.startedAt, null)
-  assert.equal(navigation.finishedAt, null)
+  assert.equal(origin.startedAt, '2026-09-13T12:20:00.000Z')
+  assert.equal(origin.finishedAt, '2026-09-13T12:27:04.000Z')
+  assert.equal(commit.startedAt, '2026-09-13T12:27:04.000Z')
+  assert.equal(commit.finishedAt, '2026-09-13T12:27:04.000Z')
+  assert.equal(navigation.startedAt, '2026-09-13T12:27:04.000Z')
+  assert.equal(navigation.finishedAt, '2026-09-13T12:27:04.000Z')
 })
 
 test('active attempts override a stale waiting stage record', () => {
@@ -614,4 +614,76 @@ test('RTK fixed verification keeps concrete samples, rejection conclusion, and L
     localizationAttemptTimeline(session).find(step => step.key === 'rtk_fixed').detail,
     /结论：RTK 固定解验证通过/,
   )
+})
+
+test('RTK fixed commit stays in its stage and exposes candidate number, NDT metrics, and executor diagnostics', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-rtk-crosscheck',
+    command_type: 'nav.initial_pose',
+    status: 'succeeded',
+    started_at: '2026-09-14T09:00:00.000Z',
+    finished_at: '2026-09-14T09:00:06.000Z',
+    result_payload: {
+      rtk_fixed_committed: true,
+      best_candidate_index: 1,
+      best_candidate_label: 'RTK固定解定位点',
+      best_candidate_seed_pose: { x: 10, y: 2, yaw: 1.6 },
+      best_candidate_ndt: {
+        matching_error: 0.07,
+        inlier_fraction: 0.82,
+        has_converged: true,
+      },
+      best_match_pose: { x: 10.04, y: 2.05, yaw: 1.62 },
+      localization_attempts: {
+        state: 'accepted',
+        rtk_fixed_committed: true,
+        selected_stage: 'rtk_fixed',
+        strategy: ['rtk_fixed'],
+        stages: [{
+          stage: 'rtk_fixed',
+          status: 'accepted',
+          started_at: '2026-09-14T09:00:00.000Z',
+          finished_at: '2026-09-14T09:00:05.000Z',
+          rtk_verification: {
+            verified: true,
+            conclusion_code: 'fixed_rtk_verified',
+            handoff: {
+              status: 'accepted',
+              active_source: 'lio_imu',
+              lio_healthy: true,
+              lio_anchored: true,
+              absolute_stable: true,
+              ros_executor_alive: true,
+              localization_frame_age_seconds: 0.03,
+              anchor_generation: 5,
+            },
+          },
+        }],
+        attempts: [{
+          index: 1,
+          candidate_number: 1,
+          candidate_label: 'RTK固定解定位点',
+          stage: 'rtk_fixed',
+          status: 'qualified',
+          seed_pose: { x: 10, y: 2, yaw: 1.6 },
+          matched_pose: { x: 10.04, y: 2.05, yaw: 1.62 },
+          matching_error: 0.07,
+          inlier_fraction: 0.82,
+          has_converged: true,
+        }],
+      },
+    },
+  })
+
+  assert.equal(session.rtkFixedCommitted, true)
+  assert.equal(session.attempts.length, 1)
+  assert.equal(session.attempts[0].candidateLabel, 'RTK固定解定位点')
+  assert.equal(session.attempts[0].matchingError, 0.07)
+  assert.equal(session.rtkVerification.handoff.rosExecutorAlive, true)
+  assert.equal(session.rtkVerification.handoff.localizationFrameAgeSeconds, 0.03)
+  assert.deepEqual(localizationAttemptTimeline(session).map(step => step.key), [
+    'map_transfer',
+    'localization_bootstrap',
+    'rtk_fixed',
+  ])
 })

@@ -104,7 +104,7 @@ def test_get_remote_parameters_does_not_destroy_client_on_timeout(monkeypatch):
     assert destroyed == []
 
 
-def test_get_remote_parameters_destroys_client_after_completed_call(monkeypatch):
+def test_get_remote_parameters_reuses_client_after_completed_call(monkeypatch):
     monkeypatch.setattr(ros_adapter_module, "ROS_AVAILABLE", True)
     monkeypatch.setattr(ros_adapter_module, "GetParameters", _FakeGetParameters)
     destroyed = []
@@ -114,9 +114,12 @@ def test_get_remote_parameters_destroys_client_after_completed_call(monkeypatch)
     )
 
     result = adapter._get_remote_parameters("/planner_server", ["planner_plugins"])
+    repeated = adapter._get_remote_parameters("/planner_server", ["planner_plugins"])
 
     assert result == {"planner_plugins": "ThetaStar"}
-    assert destroyed == [client]
+    assert repeated == result
+    assert len(client.requests) == 2
+    assert destroyed == []
 
 
 def test_set_remote_parameters_does_not_destroy_client_on_timeout(monkeypatch):
@@ -155,3 +158,22 @@ def test_ros_runtime_keeps_spinning_after_callback_error(monkeypatch):
     runtime.executor = FakeExecutor()
     runtime._spin()
     assert calls["n"] == 2
+
+
+def test_ros_runtime_reports_a_permanently_failed_executor(monkeypatch):
+    monkeypatch.setattr(ros_adapter_module, "rclpy", SimpleNamespace(ok=lambda: True))
+    runtime = object.__new__(RosRuntime)
+    runtime._stopped = threading.Event()
+    runtime._MAX_CONSECUTIVE_SPIN_FAILURES = 2
+    failures = []
+    runtime._unexpected_exit_callback = failures.append
+
+    class FailedExecutor:
+        def spin_once(self, timeout_sec=None):
+            raise RuntimeError("executor wait set is invalid")
+
+    runtime.executor = FailedExecutor()
+    runtime._spin()
+
+    assert failures == ["consecutive_spin_failures:RuntimeError"]
+    assert runtime._stopped.is_set() is False

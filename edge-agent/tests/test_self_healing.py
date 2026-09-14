@@ -58,6 +58,21 @@ def test_outdoor_rtk_transient_loss_never_allows_spin_or_laser_motion():
     assert level_two.action_type == "continue_lio_hold"
 
 
+def test_map_scene_overrides_stale_route_scene_for_self_healing():
+    diagnosis = FaultDiagnoser().diagnose(
+        episode_id="episode",
+        requested_fault="navigation_failed",
+        route_snapshot={
+            "scene_scope": "indoor",
+            "map": {"scene_scope": "outdoor", "coordinate_mode": "rtk_fixed"},
+        },
+        evidence=evidence(),
+    )
+
+    assert diagnosis.scene_mode == "outdoor"
+    assert diagnosis.forbid_spin is True
+
+
 def test_outdoor_hard_loss_uses_linear_feature_search_but_forbids_spin():
     diagnosis = FaultDiagnoser().diagnose(
         episode_id="episode",

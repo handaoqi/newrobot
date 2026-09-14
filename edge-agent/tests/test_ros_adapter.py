@@ -1,6 +1,7 @@
 import math
 import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -643,16 +644,16 @@ def test_fixed_rtk_verification_uses_rtk_self_span_not_lio_drift():
     progress = []
     samples = iter([
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_x": 10.00, "rtk_y": 2.00,
+         "rtk_x": 10.00, "rtk_y": 2.00, "rtk_yaw": 1.62,
          "rtk_drift": {"sample_stamp_ns": 9, "xy_m": 8.0}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_x": 10.00, "rtk_y": 2.00,
+         "rtk_x": 10.00, "rtk_y": 2.00, "rtk_yaw": 1.62,
          "rtk_drift": {"sample_stamp_ns": 10, "xy_m": 8.0}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_x": 10.08, "rtk_y": 2.03,
+         "rtk_x": 10.08, "rtk_y": 2.03, "rtk_yaw": 1.63,
          "rtk_drift": {"sample_stamp_ns": 11, "xy_m": 8.2}},
         {"rtk_usable": True, "rtk_quality": "fixed", "rtk_heading_usable": True,
-         "rtk_x": 10.05, "rtk_y": 2.06,
+         "rtk_x": 10.05, "rtk_y": 2.06, "rtk_yaw": 1.625,
          "rtk_drift": {"sample_stamp_ns": 12, "xy_m": 8.1}},
     ])
     adapter._localization_decision = lambda: next(samples)
@@ -681,7 +682,7 @@ def test_fixed_rtk_verification_uses_rtk_self_span_not_lio_drift():
     assert progress[-1]["verified"] is True
 
 
-def test_fixed_rtk_verification_reports_concrete_rejection_and_timeout():
+def test_fixed_rtk_verification_reports_concrete_rejection_without_waiting_for_timeout():
     adapter = object.__new__(RosAdapter)
     adapter.safety_config = SimpleNamespace(
         localization_rtk_max_drift_m=0.30,
@@ -694,6 +695,7 @@ def test_fixed_rtk_verification_reports_concrete_rejection_and_timeout():
         "rtk_heading_usable": False,
         "rtk_x": 3.2,
         "rtk_y": -1.4,
+        "rtk_yaw": 0.2,
         "rtk_blocked_reason": "fixed_rtk_required",
         "rtk_drift": {"sample_stamp_ns": 20},
     }
@@ -705,7 +707,7 @@ def test_fixed_rtk_verification_reports_concrete_rejection_and_timeout():
 
     assert result["verified"] is False
     assert result["status"] == "rejected"
-    assert result["timed_out"] is True
+    assert result.get("timed_out", False) is False
     assert result["conclusion_code"] == "fixed_quality"
     assert result["last_sample"]["quality"] == "float"
     assert result["last_sample"]["blocked_reason"] == "fixed_rtk_required"
@@ -759,6 +761,171 @@ def test_lio_handoff_accepts_readable_normal_telemetry_status():
 
     assert latest.localization_status == "normal"
     assert decision["handoff_state"] == "ready"
+
+
+@pytest.mark.parametrize("probe_result", [
+    {
+        "status": "qualified",
+        "matching_error": 0.07,
+        "inlier_fraction": 0.82,
+        "has_converged": True,
+        "eligible": True,
+    },
+    {
+        "status": "rejected",
+        "matching_error": 0.80,
+        "inlier_fraction": 0.30,
+        "has_converged": True,
+        "eligible": False,
+        "reject_reason": "ndt_score_above_threshold",
+    },
+    {
+        "status": "rejected",
+        "matching_error": 0.07,
+        "inlier_fraction": 0.82,
+        "has_converged": False,
+        "eligible": False,
+        "reject_reason": "ndt_not_converged",
+    },
+    {
+        "status": "rejected",
+        "matching_error": None,
+        "inlier_fraction": None,
+        "has_converged": None,
+        "eligible": False,
+        "reject_reason": "ndt_sample_unavailable",
+    },
+])
+def test_fixed_rtk_runs_one_numbered_ndt_crosscheck_before_anchor_commit(
+    monkeypatch,
+    probe_result,
+):
+    monkeypatch.setattr(
+        ros_adapter_module,
+        "Trigger",
+        SimpleNamespace(Request=lambda: SimpleNamespace()),
+    )
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_rtk_max_drift_m=0.30,
+        localization_rtk_required_samples=3,
+        localization_handoff_settle_seconds=8.0,
+    )
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._trusted_pose_frozen = False
+    latest = SimpleNamespace(
+        x=10.04,
+        y=2.05,
+        z=0.0,
+        yaw=1.62,
+        localization_status="normal",
+    )
+    adapter.telemetry = SimpleNamespace(
+        latest_pose=lambda: latest,
+        localization_diagnostics=lambda: {},
+    )
+    fixed_decision = {
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+        "rtk_x": 10.05,
+        "rtk_y": 2.06,
+        "rtk_yaw": 1.625,
+        "handoff_anchor_generation": 4,
+        "sample_age_seconds": 0.08,
+    }
+    adapter._localization_decision = lambda: dict(fixed_decision)
+    verification = {
+        "status": "accepted",
+        "verified": True,
+        "started_at": "2026-09-14T09:00:00Z",
+        "conclusion_code": "fixed_rtk_verified",
+        "last_sample": {
+            "quality": "fixed",
+            "usable": True,
+            "heading_usable": True,
+            "map_x": 10.05,
+            "map_y": 2.06,
+            "map_yaw": 1.625,
+        },
+    }
+    adapter._wait_for_verified_fixed_rtk = lambda **_kwargs: dict(verification)
+    events = []
+
+    def probe(seed, generation, **kwargs):
+        events.append(("ndt_probe", kwargs.get("index"), kwargs.get("require_ndt_observation")))
+        has_observation = any(
+            probe_result.get(key) is not None
+            for key in ("matching_error", "inlier_fraction", "has_converged")
+        )
+        candidate = {
+            key: probe_result.get(key)
+            for key in ("matching_error", "inlier_fraction", "has_converged", "eligible", "reject_reason")
+            if key in probe_result
+        }
+        return {
+            "index": 1,
+            "candidate_number": 1,
+            "candidate_label": seed["candidate_label"],
+            "stage": "rtk_fixed",
+            "source": "rtk_ndt_crosscheck",
+            "status": probe_result["status"],
+            "seed_pose": {"x": seed["x"], "y": seed["y"], "z": 0.0, "yaw": seed["yaw"]},
+            "matched_pose": (
+                {"x": 10.04, "y": 2.05, "yaw": 1.62}
+                if has_observation else None
+            ),
+            "matching_error": probe_result.get("matching_error"),
+            "inlier_fraction": probe_result.get("inlier_fraction"),
+            "has_converged": probe_result.get("has_converged"),
+            "stable_frames": 3,
+            "required_stable_frames": 3,
+            "eligible": probe_result["eligible"],
+            "reject_reason": probe_result.get("reject_reason"),
+            "ndt_candidate": ({
+                **candidate,
+                "matched_pose": {"x": 10.04, "y": 2.05, "yaw": 1.62},
+            } if has_observation else None),
+        }
+
+    adapter._probe_localization_seed = probe
+    progress = []
+    adapter._report_localization_attempts = lambda payload, **_kwargs: progress.append(payload)
+
+    class RtkClient:
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, _request):
+            events.append(("rtk_commit", None, None))
+            future = Future()
+            future.set_result(SimpleNamespace(success=True, message="accepted"))
+            return future
+
+    adapter._rtk_initial_pose_client = RtkClient()
+    handoff = {
+        "handoff_anchor_generation": 5,
+        "handoff_state": "ready",
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "lio_anchored": True,
+        "absolute_stable": True,
+        "sample_age_seconds": 0.03,
+    }
+    adapter._wait_for_lio_handoff = lambda **_kwargs: (latest, handoff)
+
+    result = adapter._set_initial_pose_from_rtk_once(30.0, 7)
+
+    assert events == [("ndt_probe", 1, True), ("rtk_commit", None, None)]
+    assert result["source"] == "rtk_fixed"
+    assert result["rtk_fixed_committed"] is True
+    assert result["best_candidate_index"] == 1
+    assert result["best_candidate_label"] == "RTK固定解定位点"
+    assert result["best_candidate_ndt"]["matching_error"] == probe_result.get("matching_error")
+    assert result["ndt_crosscheck_passed"] is probe_result["eligible"]
+    assert len(result["localization_attempts"]["attempts"]) == 1
+    assert result["localization_attempts"]["attempts"][0]["rtk_fixed_committed"] is True
+    assert progress[-1]["state"] == "accepted"
 
 
 def test_active_relocalize_executes_the_one_meter_candidates():
@@ -1428,6 +1595,16 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     assert outdoor_with_obstacles["FollowPath.CostCritic.enabled"] is True
     assert outdoor_with_obstacles["FollowPath.CostCritic.cost_weight"] == 8.0
     assert outdoor_with_obstacles["FollowPath.PathAlignCritic.enabled"] is False
+
+    outdoor_final_with_obstacles = follow_path_patrol_params(
+        final_approach=True,
+        local_obstacles=True,
+        outdoor=True,
+    )
+    assert outdoor_final_with_obstacles["FollowPath.CostCritic.enabled"] is True
+    assert outdoor_final_with_obstacles["FollowPath.vx_min"] == -0.12
+    assert outdoor_final_with_obstacles["FollowPath.PathAlignCritic.enabled"] is False
+    assert outdoor_final_with_obstacles["FollowPath.PreferForwardCritic.enabled"] is False
 
 
 def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(monkeypatch):

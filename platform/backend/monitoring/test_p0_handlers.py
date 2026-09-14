@@ -27,7 +27,7 @@ from .models import (
 from .protocol import ProtocolError
 from .serializers import PatrolLoopSessionSerializer
 from .services.command_service import CommandService
-from .services.task_service import TaskExecutionService
+from .services.task_service import TaskExecutionService, build_route_snapshot
 
 
 class MessageHandlerTests(TestCase):
@@ -101,6 +101,20 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(self.command.status, "succeeded")
         self.assertEqual(self.execution.state, "completed")
 
+    def test_route_snapshot_uses_map_scene_as_localization_authority(self):
+        route = self.execution.task.route
+        route.scene_scope = "indoor"
+        route.save(update_fields=["scene_scope"])
+        route.map_data.scene_scope = "outdoor"
+        route.map_data.coordinate_mode = "rtk_fixed"
+        route.map_data.save(update_fields=["scene_scope", "coordinate_mode"])
+
+        snapshot = build_route_snapshot(route)
+
+        self.assertEqual(snapshot["scene_scope"], "outdoor")
+        self.assertEqual(snapshot["map"]["scene_scope"], "outdoor")
+        self.assertEqual(snapshot["map"]["coordinate_mode"], "rtk_fixed")
+
     def test_command_progress_updates_executing_payload_without_finishing(self):
         ack = self.envelope(
             "command.ack",
@@ -134,13 +148,81 @@ class MessageHandlerTests(TestCase):
             },
         )
         handle_mqtt_message("robots/rx-001/commands/x/progress", progress)
+        navigation_progress = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "status": "executing",
+                "started_at": progress["payload"]["started_at"],
+                "result": {
+                    "selected_stage": "navigation_start",
+                    "navigation_start": {
+                        "status": "accepted",
+                        "started_at": timezone.now().isoformat(),
+                        "finished_at": timezone.now().isoformat(),
+                    },
+                },
+            },
+            sequence=2,
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", navigation_progress)
         self.command.refresh_from_db()
         self.assertEqual(self.command.status, "executing")
         self.assertEqual(
             self.command.result_payload["localization_attempts"]["attempts"][0]["status"],
             "verifying",
         )
+        self.assertEqual(self.command.result_payload["selected_stage"], "navigation_start")
+        self.assertEqual(self.command.result_payload["navigation_start"]["status"], "accepted")
         self.assertIsNone(self.command.finished_at)
+
+    def test_late_start_ack_repairs_center_timeout(self):
+        CommandService.mark_timeout(self.command)
+        self.command.refresh_from_db()
+        self.execution.refresh_from_db()
+        self.assertEqual(self.command.status, "timed_out")
+        self.assertEqual(self.execution.state, "interrupted")
+
+        ack = self.envelope(
+            "command.ack",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "ack": "accepted",
+                "acknowledged_at": timezone.now().isoformat(),
+                "reason_code": None,
+                "reason_message": None,
+                "duplicate": False,
+                "edge_state_version": 2,
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/ack", ack)
+
+        self.command.refresh_from_db()
+        self.execution.refresh_from_db()
+        self.assertEqual(self.command.status, "accepted")
+        self.assertEqual(self.execution.state, "accepted")
+
+    def test_start_progress_repairs_center_timeout(self):
+        CommandService.mark_timeout(self.command)
+        progress = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(self.command.id),
+                "task_execution_id": str(self.execution.id),
+                "status": "executing",
+                "started_at": timezone.now().isoformat(),
+                "edge_state_version": 2,
+                "result": {"localization_attempts": {"state": "running"}},
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", progress)
+
+        self.command.refresh_from_db()
+        self.execution.refresh_from_db()
+        self.assertEqual(self.command.status, "executing")
+        self.assertEqual(self.execution.state, "accepted")
 
     def test_localization_terminal_error_preserves_last_candidate_metrics(self):
         command = CommandService.create_robot_command(
@@ -193,6 +275,108 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(attempt["inlier_fraction"], 0.0)
         self.assertEqual(command.result_payload["localization_status"], "global_search_required")
 
+    def test_localization_progress_and_terminal_deep_merge_stage_candidate_evidence(self):
+        command = CommandService.create_robot_command(
+            robot=self.robot,
+            command_type="nav.initial_pose",
+            payload={"seed_source": "rtk"},
+        )
+        started_at = timezone.now().isoformat()
+        first = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(command.id),
+                "task_execution_id": None,
+                "status": "executing",
+                "started_at": started_at,
+                "result": {
+                    "localization_attempts": {
+                        "state": "running",
+                        "stages": [{
+                            "stage": "rtk_fixed",
+                            "status": "verifying",
+                            "started_at": started_at,
+                            "rtk_verification": {
+                                "sample_count": 3,
+                                "last_sample": {"quality": "fixed", "map_x": 10.0},
+                            },
+                        }],
+                        "attempts": [{
+                            "index": 1,
+                            "candidate_number": 1,
+                            "stage": "rtk_fixed",
+                            "candidate_label": "RTK固定解定位点",
+                            "status": "verifying",
+                            "started_at": started_at,
+                        }],
+                    },
+                },
+            },
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", first)
+        second = self.envelope(
+            "command.progress",
+            {
+                "command_id": str(command.id),
+                "task_execution_id": None,
+                "status": "executing",
+                "started_at": started_at,
+                "result": {
+                    "localization_attempts": {
+                        "stages": [{
+                            "stage": "rtk_fixed",
+                            "status": "accepted",
+                            "finished_at": timezone.now().isoformat(),
+                            "rtk_verification": {
+                                "verified": True,
+                                "handoff": {"ros_executor_alive": True},
+                            },
+                        }],
+                        "attempts": [{
+                            "candidate_number": 1,
+                            "stage": "rtk_fixed",
+                            "status": "qualified",
+                            "matching_error": 0.07,
+                            "inlier_fraction": 0.82,
+                        }],
+                    },
+                },
+            },
+            sequence=2,
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/progress", second)
+        terminal = self.envelope(
+            "command.result",
+            {
+                "command_id": str(command.id),
+                "task_execution_id": None,
+                "status": "succeeded",
+                "started_at": started_at,
+                "finished_at": timezone.now().isoformat(),
+                "error_code": None,
+                "error_message": None,
+                "result": {
+                    "rtk_fixed_committed": True,
+                    "localization_attempts": {"state": "accepted"},
+                },
+            },
+            sequence=3,
+        )
+        handle_mqtt_message("robots/rx-001/commands/x/result", terminal)
+
+        command.refresh_from_db()
+        snapshot = command.result_payload["localization_attempts"]
+        stage = snapshot["stages"][0]
+        attempt = snapshot["attempts"][0]
+        self.assertEqual(stage["started_at"], started_at)
+        self.assertEqual(stage["rtk_verification"]["sample_count"], 3)
+        self.assertIs(stage["rtk_verification"]["verified"], True)
+        self.assertIs(stage["rtk_verification"]["handoff"]["ros_executor_alive"], True)
+        self.assertEqual(attempt["candidate_label"], "RTK固定解定位点")
+        self.assertEqual(attempt["matching_error"], 0.07)
+        self.assertEqual(attempt["inlier_fraction"], 0.82)
+        self.assertIs(command.result_payload["rtk_fixed_committed"], True)
+
     def test_sync_reconciles_edge_terminal_state_and_releases_robot(self):
         result = handle_mqtt_message(
             "robots/rx-001/sync/state",
@@ -233,6 +417,10 @@ class MessageHandlerTests(TestCase):
 
         for sequence, message_type in enumerate(
             (
+                "task.arrival_nav2_stopping",
+                "task.arrival_zero_confirming",
+                "task.arrival_zero_confirmed",
+                "task.arrival_zero_timeout",
                 "task.arrival_check",
                 "task.arrival_confirmed",
                 "task.arrival_heading_aligning",
@@ -265,6 +453,10 @@ class MessageHandlerTests(TestCase):
                 SystemLog.objects.filter(
                     task_execution=self.execution,
                     event_code__in={
+                        "task.arrival_nav2_stopping",
+                        "task.arrival_zero_confirming",
+                        "task.arrival_zero_confirmed",
+                        "task.arrival_zero_timeout",
                         "task.arrival_check",
                         "task.arrival_confirmed",
                         "task.arrival_heading_aligning",
@@ -274,6 +466,10 @@ class MessageHandlerTests(TestCase):
                 ).values_list("event_code", flat=True)
             ),
             {
+                "task.arrival_nav2_stopping",
+                "task.arrival_zero_confirming",
+                "task.arrival_zero_confirmed",
+                "task.arrival_zero_timeout",
                 "task.arrival_check",
                 "task.arrival_confirmed",
                 "task.arrival_heading_aligning",
@@ -284,6 +480,10 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(
             InboundMessage.objects.filter(
                 message_type__in={
+                    "task.arrival_nav2_stopping",
+                    "task.arrival_zero_confirming",
+                    "task.arrival_zero_confirmed",
+                    "task.arrival_zero_timeout",
                     "task.arrival_check",
                     "task.arrival_confirmed",
                     "task.arrival_heading_aligning",
@@ -292,9 +492,9 @@ class MessageHandlerTests(TestCase):
                 },
                 process_status="processed",
             ).count(),
-            5,
+            9,
         )
-        self.assertEqual(publish_task_event.call_count, 5)
+        self.assertEqual(publish_task_event.call_count, 9)
 
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(
@@ -926,6 +1126,36 @@ class MessageHandlerTests(TestCase):
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload))
         handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", payload, sequence=2))
         self.assertEqual(InspectionEvent.objects.filter(event_id=event_id).count(), 1)
+
+    def test_distinct_bicycle_alert_ids_merge_during_cooldown(self):
+        def payload(event_id, confidence):
+            return {
+                "event_id": str(event_id),
+                "event_type": "vehicle_illegal_parking",
+                "severity": "medium",
+                "occurred_at": timezone.now().isoformat(),
+                "task_execution_id": str(self.execution.id),
+                "map_id": "1",
+                "map_version": "v1",
+                "pose": {"frame_id": "map", "x": 1.0, "y": 2.0, "yaw": 0.0},
+                "source": {"component": "bike_bot", "code": "BICYCLE_ALERT"},
+                "detection": {"label": "自行车违停", "class": "bicycle", "confidence": confidence},
+                "attributes": {},
+            }
+
+        first = payload(uuid.uuid4(), 0.8)
+        second = payload(uuid.uuid4(), 0.9)
+        first_result = handle_mqtt_message("robots/rx-001/events/alert", self.envelope("alert.event", first))
+        second_result = handle_mqtt_message(
+            "robots/rx-001/events/alert", self.envelope("alert.event", second, sequence=2)
+        )
+
+        self.assertTrue(first_result["created"])
+        self.assertFalse(second_result["created"])
+        self.assertEqual(InspectionEvent.objects.count(), 1)
+        event = InspectionEvent.objects.get()
+        self.assertEqual(event.raw_detection["alert_aggregation"]["merged_reports"], 2)
+        self.assertEqual(event.raw_detection["alert_aggregation"]["cooldown_seconds"], 10)
 
     def test_non_bicycle_edge_alert_is_not_registered_in_event_center(self):
         event_id = str(uuid.uuid4())

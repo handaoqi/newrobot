@@ -115,7 +115,14 @@ TTS_RATE = os.getenv("TTS_RATE", "-5%")
 TTS_VOLUME = os.getenv("TTS_VOLUME", "+0%")
 BICYCLE_AUTO_SPEECH_ENABLED = os.getenv("BICYCLE_AUTO_SPEECH_ENABLED", "true").lower() == "true"
 BICYCLE_AUTO_SPEECH_TEMPLATE_NAME = os.getenv("BICYCLE_AUTO_SPEECH_TEMPLATE_NAME", "驶离提醒")
-BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS = int(os.getenv("BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS", "30"))
+# One bicycle incident is confirmed on the Edge after three consecutive frames.
+# Keep the cloud-side record and speech gate on the same 10 second window so a
+# retry, restart, or alternate ingress cannot turn that one incident into a
+# burst of operator alerts.
+BICYCLE_ALERT_COOLDOWN_SECONDS = int(os.getenv("BICYCLE_ALERT_COOLDOWN_SECONDS", "10"))
+BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS = int(
+    os.getenv("BICYCLE_AUTO_SPEECH_COOLDOWN_SECONDS", str(BICYCLE_ALERT_COOLDOWN_SECONDS))
+)
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 CSRF_TRUSTED_ORIGINS = [
     item.strip()

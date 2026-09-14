@@ -143,6 +143,7 @@ const localizationInitState = ref('idle')
 const localizationInitMessage = ref('')
 const localizationAttemptSession = ref(null)
 const localizationAttemptCardOpen = ref(true)
+const localizationAttemptClockTick = ref(Date.now())
 const attemptMarkerTick = ref(0)
 const relocalizationMarkers = ref([])
 const lastLocalizationStatus = ref('')
@@ -223,6 +224,7 @@ let navigationStatusRefreshing = false
 let inspectionPointSequence = 0
 let initialSelectionApplied = false
 let attemptMarkerTimer = null
+let localizationAttemptClockTimer = null
 let routeLoadSequence = 0
 
 const GLOBAL_CONTROLLER_OPTIONS = [
@@ -304,6 +306,9 @@ const drillTimelineSummary = computed(() => {
 })
 
 onMounted(async () => {
+  localizationAttemptClockTimer = window.setInterval(() => {
+    localizationAttemptClockTick.value = Date.now()
+  }, 1_000)
   await loadData()
   await navigationPoller.run()
   restoreAttemptSessionFromStatus()
@@ -318,6 +323,10 @@ onBeforeUnmount(() => {
   if (attemptMarkerTimer) {
     clearTimeout(attemptMarkerTimer)
     attemptMarkerTimer = null
+  }
+  if (localizationAttemptClockTimer) {
+    window.clearInterval(localizationAttemptClockTimer)
+    localizationAttemptClockTimer = null
   }
 })
 
@@ -1377,7 +1386,7 @@ function buildRoutePayload() {
     })),
     waypoint_names: waypointNames.value,
     description: routeForm.value.description,
-    scene_scope: mapIsLocalOnly.value ? 'indoor' : (routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor'),
+    scene_scope: mapIsLocalOnly.value ? 'indoor' : (selectedMap.value.scene_scope || routeForm.value.scene_scope || 'indoor'),
     global_controller: DEFAULT_GLOBAL_CONTROLLER,
     record_rosbag: Boolean(routeForm.value.record_rosbag),
   }
@@ -1441,7 +1450,7 @@ async function persistRoute({ createOnly = false } = {}) {
     const result = await activateAndRelocalizeMap({
       mapId: savedRoute.map_data,
       robotId: savedRoute.robot,
-      sceneScope: routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor',
+      sceneScope: selectedMap.value?.scene_scope || routeForm.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value?.coordinate_mode || 'local_only',
       waypoints: payload.waypoints,
       traceId,
@@ -2010,9 +2019,11 @@ function maybeRegisterAttemptRelocalizationMarker(session) {
     commandId,
     candidateNumber: session.bestCandidateIndex,
     candidateLabel: session.bestCandidateLabel,
-    verification: session.rtkDrift?.verified
+    verification: session.rtkFixedCommitted
+      ? 'RTK固定解已验证并提交'
+      : (session.rtkDrift?.verified
       ? `RTK漂移 ${formatAttemptMetric(session.rtkDrift.xy_m)}m`
-      : `NDT ${formatAttemptMetric(session.bestCandidateNdt?.matching_error ?? session.bestNdtCandidate?.matching_error)} < 0.01`,
+      : `NDT ${formatAttemptMetric(session.bestCandidateNdt?.matching_error ?? session.bestNdtCandidate?.matching_error)} < 0.01`),
   })
 }
 
@@ -2043,7 +2054,9 @@ function localizationAttemptProgressText(session) {
   const committingAttempt = (session?.attempts || []).find(attempt => attempt.status === 'committing')
   if (session?.globalSearchStarted) return '全局关键帧匹配阶段'
   if (session?.commandType === 'nav.initial_pose') {
-    return session?.source === 'rtk' ? 'RTK 固定解验证阶段' : '正在验证手选初始位姿'
+    return session?.rtkVerification || ['rtk', 'rtk_fixed'].includes(session?.source)
+      ? 'RTK 固定解质量验证与定点 NDT 交叉验证'
+      : '正在验证手选初始位姿'
   }
   if (candidateCount <= 0) return '正在准备定位候选列表'
   if (activeAttempt) {
@@ -2129,7 +2142,7 @@ async function initializeLocalization() {
       mapId: selectedMap.value?.id,
       robotId,
       mapVersion: selectedMapVersion(),
-      sceneScope: routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor',
+      sceneScope: selectedMap.value?.scene_scope || routeForm.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value?.coordinate_mode || '',
       waypoints: waypoints.value.map(point => {
         const normalized = normalizeStoredWaypoint(point)
@@ -2207,7 +2220,7 @@ async function activeRelocalize() {
   beginLocalizationAttemptSession({ phase: 'localization', commandType: 'nav.relocalize' })
   navError.value = ''
   try {
-    const sceneScope = routeForm.value.scene_scope || selectedMap.value?.scene_scope || 'indoor'
+    const sceneScope = selectedMap.value?.scene_scope || routeForm.value.scene_scope || 'indoor'
     const coordinateMode = selectedMap.value?.coordinate_mode || ''
     // Active relocalization deliberately uses the same source-selection and
     // candidate order as map activation and initial setup.  A manually
@@ -2328,7 +2341,7 @@ async function handleActivateSelectedMap() {
       mapId: selectedMap.value.id,
       robotId,
       mapVersion: selectedMapVersion(),
-      sceneScope: routeForm.value.scene_scope || selectedMap.value.scene_scope || 'indoor',
+      sceneScope: selectedMap.value.scene_scope || routeForm.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value.coordinate_mode || 'local_only',
       waypoints: waypoints.value,
       traceId,
@@ -2520,6 +2533,16 @@ function formatDateTime(value) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return String(value)
   return formatClock(date)
+}
+
+function formatLocalizationStageDuration(step) {
+  localizationAttemptClockTick.value
+  const startedAt = Date.parse(step?.startedAt || '')
+  if (!Number.isFinite(startedAt)) return ''
+  const finishedAt = Date.parse(step?.finishedAt || '')
+  const end = Number.isFinite(finishedAt) ? finishedAt : Date.now()
+  const duration = formatDrillElapsed(Math.max(0, end - startedAt) / 1000)
+  return Number.isFinite(finishedAt) ? `耗时 ${duration}` : `已用 ${duration}`
 }
 
 function formatDateTimeWithAge(value) {
@@ -3711,14 +3734,17 @@ async function handleDeleteRoute(route) {
                     · LIO {{ localizationAttemptSession.rtkVerification.handoff.lioHealthy ? '健康' : '未健康' }}
                     · 锚点 {{ localizationAttemptSession.rtkVerification.handoff.lioAnchored ? '已建立' : '未建立' }}
                     · 绝对稳定 {{ localizationAttemptSession.rtkVerification.handoff.absoluteStable ? '是' : '否' }}
+                    · ROS执行器 {{ localizationAttemptSession.rtkVerification.handoff.rosExecutorAlive === false ? '已退出' : (localizationAttemptSession.rtkVerification.handoff.rosExecutorAlive === true ? '运行中' : '—') }}
+                    · 定位帧年龄 {{ formatAttemptMetric(localizationAttemptSession.rtkVerification.handoff.localizationFrameAgeSeconds, 2) }} s
+                    <span v-if="localizationAttemptSession.rtkVerification.handoff.failureReason">· {{ localizationAttemptSession.rtkVerification.handoff.failureReason }}</span>
                   </p>
                 </div>
                 <div
                   v-if="localizationAttemptSession.bestNdtCandidate || localizationAttemptSession.bestCandidateIndex != null"
                   class="localization-best-candidate"
-                  :class="localizationAttemptSession.bestNdtCommitted ? 'committed' : 'pending'"
+                  :class="(localizationAttemptSession.bestNdtCommitted || localizationAttemptSession.rtkFixedCommitted) ? 'committed' : 'pending'"
                 >
-                  <strong>{{ localizationAttemptSession.bestNdtCommitted ? (localizationAttemptSession.bestCandidateHandoffPending ? '最优NDT已提交，FAST-LIO接管失败' : '已提交最优定位结果') : '最优定位候选' }}</strong>
+                  <strong>{{ localizationAttemptSession.rtkFixedCommitted ? 'RTK固定解定位结果已提交' : (localizationAttemptSession.bestNdtCommitted ? (localizationAttemptSession.bestCandidateHandoffPending ? '最优NDT已提交，FAST-LIO接管失败' : '已提交最优定位结果') : '最优定位候选') }}</strong>
                   <span v-if="localizationAttemptSession.bestCandidateIndex != null">
                     候选 #{{ localizationAttemptSession.bestCandidateIndex }}
                   </span>
@@ -3751,8 +3777,9 @@ async function handleDeleteRoute(route) {
                       <small>{{ step.detail }}</small>
                       <div v-if="step.startedAt || step.finishedAt" class="localization-timeline-time">
                         开始 {{ formatDateTime(step.startedAt) }} · 完成 {{ formatDateTime(step.finishedAt) }}
+                        <em v-if="formatLocalizationStageDuration(step)"> · {{ formatLocalizationStageDuration(step) }}</em>
                       </div>
-                      <div v-else class="localization-timeline-time">阶段时间未上报</div>
+                      <div v-else-if="step.status !== 'waiting'" class="localization-timeline-time">阶段时间未上报</div>
                       <div v-if="step.attempts.length" class="localization-timeline-attempts">
                         <div
                           v-for="attempt in step.attempts"

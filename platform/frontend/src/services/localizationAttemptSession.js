@@ -13,6 +13,7 @@ export const ATTEMPT_STATUS_LABELS = {
 export const LOCALIZATION_ATTEMPT_COMMAND_TYPES = new Set([
   'nav.initial_pose',
   'nav.relocalize',
+  'task.start',
 ])
 
 export const ATTEMPT_MARKER_VISIBLE_MS = 60_000
@@ -54,6 +55,8 @@ const RTK_VERIFICATION_CONCLUSION_LABELS = {
   fixed_quality: 'RTK 不是固定解',
   heading_usable: '双天线航向不可用或质量不合格',
   map_position_finite: 'RTK 无有效地图坐标',
+  map_heading_finite: 'RTK 无有效地图航向',
+  rtk_lost_before_commit: '提交前 RTK 固定解失效',
   rtk_self_span_above_threshold: 'RTK 位置稳定跨度超过门限',
 }
 
@@ -62,13 +65,14 @@ const RTK_VERIFICATION_REASON_LABELS = {
   fixed_quality: '不是固定解',
   heading_usable: '航向不可用',
   map_position_finite: '地图坐标无效',
+  map_heading_finite: '地图航向无效',
   rtk_self_span_above_threshold: '位置稳定跨度超限',
 }
 
 const TIMELINE_STAGE_META = {
   map_transfer: { title: '地图下发', detail: '确认目标地图已传输并应用到机器狗' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
-  rtk_fixed: { title: 'RTK 固定解验证', detail: '验证固定解、双天线航向与 RTK 自身位置稳定性' },
+  rtk_fixed: { title: 'RTK 固定解验证与定点 NDT', detail: '验证固定解后，在 RTK 定位点执行一次 NDT 交叉验证并提交锚点' },
   last_trusted: { title: '可信位姿候选', detail: '尝试最近一次可信定位位姿' },
   mapping_origin_bounded: { title: '建图原点及周边候选', detail: '原点、航向假设和 0.3/0.6/1.0 m 周边候选' },
   route_waypoints: { title: '手选点/路线航点候选', detail: '逐个验证手选点和路线航点' },
@@ -165,6 +169,16 @@ function normalizeRtkVerification(value) {
         lioHealthy: value.handoff.lio_healthy === true || value.handoff.lioHealthy === true,
         lioAnchored: value.handoff.lio_anchored === true || value.handoff.lioAnchored === true,
         absoluteStable: value.handoff.absolute_stable === true || value.handoff.absoluteStable === true,
+        rosExecutorAlive: typeof (value.handoff.ros_executor_alive ?? value.handoff.rosExecutorAlive) === 'boolean'
+          ? Boolean(value.handoff.ros_executor_alive ?? value.handoff.rosExecutorAlive)
+          : null,
+        localizationFrameAgeSeconds: finiteNumber(
+          value.handoff.localization_frame_age_seconds ?? value.handoff.localizationFrameAgeSeconds,
+        ),
+        anchorGeneration: finiteNumber(
+          value.handoff.anchor_generation ?? value.handoff.anchorGeneration,
+        ),
+        failureReason: value.handoff.handoff_failure_reason || value.handoff.failureReason || '',
       }
     : null
   return {
@@ -353,6 +367,7 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     rtkVerification,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
+    rtkFixedCommitted: Boolean(raw.rtk_fixed_committed ?? result.rtk_fixed_committed),
     strategy: Array.isArray(raw.strategy)
       ? raw.strategy
       : (Array.isArray(result.strategy)
@@ -402,6 +417,7 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
   session.optimalVerified = Boolean(
     session.rtkVerification?.verified
     || session.rtkDrift?.verified
+    || session.rtkFixedCommitted
     || (session.bestNdtCommitted && score !== null && score < 0.01),
   )
   return withAttemptMarkerExpiry(session)
@@ -432,6 +448,7 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     rtkDrift: null,
     rtkVerification: null,
     bestNdtCommitted: false,
+    rtkFixedCommitted: false,
     optimalVerified: false,
     strategy: [],
     stages: [],
@@ -617,6 +634,22 @@ function timelineStageTimes(stageKey, status, record, session) {
     startedAt = firstTimestamp(startedAt, historical?.startedAt)
     finishedAt = firstTimestamp(finishedAt, historical?.finishedAt)
   }
+  const hasStageEvidence = Boolean(
+    record
+    || (stageKey === 'localization_bootstrap' && session?.localizationBootstrap)
+    || (stageKey === 'best_candidate_commit' && (session?.bestNdtCommitted || session?.bestMatchPose))
+    || (stageKey === 'navigation_start' && session?.navigationStart),
+  )
+  if (!startedAt && hasStageEvidence && timelineStatusClass(status) !== 'waiting') {
+    startedAt = firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt)
+  }
+  if (
+    !finishedAt
+    && hasStageEvidence
+    && ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))
+  ) {
+    finishedAt = firstTimestamp(session?.commandFinishedAt)
+  }
   return { startedAt, finishedAt }
 }
 
@@ -711,10 +744,15 @@ export function localizationAttemptTimeline(session) {
     )
   })
 
-  const commitStatus = session.bestNdtCommitted || (commandDone && session.bestMatchPose)
-    ? 'accepted'
-    : (session.bestMatchPose ? 'searching' : 'waiting')
-  add('best_candidate_commit', commitStatus)
+  // The RTK transaction commits its authoritative anchor inside rtk_fixed;
+  // adding a second "提交最优 NDT" node misrepresents the cross-check as the
+  // source of the absolute pose.
+  if (!session.rtkFixedCommitted) {
+    const commitStatus = session.bestNdtCommitted || (commandDone && session.bestMatchPose)
+      ? 'accepted'
+      : (session.bestMatchPose ? 'searching' : 'waiting')
+    add('best_candidate_commit', commitStatus)
+  }
 
   const shouldShowNavigation = session.commandType !== 'nav.initial_pose' || session.navigationStart
   if (shouldShowNavigation) {

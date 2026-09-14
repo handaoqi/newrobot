@@ -67,7 +67,7 @@ class SelfHealingEpisode:
 def normalize_scene_mode(route_snapshot: dict | None) -> str:
     route = route_snapshot or {}
     map_info = route.get("map") or {}
-    scene = str(route.get("scene_scope") or map_info.get("scene_scope") or "indoor").lower()
+    scene = str(map_info.get("scene_scope") or route.get("scene_scope") or "indoor").lower()
     return scene if scene in {"indoor", "outdoor", "transition"} else "indoor"
 
 

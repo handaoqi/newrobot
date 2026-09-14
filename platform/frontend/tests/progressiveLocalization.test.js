@@ -7,6 +7,7 @@ import {
   localizationCommandVerified,
   progressiveLocalizationTimeoutMs,
   rtkFixedForInitialization,
+  rtkInitializationSnapshotState,
   shouldInitializeFromRtk,
 } from '../src/services/progressiveLocalization.js'
 
@@ -24,6 +25,8 @@ test('initialization sends mapping-origin and route-waypoint candidates for prog
     seed_source: 'progressive',
     map_id: 7,
     map_version: 'v7',
+    scene_scope: 'indoor',
+    coordinate_mode: 'local_only',
     waypoints: [
       { x: 1, y: 2, yaw: 0.1 },
       { x: 3, y: 4, yaw: -0.2 },
@@ -191,6 +194,45 @@ test('outdoor RTK failure falls back to quick search with global fallback', asyn
   assert.ok(progress.some(message => message.includes('全局搜索')))
 })
 
+test('FAST-LIO handoff failure remains terminal instead of starting NDT fallback', async () => {
+  const actions = []
+  await assert.rejects(
+    initializeProgressiveLocalization({
+      mapId: 12,
+      robotId: 3,
+      mapVersion: 'v12',
+      sceneScope: 'outdoor',
+      coordinateMode: 'rtk_fixed',
+      dependencies: {
+        activateRouteMap: async () => ({
+          navigationStatus: {
+            status: {
+              localization_quality: {
+                decision: {
+                  rtk_usable: true,
+                  rtk_quality: 'fixed',
+                  rtk_heading_usable: true,
+                },
+              },
+            },
+          },
+        }),
+        sendRobotNavigationCommand: async (_robotId, action) => {
+          actions.push(action)
+          return { id: 'rtk-command', status: 'created' }
+        },
+        waitForRobotCommand: async () => {
+          const error = new Error('FAST-LIO handoff failed')
+          error.command = { error_code: 'LIO_HANDOFF_TIMEOUT' }
+          throw error
+        },
+      },
+    }),
+    /FAST-LIO handoff failed/,
+  )
+  assert.deepEqual(actions, ['initial-pose'])
+})
+
 test('outdoor non-fixed RTK skips the manual RTK command and starts progressive search', async () => {
   const calls = []
   const progress = []
@@ -231,6 +273,29 @@ test('outdoor non-fixed RTK skips the manual RTK command and starts progressive 
   assert.ok(progress.some(message => message.includes('跳过RTK初始位姿')))
 })
 
+test('outdoor map with an empty status snapshot lets Edge verify live RTK first', async () => {
+  const calls = []
+  const result = await initializeProgressiveLocalization({
+    mapId: 12,
+    robotId: 3,
+    mapVersion: 'v12',
+    sceneScope: 'outdoor',
+    coordinateMode: 'rtk_fixed',
+    dependencies: {
+      activateRouteMap: async () => ({ navigationStatus: { status: {} } }),
+      sendRobotNavigationCommand: async (_robotId, action, payload) => {
+        calls.push([action, payload])
+        return { id: 'live-rtk-command', status: 'created' }
+      },
+      waitForRobotCommand: async (_robotId, command) => ({ ...command, status: 'succeeded' }),
+    },
+  })
+
+  assert.deepEqual(calls.map(call => call[0]), ['initial-pose'])
+  assert.equal(calls[0][1].seed_source, 'rtk')
+  assert.equal(result.selectedSource, 'rtk_fixed')
+})
+
 test('RTK initialization needs fixed position and heading evidence from Edge', () => {
   assert.equal(rtkFixedForInitialization({
     status: { localization_quality: { decision: {
@@ -243,6 +308,12 @@ test('RTK initialization needs fixed position and heading evidence from Edge', (
     } } },
   }), false)
   assert.equal(rtkFixedForInitialization({ status: {} }), false)
+  assert.equal(rtkInitializationSnapshotState({ status: {} }), 'unknown')
+  assert.equal(rtkInitializationSnapshotState({
+    status: { localization_quality: { decision: {
+      rtk_usable: true, rtk_quality: 'float', rtk_heading_usable: false,
+    } } },
+  }), 'not_fixed')
 })
 
 test('a successful Edge localization result is authoritative even before telemetry replication', () => {

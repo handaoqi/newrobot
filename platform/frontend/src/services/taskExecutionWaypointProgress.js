@@ -91,6 +91,12 @@ function eventDetail(event) {
   if (Number.isFinite(Number(payload.reapproach_attempts))) {
     arrival.push(`追加靠近 ${Number(payload.reapproach_attempts)} 次`)
   }
+  if (Number.isFinite(Number(payload.stop_confirmation_seconds))) {
+    arrival.push(`连续零速 ${Number(payload.stop_confirmation_seconds).toFixed(1)}s`)
+  }
+  if (Number.isFinite(Number(payload.elapsed_seconds))) {
+    arrival.push(`本阶段 ${Number(payload.elapsed_seconds).toFixed(1)}s`)
+  }
   if (payload.coarse_completed === true) arrival.push('旧策略：按 0.50m 粗范围完成')
   return [
     target ? `目标 ${target}` : '',
@@ -115,6 +121,21 @@ function timelinePresentation(event, execution) {
   if (eventType === 'task.arrival_confirmed') {
     const suffix = event?.payload?.coarse_completed === true ? '（粗范围完成）' : ''
     return { type: 'arrival', title: `${waypointLabel}验收完成${suffix}`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_nav2_stopping') {
+    return { type: 'pause', title: `${waypointLabel}等待 Nav2 停止`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_zero_confirming') {
+    return { type: 'pause', title: `${waypointLabel}零速确认中`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_zero_confirmed') {
+    return { type: 'arrival', title: `${waypointLabel}零速已确认`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_zero_timeout') {
+    return { type: 'error', title: `${waypointLabel}零速确认超时`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_correcting') {
+    return { type: 'pause', title: `${waypointLabel}静止定位校正`, pointName: waypointLabel }
   }
   if (eventType === 'task.pausing') return { type: 'pause', title: '正在暂停预演' }
   if (eventType === 'task.paused') return { type: 'pause', title: '预演已暂停' }

@@ -114,6 +114,42 @@ test('arrival confirmation shows correction mode, three retries and strict radiu
   assert.match(timeline[0].detail, /追加靠近 3 次/)
 })
 
+test('separates Nav2 stop, one-second zero confirmation, and stationary correction', () => {
+  const timeline = buildTaskExecutionTimeline({
+    state: 'running',
+    route_snapshot: { waypoints: [{ map_point_number: 2 }] },
+    events: [
+      event(1, 'task.arrival_nav2_stopping', 4, '2026-09-06T08:00:04+08:00', {
+        execution_waypoint_index: 0,
+        stop_confirmation_seconds: 1,
+        elapsed_seconds: 0,
+      }),
+      event(2, 'task.arrival_zero_confirming', 4, '2026-09-06T08:00:04.5+08:00', {
+        execution_waypoint_index: 0,
+        stop_confirmation_seconds: 1,
+        elapsed_seconds: 0.5,
+      }),
+      event(3, 'task.arrival_zero_confirmed', 4, '2026-09-06T08:00:05.5+08:00', {
+        execution_waypoint_index: 0,
+        stop_confirmation_seconds: 1,
+        elapsed_seconds: 1.5,
+      }),
+      event(4, 'task.arrival_correcting', 4, '2026-09-06T08:00:05.6+08:00', {
+        execution_waypoint_index: 0,
+      }),
+    ],
+  })
+
+  assert.deepEqual(timeline.map(item => item.title), [
+    '2号点等待 Nav2 停止',
+    '2号点零速确认中',
+    '2号点零速已确认',
+    '2号点静止定位校正',
+  ])
+  assert.match(timeline[1].detail, /连续零速 1\.0s/)
+  assert.match(timeline[2].detail, /本阶段 1\.5s/)
+})
+
 test('shows a request failure before an execution exists', () => {
   const timeline = buildTaskExecutionTimeline(null, {
     requestedAt: Date.parse('2026-09-06T08:00:00+08:00'),

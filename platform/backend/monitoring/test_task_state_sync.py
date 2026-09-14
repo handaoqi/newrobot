@@ -164,3 +164,24 @@ class ActiveTaskStateSyncTests(TestCase):
         self.assertEqual(self.execution.state_version, 4)
         self.assertEqual(result["action"], "continue")
         self.assertIs(result["center_timeout_recovered"], False)
+
+    def test_accepted_edge_repairs_interrupted_start_timeout(self):
+        self.execution = TaskExecutionService.transition(
+            self.execution,
+            "interrupted",
+            event_type="task.start.timeout_pending_edge",
+            state_version=4,
+            reason_code="COMMAND_TIMED_OUT",
+            reason_message="启动指令确认超时，等待 Edge 状态对账或强制退出",
+        )
+
+        result = handle_mqtt_message(
+            f"robots/{self.robot.code}/sync/state",
+            self.envelope("accepted", 2),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, "accepted")
+        self.assertIsNone(self.execution.finished_at)
+        self.assertEqual(result["action"], "report_only")
+        self.assertIs(result["center_timeout_recovered"], True)

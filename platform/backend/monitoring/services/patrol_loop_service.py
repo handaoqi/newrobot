@@ -49,6 +49,7 @@ class PatrolLoopService:
     # result cannot be written back to the original command.
     RECOVERY_NAV2_REAPPROACH_TIMEOUT_SECONDS = 35
     RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS = 70
+    RECOVERY_TASK_START_TIMEOUT_SECONDS = 180
     LOOP_ROSBAG_STOP_COMMAND = "diagnostics.nav_rosbag_stop"
 
     @staticmethod
@@ -127,6 +128,8 @@ class PatrolLoopService:
         """Return an action-specific deadline for a terminal command result."""
         if recovery_action == "nav2_reapproach":
             return cls.RECOVERY_NAV2_REAPPROACH_TIMEOUT_SECONDS
+        if recovery_action == "task_start_initializing":
+            return cls.RECOVERY_TASK_START_TIMEOUT_SECONDS
         return cls.RECOVERY_IN_PROGRESS_TIMEOUT_SECONDS
 
     @classmethod
@@ -844,6 +847,15 @@ class PatrolLoopService:
             return session
 
         if session.state == "observing":
+            if execution and execution.state in {"accepted", "running", "resuming"}:
+                cls._clear_recovery_episode(session)
+                return cls._set_state(
+                    session,
+                    "running",
+                    "loop.edge_state_reconciled",
+                    next_action_at=now + timedelta(seconds=1),
+                    payload={"execution_state": execution.state},
+                )
             healthy, code, message = cls._observation_safety(session)
             if not healthy:
                 metadata = cls._metadata(session)
@@ -866,6 +878,23 @@ class PatrolLoopService:
                     )
                 session.next_action_at = now + timedelta(seconds=1)
                 session.save(update_fields=["next_action_at", "updated_at"])
+                return session
+            if (
+                session.recovery_reason_code == "COMMAND_TIMED_OUT"
+                and (execution is None or execution.state == "interrupted")
+            ):
+                if session.observation_started_at is not None:
+                    session.observation_started_at = None
+                    session.save(update_fields=["observation_started_at", "updated_at"])
+                session.next_action_at = now + timedelta(seconds=1)
+                session.save(update_fields=["next_action_at", "updated_at"])
+                cls._event(
+                    session,
+                    "loop.waiting_edge_reconciliation",
+                    key=f"v{session.state_version}:wait_start_ack",
+                    reason_code=session.recovery_reason_code,
+                    reason_message=session.recovery_reason_message,
+                )
                 return session
             if session.observation_started_at is None:
                 session.observation_started_at = now

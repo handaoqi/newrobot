@@ -100,6 +100,74 @@ _POWER_MODE_AUDIT_FIELDS = (
     "charge_stage_detail",
 )
 
+_LOCALIZATION_PROGRESS_COMMAND_TYPES = {
+    "nav.initial_pose",
+    "nav.relocalize",
+    "task.start",
+}
+
+
+def _localization_list_identity(item: dict, kind: str):
+    if kind == "stages":
+        stage = str(item.get("stage") or "")
+        return ("stage", stage) if stage else None
+    number = item.get("candidate_number", item.get("index"))
+    if number is None:
+        return None
+    return (
+        "attempt",
+        str(item.get("stage") or item.get("source") or ""),
+        str(number),
+    )
+
+
+def _merge_localization_list(previous, incoming, kind: str) -> list:
+    previous = previous if isinstance(previous, list) else []
+    incoming = incoming if isinstance(incoming, list) else []
+    merged = [dict(item) if isinstance(item, dict) else item for item in previous]
+    positions = {
+        identity: index
+        for index, item in enumerate(merged)
+        if isinstance(item, dict)
+        for identity in [_localization_list_identity(item, kind)]
+        if identity is not None
+    }
+    for raw_item in incoming:
+        if not isinstance(raw_item, dict):
+            if raw_item not in merged:
+                merged.append(raw_item)
+            continue
+        item = dict(raw_item)
+        identity = _localization_list_identity(item, kind)
+        if identity is None or identity not in positions:
+            if identity is not None:
+                positions[identity] = len(merged)
+            merged.append(item)
+            continue
+        index = positions[identity]
+        merged[index] = _deep_merge_localization_mapping(merged[index], item)
+    return merged
+
+
+def _deep_merge_localization_mapping(previous, incoming) -> dict:
+    previous = previous if isinstance(previous, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    merged = dict(previous)
+    for key, value in incoming.items():
+        old_value = merged.get(key)
+        if isinstance(value, dict) and isinstance(old_value, dict):
+            merged[key] = _deep_merge_localization_mapping(old_value, value)
+        elif key in {"attempts", "stages"} and isinstance(value, list):
+            merged[key] = _merge_localization_list(old_value, value, key)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_localization_command_result(previous, incoming) -> dict:
+    """Retain complete progress evidence when a later packet is partial."""
+    return _deep_merge_localization_mapping(previous, incoming)
+
 
 def _public_media_url(saved_path: str) -> str:
     base_url = str(getattr(settings, "PUBLIC_BASE_URL", "") or "").rstrip("/")
@@ -627,16 +695,34 @@ def _handle_command_ack(envelope: MessageEnvelope, robot: Robot) -> dict:
     execution = command.task_execution
     if execution and command.command_type == "task.start":
         target = "accepted" if accepted else "rejected"
-        TaskExecutionService.transition(
-            execution,
-            target,
-            event_type="command.ack",
-            state_version=int(payload.get("edge_state_version") or execution.state_version + 1),
-            occurred_at=command.acknowledged_at,
-            reason_code=command.ack_reason_code,
-            reason_message=command.ack_reason_message,
-            payload=payload,
-        )
+        try:
+            edge_version = int(payload.get("edge_state_version") or execution.state_version + 1)
+        except (TypeError, ValueError):
+            edge_version = execution.state_version + 1
+        if (
+            accepted
+            and execution.state in {"timed_out", "interrupted"}
+            and execution.failure_code == "COMMAND_TIMED_OUT"
+        ):
+            execution = TaskExecutionService.reconcile_edge_active_after_center_timeout(
+                execution,
+                "accepted",
+                edge_state_version=edge_version,
+                reason_code=command.ack_reason_code or "EDGE_SYNC_ACTIVE",
+                reason_message=command.ack_reason_message or "云边状态对账：设备端已接受启动指令",
+                payload=payload,
+            )
+        else:
+            TaskExecutionService.transition(
+                execution,
+                target,
+                event_type="command.ack",
+                state_version=edge_version,
+                occurred_at=command.acknowledged_at,
+                reason_code=command.ack_reason_code,
+                reason_message=command.ack_reason_message,
+                payload=payload,
+            )
     realtime_publisher.publish_task_event(str(execution.id), payload) if execution else None
     return {"status": command.status}
 
@@ -646,17 +732,25 @@ def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
     payload = envelope.payload
     command = _get_command(payload, robot)
     terminal = {"succeeded", "failed", "cancelled", "rejected", "timed_out", "expired"}
-    if command.status in terminal:
+    center_start_timeout = (
+        command.command_type == "task.start"
+        and command.status == "timed_out"
+        and command.error_code == "COMMAND_TIMED_OUT"
+    )
+    if command.status in terminal and not center_start_timeout:
         return {"ignored": True, "status": command.status}
-    if command.status in {"created", "published", "accepted"}:
+    if command.status in {"created", "published", "accepted"} or center_start_timeout:
         command.status = "executing"
         if command.started_at is None:
             command.started_at = _event_time(payload, "started_at") or timezone.now()
     incoming = payload.get("result") or {}
     if not isinstance(incoming, dict):
         incoming = {}
-    merged = dict(command.result_payload or {})
-    merged.update(incoming)
+    if command.command_type in _LOCALIZATION_PROGRESS_COMMAND_TYPES:
+        merged = _merge_localization_command_result(command.result_payload, incoming)
+    else:
+        merged = dict(command.result_payload or {})
+        merged.update(incoming)
     command.result_payload = merged
     command.save(update_fields=["status", "started_at", "result_payload", "updated_at"])
     CommandEvent.objects.get_or_create(
@@ -679,6 +773,25 @@ def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
         task_execution=command.task_execution,
         dedupe_seconds=2,
     )
+    execution = command.task_execution
+    if center_start_timeout and execution is not None:
+        try:
+            edge_version = int(payload.get("edge_state_version") or execution.state_version)
+        except (TypeError, ValueError):
+            edge_version = execution.state_version
+        if (
+            execution.state in {"timed_out", "interrupted"}
+            and execution.failure_code == "COMMAND_TIMED_OUT"
+        ):
+            execution = TaskExecutionService.reconcile_edge_active_after_center_timeout(
+                execution,
+                "accepted",
+                edge_state_version=edge_version,
+                reason_code="EDGE_SYNC_ACTIVE",
+                reason_message="云边状态对账：设备端正在执行启动初始化",
+                payload=payload,
+            )
+            realtime_publisher.publish_task_event(str(execution.id), payload)
     return {"status": command.status}
 
 
@@ -694,21 +807,17 @@ def _handle_command_result(envelope: MessageEnvelope, robot: Robot) -> dict:
     incoming_result = payload.get("result") or {}
     if not isinstance(incoming_result, dict):
         incoming_result = {}
-    # Localization emits the candidate table while a command is executing.
-    # A terminal failure from a deeper fallback may contain only its own
-    # error, so retain the last complete attempt snapshot instead of erasing
-    # every score and inlier ratio at the exact moment the UI needs them.
     previous_result = dict(command.result_payload or {})
-    if (
-        command.command_type in {"nav.initial_pose", "nav.relocalize"}
-        and "localization_attempts" in previous_result
-        and "localization_attempts" not in incoming_result
-        and "attempts" not in incoming_result
-        and "best_ndt_candidate" not in incoming_result
-    ):
-        incoming_result = dict(incoming_result)
-        incoming_result["localization_attempts"] = previous_result["localization_attempts"]
-    command.result_payload = incoming_result
+    if command.command_type in _LOCALIZATION_PROGRESS_COMMAND_TYPES:
+        # Terminal packets may contain only the deepest fallback result. Merge
+        # by stage/candidate identity so successful and failed commands retain
+        # the full RTK, NDT, timestamp, and handoff evidence seen in progress.
+        command.result_payload = _merge_localization_command_result(
+            previous_result,
+            incoming_result,
+        )
+    else:
+        command.result_payload = incoming_result
     command.save()
     if command.command_type == "map.activate" and terminal_status == "succeeded":
         current_map = command.result_payload.get("current_map") or command.result_payload
@@ -876,6 +985,10 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
     if envelope.message_type in {
         "task.arrival_pending_settle",
+        "task.arrival_nav2_stopping",
+        "task.arrival_zero_confirming",
+        "task.arrival_zero_confirmed",
+        "task.arrival_zero_timeout",
         "task.arrival_check",
         "task.arrival_confirmed",
         "task.arrival_correcting",

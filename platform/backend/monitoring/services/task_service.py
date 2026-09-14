@@ -31,7 +31,7 @@ ALLOWED_TRANSITIONS = {
     "paused": {"running", "pausing", "resuming", "cancelling", "cancelled", "interrupted"},
     "resuming": {"accepted", "running", "paused", "pausing", "cancelling", "cancelled", "failed", "interrupted"},
     "cancelling": {"cancelled", "failed", "interrupted"},
-    "interrupted": {"paused", "running", "pausing", "resuming", "cancelling", "cancelled", "failed"},
+    "interrupted": {"accepted", "paused", "running", "pausing", "resuming", "cancelling", "cancelled", "failed"},
 }
 
 # A reconnecting Edge can be the only side that observed the terminal result.
@@ -243,7 +243,11 @@ def build_route_snapshot(route: PatrolRoute) -> dict[str, Any]:
             "origin_status": map_data.origin_status,
             "completeness": map_data.map_completeness,
         },
-        "scene_scope": getattr(route, "scene_scope", "") or map_data.scene_scope or "indoor",
+        # Localization source selection is a property of the map package.
+        # Keep the top-level compatibility field aligned with the authoritative
+        # nested map metadata instead of allowing an old route form value to
+        # turn an outdoor RTK map into an indoor/local-only startup.
+        "scene_scope": map_data.scene_scope or getattr(route, "scene_scope", "") or "indoor",
         "global_controller": _normalize_global_controller(getattr(route, "global_controller", "")),
         "waypoints": normalize_waypoints(route),
     }
@@ -329,12 +333,25 @@ class TaskExecutionService:
         try:
             validate_route_against_map(
                 constraints_from_map_data(route.map_data),
-                scene_scope=str(getattr(route, "scene_scope", "") or route.map_data.scene_scope or "indoor"),
+                scene_scope=str(route.map_data.scene_scope or getattr(route, "scene_scope", "") or "indoor"),
                 waypoints=(snapshot.get("waypoints") or []) if snapshot is not None else (route.waypoints or []),
             )
         except MapConstraintError as exc:
             raise TaskStateError(exc.code) from exc
         snapshot = snapshot if snapshot is not None else build_route_snapshot(route)
+        # Loop dispatch can reuse an older route snapshot. Refresh only the
+        # localization policy fields from the selected map record so a stale
+        # route-level indoor default cannot suppress RTK on an outdoor map.
+        authoritative_scene = route.map_data.scene_scope or snapshot.get("scene_scope") or "indoor"
+        snapshot["scene_scope"] = authoritative_scene
+        snapshot_map = dict(snapshot.get("map") or {})
+        snapshot_map["scene_scope"] = authoritative_scene
+        snapshot_map["coordinate_mode"] = (
+            route.map_data.coordinate_mode
+            or snapshot_map.get("coordinate_mode")
+            or "local_only"
+        )
+        snapshot["map"] = snapshot_map
         try:
             execution = TaskExecution.objects.create(
                 task=task,

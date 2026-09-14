@@ -33,6 +33,8 @@ export function buildProgressiveLocalizationPayload({
     seed_source: 'progressive',
     map_id: mapId,
     map_version: mapVersion,
+    scene_scope: String(sceneScope || 'indoor').trim().toLowerCase(),
+    coordinate_mode: String(coordinateMode || 'local_only').trim().toLowerCase(),
     waypoints: normalizedWaypoints,
     wait_seconds: waitSeconds,
   }
@@ -52,7 +54,6 @@ const RTK_FALLBACK_CODES = new Set([
   'RTK_INITIAL_POSE_TIMEOUT',
   'RTK_POSE_UNAVAILABLE',
   'RTK_INITIAL_POSE_NOT_CONVERGED',
-  'LIO_HANDOFF_TIMEOUT',
 ])
 
 export function shouldInitializeFromRtk({ sceneScope, coordinateMode } = {}) {
@@ -75,7 +76,8 @@ function localizationDecision(navigationStatus) {
  * A map configured for RTK does not imply that the live receiver has a
  * usable fixed solution.  Only start the RTK command when the latest Edge
  * decision says that position *and* heading passed its navigation gate.
- * Unknown/stale status deliberately takes the deterministic NDT search path.
+ * Unknown/stale status is distinct from an explicit non-fixed result so Edge
+ * can verify fresh RTK samples instead of skipping the authoritative source.
  */
 export function rtkFixedForInitialization(navigationStatus) {
   const decision = localizationDecision(navigationStatus)
@@ -83,6 +85,17 @@ export function rtkFixedForInitialization(navigationStatus) {
   return decision.rtk_usable === true
     && String(decision.rtk_quality || '').trim().toLowerCase() === 'fixed'
     && decision.rtk_heading_usable === true
+}
+
+export function rtkInitializationSnapshotState(navigationStatus) {
+  const decision = localizationDecision(navigationStatus)
+  if (rtkFixedForInitialization(navigationStatus)) return 'fixed'
+  const quality = String(decision.rtk_quality || '').trim().toLowerCase()
+  const hasExplicitEvidence = quality.length > 0
+    || typeof decision.rtk_usable === 'boolean'
+    || typeof decision.rtk_heading_usable === 'boolean'
+    || typeof decision.rtk_good_for_navigation === 'boolean'
+  return hasExplicitEvidence ? 'not_fixed' : 'unknown'
 }
 
 /**
@@ -148,13 +161,15 @@ export async function initializeProgressiveLocalization({
 
   let rtkAttempt = null
   const rtkConfigured = shouldInitializeFromRtk({ sceneScope, coordinateMode })
-  const rtkFixed = rtkFixedForInitialization(activation.navigationStatus)
-  if (rtkConfigured && !rtkFixed) {
+  const rtkSnapshot = rtkInitializationSnapshotState(activation.navigationStatus)
+  if (rtkConfigured && rtkSnapshot === 'not_fixed') {
     rtkAttempt = { status: 'skipped', errorCode: 'RTK_NOT_FIXED' }
     onProgress('RTK当前不是可用固定解，跳过RTK初始位姿，直接搜索建图原点、附近候选和航点')
   }
-  if (rtkConfigured && rtkFixed) {
-    onProgress('室外地图已下发，正在使用RTK固定解设置初始姿态并进行本地NDT验证')
+  if (rtkConfigured && rtkSnapshot !== 'not_fixed') {
+    onProgress(rtkSnapshot === 'fixed'
+      ? '室外地图已下发，正在验证RTK固定解并对定位位置执行定点NDT匹配'
+      : '室外地图已下发，状态同步中，由机器狗优先验证实时RTK固定解')
     try {
       const rtkPayload = {
         seed_source: 'rtk',
@@ -188,7 +203,7 @@ export async function initializeProgressiveLocalization({
   }
 
   const payload = buildProgressiveLocalizationPayload({
-    mapId, mapVersion, waypoints,
+    mapId, mapVersion, waypoints, sceneScope, coordinateMode,
   })
   onProgress('地图已下发，依次尝试建图原点、原点周边候选和路线航点，失败后进入全局搜索')
   const createdCommand = await sendCommand(robotId, 'relocalize', payload, { traceId })

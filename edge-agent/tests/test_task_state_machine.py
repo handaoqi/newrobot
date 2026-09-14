@@ -454,6 +454,36 @@ def test_delayed_center_recovery_does_not_stop_an_already_resumed_task(tmp_path)
     store.close()
 
 
+def test_center_recovery_does_not_interrupt_accepted_task_start(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.prepare_task_start(command("task.start"))
+    execution_id = executor.context.task_execution_id
+    cancels_before = nav.cancelled
+    stops_before = nav.stop_commands
+
+    result = executor.recover_task(
+        execution_id,
+        trigger_reason_code="COMMAND_TIMED_OUT",
+        recovery_episode_id="episode-start-init",
+        attempt=1,
+    )
+
+    assert executor.context.state == "accepted"
+    assert result["recovery_status"] == "in_progress"
+    assert result["recovery_action"] == "task_start_initializing"
+    assert result["reason_code"] == "TASK_START_INITIALIZING"
+    assert nav.cancelled == cancels_before
+    assert nav.stop_commands == stops_before
+    store.close()
+
+
 def test_preleg_heading_is_running_before_delayed_center_recovery(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -1157,7 +1187,7 @@ def test_missing_arrival_frames_hold_without_reapproach_or_departure_spin(tmp_pa
     )
     executor.start_task(command("task.start"))
     executor._arrival_correction_completed_index = 0
-    executor._hold_final_pose = lambda: True
+    executor._hold_final_pose = lambda **_kwargs: True
     executor._handle_lightweight_arrival = lambda *_args: False
 
     def missing_frames(*_args):
@@ -1498,7 +1528,36 @@ def test_expired_bt_recovery_lease_is_reclaimed_only_after_stop_confirmation(tmp
         time.sleep(0.02)
 
     assert executor.recovery_snapshot()["owner"] == "NONE"
-    assert nav.stop_commands >= 1
+    assert nav.stop_commands == 0
+    executor.stop()
+    store.close()
+
+
+def test_bt_recovery_lease_timeout_does_not_stop_a_moving_recovery(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.stopped = False
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        bt_recovery_lease_timeout_seconds=0.05,
+    )
+    lease = executor.acquire_recovery("BT_NAVIGATOR", "navigation_recovery_backup")
+    assert lease is not None
+
+    time.sleep(0.2)
+    assert executor.recovery_snapshot()["owner"] == "BT_NAVIGATOR"
+    assert nav.stop_commands == 0
+
+    nav.stopped = True
+    deadline = time.monotonic() + 1.0
+    while executor.recovery_snapshot()["owner"] != "NONE" and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert executor.recovery_snapshot()["owner"] == "NONE"
+    assert nav.stop_commands == 0
     executor.stop()
     store.close()
 
@@ -1832,6 +1891,33 @@ def test_outdoor_hold_final_pose_allows_stop_confirmation_window(tmp_path):
     assert executor._hold_final_pose() is False
     # The timeout must exceed the 1s continuous-zero confirmation window.
     assert 1.8 <= time.monotonic() - started < 2.5
+    store.close()
+
+
+def test_hold_final_pose_reports_distinct_nav2_zero_confirmation_stages(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    stages = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+
+    assert executor._hold_final_pose(
+        timeout_seconds=1.0,
+        stage_callback=lambda stage, details: stages.append((stage, details)),
+    ) is True
+
+    assert [stage for stage, _details in stages] == [
+        "nav2_stopping",
+        "zero_confirming",
+        "zero_confirmed",
+    ]
+    assert stages[1][1]["stop_confirmation_seconds"] == 1.0
+    assert stages[2][1]["confirmation_source"] == "collision_monitor"
+    executor.stop()
     store.close()
 
 
@@ -2188,6 +2274,50 @@ def test_outdoor_fixed_rtk_stability_failure_uses_mapping_origin_progressive_sea
     assert request["origin"]["x"] == 8.0
     assert request["waypoints"][0]["x"] == 1.0
     assert request["wait_seconds"] == 180.0
+    store.close()
+
+
+def test_outdoor_lio_handoff_failure_does_not_fall_back_to_ndt_search(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {
+        "active_source": "unavailable",
+        "absolute_stable": False,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+
+    def set_initial_pose_from_rtk(wait_seconds=30.0):
+        raise ProtocolError(
+            "LIO_HANDOFF_TIMEOUT",
+            "RTK seed was accepted but FAST-LIO handoff did not become ready",
+        )
+
+    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a",
+        "map_version": "v1",
+        "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    executor.prepare_task_start(envelope)
+
+    try:
+        executor.initialize_before_navigation()
+    except ProtocolError as exc:
+        assert exc.code == "LIO_HANDOFF_TIMEOUT"
+    else:
+        raise AssertionError("FAST-LIO handoff failure must keep the task stopped")
+
+    assert nav.progressive_relocalize_requests == []
     store.close()
 
 
@@ -3681,7 +3811,7 @@ def test_micro_adjust_recheck_preserves_final_yaw_latch_for_next_segment(tmp_pat
     executor._arrival_correction_completed_index = 0
     executor._arrival_heading_completed_index = 0
     executor._set_post_arrival_stage(0, "xy_adjustment_recheck")
-    executor._hold_final_pose = lambda: True
+    executor._hold_final_pose = lambda **_kwargs: True
     executor._handle_lightweight_arrival = lambda *_args: False
     executor._arrival_xy_is_stable = lambda *_args: False
     executor._arrival_pose_errors = lambda *_args: (0.40, 0.0)
@@ -3721,7 +3851,7 @@ def test_micro_adjust_recheck_inside_xy_radius_waits_for_stability_not_another_m
     executor._arrival_correction_completed_index = 0
     executor._arrival_heading_completed_index = 0
     executor._set_post_arrival_stage(0, "xy_adjustment_recheck")
-    executor._hold_final_pose = lambda: True
+    executor._hold_final_pose = lambda **_kwargs: True
     executor._handle_lightweight_arrival = lambda *_args: False
     executor._arrival_xy_is_stable = lambda *_args: False
     executor._arrival_pose_errors = lambda *_args: (0.20, 0.0)
@@ -3759,7 +3889,7 @@ def test_post_yaw_state_guard_is_not_reported_as_missing_micro_adjust_adapter(tm
     executor._arrival_heading_completed_index = 0
     # xy_verified is deliberately not a post-yaw micro-adjust stage.
     executor._set_post_arrival_stage(0, "xy_verified")
-    executor._hold_final_pose = lambda: True
+    executor._hold_final_pose = lambda **_kwargs: True
     executor._handle_lightweight_arrival = lambda *_args: False
     executor._arrival_pose_errors = lambda *_args: (0.40, 0.0)
     executor._arrival_pose_tolerances = lambda *_args: (0.30, 0.25)
