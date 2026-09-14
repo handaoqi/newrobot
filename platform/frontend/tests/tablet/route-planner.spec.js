@@ -90,6 +90,8 @@ test('real preview shows target dispatch and waypoint arrival events in the shar
     created_at: '2026-08-24T08:30:00+08:00',
     started_at: '2026-08-24T08:30:01+08:00',
     finished_at: '2026-08-24T08:30:12+08:00',
+    execution_source: 'route_planner',
+    execution_source_label: '路径规划页',
     route_snapshot: {
       waypoints: [
         { map_point_number: 1, x: 1, y: 1 },
@@ -114,14 +116,52 @@ test('real preview shows target dispatch and waypoint arrival events in the shar
   await page.getByRole('button', { name: '▶ 预演', exact: true }).click()
 
   const timeline = page.locator('.drill-timeline-panel')
-  await expect(timeline).toContainText('时间轴 · 真实预演')
+  await expect(timeline).toContainText('任务执行时间轴 · 路径规划页')
   await expect(timeline).toContainText('1号点目标已下发')
   await expect(timeline).toContainText('1号点已到达')
   await expect(timeline).toContainText('2号点目标已下发')
   await expect(timeline).toContainText('2号点已到达')
-  await expect(timeline).toContainText('预演完成')
+  await expect(timeline).toContainText('任务执行完成')
 
   await timeline.getByRole('button', { name: '折叠', exact: true }).click()
   await expect(timeline.locator('.drill-timeline-list')).toHaveCount(0)
   await expect(timeline).toContainText('演练记录')
 })
+
+test('drill record automatically exposes a failed execution created by guard duty', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'tablet-2000-landscape-chromium', 'Run the unified execution history regression once in Chromium')
+  const guardExecution = {
+    ...defaultGuardExecution(),
+    id: 'guard-duty-failed-10',
+    route: 10,
+    route_name: '南门—主步道—活动广场',
+    state: 'failed',
+    failure_code: 'ROBOT_STANDUP_FAILED',
+    failure_message: 'recovery requires a confirmed stop',
+    execution_source: 'guard_duty',
+    execution_source_label: '保安值守',
+    created_at: '2026-09-14T21:40:00+08:00',
+    finished_at: '2026-09-14T21:41:00+08:00',
+    route_snapshot: { waypoints: [{ map_point_number: 1, x: 1, y: 1 }] },
+    events: [{ id: 1, event_type: 'task.created', state_version: 0, occurred_at: '2026-09-14T21:40:00+08:00', payload: {} }],
+  }
+  await installTabletMocks(page, { authenticated: true, routeExecution: guardExecution })
+
+  await page.goto('/dashboard/tasks/routes')
+
+  const timeline = page.locator('.drill-timeline-panel')
+  await expect(timeline).toContainText('任务执行时间轴 · 保安值守')
+  await expect(timeline).toContainText('任务执行失败')
+  await expect(timeline).toContainText('ROBOT_STANDUP_FAILED')
+})
+
+function defaultGuardExecution() {
+  return {
+    completed_waypoints: 0,
+    current_waypoint_index: 0,
+    total_waypoints: 1,
+    commands: [],
+    system_logs: [],
+    loop_events: [],
+  }
+}

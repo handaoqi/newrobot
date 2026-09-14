@@ -140,6 +140,7 @@ const taskExecutionHistory = ref([])
 const taskExecutionHistoryLoading = ref(false)
 const taskExecutionHistoryError = ref('')
 const selectedTaskExecutionId = ref('')
+const taskExecutionSelectionPinned = ref(false)
 const executionHistoryDismissed = ref(false)
 const initialPoseMode = ref(false)
 const manualInitialPose = ref(null)
@@ -1172,6 +1173,7 @@ function resetTaskExecutionHistory() {
   taskExecutionHistoryLoading.value = false
   taskExecutionHistoryError.value = ''
   selectedTaskExecutionId.value = ''
+  taskExecutionSelectionPinned.value = false
   executionHistoryDismissed.value = false
 }
 
@@ -1938,8 +1940,15 @@ async function refreshTaskMapExecution({ preferredExecutionId = '', forceOpen = 
   const knownIds = new Set(history.map(item => String(item.id)))
   const liveExecutionId = String(navStatus.value?.status?.task_execution_id || '')
   let executionId = String(preferredExecutionId || selectedTaskExecutionId.value || '')
-  if (executionId && history.length && !knownIds.has(executionId)) executionId = ''
-  if (!executionId && liveExecutionId && (!routeId || knownIds.has(liveExecutionId))) {
+  if (executionId && history.length && !knownIds.has(executionId)) {
+    executionId = ''
+    taskExecutionSelectionPinned.value = false
+  }
+  if (
+    liveExecutionId
+    && (!routeId || knownIds.has(liveExecutionId))
+    && (!taskExecutionSelectionPinned.value || !executionId)
+  ) {
     executionId = liveExecutionId
   }
   if (!executionId && lastExecution.value?.id && (!history.length || knownIds.has(String(lastExecution.value.id)))) {
@@ -1990,6 +1999,7 @@ async function refreshTaskMapExecution({ preferredExecutionId = '', forceOpen = 
 async function handleTaskExecutionHistorySelect(executionId) {
   if (!executionId) return
   selectedTaskExecutionId.value = String(executionId)
+  taskExecutionSelectionPinned.value = true
   executionHistoryDismissed.value = false
   routePreviewRequestedAt.value = 0
   routePreviewError.value = ''
@@ -2410,6 +2420,7 @@ async function handleExecuteRoute() {
   taskMapTrajectory.value = []
   lastExecution.value = null
   selectedTaskExecutionId.value = ''
+  taskExecutionSelectionPinned.value = false
   executionHistoryDismissed.value = false
   routeExecuteBusy.value = true
   navError.value = ''
@@ -2420,6 +2431,7 @@ async function handleExecuteRoute() {
     })
     taskMapExecution.value = lastExecution.value
     selectedTaskExecutionId.value = String(lastExecution.value.id)
+    taskExecutionSelectionPinned.value = false
     taskMapTrajectory.value = []
     syncExecutionTimelineClock(lastExecution.value)
     await refreshNavigationStatus()

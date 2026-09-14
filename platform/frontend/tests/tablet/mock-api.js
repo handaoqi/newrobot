@@ -226,6 +226,8 @@ const defaultRouteExecution = {
   created_at: '2026-08-24T08:30:00+08:00',
   started_at: '2026-08-24T08:30:01+08:00',
   finished_at: '2026-08-24T08:30:12+08:00',
+  execution_source: 'route_planner',
+  execution_source_label: '路径规划页',
   route_snapshot: { waypoints: routeDetail.waypoints },
   events: [],
 }
@@ -325,6 +327,8 @@ export async function installTabletMocks(page, {
     let body
     if (apiPath === '/routes/10/execute/' && request.method() === 'POST') {
       body = routeExecution
+    } else if (apiPath === '/task-executions/') {
+      body = [routeExecution]
     } else if (apiPath === `/task-executions/${routeExecution.id}/`) {
       body = routeExecution
     } else if (apiPath === `/task-executions/${routeExecution.id}/trajectory/`) {

@@ -116,7 +116,7 @@ function eventDetail(event) {
 
 function executionFailureDetail(execution) {
   const failedCommand = [...(execution?.commands || [])]
-    .reverse()
+    .sort((left, right) => Date.parse(right?.finished_at || right?.issued_at || '') - Date.parse(left?.finished_at || left?.issued_at || ''))
     .find(command => ['failed', 'timed_out', 'rejected', 'expired'].includes(String(command?.status || '')))
   const code = execution?.failure_code || failedCommand?.error_code || failedCommand?.ack_reason_code || ''
   const message = execution?.failure_message || failedCommand?.error_message || failedCommand?.ack_reason_message || ''
