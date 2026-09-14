@@ -200,6 +200,11 @@ class ObstacleSpeechConfig:
     rear_clearance_m: float = 0.70
     side_clearance_m: float = 0.80
     scan_max_age_seconds: float = 0.50
+    evidence_enabled: bool = True
+    evidence_snapshot_url: str = "http://127.0.0.1:9101/v1/snapshot/latest"
+    evidence_timeout_seconds: float = 2.0
+    evidence_retry_seconds: float = 30.0
+    evidence_spool_dir: str = "/home/dogrobot/runtime/nx-edge/data/edge-agent/obstacle-evidence"
 
 
 @dataclass

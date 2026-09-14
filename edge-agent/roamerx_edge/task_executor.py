@@ -396,6 +396,7 @@ class TaskExecutor:
         obstacle_speech=None,
         waypoint_speech=None,
         rosbag_recorder=None,
+        obstacle_evidence=None,
         docking_arrived_handler=None,
         localization_recovery_callback: Callable[[str], None] | None = None,
     ) -> None:
@@ -479,6 +480,7 @@ class TaskExecutor:
         self.obstacle_speech = obstacle_speech
         self.waypoint_speech = waypoint_speech
         self.rosbag_recorder = rosbag_recorder
+        self.obstacle_evidence = obstacle_evidence
         self.docking_arrived_handler = docking_arrived_handler
         self.localization_recovery_callback = localization_recovery_callback
         self._rosbag_state: dict = {}
@@ -515,6 +517,8 @@ class TaskExecutor:
         self._obstacle_monitor_thread = None
         self._obstacle_progress_anchor = None
         self._obstacle_progress_anchor_at = None
+        self._obstacle_target_distance_anchor_m = None
+        self._obstacle_waypoint_key = None
         self._recovery_attempts = 0
         self._leave_route_announced = False
         self._last_obstacle_seen_at = None
@@ -782,6 +786,7 @@ class TaskExecutor:
     def _start_obstacle_monitor(self) -> None:
         if not self._obstacle_monitor_enabled():
             return
+        self._sync_obstacle_waypoint_budget()
         self._obstacle_monitor_stop.clear()
         if self._obstacle_monitor_thread and self._obstacle_monitor_thread.is_alive():
             return
@@ -790,7 +795,7 @@ class TaskExecutor:
         )
         self._obstacle_monitor_thread.start()
 
-    def _stop_obstacle_monitor(self) -> None:
+    def _suspend_obstacle_monitor(self) -> None:
         self._obstacle_monitor_stop.set()
         cancel_recovery = getattr(self.navigation, "cancel_obstacle_recovery", None)
         if callable(cancel_recovery):
@@ -799,7 +804,10 @@ class TaskExecutor:
             except Exception:
                 LOGGER.warning("failed to cancel active obstacle recovery", exc_info=True)
         self._obstacle_monitor_thread = None
-        self._reset_obstacle_episode()
+
+    def _stop_obstacle_monitor(self) -> None:
+        self._suspend_obstacle_monitor()
+        self._reset_obstacle_episode(reset_waypoint_budget=True)
 
     def _obstacle_monitor_loop(self) -> None:
         while not self._obstacle_monitor_stop.wait(0.5):
@@ -811,10 +819,29 @@ class TaskExecutor:
                 # obstacle recovery for the rest of a running task.
                 LOGGER.exception("obstacle monitor iteration failed; keeping monitor alive")
 
-    def _reset_obstacle_episode(self) -> None:
+    def _current_obstacle_waypoint_key(self) -> tuple[str, int, int] | None:
+        if not self.context:
+            return None
+        return (
+            str(self.context.task_execution_id),
+            int(self.context.round_number),
+            int(self.context.current_waypoint_index),
+        )
+
+    def _sync_obstacle_waypoint_budget(self) -> None:
+        waypoint_key = self._current_obstacle_waypoint_key()
+        if waypoint_key == self._obstacle_waypoint_key:
+            return
+        self._reset_obstacle_episode(reset_waypoint_budget=True)
+        self._obstacle_waypoint_key = waypoint_key
+
+    def _reset_obstacle_episode(self, *, reset_waypoint_budget: bool = False) -> None:
         self._obstacle_progress_anchor = None
         self._obstacle_progress_anchor_at = None
-        self._recovery_attempts = 0
+        self._obstacle_target_distance_anchor_m = None
+        if reset_waypoint_budget:
+            self._recovery_attempts = 0
+            self._obstacle_waypoint_key = None
         self._leave_route_announced = False
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
@@ -822,6 +849,19 @@ class TaskExecutor:
         self._obstacle_clear_started_at = None
         self._obstacle_recovery_active = False
         self._recovery_arbiter.reset_budget()
+
+    def _distance_to_current_waypoint(self, pose) -> float | None:
+        if not self.context or pose is None:
+            return None
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        index = int(self.context.current_waypoint_index)
+        if index < 0 or index >= len(waypoints):
+            return None
+        target = waypoints[index]
+        try:
+            return hypot(float(pose.x) - float(target["x"]), float(pose.y) - float(target["y"]))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
 
     def _localization_allows_obstacle_monitor(self, observation: dict | None = None) -> bool:
         """Ignore collision-limited 'obstacles' while localization is not Normal.
@@ -901,6 +941,7 @@ class TaskExecutor:
             ):
                 return
             observation = self.navigation.obstacle_monitor_snapshot()
+            self._sync_obstacle_waypoint_budget()
             if not self._localization_allows_obstacle_monitor(observation):
                 self._obstacle_clear_started_at = None
                 return
@@ -935,6 +976,7 @@ class TaskExecutor:
                     self._obstacle_episode_id = str(uuid.uuid4())
                     self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
                     self._obstacle_progress_anchor_at = now
+                    self._obstacle_target_distance_anchor_m = self._distance_to_current_waypoint(pose)
                     self._emit_obstacle_stage(
                         "DETECTED_STOP", observation, reason=trigger_reason
                     )
@@ -945,11 +987,22 @@ class TaskExecutor:
                             "WAITING_PROGRESS", observation, reason=trigger_reason
                         )
                 else:
-                    anchor_x, anchor_y = self._obstacle_progress_anchor
-                    progressed = hypot(float(pose.x) - anchor_x, float(pose.y) - anchor_y)
+                    current_target_distance = self._distance_to_current_waypoint(pose)
+                    if (
+                        self._obstacle_target_distance_anchor_m is not None
+                        and current_target_distance is not None
+                    ):
+                        progressed = max(
+                            0.0,
+                            self._obstacle_target_distance_anchor_m - current_target_distance,
+                        )
+                    else:
+                        anchor_x, anchor_y = self._obstacle_progress_anchor
+                        progressed = hypot(float(pose.x) - anchor_x, float(pose.y) - anchor_y)
                     if progressed >= float(getattr(self.obstacle_speech, "min_progress_m", 0.5)):
                         self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
                         self._obstacle_progress_anchor_at = now
+                        self._obstacle_target_distance_anchor_m = current_target_distance
                     elif (
                         now - self._obstacle_progress_anchor_at
                         >= float(getattr(self.obstacle_speech, "no_progress_seconds", 5.0))
@@ -1112,6 +1165,7 @@ class TaskExecutor:
                     pose = self.navigation.latest_pose()
                     if pose is not None:
                         self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
+                        self._obstacle_target_distance_anchor_m = self._distance_to_current_waypoint(pose)
                     self._obstacle_progress_anchor_at = time.monotonic()
                     if navigation_goal_cancelled:
                         self._send_from(self.context.current_waypoint_index)
@@ -1177,16 +1231,28 @@ class TaskExecutor:
                 }
             except (AttributeError, TypeError, ValueError):
                 pose = {}
+        max_attempts = int(
+            getattr(self.obstacle_speech, "max_recovery_attempts", OBSTACLE_RECOVERY_MAX_ATTEMPTS)
+        )
+        alert_description = {
+            "DETECTED_STOP": "发现障碍物，已停车",
+            "RECOVERY_ATTEMPT": f"正在进行第 {int(attempt)}/{max_attempts} 次后退绕行避障",
+            "DISSUASION": "三次避障失败，请离开巡检线路",
+        }.get(stage, "")
+        event_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"roamerx:obstacle:{self.context.task_execution_id}:{self._obstacle_episode_id}",
+        ))
         payload = {
             "task_execution_id": self.context.task_execution_id,
             "round_number": self.context.round_number,
             "waypoint_index": self.context.current_waypoint_index,
             "obstacle_episode_id": self._obstacle_episode_id,
+            "event_id": event_id,
             "stage": stage,
+            "alert_description": alert_description,
             "recovery_attempt": int(attempt),
-            "max_recovery_attempts": int(
-                getattr(self.obstacle_speech, "max_recovery_attempts", OBSTACLE_RECOVERY_MAX_ATTEMPTS)
-            ),
+            "max_recovery_attempts": max_attempts,
             "detour_enabled": bool(self._segment_avoidance_enabled),
             "reason": reason,
             "front_obstacle_distance_m": observation.get("front_obstacle_distance_m"),
@@ -1202,6 +1268,11 @@ class TaskExecutor:
             "reported_at": now_iso(),
         }
         self.event_callback("task.obstacle_stage", payload, "")
+        if stage == "DETECTED_STOP" and callable(self.obstacle_evidence):
+            try:
+                self.obstacle_evidence(dict(payload))
+            except Exception:
+                LOGGER.warning("failed to schedule obstacle evidence capture", exc_info=True)
         if stage == "RECOVERY_ATTEMPT":
             self.event_callback("navigation.obstacle_recovery", payload, "")
         speech = {
@@ -4782,7 +4853,7 @@ class TaskExecutor:
             self._cancel_absolute_localization_resume_watch()
             self._assert_execution(execution_id)
             self._clear_nav_dispatch_retry()
-            self._stop_obstacle_monitor()
+            self._suspend_obstacle_monitor()
             self._cancel_arrival_adjustment(reset_state=False)
             if self.context.state == "paused":
                 return {"final_task_state": "paused", "state_version": self.context.state_version, "robot_stopped": True}
@@ -5560,7 +5631,10 @@ class TaskExecutor:
                     )
                     self._send_from(resume_index)
                     return
-                self._stop_obstacle_monitor()
+                # Nav2's coarse success is followed by precise arrival
+                # validation and may re-dispatch this same waypoint. Preserve
+                # the obstacle episode and the waypoint-level attempt budget.
+                self._suspend_obstacle_monitor()
                 missed = list((details or {}).get("missed_waypoints") or [])
                 if missed:
                     absolute_missed = [index + self._goal_offset for index in missed]

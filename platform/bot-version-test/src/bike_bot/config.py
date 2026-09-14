@@ -160,6 +160,15 @@ class SnapshotConfig:
 
 
 @dataclass
+class EvidenceConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 9101
+    max_frame_age_seconds: float = 2.0
+    jpeg_quality: int = 90
+
+
+@dataclass
 class DisplayConfig:
     enable: bool = True
     window_name: str = "Bike Bot Detection"
@@ -205,6 +214,7 @@ class AppConfig:
     audio_playback: AudioPlaybackConfig
     control: ControlConfig
     snapshot: SnapshotConfig
+    evidence: EvidenceConfig
     display: DisplayConfig
     storage: StorageConfig
     runtime: RuntimeConfig
@@ -228,6 +238,7 @@ class AppConfig:
             audio_playback=AudioPlaybackConfig(**data.get("audio_playback", {})),
             control=ControlConfig(**data.get("control", {})),
             snapshot=SnapshotConfig(**data["snapshot"]),
+            evidence=EvidenceConfig(**data.get("evidence", {})),
             display=DisplayConfig(**data.get("display", {})),
             storage=StorageConfig(**data.get("storage", {})),
             runtime=RuntimeConfig(**data["runtime"]),

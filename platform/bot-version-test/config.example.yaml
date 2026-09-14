@@ -98,6 +98,13 @@ snapshot:
   public_base_url: ""
   jpeg_quality: 90
 
+evidence:
+  enabled: true
+  host: 127.0.0.1
+  port: 9101
+  max_frame_age_seconds: 2.0
+  jpeg_quality: 90
+
 display:
   enable: false
   window_name: Bike Bot Detection

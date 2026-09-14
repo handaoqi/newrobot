@@ -76,7 +76,8 @@ const obstacleStageInfo = computed(() => {
     DISSUASION: ['三次避障失败，请离开巡检线路', '机器人保持停车'],
     SAFE_OBSERVING: ['安全观察中', '障碍连续清除 3 秒后自动继续，也可点击继续复核'],
   }
-  const [title, detail] = labels[payload.stage] || ['障碍处理状态', payload.stage]
+  const [fallbackTitle, detail] = labels[payload.stage] || ['障碍处理状态', payload.stage]
+  const title = payload.alert_description || fallbackTitle
   const zone = payload.collision_zone || '未标明区域'
   const points = payload.collision_points_inside == null ? '—' : payload.collision_points_inside
   return { title, detail, diagnostic: `${zone} · ${points} 点 · 前方 ${payload.front_obstacle_distance_m == null ? '—' : `${Number(payload.front_obstacle_distance_m).toFixed(2)} m`}` }

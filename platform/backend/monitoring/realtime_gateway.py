@@ -18,5 +18,9 @@ class RealtimePublisher:
     def publish_alert(data: dict) -> None:
         event_broker.publish("inspection_event_created", data)
 
+    @staticmethod
+    def publish_alert_updated(data: dict) -> None:
+        event_broker.publish("inspection_event_updated", data)
+
 
 realtime_publisher = RealtimePublisher()

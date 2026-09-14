@@ -139,6 +139,11 @@ obstacle_speech:
   rear_clearance_m: 0.70
   side_clearance_m: 0.80
   scan_max_age_seconds: 0.50
+  evidence_enabled: true
+  evidence_snapshot_url: http://127.0.0.1:9101/v1/snapshot/latest
+  evidence_timeout_seconds: 2.0
+  evidence_retry_seconds: 30.0
+  evidence_spool_dir: /home/dogrobot/runtime/nx-edge/data/edge-agent/obstacle-evidence
 
 waypoint_speech:
   status_dir: /home/dogrobot/runtime/nx-edge/data/audio-status

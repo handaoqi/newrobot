@@ -795,11 +795,12 @@ class MessageHandlerTests(TestCase):
 
     def test_obstacle_stages_share_one_alert_and_allow_same_task_state_version(self):
         initial_alerts = self.robot.today_alerts
-        for sequence, stage, attempt in (
-            (1, "DETECTED_STOP", 0),
-            (2, "RECOVERY_ATTEMPT", 1),
-            (3, "DISSUASION", 3),
-            (4, "SAFE_OBSERVING", 3),
+        for sequence, stage, attempt, action_result in (
+            (1, "DETECTED_STOP", 0, {}),
+            (2, "RECOVERY_ATTEMPT", 1, {}),
+            (3, "RECOVERY_ATTEMPT", 1, {"success": True}),
+            (4, "DISSUASION", 3, {}),
+            (5, "SAFE_OBSERVING", 3, {}),
         ):
             handle_mqtt_message(
                 "robots/rx-001/events/task",
@@ -814,7 +815,7 @@ class MessageHandlerTests(TestCase):
                         "collision_zone": "front_stop",
                         "collision_points_inside": 7,
                         "front_obstacle_distance_m": 0.45,
-                        "action_result": {"success": False} if attempt else {},
+                        "action_result": action_result,
                         "reported_at": timezone.now().isoformat(),
                     },
                     sequence=sequence,
@@ -833,6 +834,10 @@ class MessageHandlerTests(TestCase):
             event_type="navigation_obstacle",
         )
         self.assertEqual(alerts.count(), 1)
+        alert = alerts.get()
+        self.assertEqual(alert.description, "三次避障失败，请离开巡检线路")
+        self.assertEqual(alert.raw_detection["highest_user_stage"], "DISSUASION")
+        self.assertEqual(alert.raw_detection["current_stage"], "SAFE_OBSERVING")
         alert = alerts.get()
         self.assertEqual(alert.risk_level, "high")
         self.assertEqual(len(alert.raw_detection["stages"]), 4)

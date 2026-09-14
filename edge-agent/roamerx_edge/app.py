@@ -26,6 +26,7 @@ from .mqtt_client import EdgeMqttClient
 from .structured_logging import StructuredLogEmitter
 from .navigation_stack_adapter import NavigationStackAdapter
 from .navigation_boundary import NavigationBoundaryManager
+from .obstacle_evidence import ObstacleEvidenceManager
 from .protocol import ProtocolError, build_envelope, now_iso
 from .power_mode_controller import PowerModeController
 from .person_follow_controller import PersonFollowController
@@ -107,6 +108,7 @@ class EdgeAgentApplication:
             map_yaml_path=str(Path(config.mapping.map_dir) / "map.yaml"),
         )
         self.media_client = MediaClient(config.media, config.robot.id)
+        self.obstacle_evidence = ObstacleEvidenceManager(config.obstacle_speech, self.media_client)
         self.ros_runtime = None
         if navigation is None:
             if not ROS_AVAILABLE:
@@ -172,6 +174,7 @@ class EdgeAgentApplication:
             obstacle_speech=config.obstacle_speech,
             waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,
+            obstacle_evidence=self.obstacle_evidence.schedule,
             localization_recovery_callback=self._handle_task_localization_loss,
         )
         self.self_healing = SelfHealingCoordinator(
@@ -306,6 +309,7 @@ class EdgeAgentApplication:
             LOGGER.warning("MQTT initial connection did not complete within 15 seconds")
         self.task_executor.restore_paused_localization_recovery()
         self.task_executor.report_startup_interruption()
+        self.obstacle_evidence.start()
         self.system_telemetry.poll()
         self.charge_control_adapter.observe_power(self.telemetry.latest_power())
         self.power_mode_controller.refresh_service_status(self.telemetry.latest_power())
@@ -375,6 +379,7 @@ class EdgeAgentApplication:
         self.trajectory.flush_active()
         self.person_follow_controller.stop("edge_shutdown")
         self.task_executor.stop()
+        self.obstacle_evidence.stop()
         for thread in self._threads:
             thread.join(timeout=3)
         self.structured_logs.emit("INFO", "system", "edge.stopping", "Edge Agent 正在停止")

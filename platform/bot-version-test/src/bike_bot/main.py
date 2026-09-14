@@ -14,6 +14,7 @@ from .audio_commands import AudioCommandClient
 from .config import AppConfig
 from .control import CommandServer
 from .detector import YoloDetector
+from .evidence import EvidenceServer
 from .rate_control import InferenceRateLimiter, selected_inference_rate_hz
 from .logging_utils import rotating_file_handler
 from .runtime import RuntimeState
@@ -180,6 +181,10 @@ class LatestFrameSample:
     wait_seconds: float
     dropped_frames: int
 
+    @property
+    def age_seconds(self) -> float:
+        return max(0.0, time.time() - self.captured_at_unix)
+
 
 class LatestFrameCapture:
     def __init__(self, stop_event: threading.Event, detector: YoloDetector) -> None:
@@ -239,6 +244,23 @@ class LatestFrameCapture:
                 source_fps=self._source_fps,
                 wait_seconds=time.perf_counter() - started_at,
                 dropped_frames=dropped_frames,
+            )
+
+    def latest_sample(self, *, max_age_seconds: float) -> LatestFrameSample | None:
+        with self._condition:
+            if self._frame is None or self._frame_id <= 0:
+                return None
+            captured_at_unix = self._frame_captured_at_unix
+            if max(0.0, time.time() - captured_at_unix) > max(0.0, float(max_age_seconds)):
+                return None
+            return LatestFrameSample(
+                frame_id=self._frame_id,
+                frame=self._frame.copy(),
+                read_at=self._frame_read_at,
+                captured_at_unix=captured_at_unix,
+                source_fps=self._source_fps,
+                wait_seconds=0.0,
+                dropped_frames=0,
             )
 
     def _run(self) -> None:
@@ -460,9 +482,8 @@ def detection_worker(
     client: TelemetryClient,
     runtime_state: RuntimeState,
     error_queue: Queue[BaseException],
+    latest_capture: LatestFrameCapture,
 ) -> None:
-    latest_capture = LatestFrameCapture(stop_event, detector)
-    latest_capture.start()
     last_frame_at = time.perf_counter()
     last_frame_id = 0
     frame_number = 0
@@ -644,7 +665,6 @@ def detection_worker(
         LOGGER.exception("detection worker crashed")
         error_queue.put(exc)
     finally:
-        latest_capture.close()
         person_mode_thread.join(timeout=max(1.0, client.config.telemetry.timeout_seconds + 1.0))
         if detector.config.display.enable:
             cv2.destroyAllWindows()
@@ -666,6 +686,20 @@ def command_worker(stop_event: threading.Event, server: CommandServer, error_que
             stop_event.wait(0.5)
     except BaseException as exc:
         LOGGER.exception("command worker crashed")
+        error_queue.put(exc)
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=2)
+
+
+def evidence_worker(stop_event: threading.Event, server: EvidenceServer, error_queue: Queue[BaseException]) -> None:
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True, name="evidence-http-server")
+    try:
+        server_thread.start()
+        while not stop_event.is_set():
+            stop_event.wait(0.5)
+    except BaseException as exc:
+        LOGGER.exception("evidence server crashed")
         error_queue.put(exc)
     finally:
         server.shutdown()
@@ -739,6 +773,14 @@ def main() -> None:
     command_server = CommandServer(config, sdk_client) if config.control.enable else None
     stop_event = threading.Event()
     error_queue: Queue[BaseException] = Queue()
+    latest_capture = LatestFrameCapture(stop_event, detector) if detector is not None else None
+    evidence_server = (
+        EvidenceServer(config.evidence, latest_capture, config.video.camera_id)
+        if config.evidence.enabled and latest_capture is not None
+        else None
+    )
+    if latest_capture is not None:
+        latest_capture.start()
 
     threads = []
     if config.telemetry.heartbeat_enabled:
@@ -763,7 +805,7 @@ def main() -> None:
         threads.append(
             threading.Thread(
                 target=detection_worker,
-                args=(stop_event, detector, person_detector, client, runtime_state, error_queue),
+                args=(stop_event, detector, person_detector, client, runtime_state, error_queue, latest_capture),
                 daemon=False,
                 name="detection-worker",
             )
@@ -802,6 +844,15 @@ def main() -> None:
                 name="command-worker",
             )
         )
+    if evidence_server:
+        threads.append(
+            threading.Thread(
+                target=evidence_worker,
+                args=(stop_event, evidence_server, error_queue),
+                daemon=False,
+                name="evidence-worker",
+            )
+        )
 
     for thread in threads:
         thread.start()
@@ -820,8 +871,11 @@ def main() -> None:
         LOGGER.info("shutdown requested")
         stop_event.set()
     finally:
+        stop_event.set()
         for thread in threads:
             thread.join(timeout=2)
+        if latest_capture is not None:
+            latest_capture.close()
         client.close()
 
 

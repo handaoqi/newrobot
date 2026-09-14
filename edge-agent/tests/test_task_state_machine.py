@@ -5072,6 +5072,109 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
     store.close()
 
 
+def test_successful_recovery_motion_still_counts_when_same_waypoint_remains_blocked(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeBlockedNavigation()
+    events = []
+    evidence = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            announce=False,
+            no_progress_seconds=0.0,
+            min_progress_m=0.5,
+            obstacle_max_distance_m=0.9,
+            obstacle_clear_seconds=3.0,
+            collision_limit_ratio=0.6,
+            max_recovery_attempts=3,
+        ),
+        obstacle_evidence=lambda payload: evidence.append(payload),
+    )
+    executor._start_obstacle_monitor = lambda: None
+    executor.start_task(command("task.start"))
+
+    executor._evaluate_obstacle_progress()  # detection
+    executor._evaluate_obstacle_progress()  # successful backup + left shift
+
+    assert nav.obstacle_recoveries[-1]["lateral_direction"] == 1
+    assert executor._recovery_attempts == 1
+    recovery_results = [
+        item[1]
+        for item in events
+        if item[0] == "task.obstacle_stage"
+        and item[1]["stage"] == "RECOVERY_ATTEMPT"
+        and item[1]["action_result"]
+    ]
+    assert recovery_results[-1]["action_result"]["success"] is True
+    assert recovery_results[-1]["alert_description"] == "正在进行第 1/3 次后退绕行避障"
+    assert len(evidence) == 1
+    assert evidence[0]["alert_description"] == "发现障碍物，已停车"
+
+    executor._evaluate_obstacle_progress()  # obstacle is still ahead: attempt 2
+    assert executor._recovery_attempts == 2
+    executor._suspend_obstacle_monitor()
+    executor._sync_obstacle_waypoint_budget()
+    assert executor._recovery_attempts == 2
+
+    executor.context.current_waypoint_index += 1
+    executor._sync_obstacle_waypoint_budget()
+    assert executor._recovery_attempts == 0
+    assert executor._obstacle_episode_id is None
+    executor.stop()
+    store.close()
+
+
+def test_new_obstacle_episode_same_waypoint_keeps_recovery_budget(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeBlockedNavigation()
+    blocked_snapshot = nav.obstacle_monitor_snapshot
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            announce=False,
+            no_progress_seconds=0.0,
+            min_progress_m=0.5,
+            obstacle_max_distance_m=0.9,
+            obstacle_clear_seconds=3.0,
+            collision_limit_ratio=0.6,
+            max_recovery_attempts=3,
+        ),
+    )
+    executor._start_obstacle_monitor = lambda: None
+    executor.start_task(command("task.start"))
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    first_episode = executor._obstacle_episode_id
+    assert executor._recovery_attempts == 1
+
+    nav.obstacle_monitor_snapshot = lambda: {
+        "front_obstacle_distance_m": None,
+        "stale": False,
+        "localization_normal": True,
+        "collision_monitor": {"state": "CLEAR", "reason": "clear", "sample_age_seconds": 0.02},
+    }
+    executor._obstacle_clear_started_at = time.monotonic() - 3.1
+    executor._evaluate_obstacle_progress()
+    assert executor._obstacle_episode_id is None
+    assert executor._recovery_attempts == 1
+
+    nav.obstacle_monitor_snapshot = blocked_snapshot
+    executor._evaluate_obstacle_progress()
+    executor._evaluate_obstacle_progress()
+    assert executor._obstacle_episode_id != first_episode
+    assert executor._recovery_attempts == 2
+    executor.stop()
+    store.close()
+
+
 def test_obstacle_recovery_rejects_unknown_rear_clearance(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeBlockedNavigation()

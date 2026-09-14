@@ -19,8 +19,25 @@ class MediaClient:
         self.config = config
         self.robot_id = robot_id
 
-    def upload_snapshot(self, path: str, event_id: str, task_execution_id: str | None = None) -> dict:
-        return self._upload(path, "snapshot", event_id, task_execution_id)
+    def upload_snapshot(
+        self,
+        path: str,
+        event_id: str,
+        task_execution_id: str | None = None,
+        *,
+        camera_id: str = "",
+        sequence_id: str = "",
+        event_time: str | None = None,
+    ) -> dict:
+        return self._upload(
+            path,
+            "snapshot",
+            event_id,
+            task_execution_id,
+            camera_id=camera_id,
+            sequence_id=sequence_id,
+            event_time=event_time,
+        )
 
     def upload_clip(self, path: str, event_id: str, task_execution_id: str | None = None) -> dict:
         return self._upload(path, "clip", event_id, task_execution_id)
@@ -130,7 +147,17 @@ class MediaClient:
         response.raise_for_status()
         return response.json()
 
-    def _upload(self, path: str, media_type: str, event_id: str, task_execution_id: str | None) -> dict:
+    def _upload(
+        self,
+        path: str,
+        media_type: str,
+        event_id: str,
+        task_execution_id: str | None,
+        *,
+        camera_id: str = "",
+        sequence_id: str = "",
+        event_time: str | None = None,
+    ) -> dict:
         file_path = Path(path)
         digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
         data = {
@@ -141,6 +168,12 @@ class MediaClient:
         }
         if task_execution_id:
             data["task_execution_id"] = task_execution_id
+        if camera_id:
+            data["camera_id"] = camera_id
+        if sequence_id:
+            data["sequence_id"] = sequence_id
+        if event_time:
+            data["event_time"] = event_time
         headers = {"X-Device-Id": self.config.device_id, "X-Device-Key": self.config.device_key}
         with file_path.open("rb") as stream:
             response = requests.post(

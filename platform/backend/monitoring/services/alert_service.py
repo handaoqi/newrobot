@@ -90,9 +90,21 @@ class AlertService:
         created = event is None
         stage = str(payload.get("stage") or "DETECTED_STOP")
         attempt = int(payload.get("recovery_attempt") or 0)
+        max_attempts = int(payload.get("max_recovery_attempts") or 3)
+        fallback_description = {
+            "DETECTED_STOP": "发现障碍物，已停车",
+            "WAITING_PROGRESS": "障碍物前等待局部绕行",
+            "RECOVERY_ATTEMPT": f"正在进行第 {attempt}/{max_attempts} 次后退绕行避障",
+            "DISSUASION": "三次避障失败，请离开巡检线路",
+            "SAFE_OBSERVING": "障碍安全观察中",
+            "CLEAR_CONFIRMED": "障碍已连续清除",
+            "RESUMED": "障碍清除，任务已恢复",
+        }.get(stage, "巡检线路障碍")
+        description = str(payload.get("alert_description") or fallback_description)
         stage_record = {
             "stage": stage,
             "attempt": attempt,
+            "description": description,
             "reported_at": payload.get("reported_at"),
             "collision_zone": payload.get("collision_zone"),
             "collision_points_inside": payload.get("collision_points_inside"),
@@ -105,15 +117,14 @@ class AlertService:
         risk = "high" if stage in {"DISSUASION", "SAFE_OBSERVING"} else (
             "medium" if stage == "RECOVERY_ATTEMPT" else "low"
         )
-        title = {
-            "DETECTED_STOP": "发现障碍物，已停车",
-            "WAITING_PROGRESS": "障碍物前等待局部绕行",
-            "RECOVERY_ATTEMPT": f"第 {attempt}/3 次后退绕行",
-            "DISSUASION": "三次避障失败，请离开巡检线路",
-            "SAFE_OBSERVING": "障碍安全观察中",
-            "CLEAR_CONFIRMED": "障碍已连续清除",
-            "RESUMED": "障碍清除，任务已恢复",
-        }.get(stage, "巡检线路障碍")
+        user_stage_rank = {"DETECTED_STOP": 1, "RECOVERY_ATTEMPT": 2, "DISSUASION": 3}
+        stage_rank = user_stage_rank.get(stage, 0)
+        title = description
+        pending_snapshot = MediaAsset.objects.filter(
+            robot=locked_robot,
+            event_id=event_id,
+            media_type="snapshot",
+        ).order_by("created_at").first()
         if created:
             pose = dict(payload.get("pose") or {})
             event = InspectionEvent.objects.create(
@@ -128,7 +139,13 @@ class AlertService:
                 confidence=100,
                 risk_level=risk,
                 description=title,
-                raw_detection={"obstacle_episode_id": episode_id, "stages": [stage_record]},
+                raw_detection={
+                    "obstacle_episode_id": episode_id,
+                    "stages": [stage_record],
+                    "current_stage": stage,
+                    "highest_user_stage": stage if stage_rank else "",
+                    "highest_user_stage_rank": stage_rank,
+                },
                 map_id=str(getattr(execution.map_data, "map_id", "") or ""),
                 map_version=str(getattr(execution.map_data, "version", "") or ""),
                 frame_id=str(pose.get("frame_id") or "map"),
@@ -137,35 +154,47 @@ class AlertService:
                 position_yaw=_decimal(pose.get("yaw")),
                 source_component="edge-agent",
                 source_code="COLLISION_STOP",
+                snapshot_asset=pending_snapshot,
+                snapshot_url=pending_snapshot.url if pending_snapshot else "",
             )
             locked_robot.today_alerts += 1
             locked_robot.save(update_fields=["today_alerts", "updated_at"])
             return event, True
         raw = dict(event.raw_detection or {})
         stages = list(raw.get("stages") or [])
-        signature = (stage, attempt, payload.get("reported_at"), bool(stage_record["action_result"]))
-        existing_signatures = {
+        existing_index = next(
             (
-                item.get("stage"),
-                int(item.get("attempt") or 0),
-                item.get("reported_at"),
-                bool(item.get("action_result")),
-            )
-            for item in stages
-            if isinstance(item, dict)
-        }
-        if signature not in existing_signatures:
+                index
+                for index, item in enumerate(stages)
+                if isinstance(item, dict)
+                and item.get("stage") == stage
+                and int(item.get("attempt") or 0) == attempt
+            ),
+            None,
+        )
+        if existing_index is None:
             stages.append(stage_record)
-        raw.update({"obstacle_episode_id": episode_id, "stages": stages})
+        else:
+            stages[existing_index] = {**stages[existing_index], **stage_record}
+        highest_rank = int(raw.get("highest_user_stage_rank") or 0)
+        raw.update({"obstacle_episode_id": episode_id, "stages": stages, "current_stage": stage})
+        if stage_rank >= highest_rank and stage_rank > 0:
+            raw["highest_user_stage"] = stage
+            raw["highest_user_stage_rank"] = stage_rank
+            event.title = title
+            event.description = description
         risk_rank = {"low": 0, "medium": 1, "high": 2}
         retained_risk = max(
             (event.risk_level, risk), key=lambda value: risk_rank.get(value, 0)
         )
-        event.title = title
-        event.description = title
         event.risk_level = retained_risk
         event.raw_detection = raw
-        event.save(update_fields=["title", "description", "risk_level", "raw_detection", "updated_at"])
+        update_fields = ["title", "description", "risk_level", "raw_detection", "updated_at"]
+        if event.snapshot_asset_id is None and pending_snapshot is not None:
+            event.snapshot_asset = pending_snapshot
+            event.snapshot_url = pending_snapshot.url
+            update_fields.extend(["snapshot_asset", "snapshot_url"])
+        event.save(update_fields=update_fields)
         return event, False
 
     @staticmethod

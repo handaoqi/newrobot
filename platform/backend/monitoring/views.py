@@ -2369,6 +2369,33 @@ class MediaUploadView(APIView):
         else:
             actual_sha256 = ""
 
+        event_id = payload.get("event_id")
+        if event_id and payload["media_type"] == "snapshot":
+            existing_asset = MediaAsset.objects.filter(
+                robot=robot,
+                media_type="snapshot",
+                event_id=event_id,
+            ).order_by("created_at").first()
+            if existing_asset is not None:
+                event = InspectionEvent.objects.filter(robot=robot, event_id=event_id).first()
+                if event is not None and event.snapshot_asset_id is None:
+                    event.snapshot_asset = existing_asset
+                    event.snapshot_url = existing_asset.url
+                    event.save(update_fields=["snapshot_asset", "snapshot_url", "updated_at"])
+                    event_broker.publish(
+                        "inspection_event_updated",
+                        {"event": EventSerializer(event, context={"request": request}).data},
+                    )
+                return Response(
+                    {
+                        "media_id": str(existing_asset.media_id),
+                        "url": existing_asset.url,
+                        "asset": MediaAssetSerializer(existing_asset).data,
+                        "already_exists": True,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
         asset = MediaAsset.objects.create(
             robot=robot,
             media_type=payload["media_type"],
@@ -2387,6 +2414,17 @@ class MediaUploadView(APIView):
         public_base_url = getattr(settings, "PUBLIC_BASE_URL", "")
         asset.url = f"{public_base_url}{media_path}" if public_base_url else request.build_absolute_uri(media_path)
         asset.save(update_fields=["url", "updated_at"])
+        linked_event = None
+        if event_id and payload["media_type"] == "snapshot":
+            linked_event = InspectionEvent.objects.filter(robot=robot, event_id=event_id).first()
+            if linked_event is not None and linked_event.snapshot_asset_id is None:
+                linked_event.snapshot_asset = asset
+                linked_event.snapshot_url = asset.url
+                linked_event.save(update_fields=["snapshot_asset", "snapshot_url", "updated_at"])
+                event_broker.publish(
+                    "inspection_event_updated",
+                    {"event": EventSerializer(linked_event, context={"request": request}).data},
+                )
         return Response(
             {"media_id": str(asset.media_id), "url": asset.url, "asset": MediaAssetSerializer(asset).data},
             status=status.HTTP_201_CREATED,

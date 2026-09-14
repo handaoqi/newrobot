@@ -972,22 +972,42 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
     if envelope.message_type == "task.obstacle_stage":
         occurred_at = _event_time(payload, "reported_at", "occurred_at")
-        TaskExecutionEvent.objects.get_or_create(
-            message_id=envelope.message_id,
-            defaults={
-                "task_execution": execution,
-                "state": execution.state,
-                "state_version": execution.state_version,
-                "event_type": envelope.message_type,
-                "occurred_at": occurred_at,
-                "payload": payload,
-            },
-        )
+        episode_id = str(payload.get("obstacle_episode_id") or "")
+        stage = str(payload.get("stage") or "")
+        attempt = int(payload.get("recovery_attempt") or 0)
+        task_event = TaskExecutionEvent.objects.filter(
+            task_execution=execution,
+            event_type=envelope.message_type,
+            payload__obstacle_episode_id=episode_id,
+            payload__stage=stage,
+            payload__recovery_attempt=attempt,
+        ).order_by("id").first()
+        if task_event is None:
+            TaskExecutionEvent.objects.create(
+                message_id=envelope.message_id,
+                task_execution=execution,
+                state=execution.state,
+                state_version=execution.state_version,
+                event_type=envelope.message_type,
+                occurred_at=occurred_at,
+                payload=payload,
+            )
+        else:
+            task_event.payload = {**dict(task_event.payload or {}), **payload}
+            task_event.occurred_at = occurred_at
+            task_event.save(update_fields=["payload", "occurred_at", "updated_at"])
         alert, alert_created = AlertService.ingest_obstacle_stage(
             robot, execution, payload, occurred_at=occurred_at
         )
         if alert_created:
             realtime_publisher.publish_alert(
+                {
+                    "event": EventSerializer(alert).data,
+                    "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
+                }
+            )
+        else:
+            realtime_publisher.publish_alert_updated(
                 {
                     "event": EventSerializer(alert).data,
                     "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
@@ -1001,7 +1021,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
             level="WARNING" if payload.get("stage") in {"DISSUASION", "SAFE_OBSERVING"} else "INFO",
             module="avoidance",
             event_code=f"avoidance.obstacle.{str(payload.get('stage') or 'unknown').lower()}",
-            message=str(payload.get("stage") or "障碍阶段更新"),
+            message=str(payload.get("alert_description") or payload.get("stage") or "障碍阶段更新"),
             data=payload,
             task_execution=execution,
             waypoint_index=payload.get("waypoint_index"),
