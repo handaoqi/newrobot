@@ -1519,13 +1519,16 @@ class RosAdapter(Node):
         transient frame.
         """
         decision = decision if isinstance(decision, dict) else self._localization_decision()
-        policy_source_ready = decision.get("policy_source_ready")
+        # ``policy_source_ready`` describes whether the configured absolute
+        # correction source (RTK/NDT/UKF) is currently eligible.  It is not a
+        # prerequisite for FAST-LIO to resume as the continuous pose source;
+        # indoor NDT maps commonly report it false after the one-shot
+        # correction has completed.
         return bool(
             decision.get("active_source") == "lio_imu"
             and decision.get("lio_healthy") is True
             and decision.get("lio_anchored") is True
             and decision.get("absolute_stable") is True
-            and (policy_source_ready is None or policy_source_ready is True)
         )
 
     def _on_cmd_vel_raw(self, msg) -> None:
@@ -2787,6 +2790,10 @@ class RosAdapter(Node):
             best_candidate = self._best_ndt_candidate(scan_match_sequence, {
                 "x": x, "y": y, "z": z, "yaw": yaw,
             })
+            handoff_decision = self._localization_decision()
+            handoff_diagnostics = self._lio_handoff_diagnostics(
+                handoff_decision, accepted=False
+            )
             diagnostic = ""
             if best_candidate:
                 score = best_candidate.get("matching_error")
@@ -2810,6 +2817,8 @@ class RosAdapter(Node):
                         best_candidate.get("reject_reason")
                         if best_candidate else "ndt_sample_unavailable"
                     ),
+                    "handoff_diagnostics": handoff_diagnostics,
+                    "localization_decision": handoff_decision,
                 },
             )
         return {
