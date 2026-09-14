@@ -1535,6 +1535,10 @@ def test_fine_reapproach_does_not_run_departure_heading_turn(tmp_path):
     assert len(nav.sent) == before + 1
     assert executor._departure_heading_index is None
     assert nav.teleop == []
+    # Re-approach is XY-only: preserve the corrected current yaw and defer
+    # the waypoint's requested final heading until after XY acceptance.
+    assert nav.sent[-1][0]["yaw"] == pytest.approx(0.0)
+    assert nav.arrival_goal_tolerances[-1][1] == pytest.approx(3.14)
     executor.stop()
     store.close()
 
@@ -1876,7 +1880,7 @@ def test_initial_and_reapproach_nav2_tolerances_include_docking_precision(tmp_pa
     executor._arrival_reapproach_index = 1
     assert executor._navigation_arrival_tolerance(1) == 0.20
     executor._set_navigation_arrival_tolerance(1)
-    assert nav.arrival_goal_tolerances[-1] == (0.20, 0.25)
+    assert nav.arrival_goal_tolerances[-1] == (0.20, 3.14)
 
     final = executor.context.route_snapshot["waypoints"][-1]
     final["arrival_policy"] = "dock"

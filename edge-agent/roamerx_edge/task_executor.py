@@ -2979,6 +2979,19 @@ class TaskExecutor:
             else straighten_pass_through_waypoints(original_batch)
         )
         self._apply_batch_travel_yaw(batch, index)
+        if reapproach and batch:
+            # A fine re-approach is XY-only.  Preserve the corrected robot
+            # heading in the Nav2 goal so MPPI/RPP/iLQR do not spend the
+            # progress-checker window rotating toward the waypoint yaw.  The
+            # requested waypoint yaw is applied later by the stationary
+            # arrival-heading stage, after localization and XY acceptance.
+            pose = self.navigation.latest_pose()
+            try:
+                current_yaw = float(getattr(pose, "yaw", float("nan")))
+            except (AttributeError, TypeError, ValueError):
+                current_yaw = float("nan")
+            if isfinite(current_yaw):
+                batch[-1]["yaw"] = current_yaw
         last_index = batch_end - 1
         if batch is not original_batch:
             max_shift = max(
@@ -3015,7 +3028,7 @@ class TaskExecutor:
                 (initial_final_approach or reapproach)
                 if not self._is_docking_task() else None
             ),
-            force_require_yaw=require_yaw_stop,
+            force_require_yaw=(False if reapproach else require_yaw_stop),
             reapproach=reapproach,
         )
         self._set_navigation_arrival_tolerance(index)
@@ -6735,6 +6748,9 @@ class TaskExecutor:
         if callable(setter):
             yaw_tolerance = 0.25
             if self.context and self._arrival_reapproach_index == waypoint_index:
+                # Re-approach must not rotate toward the final waypoint yaw;
+                # that turn is performed only after corrected XY acceptance.
+                yaw_tolerance = 3.14
                 waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
                 if self._arrival_policy(waypoint, waypoint_index) == "dock":
                     yaw_tolerance = self.docking_goal_yaw_tolerance_rad
