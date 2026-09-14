@@ -209,6 +209,17 @@ class PatrolLoopServiceTests(TestCase):
 
     def test_system_pause_observes_five_seconds_then_dispatches_recovery(self):
         session = self.create_running_loop()
+        self.status.raw_payload = {
+            "navigation": {
+                "observation_schema": "roamerx.navigation-observation.v1",
+                "actual_velocity_observed": True,
+                "actual_planar_speed_mps": 0.0,
+                "actual_turn_speed_rps": 0.0,
+                "actual_velocity_sample_age_seconds": 0.1,
+            },
+            "localization": {"fresh": True, "sample_age_seconds": 0.1},
+        }
+        self.status.save(update_fields=["raw_payload"])
         TaskExecutionService.transition(
             session.current_execution,
             "accepted",
