@@ -1433,10 +1433,6 @@ async function toggleLoop() {
     showToast(lowBatteryGuardMessage(batteryPercent.value), { variant: 'alert' })
     return
   }
-  if (!navigationReady()) {
-    showToast('请先完成地图定位初始化', { variant: 'alert' })
-    return
-  }
   const duration = Number(loopDurationMinutes.value)
   const rest = Number(loopRestSeconds.value)
   if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(rest) || rest < 0) {
@@ -1445,6 +1441,28 @@ async function toggleLoop() {
   }
   busy.value = true
   try {
+    // Do not gate a new loop on the page's cached status from the previous
+    // failed round. Refresh first, then reuse the same map/localization/Nav2
+    // repair path used between loop rounds before creating the session.
+    const latestStatus = await refreshLocalizationStatus({ sync: false })
+    if (latestStatus) navigationStatus.value = latestStatus
+    if (!navigationReady()) {
+      loopMessage.value = '上一轮任务已结束，正在清理旧状态并确认导航/定位就绪'
+      const readiness = await ensureLoopNavigationReady((message) => {
+        loopMessage.value = message
+      })
+      if (!readiness.ok) {
+        showToast('定位或导航栈未就绪，循环暂未启动', { variant: 'alert' })
+        return
+      }
+    }
+    if (execution.value && !isRunning.value) {
+      execution.value = null
+      trajectory.value = []
+      trajectoryExecutionId.value = ''
+      executionTimer && window.clearInterval(executionTimer)
+      executionTimer = null
+    }
     const session = await createPatrolLoopSession({
       taskId: presetTask.value.id,
       durationSeconds: Math.round(duration * 60),
