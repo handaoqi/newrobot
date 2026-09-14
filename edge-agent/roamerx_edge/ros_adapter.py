@@ -1836,26 +1836,56 @@ class RosAdapter(Node):
             LOGGER.warning("Nav2 not ready: FollowWaypoints or a lifecycle node failed the ready probe")
         return False
 
+    @staticmethod
+    def _wait_for_future(future, timeout_seconds: float) -> bool:
+        if future is None:
+            return False
+        if future.done():
+            return True
+        completed = threading.Event()
+        future.add_done_callback(lambda _: completed.set())
+        if future.done():
+            return True
+        return completed.wait(timeout=timeout_seconds)
+
+    def _destroy_client_if_idle(self, client, future=None) -> None:
+        """Destroy a one-shot client only after the executor is done with it.
+
+        rclpy keeps the client handle in the wait set while a request is in
+        flight. Destroying it there raises InvalidHandle inside ros-executor
+        and stops all pose/status callbacks.
+        """
+        if client is None:
+            return
+        if future is not None and not future.done():
+            LOGGER.warning(
+                "leaving ROS service client alive until its in-flight request finishes"
+            )
+            return
+        try:
+            self.destroy_client(client)
+        except Exception:
+            LOGGER.debug("destroy_client failed", exc_info=True)
+
     def _lifecycle_node_is_active(self, node_name: str) -> bool:
         client = self.create_client(
             GetState,
             f"{node_name}/get_state",
             callback_group=self._nav_service_callback_group,
         )
+        future = None
         try:
             if not client.wait_for_service(timeout_sec=0.25):
                 return False
             future = client.call_async(GetState.Request())
-            completed = threading.Event()
-            future.add_done_callback(lambda _: completed.set())
-            if not completed.wait(timeout=0.75) or future.result() is None:
+            if not self._wait_for_future(future, 0.75) or future.result() is None:
                 return False
             # lifecycle_msgs/State.PRIMARY_STATE_ACTIVE == 3.
             return int(future.result().current_state.id) == 3
         except Exception:
             return False
         finally:
-            self.destroy_client(client)
+            self._destroy_client_if_idle(client, future)
 
     # Patrol goal dispatch: prefer fail-fast + Edge retry over a 30s stand.
     _NAV_SEND_READY_TIMEOUT_SECONDS = 5.0
@@ -4498,20 +4528,19 @@ class RosAdapter(Node):
             "/local_costmap/clear_entirely_local_costmap",
             callback_group=self._nav_service_callback_group,
         )
+        future = None
         try:
             if not client.wait_for_service(timeout_sec=min(timeout_seconds, 0.5)):
                 return False
             future = client.call_async(ClearEntireCostmap.Request())
-            completed = threading.Event()
-            future.add_done_callback(lambda _: completed.set())
-            if not completed.wait(timeout=timeout_seconds):
+            if not self._wait_for_future(future, timeout_seconds):
                 return False
             return future.done() and future.exception() is None
         except Exception:
             LOGGER.warning("local costmap clear request failed", exc_info=True)
             return False
         finally:
-            self.destroy_client(client)
+            self._destroy_client_if_idle(client, future)
 
     def cancel_navigation(self, timeout_seconds: float = 5.0) -> bool:
         if self._goal_handle is not None:
@@ -5248,6 +5277,7 @@ class RosAdapter(Node):
                 f"{node_name}/get_parameters",
                 callback_group=self._nav_service_callback_group,
             )
+            future = None
             try:
                 if not client.wait_for_service(timeout_sec=0.35):
                     last_error = f"{node_name} get_parameters service is unavailable"
@@ -5255,9 +5285,7 @@ class RosAdapter(Node):
                 request = GetParameters.Request()
                 request.names = list(names)
                 future = client.call_async(request)
-                completed = threading.Event()
-                future.add_done_callback(lambda _: completed.set())
-                if not completed.wait(timeout=1.0):
+                if not self._wait_for_future(future, 1.0):
                     last_error = f"{node_name} get_parameters timed out"
                     continue
                 response = future.result()
@@ -5269,7 +5297,7 @@ class RosAdapter(Node):
             except Exception as exc:
                 last_error = str(exc)
             finally:
-                self.destroy_client(client)
+                self._destroy_client_if_idle(client, future)
             time.sleep(0.05)
         raise ProtocolError(code, last_error or f"unable to get parameters on {node_name}")
 
@@ -5320,6 +5348,7 @@ class RosAdapter(Node):
                 f"{node_name}/set_parameters",
                 callback_group=self._nav_service_callback_group,
             )
+            future = None
             try:
                 if not client.wait_for_service(timeout_sec=0.25):
                     last_error = f"{node_name} parameter service is unavailable"
@@ -5331,9 +5360,7 @@ class RosAdapter(Node):
                     self._parameter_message(name, value) for name, value in values.items()
                 ]
                 future = client.call_async(request)
-                completed = threading.Event()
-                future.add_done_callback(lambda _: completed.set())
-                if not completed.wait(timeout=0.75):
+                if not self._wait_for_future(future, 0.75):
                     last_error = f"{node_name} parameter request timed out"
                     service_missing = True
                 else:
@@ -5360,7 +5387,7 @@ class RosAdapter(Node):
             except Exception as exc:
                 last_error = str(exc)
             finally:
-                self.destroy_client(client)
+                self._destroy_client_if_idle(client, future)
             time.sleep(0.05)
         if service_missing:
             self._mark_remote_param_unavailable(node_name)
@@ -5470,12 +5497,27 @@ class RosRuntime:
         # cache even though ROS itself is still publishing fresh data.
         self.executor = MultiThreadedExecutor(num_threads=5)
         self.executor.add_node(node)
-        self.thread = threading.Thread(target=self.executor.spin, daemon=True, name="ros-executor")
+        self._stopped = threading.Event()
+        self.thread = threading.Thread(target=self._spin, daemon=True, name="ros-executor")
+
+    def _spin(self) -> None:
+        # spin() itself dies on the first callback exception. A destroyed
+        # service client used to raise InvalidHandle here and freeze every
+        # pose, speed, and status callback until Edge was restarted.
+        while not self._stopped.is_set():
+            if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
+                break
+            try:
+                self.executor.spin_once(timeout_sec=0.1)
+            except Exception:
+                LOGGER.exception("ROS executor callback failed; keeping subscriptions alive")
+                time.sleep(0.05)
 
     def start(self) -> None:
         self.thread.start()
 
     def stop(self) -> None:
+        self._stopped.set()
         self.executor.shutdown()
         self.node.destroy_node()
         self.thread.join(timeout=3)
