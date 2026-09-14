@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  arrivalPolicyDescription,
+  arrivalPolicyDetails,
   appendConfirmedInspectionPoint,
   clampMapZoom,
   headingBetweenMapPoints,
@@ -22,12 +22,28 @@ import {
   shouldShowBoundaryPolicyStatus,
 } from '../src/services/routePlannerState.js'
 
-test('arrival-policy descriptions match the selected strategy and fail closed', () => {
-  assert.equal(arrivalPolicyDescription('pass_through'), '连续通过，不停车、不校正，也不执行停留、语音或动作。')
-  assert.equal(arrivalPolicyDescription('stop_and_confirm'), '停车后完成定位校正与到点确认，再执行后续事项。')
-  assert.equal(arrivalPolicyDescription('precision'), '停车校正后按更严格的位置和航向验收；不满足则安全处理。')
-  assert.equal(arrivalPolicyDescription('dock'), '用于对接终点，执行专用低速对接及严格位置、航向确认。')
-  assert.equal(arrivalPolicyDescription('unknown'), '停车后完成定位校正与到点确认，再执行后续事项。')
+test('arrival-policy details include the matching coarse, fine, and micro-adjust parameters', () => {
+  assert.deepEqual(arrivalPolicyDetails('pass_through'), [
+    '连续通过：不停车、不校正，不执行停留/语音/动作。',
+    '粗到达：0.50m。',
+    '细靠近/转向微调：不执行。',
+  ])
+  assert.deepEqual(arrivalPolicyDetails('stop_and_confirm'), [
+    '停车校正并确认后，执行后续事项。',
+    '粗到达0.50m；细靠近0.20m，最多3次。',
+    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+  ])
+  assert.deepEqual(arrivalPolicyDetails('precision'), [
+    '停车校正后，按严格位置和航向验收。',
+    '粗到达0.50m；细靠近0.15m，最多3次。',
+    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+  ])
+  assert.deepEqual(arrivalPolicyDetails('dock'), [
+    '停靠任务中：低速对接并严格确认位置、航向。',
+    '粗到达0.50m；对接到位0.08m、航向5度。',
+    '不使用通用转向微调。',
+  ])
+  assert.deepEqual(arrivalPolicyDetails('unknown'), arrivalPolicyDetails('stop_and_confirm'))
 })
 
 test('heading input is normalized and converted only when valid', () => {

@@ -36,7 +36,7 @@ import {
   MAP_ZOOM_MIN,
   MAP_ZOOM_STEP,
   appendConfirmedInspectionPoint,
-  arrivalPolicyDescription,
+  arrivalPolicyDetails,
   clampMapZoom,
   headingBetweenMapPoints,
   headingDegreesToRadians,
@@ -3249,8 +3249,34 @@ async function handleDeleteRoute(route) {
                         <small>NDT：{{ poseText(waypointMappingSamples[index]?.slam) }}</small>
                         <small>RTK：{{ rtkPoseText(waypointMappingSamples[index]?.rtk) }}</small>
                       </div>
+                      <div class="waypoint-pre-arrival-strategy">
+                        <small class="waypoint-pre-arrival-strategy-title">到点前策略（上一位置 → 当前航点）</small>
+                        <label>
+                          <span>局部控制器</span>
+                          <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
+                            <option v-for="option in LOCAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                              {{ option.label }}
+                            </option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>全局规划器</span>
+                          <select
+                            :value="point.global_controller || DEFAULT_GLOBAL_CONTROLLER"
+                            @change="setWaypointGlobalController(index, $event.target.value)"
+                          >
+                            <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                              {{ option.label }}
+                            </option>
+                          </select>
+                        </label>
+                      </div>
                       <div class="waypoint-heading-row" role="group" aria-label="方向与到点转向">
-                        <span>方向</span>
+                        <label class="waypoint-heading-turn">
+                          <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
+                          <span>到点转向</span>
+                        </label>
+                        <span class="waypoint-heading-label">方向</span>
                         <div class="waypoint-heading-input">
                           <input
                             type="number"
@@ -3261,17 +3287,13 @@ async function handleDeleteRoute(route) {
                             @input="setWaypointYawDraft(index, $event.target.value)"
                             @keydown.enter.prevent="confirmWaypointYaw(index)"
                           />
-                          <span class="heading-unit">°</span>
+                          <span class="heading-unit">度</span>
                           <button
                             type="button"
                             class="btn btn-sm heading-confirm-btn"
                             :class="{ confirmed: waypointYawConfirmed[index] }"
                             @click="confirmWaypointYaw(index)"
                           >{{ waypointYawConfirmed[index] ? '已确认' : '确认' }}</button>
-                          <label class="waypoint-heading-turn">
-                            <input type="checkbox" :checked="point.require_yaw === true" @change="setWaypointBoolean(index, 'require_yaw', $event.target.checked)" />
-                            <span>到点转向</span>
-                          </label>
                         </div>
                       </div>
                       <small v-if="waypointYawErrors[index]" class="waypoint-field-error">{{ waypointYawErrors[index] }}</small>
@@ -3298,29 +3320,12 @@ async function handleDeleteRoute(route) {
                           </option>
                         </select>
                       </label>
-                      <small class="waypoint-arrival-hint">{{ arrivalPolicyDescription(point.arrival_policy) }}</small>
+                      <small class="waypoint-arrival-hint">
+                        <span v-for="detail in arrivalPolicyDetails(point.arrival_policy)" :key="detail">{{ detail }}</span>
+                      </small>
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
                         <span>到下个点避障（绕行+减速；硬急停）</span>
-                      </label>
-                      <label>
-                        <span>局部控制器</span>
-                        <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
-                          <option v-for="option in LOCAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
-                            {{ option.label }}
-                          </option>
-                        </select>
-                      </label>
-                      <label>
-                        <span>全局规划器</span>
-                        <select
-                          :value="point.global_controller || DEFAULT_GLOBAL_CONTROLLER"
-                          @change="setWaypointGlobalController(index, $event.target.value)"
-                        >
-                          <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
-                            {{ option.label }}
-                          </option>
-                        </select>
                       </label>
                       <label>
                         <span>定位校正方式</span>
@@ -4470,13 +4475,19 @@ async function handleDeleteRoute(route) {
 
 .waypoint-arrival-hint {
   grid-column: 1 / -1;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
   color: #475467;
   line-height: 1.4;
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
   white-space: normal !important;
+}
+
+.waypoint-arrival-hint span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .waypoint-delete-btn {
@@ -4506,34 +4517,58 @@ async function handleDeleteRoute(route) {
   line-height: 1.35;
 }
 
+.waypoint-pre-arrival-strategy {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-left: 3px solid #475467;
+  background: #f8fafc;
+}
+
+.waypoint-pre-arrival-strategy-title {
+  grid-column: 1 / -1;
+  color: #344054;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.waypoint-main .waypoint-pre-arrival-strategy label {
+  grid-template-columns: 4.8rem minmax(0, 1fr);
+  gap: 0.35rem;
+}
+
 .waypoint-heading-input {
   display: grid;
-  grid-template-columns: minmax(96px, 1fr) 18px auto auto;
+  grid-template-columns: 64px 14px auto;
   align-items: center;
   gap: 0.3rem;
-  width: 100%;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .waypoint-heading-input input {
   width: 100%;
-  min-width: 96px;
+  min-width: 0;
   padding: 0.35rem 0.45rem;
   border: 1px solid #d0d5dd;
   border-radius: 4px;
 }
 
 .waypoint-heading-row {
-  display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
+  display: flex;
   align-items: center;
-  gap: 0.4rem;
+  min-width: 0;
+  gap: 0.35rem;
   color: #667085;
   font-size: 0.78rem;
+  white-space: nowrap;
 }
 
 .waypoint-main label.waypoint-heading-turn {
   display: flex;
   grid-template-columns: none;
+  flex: 0 0 auto;
   align-items: center;
   gap: 0.25rem;
   color: #475467;
@@ -4546,6 +4581,10 @@ async function handleDeleteRoute(route) {
   margin: 0;
 }
 
+.waypoint-heading-label {
+  flex: 0 0 auto;
+}
+
 .heading-unit {
   color: #475467;
   font-weight: 700;
@@ -4553,7 +4592,8 @@ async function handleDeleteRoute(route) {
 }
 
 .heading-confirm-btn {
-  min-width: 54px;
+  min-width: 58px;
+  padding: 0.35rem 0.5rem;
   white-space: nowrap;
 }
 
@@ -6680,7 +6720,9 @@ async function handleDeleteRoute(route) {
   .map-origin-legend { gap: 0.35rem; }
   .map-origin-legend-item { font-size: 0; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
-  .waypoint-heading-input { grid-template-columns: minmax(0, 1fr) 18px auto auto; }
+  .waypoint-pre-arrival-strategy { grid-template-columns: 1fr; }
+  .waypoint-main .waypoint-pre-arrival-strategy label { grid-template-columns: 1fr; }
+  .waypoint-heading-input { grid-template-columns: 64px 14px auto; }
   .waypoint-heading-input input { min-width: 0; }
   .waypoint-list { height: auto; }
   .drill-timeline-panel { max-height: 54px; padding: 0.7rem; }

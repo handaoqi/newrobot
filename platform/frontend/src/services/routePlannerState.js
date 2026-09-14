@@ -3,16 +3,32 @@ export const MAP_ZOOM_MAX = 3
 export const MAP_ZOOM_STEP = 0.25
 export const KEYFRAME_PAGE_SIZE = 50
 
-const ARRIVAL_POLICY_DESCRIPTIONS = {
-  pass_through: '连续通过，不停车、不校正，也不执行停留、语音或动作。',
-  stop_and_confirm: '停车后完成定位校正与到点确认，再执行后续事项。',
-  precision: '停车校正后按更严格的位置和航向验收；不满足则安全处理。',
-  dock: '用于对接终点，执行专用低速对接及严格位置、航向确认。',
+const ARRIVAL_POLICY_DETAILS = {
+  pass_through: [
+    '连续通过：不停车、不校正，不执行停留/语音/动作。',
+    '粗到达：0.50m。',
+    '细靠近/转向微调：不执行。',
+  ],
+  stop_and_confirm: [
+    '停车校正并确认后，执行后续事项。',
+    '粗到达0.50m；细靠近0.20m，最多3次。',
+    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+  ],
+  precision: [
+    '停车校正后，按严格位置和航向验收。',
+    '粗到达0.50m；细靠近0.15m，最多3次。',
+    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+  ],
+  dock: [
+    '停靠任务中：低速对接并严格确认位置、航向。',
+    '粗到达0.50m；对接到位0.08m、航向5度。',
+    '不使用通用转向微调。',
+  ],
 }
 
-export function arrivalPolicyDescription(value) {
+export function arrivalPolicyDetails(value) {
   const policy = String(value || '').trim().toLowerCase()
-  return ARRIVAL_POLICY_DESCRIPTIONS[policy] || ARRIVAL_POLICY_DESCRIPTIONS.stop_and_confirm
+  return ARRIVAL_POLICY_DETAILS[policy] || ARRIVAL_POLICY_DETAILS.stop_and_confirm
 }
 
 const RTK_QUALITY_ALIASES = {
