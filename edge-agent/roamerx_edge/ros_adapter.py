@@ -221,6 +221,13 @@ class RosAdapter(Node):
         self._callback_performance = CallbackPerformanceMonitor()
         self._control_callback_group = MutuallyExclusiveCallbackGroup()
         self._telemetry_callback_group = MutuallyExclusiveCallbackGroup()
+        # These three subscriptions are the stop-confirmation authority and
+        # the source of every Edge pose/status frame.  They must not queue
+        # behind a long scan-match, recovery-service, or scan-processing
+        # callback in the mutually-exclusive control group.  A reentrant,
+        # dedicated group keeps their tiny state assignments responsive while
+        # the other callback groups perform bounded work.
+        self._safety_callback_group = ReentrantCallbackGroup()
         # Action result callbacks enter TaskExecutor and may wait for its state
         # lock while an obstacle-recovery worker is making synchronous ROS
         # requests.  Keeping Nav2 action and service responses in reentrant,
@@ -323,7 +330,7 @@ class RosAdapter(Node):
             ros_config.localization_topic,
             self._on_localization,
             10,
-            callback_group=self._control_callback_group,
+            callback_group=self._safety_callback_group,
         )
         self.create_subscription(
             Odometry,
@@ -334,11 +341,11 @@ class RosAdapter(Node):
         )
         self.create_subscription(
             Twist, ros_config.cmd_vel_raw_topic, self._on_cmd_vel_raw, 10,
-            callback_group=self._control_callback_group,
+            callback_group=self._safety_callback_group,
         )
         self.create_subscription(
             Twist, ros_config.cmd_vel_topic, self._on_cmd_vel, 10,
-            callback_group=self._control_callback_group,
+            callback_group=self._safety_callback_group,
         )
         self.create_subscription(
             LaserScan, ros_config.scan_topic, self._on_scan, qos_profile_sensor_data,
@@ -5339,7 +5346,11 @@ class RosAdapter(Node):
 class RosRuntime:
     def __init__(self, node: RosAdapter) -> None:
         self.node = node
-        self.executor = MultiThreadedExecutor(num_threads=3)
+        # Safety pose and /cmd_vel callbacks have their own callback group.
+        # Reserve executor capacity for them when control/telemetry callbacks
+        # are busy, otherwise a blocked recovery callback can freeze the Edge
+        # cache even though ROS itself is still publishing fresh data.
+        self.executor = MultiThreadedExecutor(num_threads=5)
         self.executor.add_node(node)
         self.thread = threading.Thread(target=self.executor.spin, daemon=True, name="ros-executor")
 
