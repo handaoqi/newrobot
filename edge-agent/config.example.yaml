@@ -67,6 +67,28 @@ safety:
   stop_confirmation_seconds: 1.0
   standup_confirmation_timeout_seconds: 12.0
   low_battery_percent: 20
+  # 路线四档与远程监控页使用同一组三轴上限；实际速度仍取速度包络、
+  # 边界限速和 Collision Monitor 限速中的较小值。
+  navigation_speed_micro_mps: 0.30
+  navigation_speed_low_mps: 1.50
+  navigation_speed_medium_mps: 2.10
+  navigation_speed_high_mps: 3.00
+  navigation_lateral_micro_mps: 0.225
+  navigation_lateral_low_mps: 1.125
+  navigation_lateral_medium_mps: 1.575
+  navigation_lateral_high_mps: 2.25
+  navigation_turn_micro_rps: 0.525
+  navigation_turn_low_rps: 2.625
+  navigation_turn_medium_rps: 3.675
+  navigation_turn_high_rps: 5.25
+  navigation_sdk_max_vx_mps: 3.00
+  navigation_sdk_max_vy_mps: 2.25
+  navigation_sdk_max_yaw_rate_rps: 5.25
+  navigation_boundary_speed_limit_max_mps: 3.00
+  navigation_speed_accel_mps2: 0.80
+  navigation_speed_decel_mps2: 1.00
+  navigation_speed_final_mps: 0.15
+  navigation_speed_update_seconds: 0.5
   # Every waypoint first reaches this Nav2 radius. A normal stopping waypoint
   # is then stationary-corrected and retried at 0.20 m; after three attempts,
   # a fresh corrected pose inside this 0.50 m circle may continue. Precision

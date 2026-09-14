@@ -1082,6 +1082,14 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
                 if waypoint_local_controller in {"mppi", "rpp", "ilqr"}
                 else "mppi"
             )
+            navigation_speed_level = str(
+                normalized.get("navigation_speed_level") or "micro"
+            ).lower()
+            normalized["navigation_speed_level"] = (
+                navigation_speed_level
+                if navigation_speed_level in {"micro", "low", "medium", "high"}
+                else "micro"
+            )
             waypoint_global_controller = str(
                 normalized.get("global_controller") or route_global_controller
             ).lower()
@@ -1156,6 +1164,15 @@ class PatrolRouteSerializer(serializers.ModelSerializer):
         ]
         if invalid_local_controllers:
             raise serializers.ValidationError("途经点局部控制器只能是 MPPI、RPP 或 iLQR")
+        invalid_speed_levels = [
+            point.get("navigation_speed_level")
+            for point in value
+            if isinstance(point, dict)
+            and str(point.get("navigation_speed_level") or "micro").lower()
+            not in {"micro", "low", "medium", "high"}
+        ]
+        if invalid_speed_levels:
+            raise serializers.ValidationError("途经点到下个点速度只能是微速、低速、中速或高速")
         invalid_global_controllers = [
             point.get("global_controller")
             for point in value

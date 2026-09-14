@@ -63,11 +63,11 @@ class VelCmdUdpPublisher : public rclcpp::Node {
     // update the target velocity less frequently; this timer maintains the
     // joystick frames without turning every hold update into a cloud command.
     this->declare_parameter("publish_period_ms", 20);
-    this->declare_parameter("sdk_max_vx", 0.5);
-    this->declare_parameter("sdk_max_vy", 0.5);
-    this->declare_parameter("sdk_max_yaw_rate", 0.5);
-    // These scales apply only to virtual-remote teleoperation. Keep the SDK
-    // navigation limits above unchanged.
+    this->declare_parameter("sdk_max_vx", 3.0);
+    this->declare_parameter("sdk_max_vy", 2.25);
+    this->declare_parameter("sdk_max_yaw_rate", 5.25);
+    // These scales apply only to virtual-remote teleoperation. The SDK
+    // navigation limits above share the validated route-tier high ceiling.
     this->declare_parameter("remote_full_scale_vx", 3.0);
     this->declare_parameter("remote_full_scale_vy", 2.25);
     this->declare_parameter("remote_full_scale_yaw_rate", 5.25);
@@ -1077,9 +1077,9 @@ class VelCmdUdpPublisher : public rclcpp::Node {
   int inactive_linger_ms_ = 8000;
   int manual_override_ms_ = 650;
   int publish_period_ms_ = 20;
-  double sdk_max_vx_ = 0.5;
-  double sdk_max_vy_ = 0.5;
-  double sdk_max_yaw_rate_ = 0.5;
+  double sdk_max_vx_ = 3.0;
+  double sdk_max_vy_ = 2.25;
+  double sdk_max_yaw_rate_ = 5.25;
   double remote_full_scale_vx_ = 3.0;
   double remote_full_scale_vy_ = 2.25;
   double remote_full_scale_yaw_rate_ = 5.25;

@@ -327,6 +327,12 @@ def generate_launch_description():
                 executable='vel_cmd_udp_pub',
                 parameters=[{
                     'platform': LaunchConfiguration('platform'),
+                    # Route tiers intentionally share the remote-monitoring
+                    # page's high profile. Collision Monitor and the turn
+                    # coupling below remain independent final safeguards.
+                    'sdk_max_vx': 3.0,
+                    'sdk_max_vy': 2.25,
+                    'sdk_max_yaw_rate': 5.25,
                     # Do not dump forward speed while turning at Nav2 wz_max.
                     'turn_linear_limit_yaw_rate': 1.0,
                     'turn_max_linear_speed': 0.5,

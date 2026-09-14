@@ -167,8 +167,8 @@ def normalize_boundary_payload(payload: dict) -> dict:
                 speed = float(speed if speed not in (None, "") else 0.15)
             except (TypeError, ValueError) as exc:
                 raise ValidationError(f"第 {index + 1} 个限速值必须是数值") from exc
-            if not 0 < speed <= 0.3:
-                raise ValidationError(f"第 {index + 1} 个限速值必须大于 0 且不超过 0.30 m/s")
+            if not 0 < speed <= 3.0:
+                raise ValidationError(f"第 {index + 1} 个限速值必须大于 0 且不超过 3.00 m/s")
         else:
             speed = None
         try:

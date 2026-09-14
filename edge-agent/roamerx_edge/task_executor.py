@@ -24,6 +24,7 @@ from .protocol import MessageEnvelope, ProtocolError, now_iso
 from .localization_recovery import select_recovery_seed
 from .recovery_arbiter import RecoveryArbiter
 from .leg_profile import LegProfile
+from .navigation_speed import normalize_navigation_speed_level
 from .waypoint_actions import WaypointActionRegistry
 
 
@@ -293,6 +294,7 @@ class NavigationAdapter(Protocol):
         live: bool = False,
         outdoor: bool | None = None,
         local_controller: str = "mppi",
+        navigation_speed_level: str = "micro",
     ) -> None: ...
     def set_global_controller(self, mode: str) -> None: ...
     def arrival_adjust_velocity(
@@ -5291,6 +5293,7 @@ class TaskExecutor:
     ) -> None:
         apply_final = False
         policy_waypoint = None
+        speed_distance_remaining = None
         progress_updates: list[dict] = []
         with self._lock:
             if not self.context or self.context.state != "running":
@@ -5302,6 +5305,9 @@ class TaskExecutor:
                 return
             if milestone != "waypoint_reached" and milestone != "arrival_confirmed":
                 policy_waypoint = self.context.route_snapshot["waypoints"][current_waypoint_index]
+                speed_distance_remaining = distance_remaining_m
+                if speed_distance_remaining is None:
+                    speed_distance_remaining = self._distance_to_waypoint(policy_waypoint)
             if (
                 not self._is_docking_task()
                 and current_waypoint_index == dispatched_final_index
@@ -5407,6 +5413,13 @@ class TaskExecutor:
                     )
         if policy_waypoint is not None:
             self._set_localization_policy(policy_waypoint, "moving")
+        if speed_distance_remaining is not None:
+            speed_updater = getattr(self.navigation, "update_navigation_speed_envelope", None)
+            if callable(speed_updater):
+                try:
+                    speed_updater(speed_distance_remaining)
+                except Exception:
+                    LOGGER.warning("navigation speed-envelope update failed", exc_info=True)
         if apply_final:
             try:
                 self._apply_patrol_final_approach()
@@ -6626,6 +6639,9 @@ class TaskExecutor:
         self._segment_avoidance_enabled = avoid_obstacles
         outdoor_profile = self._outdoor_navigation_profile()
         local_controller = str(target.get("local_controller") or "mppi")
+        navigation_speed_level = normalize_navigation_speed_level(
+            profile_waypoint.get("navigation_speed_level")
+        )
         speed_profile = "final" if final_approach else "cruise"
         goal_checker_id = (
             "precision_goal_checker"
@@ -6666,6 +6682,7 @@ class TaskExecutor:
                 final_approach=final_approach,
                 outdoor=outdoor_profile,
                 smoother_id=leg_profile.smoother_id,
+                navigation_speed_level=navigation_speed_level,
             )
         else:
             safety_setter = getattr(self.navigation, "set_safety_profile", None)
@@ -6686,13 +6703,21 @@ class TaskExecutor:
                 )
             setter = getattr(self.navigation, "set_waypoint_profile", None)
             if callable(setter):
-                setter(
-                    avoid_obstacles=avoid_obstacles,
-                    require_yaw=require_yaw,
-                    final_approach=final_approach,
-                    outdoor=outdoor_profile,
-                    local_controller=local_controller,
-                )
+                profile_kwargs = {
+                    "avoid_obstacles": avoid_obstacles,
+                    "require_yaw": require_yaw,
+                    "final_approach": final_approach,
+                    "outdoor": outdoor_profile,
+                    "local_controller": local_controller,
+                    "navigation_speed_level": navigation_speed_level,
+                }
+                try:
+                    setter(**profile_kwargs)
+                except TypeError:
+                    # Older simulation/test adapters retain the pre-tier
+                    # signature. Production RosAdapter always receives it.
+                    profile_kwargs.pop("navigation_speed_level", None)
+                    setter(**profile_kwargs)
             smoother_setter = getattr(self.navigation, "set_smoother", None)
             if callable(smoother_setter):
                 smoother_setter(leg_profile.smoother_id)

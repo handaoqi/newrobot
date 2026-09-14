@@ -212,6 +212,13 @@ def validate_command(envelope: MessageEnvelope) -> None:
                         "INVALID_MESSAGE",
                         "waypoint local_controller must be mppi, rpp or ilqr",
                     )
+            if "navigation_speed_level" in waypoint and str(
+                waypoint["navigation_speed_level"]
+            ).lower() not in {"micro", "low", "medium", "high"}:
+                raise ProtocolError(
+                    "INVALID_MESSAGE",
+                    "waypoint navigation_speed_level must be micro, low, medium or high",
+                )
             if "global_controller" in waypoint:
                 mode = str(waypoint["global_controller"]).lower()
                 if mode not in {"theta_star", "navfn", "smac_hybrid"}:

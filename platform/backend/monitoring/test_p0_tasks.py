@@ -140,6 +140,19 @@ class TaskExecutionTests(TestCase):
         execution = TaskExecutionService.create_execution(self.task, self.user)
         self.assertEqual(execution.route_snapshot["waypoints"][0]["local_controller"], "rpp")
 
+    def test_route_snapshot_defaults_and_preserves_navigation_speed_level(self):
+        self.route.waypoints = [
+            {"x": 1, "y": 2, "yaw": 0},
+            {"x": 2, "y": 3, "yaw": 0, "navigation_speed_level": "high"},
+        ]
+        self.route.save(update_fields=["waypoints", "updated_at"])
+        execution = TaskExecutionService.create_execution(self.task, self.user)
+        levels = [
+            point["navigation_speed_level"]
+            for point in execution.route_snapshot["waypoints"]
+        ]
+        self.assertEqual(levels, ["micro", "high"])
+
     def test_route_snapshot_preserves_smac_hybrid_and_ilqr(self):
         self.route.global_controller = "smac_hybrid"
         self.route.waypoints = [{

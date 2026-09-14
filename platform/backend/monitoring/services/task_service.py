@@ -57,6 +57,11 @@ def _normalize_local_controller(value: object | None) -> str:
     return normalized if normalized in {"mppi", "rpp", "ilqr"} else "mppi"
 
 
+def _normalize_navigation_speed_level(value: object | None) -> str:
+    normalized = str(value or "micro").strip().lower()
+    return normalized if normalized in {"micro", "low", "medium", "high"} else "micro"
+
+
 def _normalize_arrival_policy(value: object | None, *, dwell_seconds: float = 0.0,
                               require_yaw: bool = False, actions: list | None = None,
                               is_last: bool = False) -> str:
@@ -111,6 +116,9 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_text = str(raw.get("speech_text") or "")
             localization_mode = str(raw.get("localization_mode") or "ndt").lower()
             local_controller = _normalize_local_controller(raw.get("local_controller"))
+            navigation_speed_level = _normalize_navigation_speed_level(
+                raw.get("navigation_speed_level")
+            )
             global_controller = _normalize_global_controller(
                 raw.get("global_controller") or route_global_controller
             )
@@ -159,6 +167,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
             speech_text = ""
             localization_mode = "ndt"
             local_controller = "mppi"
+            navigation_speed_level = "micro"
             global_controller = route_global_controller
             avoidance_to_next = True
             detour_enabled = True
@@ -188,6 +197,7 @@ def normalize_waypoints(route: PatrolRoute) -> list[dict[str, Any]]:
                 "actions": actions,
                 "localization_mode": localization_mode if localization_mode in {"ndt", "rtk", "ukf"} else "ndt",
                 "local_controller": local_controller,
+                "navigation_speed_level": navigation_speed_level,
                 "global_controller": global_controller,
                 "avoidance_to_next": avoidance_to_next,
                 "detour_enabled": detour_enabled,

@@ -119,6 +119,29 @@ class SafetyConfig:
     navigation_dispatch_retry_budget_seconds: float = 300.0
     standup_confirmation_timeout_seconds: float = 12.0
     low_battery_percent: int = 20
+    # Route speed tiers share the remote-monitoring page's three-axis values.
+    # They remain upper bounds: the velocity envelope, boundary and Collision
+    # Monitor can always lower the active command.
+    navigation_speed_micro_mps: float = 0.30
+    navigation_speed_low_mps: float = 1.50
+    navigation_speed_medium_mps: float = 2.10
+    navigation_speed_high_mps: float = 3.00
+    navigation_lateral_micro_mps: float = 0.225
+    navigation_lateral_low_mps: float = 1.125
+    navigation_lateral_medium_mps: float = 1.575
+    navigation_lateral_high_mps: float = 2.25
+    navigation_turn_micro_rps: float = 0.525
+    navigation_turn_low_rps: float = 2.625
+    navigation_turn_medium_rps: float = 3.675
+    navigation_turn_high_rps: float = 5.25
+    navigation_sdk_max_vx_mps: float = 3.00
+    navigation_sdk_max_vy_mps: float = 2.25
+    navigation_sdk_max_yaw_rate_rps: float = 5.25
+    navigation_boundary_speed_limit_max_mps: float = 3.00
+    navigation_speed_accel_mps2: float = 0.80
+    navigation_speed_decel_mps2: float = 1.00
+    navigation_speed_final_mps: float = 0.15
+    navigation_speed_update_seconds: float = 0.5
     # Every Nav2 leg first enters a coarse arrival circle. A normal stopping
     # waypoint is stationary-corrected and retried at the stricter tolerance;
     # after the configured re-approach budget it may continue only if fresh,

@@ -1388,7 +1388,8 @@ def test_lio_primary_fixed_rtk_policy_ignores_unused_ndt_degradation():
 def test_patrol_cruise_profile_does_not_hug_path_orientations():
     cruise = follow_path_patrol_params(final_approach=False, local_obstacles=False)
     assert cruise["FollowPath.vx_max"] == 0.30
-    assert cruise["FollowPath.wz_max"] == 0.35
+    assert cruise["FollowPath.vy_max"] == 0.225
+    assert cruise["FollowPath.wz_max"] == 0.525
     assert cruise["FollowPath.PathAlignCritic.enabled"] is False
     assert cruise["FollowPath.PathAlignCritic.use_path_orientations"] is False
     assert cruise["FollowPath.CostCritic.enabled"] is False
@@ -1639,7 +1640,7 @@ def test_ilqr_waypoint_profile_and_boundary_limit_use_ilqr_parameters(monkeypatc
     )
     assert writes[0] == (
         "/controller_server",
-        {"ILQR.desired_linear_vel": 0.20, "ILQR.max_angular_vel": 0.35},
+        {"ILQR.desired_linear_vel": 0.30, "ILQR.max_angular_vel": 0.525},
         "WAYPOINT_PROFILE_FAILED",
     )
 

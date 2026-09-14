@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 
 from roamerx_edge.navigation_controllers import (
@@ -6,6 +7,8 @@ from roamerx_edge.navigation_controllers import (
 )
 from roamerx_edge.protocol import ProtocolError
 from roamerx_edge.ros_adapter import RosAdapter
+from roamerx_edge.navigation_speed import navigation_speed_profile
+from roamerx_edge.config import SafetyConfig
 
 
 def test_navigation_capabilities_lists_all_registered_combos():
@@ -17,6 +20,43 @@ def test_navigation_capabilities_lists_all_registered_combos():
     assert {
         "global_controller": "smac_hybrid", "local_controller": "ilqr"
     } in caps["supported_combos"]
+
+
+def test_route_speed_profiles_match_remote_monitoring_page_and_default_micro():
+    assert navigation_speed_profile(None).level == "micro"
+    assert navigation_speed_profile(None).vx_mps == 0.30
+    assert navigation_speed_profile("micro").vy_mps == 0.225
+    assert navigation_speed_profile("micro").wz_rps == 0.525
+    assert navigation_speed_profile("low").vx_mps == 1.50
+    assert navigation_speed_profile("medium").vx_mps == 2.10
+    assert navigation_speed_profile("high").vx_mps == 3.00
+
+
+def test_speed_envelope_ramps_and_respects_the_boundary_limit():
+    adapter = object.__new__(RosAdapter)
+    published = []
+    adapter._navigation_speed_limit_pub = SimpleNamespace(
+        publish=lambda message: published.append(message)
+    )
+    adapter._active_navigation_speed_profile = navigation_speed_profile("high")
+    adapter._active_navigation_final_approach = False
+    adapter._boundary_zone_speed_limit = None
+    adapter.safety_config = SafetyConfig()
+    adapter._navigation_speed_last_limit_mps = None
+    adapter._navigation_speed_last_update_monotonic = time.monotonic() - 1.0
+
+    first = adapter.update_navigation_speed_envelope(100.0, force=True)
+    assert first == 0.15
+    adapter._navigation_speed_last_update_monotonic = time.monotonic() - 1.0
+    second = adapter.update_navigation_speed_envelope(100.0, force=True)
+    assert 0.15 < second <= 0.96
+
+    adapter._boundary_zone_speed_limit = 0.30
+    adapter._navigation_speed_last_update_monotonic = time.monotonic() - 1.0
+    limited = adapter.update_navigation_speed_envelope(100.0, force=True)
+    assert 0.30 <= limited <= 0.301
+    assert 0.30 <= published[-1].speed_limit <= 0.301
+    assert published[-1].percentage is False
 
 
 def test_apply_navigation_profile_rolls_back_on_readback_failure(monkeypatch):

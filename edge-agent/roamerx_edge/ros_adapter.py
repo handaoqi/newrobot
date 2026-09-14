@@ -25,6 +25,7 @@ from .navigation_controllers import (
     normalize_global_controller,
     normalize_local_controller,
 )
+from .navigation_speed import NavigationSpeedProfile, navigation_speed_profile
 from .protocol import ProtocolError, now_iso
 from .rtk_origin import RtkOriginPayloadCache
 from .safety_policy import RuntimeSafetyState
@@ -39,6 +40,7 @@ def follow_path_patrol_params(
     local_obstacles: bool,
     require_yaw: bool = False,
     outdoor: bool = False,
+    speed_profile: NavigationSpeedProfile | None = None,
 ) -> dict[str, bool | float]:
     """MPPI settings for a patrol goal.
 
@@ -47,16 +49,25 @@ def follow_path_patrol_params(
     only useful when the local obstacle layer is actually painting. Final
     approach slows down so the DiffDrive turning radius fits the 0.35 m window.
     """
-    vx_max = 0.15 if final_approach else 0.30
+    vx_max = 0.15 if final_approach else float(
+        (speed_profile or navigation_speed_profile("micro")).vx_mps
+    )
     # Do not back away from a terminal click or make a high-rate orbit while
     # the goal checker is settling.  Reverse and large yaw corrections are
     # reserved for the explicit recovery controller.
     vx_min = 0.0 if final_approach else -0.12
-    wz_max = 0.35 if final_approach else 0.35
+    wz_max = 0.35 if final_approach else float(
+        (speed_profile or navigation_speed_profile("micro")).wz_rps
+    )
     return {
         "FollowPath.vx_max": vx_max,
         "FollowPath.vx_min": vx_min,
-        "FollowPath.vy_max": 0.5,
+        # DiffDrive keeps vy at zero in its motion model. Preserve the shared
+        # profile here for diagnostics and future Omni support without
+        # pretending autonomous navigation can laterally translate today.
+        "FollowPath.vy_max": 0.0 if final_approach else float(
+            (speed_profile or navigation_speed_profile("micro")).vy_mps
+        ),
         "FollowPath.wz_max": wz_max,
         "FollowPath.wz_std": 0.04,
         "FollowPath.gamma": 0.03,
@@ -98,6 +109,7 @@ try:
     from geometry_msgs.msg import Twist
     from nav2_msgs.action import FollowWaypoints, NavigateThroughPoses
     from nav_msgs.msg import Odometry, Path
+    from nav2_msgs.msg import SpeedLimit
     from action_msgs.srv import CancelGoal
     from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
@@ -131,6 +143,11 @@ except ImportError:
     class Bool:  # type: ignore[no-redef]
         def __init__(self):
             self.data = False
+
+    class SpeedLimit:  # type: ignore[no-redef]
+        def __init__(self):
+            self.speed_limit = -1.0
+            self.percentage = False
 
 try:
     if ROS_AVAILABLE:
@@ -480,6 +497,7 @@ class RosAdapter(Node):
         self._controller_selector_pub = self.create_publisher(String, "/controller_selector", goal_yaw_qos)
         self._planner_selector_pub = self.create_publisher(String, "/planner_selector", goal_yaw_qos)
         self._smoother_selector_pub = self.create_publisher(String, "/smoother_selector", goal_yaw_qos)
+        self._navigation_speed_limit_pub = self.create_publisher(SpeedLimit, "/speed_limit", 10)
         self.create_subscription(String, "/robot_motion_state", self._on_robot_motion_state, 10)
         self.create_subscription(Path, "/plan", self._on_global_plan, 10)
         self._install_callback_timers()
@@ -4693,6 +4711,7 @@ class RosAdapter(Node):
         outdoor: bool | None = None,
         smoother_id: str = "savitzky_golay",
         live: bool = False,
+        navigation_speed_level: str = "micro",
     ) -> dict:
         """Atomically apply a leg profile, read it back, and roll back on failure."""
         previous = copy.deepcopy(getattr(self, "_last_good_navigation_profile", None))
@@ -4757,6 +4776,7 @@ class RosAdapter(Node):
                 live=live,
                 outdoor=use_outdoor,
                 local_controller=normalized_local,
+                navigation_speed_level=navigation_speed_level,
             )
             self.set_local_controller(normalized_local)
             self.set_smoother(smoother_id)
@@ -4775,6 +4795,9 @@ class RosAdapter(Node):
                 "final_approach": bool(final_approach),
                 "outdoor": bool(use_outdoor),
                 "smoother_id": str(smoother_id),
+                "navigation_speed_level": navigation_speed_profile(
+                    navigation_speed_level, getattr(self, "safety_config", None)
+                ).level,
                 "readback": {
                     "planner_use_astar": actual_astar,
                     "obstacle_layer.enabled": safety_readback.get("obstacle_layer.enabled"),
@@ -4817,6 +4840,7 @@ class RosAdapter(Node):
             final_approach=bool(snapshot.get("final_approach", False)),
             outdoor=bool(snapshot.get("outdoor", False)),
             local_controller=str(snapshot.get("local_controller") or "mppi"),
+            navigation_speed_level=str(snapshot.get("navigation_speed_level") or "micro"),
         )
         self.set_local_controller(str(snapshot.get("local_controller") or "mppi"))
         self.set_smoother(str(snapshot.get("smoother_id") or "savitzky_golay"))
@@ -4832,6 +4856,7 @@ class RosAdapter(Node):
         live: bool = False,
         outdoor: bool | None = None,
         local_controller: str = "mppi",
+        navigation_speed_level: str = "micro",
     ) -> None:
         self.set_local_controller(local_controller)
         yaw_message = Bool()
@@ -4842,6 +4867,9 @@ class RosAdapter(Node):
         )
         local_obstacles = bool(avoid_obstacles)
         normalized_local = normalize_local_controller(local_controller)
+        speed_profile = navigation_speed_profile(
+            navigation_speed_level, getattr(self, "safety_config", None)
+        )
         use_mppi = normalized_local == "mppi"
         use_rpp = normalized_local == "rpp"
         use_ilqr = normalized_local == "ilqr"
@@ -4852,6 +4880,7 @@ class RosAdapter(Node):
             bool(live),
             bool(use_outdoor_profile),
             bool(local_obstacles),
+            speed_profile,
         )
         if (
             not live
@@ -4873,6 +4902,7 @@ class RosAdapter(Node):
                 local_obstacles=local_obstacles,
                 require_yaw=require_yaw,
                 outdoor=use_outdoor_profile,
+                speed_profile=speed_profile,
             )
             self._boundary_base_velocity = {
                 "vx_max": float(params["FollowPath.vx_max"]),
@@ -4896,14 +4926,14 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
         elif use_rpp:
             params = {
-                "RPP.desired_linear_vel": 0.18 if final_approach else 0.22,
+                "RPP.desired_linear_vel": 0.18 if final_approach else speed_profile.vx_mps,
                 "RPP.min_linear_vel": 0.03 if final_approach else 0.05,
                 "RPP.lookahead_dist": 0.40 if final_approach else 1.2,
                 "RPP.min_lookahead_dist": 0.25 if final_approach else 0.6,
                 "RPP.max_lookahead_dist": 0.8 if final_approach else 1.8,
                 "RPP.use_velocity_scaled_lookahead_dist": not final_approach,
                 "RPP.lookahead_time": 1.5 if final_approach else 2.5,
-                "RPP.max_angular_vel": 0.30,
+                "RPP.max_angular_vel": 0.30 if final_approach else speed_profile.wz_rps,
                 "RPP.rotate_to_heading_threshold": 0.35 if require_yaw else 0.52,
                 "RPP.rotate_to_heading_angular_vel": 0.25 if require_yaw else 0.22,
                 "RPP.use_regulated_linear_velocity_scaling": True,
@@ -4914,6 +4944,11 @@ class RosAdapter(Node):
                 "vx_min": 0.0,
                 "vy_max": 0.0,
             }
+            boundary_limit = getattr(self, "_boundary_zone_speed_limit", None)
+            if boundary_limit is not None:
+                params["RPP.desired_linear_vel"] = min(
+                    params["RPP.desired_linear_vel"], boundary_limit
+                )
             try:
                 self._set_remote_parameters(
                     "/controller_server", params,
@@ -4925,8 +4960,8 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply RPP waypoint speed profile")
         elif use_ilqr:
             params = {
-                "ILQR.desired_linear_vel": 0.14 if final_approach else 0.20,
-                "ILQR.max_angular_vel": 0.25 if final_approach else 0.35,
+                "ILQR.desired_linear_vel": 0.14 if final_approach else speed_profile.vx_mps,
+                "ILQR.max_angular_vel": 0.25 if final_approach else speed_profile.wz_rps,
             }
             self._boundary_base_velocity = {
                 "vx_max": float(params["ILQR.desired_linear_vel"]),
@@ -4968,8 +5003,9 @@ class RosAdapter(Node):
             self._waypoint_profile_signature = None
             self._safety_profile_signature = None
         LOGGER.info(
-            "waypoint profile local=%s outdoor=%s final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s cost_weight=%s",
+            "waypoint profile local=%s speed=%s outdoor=%s final_approach=%s live=%s follow_applied=%s vx=[%s,%s] wz_max=%s path_align=%s cost=%s cost_weight=%s",
             normalize_local_controller(local_controller),
+            speed_profile.level,
             use_outdoor_profile,
             final_approach,
             live,
@@ -4987,6 +5023,75 @@ class RosAdapter(Node):
             params.get("FollowPath.CostCritic.enabled") if use_mppi else None,
             params.get("FollowPath.CostCritic.cost_weight") if use_mppi else None,
         )
+
+        self._active_navigation_speed_profile = speed_profile
+        self._active_navigation_final_approach = bool(final_approach)
+        self._navigation_speed_last_limit_mps = None
+        self._navigation_speed_last_update_monotonic = time.monotonic()
+        # A new leg starts from its safe terminal speed. Feedback then raises
+        # the cap with a bounded ramp; this avoids a parameter-write jump to
+        # the remote-monitoring maximum.
+        self.update_navigation_speed_envelope(0.0, force=True)
+
+    def update_navigation_speed_envelope(
+        self, distance_remaining_m: float | None, *, force: bool = False
+    ) -> float | None:
+        """Publish a smooth controller speed cap for the active route leg.
+
+        The selected tier is an upper bound. Remaining distance creates a
+        braking envelope, while the boundary remains a stricter cap. MPPI,
+        RPP and iLQR consume the same absolute ``/speed_limit`` topic.
+        """
+        profile = getattr(self, "_active_navigation_speed_profile", None)
+        publisher = getattr(self, "_navigation_speed_limit_pub", None)
+        if profile is None or publisher is None:
+            return None
+        try:
+            remaining = max(0.0, float(distance_remaining_m or 0.0))
+        except (TypeError, ValueError):
+            return None
+        self._navigation_speed_last_distance_remaining_m = remaining
+        safety = getattr(self, "safety_config", None)
+        final_speed = max(0.01, float(getattr(safety, "navigation_speed_final_mps", 0.15)))
+        decel = max(0.05, float(getattr(safety, "navigation_speed_decel_mps2", 1.0)))
+        accel = max(0.05, float(getattr(safety, "navigation_speed_accel_mps2", 0.8)))
+        interval = max(0.05, float(getattr(safety, "navigation_speed_update_seconds", 0.5)))
+        if getattr(self, "_active_navigation_final_approach", False):
+            desired = final_speed
+        elif profile.level == "micro":
+            # The established micro profile is a constant 0.30 m/s cap; only
+            # explicitly selected low/medium/high legs use the envelope ramp.
+            desired = float(profile.vx_mps)
+        else:
+            brake_cap = math.sqrt(final_speed * final_speed + 2.0 * decel * remaining)
+            desired = min(float(profile.vx_mps), brake_cap)
+        boundary = getattr(self, "_boundary_zone_speed_limit", None)
+        if boundary is not None:
+            desired = min(desired, float(boundary))
+        now = time.monotonic()
+        previous = getattr(self, "_navigation_speed_last_limit_mps", None)
+        previous_at = getattr(self, "_navigation_speed_last_update_monotonic", now)
+        elapsed = max(0.0, now - previous_at)
+        if previous is None:
+            limited = desired if profile.level == "micro" else final_speed
+        elif desired >= previous:
+            limited = min(desired, previous + accel * elapsed)
+        else:
+            limited = max(desired, previous - decel * elapsed)
+        if (
+            not force
+            and previous is not None
+            and now - previous_at < interval
+            and abs(limited - previous) < 1e-3
+        ):
+            return previous
+        message = SpeedLimit()
+        message.speed_limit = float(limited)
+        message.percentage = False
+        publisher.publish(message)
+        self._navigation_speed_last_limit_mps = float(limited)
+        self._navigation_speed_last_update_monotonic = now
+        return float(limited)
 
     def apply_outdoor_gps_profile(self, *, outdoor: bool | None = None) -> None:
         """Select an outdoor RTK line planner or restore the indoor map planner."""
@@ -5263,8 +5368,18 @@ class RosAdapter(Node):
 
     def set_boundary_speed_limit(self, speed_limit_mps: float | None) -> None:
         """Apply the most restrictive active map-zone speed to the selected controller."""
+        maximum = max(
+            0.05,
+            float(
+                getattr(
+                    getattr(self, "safety_config", None),
+                    "navigation_boundary_speed_limit_max_mps",
+                    3.0,
+                )
+            ),
+        )
         self._boundary_zone_speed_limit = (
-            None if speed_limit_mps is None else max(0.05, min(0.30, float(speed_limit_mps)))
+            None if speed_limit_mps is None else max(0.05, min(maximum, float(speed_limit_mps)))
         )
         base = getattr(self, "_boundary_base_velocity", {"vx_max": 0.30, "vx_min": -0.12, "vy_max": 0.5})
         limit = base["vx_max"] if self._boundary_zone_speed_limit is None else min(base["vx_max"], self._boundary_zone_speed_limit)
@@ -5284,6 +5399,9 @@ class RosAdapter(Node):
             controller_params,
             code="BOUNDARY_SPEED_LIMIT_FAILED",
             attempts=2,
+        )
+        self.update_navigation_speed_envelope(
+            getattr(self, "_navigation_speed_last_distance_remaining_m", 0.0), force=True
         )
 
     @staticmethod

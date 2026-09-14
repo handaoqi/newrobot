@@ -850,6 +850,20 @@ function normalizeGlobalController(mode) {
   return ['theta_star', 'navfn', 'smac_hybrid'].includes(normalized) ? normalized : 'theta_star'
 }
 
+const NAVIGATION_SPEED_LEVEL_OPTIONS = [
+  { value: 'micro', label: '微速' },
+  { value: 'low', label: '低速' },
+  { value: 'medium', label: '中速' },
+  { value: 'high', label: '高速' },
+]
+
+function normalizeWaypointNavigationSpeedLevel(level) {
+  const normalized = String(level || 'micro').trim().toLowerCase()
+  return NAVIGATION_SPEED_LEVEL_OPTIONS.some(option => option.value === normalized)
+    ? normalized
+    : 'micro'
+}
+
 function normalizeArrivalPolicy(value, point = {}) {
   const normalized = String(value || '').trim().toLowerCase()
   if (ARRIVAL_POLICY_OPTIONS.some(option => option.value === normalized)) return normalized
@@ -892,6 +906,13 @@ function setWaypointGlobalController(index, mode) {
   waypoints.value[index] = {
     ...waypoints.value[index],
     global_controller: normalizeGlobalController(mode),
+  }
+}
+
+function setWaypointNavigationSpeedLevel(index, level) {
+  waypoints.value[index] = {
+    ...waypoints.value[index],
+    navigation_speed_level: normalizeWaypointNavigationSpeedLevel(level),
   }
 }
 
@@ -1559,6 +1580,7 @@ function normalizeStoredWaypoint(point, map = selectedMap.value) {
     localization_mode: normalizeWaypointLocalizationMode(point.localization_mode),
     local_controller: normalizeLocalController(point.local_controller),
     global_controller: normalizeGlobalController(point.global_controller || DEFAULT_GLOBAL_CONTROLLER),
+    navigation_speed_level: normalizeWaypointNavigationSpeedLevel(point.navigation_speed_level),
     arrival_policy: normalizeArrivalPolicy(point.arrival_policy, point),
     avoidance_to_next: point.avoidance_to_next !== false,
     detour_enabled: point.detour_enabled !== false && point.avoidance_to_next !== false,
@@ -1621,6 +1643,7 @@ function withWaypointYaw(points) {
       localization_mode: normalizeWaypointLocalizationMode(current.localization_mode),
       local_controller: normalizeLocalController(current.local_controller),
       global_controller: normalizeGlobalController(current.global_controller || DEFAULT_GLOBAL_CONTROLLER),
+      navigation_speed_level: normalizeWaypointNavigationSpeedLevel(current.navigation_speed_level),
       arrival_policy: normalizeArrivalPolicy(current.arrival_policy, current),
       avoidance_to_next: current.avoidance_to_next !== false,
       detour_enabled: current.detour_enabled !== false && current.avoidance_to_next !== false,
@@ -3105,6 +3128,7 @@ function imagePointToWaypoint({ imageX, imageY }, geometry, yaw = 0) {
     localization_mode: 'ndt',
     local_controller: 'mppi',
     global_controller: DEFAULT_GLOBAL_CONTROLLER,
+    navigation_speed_level: 'micro',
     avoidance_to_next: true,
     detour_enabled: true,
     collision_slowdown_enabled: true,
@@ -3326,6 +3350,17 @@ async function handleDeleteRoute(route) {
                       <label v-if="index < waypoints.length - 1" class="waypoint-check">
                         <input type="checkbox" :checked="point.avoidance_to_next !== false" @change="setWaypointBoolean(index, 'avoidance_to_next', $event.target.checked)" />
                         <span>到下个点避障（绕行+减速；硬急停）</span>
+                      </label>
+                      <label v-if="index < waypoints.length - 1">
+                        <span>到下个点速度</span>
+                        <select
+                          :value="point.navigation_speed_level || 'micro'"
+                          @change="setWaypointNavigationSpeedLevel(index, $event.target.value)"
+                        >
+                          <option v-for="option in NAVIGATION_SPEED_LEVEL_OPTIONS" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </option>
+                        </select>
                       </label>
                       <label>
                         <span>定位校正方式</span>
