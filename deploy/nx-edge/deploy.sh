@@ -13,13 +13,15 @@ INSTALL_SERVICE=false
 INSTALL_EDGE_SERVICE=false
 INIT_SYSTEM_DEPS=false
 RESTART_EDGE=false
+DEPLOY_ROBOT=true
 DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--init-system-deps] [--build] [--install-edge-service] [--install-service] [--restart-edge] [--dry-run]
+Usage: deploy/nx-edge/deploy.sh [--host user@robot] [--edge-only] [--init-system-deps] [--build] [--install-edge-service] [--install-service] [--restart-edge] [--dry-run]
 
 Runtime configuration, state, maps, build outputs and logs are preserved.
+--edge-only stages only the versioned Edge release and never syncs the ROS tree.
 --init-system-deps installs and verifies required NX runtime packages.
 --install-service includes --init-system-deps automatically.
 --install-edge-service updates only the Edge Agent systemd unit.
@@ -30,6 +32,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) ROBOT_HOST="${2:?missing host}"; shift ;;
+    --edge-only) DEPLOY_ROBOT=false ;;
     --init-system-deps) INIT_SYSTEM_DEPS=true ;;
     --build) BUILD=true ;;
     --install-edge-service) INSTALL_EDGE_SERVICE=true ;;
@@ -57,7 +60,7 @@ target_path() {
 }
 
 if "$DRY_RUN"; then
-  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge_current=$EDGE_CURRENT_LINK runtime=$EDGE_RUNTIME_DIR init_system_deps=$INIT_SYSTEM_DEPS build=$BUILD install_edge_service=$INSTALL_EDGE_SERVICE install_service=$INSTALL_SERVICE restart_edge=$RESTART_EDGE"
+  echo "NX deployment dry-run: host=${ROBOT_HOST:-local} project=$ROBOT_PROJECT_DIR edge_current=$EDGE_CURRENT_LINK runtime=$EDGE_RUNTIME_DIR deploy_robot=$DEPLOY_ROBOT init_system_deps=$INIT_SYSTEM_DEPS build=$BUILD install_edge_service=$INSTALL_EDGE_SERVICE install_service=$INSTALL_SERVICE restart_edge=$RESTART_EDGE"
   exit 0
 fi
 
@@ -75,7 +78,7 @@ if "$INIT_SYSTEM_DEPS"; then
   remote_exec "chmod 0755 /tmp/roamerx-init-nx-system-deps.sh && /tmp/roamerx-init-nx-system-deps.sh"
 fi
 
-if [[ -n "$ROBOT_HOST" || "$(readlink -f "$REPO_ROOT/robot")" != "$(readlink -f "$ROBOT_PROJECT_DIR")" ]]; then
+if "$DEPLOY_ROBOT" && { [[ -n "$ROBOT_HOST" ]] || [[ "$(readlink -f "$REPO_ROOT/robot")" != "$(readlink -f "$ROBOT_PROJECT_DIR")" ]]; }; then
   rsync -a --exclude='build/' --exclude='install/' --exclude='log/' \
     "$REPO_ROOT/robot/" "$(target_path "$ROBOT_PROJECT_DIR/")"
 fi
@@ -87,7 +90,13 @@ rsync -a --delete \
 PREVIOUS_EDGE_RELEASE="$(remote_exec "readlink -f '$EDGE_CURRENT_LINK' 2>/dev/null || true")"
 remote_exec "candidate='$EDGE_RUNTIME_DIR/.current-edge-$EDGE_RELEASE_ID'; ln -sfn '$EDGE_RELEASE_DIR' \"\$candidate\"; mv -Tf \"\$candidate\" '$EDGE_CURRENT_LINK'"
 
-if "$BUILD"; then remote_exec "cd '$ROBOT_PROJECT_DIR' && ./build.sh all"; fi
+if "$BUILD"; then
+  if ! "$DEPLOY_ROBOT"; then
+    echo "--build cannot be combined with --edge-only" >&2
+    exit 2
+  fi
+  remote_exec "cd '$ROBOT_PROJECT_DIR' && ./build.sh all"
+fi
 
 if "$INSTALL_EDGE_SERVICE"; then
   rsync -a "$REPO_ROOT/edge-agent/systemd/roamerx-edge-agent.service" \
