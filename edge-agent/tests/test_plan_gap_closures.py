@@ -30,8 +30,10 @@ class FakeNavigation:
 def test_recovery_budget_exhaustion_blocks_new_owners():
     arbiter = RecoveryArbiter()
     leases = []
-    for index in range(6):
-        lease = arbiter.acquire("EDGE_OBSTACLE", f"attempt-{index}", distance_m=0.3)
+    # Exercise the attempt ceiling independently from the shorter movement
+    # distance ceiling; either limit is allowed to stop the next owner.
+    for index in range(10):
+        lease = arbiter.acquire("EDGE_OBSTACLE", f"attempt-{index}")
         assert lease is not None
         leases.append(lease)
         assert arbiter.release(lease) is True

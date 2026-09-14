@@ -498,6 +498,11 @@ def test_duplicate_command_is_not_executed_twice(tmp_path):
 
 def test_task_progress_version_follows_start_ack_version(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    # This test verifies event-version ordering, not stationary arrival. Make
+    # the final batch a pass-through route so the newer fresh-frame arrival
+    # gate does not turn the test double's missing ROS samples into SAFE_HOLD.
+    for waypoint in raw["payload"]["command"]["route_snapshot"]["waypoints"]:
+        waypoint["arrival_policy"] = "pass_through"
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()
     events = []
