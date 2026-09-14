@@ -109,7 +109,7 @@ try:
     from geometry_msgs.msg import PoseStamped
     from geometry_msgs.msg import PoseWithCovarianceStamped
     from geometry_msgs.msg import Twist
-    from nav2_msgs.action import FollowWaypoints, NavigateThroughPoses
+    from nav2_msgs.action import BackUp, DriveOnHeading, FollowWaypoints, NavigateThroughPoses
     from nav_msgs.msg import Odometry, Path
     from nav2_msgs.msg import SpeedLimit
     from action_msgs.srv import CancelGoal
@@ -312,8 +312,13 @@ class RosAdapter(Node):
         self._raw_velocity_updated_monotonic = 0.0
         self._actual_velocity_updated_monotonic = 0.0
         self._front_obstacle_distance_m = None
+        self._rear_clearance_m = None
         self._left_clearance_m = None
         self._right_clearance_m = None
+        self._collision_monitor_state: dict = {}
+        self._collision_monitor_state_received_monotonic = 0.0
+        self._obstacle_recovery_goal_lock = threading.Lock()
+        self._obstacle_recovery_goal_handle = None
         self._global_plan_points: list[dict] = []
         self._global_plan_updated_monotonic = 0.0
         self._global_plan_stale_seconds = 30.0
@@ -443,6 +448,18 @@ class RosAdapter(Node):
             callback_group=self._nav_action_callback_group,
         )
         self._through_poses_action = through_poses_action
+        self._backup_client = ActionClient(
+            self,
+            BackUp,
+            "/backup",
+            callback_group=self._nav_action_callback_group,
+        )
+        self._drive_on_heading_client = ActionClient(
+            self,
+            DriveOnHeading,
+            "/drive_on_heading",
+            callback_group=self._nav_action_callback_group,
+        )
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 8)
         self._rtk_initial_pose_client = self.create_client(Trigger, "/localization/seed_from_rtk")
         self._global_relocalize_client = self.create_client(
@@ -666,6 +683,9 @@ class RosAdapter(Node):
         if payload is None:
             return
         state = str(payload.get("state") or "CLEAR").upper()
+        self._collision_monitor_state = dict(payload)
+        self._collision_monitor_state["state"] = state
+        self._collision_monitor_state_received_monotonic = time.monotonic()
         level = "INFO" if state == "CLEAR" else "WARNING"
         self._emit_ros_diagnostic(level, "avoidance.collision_monitor.state", f"避障状态变为 {state}", payload)
 
@@ -1575,8 +1595,14 @@ class RosAdapter(Node):
 
     def _process_scan(self, scan) -> None:
         nearest = None
-        left = None
-        right = None
+        measured_range = float(getattr(scan, "range_max", 0.0) or 0.0)
+        verified_open_range = measured_range if math.isfinite(measured_range) and measured_range > 0 else None
+        # A finite LaserScan range_max is verified free-space evidence. Keep
+        # None reserved for unavailable directional data so recovery can fail
+        # closed without pretending that missing data means infinity.
+        rear = verified_open_range
+        left = verified_open_range
+        right = verified_open_range
         for index, cosine, sine in self._scan_geometry_for(scan):
             distance = scan.ranges[index]
             if not math.isfinite(distance) or distance < scan.range_min:
@@ -1585,11 +1611,14 @@ class RosAdapter(Node):
             y = distance * sine
             if distance <= 0.9 and x >= 0.18 and abs(y) <= 0.35:
                 nearest = distance if nearest is None else min(nearest, distance)
-            if 0.20 <= x <= 2.5 and 0.40 <= y <= 2.0:
+            if -2.5 <= x <= -0.18 and abs(y) <= 0.35:
+                rear = distance if rear is None else min(rear, distance)
+            if -0.35 <= x <= 2.5 and 0.18 <= y <= 2.0:
                 left = distance if left is None else min(left, distance)
-            if 0.20 <= x <= 2.5 and -2.0 <= y <= -0.40:
+            if -0.35 <= x <= 2.5 and -2.0 <= y <= -0.18:
                 right = distance if right is None else min(right, distance)
         self._front_obstacle_distance_m = nearest
+        self._rear_clearance_m = rear
         self._left_clearance_m = left
         self._right_clearance_m = right
 
@@ -1752,6 +1781,19 @@ class RosAdapter(Node):
             and plan_age <= self._global_plan_stale_seconds
             and self._global_plan_points
         )
+        collision_state_age = (
+            max(
+                0.0,
+                now_monotonic
+                - float(getattr(self, "_collision_monitor_state_received_monotonic", 0.0)),
+            )
+            if getattr(self, "_collision_monitor_state_received_monotonic", 0.0)
+            else None
+        )
+        collision_state = dict(getattr(self, "_collision_monitor_state", {}) or {})
+        collision_state["sample_age_seconds"] = (
+            round(collision_state_age, 3) if collision_state_age is not None else None
+        )
         return {
             "requested_forward_speed_mps": self._raw_forward_command,
             "actual_forward_speed_mps": self._actual_forward_command,
@@ -1767,8 +1809,13 @@ class RosAdapter(Node):
             ),
             "localized_speed_mps": self._latest_speed,
             "front_obstacle_distance_m": self._front_obstacle_distance_m,
+            "rear_clearance_m": getattr(self, "_rear_clearance_m", None),
             "left_clearance_m": self._left_clearance_m,
             "right_clearance_m": self._right_clearance_m,
+            "rear_obstacle_distance_m": getattr(self, "_rear_clearance_m", None),
+            "left_obstacle_distance_m": self._left_clearance_m,
+            "right_obstacle_distance_m": self._right_clearance_m,
+            "collision_monitor": collision_state,
             "scan_sample_age_seconds": round(scan_age, 3) if scan_age is not None else None,
             "stale": scan_age is None or scan_age > scan_max_age,
             "collision_limited": bool(
@@ -2161,6 +2208,119 @@ class RosAdapter(Node):
             "nearest_along_m": nearest,
             "required_clearance_m": corridor_end,
         }
+
+    def _execute_behavior_action(self, client, goal, *, name: str, timeout_seconds: float) -> dict:
+        """Run one BehaviorServer action while the executor continues spinning."""
+        timeout = max(0.1, float(timeout_seconds))
+        if not client.wait_for_server(timeout_sec=min(timeout, 1.0)):
+            return {"action": name, "status": "unavailable", "success": False}
+        sent = client.send_goal_async(goal)
+        if not self._wait_for_future(sent, min(timeout, 2.0)):
+            return {"action": name, "status": "goal_timeout", "success": False}
+        handle = sent.result() if sent.done() else None
+        if handle is None or not handle.accepted:
+            return {"action": name, "status": "rejected", "success": False}
+        lock = getattr(self, "_obstacle_recovery_goal_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._obstacle_recovery_goal_lock = lock
+        with lock:
+            self._obstacle_recovery_goal_handle = handle
+        try:
+            result_future = handle.get_result_async()
+            if not self._wait_for_future(result_future, timeout):
+                cancel_future = handle.cancel_goal_async()
+                cancel_confirmed = self._wait_for_future(cancel_future, min(2.0, timeout))
+                self.stop_motion()
+                return {
+                    "action": name,
+                    "status": "timeout",
+                    "success": False,
+                    "cancel_confirmed": cancel_confirmed,
+                }
+            wrapped = result_future.result()
+            status = int(getattr(wrapped, "status", 0) or 0)
+            result = getattr(wrapped, "result", None)
+            error_code = int(getattr(result, "error_code", 0) or 0)
+            return {
+                "action": name,
+                "status": "succeeded" if status == 4 else "failed",
+                "success": status == 4,
+                "goal_status": status,
+                "error_code": error_code,
+            }
+        finally:
+            with lock:
+                if getattr(self, "_obstacle_recovery_goal_handle", None) is handle:
+                    self._obstacle_recovery_goal_handle = None
+
+    @staticmethod
+    def _set_action_duration(duration, seconds: float) -> None:
+        nanoseconds = int(max(0.0, float(seconds)) * 1_000_000_000)
+        duration.sec = nanoseconds // 1_000_000_000
+        duration.nanosec = nanoseconds % 1_000_000_000
+
+    def execute_obstacle_recovery(
+        self,
+        *,
+        reverse_distance_m: float,
+        lateral_distance_m: float,
+        lateral_direction: int,
+        speed_mps: float,
+        timeout_seconds: float,
+    ) -> dict:
+        """Execute the bounded backup + lateral BehaviorServer sequence."""
+        backup = BackUp.Goal()
+        backup.target.x = abs(float(reverse_distance_m))
+        backup.target.y = 0.0
+        backup.target.z = 0.0
+        backup.speed = abs(float(speed_mps))
+        self._set_action_duration(backup.time_allowance, timeout_seconds)
+        actions = [
+            self._execute_behavior_action(
+                self._backup_client,
+                backup,
+                name="backup",
+                timeout_seconds=timeout_seconds,
+            )
+        ]
+        if not actions[-1]["success"]:
+            return {"success": False, "actions": actions}
+        lateral = DriveOnHeading.Goal()
+        lateral.target.x = 0.0
+        lateral.target.y = math.copysign(
+            abs(float(lateral_distance_m)),
+            1 if int(lateral_direction) >= 0 else -1,
+        )
+        lateral.target.z = 0.0
+        lateral.speed = math.copysign(abs(float(speed_mps)), lateral.target.y)
+        self._set_action_duration(lateral.time_allowance, timeout_seconds)
+        actions.append(
+            self._execute_behavior_action(
+                self._drive_on_heading_client,
+                lateral,
+                name="drive_on_heading",
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        return {"success": bool(actions[-1]["success"]), "actions": actions}
+
+    def cancel_obstacle_recovery(self) -> bool:
+        lock = getattr(self, "_obstacle_recovery_goal_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            handle = getattr(self, "_obstacle_recovery_goal_handle", None)
+        if handle is None:
+            return False
+        try:
+            future = handle.cancel_goal_async()
+            confirmed = self._wait_for_future(future, 2.0)
+            self.stop_motion()
+            return bool(confirmed)
+        except Exception:
+            LOGGER.warning("failed to cancel obstacle recovery action", exc_info=True)
+            return False
 
     def teleop_action(self, action: str) -> dict:
         msg = String()

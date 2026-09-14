@@ -1045,11 +1045,18 @@ class TaskExecutionEvent(BaseTimestampModel):
     payload = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        ordering = ["state_version"]
+        ordering = ["state_version", "received_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["task_execution", "state_version"],
+                name="task_event_exec_ver_idx",
+            )
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["task_execution", "state_version"],
-                name="uniq_task_execution_state_version",
+                condition=~Q(event_type="task.obstacle_stage"),
+                name="uniq_task_state_ver_non_obstacle",
             )
         ]
 

@@ -130,6 +130,7 @@ CollisionMonitor::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 
   // Reset action type to default after worker deactivating
   robot_action_prev_ = {DO_NOTHING, {-1.0, -1.0, -1.0}};
+  state_signature_prev_.clear();
   stop_detection_count_ = 0;
 
   // Deactivating polygons
@@ -411,6 +412,7 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
         status, seen ? "true" : "false");
     }
     publishVelocity(stop_action);
+    publishState(stop_action, nullptr, 0, "localization_unhealthy", cmd_vel_in);
     publishPolygons();
     robot_action_prev_ = stop_action;
     return;
@@ -422,6 +424,7 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
       RCLCPP_WARN(get_logger(), "Zeroing cmd_vel: an enabled collision source is stale");
     }
     publishVelocity(stop_action);
+    publishState(stop_action, nullptr, 0, "source_stale", cmd_vel_in);
     publishPolygons();
     robot_action_prev_ = stop_action;
     return;
@@ -441,6 +444,7 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   Action robot_action{DO_NOTHING, cmd_vel_in};
   // Polygon causing robot action (if any)
   std::shared_ptr<Polygon> action_polygon;
+  std::size_t action_points_inside = 0;
 
   for (std::shared_ptr<Polygon> polygon : polygons_) {
     if (!polygon->getEnabled()) {
@@ -459,11 +463,13 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
       // Process STOP/SLOWDOWN for the selected polygon
       if (processStopSlowdown(polygon, collision_points, cmd_vel_in, robot_action)) {
         action_polygon = polygon;
+        action_points_inside = polygon->getPointsInside(collision_points);
       }
     } else if (at == APPROACH) {
       // Process APPROACH for the selected polygon
       if (processApproach(polygon, collision_points, cmd_vel_in, robot_action)) {
         action_polygon = polygon;
+        action_points_inside = polygon->getPointsInside(collision_points);
       }
     }
   }
@@ -480,12 +486,14 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
       // This stop polygon is in front. Permit commands that increase clearance.
       robot_action = {DO_NOTHING, cmd_vel_in};
       action_polygon.reset();
+      action_points_inside = 0;
       stop_detection_count_ = 0;
     } else {
       ++stop_detection_count_;
       if (stop_detection_count_ < stop_confirmation_cycles_) {
         robot_action = {DO_NOTHING, cmd_vel_in};
         action_polygon.reset();
+        action_points_inside = 0;
       }
     }
   } else {
@@ -495,8 +503,10 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   if (robot_action.action_type != robot_action_prev_.action_type) {
     // Report changed robot behavior
     printAction(robot_action, action_polygon);
-    publishState(robot_action);
   }
+  publishState(
+    robot_action, action_polygon, action_points_inside,
+    action_polygon ? "polygon" : "clear", cmd_vel_in);
 
   // Publish required robot velocity
   publishVelocity(robot_action);
@@ -543,7 +553,12 @@ bool CollisionMonitor::polygonAppliesToVelocity(const Polygon & polygon, const V
   return std::abs(velocity.y) > 0.01;
 }
 
-void CollisionMonitor::publishState(const Action & robot_action)
+void CollisionMonitor::publishState(
+  const Action & robot_action,
+  const std::shared_ptr<Polygon> & action_polygon,
+  std::size_t points_inside,
+  const std::string & reason,
+  const Velocity & requested_velocity)
 {
   if (!state_pub_ || !state_pub_->is_activated()) {
     return;
@@ -554,9 +569,22 @@ void CollisionMonitor::publishState(const Action & robot_action)
   } else if (robot_action.action_type == SLOWDOWN || robot_action.action_type == APPROACH) {
     state = "SLOW";
   }
+  const std::string zone = action_polygon ? action_polygon->getName() : "";
+  const std::string motion_scope = action_polygon ? action_polygon->getMotionScope() : "";
+  const std::string signature = std::string(state) + "|" + zone + "|" + reason + "|" + motion_scope;
+  if (signature == state_signature_prev_) {
+    return;
+  }
+  state_signature_prev_ = signature;
   std_msgs::msg::String message;
   message.data = std::string("{\"schema\":\"roamerx.collision-state.v1\",\"state\":\"") +
-    state + "\",\"velocity_x\":" + std::to_string(robot_action.req_vel.x) +
+    state + "\",\"zone\":\"" + zone + "\",\"motion_scope\":\"" + motion_scope +
+    "\",\"reason\":\"" + reason + "\",\"points_inside\":" +
+    std::to_string(points_inside) + ",\"requested_velocity_x\":" +
+    std::to_string(requested_velocity.x) + ",\"requested_velocity_y\":" +
+    std::to_string(requested_velocity.y) + ",\"requested_velocity_w\":" +
+    std::to_string(requested_velocity.tw) + ",\"velocity_x\":" +
+    std::to_string(robot_action.req_vel.x) +
     ",\"velocity_y\":" + std::to_string(robot_action.req_vel.y) +
     ",\"velocity_w\":" + std::to_string(robot_action.req_vel.tw) + "}";
   state_pub_->publish(message);

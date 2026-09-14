@@ -131,6 +131,14 @@ obstacle_speech:
   collision_limit_ratio: 0.6
   minimum_blocked_task_seconds: 300.0
   navigation_retry_seconds: 5.0
+  max_recovery_attempts: 3
+  reverse_distance_m: 0.25
+  lateral_distance_m: 0.20
+  recovery_speed_mps: 0.06
+  recovery_timeout_seconds: 6.0
+  rear_clearance_m: 0.70
+  side_clearance_m: 0.80
+  scan_max_age_seconds: 0.50
 
 waypoint_speech:
   status_dir: /home/dogrobot/runtime/nx-edge/data/audio-status

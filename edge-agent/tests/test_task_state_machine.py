@@ -5,6 +5,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from roamerx_edge.local_store import LocalStore
 from roamerx_edge.protocol import ProtocolError, decode_message
 from roamerx_edge.task_executor import (
@@ -48,6 +50,8 @@ class FakeNavigation:
         self.global_controllers = []
         self.localization_state = {"active_source": "ndt_imu", "absolute_stable": True}
         self.progressive_relocalize_requests = []
+        self.obstacle_recoveries = []
+        self.obstacle_recovery_cancels = 0
 
     def prepare_for_navigation(self, timeout_seconds=12):
         self.stand_requests += 1
@@ -114,6 +118,20 @@ class FakeNavigation:
 
     def clear_local_costmap(self, timeout_seconds=1.0):
         self.costmap_clears += 1
+        return True
+
+    def execute_obstacle_recovery(self, **kwargs):
+        self.obstacle_recoveries.append(dict(kwargs))
+        return {
+            "success": True,
+            "actions": [
+                {"action": "backup", "status": "succeeded", "success": True},
+                {"action": "drive_on_heading", "status": "succeeded", "success": True},
+            ],
+        }
+
+    def cancel_obstacle_recovery(self):
+        self.obstacle_recovery_cancels += 1
         return True
 
     def stop_motion(self):
@@ -202,8 +220,19 @@ class FakeBlockedNavigation(FakeNavigation):
             "actual_forward_speed_mps": 0.0,
             "localized_speed_mps": 0.0,
             "front_obstacle_distance_m": 0.45,
+            "rear_clearance_m": 1.5,
             "left_clearance_m": 2.4,
             "right_clearance_m": 0.3,
+            "stale": False,
+            "localization_normal": True,
+            "collision_monitor": {
+                "state": "STOP",
+                "reason": "polygon",
+                "zone": "front_stop",
+                "motion_scope": "forward",
+                "points_inside": 7,
+                "sample_age_seconds": 0.02,
+            },
         }
 
 
@@ -5007,8 +5036,9 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
         no_progress_seconds=0.0,
         min_progress_m=0.08,
         obstacle_max_distance_m=0.9,
-        reverse_speed_mps=0.12,
-        reverse_duration_seconds=0.2,
+        obstacle_clear_seconds=3.0,
+        collision_limit_ratio=0.6,
+        announce=True,
     )
     executor = TaskExecutor(
         store,
@@ -5021,7 +5051,8 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
     executor._evaluate_obstacle_progress()  # first front obstacle detection
     executor._evaluate_obstacle_progress()  # recovery attempt 1
     executor._evaluate_obstacle_progress()  # recovery attempt 2
-    executor._evaluate_obstacle_progress()  # recovery attempt 3 + leave-route
+    executor._evaluate_obstacle_progress()  # recovery attempt 3
+    executor._evaluate_obstacle_progress()  # three attempts exhausted + leave-route
     speech_events = [event for event in events if event[0] == "task.obstacle_speech"]
     assert [event[1]["template_name"] for event in speech_events] == [
         "发现障碍物",
@@ -5032,74 +5063,127 @@ def test_obstacle_speech_escalates_after_three_no_progress_recovery_attempts(tmp
     ]
     assert [event[1]["recovery_attempt"] for event in speech_events] == [0, 1, 2, 3, 3]
     assert nav.costmap_clears >= 1
-    assert nav.cancelled >= 1
-    assert any(cmd[0] < 0 for cmd in nav.teleop)
-    assert len(nav.sent) >= 2
-    assert nav.sent[-1][0]["waypoint_id"].startswith("bypass-")
+    assert nav.cancelled == 4
+    assert len(nav.obstacle_recoveries) == 3
+    assert all(call["reverse_distance_m"] == 0.25 for call in nav.obstacle_recoveries)
+    assert all(call["lateral_distance_m"] == 0.20 for call in nav.obstacle_recoveries)
+    assert executor._obstacle_stage == "SAFE_OBSERVING"
     executor.stop()
     store.close()
 
 
-def test_obstacle_bypass_via_advances_toward_goal_when_heading_is_reversed(tmp_path):
+def test_obstacle_recovery_rejects_unknown_rear_clearance(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeBlockedNavigation()
-    # Face west while the pending waypoint is east. Body-forward bypasses used
-    # to walk further from the goal / into the wall behind the dog.
-    from math import pi
-
-    nav.pose = SimpleNamespace(x=0.0, y=0.0, yaw=pi)
+    observation = nav.obstacle_monitor_snapshot()
+    observation["rear_clearance_m"] = None
     executor = TaskExecutor(
         store,
         nav,
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
     )
-    executor.context = SimpleNamespace(
-        state="running",
-        current_waypoint_index=0,
-        route_snapshot={
-            "waypoints": [
-                {"waypoint_id": "wp-goal", "x": 10.0, "y": 0.0, "map_point_number": 7}
-            ]
-        },
-    )
-    via = executor._obstacle_bypass_via(nav.obstacle_monitor_snapshot())
-    assert via is not None
-    assert via["x"] > 0.0
-    assert via["waypoint_id"] == "bypass-0"
+    executor.obstacle_speech = SimpleNamespace()
+    selection = executor._select_obstacle_recovery_direction(observation)
+    assert selection == {"safe": False, "reason": "rear_clearance_unknown"}
     store.close()
 
 
-def test_obstacle_bypass_profile_timeout_still_dispatches_via(tmp_path):
+def test_detour_disabled_skips_motion_and_enters_safe_observing(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
-    nav = FakeProfileTimeoutNavigation()
+    nav = FakeBlockedNavigation()
+    events = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            announce=True,
+            no_progress_seconds=0.0,
+            min_progress_m=0.5,
+            obstacle_max_distance_m=0.9,
+            collision_limit_ratio=0.6,
+            obstacle_clear_seconds=3.0,
+        ),
+    )
+    executor.start_task(command("task.start"))
+    executor._segment_avoidance_enabled = False
+    executor._evaluate_obstacle_progress()
+
+    assert nav.obstacle_recoveries == []
+    assert executor._obstacle_stage == "SAFE_OBSERVING"
+    stages = [item[1]["stage"] for item in events if item[0] == "task.obstacle_stage"]
+    assert stages == ["DETECTED_STOP", "DISSUASION", "SAFE_OBSERVING"]
+    executor.stop()
+    store.close()
+
+
+def test_manual_continue_rechecks_stable_clear_window_before_redispatch(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeBlockedNavigation()
     executor = TaskExecutor(
         store,
         nav,
         event_callback=lambda *args: None,
         start_result_callback=lambda *args: None,
+        obstacle_speech=SimpleNamespace(
+            enabled=True,
+            announce=False,
+            no_progress_seconds=0.0,
+            min_progress_m=0.5,
+            obstacle_max_distance_m=0.9,
+            collision_limit_ratio=0.6,
+            obstacle_clear_seconds=3.0,
+        ),
     )
     executor.start_task(command("task.start"))
-    previous_profile = executor._active_leg_profile
+    executor._segment_avoidance_enabled = False
+    executor._evaluate_obstacle_progress()
     sent_before = len(nav.sent)
-    nav.fail_profile_apply = True
 
-    executor._dispatch_bypass_via(
-        {
-            "x": 4.0,
-            "y": 3.0,
-            "yaw": 0.0,
-            "waypoint_id": "bypass-1",
-            "map_point_number": 2,
-        }
-    )
+    with pytest.raises(ProtocolError) as blocked:
+        executor.resume_forward(executor.context.task_execution_id)
+    assert blocked.value.code == "OBSTACLE_NOT_CLEAR"
 
+    nav.obstacle_monitor_snapshot = lambda: {
+        "requested_planar_speed_mps": 0.0,
+        "actual_planar_speed_mps": 0.0,
+        "requested_turn_speed_rps": 0.0,
+        "actual_turn_speed_rps": 0.0,
+        "front_obstacle_distance_m": None,
+        "rear_clearance_m": 4.0,
+        "left_clearance_m": 4.0,
+        "right_clearance_m": 4.0,
+        "stale": False,
+        "localization_normal": True,
+        "collision_monitor": {"state": "CLEAR", "reason": "clear", "sample_age_seconds": 0.02},
+    }
+    executor._obstacle_clear_started_at = time.monotonic() - 3.1
+    result = executor.resume_forward(executor.context.task_execution_id)
+
+    assert result["resumed_forward"] is True
     assert len(nav.sent) == sent_before + 1
-    assert nav.sent[-1][0]["waypoint_id"] == "bypass-1"
-    assert executor.context.state == "running"
-    assert executor._active_leg_profile == previous_profile
-    assert executor._recovery_arbiter.snapshot()["owner"] == "NONE"
+    assert executor._obstacle_episode_id is None
     executor.stop()
+    store.close()
+
+
+def test_bt_recovery_is_suppressed_while_edge_owns_obstacle_episode(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    executor = TaskExecutor(
+        store,
+        FakeNavigation(),
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor._obstacle_episode_id = "episode-owned-by-edge"
+
+    assert executor.acquire_recovery("BT_NAVIGATOR", "backup", distance_m=0.25) is None
+    edge_lease = executor.acquire_recovery("EDGE_OBSTACLE", "backup", distance_m=0.25)
+    assert edge_lease is not None
+    assert executor.release_recovery(edge_lease) is True
     store.close()
 
 

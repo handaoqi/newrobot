@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import uuid
 
 from django.conf import settings
 from django.db import transaction
@@ -65,6 +66,106 @@ def _bicycle_alert_cooldown_seconds() -> int:
 
 
 class AlertService:
+    @staticmethod
+    @transaction.atomic
+    def ingest_obstacle_stage(
+        robot: Robot,
+        execution: TaskExecution,
+        payload: dict,
+        *,
+        occurred_at,
+    ) -> tuple[InspectionEvent, bool]:
+        """Create one durable alert per physical-obstacle episode and append stages."""
+        episode_id = str(payload.get("obstacle_episode_id") or "").strip()
+        if not episode_id:
+            raise ValueError("obstacle_episode_id is required")
+        event_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"roamerx:obstacle:{execution.pk}:{episode_id}",
+        )
+        locked_robot = Robot.objects.select_for_update().get(pk=robot.pk)
+        event = InspectionEvent.objects.select_for_update().filter(event_id=event_id).first()
+        created = event is None
+        stage = str(payload.get("stage") or "DETECTED_STOP")
+        attempt = int(payload.get("recovery_attempt") or 0)
+        stage_record = {
+            "stage": stage,
+            "attempt": attempt,
+            "reported_at": payload.get("reported_at"),
+            "collision_zone": payload.get("collision_zone"),
+            "collision_points_inside": payload.get("collision_points_inside"),
+            "front_obstacle_distance_m": payload.get("front_obstacle_distance_m"),
+            "rear_clearance_m": payload.get("rear_clearance_m"),
+            "left_clearance_m": payload.get("left_clearance_m"),
+            "right_clearance_m": payload.get("right_clearance_m"),
+            "action_result": payload.get("action_result") or {},
+        }
+        risk = "high" if stage in {"DISSUASION", "SAFE_OBSERVING"} else (
+            "medium" if stage == "RECOVERY_ATTEMPT" else "low"
+        )
+        title = {
+            "DETECTED_STOP": "发现障碍物，已停车",
+            "WAITING_PROGRESS": "障碍物前等待局部绕行",
+            "RECOVERY_ATTEMPT": f"第 {attempt}/3 次后退绕行",
+            "DISSUASION": "三次避障失败，请离开巡检线路",
+            "SAFE_OBSERVING": "障碍安全观察中",
+            "CLEAR_CONFIRMED": "障碍已连续清除",
+            "RESUMED": "障碍清除，任务已恢复",
+        }.get(stage, "巡检线路障碍")
+        if created:
+            pose = dict(payload.get("pose") or {})
+            event = InspectionEvent.objects.create(
+                event_id=event_id,
+                robot=locked_robot,
+                task_execution=execution,
+                map_data=execution.map_data,
+                title=title,
+                event_type="navigation_obstacle",
+                location=locked_robot.location,
+                detected_at=occurred_at,
+                confidence=100,
+                risk_level=risk,
+                description=title,
+                raw_detection={"obstacle_episode_id": episode_id, "stages": [stage_record]},
+                map_id=str(getattr(execution.map_data, "map_id", "") or ""),
+                map_version=str(getattr(execution.map_data, "version", "") or ""),
+                frame_id=str(pose.get("frame_id") or "map"),
+                position_x=_decimal(pose.get("x")),
+                position_y=_decimal(pose.get("y")),
+                position_yaw=_decimal(pose.get("yaw")),
+                source_component="edge-agent",
+                source_code="COLLISION_STOP",
+            )
+            locked_robot.today_alerts += 1
+            locked_robot.save(update_fields=["today_alerts", "updated_at"])
+            return event, True
+        raw = dict(event.raw_detection or {})
+        stages = list(raw.get("stages") or [])
+        signature = (stage, attempt, payload.get("reported_at"), bool(stage_record["action_result"]))
+        existing_signatures = {
+            (
+                item.get("stage"),
+                int(item.get("attempt") or 0),
+                item.get("reported_at"),
+                bool(item.get("action_result")),
+            )
+            for item in stages
+            if isinstance(item, dict)
+        }
+        if signature not in existing_signatures:
+            stages.append(stage_record)
+        raw.update({"obstacle_episode_id": episode_id, "stages": stages})
+        risk_rank = {"low": 0, "medium": 1, "high": 2}
+        retained_risk = max(
+            (event.risk_level, risk), key=lambda value: risk_rank.get(value, 0)
+        )
+        event.title = title
+        event.description = title
+        event.risk_level = retained_risk
+        event.raw_detection = raw
+        event.save(update_fields=["title", "description", "risk_level", "raw_detection", "updated_at"])
+        return event, False
+
     @staticmethod
     def _recent_bicycle_event(robot: Robot) -> InspectionEvent | None:
         """Find the still-cooling bicycle incident for this robot.

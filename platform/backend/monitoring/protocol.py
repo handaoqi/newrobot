@@ -89,6 +89,8 @@ UPLINK_MESSAGE_TYPES = {
     "task.progress",
     "task.round_started",
     "task.obstacle_speech",
+    "task.obstacle_stage",
+    "navigation.obstacle_recovery",
     "task.accepted",
     "task.started",
     "task.pausing",

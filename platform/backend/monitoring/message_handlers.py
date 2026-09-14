@@ -542,7 +542,7 @@ def _dispatch(
         return _handle_command_progress(envelope, robot)
     if message_type == "command.result":
         return _handle_command_result(envelope, robot)
-    if message_type.startswith("task."):
+    if message_type.startswith("task.") or message_type == "navigation.obstacle_recovery":
         return _handle_task_event(envelope, robot)
     if message_type == "trajectory.batch":
         return _handle_trajectory(envelope, robot, publish_response)
@@ -970,6 +970,58 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         )
     except TaskExecution.DoesNotExist as exc:
         raise ProtocolError("UNKNOWN_TASK_EXECUTION", "task execution not found") from exc
+    if envelope.message_type == "task.obstacle_stage":
+        occurred_at = _event_time(payload, "reported_at", "occurred_at")
+        TaskExecutionEvent.objects.get_or_create(
+            message_id=envelope.message_id,
+            defaults={
+                "task_execution": execution,
+                "state": execution.state,
+                "state_version": execution.state_version,
+                "event_type": envelope.message_type,
+                "occurred_at": occurred_at,
+                "payload": payload,
+            },
+        )
+        alert, alert_created = AlertService.ingest_obstacle_stage(
+            robot, execution, payload, occurred_at=occurred_at
+        )
+        if alert_created:
+            realtime_publisher.publish_alert(
+                {
+                    "event": EventSerializer(alert).data,
+                    "robot": {"id": robot.id, "code": robot.code, "name": robot.name},
+                }
+            )
+        realtime_publisher.publish_task_event(
+            str(execution.id), {"type": "obstacle_stage", "payload": payload}
+        )
+        emit_center_log(
+            robot=robot,
+            level="WARNING" if payload.get("stage") in {"DISSUASION", "SAFE_OBSERVING"} else "INFO",
+            module="avoidance",
+            event_code=f"avoidance.obstacle.{str(payload.get('stage') or 'unknown').lower()}",
+            message=str(payload.get("stage") or "障碍阶段更新"),
+            data=payload,
+            task_execution=execution,
+            waypoint_index=payload.get("waypoint_index"),
+        )
+        return {
+            "state": execution.state,
+            "state_version": execution.state_version,
+            "inspection_event_id": str(alert.event_id),
+        }
+    if envelope.message_type == "navigation.obstacle_recovery":
+        realtime_publisher.publish_task_event(
+            str(execution.id), {"type": "obstacle_recovery", "payload": payload}
+        )
+        emit_center_log(
+            robot=robot, level="INFO", module="avoidance",
+            event_code="navigation.obstacle_recovery",
+            message="障碍恢复动作结果", data=payload, task_execution=execution,
+            waypoint_index=payload.get("waypoint_index"),
+        )
+        return {"state": execution.state, "state_version": execution.state_version}
     if envelope.message_type == "task.obstacle_speech":
         command = _queue_obstacle_speech(execution, robot, payload)
         emit_center_log(

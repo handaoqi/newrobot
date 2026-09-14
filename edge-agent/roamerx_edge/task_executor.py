@@ -53,12 +53,9 @@ TASK_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 # leg is still a cruise. Switch to the slow DiffDrive profile only inside
 # this radius so MPPI can detour on the way.
 PATROL_FINAL_APPROACH_M = 1.0
-# First stall recoveries leave the Nav2 goal in place so FollowPath / BT
-# Backup can replan. Reverse+redispatch is the last automatic attempt.
-OBSTACLE_LOCAL_RECOVERY_ATTEMPTS = 2
-BYPASS_LATERAL_M = 1.8
-BYPASS_FORWARD_M = 0.5
-BYPASS_MIN_SIDE_CLEARANCE_M = 0.8
+# Physical-obstacle recovery is owned by one Edge episode. Collision Monitor
+# remains the final authority for every BehaviorServer velocity command.
+OBSTACLE_RECOVERY_MAX_ATTEMPTS = 3
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
@@ -146,11 +143,6 @@ NO_CORRECTION_CONTINUE_REASONS = frozenset(
 # Patrol redispatches after a rejected FollowWaypoints goal. Keep this short —
 # send_waypoints already waited for Nav2 readiness.
 NAV_DISPATCH_RETRY_DEFAULT_SECONDS = 2.0
-# Obstacle reverse must see enough rear free space before teleop backup.
-RECOVERY_REVERSE_MIN_REAR_CLEARANCE_M = 0.45
-RECOVERY_REVERSE_DISTANCE_M = 0.30
-
-
 def _waypoint_xy(waypoint: dict) -> tuple[float, float] | None:
     try:
         x = float(waypoint["x"])
@@ -307,6 +299,16 @@ class NavigationAdapter(Protocol):
         *,
         max_scan_age_seconds: float = 0.5,
     ) -> dict: ...
+    def execute_obstacle_recovery(
+        self,
+        *,
+        reverse_distance_m: float,
+        lateral_distance_m: float,
+        lateral_direction: int,
+        speed_mps: float,
+        timeout_seconds: float,
+    ) -> dict: ...
+    def cancel_obstacle_recovery(self) -> bool: ...
 
 
 @dataclass
@@ -517,6 +519,8 @@ class TaskExecutor:
         self._leave_route_announced = False
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
+        self._obstacle_stage = None
+        self._obstacle_clear_started_at = None
         self._obstacle_recovery_active = False
         self._recovery_arbiter = RecoveryArbiter()
         self._bt_recovery_lease_timers: dict[int, threading.Timer] = {}
@@ -569,6 +573,12 @@ class TaskExecutor:
 
     def acquire_recovery(self, owner: str, reason: str = "", *, distance_m: float = 0.0):
         """Acquire recovery ownership for Edge-owned recovery paths."""
+        if str(owner) == "BT_NAVIGATOR" and self._obstacle_episode_id is not None:
+            LOGGER.info(
+                "BT recovery lease rejected while physical obstacle episode %s is Edge-owned",
+                self._obstacle_episode_id,
+            )
+            return None
         if self._recovery_arbiter.budget_exhausted():
             self._emit_safe_hold("RECOVERY_BUDGET_EXHAUSTED", "自愈预算耗尽，进入安全保持")
             return None
@@ -758,10 +768,15 @@ class TaskExecutor:
 
     def _obstacle_monitor_enabled(self) -> bool:
         return bool(
-            self._segment_avoidance_enabled
-            and self.obstacle_speech
+            self.obstacle_speech
             and self.obstacle_speech.enabled
             and callable(getattr(self.navigation, "obstacle_monitor_snapshot", None))
+        )
+
+    def _obstacle_motion_recovery_enabled(self) -> bool:
+        return bool(
+            self._segment_avoidance_enabled
+            and callable(getattr(self.navigation, "execute_obstacle_recovery", None))
         )
 
     def _start_obstacle_monitor(self) -> None:
@@ -777,6 +792,12 @@ class TaskExecutor:
 
     def _stop_obstacle_monitor(self) -> None:
         self._obstacle_monitor_stop.set()
+        cancel_recovery = getattr(self.navigation, "cancel_obstacle_recovery", None)
+        if callable(cancel_recovery):
+            try:
+                cancel_recovery()
+            except Exception:
+                LOGGER.warning("failed to cancel active obstacle recovery", exc_info=True)
         self._obstacle_monitor_thread = None
         self._reset_obstacle_episode()
 
@@ -797,6 +818,9 @@ class TaskExecutor:
         self._leave_route_announced = False
         self._last_obstacle_seen_at = None
         self._obstacle_episode_id = None
+        self._obstacle_stage = None
+        self._obstacle_clear_started_at = None
+        self._obstacle_recovery_active = False
         self._recovery_arbiter.reset_budget()
 
     def _localization_allows_obstacle_monitor(self, observation: dict | None = None) -> bool:
@@ -824,8 +848,51 @@ class TaskExecutor:
             return True
         return status == "normal"
 
+    def _physical_obstacle_blocked(self, observation: dict) -> tuple[bool, str]:
+        """Classify only physical stops; localization/source gates are not obstacles."""
+        collision = observation.get("collision_monitor") or {}
+        collision_age = collision.get("sample_age_seconds")
+        collision_fresh = collision_age is not None and float(collision_age) <= 1.0
+        collision_state = str(collision.get("state") or "").upper()
+        collision_reason = str(collision.get("reason") or "")
+        if collision_fresh and collision_state == "STOP":
+            if collision_reason == "polygon" and collision.get("zone"):
+                return True, "collision_polygon"
+            if collision_reason in {"localization_unhealthy", "source_stale"}:
+                return False, collision_reason
+        distance = observation.get("front_obstacle_distance_m")
+        scan_blocked = (
+            distance is not None
+            and float(distance) <= float(getattr(self.obstacle_speech, "obstacle_max_distance_m", 0.9))
+        )
+        if scan_blocked:
+            return True, "front_scan"
+        if collision_fresh:
+            return False, collision_reason or "collision_clear"
+        raw_planar = abs(float(observation.get("requested_planar_speed_mps") or 0.0))
+        actual_planar = abs(float(observation.get("actual_planar_speed_mps") or 0.0))
+        raw_turn = abs(float(observation.get("requested_turn_speed_rps") or 0.0))
+        actual_turn = abs(float(observation.get("actual_turn_speed_rps") or 0.0))
+        requested_motion = raw_planar >= 0.04 or raw_turn >= 0.15
+        actual_motion = max(actual_planar, actual_turn * 0.25)
+        requested_magnitude = max(raw_planar, raw_turn * 0.25)
+        collision_limited = (
+            requested_motion
+            and actual_motion
+            <= requested_magnitude * float(getattr(self.obstacle_speech, "collision_limit_ratio", 0.6))
+        )
+        return collision_limited, "velocity_limited" if collision_limited else "clear"
+
+    @staticmethod
+    def _obstacle_scan_is_fresh(observation: dict) -> bool:
+        return observation.get("stale") is not True
+
+    def _obstacle_is_clear(self, observation: dict) -> bool:
+        blocked, _ = self._physical_obstacle_blocked(observation)
+        return self._obstacle_scan_is_fresh(observation) and not blocked
+
     def _evaluate_obstacle_progress(self) -> None:
-        recovery_action = None
+        next_action: tuple[str, int | None] | None = None
         with self._lock:
             if (
                 not self.context
@@ -835,410 +902,334 @@ class TaskExecutor:
                 return
             observation = self.navigation.obstacle_monitor_snapshot()
             if not self._localization_allows_obstacle_monitor(observation):
-                # Localization loss already pauses navigation; do not open an
-                # obstacle episode from the zeroed cmd_vel that follows.
-                if (
-                    self._last_obstacle_seen_at is not None
-                    and time.monotonic() - self._last_obstacle_seen_at
-                    >= self.obstacle_speech.obstacle_clear_seconds
-                ):
-                    self._reset_obstacle_episode()
+                self._obstacle_clear_started_at = None
                 return
-            obstacle_distance = observation.get("front_obstacle_distance_m")
-            raw_planar = abs(float(observation.get("requested_planar_speed_mps") or 0.0))
-            actual_planar = abs(float(observation.get("actual_planar_speed_mps") or 0.0))
-            raw_turn = abs(float(observation.get("requested_turn_speed_rps") or 0.0))
-            actual_turn = abs(float(observation.get("actual_turn_speed_rps") or 0.0))
-            scan_blocked = (
-                obstacle_distance is not None
-                and float(obstacle_distance) <= self.obstacle_speech.obstacle_max_distance_m
-            )
-            # /cmd_vel_raw is the planner request; /cmd_vel is collision-monitor
-            # output. A large reduction here catches the monitor's polygon zones,
-            # including obstacles outside the narrow front scan corridor.
-            requested_motion = raw_planar >= 0.04 or raw_turn >= 0.15
-            actual_motion = max(actual_planar, actual_turn * 0.25)
-            requested_magnitude = max(raw_planar, raw_turn * 0.25)
-            collision_limited = (
-                requested_motion
-                and actual_motion
-                <= requested_magnitude * self.obstacle_speech.collision_limit_ratio
-            )
-            blocked = scan_blocked or collision_limited
+            blocked, trigger_reason = self._physical_obstacle_blocked(observation)
             now = time.monotonic()
             pose = self.navigation.latest_pose()
-            if not blocked or not pose:
-                # Require a continuous clear window before opening a new episode.
-                # This prevents scan flicker around one obstacle from causing
-                # repeated announcements while still allowing a later obstacle to
-                # announce again in the same patrol task.
-                if (
-                    self._last_obstacle_seen_at is not None
-                    and now - self._last_obstacle_seen_at
-                    < self.obstacle_speech.obstacle_clear_seconds
+            if self._obstacle_episode_id and self._obstacle_stage == "SAFE_OBSERVING":
+                if not self._obstacle_is_clear(observation):
+                    self._obstacle_clear_started_at = None
+                elif self._obstacle_clear_started_at is None:
+                    self._obstacle_clear_started_at = now
+                elif now - self._obstacle_clear_started_at >= float(
+                    getattr(self.obstacle_speech, "obstacle_clear_seconds", 3.0)
                 ):
+                    self._emit_obstacle_stage("CLEAR_CONFIRMED", observation)
+                    next_action = ("resume", None)
+            elif not blocked or not pose:
+                if self._obstacle_episode_id is None:
                     return
-                self._reset_obstacle_episode()
-                return
-            self._last_obstacle_seen_at = now
-            if self._obstacle_progress_anchor is None:
-                self._obstacle_episode_id = str(uuid.uuid4())
-                self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
-                self._obstacle_progress_anchor_at = now
-                self._emit_obstacle_speech("obstacle_detected", 0, observation)
-                return
-            anchor_x, anchor_y = self._obstacle_progress_anchor
-            progressed = hypot(float(pose.x) - anchor_x, float(pose.y) - anchor_y)
-            if progressed >= self.obstacle_speech.min_progress_m:
-                self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
-                self._obstacle_progress_anchor_at = now
-                # Progress starts a fresh five-second observation window, but the
-                # number of level-2 announcements remains cumulative within this
-                # obstacle episode. Level 3 must follow exactly three level-2
-                # announcements and may only be announced once per episode.
-                return
-            if now - self._obstacle_progress_anchor_at < self.obstacle_speech.no_progress_seconds:
-                return
-            if self._leave_route_announced:
-                return
-            self._recovery_attempts += 1
-            recovery_attempt = self._recovery_attempts
-            self._obstacle_progress_anchor_at = now
-            self._emit_obstacle_speech("recovery_attempt", recovery_attempt, observation)
-            if recovery_attempt <= OBSTACLE_LOCAL_RECOVERY_ATTEMPTS:
-                recovery_action = "local_replan"
-            elif recovery_attempt <= 3:
-                recovery_action = "reverse"
-            if recovery_attempt >= 3:
-                self._leave_route_announced = True
-                self._emit_obstacle_speech("leave_route", recovery_attempt, observation)
-                self.event_callback(
-                    "task.obstacle_blocked_manual",
-                    {"task_execution_id": self.context.task_execution_id,
-                     "round_number": self.context.round_number,
-                     "waypoint_index": self.context.current_waypoint_index,
-                     "obstacle_episode_id": self._obstacle_episode_id,
-                     "requires_manual_intervention": True,
-                     "reported_at": now_iso()}, "",
-                )
-
-        # ROS service/action waits must never happen while TaskExecutor._lock is
-        # held.  Nav2 result callbacks enter on_navigation_result(), which needs
-        # that same lock; holding it here used to block the callback group and
-        # make unrelated /planner_server get_parameters requests time out.
-        if recovery_action == "local_replan":
-            self._request_local_replanning()
-        elif recovery_action == "reverse":
-            self._perform_obstacle_reverse()
-
-    def _request_local_replanning(self) -> None:
-        """Ask Nav2 to refresh the local view without dropping the current goal."""
-        clearer = getattr(self.navigation, "clear_local_costmap", None)
-        if callable(clearer):
-            try:
-                clearer()
-            except Exception:
-                LOGGER.warning("local costmap clear failed during obstacle stall", exc_info=True)
-        LOGGER.info(
-            "obstacle stall: Nav2 goal kept so FollowPath recovery can replan (attempt %s)",
-            self._recovery_attempts,
-        )
-
-    def _perform_obstacle_reverse(self) -> None:
-        """Back up, then re-dispatch so planning continues after the safety stop."""
-        with self._lock:
-            if not self.context or self.context.state != "running":
-                return
-            recovery_execution_id = self.context.task_execution_id
-        cancel = getattr(self.navigation, "cancel_navigation", None)
-        velocity = getattr(self.navigation, "teleop_velocity", None)
-        stop = getattr(self.navigation, "stop_motion", None)
-        observation = {}
-        snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
-        if callable(snapshot):
-            try:
-                observation = snapshot() or {}
-            except Exception:
-                LOGGER.warning("obstacle snapshot failed before reverse", exc_info=True)
-        rear = observation.get("rear_clearance_m")
-        if rear is not None:
-            try:
-                if float(rear) < RECOVERY_REVERSE_MIN_REAR_CLEARANCE_M:
-                    LOGGER.warning(
-                        "obstacle reverse skipped; rear clearance %.2fm < %.2fm",
-                        float(rear),
-                        RECOVERY_REVERSE_MIN_REAR_CLEARANCE_M,
+                if self._obstacle_clear_started_at is None:
+                    self._obstacle_clear_started_at = now
+                elif now - self._obstacle_clear_started_at >= float(
+                    getattr(self.obstacle_speech, "obstacle_clear_seconds", 3.0)
+                ):
+                    self._emit_obstacle_stage("CLEAR_CONFIRMED", observation)
+                    self._emit_obstacle_stage("RESUMED", observation)
+                    self._reset_obstacle_episode()
+            else:
+                self._obstacle_clear_started_at = None
+                self._last_obstacle_seen_at = now
+                if self._obstacle_progress_anchor is None:
+                    self._obstacle_episode_id = str(uuid.uuid4())
+                    self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
+                    self._obstacle_progress_anchor_at = now
+                    self._emit_obstacle_stage(
+                        "DETECTED_STOP", observation, reason=trigger_reason
                     )
-                    self._emit_idempotent(
-                        "task.recovery_active",
-                        event_type_key="recovery_blocked_rear",
-                        code="RECOVERY_REAR_BLOCKED",
-                        message="后方净空不足，跳过后退自愈",
-                        extra={"recovery": self._recovery_arbiter.snapshot(), "observation": observation},
-                    )
-                    return
-            except (TypeError, ValueError):
-                pass
-        lease = self.acquire_recovery(
-            "EDGE_OBSTACLE",
-            "obstacle_reverse",
-            distance_m=RECOVERY_REVERSE_DISTANCE_M,
-        )
-        if lease is None:
-            LOGGER.warning(
-                "obstacle reverse skipped; another recovery owns movement or budget exhausted: %s",
-                self._recovery_arbiter.snapshot(),
-            )
-            return
-        with self._lock:
-            if (
-                not self.context
-                or self.context.state != "running"
-                or self.context.task_execution_id != recovery_execution_id
-            ):
-                self.release_recovery(lease)
-                return
-            self._obstacle_recovery_active = True
-            self._emit_idempotent(
-                "task.recovery_active",
-                event_type_key="recovery_reverse",
-                code="EDGE_OBSTACLE",
-                message="障碍后退自愈",
-                extra={"recovery": self._recovery_arbiter.snapshot()},
-            )
+                    if not self._obstacle_motion_recovery_enabled():
+                        next_action = ("safe_observing", None)
+                    else:
+                        self._emit_obstacle_stage(
+                            "WAITING_PROGRESS", observation, reason=trigger_reason
+                        )
+                else:
+                    anchor_x, anchor_y = self._obstacle_progress_anchor
+                    progressed = hypot(float(pose.x) - anchor_x, float(pose.y) - anchor_y)
+                    if progressed >= float(getattr(self.obstacle_speech, "min_progress_m", 0.5)):
+                        self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
+                        self._obstacle_progress_anchor_at = now
+                    elif (
+                        now - self._obstacle_progress_anchor_at
+                        >= float(getattr(self.obstacle_speech, "no_progress_seconds", 5.0))
+                        and not self._obstacle_recovery_active
+                        and not self._leave_route_announced
+                    ):
+                        max_attempts = int(getattr(
+                            self.obstacle_speech,
+                            "max_recovery_attempts",
+                            OBSTACLE_RECOVERY_MAX_ATTEMPTS,
+                        ))
+                        if self._recovery_attempts >= max_attempts:
+                            next_action = ("safe_observing", None)
+                        else:
+                            self._recovery_attempts += 1
+                            attempt = int(self._recovery_attempts)
+                            self._obstacle_progress_anchor_at = now
+                            self._emit_obstacle_stage(
+                                "RECOVERY_ATTEMPT", observation, attempt=attempt
+                            )
+                            next_action = ("recover", attempt)
+
+        if next_action and next_action[0] == "resume":
+            self._resume_after_obstacle(observation, automatic=True)
+        elif next_action and next_action[0] == "safe_observing":
+            self._enter_obstacle_safe_observing(observation)
+        elif next_action and next_action[0] == "recover":
+            self._perform_bounded_obstacle_recovery(int(next_action[1] or 0))
+
+    @staticmethod
+    def _finite_clearance(value) -> float | None:
         try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isfinite(parsed) else None
+
+    def _select_obstacle_recovery_direction(self, observation: dict) -> dict:
+        """Fail closed on stale scans and select a verified body-side corridor."""
+        if not self._obstacle_scan_is_fresh(observation):
+            return {"safe": False, "reason": "scan_stale"}
+        clearance = getattr(self.navigation, "directional_clearance", None)
+        if not callable(clearance):
+            return {"safe": False, "reason": "directional_clearance_unavailable"}
+        reverse_distance = float(getattr(self.obstacle_speech, "reverse_distance_m", 0.25))
+        lateral_distance = float(getattr(self.obstacle_speech, "lateral_distance_m", 0.20))
+        speed = float(getattr(self.obstacle_speech, "recovery_speed_mps", 0.06))
+        max_age = float(getattr(self.obstacle_speech, "scan_max_age_seconds", 0.50))
+        rear_min = float(getattr(self.obstacle_speech, "rear_clearance_m", 0.70))
+        side_min = float(getattr(self.obstacle_speech, "side_clearance_m", 0.80))
+        rear = self._finite_clearance(observation.get("rear_clearance_m"))
+        if rear is None:
+            return {"safe": False, "reason": "rear_clearance_unknown"}
+        if rear is not None and rear < rear_min:
+            return {"safe": False, "reason": "rear_clearance", "rear_clearance_m": rear}
+        reverse_check = clearance(
+            -abs(speed), 0.0, reverse_distance, max_scan_age_seconds=max_age
+        )
+        if not reverse_check.get("clear"):
+            return {"safe": False, "reason": "reverse_" + str(reverse_check.get("reason")),
+                    "reverse_check": reverse_check}
+        candidates = []
+        for direction, key in ((1, "left_clearance_m"), (-1, "right_clearance_m")):
+            measured = self._finite_clearance(observation.get(key))
+            if measured is None or measured < side_min:
+                continue
+            check = clearance(
+                0.0,
+                direction * abs(speed),
+                lateral_distance,
+                max_scan_age_seconds=max_age,
+            )
+            if check.get("clear"):
+                # Unknown means "no nearest point", not infinity. It is ranked
+                # below a measured-clear side and accepted only by the full
+                # swept-corridor check above.
+                candidates.append((measured is not None, measured or 0.0, direction, check))
+        if not candidates:
+            return {"safe": False, "reason": "side_clearance"}
+        _, measured, direction, side_check = max(candidates, key=lambda item: (item[0], item[1]))
+        return {
+            "safe": True,
+            "lateral_direction": direction,
+            "lateral_side": "left" if direction > 0 else "right",
+            "selected_side_clearance_m": measured or None,
+            "reverse_check": reverse_check,
+            "side_check": side_check,
+        }
+
+    def _perform_bounded_obstacle_recovery(self, attempt: int) -> None:
+        with self._lock:
+            if not self.context or self.context.state != "running" or self._obstacle_recovery_active:
+                return
+            execution_id = self.context.task_execution_id
+            observation = self.navigation.obstacle_monitor_snapshot() or {}
+            selection = self._select_obstacle_recovery_direction(observation)
+            self._obstacle_recovery_active = True
+        result = {"success": False, "reason": selection.get("reason", "unsafe")}
+        lease = None
+        navigation_goal_cancelled = False
+        try:
+            if not selection.get("safe"):
+                return
+            total_distance = float(getattr(self.obstacle_speech, "reverse_distance_m", 0.25)) + float(
+                getattr(self.obstacle_speech, "lateral_distance_m", 0.20)
+            )
+            cancel = getattr(self.navigation, "cancel_navigation", None)
             if callable(cancel):
                 with self._lock:
                     self._expected_recovery_cancels += 1
-                cancel(timeout_seconds=2.0)
-            if callable(velocity):
-                speed = -abs(float(getattr(self.obstacle_speech, "reverse_speed_mps", 0.12)))
-                duration = max(
-                    0.2,
-                    min(float(getattr(self.obstacle_speech, "reverse_duration_seconds", 1.5)), 3.0),
-                )
-                LOGGER.warning(
-                    "obstacle recovery reverse start speed=%.2f duration=%.2fs",
-                    speed,
-                    duration,
-                )
-                deadline = time.monotonic() + duration
-                try:
-                    while time.monotonic() < deadline:
-                        with self._lock:
-                            recovery_still_active = bool(
-                                self.context
-                                and self.context.state == "running"
-                                and self.context.task_execution_id == recovery_execution_id
-                                and self._obstacle_recovery_active
-                            )
-                        if not recovery_still_active:
-                            LOGGER.info("obstacle recovery reverse interrupted by task state change")
-                            break
-                        velocity(vx=speed, vy=0.0, yaw_rate=0.0)
-                        time.sleep(0.1)
-                finally:
-                    if callable(stop):
-                        stop()
-                    else:
-                        velocity(vx=0.0, vy=0.0, yaw_rate=0.0)
-                    LOGGER.warning("obstacle recovery reverse finished")
-            elif callable(stop):
-                stop()
-            else:
-                LOGGER.warning("obstacle recovery reverse skipped; teleop reverse is unavailable")
+                navigation_goal_cancelled = bool(cancel(timeout_seconds=2.0))
+            if not navigation_goal_cancelled:
+                with self._lock:
+                    self._expected_recovery_cancels = max(
+                        0, self._expected_recovery_cancels - 1
+                    )
+                result = {"success": False, "reason": "navigation_cancel_not_confirmed"}
+                return
+            self.navigation.stop_motion()
+            if not self.navigation.is_robot_stopped():
+                result = {"success": False, "reason": "stop_not_confirmed"}
+                return
+            lease = self.acquire_recovery(
+                "EDGE_OBSTACLE", f"physical_obstacle_attempt_{attempt}", distance_m=total_distance
+            )
+            if lease is None:
+                result = {"success": False, "reason": "recovery_lease_unavailable"}
+                return
+            clearer = getattr(self.navigation, "clear_local_costmap", None)
+            if callable(clearer):
+                clearer()
+            result = self.navigation.execute_obstacle_recovery(
+                reverse_distance_m=float(getattr(self.obstacle_speech, "reverse_distance_m", 0.25)),
+                lateral_distance_m=float(getattr(self.obstacle_speech, "lateral_distance_m", 0.20)),
+                lateral_direction=int(selection["lateral_direction"]),
+                speed_mps=float(getattr(self.obstacle_speech, "recovery_speed_mps", 0.06)),
+                timeout_seconds=float(getattr(self.obstacle_speech, "recovery_timeout_seconds", 6.0)),
+            ) or {"success": False, "reason": "empty_behavior_result"}
+        except Exception as exc:
+            LOGGER.exception("bounded obstacle recovery attempt %s failed", attempt)
+            result = {"success": False, "reason": str(exc)}
         finally:
+            if lease is not None:
+                self.release_recovery(lease)
             with self._lock:
                 self._obstacle_recovery_active = False
-            self.release_recovery(lease)
-        self._redispatch_after_obstacle_recovery()
-
-    def _redispatch_after_obstacle_recovery(self) -> None:
-        if not self.context or self.context.state != "running":
-            return
-        observation = {}
-        snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
-        if callable(snapshot):
-            try:
-                observation = snapshot() or {}
-            except Exception:
-                LOGGER.warning("obstacle snapshot failed before bypass redispatch", exc_info=True)
-        via = self._obstacle_bypass_via(observation)
-        if via is not None:
-            LOGGER.info(
-                "dispatching obstacle bypass via x=%.2f y=%.2f toward waypoint %s",
-                via["x"],
-                via["y"],
-                self.context.current_waypoint_index,
-            )
-            self._dispatch_bypass_via(via)
-            return
-        LOGGER.info(
-            "obstacle reverse complete; re-dispatching waypoint %s",
-            self.context.current_waypoint_index,
-        )
-        self._send_from(self.context.current_waypoint_index)
-
-    def _obstacle_bypass_via(self, observation: dict) -> dict | None:
-        """Pick a short lateral via along the route toward the pending waypoint.
-
-        Clearances are measured in the robot body frame, but the via itself must
-        advance toward the goal. Using body-forward when yaw is wrong (common
-        after a failed departure turn) walks the dog into the wall it just
-        reversed away from.
-        """
-        if not self.context:
-            return None
-        pose = self.navigation.latest_pose() if self.navigation else None
-        if pose is None:
-            return None
-        try:
-            x = float(pose.x)
-            y = float(pose.y)
-            yaw = float(getattr(pose, "yaw", 0.0) or 0.0)
-        except (AttributeError, TypeError, ValueError):
-            return None
-        waypoints = self.context.route_snapshot.get("waypoints") or []
-        if not waypoints:
-            return None
-        index = min(max(0, self.context.current_waypoint_index), len(waypoints) - 1)
-        target = waypoints[index]
-        try:
-            target_x = float(target["x"])
-            target_y = float(target["y"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        goal_dx = target_x - x
-        goal_dy = target_y - y
-        # If we are already on the pending waypoint (final approach / restart on
-        # the nearest point), aim the bypass at the next leg instead of failing
-        # open and redispatching into the same wall.
-        if hypot(goal_dx, goal_dy) < 0.3 and index + 1 < len(waypoints):
-            nxt = waypoints[index + 1]
-            try:
-                target = nxt
-                target_x = float(nxt["x"])
-                target_y = float(nxt["y"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            goal_dx = target_x - x
-            goal_dy = target_y - y
-            index = index + 1
-        if hypot(goal_dx, goal_dy) < 0.3:
-            return None
-        goal_yaw = atan2(goal_dy, goal_dx)
-        goal_forward_x, goal_forward_y = cos(goal_yaw), sin(goal_yaw)
-        goal_left_x, goal_left_y = -sin(goal_yaw), cos(goal_yaw)
-        left = observation.get("left_clearance_m")
-        right = observation.get("right_clearance_m")
-        left_m = float("inf") if left is None else float(left)
-        right_m = float("inf") if right is None else float(right)
-        if max(left_m, right_m) < BYPASS_MIN_SIDE_CLEARANCE_M:
-            return None
-        # Map body-frame left/right clearances into the goal frame. When the
-        # dog faces away from the waypoint, body-left is goal-right.
-        robot_left_x, robot_left_y = -sin(yaw), cos(yaw)
-        align = robot_left_x * goal_left_x + robot_left_y * goal_left_y
-        if align >= 0.0:
-            goal_left_clear_m, goal_right_clear_m = left_m, right_m
-        else:
-            goal_left_clear_m, goal_right_clear_m = right_m, left_m
-        side = 1.0 if goal_left_clear_m >= goal_right_clear_m else -1.0
-        via_x = x + BYPASS_FORWARD_M * goal_forward_x + side * BYPASS_LATERAL_M * goal_left_x
-        via_y = y + BYPASS_FORWARD_M * goal_forward_y + side * BYPASS_LATERAL_M * goal_left_y
-        if hypot(via_x - x, via_y - y) < 0.3:
-            return None
-        if hypot(via_x - target_x, via_y - target_y) < 0.5:
-            return None
-        return {
-            "x": via_x,
-            "y": via_y,
-            "yaw": atan2(target_y - via_y, target_x - via_x),
-            "waypoint_id": f"bypass-{index}",
-            "map_point_number": target.get("map_point_number"),
-        }
-
-    def _dispatch_bypass_via(self, via: dict) -> None:
-        lease = self.acquire_recovery("EDGE_OBSTACLE", "obstacle_bypass", distance_m=BYPASS_LATERAL_M)
-        if lease is None:
-            LOGGER.warning(
-                "obstacle bypass skipped; recovery ownership unavailable: %s",
-                self._recovery_arbiter.snapshot(),
-            )
-            self._send_from(self.context.current_waypoint_index)
-            return
-        self._emit_idempotent(
-            "task.recovery_active",
-            event_type_key="recovery_bypass",
-            code="EDGE_OBSTACLE",
-            message="障碍侧移绕行",
-            extra={"recovery": self._recovery_arbiter.snapshot(), "via": via},
-        )
-        try:
-            previous_leg_profile = self._active_leg_profile
-            previous_avoidance_enabled = self._segment_avoidance_enabled
-            try:
-                self._apply_navigation_profile(
-                    self.context.current_waypoint_index,
-                    force_final=False,
+                still_active = bool(
+                    self.context
+                    and self.context.state == "running"
+                    and self.context.task_execution_id == execution_id
                 )
-            except ProtocolError:
-                # apply_navigation_profile is an atomic best-effort tuning
-                # operation.  RosAdapter rolls back its last known good Nav2
-                # profile on ProtocolError.  Keep the TaskExecutor's view in
-                # sync with that rollback and dispatch the bypass using the
-                # safe profile that was already active; otherwise a temporary
-                # get_parameters timeout leaves the task running with no goal.
-                self._active_leg_profile = previous_leg_profile
-                self._segment_avoidance_enabled = previous_avoidance_enabled
-                LOGGER.exception(
-                    "obstacle bypass profile apply failed; continuing with last known safe profile"
-                )
-            self._patrol_final_approach_applied = False
-            self._bypass_active = True
-            self._goal_offset = self.context.current_waypoint_index
-            self._dispatched_count = 1
-            accepted = self.navigation.send_waypoints([via], self.on_feedback, self._bind_nav_result())
-            if accepted:
+                latest = self.navigation.obstacle_monitor_snapshot() if still_active else observation
+                if still_active:
+                    self._emit_obstacle_stage(
+                        "RECOVERY_ATTEMPT",
+                        latest or observation,
+                        attempt=attempt,
+                        action_result={**selection, **result},
+                    )
+                    pose = self.navigation.latest_pose()
+                    if pose is not None:
+                        self._obstacle_progress_anchor = (float(pose.x), float(pose.y))
+                    self._obstacle_progress_anchor_at = time.monotonic()
+                    if navigation_goal_cancelled:
+                        self._send_from(self.context.current_waypoint_index)
+
+    def _enter_obstacle_safe_observing(self, observation: dict) -> None:
+        with self._lock:
+            if not self.context or not self._obstacle_episode_id or self._leave_route_announced:
                 return
-            self._bypass_active = False
-            LOGGER.warning("obstacle bypass via was rejected; retrying the original waypoint")
-            self._send_from(self.context.current_waypoint_index)
-        finally:
-            # Ownership is released once the via goal is accepted or rejected.
-            # Motion during the via is under the Nav2 goal generation, not teleop.
-            self.release_recovery(lease)
+            self._leave_route_announced = True
+            self._obstacle_clear_started_at = None
+            self._emit_obstacle_stage(
+                "DISSUASION", observation, attempt=self._recovery_attempts
+            )
+            self._emit_obstacle_stage(
+                "SAFE_OBSERVING", observation, attempt=self._recovery_attempts
+            )
+            self._expected_recovery_cancels += 1
+        cancel = getattr(self.navigation, "cancel_navigation", None)
+        cancelled = bool(cancel(timeout_seconds=2.0)) if callable(cancel) else False
+        if not cancelled:
+            with self._lock:
+                self._expected_recovery_cancels = max(0, self._expected_recovery_cancels - 1)
+            LOGGER.warning("safe observation entered without Nav2 cancel acknowledgement")
+        self.navigation.stop_motion()
 
-    def _emit_obstacle_speech(self, stage: str, attempt: int, observation: dict) -> None:
-        if self.obstacle_speech is None or not bool(getattr(self.obstacle_speech, "announce", True)):
+    def _resume_after_obstacle(self, observation: dict, *, automatic: bool) -> None:
+        with self._lock:
+            if not self.context or self.context.state != "running" or not self._obstacle_episode_id:
+                return
+            index = self.context.current_waypoint_index
+            self._emit_obstacle_stage(
+                "RESUMED", observation, attempt=self._recovery_attempts,
+                reason="automatic_clear" if automatic else "manual_continue",
+            )
+            self._reset_obstacle_episode()
+            if self._post_arrival_active(index):
+                self._resume_post_arrival(index)
+            else:
+                self._send_from(index)
+
+    def _emit_obstacle_stage(
+        self,
+        stage: str,
+        observation: dict,
+        *,
+        attempt: int = 0,
+        reason: str = "",
+        action_result: dict | None = None,
+    ) -> None:
+        if not self.context or not self._obstacle_episode_id:
             return
-        titles = {
-            "obstacle_detected": "发现障碍物",
-            "recovery_attempt": "后退尝试避障",
-            "leave_route": "劝阻离开线路",
+        self._obstacle_stage = stage
+        collision = dict(observation.get("collision_monitor") or {})
+        latest_pose = self.navigation.latest_pose()
+        pose = {}
+        if latest_pose is not None:
+            try:
+                pose = {
+                    "frame_id": str(getattr(latest_pose, "frame_id", "map") or "map"),
+                    "x": float(latest_pose.x),
+                    "y": float(latest_pose.y),
+                    "yaw": float(getattr(latest_pose, "yaw", 0.0) or 0.0),
+                }
+            except (AttributeError, TypeError, ValueError):
+                pose = {}
+        payload = {
+            "task_execution_id": self.context.task_execution_id,
+            "round_number": self.context.round_number,
+            "waypoint_index": self.context.current_waypoint_index,
+            "obstacle_episode_id": self._obstacle_episode_id,
+            "stage": stage,
+            "recovery_attempt": int(attempt),
+            "max_recovery_attempts": int(
+                getattr(self.obstacle_speech, "max_recovery_attempts", OBSTACLE_RECOVERY_MAX_ATTEMPTS)
+            ),
+            "detour_enabled": bool(self._segment_avoidance_enabled),
+            "reason": reason,
+            "front_obstacle_distance_m": observation.get("front_obstacle_distance_m"),
+            "rear_clearance_m": observation.get("rear_clearance_m"),
+            "left_clearance_m": observation.get("left_clearance_m"),
+            "right_clearance_m": observation.get("right_clearance_m"),
+            "collision_state": collision.get("state"),
+            "collision_zone": collision.get("zone"),
+            "collision_motion_scope": collision.get("motion_scope"),
+            "collision_points_inside": collision.get("points_inside"),
+            "pose": pose,
+            "action_result": action_result or {},
+            "reported_at": now_iso(),
         }
-        self.event_callback(
-            "task.obstacle_speech",
-            {
-                "task_execution_id": self.context.task_execution_id,
-                "round_number": self.context.round_number,
-                "obstacle_episode_id": self._obstacle_episode_id,
-                "speech_stage": stage,
-                "template_name": titles[stage],
-                "recovery_attempt": attempt,
-                "front_obstacle_distance_m": observation.get("front_obstacle_distance_m"),
-                "reported_at": now_iso(),
-            },
-            "",
-        )
+        self.event_callback("task.obstacle_stage", payload, "")
+        if stage == "RECOVERY_ATTEMPT":
+            self.event_callback("navigation.obstacle_recovery", payload, "")
+        speech = {
+            "DETECTED_STOP": ("obstacle_detected", "发现障碍物"),
+            "RECOVERY_ATTEMPT": ("recovery_attempt", "后退尝试避障"),
+            "DISSUASION": ("leave_route", "劝阻离开线路"),
+        }.get(stage)
+        if (
+            speech
+            and action_result is None
+            and bool(getattr(self.obstacle_speech, "announce", True))
+        ):
+            self.event_callback(
+                "task.obstacle_speech",
+                {
+                    **payload,
+                    "speech_stage": speech[0],
+                    "template_name": speech[1],
+                },
+                "",
+            )
         LOGGER.info(
-            "obstacle speech episode=%s stage=%s attempt=%s distance=%s raw_planar=%s actual_planar=%s",
+            "obstacle episode=%s stage=%s attempt=%s zone=%s distance=%s",
             self._obstacle_episode_id,
             stage,
             attempt,
+            collision.get("zone"),
             observation.get("front_obstacle_distance_m"),
-            observation.get("requested_planar_speed_mps"),
-            observation.get("actual_planar_speed_mps"),
         )
 
     def report_docking_charge(self, event_type: str, *, message: str = "", extra: dict | None = None) -> None:
@@ -2955,8 +2946,7 @@ class TaskExecutor:
             },
         )
         self.on_feedback(0, milestone="target_dispatched")
-        if self._segment_avoidance_enabled:
-            self._start_obstacle_monitor()
+        self._start_obstacle_monitor()
 
     def _pass_through_yaw(self, index: int, waypoint: dict) -> float:
         """Use travel heading for pass-through patrol points (cloud yaw is often 0)."""
@@ -4836,18 +4826,43 @@ class TaskExecutor:
             self._assert_execution(execution_id)
             if self.context.state != "running":
                 raise ProtocolError("INVALID_TASK_STATE", "task is not running")
-            self._leave_route_announced = False
-            self._recovery_attempts = 0
-            self._last_obstacle_seen_at = None
-            self._obstacle_progress_anchor = None
-            self._obstacle_progress_anchor_at = None
+            if self._obstacle_stage != "SAFE_OBSERVING" or not self._obstacle_episode_id:
+                raise ProtocolError(
+                    "OBSTACLE_NOT_OBSERVING", "task is not waiting in obstacle safe observation"
+                )
+            self.navigation.stop_motion()
+            if not self.navigation.is_robot_stopped():
+                raise ProtocolError("STOP_NOT_CONFIRMED", "robot stop is not confirmed")
+            observation = self.navigation.obstacle_monitor_snapshot() or {}
+            if not self._localization_allows_obstacle_monitor(observation):
+                raise ProtocolError("LOCALIZATION_NOT_NORMAL", "localization is not normal")
+            if not self._obstacle_is_clear(observation):
+                self._obstacle_clear_started_at = None
+                raise ProtocolError("OBSTACLE_NOT_CLEAR", "obstacle or stale scan still blocks recovery")
+            clear_for = (
+                time.monotonic() - self._obstacle_clear_started_at
+                if self._obstacle_clear_started_at is not None
+                else 0.0
+            )
+            required = float(getattr(self.obstacle_speech, "obstacle_clear_seconds", 3.0))
+            if clear_for < required:
+                if self._obstacle_clear_started_at is None:
+                    self._obstacle_clear_started_at = time.monotonic()
+                raise ProtocolError(
+                    "OBSTACLE_CLEAR_NOT_STABLE",
+                    f"obstacle clearance must remain stable for {required:.1f}s",
+                )
             waypoint_index = self.context.current_waypoint_index
-            if self._post_arrival_active(waypoint_index):
-                self._resume_post_arrival(waypoint_index)
-            else:
-                self._send_from(waypoint_index)
-            return {"final_task_state": "running", "resumed_forward": True,
-                    "waypoint_index": waypoint_index}
+            self._emit_obstacle_stage(
+                "CLEAR_CONFIRMED", observation, attempt=self._recovery_attempts,
+                reason="manual_continue_check",
+            )
+        self._resume_after_obstacle(observation, automatic=False)
+        return {
+            "final_task_state": "running",
+            "resumed_forward": True,
+            "waypoint_index": waypoint_index,
+        }
 
     def resume_task(self, execution_id: str, resume_index: int) -> dict:
         with self._lock:
@@ -6751,8 +6766,6 @@ class TaskExecutor:
             precision_setter(enabled=precision_goal or arrival_policy == "precision")
         if self._is_docking_task():
             self._apply_docking_profile(waypoint_index)
-        if not avoid_obstacles:
-            self._stop_obstacle_monitor()
 
     def _outdoor_navigation_profile(self) -> bool:
         if not self.context:
@@ -6974,29 +6987,22 @@ class TaskExecutor:
         return True
 
     def _retry_blocked_navigation(self) -> None:
+        self._evaluate_obstacle_progress()
         with self._lock:
             if not self.context or self.context.state != "running":
                 return
-            if self._leave_route_announced:
-                # Keep the safety stop, but allow an automatic retry after a
-                # short cooling window once the obstacle has actually cleared.
-                # Do not blindly re-dispatch into the same obstacle.
-                self.navigation.stop_motion()
-                observation = self.navigation.obstacle_monitor_snapshot()
-                distance = observation.get("front_obstacle_distance_m")
-                clear = distance is None or float(distance) > self.obstacle_speech.obstacle_max_distance_m
-                if not clear:
-                    LOGGER.warning("obstacle recovery still blocked; retrying safety check in 5s")
-                    self._blocked_retry_timer = threading.Timer(5.0, self._retry_blocked_navigation)
-                    self._blocked_retry_timer.daemon = True
-                    self._blocked_retry_timer.start()
-                    return
-                LOGGER.info("obstacle cleared after cooling; resetting recovery episode and retrying waypoint")
-                self._recovery_attempts = 0
-                self._leave_route_announced = False
-                self._last_obstacle_seen_at = None
-                self._obstacle_progress_anchor = None
-                self._obstacle_progress_anchor_at = None
+            if self._obstacle_episode_id is not None:
+                # The episode monitor owns retries and the continuous 3 s clear
+                # window. A Nav2 failure must not create a second recovery path.
+                interval = 0.5 if self._obstacle_stage == "SAFE_OBSERVING" else float(
+                    self.obstacle_speech.navigation_retry_seconds
+                )
+                self._blocked_retry_timer = threading.Timer(
+                    interval, self._retry_blocked_navigation
+                )
+                self._blocked_retry_timer.daemon = True
+                self._blocked_retry_timer.start()
+                return
             self._send_from(self.context.current_waypoint_index)
 
     def _hold_final_pose(

@@ -1,3 +1,4 @@
+import json
 import math
 import threading
 import time
@@ -1933,6 +1934,82 @@ def test_scan_reports_side_clearance_for_bypass():
     adapter._on_scan(scan)
     assert adapter._left_clearance_m == pytest.approx(1.5, abs=0.05)
     assert adapter._front_obstacle_distance_m is None
+
+
+def test_scan_reports_verified_front_rear_left_and_right_ranges():
+    adapter = object.__new__(RosAdapter)
+    adapter._scan_geometry_key = None
+    adapter._scan_geometry = []
+    scan = SimpleNamespace(
+        # rear, right, front, left
+        ranges=[0.65, 1.10, 0.50, 1.20],
+        range_min=0.05,
+        range_max=4.0,
+        angle_min=-math.pi,
+        angle_increment=math.pi / 2,
+    )
+
+    adapter._process_scan(scan)
+
+    assert adapter._front_obstacle_distance_m == pytest.approx(0.50)
+    assert adapter._rear_clearance_m == pytest.approx(0.65)
+    assert adapter._left_clearance_m == pytest.approx(1.20)
+    assert adapter._right_clearance_m == pytest.approx(1.10)
+
+
+def test_collision_monitor_diagnostic_is_retained_for_obstacle_snapshot():
+    adapter = object.__new__(RosAdapter)
+    adapter._emit_ros_diagnostic = lambda *args, **kwargs: None
+    adapter._collision_monitor_state = {}
+    adapter._collision_monitor_state_received_monotonic = 0.0
+
+    adapter._on_collision_state(SimpleNamespace(data=json.dumps({
+        "state": "STOP",
+        "reason": "polygon",
+        "zone": "left_stop",
+        "motion_scope": "left",
+        "points_inside": 5,
+    })))
+
+    assert adapter._collision_monitor_state["state"] == "STOP"
+    assert adapter._collision_monitor_state["zone"] == "left_stop"
+    assert adapter._collision_monitor_state_received_monotonic > 0
+
+
+def test_behavior_recovery_builds_bounded_backup_and_lateral_goals(monkeypatch):
+    class Goal:
+        def __init__(self):
+            self.target = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.speed = 0.0
+            self.time_allowance = SimpleNamespace(sec=0, nanosec=0)
+
+    monkeypatch.setattr(ros_adapter_module, "BackUp", SimpleNamespace(Goal=Goal), raising=False)
+    monkeypatch.setattr(ros_adapter_module, "DriveOnHeading", SimpleNamespace(Goal=Goal), raising=False)
+    adapter = object.__new__(RosAdapter)
+    adapter._backup_client = object()
+    adapter._drive_on_heading_client = object()
+    calls = []
+
+    def execute(client, goal, *, name, timeout_seconds):
+        calls.append((client, goal, name, timeout_seconds))
+        return {"action": name, "status": "succeeded", "success": True}
+
+    adapter._execute_behavior_action = execute
+
+    result = adapter.execute_obstacle_recovery(
+        reverse_distance_m=0.25,
+        lateral_distance_m=0.20,
+        lateral_direction=-1,
+        speed_mps=0.06,
+        timeout_seconds=6.0,
+    )
+
+    assert result["success"] is True
+    assert calls[0][1].target.x == pytest.approx(0.25)
+    assert calls[0][1].speed == pytest.approx(0.06)
+    assert calls[1][1].target.y == pytest.approx(-0.20)
+    assert calls[1][1].speed == pytest.approx(-0.06)
+    assert calls[1][1].time_allowance.sec == 6
 
 
 def test_directional_clearance_uses_rear_and_side_scan_points():

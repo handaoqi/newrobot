@@ -33,6 +33,8 @@ const error = ref('')
 const mapImageRef = ref(null)
 const imageReadyTick = ref(0)
 let timer
+let taskEventSource
+let refreshQueued = false
 
 const actions = computed(() => executionActions(execution.value?.state))
 const waypointProgress = computed(() => resolveTaskExecutionWaypointProgress(execution.value))
@@ -58,11 +60,27 @@ const progress = computed(() => {
 })
 const isActive = computed(() => ['created', 'dispatching', 'accepted', 'running', 'pausing', 'paused', 'resuming', 'cancelling', 'interrupted'].includes(execution.value?.state))
 const rosbagStatus = computed(() => resolveTaskRosbagStatus(execution.value))
-const obstacleManualIntervention = computed(() =>
-  (execution.value?.events || []).some(event =>
-    event.event_type === 'task.obstacle_blocked_manual' && event.payload?.requires_manual_intervention
-  )
-)
+const latestObstacleStage = computed(() => {
+  const events = (execution.value?.events || []).filter(event => event.event_type === 'task.obstacle_stage')
+  return events.length ? events[events.length - 1]?.payload || null : null
+})
+const obstacleManualIntervention = computed(() => latestObstacleStage.value?.stage === 'SAFE_OBSERVING')
+const obstacleStageInfo = computed(() => {
+  const payload = latestObstacleStage.value
+  if (!payload || ['CLEAR_CONFIRMED', 'RESUMED'].includes(payload.stage)) return null
+  const attempt = Number(payload.recovery_attempt || 0)
+  const labels = {
+    DETECTED_STOP: ['发现障碍物，已停车', '正在等待局部规划绕行'],
+    WAITING_PROGRESS: ['发现障碍物，已停车', '连续无进展后将进行受限恢复'],
+    RECOVERY_ATTEMPT: [`正在进行第 ${attempt}/3 次后退绕行`, payload.action_result?.success === true ? '动作完成，正在重新规划当前航点' : (payload.action_result?.reason || '动作执行中')],
+    DISSUASION: ['三次避障失败，请离开巡检线路', '机器人保持停车'],
+    SAFE_OBSERVING: ['安全观察中', '障碍连续清除 3 秒后自动继续，也可点击继续复核'],
+  }
+  const [title, detail] = labels[payload.stage] || ['障碍处理状态', payload.stage]
+  const zone = payload.collision_zone || '未标明区域'
+  const points = payload.collision_points_inside == null ? '—' : payload.collision_points_inside
+  return { title, detail, diagnostic: `${zone} · ${points} 点 · 前方 ${payload.front_obstacle_distance_m == null ? '—' : `${Number(payload.front_obstacle_distance_m).toFixed(2)} m`}` }
+})
 
 function fullUrl(relativeUrl) {
   if (!relativeUrl) return ''
@@ -83,6 +101,28 @@ async function refresh() {
     mapData.value = await fetchMapDetail(data.map_data)
   }
   refreshImageGeometry()
+}
+
+function queueRefresh() {
+  if (refreshQueued) return
+  refreshQueued = true
+  window.setTimeout(() => {
+    refreshQueued = false
+    refresh().catch(exc => { error.value = exc.message })
+  }, 100)
+}
+
+function connectTaskStream() {
+  const token = localStorage.getItem('inspection_token') || ''
+  if (!token || typeof EventSource === 'undefined') return
+  taskEventSource?.close()
+  taskEventSource = new EventSource(`${API_BASE}/events/stream/?token=${encodeURIComponent(token)}`)
+  taskEventSource.addEventListener('task_event', message => {
+    try {
+      const data = JSON.parse(message.data || '{}')
+      if (String(data.execution_id) === String(route.params.executionId)) queueRefresh()
+    } catch {}
+  })
 }
 
 async function act(action) {
@@ -480,11 +520,14 @@ function localizationDebugItems() {
 
 onMounted(async () => {
   await refresh()
+  connectTaskStream()
   timer = window.setInterval(refresh, 2000)
   window.addEventListener('resize', refreshImageGeometry)
 })
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
+  taskEventSource?.close()
+  taskEventSource = null
   window.removeEventListener('resize', refreshImageGeometry)
 })
 </script>
@@ -518,6 +561,11 @@ onBeforeUnmount(() => {
           <small v-if="failureInfo.detail">{{ failureInfo.detail }}</small>
           <small v-if="failureInfo.suggestion">{{ failureInfo.suggestion }}</small>
         </div>
+        <div v-if="obstacleStageInfo" class="obstacle-stage-card">
+          <strong>{{ obstacleStageInfo.title }}</strong>
+          <p>{{ obstacleStageInfo.detail }}</p>
+          <small>{{ obstacleStageInfo.diagnostic }}</small>
+        </div>
         <div class="debug-list">
           <div v-for="[label, value, state] in localizationDebugItems()" :key="label" class="debug-row" :class="state">
             <span>{{ label }}</span>
@@ -532,7 +580,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="action-row">
           <button class="primary-btn" :disabled="!actions.control.enabled" @click="controlTask">{{ actions.control.label }}</button>
-          <button v-if="obstacleManualIntervention" class="primary-btn" @click="act('resume-forward')">恢复前向</button>
+          <button v-if="obstacleManualIntervention" class="primary-btn" @click="act('resume-forward')">继续</button>
           <button class="danger-btn" :disabled="!actions.forceExit" @click="act('force-exit')">强制退出</button>
         </div>
         <p v-if="error" class="form-error">{{ error }}</p>
@@ -895,6 +943,25 @@ onBeforeUnmount(() => {
 
 .rosbag-card {
   border-left: 3px solid #64748b;
+}
+
+.obstacle-stage-card {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #f59e0b;
+  border-left: 4px solid #f59e0b;
+  border-radius: 6px;
+  background: #fffbeb;
+}
+
+.obstacle-stage-card p,
+.obstacle-stage-card small {
+  margin: 0;
+}
+
+.obstacle-stage-card small {
+  color: #92400e;
 }
 
 .rosbag-card.recording {

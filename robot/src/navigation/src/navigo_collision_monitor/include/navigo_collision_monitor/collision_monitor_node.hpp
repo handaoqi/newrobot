@@ -105,7 +105,12 @@ protected:
    * @param robot_action Robot action to publish
    */
   void publishVelocity(const Action & robot_action);
-  void publishState(const Action & robot_action);
+  void publishState(
+    const Action & robot_action,
+    const std::shared_ptr<Polygon> & action_polygon,
+    std::size_t points_inside,
+    const std::string & reason,
+    const Velocity & requested_velocity);
 
   /**
    * @brief Supporting routine obtaining all ROS-parameters
@@ -227,6 +232,8 @@ protected:
 
   /// @brief Previous robot action
   Action robot_action_prev_;
+  /// @brief Last published state/zone/reason signature (payload values may vary per cycle)
+  std::string state_signature_prev_;
   /// @brief Latest timestamp when robot has 0-velocity
   rclcpp::Time stop_stamp_;
   /// @brief Timeout after which 0-velocity ceases to be published

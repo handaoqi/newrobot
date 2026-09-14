@@ -1,7 +1,7 @@
 # 障碍停车、三次恢复与劝阻告警实施计划
 
 - 建立日期：2026-09-14
-- 当前状态：方案已确认，待实施
+- 当前状态：软件实现与离线验证完成，待 NX 低速实机验收
 - 关联范围：导航任务 9（BT/BehaviorServer 脱困）、任务 10（Collision Monitor）后续增强
 - 明确不包含：任务 6 的 MPPI/RPP `wz` 抑振调参
 
@@ -106,7 +106,7 @@ DETECTED_STOP
 - 新增 `task.obstacle_stage`：包含 `obstacle_episode_id`、阶段、尝试次数、方向距离、触发区域、激光点数、动作及结果、航点和上报时间；
 - 新增 `navigation.obstacle_recovery` 遥测，用于实时页面而非任务状态迁移；
 - 保留 `task.obstacle_speech` 兼容旧端，语音文案由统一阶段事件驱动；
-- 将新消息加入 Edge 协议白名单、云端事件映射及 WebSocket 增量刷新；
+- 将新消息加入云端协议白名单、事件映射及既有 SSE 实时增量刷新；
 - 每个阶段写入 `TaskExecutionEvent`，每个 episode 最终只生成一条汇总 `InspectionEvent`，避免重复告警统计。
 
 ### 4.3 三阶段提示
@@ -141,8 +141,16 @@ DETECTED_STOP
 
 | 工作项 | 状态 | 完成证据 |
 | --- | --- | --- |
-| Collision Monitor 触发区域诊断字段 | 待实施 | ROS 单测、状态话题回放 |
-| Edge 四向距离及 episode 状态机 | 待实施 | Edge 单测、事件序列 |
-| 三次 BehaviorServer 受限恢复 | 待实施 | BT/BehaviorServer 测试、恢复租约记录 |
-| 云协议、页面和语音统一提示 | 待实施 | 后端/前端测试、WebSocket 回放 |
+| Collision Monitor 触发区域诊断字段 | 已完成 | `navigo_collision_monitor` 独立构建通过；状态追加区域、方向、点数、原因和限速前后速度 |
+| Edge 四向距离及 episode 状态机 | 已完成 | Edge `test_ros_adapter.py`、`test_task_state_machine.py` 共 219 项通过 |
+| 三次 BehaviorServer 受限恢复 | 已完成 | BackUp 0.25 m + 横移 0.20 m action、三次上限、BT 租约抑制和人工继续安全复核已有定向测试 |
+| 云协议、页面和语音统一提示 | 已完成 | 后端 `MessageHandlerTests` 31 项、前端 179 项及生产构建通过；SSE 刷新任务阶段 |
 | NX 低速实机验收 | 待实施 | MCAP、日志、阶段事件与安全停车结果 |
+
+## 8. 本阶段实际实现结果
+
+- Collision Monitor 仍使用原有停车/减速区域和点数阈值；新诊断明确区分 `polygon`、`localization_unhealthy`、`source_stale`，防止 Edge 把定位或传感器故障误当成物理障碍。
+- Edge 用一个 `obstacle_episode_id` 串联发现、等待、三次恢复、劝阻、安全观察、清除和恢复；`detour_enabled=false` 会跳过全部运动恢复，但监控、停车和提示不关闭。
+- 三次恢复均取消当前 Nav2 goal、确认停车、检查扫描新鲜度以及后/侧门槛，再调用 BehaviorServer；动作拒绝、超时或被 Collision Monitor 截停均作为本次失败结果上报。
+- 云端允许同一任务状态版本保存多个障碍阶段，同时保留其他任务事件的状态版本唯一约束；一个 episode 只创建一条 `InspectionEvent`，后续阶段追加到汇总记录。
+- 任务执行页显示最多三行的阶段、动作结果和触发区诊断，并通过既有 SSE `task_event` 实时刷新；“继续”会在 Edge 再次检查停车、定位、扫描及连续清除 3 秒后才重新下发当前航点，强制退出入口未改动。

@@ -793,6 +793,72 @@ class MessageHandlerTests(TestCase):
         )
         self.assertTrue(all(item.payload["dual_output"] for item in commands))
 
+    def test_obstacle_stages_share_one_alert_and_allow_same_task_state_version(self):
+        initial_alerts = self.robot.today_alerts
+        for sequence, stage, attempt in (
+            (1, "DETECTED_STOP", 0),
+            (2, "RECOVERY_ATTEMPT", 1),
+            (3, "DISSUASION", 3),
+            (4, "SAFE_OBSERVING", 3),
+        ):
+            handle_mqtt_message(
+                "robots/rx-001/events/task",
+                self.envelope(
+                    "task.obstacle_stage",
+                    {
+                        "task_execution_id": str(self.execution.id),
+                        "obstacle_episode_id": "episode-one",
+                        "stage": stage,
+                        "recovery_attempt": attempt,
+                        "waypoint_index": 1,
+                        "collision_zone": "front_stop",
+                        "collision_points_inside": 7,
+                        "front_obstacle_distance_m": 0.45,
+                        "action_result": {"success": False} if attempt else {},
+                        "reported_at": timezone.now().isoformat(),
+                    },
+                    sequence=sequence,
+                ),
+            )
+
+        task_events = TaskExecutionEvent.objects.filter(
+            task_execution=self.execution,
+            event_type="task.obstacle_stage",
+        )
+        self.execution.refresh_from_db()
+        self.assertEqual(task_events.count(), 4)
+        self.assertEqual({item.state_version for item in task_events}, {self.execution.state_version})
+        alerts = InspectionEvent.objects.filter(
+            task_execution=self.execution,
+            event_type="navigation_obstacle",
+        )
+        self.assertEqual(alerts.count(), 1)
+        alert = alerts.get()
+        self.assertEqual(alert.risk_level, "high")
+        self.assertEqual(len(alert.raw_detection["stages"]), 4)
+        self.robot.refresh_from_db()
+        self.assertEqual(self.robot.today_alerts, initial_alerts + 1)
+
+    def test_obstacle_recovery_telemetry_does_not_duplicate_durable_stage(self):
+        payload = {
+            "task_execution_id": str(self.execution.id),
+            "obstacle_episode_id": "episode-two",
+            "stage": "RECOVERY_ATTEMPT",
+            "recovery_attempt": 2,
+            "reported_at": timezone.now().isoformat(),
+        }
+        result = handle_mqtt_message(
+            "robots/rx-001/events/navigation",
+            self.envelope("navigation.obstacle_recovery", payload),
+        )
+
+        self.execution.refresh_from_db()
+        self.assertEqual(result["state_version"], self.execution.state_version)
+        self.assertFalse(TaskExecutionEvent.objects.filter(
+            task_execution=self.execution,
+            event_type="navigation.obstacle_recovery",
+        ).exists())
+
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/final.mp3", True))
     def test_task_completion_queues_final_waypoint_speech(self, synthesize_speech):
         category, _ = SpeechCategory.objects.get_or_create(name="巡检智能播报")

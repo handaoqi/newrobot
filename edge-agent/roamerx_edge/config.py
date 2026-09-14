@@ -192,8 +192,14 @@ class ObstacleSpeechConfig:
     collision_limit_ratio: float = 0.6
     minimum_blocked_task_seconds: float = 300.0
     navigation_retry_seconds: float = 5.0
-    reverse_speed_mps: float = 0.12
-    reverse_duration_seconds: float = 1.5
+    max_recovery_attempts: int = 3
+    reverse_distance_m: float = 0.25
+    lateral_distance_m: float = 0.20
+    recovery_speed_mps: float = 0.06
+    recovery_timeout_seconds: float = 6.0
+    rear_clearance_m: float = 0.70
+    side_clearance_m: float = 0.80
+    scan_max_age_seconds: float = 0.50
 
 
 @dataclass
