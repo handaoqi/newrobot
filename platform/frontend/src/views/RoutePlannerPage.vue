@@ -3252,20 +3252,20 @@ async function handleDeleteRoute(route) {
                       <div class="waypoint-pre-arrival-strategy">
                         <small class="waypoint-pre-arrival-strategy-title">到点前策略（上一位置 → 当前航点）</small>
                         <label>
-                          <span>局部控制器</span>
-                          <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
-                            <option v-for="option in LOCAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
-                              {{ option.label }}
-                            </option>
-                          </select>
-                        </label>
-                        <label>
                           <span>全局规划器</span>
                           <select
                             :value="point.global_controller || DEFAULT_GLOBAL_CONTROLLER"
                             @change="setWaypointGlobalController(index, $event.target.value)"
                           >
                             <option v-for="option in GLOBAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
+                              {{ option.label }}
+                            </option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>局部控制器</span>
+                          <select :value="point.local_controller || 'mppi'" @change="setWaypointLocalController(index, $event.target.value)">
+                            <option v-for="option in LOCAL_CONTROLLER_OPTIONS" :key="option.value" :value="option.value">
                               {{ option.label }}
                             </option>
                           </select>
@@ -4519,7 +4519,7 @@ async function handleDeleteRoute(route) {
 
 .waypoint-pre-arrival-strategy {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.35rem 0.5rem;
   padding: 0.4rem 0.5rem;
   border-left: 3px solid #475467;
@@ -4534,7 +4534,7 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-main .waypoint-pre-arrival-strategy label {
-  grid-template-columns: 4.8rem minmax(0, 1fr);
+  grid-template-columns: 5.2rem minmax(0, 1fr);
   gap: 0.35rem;
 }
 
@@ -6720,7 +6720,6 @@ async function handleDeleteRoute(route) {
   .map-origin-legend { gap: 0.35rem; }
   .map-origin-legend-item { font-size: 0; }
   .waypoint-main label { grid-template-columns: 1fr; gap: 0.3rem; }
-  .waypoint-pre-arrival-strategy { grid-template-columns: 1fr; }
   .waypoint-main .waypoint-pre-arrival-strategy label { grid-template-columns: 1fr; }
   .waypoint-heading-input { grid-template-columns: 64px 14px auto; }
   .waypoint-heading-input input { min-width: 0; }
