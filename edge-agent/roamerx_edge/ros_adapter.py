@@ -5106,8 +5106,9 @@ class RosAdapter(Node):
         while time.monotonic() < deadline:
             remaining = max(0.1, deadline - time.monotonic())
             try:
-                if self._goal_handle is not None:
-                    future = self._goal_handle.cancel_goal_async()
+                goal_handle = self._goal_handle
+                if goal_handle is not None:
+                    future = goal_handle.cancel_goal_async()
                 else:
                     # Edge may have restarted after it sent a goal. In that
                     # case the local handle is gone while Nav2 continues
@@ -5125,6 +5126,16 @@ class RosAdapter(Node):
                 completed.wait(timeout=min(remaining, 2.0))
                 response = future.result() if future.done() else None
                 if bool(response and response.goals_canceling):
+                    return True
+                # Nav2 may finish or cancel the goal while this request is in
+                # flight.  In that race the cancel response legitimately has
+                # an empty goals_canceling list; an empty global cancellation
+                # result likewise means there is no active goal left to stop.
+                # Treat these terminal states as confirmed cancellation.
+                if goal_handle is None:
+                    return True
+                status = getattr(goal_handle, "status", None)
+                if self._goal_handle is not goal_handle or status in (4, 5, 6):
                     return True
                 last_failure = "not acknowledged"
             except Exception as exc:

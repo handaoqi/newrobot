@@ -37,6 +37,41 @@ class _FakeRecoveryLeaseService:
         RELEASE = 2
 
 
+def test_cancel_navigation_accepts_goal_that_reached_terminal_state():
+    adapter = object.__new__(RosAdapter)
+
+    class GoalHandle:
+        status = 5  # action_msgs/GoalStatus.STATUS_CANCELED
+
+        def cancel_goal_async(self):
+            future = Future()
+            future.set_result(SimpleNamespace(goals_canceling=[]))
+            return future
+
+    adapter._goal_handle = GoalHandle()
+    adapter._nav_cancel_action = "/follow_waypoints"
+
+    assert adapter.cancel_navigation(timeout_seconds=0.2) is True
+
+
+def test_cancel_navigation_accepts_handle_cleared_during_cancel_request():
+    adapter = object.__new__(RosAdapter)
+
+    class GoalHandle:
+        status = 0
+
+        def cancel_goal_async(self):
+            adapter._goal_handle = None
+            future = Future()
+            future.set_result(SimpleNamespace(goals_canceling=[]))
+            return future
+
+    adapter._goal_handle = GoalHandle()
+    adapter._nav_cancel_action = "/follow_waypoints"
+
+    assert adapter.cancel_navigation(timeout_seconds=0.2) is True
+
+
 def test_recovery_lease_service_keeps_opaque_lease_by_generation(monkeypatch):
     monkeypatch.setattr(ros_adapter_module, "NavigationRecoveryLease", _FakeRecoveryLeaseService)
     adapter = object.__new__(RosAdapter)
