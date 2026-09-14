@@ -1115,6 +1115,11 @@ class TaskExecutor:
             )
             cancel = getattr(self.navigation, "cancel_navigation", None)
             if callable(cancel):
+                # A late success from the cancelled FollowWaypoints goal must
+                # not advance the route while the same obstacle episode is
+                # still being recovered. Invalidate its callback generation
+                # before sending the cancel request, not after it returns.
+                self._invalidate_nav_results()
                 with self._lock:
                     self._expected_recovery_cancels += 1
                 navigation_goal_cancelled = bool(cancel(timeout_seconds=2.0))
@@ -5644,6 +5649,12 @@ class TaskExecutor:
             # worker thread later).  Never let such a stale success advance
             # the route or dispatch the next waypoint.
             if generation is not None and generation != self._nav_goal_generation:
+                # Obstacle recovery invalidates the old goal generation before
+                # asking Nav2 to cancel it. Account for that expected cancel
+                # even when its acknowledgement arrives through the now-stale
+                # callback, while still discarding every stale success.
+                if status == "cancelled" and self._expected_recovery_cancels > 0:
+                    self._expected_recovery_cancels -= 1
                 LOGGER.info(
                     "ignoring stale Nav2 result generation=%s current=%s status=%s",
                     generation,
