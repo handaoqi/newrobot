@@ -125,7 +125,7 @@ fi
 
 remote_exec "python3 '$EDGE_RELEASE_DIR/edge-agent/tools/write_mapping_deployment_manifest.py' --repo '$TARGET_REPO_ROOT' --output '$EDGE_RUNTIME_DIR/conf/mapping-deployment.json'"
 
-PREVIOUS_EDGE_RELEASE="$(remote_exec "readlink -f '$EDGE_CURRENT_LINK' 2>/dev/null || true")"
+PREVIOUS_EDGE_RELEASE="$(remote_exec "readlink -e '$EDGE_CURRENT_LINK' 2>/dev/null || true")"
 EDGE_RELEASE_STATUS="staged"
 if "$RESTART_EDGE"; then
   remote_exec "candidate='$EDGE_RUNTIME_DIR/.current-edge-$EDGE_RELEASE_ID'; ln -sfn '$EDGE_RELEASE_DIR' \"\$candidate\"; mv -Tf \"\$candidate\" '$EDGE_CURRENT_LINK'"
