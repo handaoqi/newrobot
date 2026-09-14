@@ -41,6 +41,7 @@ def follow_path_patrol_params(
     require_yaw: bool = False,
     outdoor: bool = False,
     speed_profile: NavigationSpeedProfile | None = None,
+    reapproach: bool = False,
 ) -> dict[str, bool | float]:
     """MPPI settings for a patrol goal.
 
@@ -49,14 +50,14 @@ def follow_path_patrol_params(
     only useful when the local obstacle layer is actually painting. Final
     approach slows down so the DiffDrive turning radius fits the 0.35 m window.
     """
-    vx_max = 0.15 if final_approach else float(
+    vx_max = (0.08 if reapproach else 0.15) if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
     )
     # A clear final click can sit still while the goal checker settles.
     # With the local obstacle layer on, DiffDrive has to reverse a little to
     # turn around a mark; leaving vx_min at 0 freezes the dog on the spot.
-    vx_min = 0.0 if final_approach and not local_obstacles else -0.12
-    wz_max = 0.35 if final_approach else float(
+    vx_min = 0.0 if reapproach or (final_approach and not local_obstacles) else -0.12
+    wz_max = (0.25 if reapproach else 0.35) if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).wz_rps
     )
     return {
@@ -5307,6 +5308,7 @@ class RosAdapter(Node):
         smoother_id: str = "savitzky_golay",
         live: bool = False,
         navigation_speed_level: str = "micro",
+        reapproach: bool = False,
     ) -> dict:
         """Atomically apply a leg profile, read it back, and roll back on failure."""
         previous = copy.deepcopy(getattr(self, "_last_good_navigation_profile", None))
@@ -5372,6 +5374,7 @@ class RosAdapter(Node):
                 outdoor=use_outdoor,
                 local_controller=normalized_local,
                 navigation_speed_level=navigation_speed_level,
+                reapproach=reapproach,
             )
             self.set_local_controller(normalized_local)
             self.set_smoother(smoother_id)
@@ -5452,6 +5455,7 @@ class RosAdapter(Node):
         outdoor: bool | None = None,
         local_controller: str = "mppi",
         navigation_speed_level: str = "micro",
+        reapproach: bool = False,
     ) -> None:
         self.set_local_controller(local_controller)
         yaw_message = Bool()
@@ -5472,6 +5476,7 @@ class RosAdapter(Node):
             normalize_local_controller(local_controller),
             bool(require_yaw),
             bool(final_approach),
+            bool(reapproach),
             bool(live),
             bool(use_outdoor_profile),
             bool(local_obstacles),
@@ -5498,6 +5503,7 @@ class RosAdapter(Node):
                 require_yaw=require_yaw,
                 outdoor=use_outdoor_profile,
                 speed_profile=speed_profile,
+                reapproach=reapproach,
             )
             self._boundary_base_velocity = {
                 "vx_max": float(params["FollowPath.vx_max"]),
@@ -5521,8 +5527,8 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
         elif use_rpp:
             params = {
-                "RPP.desired_linear_vel": 0.18 if final_approach else speed_profile.vx_mps,
-                "RPP.min_linear_vel": 0.03 if final_approach else 0.05,
+                "RPP.desired_linear_vel": (0.08 if reapproach else 0.18) if final_approach else speed_profile.vx_mps,
+                "RPP.min_linear_vel": 0.02 if reapproach else (0.03 if final_approach else 0.05),
                 "RPP.lookahead_dist": 0.40 if final_approach else 1.2,
                 "RPP.min_lookahead_dist": 0.25 if final_approach else 0.6,
                 "RPP.max_lookahead_dist": 0.8 if final_approach else 1.8,
@@ -5555,7 +5561,7 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply RPP waypoint speed profile")
         elif use_ilqr:
             params = {
-                "ILQR.desired_linear_vel": 0.14 if final_approach else speed_profile.vx_mps,
+                "ILQR.desired_linear_vel": (0.08 if reapproach else 0.14) if final_approach else speed_profile.vx_mps,
                 "ILQR.max_angular_vel": 0.25 if final_approach else speed_profile.wz_rps,
             }
             self._boundary_base_velocity = {

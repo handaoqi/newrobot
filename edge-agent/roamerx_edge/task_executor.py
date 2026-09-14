@@ -286,6 +286,7 @@ class NavigationAdapter(Protocol):
         outdoor: bool | None = None,
         local_controller: str = "mppi",
         navigation_speed_level: str = "micro",
+        reapproach: bool = False,
     ) -> None: ...
     def set_global_controller(self, mode: str) -> None: ...
     def arrival_adjust_velocity(
@@ -2962,7 +2963,7 @@ class TaskExecutor:
                 return atan2(dy, dx)
         return self._pass_through_yaw(index, waypoint)
 
-    def _dispatch_navigation(self, index: int) -> None:
+    def _dispatch_navigation(self, index: int, *, reapproach: bool = False) -> None:
         if not self.context:
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "task context is missing")
         if not self._prepare_robot_for_navigation():
@@ -3011,9 +3012,11 @@ class TaskExecutor:
         self._apply_navigation_profile(
             index,
             force_final=(
-                initial_final_approach if not self._is_docking_task() else None
+                (initial_final_approach or reapproach)
+                if not self._is_docking_task() else None
             ),
             force_require_yaw=require_yaw_stop,
+            reapproach=reapproach,
         )
         self._set_navigation_arrival_tolerance(index)
         # The reached point owns both its departure correction and the
@@ -4581,7 +4584,7 @@ class TaskExecutor:
         # already-at-click guard. A coarse-arrived robot that merely needs
         # 0.20 m fine XY convergence must instead keep its heading and let the
         # single fine-tolerance Nav2 goal translate/replan as needed.
-        self._dispatch_navigation(reached_index)
+        self._dispatch_navigation(reached_index, reapproach=True)
         return True
 
     def _cancel_absolute_localization_resume_watch(self) -> None:
@@ -4970,7 +4973,13 @@ class TaskExecutor:
             "waypoint_index": waypoint_index,
         }
 
-    def resume_task(self, execution_id: str, resume_index: int) -> dict:
+    def resume_task(
+        self,
+        execution_id: str,
+        resume_index: int,
+        *,
+        _navigation_cancelled: bool = False,
+    ) -> dict:
         with self._lock:
             self._assert_execution(execution_id)
             if self.context.state == "running":
@@ -5069,6 +5078,19 @@ class TaskExecutor:
                         and not self._dwell_wait_finished
                     ),
                 }
+            # A paused task may still have a live FollowWaypoints goal (or a
+            # goal whose cancel acknowledgement is late). Never start the
+            # replacement heading/cruise leg until the old goal is confirmed
+            # cancelled, otherwise both controllers can move the robot.
+            if not _navigation_cancelled and not self._cancel_active_navigation(timeout_seconds=2.0):
+                self.navigation.stop_motion()
+                self.context.state = "paused"
+                self.context.state_version += 1
+                self._persist()
+                raise ProtocolError(
+                    "NAVIGATION_CANCEL_FAILED",
+                    "cannot resume until the previous Nav2 goal cancellation is confirmed",
+                )
             self._send_from(resume_index)
             # A pre-leg heading action returns before _dispatch_navigation(),
             # so that path used to leave the persisted Edge state at
@@ -5281,7 +5303,11 @@ class TaskExecutor:
             self.context.last_safe_hold_code = ""
             self.context.last_safe_hold_message = ""
             self._persist()
-            result = self.resume_task(execution_id, self.context.current_waypoint_index)
+            result = self.resume_task(
+                execution_id,
+                self.context.current_waypoint_index,
+                _navigation_cancelled=navigation_cancelled,
+            )
             result.update(
                 {
                     "recovery_action": "resume_pending_waypoint",
@@ -6737,6 +6763,7 @@ class TaskExecutor:
         *,
         force_final: bool | None = None,
         force_require_yaw: bool | None = None,
+        reapproach: bool = False,
     ) -> None:
         if not self.context:
             return
@@ -6838,6 +6865,7 @@ class TaskExecutor:
                 outdoor=outdoor_profile,
                 smoother_id=leg_profile.smoother_id,
                 navigation_speed_level=navigation_speed_level,
+                reapproach=reapproach,
             )
         else:
             safety_setter = getattr(self.navigation, "set_safety_profile", None)
@@ -6865,6 +6893,7 @@ class TaskExecutor:
                     "outdoor": outdoor_profile,
                     "local_controller": local_controller,
                     "navigation_speed_level": navigation_speed_level,
+                    "reapproach": reapproach,
                 }
                 try:
                     setter(**profile_kwargs)
@@ -6872,6 +6901,7 @@ class TaskExecutor:
                     # Older simulation/test adapters retain the pre-tier
                     # signature. Production RosAdapter always receives it.
                     profile_kwargs.pop("navigation_speed_level", None)
+                    profile_kwargs.pop("reapproach", None)
                     setter(**profile_kwargs)
             smoother_setter = getattr(self.navigation, "set_smoother", None)
             if callable(smoother_setter):
