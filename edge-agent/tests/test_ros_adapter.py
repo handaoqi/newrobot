@@ -606,7 +606,7 @@ def test_quick_then_global_failure_keeps_each_rejected_ndt_measurement():
     assert progress[-1]["state"] == "failed"
 
 
-def test_quick_then_global_keeps_failed_rtk_verification_details_during_fallback():
+def test_quick_then_global_skips_rtk_and_falls_back_from_ndt_to_global():
     adapter = object.__new__(RosAdapter)
     adapter.safety_config = SimpleNamespace(
         localization_quick_search_seconds=30.0,
@@ -614,18 +614,8 @@ def test_quick_then_global_keeps_failed_rtk_verification_details_during_fallback
     )
     adapter._start_localization_operation = lambda *_args, **_kwargs: 7
     adapter._assert_localization_operation = lambda _generation: None
-    verification = {
-        "status": "rejected",
-        "verified": False,
-        "conclusion_code": "fixed_quality",
-        "last_sample": {"quality": "float", "usable": True},
-    }
     adapter._set_initial_pose_from_rtk_once = lambda *_args: (_ for _ in ()).throw(
-        ProtocolError(
-            "RTK_FIXED_NOT_STABLE",
-            "RTK was not fixed",
-            details={"rtk_verification": verification},
-        )
+        AssertionError("RTK must not run before the NDT/global initialization pipeline")
     )
     adapter.latest_trusted_pose = lambda: None
     adapter._current_live_pose = lambda: None
@@ -643,12 +633,12 @@ def test_quick_then_global_keeps_failed_rtk_verification_details_during_fallback
         wait_seconds=60.0,
     )
 
-    assert result["stages"][0]["error_code"] == "RTK_FIXED_NOT_STABLE"
-    assert result["stages"][0]["rtk_verification"] == verification
+    assert result["stages"][0]["stage"] == "quick_initialization"
+    assert result["stages"][1]["stage"] == "keyframe_global_match"
     fallback_progress = next(
         payload for payload in progress if payload.get("selected_stage") == "keyframe_global_match"
     )
-    assert fallback_progress["rtk_verification"] == verification
+    assert "rtk_verification" not in fallback_progress
 
 
 def test_fixed_rtk_verification_uses_rtk_self_span_not_lio_drift():

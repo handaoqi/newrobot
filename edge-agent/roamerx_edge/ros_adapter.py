@@ -2890,6 +2890,13 @@ class RosAdapter(Node):
                     "localization_decision": handoff_decision,
                 },
             )
+        handoff_decision = self._localization_decision()
+        handoff = {
+            **self._lio_handoff_diagnostics(handoff_decision, accepted=True),
+            "status": "completed",
+            "conclusion_code": "lio_imu_handoff_verified",
+            "conclusion": "fresh FAST-LIO + IMU handoff verified",
+        }
         return {
             "frame_id": frame_id,
             "x": x,
@@ -2906,6 +2913,9 @@ class RosAdapter(Node):
                 "yaw": latest.yaw,
                 "source_status": latest.source_status,
             },
+            "handoff": handoff,
+            "continuous_source": "lio_imu",
+            "map_lio_anchor_generation": handoff.get("anchor_generation"),
         }
 
     def set_initial_pose_from_rtk(self, wait_seconds: float = 30.0) -> dict:
@@ -5068,6 +5078,9 @@ class RosAdapter(Node):
             "best_ndt_committed": True,
             "localized_pose": result["localized_pose"],
             "localization_status": result["localization_status"],
+            "handoff": result.get("handoff"),
+            "continuous_source": result.get("continuous_source", "lio_imu"),
+            "map_lio_anchor_generation": result.get("map_lio_anchor_generation"),
             "motion_commanded": False,
             "best_candidate_commit_started_at": commit_started_at,
             "best_candidate_commit_finished_at": now_iso(),

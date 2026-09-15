@@ -106,6 +106,7 @@ const SHARED_CONTROL_ACTIONS = new Set([
   'move_forward', 'move_backward', 'move_left', 'move_right',
   'turn_left', 'turn_right', 'move_velocity', 'move_stop',
   'speed_micro', 'speed_slow', 'speed_normal', 'speed_fast',
+  'stand_up', 'lie_down', 'shake_hand', 'two_leg_stand',
 ])
 
 function showVideoNotice({ message, variant }) {
@@ -283,7 +284,8 @@ async function ensureManualAssist() {
 }
 
 async function releaseManualAssist(source = 'remote_control_manual_assist_release') {
-  if (!manualAssistActive.value || !selectedRobot.value?.id) return
+  if (!manualAssistActive.value || !selectedRobot.value?.id) return true
+  let released = false
   try {
     const command = await sendRobotCommand(selectedRobot.value.id, {
       action: 'takeover_exit',
@@ -294,12 +296,16 @@ async function releaseManualAssist(source = 'remote_control_manual_assist_releas
       },
     })
     await waitForRobotCommand(command, '退出人工辅助模式', 12000)
+    released = true
   } catch (error) {
     commandFeedback.value = error.message || '退出人工辅助模式失败'
   } finally {
-    manualAssistTaskId = ''
-    manualAssistActive.value = false
+    if (released) {
+      manualAssistTaskId = ''
+      manualAssistActive.value = false
+    }
   }
+  return released
 }
 
 async function waitForRobotCommand(command, label, timeoutMs = 12000) {
@@ -557,7 +563,9 @@ async function chooseRobot(robotId) {
   robotLoadController = new AbortController()
   const { signal } = robotLoadController
   try {
-    await releaseManualAssist('remote_control_robot_switch')
+    if (!await releaseManualAssist('remote_control_robot_switch')) {
+      throw new Error('人工辅助模式尚未退出，不能切换设备')
+    }
     await stopHoldAction()
     await stopFollowing('已切换设备')
     if (personDetectionEnabled.value && selectedRobot.value?.id) {

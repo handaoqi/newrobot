@@ -236,7 +236,7 @@ def test_localization_loss_ignored_while_outdoor_rtk_is_good(monkeypatch):
     assert application.task_executor.loss_notifications == 0
 
 
-def test_handoff_failed_keeps_self_heal_and_resumes_on_fixed_rtk_xy(monkeypatch):
+def test_handoff_failed_waits_for_lio_stability_without_direct_rtk_reseed(monkeypatch):
     """NDT commit + LIO handoff timeout must not abandon the paused task forever."""
     from roamerx_edge.protocol import ProtocolError
 
@@ -263,10 +263,11 @@ def test_handoff_failed_keeps_self_heal_and_resumes_on_fixed_rtk_xy(monkeypatch)
 
         def active_relocalize(self, seed):
             self.relocalize_calls += 1
-            # Pose is committed; outdoor RTK XY becomes fixed a moment later.
+            # Pose is committed; FAST-LIO completes its handoff just after the
+            # bounded relocalization call returns.
             self._decision = {
                 "active_source": "lio_imu",
-                "absolute_stable": False,
+                "absolute_stable": True,
                 "rtk_good_for_navigation": False,
                 "rtk_position_good_for_navigation": True,
                 "rtk_usable": True,
@@ -306,20 +307,25 @@ def test_handoff_failed_keeps_self_heal_and_resumes_on_fixed_rtk_xy(monkeypatch)
     assert application._localization_recovery_lock.acquire(blocking=False)
 
 
-def test_recovery_attempts_trusted_pose_before_waypoint_candidates(monkeypatch):
+def test_recovery_attempts_current_waypoint_before_trusted_pose(monkeypatch):
     application = object.__new__(EdgeAgentApplication)
     application.navigation = FakeNavigation()
     application.task_executor = SimpleNamespace(
-        context=SimpleNamespace(route_snapshot={"waypoints": [{"x": 9.308, "y": -0.489, "yaw": 0.0}]}),
+        context=SimpleNamespace(route_snapshot={"waypoints": [
+            {"x": 7.0, "y": -0.2, "yaw": 0.0},
+            {"x": 9.308, "y": -0.489, "yaw": 0.0},
+            {"x": 12.0, "y": 0.5, "yaw": 0.0},
+        ]}),
         current_localization_waypoint=lambda: {
             "x": 9.308,
             "y": -0.489,
             "yaw": 0.0,
-            "waypoint_index": 0,
+            "waypoint_index": 1,
             "round_number": 10,
         },
         is_paused_for_localization=lambda: True,
         has_active_task=lambda: True,
+        on_localization_recovered=lambda: None,
     )
     application.navigation_stack_adapter = SimpleNamespace(restarts=0)
     _wire_recovery_collaborators(application)
@@ -327,8 +333,9 @@ def test_recovery_attempts_trusted_pose_before_waypoint_candidates(monkeypatch):
 
     application._recover_task_localization()
 
-    assert application.navigation.seeds[0]["source"] == "last_trusted"
+    assert application.navigation.seeds[0]["source"] == "waypoint"
     assert application.navigation.seeds[0]["_automatic_recovery"] is True
+    assert application.navigation.seeds[1]["source"] == "last_trusted"
 
 
 def _wire_recovery_collaborators(application, *, max_cycles=0):
@@ -820,40 +827,3 @@ def test_recovery_seed_prefers_latest_pose_over_stale_trusted():
         "yaw": -0.5,
         "source": "latest_pose",
     }
-
-
-
-def test_wait_for_rtk_recovery_retries_until_fixed(monkeypatch):
-    application = object.__new__(EdgeAgentApplication)
-    application.config = SimpleNamespace(
-        safety=SimpleNamespace(localization_rtk_float_retry_seconds=2.0),
-    )
-    navigation = RtkNavigation()
-    calls = {"count": 0}
-
-    def localization_decision():
-        calls["count"] += 1
-        if calls["count"] < 3:
-            return {
-                "rtk_usable": True,
-                "rtk_heading_usable": True,
-                "rtk_quality": "float",
-            }
-        return {
-            "active_source": "rtk_imu",
-            "rtk_good_for_navigation": True,
-            "rtk_usable": True,
-            "rtk_quality": "fixed",
-            "rtk_heading_usable": True,
-        }
-
-    navigation.localization_decision = localization_decision
-    application.navigation = navigation
-    application.task_executor = FakeTaskExecutor()
-    application.telemetry = SimpleNamespace(on_localization_recovery=lambda _state: None)
-    monkeypatch.setattr(app_module.time, "sleep", lambda _seconds: None)
-    clock = {"now": 1000.0}
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock.__setitem__("now", clock["now"] + 0.6) or clock["now"])
-
-    assert application._wait_for_rtk_recovery() is True
-    assert application.task_executor.recovered == 1

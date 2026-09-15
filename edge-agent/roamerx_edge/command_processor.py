@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -159,6 +160,7 @@ class CommandProcessor:
                 set_progress = getattr(
                     self.localization_adapter, "set_attempt_progress_callback", None
                 )
+                initialization_result = {}
                 try:
                     if callable(set_progress):
                         set_progress(
@@ -167,7 +169,9 @@ class CommandProcessor:
                             )
                         )
                     if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
-                        self.task_executor.initialize_before_navigation()
+                        initialization_result = dict(
+                            self.task_executor.initialize_before_navigation() or {}
+                        )
                 finally:
                     if callable(set_progress):
                         set_progress(None)
@@ -176,6 +180,7 @@ class CommandProcessor:
                     envelope,
                     started_at,
                     {
+                        **initialization_result,
                         "state": "running",
                         "selected_stage": "navigation_start",
                         "navigation_start": {
@@ -714,25 +719,66 @@ class CommandProcessor:
                     mode = str(command.get("localization_mode") or "ndt").strip().lower()
                     if mode not in {"ndt", "rtk", "ukf"}:
                         mode = "ndt"
-                    transaction_id = f"{envelope.message_type}:{getattr(envelope, 'command_id', '')}:secondary:{mode}"
+                    transaction_id = f"{envelope.message_type}:{envelope.message_id}:secondary:{mode}"
+                    secondary_started_at = now_iso()
                     secondary = correction(transaction_id, mode, "start") or {}
+                    secondary = {
+                        **secondary,
+                        "mode": mode,
+                        "transaction_id": transaction_id,
+                        "started_at": secondary_started_at,
+                    }
                     decision_reader = getattr(self.localization_adapter, "localization_decision", None)
-                    if secondary.get("accepted") and callable(decision_reader):
+                    if not secondary.get("accepted"):
+                        if mode == "ndt" and str(secondary.get("status") or "") == "unavailable":
+                            secondary.update({"status": "skipped", "finished_at": now_iso()})
+                        else:
+                            raise ProtocolError(
+                                "LOCALIZATION_SECONDARY_CORRECTION_REJECTED",
+                                str(secondary.get("message") or secondary.get("status") or "secondary correction rejected"),
+                                details={"secondary_correction": secondary},
+                            )
+                    elif callable(decision_reader):
                         deadline = time.monotonic() + 30.0
+                        terminal = False
                         while time.monotonic() < deadline:
                             decision = decision_reader()
                             one_shot = decision.get("one_shot_correction") if isinstance(decision, dict) else {}
                             if isinstance(one_shot, dict) and str(one_shot.get("transaction_id") or "") == transaction_id:
                                 status = str(one_shot.get("status") or "")
                                 if status in {"completed", "failed", "cancelled", "rejected"}:
-                                    secondary = {**secondary, **one_shot}
+                                    secondary = {**secondary, **one_shot, "finished_at": now_iso()}
+                                    terminal = True
                                     break
                             time.sleep(0.2)
-                    result_payload["secondary_correction"] = {
-                        **secondary,
-                        "mode": mode,
-                        "transaction_id": transaction_id,
-                    }
+                        if not terminal:
+                            try:
+                                correction(transaction_id, mode, "cancel")
+                            except Exception:
+                                LOGGER.exception(
+                                    "failed to cancel timed-out secondary correction %s",
+                                    transaction_id,
+                                )
+                            secondary.update({"status": "timed_out", "finished_at": now_iso()})
+                            raise ProtocolError(
+                                "LOCALIZATION_SECONDARY_CORRECTION_TIMEOUT",
+                                f"secondary {mode} correction timed out",
+                                details={"secondary_correction": secondary},
+                            )
+                        if str(secondary.get("status") or "") != "completed":
+                            raise ProtocolError(
+                                "LOCALIZATION_SECONDARY_CORRECTION_FAILED",
+                                str(secondary.get("reason") or f"secondary {mode} correction failed"),
+                                details={"secondary_correction": secondary},
+                            )
+                    else:
+                        secondary.update({"status": "unverifiable", "finished_at": now_iso()})
+                        raise ProtocolError(
+                            "LOCALIZATION_SECONDARY_CORRECTION_UNVERIFIABLE",
+                            "secondary correction was accepted but no decision reader is available",
+                            details={"secondary_correction": secondary},
+                        )
+                    result_payload["secondary_correction"] = secondary
                 # Every localization snapshot must identify its map.  The
                 # route planner uses this identity to reject terminal results
                 # from a previously selected map.

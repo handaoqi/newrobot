@@ -921,6 +921,91 @@ def test_active_relocalization_uses_map_scoped_trusted_pose(tmp_path):
     store.close()
 
 
+def test_relocalization_secondary_correction_uses_unique_message_id(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.relocalize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "map_id": "92", "map_version": "v1", "localization_mode": "ukf",
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+    store.save_last_trusted_pose("92", "v1", {"x": 8.0, "y": 9.0, "yaw": -0.4})
+    navigation = FakeNavigation()
+    transactions = []
+
+    def control(transaction_id, mode, command="start"):
+        transactions.append((transaction_id, mode, command))
+        return {"accepted": True, "transaction_id": transaction_id, "status": "waiting_source"}
+
+    navigation.control_localization_correction = control
+    navigation.localization_decision = lambda: {
+        "one_shot_correction": {
+            "transaction_id": transactions[0][0],
+            "status": "completed",
+            "selected_source": "ukf_fused",
+        },
+    }
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(
+            SafetyConfig(), RuntimeSafetyState(current_map_id="92", current_map_version="v1")
+        ),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert raw["message_id"] in transactions[0][0]
+    assert result["payload"]["result"]["secondary_correction"]["status"] == "completed"
+    assert result["payload"]["result"]["secondary_correction"]["selected_source"] == "ukf_fused"
+    store.close()
+
+
+def test_relocalization_rejects_unaccepted_secondary_correction(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.relocalize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "map_id": "92", "map_version": "v1", "localization_mode": "rtk",
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+    store.save_last_trusted_pose("92", "v1", {"x": 8.0, "y": 9.0, "yaw": -0.4})
+    navigation = FakeNavigation()
+    navigation.control_localization_correction = lambda *_args: {
+        "accepted": False,
+        "status": "rejected",
+        "message": "fixed RTK unavailable",
+    }
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(
+            SafetyConfig(), RuntimeSafetyState(current_map_id="92", current_map_version="v1")
+        ),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None,
+            start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "failed"
+    assert result["payload"]["error_code"] == "LOCALIZATION_SECONDARY_CORRECTION_REJECTED"
+    store.close()
+
+
 def test_trusted_pose_relocalization_preserves_operator_search_controls(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     store.save_last_trusted_pose("92", "v1", {"x": 8.0, "y": 9.0, "yaw": -0.4})

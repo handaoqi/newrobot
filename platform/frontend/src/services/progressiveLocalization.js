@@ -26,6 +26,9 @@ export function buildProgressiveLocalizationPayload({
   localizationMode = '',
 }) {
   const normalizedWaypoints = waypoints.map(normalizeWaypoint)
+  const waypointLocalizationMode = Array.isArray(waypoints[0])
+    ? ''
+    : String(waypoints[0]?.localization_mode || '')
   const waitSeconds = Math.min(
     900,
     Math.max(180, 60 + (normalizedWaypoints.length + 1) * 8),
@@ -39,7 +42,7 @@ export function buildProgressiveLocalizationPayload({
     // The waypoint mode is a secondary-correction policy only.  Keeping it
     // on the command lets Edge apply the same policy after the NDT anchor is
     // committed, without allowing the UI to reorder initialization sources.
-    localization_mode: String(localizationMode || '').trim().toLowerCase(),
+    localization_mode: String(localizationMode || waypointLocalizationMode).trim().toLowerCase(),
     waypoints: normalizedWaypoints,
     wait_seconds: waitSeconds,
   }
@@ -47,60 +50,6 @@ export function buildProgressiveLocalizationPayload({
 
 export function progressiveLocalizationTimeoutMs(payload) {
   return (Number(payload?.wait_seconds || 180) + 240) * 1000
-}
-
-const OUTDOOR_SCENES = new Set(['outdoor', 'transition'])
-const RTK_FALLBACK_CODES = new Set([
-  // A fixed-quality flag is not enough to seed the map: Edge also requires
-  // three fresh position-and-heading samples inside its self-stability gate.
-  // A timeout there is a normal localization fallback, not an operator error.
-  'RTK_FIXED_NOT_STABLE',
-  'RTK_INITIAL_POSE_UNAVAILABLE',
-  'RTK_INITIAL_POSE_TIMEOUT',
-  'RTK_POSE_UNAVAILABLE',
-  'RTK_INITIAL_POSE_NOT_CONVERGED',
-])
-
-export function shouldInitializeFromRtk({ sceneScope, coordinateMode } = {}) {
-  const scene = String(sceneScope || '').trim().toLowerCase()
-  const coordinates = String(coordinateMode || '').trim().toLowerCase()
-  // Only a map explicitly built with a fixed RTK origin may start the RTK
-  // initialization transaction.  Unknown metadata must fail closed to the
-  // NDT progressive path, and indoor maps always skip this stage.
-  return OUTDOOR_SCENES.has(scene) && coordinates === 'rtk_fixed'
-}
-
-function localizationDecision(navigationStatus) {
-  const status = navigationStatus?.status || {}
-  const quality = status.localization_quality || {}
-  const decision = quality.decision || status.localization?.decision || {}
-  return decision && typeof decision === 'object' ? decision : {}
-}
-
-/**
- * A map configured for RTK does not imply that the live receiver has a
- * usable fixed solution.  Only start the RTK command when the latest Edge
- * decision says that position *and* heading passed its navigation gate.
- * Unknown/stale status is distinct from an explicit non-fixed result so Edge
- * can verify fresh RTK samples instead of skipping the authoritative source.
- */
-export function rtkFixedForInitialization(navigationStatus) {
-  const decision = localizationDecision(navigationStatus)
-  if (decision.rtk_good_for_navigation === true) return true
-  return decision.rtk_usable === true
-    && String(decision.rtk_quality || '').trim().toLowerCase() === 'fixed'
-    && decision.rtk_heading_usable === true
-}
-
-export function rtkInitializationSnapshotState(navigationStatus) {
-  const decision = localizationDecision(navigationStatus)
-  if (rtkFixedForInitialization(navigationStatus)) return 'fixed'
-  const quality = String(decision.rtk_quality || '').trim().toLowerCase()
-  const hasExplicitEvidence = quality.length > 0
-    || typeof decision.rtk_usable === 'boolean'
-    || typeof decision.rtk_heading_usable === 'boolean'
-    || typeof decision.rtk_good_for_navigation === 'boolean'
-  return hasExplicitEvidence ? 'not_fixed' : 'unknown'
 }
 
 /**
@@ -118,16 +67,6 @@ export function localizationCommandVerified(command) {
   const attempts = result.localization_attempts
   if (attempts?.state === 'handoff_failed') return false
   return true
-}
-
-function commandErrorCode(error) {
-  return String(
-    error?.command?.error_code
-    || error?.command?.ack_reason_code
-    || error?.error_code
-    || error?.code
-    || '',
-  ).trim()
 }
 
 export async function initializeProgressiveLocalization({

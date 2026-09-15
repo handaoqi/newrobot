@@ -72,7 +72,7 @@ const RTK_VERIFICATION_REASON_LABELS = {
 const TIMELINE_STAGE_META = {
   map_transfer: { title: '地图下发', detail: '确认目标地图已传输并应用到机器狗' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
-  rtk_fixed: { title: 'RTK 固定解验证与定点 NDT', detail: '验证固定解后，在 RTK 定位点执行一次 NDT 交叉验证并提交锚点' },
+  rtk_fixed: { title: 'RTK 二次校正验证', detail: '最优 NDT 已提交并由 FAST-LIO + IMU 接管后，再验证固定解并更新锚点' },
   fast_lio_imu_handoff: { title: 'FAST-LIO + IMU 主定位接管', detail: '确认新鲜 FAST-LIO + IMU 帧、锚点代数和连续主定位源' },
   secondary_correction: { title: '二次定位校正', detail: 'NDT 最优提交后按场景和航点策略执行 RTK、UKF 或 NDT 校正' },
   rtk_correction: { title: 'RTK 二次校正', detail: '仅合格固定解可作为绝对校正源；非 fixed 不阻塞任务' },
@@ -98,15 +98,16 @@ const TIMELINE_STAGE_ALIASES = {
 const TIMELINE_STAGE_ORDER = [
   'map_transfer',
   'localization_bootstrap',
-  'rtk_fixed',
   'last_trusted',
   'mapping_origin_bounded',
   'route_waypoints',
   'keyframe_global_match',
   'quick_initialization',
+  'operator_initial_pose',
   'best_candidate_commit',
   'fast_lio_imu_handoff',
   'secondary_correction',
+  'rtk_fixed',
   'rtk_correction',
   'ukf_correction',
   'ndt_secondary_correction',
@@ -810,7 +811,6 @@ export function localizationAttemptTimeline(session) {
 
 function mergeTimelineHistory(session, currentTimeline) {
   const history = Array.isArray(session?.timelineHistory) ? session.timelineHistory : []
-  if (!history.length) return currentTimeline
   const merged = history.map(step => ({ ...step }))
   currentTimeline.forEach(step => {
     const index = merged.findIndex(item => item.key === step.key)

@@ -6,9 +6,6 @@ import {
   initializeProgressiveLocalization,
   localizationCommandVerified,
   progressiveLocalizationTimeoutMs,
-  rtkFixedForInitialization,
-  rtkInitializationSnapshotState,
-  shouldInitializeFromRtk,
 } from '../src/services/progressiveLocalization.js'
 
 test('initialization sends mapping-origin and route-waypoint candidates for progressive search', () => {
@@ -27,6 +24,7 @@ test('initialization sends mapping-origin and route-waypoint candidates for prog
     map_version: 'v7',
     scene_scope: 'indoor',
     coordinate_mode: 'local_only',
+    localization_mode: '',
     waypoints: [
       { x: 1, y: 2, yaw: 0.1 },
       { x: 3, y: 4, yaw: -0.2 },
@@ -41,10 +39,11 @@ test('active relocalization payload keeps the manually selected pose as a candid
   const payload = buildProgressiveLocalizationPayload({
     mapId: 7,
     mapVersion: 'v7',
-    waypoints: [manualPose, { x: 9, y: 10, yaw: -0.2 }],
+    waypoints: [{ ...manualPose, localization_mode: 'ukf' }, { x: 9, y: 10, yaw: -0.2 }],
   })
 
   assert.equal(payload.seed_source, 'progressive')
+  assert.equal(payload.localization_mode, 'ukf')
   assert.deepEqual(payload.waypoints[0], manualPose)
   assert.deepEqual(payload.waypoints[1], { x: 9, y: 10, yaw: -0.2 })
 })
@@ -98,7 +97,7 @@ test('guard duty and route planner share one activation and localization orchest
   assert.ok(progress.some(message => message.includes('原点/航点候选搜索')))
 })
 
-test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before progressive search', async () => {
+test('outdoor RTK-fixed maps still initialize NDT-first and retain RTK as secondary policy', async () => {
   const calls = []
   const result = await initializeProgressiveLocalization({
     mapId: 12,
@@ -106,6 +105,7 @@ test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before prog
     mapVersion: 'v12',
     sceneScope: 'outdoor',
     coordinateMode: 'rtk_fixed',
+    localizationMode: 'rtk',
     dependencies: {
       activateRouteMap: async () => ({
         navigationStatus: {
@@ -131,21 +131,24 @@ test('outdoor RTK-fixed maps initialize from fixed RTK and local NDT before prog
     },
   })
 
-  assert.deepEqual(calls[0].slice(0, 3), ['send', 3, 'initial-pose'])
+  assert.deepEqual(calls[0].slice(0, 3), ['send', 3, 'relocalize'])
   assert.deepEqual(calls[0][3], {
-    seed_source: 'rtk',
+    seed_source: 'progressive',
     map_id: 12,
     map_version: 'v12',
-    wait_seconds: 30,
-    start_navigation: true,
+    scene_scope: 'outdoor',
+    coordinate_mode: 'rtk_fixed',
+    localization_mode: 'rtk',
+    waypoints: [],
+    wait_seconds: 180,
   })
-  assert.deepEqual(calls[1], ['wait', 3, 'rtk-command', 90_000])
+  assert.deepEqual(calls[1], ['wait', 3, 'rtk-command', 420_000])
   assert.equal(calls.length, 2)
-  assert.equal(result.selectedSource, 'rtk_fixed')
-  assert.equal(result.rtkAttempted, true)
+  assert.equal(result.selectedSource, 'progressive')
+  assert.equal(result.rtkAttempted, false)
 })
 
-test('outdoor RTK failure falls back to quick search with global fallback', async () => {
+test('outdoor fixed RTK telemetry cannot bypass the progressive NDT command', async () => {
   const calls = []
   const progress = []
   const result = await initializeProgressiveLocalization({
@@ -174,27 +177,19 @@ test('outdoor RTK failure falls back to quick search with global fallback', asyn
         calls.push(['send', action, payload])
         return { id: `${action}-${calls.length}`, status: 'created' }
       },
-      waitForRobotCommand: async (_robotId, command) => {
-        if (command.id.startsWith('initial-pose')) {
-          const error = new Error('RTK unavailable')
-          error.command = { error_code: 'RTK_FIXED_NOT_STABLE' }
-          throw error
-        }
-        return { ...command, status: 'succeeded' }
-      },
+      waitForRobotCommand: async (_robotId, command) => ({ ...command, status: 'succeeded' }),
     },
   })
 
-  assert.deepEqual(calls.map(call => call[1]), ['initial-pose', 'relocalize'])
-  assert.equal(calls[1][2].seed_source, 'progressive')
-  assert.equal(calls[1][2].waypoints[0].x, 4)
+  assert.deepEqual(calls.map(call => call[1]), ['relocalize'])
+  assert.equal(calls[0][2].seed_source, 'progressive')
+  assert.equal(calls[0][2].waypoints[0].x, 4)
   assert.equal(result.selectedSource, 'progressive')
-  assert.equal(result.rtkAttempt.errorCode, 'RTK_FIXED_NOT_STABLE')
-  assert.ok(progress.some(message => message.includes('转入渐进定位')))
-  assert.ok(progress.some(message => message.includes('全局搜索')))
+  assert.equal(result.rtkAttempt, null)
+  assert.ok(progress.some(message => message.includes('先搜索建图原点及附近候选')))
 })
 
-test('FAST-LIO handoff failure remains terminal instead of starting NDT fallback', async () => {
+test('progressive FAST-LIO handoff failure remains terminal without direct RTK fallback', async () => {
   const actions = []
   await assert.rejects(
     initializeProgressiveLocalization({
@@ -230,7 +225,7 @@ test('FAST-LIO handoff failure remains terminal instead of starting NDT fallback
     }),
     /FAST-LIO handoff failed/,
   )
-  assert.deepEqual(actions, ['initial-pose'])
+  assert.deepEqual(actions, ['relocalize'])
 })
 
 test('outdoor non-fixed RTK skips the manual RTK command and starts progressive search', async () => {
@@ -269,11 +264,11 @@ test('outdoor non-fixed RTK skips the manual RTK command and starts progressive 
   assert.deepEqual(calls.map(call => call[0]), ['relocalize'])
   assert.equal(calls[0][1].seed_source, 'progressive')
   assert.equal(result.rtkAttempted, false)
-  assert.equal(result.rtkAttempt.errorCode, 'RTK_NOT_FIXED')
-  assert.ok(progress.some(message => message.includes('跳过RTK初始位姿')))
+  assert.equal(result.rtkAttempt, null)
+  assert.ok(progress.some(message => message.includes('最优 NDT')))
 })
 
-test('outdoor map with an empty status snapshot lets Edge verify live RTK first', async () => {
+test('outdoor map with an empty status snapshot still starts NDT-first localization', async () => {
   const calls = []
   const result = await initializeProgressiveLocalization({
     mapId: 12,
@@ -291,29 +286,9 @@ test('outdoor map with an empty status snapshot lets Edge verify live RTK first'
     },
   })
 
-  assert.deepEqual(calls.map(call => call[0]), ['initial-pose'])
-  assert.equal(calls[0][1].seed_source, 'rtk')
-  assert.equal(result.selectedSource, 'rtk_fixed')
-})
-
-test('RTK initialization needs fixed position and heading evidence from Edge', () => {
-  assert.equal(rtkFixedForInitialization({
-    status: { localization_quality: { decision: {
-      rtk_usable: true, rtk_quality: 'fixed', rtk_heading_usable: true,
-    } } },
-  }), true)
-  assert.equal(rtkFixedForInitialization({
-    status: { localization_quality: { decision: {
-      rtk_usable: true, rtk_quality: 'float', rtk_heading_usable: true,
-    } } },
-  }), false)
-  assert.equal(rtkFixedForInitialization({ status: {} }), false)
-  assert.equal(rtkInitializationSnapshotState({ status: {} }), 'unknown')
-  assert.equal(rtkInitializationSnapshotState({
-    status: { localization_quality: { decision: {
-      rtk_usable: true, rtk_quality: 'float', rtk_heading_usable: false,
-    } } },
-  }), 'not_fixed')
+  assert.deepEqual(calls.map(call => call[0]), ['relocalize'])
+  assert.equal(calls[0][1].seed_source, 'progressive')
+  assert.equal(result.selectedSource, 'progressive')
 })
 
 test('a successful Edge localization result is authoritative even before telemetry replication', () => {
@@ -328,14 +303,7 @@ test('a successful Edge localization result is authoritative even before telemet
   assert.equal(localizationCommandVerified({ status: 'running', result_payload: {} }), false)
 })
 
-test('local-only maps never attempt RTK even when scene metadata is inconsistent', () => {
-  assert.equal(shouldInitializeFromRtk({ sceneScope: 'outdoor', coordinateMode: 'local_only' }), false)
-  assert.equal(shouldInitializeFromRtk({ sceneScope: 'outdoor', coordinateMode: 'rtk_fixed' }), true)
-  assert.equal(shouldInitializeFromRtk({ sceneScope: 'indoor', coordinateMode: 'rtk_fixed' }), false)
-  assert.equal(shouldInitializeFromRtk({ sceneScope: 'transition', coordinateMode: 'unknown' }), false)
-})
-
-test('operator conflicts do not silently fall back from outdoor RTK initialization', async () => {
+test('operator conflicts terminate the single NDT-first initialization command', async () => {
   const actions = []
   await assert.rejects(
     initializeProgressiveLocalization({
@@ -371,5 +339,5 @@ test('operator conflicts do not silently fall back from outdoor RTK initializati
     }),
     /superseded/,
   )
-  assert.deepEqual(actions, ['initial-pose'])
+  assert.deepEqual(actions, ['relocalize'])
 })

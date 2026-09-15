@@ -101,18 +101,6 @@ ARRIVAL_CONFIRMATION_INTERVAL_SECONDS = 0.01
 PRECISION_ARRIVAL_YAW_TOLERANCE_RAD = 0.25
 # Match localization lio_primary.drift_xy_m default; above this, wait for correction.
 WAYPOINT_CORRECTION_DRIFT_M = 0.30
-# A fixed-quality status alone is insufficient for the RTK initial-pose
-# transaction.  These failures mean there is no safe RTK seed for this start;
-# the deterministic map-origin -> route -> global NDT path must take over
-# instead of trying a saved or manually selected pose first.
-RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES = frozenset({
-    "RTK_FIXED_NOT_STABLE",
-    "RTK_INITIAL_POSE_UNAVAILABLE",
-    "RTK_INITIAL_POSE_TIMEOUT",
-    "RTK_POSE_UNAVAILABLE",
-    "RTK_INITIAL_POSE_NOT_CONVERGED",
-    "RTK_HEADING_CONFLICTS_WITH_LIDAR",
-})
 # Outdoor reverse/start checks keep a looser LIO envelope while RTK performs
 # the authoritative click check. Arrival verdicts use configured tolerances.
 ARRIVAL_ACCEPT_LIO_M = 1.0
@@ -2059,36 +2047,60 @@ class TaskExecutor:
             return False
         return True
 
-    def initialize_before_navigation(self) -> None:
-        self._initialize_before_navigation()
+    def initialize_before_navigation(self) -> dict:
+        result = self._initialize_before_navigation()
         if getattr(self, "_startup_localization_reused_stable", False):
             LOGGER.info(
                 "startup localization reused stable FAST-LIO+IMU pose; skipping fresh handoff acceptance"
             )
-            return
+            return dict(result or {})
         accept_trusted = getattr(self.navigation, "accept_startup_trusted_pose", None)
         if callable(accept_trusted):
             accept_trusted()
+        result = dict(result or {})
+        initial_ndt_commit = result.get("initial_ndt_commit")
+        initial_ndt_commit = initial_ndt_commit if isinstance(initial_ndt_commit, dict) else {}
+        handoff = initial_ndt_commit.get("handoff")
+        handoff = handoff if isinstance(handoff, dict) else {
+            "status": "completed",
+            "continuous_source": "lio_imu",
+        }
+        return {
+            **result,
+            "continuous_source": "lio_imu",
+            "map_lio_anchor_generation": initial_ndt_commit.get(
+                "map_lio_anchor_generation", handoff.get("anchor_generation")
+            ),
+            "fast_lio_imu_handoff": handoff,
+        }
 
-    def _apply_startup_secondary_correction(self, mode: str) -> None:
+    def _apply_startup_secondary_correction(self, mode: str) -> dict:
         """Apply the first-waypoint RTK/UKF/NDT correction after NDT commit."""
         requester = getattr(self.navigation, "control_localization_correction", None)
         if not callable(requester):
-            return
+            return {"status": "skipped", "reason": "interface_unavailable"}
         normalized = waypoint_localization_mode(mode)
         transaction_id = (
             f"{self.context.task_execution_id}:startup:secondary:{normalized}"
             if self.context else f"startup:secondary:{normalized}"
         )
+        started_at = now_iso()
         result = requester(transaction_id, normalized, "start") or {}
+        result = {
+            **result,
+            "mode": normalized,
+            "transaction_id": transaction_id,
+            "started_at": started_at,
+        }
         if not bool(result.get("accepted")):
             # Compatibility adapters without a live correction service report
             # unavailable; the committed NDT pose remains usable in NDT mode.
             if normalized == "ndt" and str(result.get("status") or "") == "unavailable":
-                return
+                return {**result, "status": "skipped", "finished_at": now_iso()}
             raise ProtocolError(
                 "INITIALIZATION_CORRECTION_REJECTED",
                 str(result.get("message") or result.get("status") or "secondary correction rejected"),
+                details={"secondary_correction": result},
             )
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
@@ -2097,19 +2109,35 @@ class TaskExecutor:
             if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
                 status = str(transaction.get("status") or "")
                 if status == "completed":
-                    return
+                    return {**result, **transaction, "finished_at": now_iso()}
                 if status in {"failed", "cancelled", "rejected"}:
                     raise ProtocolError(
                         "INITIALIZATION_CORRECTION_FAILED",
                         str(transaction.get("reason") or f"secondary {normalized} correction failed"),
+                        details={
+                            "secondary_correction": {
+                                **result,
+                                **transaction,
+                                "finished_at": now_iso(),
+                            },
+                        },
                     )
             time.sleep(0.2)
+        try:
+            requester(transaction_id, normalized, "cancel")
+        except Exception:
+            LOGGER.exception(
+                "failed to cancel timed-out startup secondary correction %s",
+                transaction_id,
+            )
+        timed_out = {**result, "status": "timed_out", "finished_at": now_iso()}
         raise ProtocolError(
             "INITIALIZATION_CORRECTION_TIMEOUT",
             f"secondary {normalized} correction timed out",
+            details={"secondary_correction": timed_out},
         )
 
-    def _progressive_startup_relocalize(self, points: list[dict]) -> None:
+    def _progressive_startup_relocalize(self, points: list[dict]) -> dict:
         """Run the cold-start search in its fixed, map-scoped order.
 
         Outdoor routes cannot safely treat a float/unavailable RTK position as
@@ -2157,9 +2185,11 @@ class TaskExecutor:
             "startup localization running progressive search: mapping origin, %d route waypoint(s), global fallback",
             len(waypoints),
         )
-        relocalize(origin=origin, waypoints=waypoints, wait_seconds=180.0)
+        return dict(
+            relocalize(origin=origin, waypoints=waypoints, wait_seconds=180.0) or {}
+        )
 
-    def _initialize_before_navigation(self) -> None:
+    def _initialize_before_navigation(self) -> dict:
         """Require a verified absolute pose before the first Nav2 goal."""
         self._startup_localization_reused_stable = False
         if not self.context or self.context.state != "accepted":
@@ -2175,16 +2205,28 @@ class TaskExecutor:
                 decision.get("active_source"),
                 self._reported_localization_status() or "unspecified",
             )
-            return
-        self._progressive_startup_relocalize(points)
+            return {
+                "initial_ndt_commit": {"status": "reused", "reason": "stable_same_map_pose"},
+                "secondary_correction": {"status": "skipped", "reason": "stable_pose_reused"},
+                "continuous_source": "lio_imu",
+            }
+        initial_ndt_commit = self._progressive_startup_relocalize(points)
         first_index = min(
             max(0, self.context.current_waypoint_index),
             max(0, len(points) - 1),
         )
         first_waypoint = points[first_index] if points else {}
-        self._apply_startup_secondary_correction(
+        secondary_correction = self._apply_startup_secondary_correction(
             waypoint_localization_mode(first_waypoint.get("localization_mode"))
         )
+        return {
+            "initial_ndt_commit": initial_ndt_commit,
+            "secondary_correction": secondary_correction,
+            "continuous_source": "lio_imu",
+            "localization_mode": waypoint_localization_mode(
+                first_waypoint.get("localization_mode")
+            ),
+        }
 
     def start_task(self, envelope: MessageEnvelope) -> None:
         """Compatibility entry point used by tests and direct callers."""

@@ -202,6 +202,8 @@ test('localization timeline exposes ordered stages and every candidate result', 
     'route_waypoints',
     'keyframe_global_match',
     'best_candidate_commit',
+    'fast_lio_imu_handoff',
+    'secondary_correction',
     'navigation_start',
   ])
   assert.equal(timeline[0].status, 'done')
@@ -236,15 +238,17 @@ test('timeline preserves the RTK phase when it falls back to progressive localiz
   assert.deepEqual(timeline.map(step => step.key), [
     'map_transfer',
     'localization_bootstrap',
-    'rtk_fixed',
     'mapping_origin_bounded',
     'route_waypoints',
     'keyframe_global_match',
     'best_candidate_commit',
+    'fast_lio_imu_handoff',
+    'secondary_correction',
+    'rtk_fixed',
     'navigation_start',
   ])
-  assert.equal(timeline[2].status, 'failed')
-  assert.equal(timeline[3].status, 'active')
+  assert.equal(timeline[8].status, 'failed')
+  assert.equal(timeline[2].status, 'active')
 })
 
 test('timeline keeps stage times and groups mapping-origin attempts under the origin step', () => {
@@ -460,6 +464,8 @@ test('manual initial-pose command does not display unrelated global-search stage
     'localization_bootstrap',
     'operator_initial_pose',
     'best_candidate_commit',
+    'fast_lio_imu_handoff',
+    'secondary_correction',
   ])
   assert.equal(timeline[2].status, 'done')
 })
@@ -684,6 +690,8 @@ test('RTK fixed commit stays in its stage and exposes candidate number, NDT metr
   assert.deepEqual(localizationAttemptTimeline(session).map(step => step.key), [
     'map_transfer',
     'localization_bootstrap',
+    'fast_lio_imu_handoff',
+    'secondary_correction',
     'rtk_fixed',
   ])
 })

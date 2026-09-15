@@ -1670,16 +1670,6 @@ class EdgeAgentApplication:
     def _trusted_seed_max_drift_m(self) -> float:
         return float(getattr(self.config.safety, "localization_trusted_seed_max_drift_m", 15.0))
 
-    def _rtk_usable_for_recovery(self) -> bool:
-        getter = getattr(self.navigation, "localization_decision", None)
-        decision = getter() if callable(getter) else {}
-        if not isinstance(decision, dict):
-            return False
-        return (
-            decision.get("rtk_usable") is True
-            and decision.get("rtk_heading_usable") is True
-        )
-
     def _localization_recovery_seed(self) -> dict | None:
         latest_getter = getattr(self.navigation, "latest_pose", None)
         latest = latest_getter() if callable(latest_getter) else None
@@ -1708,61 +1698,14 @@ class EdgeAgentApplication:
             )
         return seed
 
-    def _attempt_rtk_recovery(self, *, force_reseed: bool = False) -> bool:
-        if self._rtk_pose_is_driving() and not force_reseed:
-            LOGGER.info("automatic recovery left the GPS pose in place; resuming the task")
-            self._handle_task_localization_recovered()
-            return True
-        if force_reseed and self._rtk_good_for_navigation():
-            if self._recover_with_fixed_rtk():
-                self._handle_task_localization_recovered()
-                return True
-            return False
-        # LIO-primary outdoor mode: fixed RTK XY is already correcting the pose.
-        # Do not force a dual-antenna reseeding cycle when heading is flickering.
-        if self._rtk_position_good_for_navigation() and not force_reseed:
-            getter = getattr(self.navigation, "localization_decision", None)
-            decision = getter() if callable(getter) else {}
-            source = str((decision or {}).get("active_source") or "")
-            if source in {"lio_imu", "rtk_imu"}:
-                LOGGER.info(
-                    "automatic recovery left the outdoor LIO/RTK pose in place; resuming the task"
-                )
-                self._handle_task_localization_recovered()
-                return True
-        if self._recover_with_fixed_rtk():
-            self._handle_task_localization_recovered()
-            return True
-        return False
-
-    def _wait_for_rtk_recovery(self) -> bool:
-        if not self._rtk_usable_for_recovery() or self._rtk_good_for_navigation():
-            return False
-        retry_seconds = float(
-            getattr(self.config.safety, "localization_rtk_float_retry_seconds", 5.0)
-        )
-        deadline = time.monotonic() + max(0.0, retry_seconds)
-        LOGGER.warning(
-            "RTK is usable but not fixed; waiting up to %.1fs before NDT relocalization",
-            retry_seconds,
-        )
-        while time.monotonic() < deadline:
-            if self._rtk_good_for_navigation():
-                try:
-                    return self._attempt_rtk_recovery()
-                except Exception as exc:
-                    LOGGER.warning("RTK recovery after float flicker failed: %s", exc)
-                    return False
-            time.sleep(0.5)
-        return False
-
     def _wait_for_post_handoff_resume(self, timeout_seconds: float | None = None) -> bool:
-        """Resume after an NDT commit when LIO/RTK becomes usable a few seconds later.
+        """Resume after an NDT commit once FAST-LIO reports a stable handoff.
 
         `RELOCALIZATION_HANDOFF_FAILED` means the best NDT pose was already written,
         but FAST-LIO did not report `absolute_stable` inside the handoff window.
-        Outdoor dogs often settle shortly afterward (or regain fixed RTK XY). Waiting
-        here keeps the existing pause/resume contract instead of abandoning self-heal.
+        The anchor can settle shortly after the bounded handoff window. RTK is
+        deliberately not used as a direct recovery source here; waypoint policy
+        may consume it only after the NDT/LIO handoff as a secondary correction.
         """
         if timeout_seconds is None:
             timeout_seconds = float(
@@ -1774,13 +1717,6 @@ class EdgeAgentApplication:
                 return False
             if not self.task_executor.is_paused_for_localization():
                 return True
-            if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
-                try:
-                    if self._attempt_rtk_recovery():
-                        return True
-                except Exception as exc:
-                    LOGGER.warning("post-handoff RTK recovery failed: %s", exc)
-                    return False
             getter = getattr(self.navigation, "localization_decision", None)
             decision = getter() if callable(getter) else {}
             if isinstance(decision, dict) and decision.get("absolute_stable") is True:
@@ -1923,25 +1859,6 @@ class EdgeAgentApplication:
             and str(decision.get("rtk_quality") or "").lower() == "fixed"
         )
 
-    def _rtk_pose_is_driving(self) -> bool:
-        getter = getattr(self.navigation, "localization_decision", None)
-        decision = getter() if callable(getter) else {}
-        if not isinstance(decision, dict):
-            return False
-        return (
-            str(decision.get("active_source") or "") == "rtk_imu"
-            and self._rtk_good_for_navigation()
-        )
-
-    def _recover_with_fixed_rtk(self) -> bool:
-        seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
-        if not callable(seed_rtk):
-            return False
-        self._hold_motion_for_relocalize()
-        seed_rtk()
-        LOGGER.info("automatic recovery accepted a fixed RTK pose")
-        return True
-
     def _cancel_task_localization_recovery(self) -> None:
         """Invalidate and interrupt every recovery started by the old task."""
         lock = getattr(self, "_localization_recovery_generation_lock", None)
@@ -1994,10 +1911,6 @@ class EdgeAgentApplication:
             if self._operator_localization_active():
                 LOGGER.info("automatic relocalization skipped while an operator request is active")
                 return
-            force_absolute_recovery = str(reason) in {
-                "lio_motion_anomaly",
-                "lio_absolute_disagreement",
-            }
             diagnosis = self._diagnose_self_healing(reason, level=0)
             level_zero_action = self._begin_self_heal_action(
                 level=0, action_type=diagnosis.action_type
@@ -2024,80 +1937,26 @@ class EdgeAgentApplication:
             cycle = 0
             started_at = time.time()
             first_cycle = True
-            # Keep the legacy RTK branch below as a final fallback only; it is
-            # deliberately disabled for the normal recovery cycle so RTK
-            # cannot bypass NDT commit and FAST-LIO handoff.
-            allow_direct_rtk_fallback = False
             while first_cycle or self.task_executor.is_paused_for_localization():
                 if self._localization_recovery_cancelled(recovery_generation):
                     LOGGER.info("localization recovery cancelled by task teardown")
                     return
                 first_cycle = False
                 cycle += 1
-                if allow_direct_rtk_fallback and (
-                    self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation()
-                ):
-                    try:
-                        if self._attempt_rtk_recovery(
-                            force_reseed=force_absolute_recovery
-                        ):
-                            return
-                    except Exception as exc:
-                        LOGGER.warning("fixed RTK recovery failed: %s", exc)
-                    if not self.task_executor.is_paused_for_localization():
-                        return
-                    if force_absolute_recovery:
-                        # A fixed XY observation without heading cannot reset
-                        # LIO safely. Continue with bounded NDT relocalization
-                        # instead of resuming the disagreed map pose.
-                        LOGGER.warning(
-                            "absolute LIO disagreement remains; fixed RTK is not "
-                            "eligible for a reseed, trying bounded relocalization"
-                        )
-                    else:
-                        elapsed = time.time() - started_at
-                        self._report_localization_recovery_state(reason, cycle, elapsed, max_cycles)
-                        if max_cycles and cycle >= max_cycles:
-                            LOGGER.error(
-                                "localization recovery gave up after %d cycles (%.0fs); escalating",
-                                cycle,
-                                elapsed,
-                            )
-                            self._emit_localization_alert(
-                                "localization_recovery_failed",
-                                "critical",
-                                "LOCALIZATION_RECOVERY_FAILED",
-                                "定位恢复失败，需人工介入",
-                                {
-                                    **self._localization_alert_attributes(reason),
-                                    "recovery_cycles": cycle,
-                                    "recovery_elapsed_seconds": round(elapsed, 1),
-                                },
-                            )
-                            self._complete_self_healing(
-                                success=False, reason="fixed_rtk_recovery_levels_exhausted"
-                            )
-                            safe_hold = getattr(self.task_executor, "enter_safe_hold", None)
-                            if callable(safe_hold):
-                                safe_hold(
-                                    "LOCALIZATION_RECOVERY_EXHAUSTED",
-                                    "定位自愈等级已耗尽，进入安全保持",
-                                )
-                            return
-                        LOGGER.warning(
-                            "fixed RTK XY is available; skipping open-sky NDT search and retrying GPS in %.1fs",
-                            cycle_retry,
-                        )
-                        time.sleep(cycle_retry)
-                        continue
-                if self._wait_for_rtk_recovery():
-                    return
                 primary_seed = self._localization_recovery_seed()
                 waypoint_seeds = self._localization_waypoint_seeds()
                 recovery_policy = self._current_recovery_localization_policy()
                 seeds = []
                 seen_seeds = set()
-                for seed in ([primary_seed] if primary_seed else []) + waypoint_seeds:
+                # The pending waypoint is the most relevant map hypothesis;
+                # trusted history is the next fallback, followed by adjacent
+                # and endpoint waypoint hypotheses.
+                ordered_seeds = (
+                    waypoint_seeds[:1]
+                    + ([primary_seed] if primary_seed else [])
+                    + waypoint_seeds[1:]
+                )
+                for seed in ordered_seeds:
                     key = (
                         round(float(seed["x"]), 3),
                         round(float(seed["y"]), 3),
@@ -2158,6 +2017,9 @@ class EdgeAgentApplication:
                                 reason="local_relocalization_accepted",
                             )
                             LOGGER.info("active relocalize accepted on cycle %d waypoint=%s", cycle, seed.get("waypoint_index"))
+                            self._handle_task_localization_recovered(
+                                recovery_reason="ndt_handoff_secondary_correction_completed"
+                            )
                             return
                         except Exception as exc:
                             self._finish_self_heal_action(
@@ -2180,28 +2042,6 @@ class EdgeAgentApplication:
                                     "best NDT pose committed but LIO handoff failed; "
                                     "continuing self-heal instead of giving up"
                                 )
-                                if (
-                                    self._rtk_usable_for_recovery()
-                                    or self._rtk_good_for_navigation()
-                                    or self._rtk_position_good_for_navigation()
-                                ):
-                                    LOGGER.warning(
-                                        "NDT/LIO handoff failed; switching to RTK recovery"
-                                    )
-                                    try:
-                                        if self._wait_for_rtk_recovery() or (
-                                            (
-                                                self._rtk_good_for_navigation()
-                                                or self._rtk_position_good_for_navigation()
-                                            )
-                                            and self._attempt_rtk_recovery()
-                                        ):
-                                            return
-                                    except Exception as rtk_exc:
-                                        LOGGER.warning(
-                                            "RTK recovery after NDT handoff failed: %s",
-                                            rtk_exc,
-                                        )
                                 if self._wait_for_post_handoff_resume():
                                     return
                                 break
@@ -2230,13 +2070,17 @@ class EdgeAgentApplication:
                                 search_action,
                                 success=search_succeeded,
                                 reason=(
-                                    "ndt_recovered_during_feature_search"
+                                    "laser_feature_found_retry_ndt_commit"
                                     if search_succeeded else "feature_search_exhausted"
                                 ),
                             )
                             if search_succeeded:
-                                self._handle_task_localization_recovered()
-                                return
+                                # Better geometry is only a new search
+                                # opportunity. It is not localization proof:
+                                # rerun the NDT commit/handoff transaction and
+                                # its waypoint secondary correction before the
+                                # task may resume.
+                                continue
                         global_relocalize = getattr(self.navigation, "global_relocalize", None)
                         if callable(global_relocalize):
                             if self._operator_localization_active():
@@ -2249,12 +2093,22 @@ class EdgeAgentApplication:
                                     level=3, action_type="global_relocalize"
                                 )
                                 global_relocalize(wait_seconds=90.0, automatic=True)
+                                recovery_policy = self._current_recovery_localization_policy()
+                                if not self._apply_recovery_secondary_correction(
+                                    recovery_policy, recovery_generation, cycle
+                                ):
+                                    raise RuntimeError(
+                                        f"secondary {recovery_policy['mode']} correction failed"
+                                    )
                                 self._finish_self_heal_action(
                                     global_action,
                                     success=True,
                                     reason="global_relocalization_accepted",
                                 )
                                 LOGGER.info("global relocalize accepted after waypoint seed failure")
+                                self._handle_task_localization_recovered(
+                                    recovery_reason="global_ndt_handoff_secondary_correction_completed"
+                                )
                                 return
                             except Exception as exc:
                                 self._finish_self_heal_action(

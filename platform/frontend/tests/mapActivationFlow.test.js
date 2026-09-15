@@ -80,6 +80,7 @@ test('saving a route prepares its map, localization and navigation stack', () =>
   assert.match(saveHandler, /beginLocalizationAttemptSession\(\{ phase: 'transfer', commandType: 'map\.activate' \}\)/)
   assert.match(saveHandler, /onCommand: event => applyLocalizationAttemptCommand\(event\.command, event\)/)
   assert.match(saveHandler, /sceneScope: selectedMap\.value\?\.scene_scope \|\| routeForm\.value\.scene_scope/)
+  assert.match(saveHandler, /localizationMode: payload\.waypoints\?\.\[0\]\?\.localization_mode \|\| 'ndt'/)
   assert.match(saveHandler, /地图、定位与导航栈均已就绪/)
 })
 
@@ -104,8 +105,10 @@ test('navigation test hints describe the implemented localization gates and fall
 
   assert.match(source, /目标地图已就绪时直接复用/)
   assert.match(source, /局部候选均无合格结果时才进入全图位置与航向匹配/)
-  assert.match(source, /连续 3 个新样本的 RTK 自身位置跨度不超过 0\.30 m/)
-  assert.match(source, /随后必须由新鲜 FAST-LIO \+ IMU 完成接管/)
+  assert.match(source, /所有场景先搜索建图原点及周边 NDT 候选/)
+  assert.match(source, /提交当前阶段最优结果并确认 FAST-LIO \+ IMU 接管/)
+  assert.match(source, /随后按首航点策略执行 RTK、UKF 或 NDT 二次校正/)
+  assert.match(source, /室内不读取 RTK/)
   assert.match(source, /原点阶段无合格候选才尝试手选点\/路线航点/)
   assert.match(source, /稳定 NDT 分数严格小于 0\.01 时提前结束/)
   assert.match(source, /最优 NDT 位姿已提交且分数严格小于 0\.01/)

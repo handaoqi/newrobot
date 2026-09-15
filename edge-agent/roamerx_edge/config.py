@@ -222,8 +222,8 @@ class WaypointSpeechConfig:
     timeout_seconds: float = 120.0
     poll_interval_seconds: float = 0.2
     enabled: bool = True
-    # When enabled=true and this is false, still never block/fail navigation.
-    block_navigation: bool = False
+    # Waypoint blocking/non_blocking flags are authoritative while speech is enabled.
+    block_navigation: bool = True
 
 
 @dataclass

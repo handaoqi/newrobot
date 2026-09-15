@@ -2135,7 +2135,7 @@ def test_outdoor_waypoint_arrival_waits_for_rtk_drift_correction(tmp_path):
     store.close()
 
 
-def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
+def test_startup_uses_ndt_before_fixed_rtk_secondary_correction(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.localization_state = {
@@ -2166,13 +2166,21 @@ def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
         assert nav.localization_state["lio_anchored"] is True
         assert nav.localization_state["absolute_stable"] is True
 
-    def active_relocalize(seed):
-        nav.relocalize_calls.append(dict(seed))
-        raise AssertionError("open-sky NDT must not run when RTK is good")
+    original_progressive = nav.progressive_relocalize
+
+    def progressive_relocalize(**kwargs):
+        result = original_progressive(**kwargs)
+        nav.localization_state.update({
+            "active_source": "lio_imu",
+            "lio_healthy": True,
+            "lio_anchored": True,
+            "absolute_stable": True,
+        })
+        return result
 
     nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
     nav.accept_startup_trusted_pose = accept_startup_trusted_pose
-    nav.active_relocalize = active_relocalize
+    nav.progressive_relocalize = progressive_relocalize
     executor = TaskExecutor(
         store,
         nav,
@@ -2187,9 +2195,9 @@ def test_startup_uses_fixed_rtk_instead_of_open_sky_ndt(tmp_path):
     envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
-    assert nav.rtk_calls == 1
+    assert nav.rtk_calls == 0
     assert nav.startup_handoff_calls == 1
-    assert nav.relocalize_calls == []
+    assert len(nav.progressive_relocalize_requests) == 1
     store.close()
 
 
@@ -2355,7 +2363,7 @@ def test_startup_reseeds_when_indoor_status_is_not_normal(tmp_path):
     )
     executor.prepare_task_start(command("task.start"))
     executor.initialize_before_navigation()
-    assert nav.relocalize_calls[0]["source"] == "startup_trusted"
+    assert len(nav.progressive_relocalize_requests) == 1
     store.close()
 
 
@@ -2424,7 +2432,7 @@ def test_outdoor_fixed_rtk_stability_failure_uses_mapping_origin_progressive_sea
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
 
-    assert nav.rtk_calls == 1
+    assert nav.rtk_calls == 0
     assert len(nav.progressive_relocalize_requests) == 1
     request = nav.progressive_relocalize_requests[0]
     assert request["origin"]["x"] == 8.0
@@ -2472,12 +2480,12 @@ def test_outdoor_rtk_heading_conflict_uses_mapping_origin_progressive_search(tmp
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
 
-    assert nav.rtk_calls == 1
+    assert nav.rtk_calls == 0
     assert len(nav.progressive_relocalize_requests) == 1
     store.close()
 
 
-def test_outdoor_lio_handoff_failure_does_not_fall_back_to_ndt_search(tmp_path):
+def test_outdoor_ndt_handoff_failure_keeps_task_stopped(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.localization_state = {
@@ -2488,13 +2496,18 @@ def test_outdoor_lio_handoff_failure_does_not_fall_back_to_ndt_search(tmp_path):
         "rtk_heading_usable": True,
     }
 
-    def set_initial_pose_from_rtk(wait_seconds=30.0):
+    def progressive_relocalize(*, origin, waypoints, wait_seconds=180.0):
+        nav.progressive_relocalize_requests.append({
+            "origin": dict(origin or {}),
+            "waypoints": [dict(point) for point in waypoints],
+            "wait_seconds": float(wait_seconds),
+        })
         raise ProtocolError(
             "LIO_HANDOFF_TIMEOUT",
-            "RTK seed was accepted but FAST-LIO handoff did not become ready",
+            "NDT pose was accepted but FAST-LIO handoff did not become ready",
         )
 
-    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    nav.progressive_relocalize = progressive_relocalize
     executor = TaskExecutor(
         store,
         nav,
@@ -2517,7 +2530,7 @@ def test_outdoor_lio_handoff_failure_does_not_fall_back_to_ndt_search(tmp_path):
     else:
         raise AssertionError("FAST-LIO handoff failure must keep the task stopped")
 
-    assert nav.progressive_relocalize_requests == []
+    assert len(nav.progressive_relocalize_requests) == 1
     store.close()
 
 
@@ -3379,7 +3392,7 @@ def test_outdoor_final_pose_error_rejects_rtk_off_click(tmp_path):
     store.close()
 
 
-def test_outdoor_startup_reseeds_fixed_rtk_even_when_lio_is_already_stable(tmp_path):
+def test_outdoor_startup_runs_ndt_before_secondary_correction_when_lio_is_stable(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     nav.pose = SimpleNamespace(x=10.0, y=10.0, yaw=0.0)
@@ -3415,7 +3428,8 @@ def test_outdoor_startup_reseeds_fixed_rtk_even_when_lio_is_already_stable(tmp_p
     envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
     executor.prepare_task_start(envelope)
     executor.initialize_before_navigation()
-    assert nav.rtk_calls == 1
+    assert nav.rtk_calls == 0
+    assert len(nav.progressive_relocalize_requests) == 1
     store.close()
 
 
@@ -3876,7 +3890,9 @@ def test_final_configured_heading_large_translation_recovers_after_bounded_adjus
         nav,
         event_callback=lambda *args: events.append(args),
         start_result_callback=lambda *args: results.append(args),
-        arrival_adjust_timeout_seconds=0.01,
+        # Leave enough wall-clock budget for the worker to issue at least one
+        # bounded translation even when the full suite is under load.
+        arrival_adjust_timeout_seconds=0.25,
     )
 
     executor.start_task(envelope)
