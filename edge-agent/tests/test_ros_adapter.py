@@ -1629,6 +1629,7 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
         outdoor=True,
     )
     assert outdoor_with_obstacles["FollowPath.CostCritic.enabled"] is True
+    assert outdoor_with_obstacles["FollowPath.vx_min"] == 0.0
     assert outdoor_with_obstacles["FollowPath.CostCritic.cost_weight"] == 8.0
     assert outdoor_with_obstacles["FollowPath.PathAlignCritic.enabled"] is True
     assert outdoor_with_obstacles["FollowPath.PathAlignCritic.use_path_orientations"] is False

@@ -5012,6 +5012,7 @@ def test_last_pass_through_waypoint_stays_cruise_inside_last_metre(tmp_path):
         start_result_callback=lambda *args: None,
     )
     executor.start_task(envelope)
+    _await_departure_heading(executor)
     drive_patrol(nav, until_ids=[last["waypoint_id"]], executor=executor)
 
     assert executor._patrol_final_approach_applied is False
@@ -5023,11 +5024,38 @@ def test_last_pass_through_waypoint_stays_cruise_inside_last_metre(tmp_path):
     store.close()
 
 
-def test_pass_through_does_not_spin_before_or_after_the_click(tmp_path):
+def test_pass_through_faces_travel_direction_when_heading_is_off(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
-    # 1.5 m from wp-1 so a stop_and_confirm start would teleop-spin ~92°.
+    # 1.5 m from wp-1 with ~92° heading error: cruise must face the leg first.
     nav.pose = SimpleNamespace(x=-0.5, y=2.0, yaw=1.6)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(_pass_through_outdoor_start(nav))
+
+    _await_departure_heading(executor)
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert nav.teleop
+    assert any(abs(cmd[2]) > 0 for cmd in nav.teleop)
+
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=3.0)
+    nav.teleop.clear()
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    _await_departure_heading(executor)
+    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    store.close()
+
+
+def test_pass_through_does_not_spin_on_the_click(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # Already inside the 1 m click window; spinning here restarts the orbit.
+    nav.pose = SimpleNamespace(x=0.4, y=2.0, yaw=1.6)
     executor = TaskExecutor(
         store,
         nav,
@@ -5039,14 +5067,6 @@ def test_pass_through_does_not_spin_before_or_after_the_click(tmp_path):
     assert ids(nav.sent[0]) == ["wp-1"]
     assert nav.teleop == []
     assert executor._maybe_face_travel_direction(0) is False
-    assert executor._dispatch_departure_heading(0) is False
-
-    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=3.0)
-    nav.result("succeeded", "", {"missed_waypoints": []})
-    assert executor.context.current_waypoint_index == 1
-    assert ids(nav.sent[-1]) == ["wp-2"]
-    assert nav.teleop == []
-    assert executor._departure_heading_index is None
     store.close()
 
 

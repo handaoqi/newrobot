@@ -2893,8 +2893,6 @@ class TaskExecutor:
         waypoints = self.context.route_snapshot.get("waypoints") or []
         if target_index < 0 or target_index >= len(waypoints):
             return False
-        if self._waypoint_is_pass_through(target_index):
-            return False
         pose = self.navigation.latest_pose() if self.navigation else None
         if pose is None:
             return False
@@ -6245,8 +6243,6 @@ class TaskExecutor:
         waypoints = self.context.route_snapshot.get("waypoints") or []
         next_index = reached_index + 1
         if next_index >= len(waypoints):
-            return False
-        if self._waypoint_is_pass_through(reached_index):
             return False
         current, target = waypoints[reached_index], waypoints[next_index]
         pose = self.navigation.latest_pose() if self.navigation else None

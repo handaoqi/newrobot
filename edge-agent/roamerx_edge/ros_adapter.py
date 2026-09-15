@@ -56,10 +56,11 @@ def follow_path_patrol_params(
     vx_max = 0.15 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
     )
-    # Last-metre and reapproach are XY close-ups. Allowing reverse here lets
-    # GoalCritic hunt the click (forward, back, forward) instead of settling.
-    # Cruise still keeps vx_min=-0.12 so a blocked leg can reverse around a mark.
-    vx_min = 0.0 if reapproach or final_approach else -0.12
+    # Last-metre, reapproach, and outdoor cruise are forward-only. Allowing
+    # reverse on outdoor FollowPath lets CostCritic hunt grass returns instead
+    # of tracking ThetaStar. Indoor cruise still keeps vx_min=-0.12 so a
+    # blocked leg can reverse around a mark; Edge BackUp owns outdoor reverse.
+    vx_min = 0.0 if reapproach or final_approach or outdoor else -0.12
     wz_max = 0.35 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).wz_rps
     )
