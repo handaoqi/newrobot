@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { createAsyncPoller, useAsyncPoller } from '../composables/useAsyncPoller'
 import { API_BASE } from '../services/api/client.js'
 
@@ -69,6 +70,7 @@ const KEY_ACTIONS = {
   e: 'turn_right',
 }
 const { toastMessage, toastVariant, visible, showToast } = useToast()
+const router = useRouter()
 
 const selectedRobotId = computed(() => selectedRobot.value?.id || '')
 const livePlayUrls = computed(() => selectedRobot.value?.play_urls || {})
@@ -94,6 +96,10 @@ const todayAlertCount = computed(() => Number(selectedRobot.value?.today_alerts 
 
 function showVideoNotice({ message, variant }) {
   showToast(message, variant ? { variant } : undefined)
+}
+
+function openEventCenter() {
+  router.push('/dashboard/events')
 }
 
 function fallbackToSnapshot() {
@@ -662,15 +668,6 @@ watch(liveSourceKey, () => {
             {{ followActive ? '停止跟随' : '开始跟随' }}
           </button>
         </div>
-        <section class="remote-alert-panel" aria-label="实时告警">
-          <div><strong>实时告警</strong><span>今日 {{ todayAlertCount }} 条</span></div>
-          <article v-if="recentAlerts[0]" class="remote-alert-main">
-            <img v-if="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :src="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :alt="recentAlerts[0].title" />
-            <span><strong>{{ recentAlerts[0].title || recentAlerts[0].event_type }}</strong><small>{{ recentAlerts[0].detected_at }}</small></span>
-          </article>
-          <p v-else>当前没有新的现场告警</p>
-          <small v-for="event in recentAlerts.slice(1, 4)" :key="event.id">{{ event.title || event.event_type }}</small>
-        </section>
       </section>
 
       <section class="panel remote-console">
@@ -792,6 +789,27 @@ watch(liveSourceKey, () => {
             </div>
           </button>
         </div>
+      </section>
+
+      <section class="panel remote-alert-panel" aria-label="实时告警">
+        <div class="remote-alert-head">
+          <strong>实时告警</strong>
+          <button
+            type="button"
+            class="remote-alert-count"
+            :class="{ empty: todayAlertCount === 0 }"
+            :aria-label="`今天 ${todayAlertCount} 条告警，点击进入事件中心`"
+            @click="openEventCenter"
+          >
+            今天 {{ todayAlertCount }} 条
+          </button>
+        </div>
+        <article v-if="recentAlerts[0]" class="remote-alert-main">
+          <img v-if="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :src="recentAlerts[0].annotated_snapshot_url || recentAlerts[0].snapshot_url" :alt="recentAlerts[0].title" />
+          <span><strong>{{ recentAlerts[0].title || recentAlerts[0].event_type }}</strong><small>{{ recentAlerts[0].detected_at }}</small></span>
+        </article>
+        <p v-else>当前没有新的现场告警</p>
+        <small v-for="event in recentAlerts.slice(1, 4)" :key="event.id">{{ event.title || event.event_type }}</small>
       </section>
 
       <section class="panel remote-status-panel">
@@ -1408,8 +1426,24 @@ watch(liveSourceKey, () => {
   }
 }
 
-.remote-alert-panel { display: grid; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
-.remote-alert-panel > div { display: flex; justify-content: space-between; gap: 10px; }
+.remote-alert-panel { display: grid; gap: 8px; margin-top: 0; padding-top: 0; border-top: 0; }
+.remote-alert-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.remote-alert-count {
+  min-height: 30px;
+  border: 1px solid rgba(255, 94, 94, 0.7);
+  border-radius: 7px;
+  padding: 4px 10px;
+  color: #fff;
+  background: #c93636;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(201, 54, 54, 0.2);
+}
+.remote-alert-count:hover,
+.remote-alert-count:focus-visible { background: #e34848; border-color: #ff9797; }
+.remote-alert-count:focus-visible { outline: 2px solid #ffcc36; outline-offset: 2px; }
 .remote-alert-panel > div span, .remote-alert-panel > p, .remote-alert-panel > small, .remote-alert-main small { color: var(--muted); font-size: 12px; }
 .remote-alert-panel > p { margin: 0; }
 .remote-alert-main { display: grid; grid-template-columns: 70px minmax(0, 1fr); align-items: center; gap: 9px; }
