@@ -964,6 +964,103 @@ def test_fixed_rtk_runs_one_numbered_ndt_crosscheck_before_anchor_commit(
     assert progress[-1]["state"] == "accepted"
 
 
+def test_rtk_heading_conflict_with_lidar_only_vetoes_same_place_flips():
+    seed = {"x": -0.01, "y": 0.46, "yaw": 0.016}
+    flipped = SimpleNamespace(
+        x=-0.26, y=0.81, yaw=2.95, localization_status="normal"
+    )
+    conflict = RosAdapter._rtk_heading_conflict_with_lidar(seed, flipped)
+    assert conflict is not None
+    assert abs(conflict["yaw_delta_deg"]) > 90.0
+    assert conflict["xy_delta_m"] < 3.0
+
+    aligned = SimpleNamespace(
+        x=-0.01, y=0.46, yaw=0.02, localization_status="normal"
+    )
+    assert RosAdapter._rtk_heading_conflict_with_lidar(seed, aligned) is None
+
+    lost = SimpleNamespace(x=-0.26, y=0.81, yaw=2.95, localization_status="lost")
+    assert RosAdapter._rtk_heading_conflict_with_lidar(seed, lost) is None
+
+    far = SimpleNamespace(x=20.0, y=20.0, yaw=2.95, localization_status="normal")
+    assert RosAdapter._rtk_heading_conflict_with_lidar(seed, far) is None
+
+
+def test_fixed_rtk_does_not_commit_when_live_lidar_heading_is_flipped(monkeypatch):
+    monkeypatch.setattr(
+        ros_adapter_module,
+        "Trigger",
+        SimpleNamespace(Request=lambda: SimpleNamespace()),
+    )
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SimpleNamespace(
+        localization_rtk_max_drift_m=0.30,
+        localization_rtk_required_samples=3,
+        localization_handoff_settle_seconds=8.0,
+    )
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._trusted_pose_frozen = False
+    latest = SimpleNamespace(
+        x=-0.26,
+        y=0.81,
+        z=-0.02,
+        yaw=2.95,
+        localization_status="normal",
+    )
+    adapter.telemetry = SimpleNamespace(
+        latest_pose=lambda: latest,
+        localization_diagnostics=lambda: {},
+    )
+    adapter._localization_decision = lambda: {
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+        "rtk_x": -0.01,
+        "rtk_y": 0.46,
+        "rtk_yaw": 0.016,
+        "handoff_anchor_generation": 4,
+        "sample_age_seconds": 0.08,
+    }
+    adapter._wait_for_verified_fixed_rtk = lambda **_kwargs: {
+        "status": "accepted",
+        "verified": True,
+        "started_at": "2026-09-15T13:24:14Z",
+        "conclusion_code": "fixed_rtk_verified",
+        "last_sample": {
+            "quality": "fixed",
+            "usable": True,
+            "heading_usable": True,
+            "map_x": -0.01,
+            "map_y": 0.46,
+            "map_yaw": 0.016,
+        },
+    }
+    events = []
+    adapter._probe_localization_seed = lambda *_args, **_kwargs: events.append("ndt_probe")
+    adapter._report_localization_attempts = lambda payload, **_kwargs: None
+    adapter._report_rtk_verification = lambda *_args, **_kwargs: None
+
+    class RtkClient:
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, _request):
+            events.append("rtk_commit")
+            future = Future()
+            future.set_result(SimpleNamespace(success=True, message="accepted"))
+            return future
+
+    adapter._rtk_initial_pose_client = RtkClient()
+    adapter._wait_for_lio_handoff = lambda **_kwargs: (latest, {})
+
+    with pytest.raises(ProtocolError) as captured:
+        adapter._set_initial_pose_from_rtk_once(30.0, 7)
+
+    assert captured.value.code == "RTK_HEADING_CONFLICTS_WITH_LIDAR"
+    assert abs(captured.value.details["heading_conflict"]["yaw_delta_deg"]) > 90.0
+    assert events == []
+
+
 def test_active_relocalize_executes_the_one_meter_candidates():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 12

@@ -2355,6 +2355,50 @@ def test_outdoor_fixed_rtk_stability_failure_uses_mapping_origin_progressive_sea
     store.close()
 
 
+def test_outdoor_rtk_heading_conflict_uses_mapping_origin_progressive_search(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    nav.localization_state = {
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "rtk_usable": True,
+        "rtk_quality": "fixed",
+        "rtk_heading_usable": True,
+    }
+    nav.rtk_calls = 0
+
+    def set_initial_pose_from_rtk(wait_seconds=30.0):
+        nav.rtk_calls += 1
+        raise ProtocolError(
+            "RTK_HEADING_CONFLICTS_WITH_LIDAR",
+            "live lidar heading disagrees with fixed RTK by 170.0deg at the same place",
+        )
+
+    nav.set_initial_pose_from_rtk = set_initial_pose_from_rtk
+    mapping = SimpleNamespace(
+        mapping_start_pose=lambda: {"x": 8.0, "y": 9.0, "z": 0.0, "yaw": 0.4}
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        map_activation_adapter=mapping,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a", "map_version": "v1", "coordinate_mode": "rtk_fixed",
+        "scene_scope": "outdoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    executor.prepare_task_start(envelope)
+    executor.initialize_before_navigation()
+
+    assert nav.rtk_calls == 1
+    assert len(nav.progressive_relocalize_requests) == 1
+    store.close()
+
+
 def test_outdoor_lio_handoff_failure_does_not_fall_back_to_ndt_search(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

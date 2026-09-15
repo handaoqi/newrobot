@@ -33,6 +33,12 @@ from .telemetry_collector import TelemetryCollector
 
 LOGGER = logging.getLogger(__name__)
 
+# A live lidar pose at the same place whose heading is in the opposite
+# hemisphere means the RTK dual-antenna yaw (or 180deg offset) is unusable.
+# Weak or missing lidar stays advisory so outdoor RTK can still initialize.
+RTK_LIDAR_HEADING_CONFLICT_DEG = 90.0
+RTK_LIDAR_HEADING_CONFLICT_XY_M = 3.0
+
 
 def follow_path_patrol_params(
     *,
@@ -3289,6 +3295,50 @@ class RosAdapter(Node):
         return None, last_decision
 
     @staticmethod
+    def _rtk_heading_conflict_with_lidar(rtk_seed: dict | None, lidar_pose) -> dict | None:
+        """Return conflict details when lidar heading flips relative to RTK.
+
+        Only vetoes when lidar is currently normal and already at the RTK XY.
+        Lost lidar, or a large XY disagreement, is not treated as a heading
+        fault so a cold start can still use a verified fixed RTK seed.
+        """
+        if not rtk_seed or lidar_pose is None:
+            return None
+        if not RosAdapter._localization_status_is_normal(
+            getattr(lidar_pose, "localization_status", None)
+        ):
+            return None
+        lidar_x = RosAdapter._finite_or_none(getattr(lidar_pose, "x", None))
+        lidar_y = RosAdapter._finite_or_none(getattr(lidar_pose, "y", None))
+        lidar_yaw = RosAdapter._finite_or_none(getattr(lidar_pose, "yaw", None))
+        rtk_x = RosAdapter._finite_or_none(rtk_seed.get("x"))
+        rtk_y = RosAdapter._finite_or_none(rtk_seed.get("y"))
+        rtk_yaw = RosAdapter._finite_or_none(rtk_seed.get("yaw"))
+        if None in (lidar_x, lidar_y, lidar_yaw, rtk_x, rtk_y, rtk_yaw):
+            return None
+        xy_delta_m = math.hypot(rtk_x - lidar_x, rtk_y - lidar_y)
+        if xy_delta_m > RTK_LIDAR_HEADING_CONFLICT_XY_M:
+            return None
+        yaw_delta_deg = math.degrees(
+            math.atan2(
+                math.sin(rtk_yaw - lidar_yaw),
+                math.cos(rtk_yaw - lidar_yaw),
+            )
+        )
+        if abs(yaw_delta_deg) <= RTK_LIDAR_HEADING_CONFLICT_DEG:
+            return None
+        return {
+            "lidar_x": lidar_x,
+            "lidar_y": lidar_y,
+            "lidar_yaw": lidar_yaw,
+            "rtk_x": rtk_x,
+            "rtk_y": rtk_y,
+            "rtk_yaw": rtk_yaw,
+            "xy_delta_m": xy_delta_m,
+            "yaw_delta_deg": yaw_delta_deg,
+        }
+
+    @staticmethod
     def _localization_status_is_normal(status) -> bool:
         """Accept both ROS numeric status=3 and telemetry's readable value.
 
@@ -3369,11 +3419,10 @@ class RosAdapter(Node):
             )
         verification = stability
 
-        # RTK has provided the authoritative map pose. Before committing that
-        # anchor, run exactly one bounded NDT observation at the same position
-        # so operators get a numbered location and concrete geometric quality.
-        # This cross-check is evidence only: a still-valid fixed RTK solution
-        # remains authoritative even when NDT is weak or unavailable outdoors.
+        # RTK has provided the map pose. A healthy live lidar heading at the
+        # same XY can veto a flipped RTK yaw before that seed is published.
+        # Weak or missing lidar stays advisory: the NDT cross-check below is
+        # still evidence only, so outdoor RTK can initialize without a match.
         rtk_seed = self._rtk_pose_from_verification(verification)
         if rtk_seed is None:
             self._report_rtk_verification(
@@ -3389,6 +3438,34 @@ class RosAdapter(Node):
                 details={
                     "rtk_stability": verification,
                     "rtk_verification": verification,
+                },
+            )
+
+        lidar_pose = None
+        latest_getter = getattr(self.telemetry, "latest_pose", None) if self.telemetry else None
+        if callable(latest_getter):
+            lidar_pose = latest_getter()
+        heading_conflict = self._rtk_heading_conflict_with_lidar(rtk_seed, lidar_pose)
+        if heading_conflict:
+            conclusion = (
+                "live lidar heading disagrees with fixed RTK by "
+                f"{abs(heading_conflict['yaw_delta_deg']):.1f}deg at the same place; "
+                "not committing the RTK heading"
+            )
+            self._report_rtk_verification(
+                verification,
+                state="failed",
+                stage_status="rejected",
+                error_code="RTK_HEADING_CONFLICTS_WITH_LIDAR",
+                error_message=conclusion,
+            )
+            raise ProtocolError(
+                "RTK_HEADING_CONFLICTS_WITH_LIDAR",
+                conclusion,
+                details={
+                    "rtk_stability": verification,
+                    "rtk_verification": verification,
+                    "heading_conflict": heading_conflict,
                 },
             )
 

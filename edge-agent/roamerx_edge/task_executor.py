@@ -111,6 +111,7 @@ RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES = frozenset({
     "RTK_INITIAL_POSE_TIMEOUT",
     "RTK_POSE_UNAVAILABLE",
     "RTK_INITIAL_POSE_NOT_CONVERGED",
+    "RTK_HEADING_CONFLICTS_WITH_LIDAR",
 })
 # Outdoor reverse/start checks keep a looser LIO envelope while RTK performs
 # the authoritative click check. Arrival verdicts use configured tolerances.
