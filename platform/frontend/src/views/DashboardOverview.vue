@@ -60,6 +60,10 @@ const switchingRobot = ref(false)
 const commandSending = ref(false)
 const takeoverActive = ref(false)
 const assistActive = ref(false)
+// Distinguish a session opened by this page from a mode observed on the robot.
+// Observing manual_assist must not cause component unmount to release another
+// page's operator session.
+const takeoverOwned = ref(false)
 const speakerText = ref('您好，这里禁止自行车长时间停放，请尽快驶离指定区域，感谢配合。')
 const speechCategories = ref([])
 const speechTemplates = ref([])
@@ -132,6 +136,16 @@ const liveEvent = computed(() => latestRobot.value?.recent_events?.[0] || overvi
 const livePlayUrls = computed(() => latestRobot.value?.play_urls || {})
 const liveSourceKey = computed(() => `${latestRobot.value?.id || ''}\n${livePlayUrls.value.flv || ''}\n${livePlayUrls.value.hls || ''}`)
 const hasLiveStream = computed(() => !streamUnavailable.value && Boolean(livePlayUrls.value.flv || livePlayUrls.value.hls))
+const liveControlMode = computed(() => robotLiveStatus.value?.control_mode || latestRobot.value?.control_mode || '')
+const hasActiveNavigationTask = computed(() => {
+  // The live status endpoint is authoritative once it has returned a task id.
+  // Keep the detail-page fallback only before the first status sample arrives.
+  if (robotLiveStatus.value && Object.prototype.hasOwnProperty.call(robotLiveStatus.value, 'task_execution_id')) {
+    return Boolean(robotLiveStatus.value.task_execution_id)
+  }
+  return Boolean(latestRobot.value?.current_task_name)
+})
+const assistSessionActive = computed(() => assistActive.value || liveControlMode.value === 'manual_assist')
 const bicycleDetections = computed(() => (liveDetectionState.value?.detections || []).filter((item) =>
   ['bicycle', 'bike', '自行车'].includes(String(item.label || '').toLowerCase()),
 ))
@@ -628,7 +642,11 @@ async function sendControlAction(action, payload = {}) {
   if (commandSending.value || activeHoldAction.value) return
   commandSending.value = true
   try {
-    await dispatchRobotAction(action, payload, takeoverActive.value ? 'manual_takeover' : 'dashboard_control')
+    await dispatchRobotAction(
+      action,
+      { assist: assistSessionActive.value, ...payload },
+      assistSessionActive.value ? 'manual_assist' : (takeoverActive.value ? 'manual_takeover' : 'dashboard_control'),
+    )
     const label = allControlActions.find((item) => item.action === action)?.label || action
     showToast(`已下发指令：${label}`)
   } catch (error) {
@@ -642,7 +660,11 @@ async function sendHeldAction() {
   if (!holdAction || holdInFlight) return
   holdInFlight = true
   try {
-    holdPromise = dispatchRobotAction(holdAction.action, holdAction.payload || {}, 'manual_takeover_hold')
+    holdPromise = dispatchRobotAction(
+      holdAction.action,
+      { assist: assistSessionActive.value, ...(holdAction.payload || {}) },
+      assistSessionActive.value ? 'manual_assist_hold' : 'manual_takeover_hold',
+    )
     await holdPromise
   } catch (error) {
     stopHoldAction()
@@ -689,7 +711,11 @@ async function stopHoldAction(event) {
 
   try {
     await pendingHoldPromise?.catch(() => {})
-    await dispatchRobotAction('move_stop', {}, 'manual_takeover_hold_release')
+    await dispatchRobotAction(
+      'move_stop',
+      { assist: assistSessionActive.value },
+      assistSessionActive.value ? 'manual_assist_hold_release' : 'manual_takeover_hold_release',
+    )
   } catch (error) {
     showToast(error.message || '停止指令下发失败')
   }
@@ -781,13 +807,13 @@ function closeAlertStream() {
 async function enterTakeover() {
   const robot = latestRobot.value
   if (!robot?.id || commandSending.value) return
-  if (!hasLiveStream.value) {
+  const assist = hasActiveNavigationTask.value
+  if (!assist && !hasLiveStream.value) {
     showToast('当前设备暂无可用视频流')
     return
   }
   commandSending.value = true
   try {
-    const assist = Boolean(robot.current_task_name)
     await sendRobotCommand(robot.id, {
       action: 'takeover_enter',
       payload: {
@@ -800,10 +826,13 @@ async function enterTakeover() {
     })
     assistActive.value = assist
     takeoverActive.value = true
+    takeoverOwned.value = true
     await nextTick()
-    try {
-      await videoStageRef.value?.requestFullscreen?.()
-    } catch {}
+    if (!assist) {
+      try {
+        await videoStageRef.value?.requestFullscreen?.()
+      } catch {}
+    }
     showToast(assist ? '已切换至人工辅助模式，自动导航保持运行' : '已切换至远程接管模式')
   } catch (error) {
     showToast(error.message || '接管指令下发失败')
@@ -827,14 +856,15 @@ async function exitTakeover(options = {}) {
           note: 'Exit remote takeover mode and release SDK control.',
         },
       })
-      showToast('已切回手柄模式')
+      showToast(assistSessionActive.value ? '已退出人工辅助，恢复自主导航' : '已切回手柄模式')
     }
   } catch (error) {
     showToast(error.message || '退出接管失败')
   } finally {
-    takeoverActive.value = false
-    assistActive.value = false
-    takeoverExitInFlight = false
+      takeoverActive.value = false
+      assistActive.value = false
+      takeoverOwned.value = false
+      takeoverExitInFlight = false
   }
   if (!options.skipFullscreen && document.fullscreenElement) {
     document.exitFullscreen?.().catch(() => {})
@@ -853,6 +883,7 @@ async function chooseRobot(robotId, announce = true) {
     ])
     selectedRobot.value = robotDetail
     robotLiveStatus.value = liveStatus?.status || null
+    syncControlSessionFromStatus()
     streamUnavailable.value = false
     if (announce) showToast(`已切换至 ${selectedRobot.value.name}`)
   } finally {
@@ -867,9 +898,25 @@ async function refreshRobotStatus({ signal } = {}) {
     const liveStatus = await fetchRobotStatus(robotId, { signal })
     if (latestRobot.value?.id === robotId) {
       robotLiveStatus.value = liveStatus?.status || null
+      syncControlSessionFromStatus()
     }
   } catch (_error) {
     // Retain the last valid device sample during a transient request failure.
+  }
+}
+
+function syncControlSessionFromStatus() {
+  if (commandSending.value || takeoverExitInFlight) return
+  const mode = liveControlMode.value
+  if (mode === 'manual_assist') {
+    assistActive.value = true
+    takeoverActive.value = true
+  } else if (mode === 'manual_takeover') {
+    assistActive.value = false
+    takeoverActive.value = true
+  } else if (mode === 'autonomous' || mode === 'emergency_stop') {
+    assistActive.value = false
+    takeoverActive.value = false
   }
 }
 
@@ -912,7 +959,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (takeoverActive.value) {
+  if (takeoverOwned.value) {
     void exitTakeover({ skipFullscreen: true, source: 'component_unmount' })
   }
   if (recording.value && mediaRecorder) mediaRecorder.stop()
@@ -933,7 +980,7 @@ watch(liveSourceKey, () => {
 })
 
 function handleFullscreenChange() {
-  if (takeoverActive.value && !document.fullscreenElement) {
+  if (takeoverOwned.value && takeoverActive.value && !document.fullscreenElement) {
     void exitTakeover({ skipFullscreen: true, source: 'fullscreen_exit' })
   }
 }
@@ -1094,8 +1141,8 @@ function handleVisibilityChange() {
             <strong>当前巡检区域</strong>
             <span>{{ latestRobot?.area }}</span>
           </div>
-          <button class="takeover-btn" :disabled="!hasLiveStream || commandSending" @click="enterTakeover">
-            {{ commandSending ? '下发中...' : (latestRobot?.current_task_name ? '辅助导航' : '接管') }}
+          <button class="takeover-btn" :disabled="(!hasActiveNavigationTask && !hasLiveStream) || commandSending" @click="enterTakeover">
+            {{ commandSending ? '下发中...' : (hasActiveNavigationTask ? '辅助导航' : '接管') }}
           </button>
           <div class="footer-card">
             <strong>设备电量</strong>
