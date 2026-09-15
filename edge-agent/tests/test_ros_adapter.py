@@ -789,6 +789,50 @@ def test_lio_handoff_accepts_readable_normal_telemetry_status():
     assert decision["handoff_state"] == "ready"
 
 
+def test_successful_initial_pose_reports_handoff_stage_times_and_generation():
+    adapter = object.__new__(RosAdapter)
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter.wait_for_initial_pose_subscriber = lambda **_kwargs: True
+    adapter._localization_sample_condition = threading.Condition()
+    adapter._localization_sample_sequence = 4
+    adapter._scan_match_sequence_snapshot = lambda: 8
+    adapter._initial_pose_pub = SimpleNamespace(publish=lambda _msg: None)
+    latest = SimpleNamespace(
+        localization_status="normal",
+        x=1.1,
+        y=2.2,
+        yaw=0.3,
+        source_status=3,
+    )
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: latest)
+    adapter._wait_for_fresh_normal_samples = lambda **_kwargs: latest
+    adapter._fast_lio_handoff_ready = lambda: True
+    adapter._localization_decision = lambda: {
+        "handoff_anchor_generation": 9,
+        "handoff_state": "ready",
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "lio_anchored": True,
+        "absolute_stable": True,
+    }
+    adapter._best_ndt_candidate = lambda *_args: None
+
+    result = adapter._set_initial_pose_once({
+        "x": 1.0,
+        "y": 2.0,
+        "yaw": 0.3,
+        "wait_seconds": 0.1,
+        "required_normal_samples": 1,
+        "require_absolute": True,
+    }, 7)
+
+    assert result["continuous_source"] == "lio_imu"
+    assert result["map_lio_anchor_generation"] == 9
+    assert result["handoff"]["status"] == "completed"
+    assert result["handoff"]["started_at"]
+    assert result["handoff"]["finished_at"] >= result["handoff"]["started_at"]
+
+
 @pytest.mark.parametrize("probe_result", [
     {
         "status": "qualified",

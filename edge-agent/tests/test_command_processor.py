@@ -365,9 +365,18 @@ def test_task_start_forwards_localization_attempt_progress(tmp_path):
         if payload["payload"]["result"].get("selected_stage") == "rtk_fixed"
     )
     assert localization_progress["payload"]["result"]["attempts"][0]["candidate_number"] == 1
+    startup = localization_progress["payload"]["result"]["startup_progress"]
+    assert startup["phase"] == "rtk_fixed"
+    assert startup["current_action"] == "智能初始化定位：验证 RTK 固定解"
+    assert [item["status"] for item in startup["actions"]] == [
+        "completed", "completed", "in_progress", "waiting",
+    ]
     assert progress[-1][1]["payload"]["result"]["selected_stage"] == "navigation_start"
     assert progress[-1][1]["payload"]["result"]["navigation_start"]["status"] == "accepted"
     assert progress[-1][1]["payload"]["result"]["navigation_start"]["finished_at"]
+    final_startup = progress[-1][1]["payload"]["result"]["startup_progress"]
+    assert final_startup["status"] == "completed"
+    assert final_startup["current_action"] == "首航点已下发，Nav2 开始执行"
     assert navigation.attempt_progress_callback is None
     store.close()
 

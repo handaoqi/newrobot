@@ -14,6 +14,7 @@ class LegProfile:
     collision_slowdown_enabled: bool = True
     collision_stop_enabled: bool = True
     speed_profile: str = "cruise"
+    navigation_speed_level: str = "micro"
     goal_checker_id: str = "general_goal_checker"
     arrival_policy: str = "stop_and_confirm"
     smoother_id: str = "savitzky_golay"

@@ -254,3 +254,74 @@ test('adds persisted diagnostic logs and a missing terminal failure event', () =
   assert.match(timeline[1].detail, /重复 3 次/)
   assert.equal(timeline[2].detail, 'ROBOT_STANDUP_FAILED · recovery requires a confirmed stop')
 })
+
+test('expands startup actions and navigation modules in drill records', () => {
+  const timeline = buildTaskExecutionTimeline({
+    id: 'execution-progress-detail',
+    state: 'running',
+    created_at: '2026-09-16T08:00:00+08:00',
+    route_snapshot: { waypoints: [{ map_point_number: 2 }] },
+    events: [],
+    system_logs: [
+      {
+        id: 'start-progress',
+        level: 'INFO',
+        event_code: 'task.start.progress',
+        message: '启动任务：智能初始化定位：验证 RTK 固定解',
+        occurred_at: '2026-09-16T08:00:01+08:00',
+        data: {
+          startup_progress: {
+            current_action: '智能初始化定位：验证 RTK 固定解',
+            next_action: '定位接管后应用航段策略并下发首航点',
+            actions: [
+              { label: '检查导航栈与安全状态', status: 'completed' },
+              { label: '校验地图、边界与路线', status: 'completed' },
+              { label: '初始化定位并确认主定位源', status: 'in_progress' },
+            ],
+          },
+        },
+      },
+      {
+        id: 'navigation-progress',
+        level: 'INFO',
+        event_code: 'navigation.progress',
+        message: '导航至2号点：路径跟踪',
+        waypoint_index: 0,
+        occurred_at: '2026-09-16T08:00:02+08:00',
+        data: {
+          navigation_progress: {
+            progress: { completed_waypoints: 0, total_waypoints: 1, distance_remaining_m: 3.25 },
+            modules: {
+              global_planner: 'theta_star',
+              local_controller: 'mppi',
+              smoother: 'savitzky_golay',
+              goal_checker: 'general_goal_checker',
+              localization_mode: 'ukf',
+            },
+            strategy: {
+              speed_level: 'micro',
+              speed_profile: 'cruise',
+              configured_linear_limit_mps: 0.3,
+              detour_enabled: true,
+              collision_slowdown_enabled: true,
+              collision_stop_enabled: true,
+              arrival_policy: 'stop_and_confirm',
+              xy_goal_tolerance_m: 0.3,
+            },
+          },
+        },
+      },
+    ],
+  })
+
+  assert.equal(timeline[0].title, '启动任务：智能初始化定位：验证 RTK 固定解')
+  assert.match(timeline[0].detail, /已完成：检查导航栈与安全状态、校验地图、边界与路线/)
+  assert.match(timeline[0].detail, /当前：初始化定位并确认主定位源/)
+  assert.match(timeline[0].detail, /下一步：定位接管后应用航段策略并下发首航点/)
+  assert.equal(timeline[1].title, '导航至2号点：路径跟踪')
+  assert.match(timeline[1].detail, /进度 0\/1/)
+  assert.match(timeline[1].detail, /距航点 3\.25m/)
+  assert.match(timeline[1].detail, /执行模块：ThetaStar → MPPI（FollowPath） → Savitzky-Golay → 通用 GoalChecker/)
+  assert.match(timeline[1].detail, /定位策略：UKF/)
+  assert.match(timeline[1].detail, /微速、巡航、线速度上限 0\.30m\/s、绕行开启、碰撞减速开启、硬急停开启/)
+})

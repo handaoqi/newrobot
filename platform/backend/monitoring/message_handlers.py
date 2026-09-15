@@ -728,6 +728,30 @@ def _handle_command_ack(envelope: MessageEnvelope, robot: Robot) -> dict:
 
 
 
+def _command_progress_log_message(command: RemoteCommand, incoming: dict) -> str:
+    if command.command_type != "task.start":
+        return f"{command.get_command_type_display()}执行中"
+    startup = incoming.get("startup_progress")
+    startup = startup if isinstance(startup, dict) else {}
+    action = str(startup.get("current_action") or startup.get("phase_label") or "准备导航任务")
+    return f"启动任务：{action}"
+
+
+def _navigation_progress_log_message(payload: dict) -> str:
+    navigation = payload.get("navigation_progress")
+    navigation = navigation if isinstance(navigation, dict) else {}
+    waypoint = navigation.get("waypoint")
+    waypoint = waypoint if isinstance(waypoint, dict) else {}
+    point_number = waypoint.get("map_point_number")
+    if point_number in {None, ""}:
+        point = payload.get("waypoint")
+        point = point if isinstance(point, dict) else {}
+        point_number = point.get("map_point_number")
+    target = f"{point_number}号点" if point_number not in {None, ""} else "当前航点"
+    phase = str(navigation.get("phase_label") or "路径跟踪")
+    return f"导航至{target}：{phase}"
+
+
 def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
     payload = envelope.payload
     command = _get_command(payload, robot)
@@ -767,10 +791,15 @@ def _handle_command_progress(envelope: MessageEnvelope, robot: Robot) -> dict:
         level="INFO",
         module=_command_log_module(command.command_type),
         event_code=f"{command.command_type}.progress",
-        message=f"{command.get_command_type_display()}执行中",
+        message=_command_progress_log_message(command, incoming),
         data=incoming,
         command=command,
         task_execution=command.task_execution,
+        dedupe_key=(
+            f"{command.command_type}:"
+            f"{((incoming.get('startup_progress') or {}).get('phase') if isinstance(incoming.get('startup_progress'), dict) else 'progress')}:"
+            f"{((incoming.get('startup_progress') or {}).get('status') if isinstance(incoming.get('startup_progress'), dict) else 'running')}"
+        ),
         dedupe_seconds=2,
     )
     execution = command.task_execution
@@ -1198,12 +1227,21 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         emit_center_log(
             robot=robot, level="INFO", module=module,
             event_code=f"{module}.{milestone}",
-            message="航点已到达" if milestone in {"waypoint_reached", "arrival_confirmed"} else "导航任务进度更新",
+            message=(
+                "航点已到达"
+                if milestone in {"waypoint_reached", "arrival_confirmed"}
+                else _navigation_progress_log_message(payload)
+            ),
             data=payload, task_execution=execution,
             waypoint_index=(
                 payload.get("execution_waypoint_index")
                 if payload.get("execution_waypoint_index") is not None
                 else payload.get("current_waypoint_index")
+            ),
+            dedupe_key=(
+                f"{payload.get('round_number') or 0}:"
+                f"{payload.get('current_waypoint_index') if payload.get('current_waypoint_index') is not None else 'unknown'}:"
+                f"{((payload.get('navigation_progress') or {}).get('phase') if isinstance(payload.get('navigation_progress'), dict) else milestone or 'progress')}"
             ),
             dedupe_seconds=2,
         )

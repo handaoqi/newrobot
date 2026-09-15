@@ -190,6 +190,9 @@ function normalizeRtkVerification(value) {
           value.handoff.anchor_generation ?? value.handoff.anchorGeneration,
         ),
         failureReason: value.handoff.handoff_failure_reason || value.handoff.failureReason || '',
+        startedAt: firstTimestamp(value.handoff.started_at, value.handoff.startedAt),
+        updatedAt: firstTimestamp(value.handoff.updated_at, value.handoff.updatedAt),
+        finishedAt: firstTimestamp(value.handoff.finished_at, value.handoff.finishedAt),
       }
     : null
   return {
@@ -377,6 +380,14 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     commandIssuedAt: firstTimestamp(command.issued_at, command.created_at),
     commandStartedAt: firstTimestamp(command.started_at),
     commandFinishedAt: firstTimestamp(command.finished_at),
+    observedAt: firstTimestamp(
+      extras.observedAt,
+      command.updated_at,
+      command.finished_at,
+      command.started_at,
+      command.issued_at,
+      command.created_at,
+    ) || new Date().toISOString(),
     phase,
     showCandidates,
     status: raw.state || command.status || '',
@@ -396,7 +407,12 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     rtkVerification,
-    handoff: raw.handoff || result.handoff || rtkVerification?.handoff || null,
+    handoff: raw.handoff
+      || result.handoff
+      || raw.handoff_diagnostics
+      || result.handoff_diagnostics
+      || rtkVerification?.handoff
+      || null,
     secondaryCorrection: raw.secondary_correction || result.secondary_correction || null,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     rtkFixedCommitted: Boolean(raw.rtk_fixed_committed ?? result.rtk_fixed_committed),
@@ -464,6 +480,7 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     commandIssuedAt: null,
     commandStartedAt: null,
     commandFinishedAt: null,
+    observedAt: new Date().toISOString(),
     phase,
     showCandidates: phase !== 'transfer',
     status: '',
@@ -670,6 +687,28 @@ function timelineStageTimes(stageKey, status, record, session) {
       session?.navigationStart?.finished_at,
       session?.navigationStart?.finishedAt,
     )
+  } else if (stageKey === 'fast_lio_imu_handoff') {
+    startedAt = firstTimestamp(
+      startedAt,
+      session?.handoff?.started_at,
+      session?.handoff?.startedAt,
+    )
+    finishedAt = firstTimestamp(
+      finishedAt,
+      session?.handoff?.finished_at,
+      session?.handoff?.finishedAt,
+    )
+  } else if (stageKey === 'secondary_correction') {
+    startedAt = firstTimestamp(
+      startedAt,
+      session?.secondaryCorrection?.started_at,
+      session?.secondaryCorrection?.startedAt,
+    )
+    finishedAt = firstTimestamp(
+      finishedAt,
+      session?.secondaryCorrection?.finished_at,
+      session?.secondaryCorrection?.finishedAt,
+    )
   } else if (stageKey === 'map_transfer' && session?.phase !== 'transfer') {
     startedAt = firstTimestamp(startedAt, historical?.startedAt)
     finishedAt = firstTimestamp(finishedAt, historical?.finishedAt)
@@ -678,17 +717,38 @@ function timelineStageTimes(stageKey, status, record, session) {
     record
     || (stageKey === 'localization_bootstrap' && session?.localizationBootstrap)
     || (stageKey === 'best_candidate_commit' && (session?.bestNdtCommitted || session?.bestMatchPose))
+    || (stageKey === 'fast_lio_imu_handoff' && session?.handoff)
+    || (stageKey === 'secondary_correction' && session?.secondaryCorrection)
     || (stageKey === 'navigation_start' && session?.navigationStart),
   )
-  if (!startedAt && hasStageEvidence && timelineStatusClass(status) !== 'waiting') {
-    startedAt = firstTimestamp(session?.commandStartedAt, session?.commandIssuedAt)
+  if (!startedAt && timelineStatusClass(status) !== 'waiting') {
+    startedAt = firstTimestamp(
+      historical?.startedAt,
+      session?.commandStartedAt,
+      session?.commandIssuedAt,
+      session?.commandFinishedAt,
+      session?.observedAt,
+    )
   }
   if (
     !finishedAt
-    && hasStageEvidence
     && ['done', 'failed', 'skipped'].includes(timelineStatusClass(status))
   ) {
-    finishedAt = firstTimestamp(session?.commandFinishedAt)
+    // Synthetic prerequisite rows (for example map transfer on a direct
+    // relocalize command) have no independent completion packet. Close them
+    // at their inferred start instead of using the whole command's finish;
+    // otherwise chronological clamping pushes every real NDT stage to the
+    // command completion time.
+    finishedAt = hasStageEvidence
+      ? firstTimestamp(
+          record?.updated_at,
+          record?.updatedAt,
+          historical?.finishedAt,
+          session?.commandFinishedAt,
+          session?.observedAt,
+          startedAt,
+        )
+      : startedAt
   }
   return { startedAt, finishedAt }
 }
@@ -920,6 +980,7 @@ export function readStoredAttemptSession(robotId) {
     const session = JSON.parse(raw)
     return withAttemptMarkerExpiry({
       ...session,
+      observedAt: session.observedAt || new Date().toISOString(),
       attempts: Array.isArray(session.attempts)
         ? session.attempts.map(normalizeAttempt)
         : [],

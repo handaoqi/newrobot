@@ -3947,10 +3947,11 @@ async function handleDeleteRoute(route) {
                       </div>
                       <small>{{ step.detail }}</small>
                       <div v-if="step.startedAt || step.finishedAt" class="localization-timeline-time">
-                        开始 {{ formatDateTime(step.startedAt) }} · 完成 {{ formatDateTime(step.finishedAt) }}
+                        开始 {{ formatDateTime(step.startedAt) }}
+                        <template v-if="step.finishedAt"> · 完成 {{ formatDateTime(step.finishedAt) }}</template>
+                        <template v-else> · 进行中</template>
                         <em v-if="formatLocalizationStageDuration(step)"> · {{ formatLocalizationStageDuration(step) }}</em>
                       </div>
-                      <div v-else-if="step.status !== 'waiting'" class="localization-timeline-time">阶段时间未上报</div>
                       <div v-if="step.attempts.length" class="localization-timeline-attempts">
                         <div
                           v-for="attempt in step.attempts"

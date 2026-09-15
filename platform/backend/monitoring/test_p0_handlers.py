@@ -138,6 +138,13 @@ class MessageHandlerTests(TestCase):
                 "status": "executing",
                 "started_at": timezone.now().isoformat(),
                 "result": {
+                    "startup_progress": {
+                        "phase": "rtk_fixed",
+                        "phase_label": "验证 RTK 固定解",
+                        "status": "running",
+                        "current_action": "智能初始化定位：验证 RTK 固定解",
+                        "next_action": "定位接管后应用航段策略并下发首航点",
+                    },
                     "localization_attempts": {
                         "state": "running",
                         "attempts": [
@@ -157,6 +164,13 @@ class MessageHandlerTests(TestCase):
                 "started_at": progress["payload"]["started_at"],
                 "result": {
                     "selected_stage": "navigation_start",
+                    "startup_progress": {
+                        "phase": "navigation_start",
+                        "phase_label": "应用航段策略并下发首航点",
+                        "status": "completed",
+                        "current_action": "首航点已下发，Nav2 开始执行",
+                        "next_action": "持续上报路径跟踪与航点进度",
+                    },
                     "navigation_start": {
                         "status": "accepted",
                         "started_at": timezone.now().isoformat(),
@@ -176,6 +190,14 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(self.command.result_payload["selected_stage"], "navigation_start")
         self.assertEqual(self.command.result_payload["navigation_start"]["status"], "accepted")
         self.assertIsNone(self.command.finished_at)
+        logs = list(SystemLog.objects.filter(
+            command=self.command,
+            event_code="task.start.progress",
+        ))
+        self.assertCountEqual([item.message for item in logs], [
+            "启动任务：智能初始化定位：验证 RTK 固定解",
+            "启动任务：首航点已下发，Nav2 开始执行",
+        ])
 
     def test_late_start_ack_repairs_center_timeout(self):
         CommandService.mark_timeout(self.command)
@@ -711,6 +733,51 @@ class MessageHandlerTests(TestCase):
         self.assertEqual(event.event_type, "task.target_dispatched")
         self.assertEqual(event.payload["waypoint"]["map_point_number"], 1)
         self.assertEqual(event.payload["robot_pose"]["x"], 0.8)
+
+    def test_navigation_progress_log_names_phase_and_keeps_strategy_details(self):
+        progress = self.envelope(
+            "task.progress",
+            {
+                "task_execution_id": str(self.execution.id),
+                "state": "running",
+                "state_version": 4,
+                "current_waypoint_index": 1,
+                "completed_waypoints": 1,
+                "total_waypoints": 2,
+                "distance_remaining_m": 3.25,
+                "reported_at": timezone.now().isoformat(),
+                "navigation_progress": {
+                    "phase": "path_tracking",
+                    "phase_label": "路径跟踪",
+                    "waypoint": {"index": 1, "map_point_number": 2, "waypoint_id": "wp-2"},
+                    "progress": {
+                        "completed_waypoints": 1,
+                        "total_waypoints": 2,
+                        "distance_remaining_m": 3.25,
+                    },
+                    "modules": {
+                        "global_planner": "theta_star",
+                        "local_controller": "mppi",
+                    },
+                    "strategy": {
+                        "speed_level": "micro",
+                        "configured_linear_limit_mps": 0.3,
+                        "detour_enabled": True,
+                        "collision_stop_enabled": True,
+                    },
+                },
+            },
+        )
+
+        handle_mqtt_message("robots/rx-001/events/task", progress)
+
+        log = SystemLog.objects.get(
+            task_execution=self.execution,
+            event_code="navigation.progress",
+        )
+        self.assertEqual(log.message, "导航至2号点：路径跟踪")
+        self.assertEqual(log.data["navigation_progress"]["modules"]["local_controller"], "mppi")
+        self.assertEqual(log.dedupe_key, "0:1:path_tracking")
 
     @patch("monitoring.message_handlers.tts_service.synthesize_speech", return_value=("tts-audio/waypoint.mp3", True))
     def test_completed_waypoint_queues_selected_speech(self, synthesize_speech):

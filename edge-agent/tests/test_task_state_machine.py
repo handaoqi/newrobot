@@ -662,6 +662,19 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
     assert events[0][1]["initial_waypoint_index"] == 1
     assert events[1][0] == "task.progress"
     assert events[1][1]["completed_waypoints"] == 1
+    navigation = events[1][1]["navigation_progress"]
+    assert navigation["phase"] == "target_dispatched"
+    assert navigation["waypoint"]["map_point_number"] == 2
+    assert navigation["progress"] == {
+        "completed_waypoints": 1,
+        "total_waypoints": 3,
+        "distance_remaining_m": None,
+    }
+    assert navigation["modules"]["local_controller"] == "mppi"
+    assert navigation["strategy"]["speed_level"] == "micro"
+    assert navigation["strategy"]["speed_profile"] == "final"
+    assert navigation["strategy"]["configured_linear_limit_mps"] == 0.15
+    assert navigation["strategy"]["collision_stop_enabled"] is True
     store.close()
 
 

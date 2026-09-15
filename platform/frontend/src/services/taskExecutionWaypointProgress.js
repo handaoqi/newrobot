@@ -70,6 +70,10 @@ function coordinateText(point) {
   return `x ${x.toFixed(2)} / y ${y.toFixed(2)}`
 }
 
+function hasFiniteNumber(value) {
+  return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
+}
+
 function eventWaypointLabel(event, execution) {
   const payload = event?.payload || {}
   const point = payload.waypoint || {}
@@ -138,6 +142,74 @@ function executionFailureDetail(execution) {
 
 function systemLogDetail(log) {
   const data = log?.data || {}
+  const startup = data.startup_progress && typeof data.startup_progress === 'object'
+    ? data.startup_progress
+    : null
+  if (startup) {
+    const actions = Array.isArray(startup.actions) ? startup.actions : []
+    const completed = actions.filter(item => item?.status === 'completed').map(item => item.label).filter(Boolean)
+    const active = actions.find(item => item?.status === 'in_progress')
+    const failed = actions.find(item => item?.status === 'failed')
+    return [
+      completed.length ? `已完成：${completed.join('、')}` : '',
+      failed?.label ? `失败：${failed.label}` : (active?.label ? `当前：${active.label}` : ''),
+      startup.current_action && startup.current_action !== active?.label ? startup.current_action : '',
+      startup.next_action ? `下一步：${startup.next_action}` : '',
+    ].filter(Boolean).join(' · ')
+  }
+  const navigation = data.navigation_progress && typeof data.navigation_progress === 'object'
+    ? data.navigation_progress
+    : null
+  if (navigation) {
+    const progress = navigation.progress || {}
+    const modules = navigation.modules || {}
+    const strategy = navigation.strategy || {}
+    const globalPlannerLabels = { theta_star: 'ThetaStar', navfn: 'NavFn', smac_hybrid: 'Smac Hybrid' }
+    const localControllerLabels = { mppi: 'MPPI（FollowPath）', rpp: 'RPP', ilqr: 'iLQR' }
+    const smootherLabels = { savitzky_golay: 'Savitzky-Golay', simple_smoother: 'Simple Smoother', passthrough_smoother: '直通平滑器' }
+    const goalCheckerLabels = { general_goal_checker: '通用 GoalChecker', precision_goal_checker: '精确 GoalChecker' }
+    const localizationLabels = { ndt: 'NDT', ukf: 'UKF', rtk: 'RTK' }
+    const moduleNames = [
+      globalPlannerLabels[modules.global_planner] || modules.global_planner,
+      localControllerLabels[modules.local_controller] || modules.local_controller,
+      smootherLabels[modules.smoother] || modules.smoother,
+      goalCheckerLabels[modules.goal_checker] || modules.goal_checker,
+    ].filter(Boolean)
+    const speedLabels = { micro: '微速', low: '低速', medium: '中速', high: '高速' }
+    const arrivalPolicyLabels = {
+      pass_through: '通过不停留',
+      stop_and_confirm: '停车校正确认',
+      precision: '精确到点',
+      dock: '停靠确认',
+    }
+    const strategyParts = [
+      speedLabels[strategy.speed_level] || strategy.speed_level,
+      strategy.speed_profile === 'final' ? '终点靠近' : '巡航',
+      hasFiniteNumber(strategy.configured_linear_limit_mps)
+        ? `线速度上限 ${Number(strategy.configured_linear_limit_mps).toFixed(2)}m/s`
+        : '',
+      strategy.detour_enabled === true ? '绕行开启' : strategy.detour_enabled === false ? '绕行关闭' : '',
+      strategy.collision_slowdown_enabled === true ? '碰撞减速开启' : strategy.collision_slowdown_enabled === false ? '碰撞减速关闭' : '',
+      strategy.collision_stop_enabled === true ? '硬急停开启' : '',
+      strategy.arrival_policy ? `到点 ${arrivalPolicyLabels[strategy.arrival_policy] || strategy.arrival_policy}` : '',
+      hasFiniteNumber(strategy.xy_goal_tolerance_m)
+        ? `XY ${Number(strategy.xy_goal_tolerance_m).toFixed(2)}m`
+        : '',
+    ].filter(Boolean)
+    return [
+      hasFiniteNumber(progress.completed_waypoints) && hasFiniteNumber(progress.total_waypoints)
+        ? `进度 ${Number(progress.completed_waypoints)}/${Number(progress.total_waypoints)}`
+        : '',
+      hasFiniteNumber(progress.distance_remaining_m)
+        ? `距航点 ${Number(progress.distance_remaining_m).toFixed(2)}m`
+        : '',
+      moduleNames.length ? `执行模块：${moduleNames.join(' → ')}` : '',
+      modules.localization_mode
+        ? `定位策略：${localizationLabels[modules.localization_mode] || modules.localization_mode}`
+        : '',
+      strategyParts.length ? `控制策略：${strategyParts.join('、')}` : '',
+    ].filter(Boolean).join(' · ')
+  }
   const reason = data.reason_message || data.error_message || data.reason_code || data.error_code || ''
   const parts = [log?.event_code || '', reason]
   if (log?.waypoint_index !== null && log?.waypoint_index !== undefined) {

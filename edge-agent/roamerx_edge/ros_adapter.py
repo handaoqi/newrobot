@@ -2792,6 +2792,7 @@ class RosAdapter(Node):
         with self._localization_sample_condition:
             sample_sequence = self._localization_sample_sequence
         scan_match_sequence = self._scan_match_sequence_snapshot()
+        handoff_started_at = now_iso()
         # The publisher is reliable and a live subscriber was confirmed above.
         # Publishing once also lets the localization node deliberately re-run
         # an unchanged pose while lost without five duplicate resets.
@@ -2863,6 +2864,13 @@ class RosAdapter(Node):
             handoff_diagnostics = self._lio_handoff_diagnostics(
                 handoff_decision, accepted=False
             )
+            handoff_finished_at = now_iso()
+            handoff_diagnostics.update({
+                "status": "failed",
+                "started_at": handoff_started_at,
+                "updated_at": handoff_finished_at,
+                "finished_at": handoff_finished_at,
+            })
             diagnostic = ""
             if best_candidate:
                 score = best_candidate.get("matching_error")
@@ -2887,6 +2895,7 @@ class RosAdapter(Node):
                         if best_candidate else "ndt_sample_unavailable"
                     ),
                     "handoff_diagnostics": handoff_diagnostics,
+                    "handoff": handoff_diagnostics,
                     "localization_decision": handoff_decision,
                 },
             )
@@ -2896,6 +2905,9 @@ class RosAdapter(Node):
             "status": "completed",
             "conclusion_code": "lio_imu_handoff_verified",
             "conclusion": "fresh FAST-LIO + IMU handoff verified",
+            "started_at": handoff_started_at,
+            "updated_at": now_iso(),
+            "finished_at": now_iso(),
         }
         return {
             "frame_id": frame_id,
@@ -5029,6 +5041,11 @@ class RosAdapter(Node):
         except ProtocolError as exc:
             if exc.code == "RELOCALIZATION_SUPERSEDED":
                 raise
+            failed_handoff = dict(
+                (exc.details or {}).get("handoff")
+                or (exc.details or {}).get("handoff_diagnostics")
+                or {}
+            )
             for item in attempts:
                 if item.get("index") != winner_index:
                     continue
@@ -5048,6 +5065,7 @@ class RosAdapter(Node):
                 "best_match_pose": best_pose,
                 "best_ndt_committed": True,
                 "handoff_pending": True,
+                "handoff": failed_handoff or None,
                 "motion_commanded": False,
                 "best_candidate_commit_started_at": commit_started_at,
                 "best_candidate_commit_finished_at": now_iso(),

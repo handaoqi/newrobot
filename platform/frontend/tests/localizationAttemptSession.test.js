@@ -328,6 +328,105 @@ test('timeline does not timestamp future stages and keeps displayed times chrono
   assert.equal(global.finishedAt, null)
 })
 
+test('handoff and secondary correction expose reported stage times with legacy fallback', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-stage-times',
+    command_type: 'nav.relocalize',
+    status: 'succeeded',
+    issued_at: '2026-09-16T00:00:00.000Z',
+    started_at: '2026-09-16T00:00:01.000Z',
+    finished_at: '2026-09-16T00:00:08.000Z',
+    result_payload: {
+      localization_bootstrap: {
+        status: 'completed',
+        started_at: '2026-09-16T00:00:01.000Z',
+        finished_at: '2026-09-16T00:00:02.000Z',
+      },
+      localization_attempts: {
+        state: 'accepted',
+        strategy: ['mapping_origin_bounded'],
+        stages: [{
+          stage: 'mapping_origin_bounded',
+          status: 'accepted',
+          started_at: '2026-09-16T00:00:02.000Z',
+          finished_at: '2026-09-16T00:00:04.000Z',
+        }],
+        best_ndt_committed: true,
+        best_match_pose: { x: 1, y: 2, yaw: 0 },
+        best_candidate_commit_started_at: '2026-09-16T00:00:04.000Z',
+        best_candidate_commit_finished_at: '2026-09-16T00:00:05.000Z',
+        handoff: {
+          status: 'completed',
+          started_at: '2026-09-16T00:00:05.000Z',
+          finished_at: '2026-09-16T00:00:06.000Z',
+        },
+        secondary_correction: {
+          status: 'completed',
+          started_at: '2026-09-16T00:00:06.000Z',
+          finished_at: '2026-09-16T00:00:07.000Z',
+        },
+      },
+      navigation_start: {
+        status: 'completed',
+        started_at: '2026-09-16T00:00:07.000Z',
+        finished_at: '2026-09-16T00:00:08.000Z',
+      },
+    },
+  })
+
+  const timeline = localizationAttemptTimeline(session)
+  const handoff = timeline.find(item => item.key === 'fast_lio_imu_handoff')
+  const secondary = timeline.find(item => item.key === 'secondary_correction')
+  assert.equal(handoff.startedAt, '2026-09-16T00:00:05.000Z')
+  assert.equal(handoff.finishedAt, '2026-09-16T00:00:06.000Z')
+  assert.equal(secondary.startedAt, '2026-09-16T00:00:06.000Z')
+  assert.equal(secondary.finishedAt, '2026-09-16T00:00:07.000Z')
+  assert.equal(
+    timeline.filter(item => item.status !== 'waiting').every(item => item.startedAt),
+    true,
+  )
+
+  const legacy = localizationAttemptSessionFromCommand({
+    command_type: 'nav.relocalize',
+    status: 'executing',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        strategy: ['mapping_origin_bounded'],
+        selected_stage: 'mapping_origin_bounded',
+      },
+    },
+  }, { observedAt: '2026-09-16T00:10:00.000Z' })
+  assert.equal(
+    localizationAttemptTimeline(legacy)
+      .filter(item => item.status !== 'waiting')
+      .every(item => item.startedAt),
+    true,
+  )
+
+  const rtkNestedHandoff = localizationAttemptSessionFromCommand({
+    command_type: 'nav.initial_pose',
+    status: 'succeeded',
+    result_payload: {
+      localization_attempts: {
+        state: 'accepted',
+        rtk_verification: {
+          status: 'accepted',
+          handoff: {
+            status: 'completed',
+            started_at: '2026-09-16T00:20:01.000Z',
+            finished_at: '2026-09-16T00:20:02.000Z',
+          },
+        },
+      },
+    },
+  })
+  const nestedHandoffStage = localizationAttemptTimeline(rtkNestedHandoff)
+    .find(item => item.key === 'fast_lio_imu_handoff')
+  assert.equal(nestedHandoffStage.startedAt, '2026-09-16T00:20:01.000Z')
+  assert.equal(nestedHandoffStage.finishedAt, '2026-09-16T00:20:02.000Z')
+})
+
 test('legacy terminal stages fall back to command timestamps', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-no-synthetic-times',

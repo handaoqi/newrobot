@@ -15,6 +15,72 @@ from .teleop_skill_executor import TeleopSkillExecutor
 LOGGER = logging.getLogger(__name__)
 
 
+STARTUP_STAGE_LABELS = {
+    "map_transfer": "应用任务地图",
+    "localization_bootstrap": "准备定位节点",
+    "last_trusted": "验证可信位姿",
+    "mapping_origin_bounded": "搜索建图原点及周边候选",
+    "mapping_origin": "搜索建图原点及周边候选",
+    "route_waypoints": "搜索路线航点候选",
+    "route_waypoint": "搜索路线航点候选",
+    "keyframe_global_match": "执行全局关键帧匹配",
+    "quick_initialization": "执行快速定位搜索",
+    "operator_initial_pose": "验证手选初始位姿",
+    "best_candidate_commit": "提交最优定位结果",
+    "fast_lio_imu_handoff": "确认 FAST-LIO + IMU 接管",
+    "secondary_correction": "执行二次定位校正",
+    "rtk_fixed": "验证 RTK 固定解",
+    "rtk_correction": "执行 RTK 定位校正",
+    "ukf_correction": "执行 UKF 融合校正",
+    "ndt_secondary_correction": "执行 NDT 二次校正",
+    "navigation_start": "应用航段策略并下发首航点",
+}
+
+
+def _startup_progress_detail(result: dict) -> dict:
+    """Build a stable operator summary for task.start progress records."""
+    localization = result.get("localization_attempts")
+    localization = localization if isinstance(localization, dict) else {}
+    phase = str(result.get("selected_stage") or localization.get("selected_stage") or "localization_bootstrap")
+    phase_label = STARTUP_STAGE_LABELS.get(phase, phase.replace("_", " "))
+    navigation_start = result.get("navigation_start")
+    navigation_start = navigation_start if isinstance(navigation_start, dict) else {}
+    navigation_status = str(navigation_start.get("status") or result.get("state") or "running").lower()
+    at_navigation_start = phase == "navigation_start"
+    navigation_done = at_navigation_start and navigation_status in {"accepted", "succeeded", "ready"}
+    navigation_failed = at_navigation_start and navigation_status in {"failed", "rejected", "error"}
+    localization_status = "completed" if at_navigation_start else "in_progress"
+    dispatch_status = (
+        "failed" if navigation_failed else "completed" if navigation_done else
+        "in_progress" if at_navigation_start else "waiting"
+    )
+    if navigation_done:
+        current_action = "首航点已下发，Nav2 开始执行"
+        next_action = "持续上报路径跟踪与航点进度"
+    elif navigation_failed:
+        current_action = "启动导航失败"
+        next_action = "等待安全处理或重新启动"
+    elif at_navigation_start:
+        current_action = phase_label
+        next_action = "确认 Nav2 接受首航点"
+    else:
+        current_action = f"智能初始化定位：{phase_label}"
+        next_action = "定位接管后应用航段策略并下发首航点"
+    return {
+        "phase": phase,
+        "phase_label": phase_label,
+        "status": "failed" if navigation_failed else "completed" if navigation_done else "running",
+        "current_action": current_action,
+        "next_action": next_action,
+        "actions": [
+            {"key": "navigation_stack_check", "label": "检查导航栈与安全状态", "status": "completed"},
+            {"key": "route_validation", "label": "校验地图、边界与路线", "status": "completed"},
+            {"key": "localization_initialization", "label": "初始化定位并确认主定位源", "status": localization_status},
+            {"key": "navigation_dispatch", "label": "应用航段策略并下发首航点", "status": dispatch_status},
+        ],
+    }
+
+
 class CommandProcessor:
     def __init__(
         self,
@@ -896,9 +962,12 @@ class CommandProcessor:
 
     def _emit_command_progress(self, envelope: MessageEnvelope, started_at: str, result: dict) -> None:
         try:
+            progress_result = dict(result) if isinstance(result, dict) else {}
+            if envelope.message_type == "task.start":
+                progress_result["startup_progress"] = _startup_progress_detail(progress_result)
             progress = build_progress(
                 envelope,
-                result=result if isinstance(result, dict) else {},
+                result=progress_result,
                 started_at=started_at,
             )
             self.publish_progress(envelope.payload["command_id"], progress)

@@ -24,7 +24,7 @@ from .protocol import MessageEnvelope, ProtocolError, now_iso
 from .localization_recovery import select_recovery_seed
 from .recovery_arbiter import RecoveryArbiter
 from .leg_profile import LegProfile
-from .navigation_speed import normalize_navigation_speed_level
+from .navigation_speed import navigation_speed_profile, normalize_navigation_speed_level
 from .waypoint_actions import WaypointActionRegistry
 
 
@@ -5946,7 +5946,7 @@ class TaskExecutor:
                 "yaw": float(getattr(pose, "yaw", 0.0)),
                 "sampled_at": getattr(pose, "sampled_at", None),
             }
-        return {
+        progress = {
             "task_execution_id": self.context.task_execution_id,
             "trace_id": self.context.trace_id,
             "round_number": self.context.round_number,
@@ -5981,6 +5981,92 @@ class TaskExecutor:
                 "yaw": float(waypoint["yaw"]),
             },
             "robot_pose": robot_pose,
+        }
+        progress["navigation_progress"] = self._navigation_progress_detail_locked(
+            waypoint_index,
+            milestone=milestone,
+            completed_waypoints=completed_waypoints,
+            distance_remaining_m=distance_remaining_m,
+        )
+        return progress
+
+    def _navigation_progress_detail_locked(
+        self,
+        waypoint_index: int,
+        *,
+        milestone: str = "",
+        completed_waypoints: int,
+        distance_remaining_m: float | None,
+        phase_override: str = "",
+        phase_label_override: str = "",
+    ) -> dict:
+        """Describe the active Nav2 leg for operator-facing drill records."""
+        waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
+        profile = self._active_leg_profile
+        phase = phase_override or {
+            "target_dispatched": "target_dispatched",
+            "waypoint_reached": "waypoint_reached",
+            "arrival_confirmed": "arrival_confirmed",
+        }.get(milestone, "")
+        if not phase:
+            phase = "final_approach" if profile and profile.speed_profile == "final" else "path_tracking"
+        phase_label = phase_label_override or {
+            "target_dispatched": "目标下发与路径规划",
+            "path_tracking": "路径跟踪",
+            "final_approach": "终点减速靠近",
+            "waypoint_reached": "航点粗到达",
+            "arrival_confirmed": "航点验收完成",
+            "nav_stack_retry": "等待 Nav2 接受目标",
+            "obstacle_wait": "障碍等待与恢复",
+        }.get(phase, phase)
+        speed_level = profile.navigation_speed_level if profile else "micro"
+        configured_speed = navigation_speed_profile(
+            speed_level,
+            getattr(self.navigation, "safety_config", None),
+        ).vx_mps
+        if profile and profile.speed_profile == "final":
+            configured_speed = {
+                "mppi": 0.15,
+                "rpp": 0.18,
+                "ilqr": 0.14,
+            }.get(str(profile.local_controller_id).lower(), configured_speed)
+        return {
+            "phase": phase,
+            "phase_label": phase_label,
+            "module": "Nav2 controller_server",
+            "waypoint": {
+                "index": waypoint_index,
+                "map_point_number": waypoint.get(
+                    "map_point_number", int(waypoint.get("sequence", waypoint_index)) + 1
+                ),
+                "waypoint_id": waypoint.get("waypoint_id", ""),
+            },
+            "progress": {
+                "completed_waypoints": int(completed_waypoints),
+                "total_waypoints": len(self.context.route_snapshot["waypoints"]),
+                "distance_remaining_m": distance_remaining_m,
+            },
+            "modules": {
+                "global_planner": profile.global_planner_id if profile else None,
+                "local_controller": profile.local_controller_id if profile else None,
+                "smoother": profile.smoother_id if profile else None,
+                "goal_checker": profile.goal_checker_id if profile else None,
+                "localization_mode": profile.localization_mode if profile else None,
+            },
+            "strategy": {
+                "speed_level": speed_level,
+                "speed_profile": profile.speed_profile if profile else None,
+                "configured_linear_limit_mps": round(float(configured_speed), 3),
+                "detour_enabled": profile.detour_enabled if profile else None,
+                "collision_slowdown_enabled": (
+                    profile.collision_slowdown_enabled if profile else None
+                ),
+                "collision_stop_enabled": profile.collision_stop_enabled if profile else True,
+                "arrival_policy": profile.arrival_policy if profile else None,
+                "xy_goal_tolerance_m": round(
+                    float(self._navigation_arrival_tolerance(waypoint_index)), 3
+                ),
+            },
         }
 
     def on_navigation_result(self, status: str, error_message: str = "", details: dict | None = None, generation: int | None = None) -> None:
@@ -7190,6 +7276,7 @@ class TaskExecutor:
             collision_slowdown_enabled=slowdown_enabled,
             collision_stop_enabled=stop_enabled,
             speed_profile=speed_profile,
+            navigation_speed_level=navigation_speed_level,
             goal_checker_id=goal_checker_id,
             arrival_policy=arrival_policy,
             # The filter preserves both endpoints, so it is also safe for
@@ -7412,6 +7499,12 @@ class TaskExecutor:
                 "distance_remaining_m": None,
                 "estimated_time_remaining_s": round(remaining),
                 "nav_stack_retry": True,
+                "navigation_progress": self._navigation_progress_detail_locked(
+                    index,
+                    completed_waypoints=index,
+                    distance_remaining_m=None,
+                    phase_override="nav_stack_retry",
+                ),
                 "reported_at": now_iso(),
             },
             self._event_trace_id(),
@@ -7476,6 +7569,12 @@ class TaskExecutor:
                 "total_waypoints": len(self.context.route_snapshot["waypoints"]),
                 "distance_remaining_m": None,
                 "estimated_time_remaining_s": round(minimum - elapsed),
+                "navigation_progress": self._navigation_progress_detail_locked(
+                    self.context.current_waypoint_index,
+                    completed_waypoints=self.context.current_waypoint_index,
+                    distance_remaining_m=None,
+                    phase_override="obstacle_wait",
+                ),
                 "reported_at": now_iso(),
             },
             "",
