@@ -1510,35 +1510,37 @@ def test_reapproach_rejected_arrival_redispatches_same_waypoint(tmp_path):
     store.close()
 
 
-def test_fine_reapproach_does_not_run_departure_heading_turn(tmp_path):
+def test_normal_patrol_skips_fine_reapproach_inside_coarse_circle(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
+    events = []
+    results = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"arrival_policy": "stop_and_confirm", "require_yaw": False})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
     executor = TaskExecutor(
         store,
         nav,
-        event_callback=lambda *args: None,
-        start_result_callback=lambda *args: None,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: results.append(args),
     )
-    executor.start_task(command("task.start"))
-    waypoint = executor.context.route_snapshot["waypoints"][0]
-    # Inside the 0.50 m coarse radius but outside the 0.20 m final radius,
-    # and deliberately facing away from the click. This is a fine XY
-    # re-approach, not a departure toward a new leg.
+    executor.start_task(envelope)
     nav.pose = SimpleNamespace(
         x=float(waypoint["x"]) + 0.40,
         y=float(waypoint["y"]),
         yaw=0.0,
     )
+    executor._arrival_correction_completed_index = 0
     before = len(nav.sent)
 
     assert executor._reapproach_rejected_arrival(0) is True
-    assert len(nav.sent) == before + 1
-    assert executor._departure_heading_index is None
-    assert nav.teleop == []
-    # Re-approach is XY-only: preserve the corrected current yaw and defer
-    # the waypoint's requested final heading until after XY acceptance.
-    assert nav.sent[-1][0]["yaw"] == pytest.approx(0.0)
-    assert nav.arrival_goal_tolerances[-1][1] == pytest.approx(3.14)
+    assert executor._arrival_reapproach_index is None
+    assert len(nav.sent) == before
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
+    accepted = [event for event in events if event[0] == "task.arrival_degraded_accepted"]
+    assert accepted[-1][1]["distance_m"] == 0.4
     executor.stop()
     store.close()
 
@@ -4892,39 +4894,73 @@ def test_navigation_success_requires_final_pose_near_last_waypoint(tmp_path):
     store.close()
 
 
+def test_patrol_coarse_arrival_continues_without_micro_adjustment(tmp_path):
+    store = LocalStore(str(tmp_path / "edge-coarse.db"))
+    nav = FakeNavigation()
+    results = []
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: results.append(args),
+    )
+    executor.start_task(command("task.start"))
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    final = executor.context.route_snapshot["waypoints"][-1]
+    nav.pose = SimpleNamespace(
+        x=float(final["x"]) + 0.42,
+        y=float(final["y"]),
+        yaw=float(final.get("yaw") or 0.0),
+    )
+    if executor._departure_heading_thread is not None:
+        _await_departure_heading(executor)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    deadline = time.time() + 2.0
+    while executor.context.state == "running" and time.time() < deadline:
+        time.sleep(0.05)
+    assert executor.context.state == "completed"
+    assert results[-1][1] == "succeeded"
+    assert not any(
+        abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
+        for vx, vy, yaw_rate in nav.arrival_adjustments
+    )
+    executor.stop()
+    store.close()
+
+
 def test_patrol_initial_xy_failure_uses_nav2_reapproach_not_micro_adjustment(tmp_path):
-    for distance in (0.42, 1.19):
-        store = LocalStore(str(tmp_path / f"edge-{distance}.db"))
-        nav = FakeNavigation()
-        executor = TaskExecutor(
-            store,
-            nav,
-            event_callback=lambda *args: None,
-            start_result_callback=lambda *args: None,
-        )
-        executor.start_task(command("task.start"))
-        assert ids(nav.sent[0]) == ["wp-1"]
-        drive_patrol(nav, until_ids=["wp-3"], executor=executor)
-        final = executor.context.route_snapshot["waypoints"][-1]
-        nav.pose = SimpleNamespace(
-            x=float(final["x"]) + distance,
-            y=float(final["y"]),
-            yaw=float(final.get("yaw") or 0.0),
-        )
-        if executor._departure_heading_thread is not None:
-            _await_departure_heading(executor)
-        nav.result("succeeded", "", {"missed_waypoints": []})
-        deadline = time.time() + 2.0
-        while len(nav.sent) < 4 and time.time() < deadline:
-            time.sleep(0.05)
-        assert executor.context.state == "running"
-        assert ids(nav.sent[-1]) == ["wp-3"]
-        assert not any(
-            abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
-            for vx, vy, yaw_rate in nav.arrival_adjustments
-        )
-        executor.stop()
-        store.close()
+    store = LocalStore(str(tmp_path / "edge-1.19.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    assert ids(nav.sent[0]) == ["wp-1"]
+    drive_patrol(nav, until_ids=["wp-3"], executor=executor)
+    final = executor.context.route_snapshot["waypoints"][-1]
+    nav.pose = SimpleNamespace(
+        x=float(final["x"]) + 1.19,
+        y=float(final["y"]),
+        yaw=float(final.get("yaw") or 0.0),
+    )
+    if executor._departure_heading_thread is not None:
+        _await_departure_heading(executor)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    deadline = time.time() + 2.0
+    while len(nav.sent) < 4 and time.time() < deadline:
+        time.sleep(0.05)
+    assert executor.context.state == "running"
+    assert ids(nav.sent[-1]) == ["wp-3"]
+    assert not any(
+        abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
+        for vx, vy, yaw_rate in nav.arrival_adjustments
+    )
+    executor.stop()
+    store.close()
 
 
 def test_indoor_patrol_dispatches_single_waypoint_goals(tmp_path):
