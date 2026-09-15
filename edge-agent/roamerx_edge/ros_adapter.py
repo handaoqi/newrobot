@@ -56,10 +56,10 @@ def follow_path_patrol_params(
     vx_max = (0.08 if reapproach else 0.15) if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
     )
-    # A clear final click can sit still while the goal checker settles.
-    # With the local obstacle layer on, DiffDrive has to reverse a little to
-    # turn around a mark; leaving vx_min at 0 freezes the dog on the spot.
-    vx_min = 0.0 if reapproach or (final_approach and not local_obstacles) else -0.12
+    # Last-metre and reapproach are XY close-ups. Allowing reverse here lets
+    # GoalCritic hunt the click (forward, back, forward) instead of settling.
+    # Cruise still keeps vx_min=-0.12 so a blocked leg can reverse around a mark.
+    vx_min = 0.0 if reapproach or final_approach else -0.12
     wz_max = (0.25 if reapproach else 0.35) if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).wz_rps
     )
@@ -83,7 +83,7 @@ def follow_path_patrol_params(
         # PathAlign targets the path tangent instead and made the robot orbit
         # short goals while the goal checker waited for the requested yaw.
         "FollowPath.GoalAngleCritic.enabled": bool(final_approach and require_yaw),
-        "FollowPath.PreferForwardCritic.enabled": not final_approach,
+        "FollowPath.PreferForwardCritic.enabled": True,
         "FollowPath.CostCritic.enabled": bool(local_obstacles),
         # Outdoor scans contain more grass and long-range noise. Keep collision
         # rejection active, but use a lower gradient weight so MPPI makes one

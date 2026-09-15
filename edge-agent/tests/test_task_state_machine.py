@@ -4903,6 +4903,30 @@ def test_pass_through_skips_last_metre_hunt_when_already_close(tmp_path):
     store.close()
 
 
+def test_last_pass_through_waypoint_stays_cruise_inside_last_metre(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    envelope = _pass_through_outdoor_start(nav)
+    last = envelope.payload["command"]["route_snapshot"]["waypoints"][-1]
+    nav.pose = SimpleNamespace(x=float(last["x"]) - 0.6, y=float(last["y"]), yaw=0.0)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(envelope)
+    drive_patrol(nav, until_ids=[last["waypoint_id"]], executor=executor)
+
+    assert executor._patrol_final_approach_applied is False
+    assert nav.waypoint_profiles[-1][2] is False
+
+    nav.feedback(0, 0.4)
+    assert executor._patrol_final_approach_applied is False
+    assert nav.waypoint_profiles[-1][2] is False
+    store.close()
+
+
 def test_pass_through_does_not_spin_before_or_after_the_click(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()

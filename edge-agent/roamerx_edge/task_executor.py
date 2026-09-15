@@ -6902,9 +6902,13 @@ class TaskExecutor:
                 detour_enabled = False
                 slowdown_enabled = False
             precision_goal = waypoint_index == final_index
-        patrol_final = (not self._is_docking_task()) and waypoint_index == len(waypoints) - 1
         require_yaw = bool(target.get("require_yaw", False)) or precision_goal
         arrival_policy = self._arrival_policy(target, waypoint_index)
+        patrol_final = (
+            (not self._is_docking_task())
+            and waypoint_index == len(waypoints) - 1
+            and arrival_policy != "pass_through"
+        )
         final_approach = patrol_final or precision_goal
         if force_require_yaw is not None:
             require_yaw = bool(force_require_yaw) or precision_goal

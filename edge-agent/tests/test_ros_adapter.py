@@ -1605,7 +1605,7 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     assert final["FollowPath.wz_max"] == 0.35
     assert final["FollowPath.PathAlignCritic.enabled"] is True
     assert final["FollowPath.PathAlignCritic.use_path_orientations"] is False
-    assert final["FollowPath.PreferForwardCritic.enabled"] is False
+    assert final["FollowPath.PreferForwardCritic.enabled"] is True
     assert final["FollowPath.GoalCritic.enabled"] is True
     assert final["FollowPath.GoalAngleCritic.enabled"] is False
 
@@ -1639,9 +1639,9 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
         outdoor=True,
     )
     assert outdoor_final_with_obstacles["FollowPath.CostCritic.enabled"] is True
-    assert outdoor_final_with_obstacles["FollowPath.vx_min"] == -0.12
+    assert outdoor_final_with_obstacles["FollowPath.vx_min"] == 0.0
     assert outdoor_final_with_obstacles["FollowPath.PathAlignCritic.enabled"] is False
-    assert outdoor_final_with_obstacles["FollowPath.PreferForwardCritic.enabled"] is False
+    assert outdoor_final_with_obstacles["FollowPath.PreferForwardCritic.enabled"] is True
 
 
 def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(monkeypatch):
@@ -1698,7 +1698,7 @@ def test_final_approach_follow_path_is_applied_before_costmap_timeout(monkeypatc
 
     assert order[0][0] == "/controller_server"
     assert order[0][2]["FollowPath.vx_max"] == 0.15
-    assert order[0][2]["FollowPath.PreferForwardCritic.enabled"] is False
+    assert order[0][2]["FollowPath.PreferForwardCritic.enabled"] is True
     assert order[0][2]["FollowPath.GoalCritic.enabled"] is True
     costmap_calls = [item for item in order if item[0] != "/controller_server"]
     assert costmap_calls
