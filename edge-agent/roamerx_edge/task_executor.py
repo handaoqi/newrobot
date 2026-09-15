@@ -2070,6 +2070,45 @@ class TaskExecutor:
         if callable(accept_trusted):
             accept_trusted()
 
+    def _apply_startup_secondary_correction(self, mode: str) -> None:
+        """Apply the first-waypoint RTK/UKF/NDT correction after NDT commit."""
+        requester = getattr(self.navigation, "control_localization_correction", None)
+        if not callable(requester):
+            return
+        normalized = waypoint_localization_mode(mode)
+        transaction_id = (
+            f"{self.context.task_execution_id}:startup:secondary:{normalized}"
+            if self.context else f"startup:secondary:{normalized}"
+        )
+        result = requester(transaction_id, normalized, "start") or {}
+        if not bool(result.get("accepted")):
+            # Compatibility adapters without a live correction service report
+            # unavailable; the committed NDT pose remains usable in NDT mode.
+            if normalized == "ndt" and str(result.get("status") or "") == "unavailable":
+                return
+            raise ProtocolError(
+                "INITIALIZATION_CORRECTION_REJECTED",
+                str(result.get("message") or result.get("status") or "secondary correction rejected"),
+            )
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            decision = self._localization_decision()
+            transaction = decision.get("one_shot_correction") if isinstance(decision, dict) else {}
+            if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
+                status = str(transaction.get("status") or "")
+                if status == "completed":
+                    return
+                if status in {"failed", "cancelled", "rejected"}:
+                    raise ProtocolError(
+                        "INITIALIZATION_CORRECTION_FAILED",
+                        str(transaction.get("reason") or f"secondary {normalized} correction failed"),
+                    )
+            time.sleep(0.2)
+        raise ProtocolError(
+            "INITIALIZATION_CORRECTION_TIMEOUT",
+            f"secondary {normalized} correction timed out",
+        )
+
     def _progressive_startup_relocalize(self, points: list[dict]) -> None:
         """Run the cold-start search in its fixed, map-scoped order.
 
@@ -2126,36 +2165,7 @@ class TaskExecutor:
         if not self.context or self.context.state != "accepted":
             raise ProtocolError("TASK_CONTEXT_MISMATCH", "accepted task context is missing")
         decision = self._localization_decision()
-        outdoor = self._outdoor_navigation_profile()
         points = self.context.route_snapshot.get("waypoints") or []
-        if outdoor:
-            seed_rtk = getattr(self.navigation, "set_initial_pose_from_rtk", None)
-            if callable(seed_rtk):
-                try:
-                    LOGGER.info(
-                        "startup localization checking live RTK before progressive fallback"
-                    )
-                    seed_rtk()
-                    return
-                except ProtocolError as exc:
-                    if exc.code not in RTK_STARTUP_PROGRESSIVE_FALLBACK_CODES:
-                        raise
-                    LOGGER.warning(
-                        "fixed RTK startup verification failed (%s); using mapping-origin progressive localization: %s",
-                        exc.code,
-                        exc.message,
-                    )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "fixed RTK startup initialization raised %s; using mapping-origin progressive localization",
-                        exc,
-                    )
-            else:
-                LOGGER.warning(
-                    "startup RTK verification API is unavailable; using progressive localization"
-                )
-            self._progressive_startup_relocalize(points)
-            return
         if not self._outdoor_navigation_profile() and self._startup_localization_already_ready(
             decision
         ):
@@ -2166,65 +2176,15 @@ class TaskExecutor:
                 self._reported_localization_status() or "unspecified",
             )
             return
-        index = min(max(0, self.context.current_waypoint_index), max(0, len(points) - 1))
-        candidate_indexes = [index, index - 1, index + 1, 0, len(points) - 1]
-        relocalize = getattr(self.navigation, "active_relocalize", None)
-        seen = set()
-        if callable(relocalize):
-            map_info = dict(self.context.route_snapshot.get("map") or {})
-            latest_getter = getattr(self.navigation, "latest_pose", None)
-            latest = latest_getter() if callable(latest_getter) else None
-            trusted_pose_getter = getattr(self.navigation, "latest_trusted_pose", None)
-            memory_trusted = trusted_pose_getter() if callable(trusted_pose_getter) else None
-            disk_trusted = self.store.load_last_trusted_pose(
-                str(map_info.get("map_id") or ""),
-                str(map_info.get("map_version") or ""),
-            )
-            waypoint = points[index] if index < len(points) else None
-            max_drift = float(
-                getattr(getattr(self, "safety_config", None), "localization_trusted_seed_max_drift_m", 15.0)
-            )
-            startup_seed = select_recovery_seed(
-                latest_pose=latest,
-                memory_trusted=memory_trusted,
-                disk_trusted=disk_trusted,
-                waypoint=waypoint,
-                max_drift_m=max_drift,
-            )
-            if startup_seed:
-                trusted_seed = dict(startup_seed)
-                trusted_seed.update({"max_attempts": 12, "source": "startup_trusted"})
-                try:
-                    LOGGER.info(
-                        "startup localization using %s seed",
-                        startup_seed.get("source"),
-                    )
-                    relocalize(trusted_seed)
-                    return
-                except Exception as exc:
-                    LOGGER.warning("startup trusted-pose localization failed: %s", exc)
-            for candidate_index in candidate_indexes:
-                if candidate_index < 0 or candidate_index >= len(points):
-                    continue
-                waypoint = dict(points[candidate_index])
-                key = (round(float(waypoint["x"]), 3), round(float(waypoint["y"]), 3))
-                if key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    LOGGER.info("startup localization waypoint candidate index=%d", candidate_index)
-                    relocalize({"x": float(waypoint["x"]), "y": float(waypoint["y"]), "yaw": float(waypoint.get("yaw", 0.0)), "max_attempts": 12, "source": "startup_waypoint", "waypoint_index": candidate_index})
-                    return
-                except Exception as exc:
-                    LOGGER.warning("startup waypoint %d localization failed: %s", candidate_index, exc)
-        global_relocalize = getattr(self.navigation, "global_relocalize", None)
-        if callable(global_relocalize):
-            try:
-                global_relocalize(wait_seconds=90.0)
-                return
-            except Exception as exc:
-                LOGGER.warning("startup global localization failed: %s", exc)
-        raise ProtocolError("INITIALIZATION_FAILED", "startup waypoint and global localization both failed")
+        self._progressive_startup_relocalize(points)
+        first_index = min(
+            max(0, self.context.current_waypoint_index),
+            max(0, len(points) - 1),
+        )
+        first_waypoint = points[first_index] if points else {}
+        self._apply_startup_secondary_correction(
+            waypoint_localization_mode(first_waypoint.get("localization_mode"))
+        )
 
     def start_task(self, envelope: MessageEnvelope) -> None:
         """Compatibility entry point used by tests and direct callers."""

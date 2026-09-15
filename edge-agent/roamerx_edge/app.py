@@ -18,6 +18,7 @@ from .command_processor import CommandProcessor
 from .config import EdgeConfig
 from .local_store import LocalStore
 from .localization_recovery import planar_distance_m, select_recovery_seed
+from .map_coordinate import waypoint_localization_mode
 from .map_activation_adapter import MapActivationAdapter
 from .map_set_coordinator import MapSetCoordinator
 from .mapping_adapter import MappingAdapter
@@ -1809,8 +1810,93 @@ class EdgeAgentApplication:
             if key in seen:
                 continue
             seen.add(key)
-            seeds.append({"x": float(point["x"]), "y": float(point["y"]), "z": float(point.get("z", 0.0) or 0.0), "yaw": float(point.get("yaw", 0.0) or 0.0), "source": "waypoint", "waypoint_index": candidate_index})
+            seeds.append({
+                "x": float(point["x"]),
+                "y": float(point["y"]),
+                "z": float(point.get("z", 0.0) or 0.0),
+                "yaw": float(point.get("yaw", 0.0) or 0.0),
+                "source": "waypoint",
+                "waypoint_index": candidate_index,
+                "localization_mode": waypoint_localization_mode(
+                    point.get("localization_mode")
+                ),
+                "localization_anchor_preference": str(
+                    point.get("localization_anchor_preference") or "balanced"
+                ).strip().lower(),
+            })
         return seeds
+
+    def _current_recovery_localization_policy(self) -> dict:
+        """Return the live pending-waypoint correction policy for recovery.
+
+        Recovery used to select RTK/NDT from the fault diagnosis alone.  That
+        made the second attempt different from the waypoint's configured
+        localization policy and allowed a direct RTK reseed before NDT.
+        """
+        waypoint_getter = getattr(self.task_executor, "current_localization_waypoint", None)
+        waypoint = waypoint_getter() if callable(waypoint_getter) else None
+        waypoint = waypoint if isinstance(waypoint, dict) else {}
+        mode = waypoint_localization_mode(waypoint.get("localization_mode"))
+        map_info = {}
+        context = getattr(self.task_executor, "context", None)
+        route_snapshot = {}
+        if context:
+            route_snapshot = getattr(context, "route_snapshot", None) or {}
+            map_info = dict(route_snapshot.get("map") or {})
+        scene = str(
+            map_info.get("scene_scope")
+            or route_snapshot.get("scene_scope")
+            or "indoor"
+        ).strip().lower()
+        coordinate_mode = str(map_info.get("coordinate_mode") or "").strip().lower()
+        # A local-only map cannot consume RTK.  Keep the request auditable by
+        # reporting the normalized mode rather than silently calling RTK.
+        if coordinate_mode == "local_only" and mode == "rtk":
+            mode = "ndt"
+        return {
+            "mode": mode,
+            "scene_scope": scene,
+            "coordinate_mode": coordinate_mode,
+            "waypoint_index": waypoint.get("waypoint_index"),
+            "anchor_preference": str(
+                waypoint.get("localization_anchor_preference") or "balanced"
+            ).strip().lower(),
+        }
+
+    def _apply_recovery_secondary_correction(
+        self, policy: dict, recovery_generation: int, cycle: int
+    ) -> bool:
+        """Run the configured stationary RTK/UKF/NDT correction after NDT commit."""
+        mode = str(policy.get("mode") or "ndt")
+        requester = getattr(self.navigation, "control_localization_correction", None)
+        if not callable(requester):
+            # Older simulation adapters have no correction transaction API;
+            # their NDT commit remains the complete recovery operation.
+            return True
+        task_id = getattr(getattr(self.task_executor, "context", None), "task_execution_id", "recovery")
+        transaction_id = f"{task_id}:recovery:{cycle}:secondary:{mode}"
+        result = requester(transaction_id, mode, "start") or {}
+        if not bool(result.get("accepted")):
+            LOGGER.warning(
+                "recovery secondary %s correction was not accepted: %s",
+                mode, result.get("message") or result.get("status"),
+            )
+            return mode == "ndt" and str(result.get("status") or "") == "unavailable"
+        deadline = time.monotonic() + 30.0
+        while not self._localization_recovery_cancelled(recovery_generation) and time.monotonic() < deadline:
+            decision_getter = getattr(self.navigation, "localization_decision", None)
+            decision = decision_getter() if callable(decision_getter) else {}
+            transaction = decision.get("one_shot_correction") if isinstance(decision, dict) else {}
+            if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
+                status = str(transaction.get("status") or "")
+                if status == "completed":
+                    return True
+                if status in {"failed", "cancelled", "rejected"}:
+                    LOGGER.warning("recovery secondary %s correction ended with %s", mode, status)
+                    return False
+            time.sleep(0.2)
+        LOGGER.warning("recovery secondary %s correction timed out", mode)
+        return False
 
     def _rtk_good_for_navigation(self) -> bool:
         getter = getattr(self.navigation, "localization_decision", None)
@@ -1916,55 +2002,16 @@ class EdgeAgentApplication:
             level_zero_action = self._begin_self_heal_action(
                 level=0, action_type=diagnosis.action_type
             )
-            if diagnosis.wait_for_rtk and not force_absolute_recovery:
-                self._hold_motion_for_relocalize()
-                if self._wait_for_rtk_recovery():
-                    self._finish_self_heal_action(
-                        level_zero_action, success=True, reason="rtk_recovered_during_wait"
-                    )
-                    return
-                self._finish_self_heal_action(
-                    level_zero_action, success=False, reason="rtk_wait_expired"
-                )
-                diagnosis = self._diagnose_self_healing(
-                    diagnosis.fault_label,
-                    episode_id=diagnosis.episode_id,
-                    level=1,
-                )
-                if diagnosis.use_lio_hold:
-                    profile_action = self._begin_self_heal_action(
-                        level=1, action_type="set_ukf_lio_hold"
-                    )
-                    result = self._activate_lio_hold(diagnosis.fault_label)
-                    accepted = bool(result.get("accepted"))
-                    profile_generation = int(result.get("generation") or 0)
-                    self._finish_self_heal_action(
-                        profile_action,
-                        success=accepted,
-                        reason=str(result.get("message") or ""),
-                    )
-                    if accepted:
-                        # RTK/NDT are auxiliary anchors. Healthy FAST-LIO may
-                        # continue safely without waiting for either source to
-                        # improve, and the temporary profile rejects bad anchor
-                        # observations until health returns.
-                        self._handle_task_localization_recovered(
-                            restore_fusion=False,
-                            recovery_reason="lio_hold_degraded_continuation",
-                        )
-                        threading.Thread(
-                            target=self._restore_fusion_when_absolute_recovers,
-                            args=(profile_generation,),
-                            daemon=True,
-                            name="localization-fusion-profile-restore",
-                        ).start()
-                        return
-            else:
-                self._finish_self_heal_action(
-                    level_zero_action,
-                    success=False,
-                    reason="level_0_requires_active_relocalization",
-                )
+            # RTK is no longer a first-step reseed.  Every recovery attempt
+            # must first run the stationary NDT search and commit its best
+            # candidate; the current waypoint policy then selects RTK/UKF/NDT
+            # as the secondary correction.  LIO-hold continuation remains an
+            # explicit higher-level fallback after the bounded search.
+            self._finish_self_heal_action(
+                level_zero_action,
+                success=False,
+                reason="ndt_first_requires_active_relocalization",
+            )
             cycle_retry = max(
                 1.0,
                 (
@@ -1977,13 +2024,19 @@ class EdgeAgentApplication:
             cycle = 0
             started_at = time.time()
             first_cycle = True
+            # Keep the legacy RTK branch below as a final fallback only; it is
+            # deliberately disabled for the normal recovery cycle so RTK
+            # cannot bypass NDT commit and FAST-LIO handoff.
+            allow_direct_rtk_fallback = False
             while first_cycle or self.task_executor.is_paused_for_localization():
                 if self._localization_recovery_cancelled(recovery_generation):
                     LOGGER.info("localization recovery cancelled by task teardown")
                     return
                 first_cycle = False
                 cycle += 1
-                if self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation():
+                if allow_direct_rtk_fallback and (
+                    self._rtk_good_for_navigation() or self._rtk_position_good_for_navigation()
+                ):
                     try:
                         if self._attempt_rtk_recovery(
                             force_reseed=force_absolute_recovery
@@ -2041,6 +2094,7 @@ class EdgeAgentApplication:
                     return
                 primary_seed = self._localization_recovery_seed()
                 waypoint_seeds = self._localization_waypoint_seeds()
+                recovery_policy = self._current_recovery_localization_policy()
                 seeds = []
                 seen_seeds = set()
                 for seed in ([primary_seed] if primary_seed else []) + waypoint_seeds:
@@ -2073,6 +2127,10 @@ class EdgeAgentApplication:
                                 "automatic relocalization stopped before it could preempt an operator request"
                             )
                             return
+                        # Re-read the pending waypoint immediately before each
+                        # candidate so a reconciled task index cannot retain a
+                        # stale RTK/UKF/NDT policy from the previous attempt.
+                        recovery_policy = self._current_recovery_localization_policy()
                         LOGGER.warning("localization lost; try waypoint seed index=%s x=%.3f y=%.3f yaw=%.3f", seed.get("waypoint_index"), seed["x"], seed["y"], seed["yaw"])
                         local_action = self._begin_self_heal_action(
                             level=1, action_type="local_relocalize"
@@ -2085,7 +2143,15 @@ class EdgeAgentApplication:
                                 **seed,
                                 "max_attempts": 12,
                                 "_automatic_recovery": True,
+                                "secondary_correction_mode": recovery_policy["mode"],
+                                "secondary_correction_policy": recovery_policy,
                             })
+                            if not self._apply_recovery_secondary_correction(
+                                recovery_policy, recovery_generation, cycle
+                            ):
+                                raise RuntimeError(
+                                    f"secondary {recovery_policy['mode']} correction failed"
+                                )
                             self._finish_self_heal_action(
                                 local_action,
                                 success=True,

@@ -2147,9 +2147,7 @@ function localizationAttemptProgressText(session) {
   const committingAttempt = (session?.attempts || []).find(attempt => attempt.status === 'committing')
   if (session?.globalSearchStarted) return '全局关键帧匹配阶段'
   if (session?.commandType === 'nav.initial_pose') {
-    return session?.rtkVerification || ['rtk', 'rtk_fixed'].includes(session?.source)
-      ? 'RTK 固定解质量验证与定点 NDT 交叉验证'
-      : '正在验证手选初始位姿'
+    return '统一初始化：NDT 原点/附近搜索 → 提交最优结果 → FAST-LIO + IMU 接管 → 二次校正'
   }
   if (candidateCount <= 0) return '正在准备定位候选列表'
   if (activeAttempt) {
@@ -2256,6 +2254,7 @@ async function initializeLocalization() {
       mapVersion: selectedMapVersion(),
       sceneScope: selectedMap.value?.scene_scope || routeForm.value.scene_scope || 'indoor',
       coordinateMode: selectedMap.value?.coordinate_mode || '',
+      localizationMode: waypoints.value[0]?.localization_mode || 'ndt',
       waypoints: waypoints.value.map(point => {
         const normalized = normalizeStoredWaypoint(point)
         return { x: Number(normalized.x), y: Number(normalized.y), yaw: Number(normalized.yaw || 0) }
@@ -2353,6 +2352,7 @@ async function activeRelocalize() {
       mapVersion: selectedMapVersion(),
       sceneScope,
       coordinateMode,
+      localizationMode: waypoints.value[0]?.localization_mode || 'ndt',
       waypoints: waypoints.value,
       existingActivation: activation,
       onProgress: message => { localizationInitMessage.value = message },
@@ -3763,7 +3763,7 @@ async function handleDeleteRoute(route) {
             </div>
             <div class="localization-algorithm-note">
               <span><strong>下发地图</strong> 目标地图已就绪时直接复用；否则应用地图并恢复定位，局部候选均无合格结果时才进入全图位置与航向匹配。</span>
-              <span><strong>初始化定位</strong> 室外/过渡且使用 RTK 固定原点时优先验证 RTK；位置与双天线航向可用、连续 3 个新样本的 RTK 自身位置跨度不超过 0.30 m 才通过，随后必须由新鲜 FAST-LIO + IMU 完成接管，否则转入建图原点、航点和全局流程。</span>
+              <span><strong>统一定位</strong> 所有场景先搜索建图原点及周边 NDT 候选，提交当前阶段最优结果并确认 FAST-LIO + IMU 接管；随后按首航点策略执行 RTK、UKF 或 NDT 二次校正，室内不读取 RTK。</span>
               <span><strong>主动重定位</strong> 静止搜索建图原点及周边，有合格候选即提交该阶段最优，其中稳定 NDT 分数严格小于 0.01 时提前结束；原点阶段无合格候选才尝试手选点/路线航点，仍无合格候选才全局匹配。</span>
               <span><i class="legend-relocalization-dot"></i> 紫色标记仅记录终态中的严格优选位置：RTK 固定解验证及 FAST-LIO 接管通过，或最优 NDT 位姿已提交且分数严格小于 0.01；NDT 标记本身不表示 FAST-LIO 已完成稳定接管。</span>
             </div>

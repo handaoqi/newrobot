@@ -3829,63 +3829,8 @@ class RosAdapter(Node):
             self.safety_config, "localization_quick_search_seconds", 30.0
         )))
         quick_deadline = min(overall_deadline, time.monotonic() + quick_budget)
-        outdoor = (
-            str(scene_scope or "").lower() in {"outdoor", "transition"}
-            and str(coordinate_mode or "").lower() != "local_only"
-        )
         stages = []
         rtk_verification = None
-
-        if manual_seed is None and outdoor:
-            rtk_stage_started_at = now_iso()
-            self._report_localization_attempts({
-                "state": "running",
-                "mode": "quick_then_global",
-                "selected_stage": "rtk_fixed",
-                "stages": [{
-                    "stage": "rtk_fixed",
-                    "status": "verifying",
-                    "started_at": rtk_stage_started_at,
-                    "updated_at": rtk_stage_started_at,
-                }],
-                "attempts": [],
-                "candidate_count": 0,
-                "motion_commanded": False,
-            })
-            try:
-                rtk_result = self._set_initial_pose_from_rtk_once(
-                    min(8.0, max(1.0, quick_deadline - time.monotonic())),
-                    generation,
-                )
-                return {
-                    **rtk_result,
-                    "mode": "quick_then_global",
-                    "selected_stage": "rtk_fixed",
-                    "early_stopped": True,
-                    "stop_reason": "rtk_fixed_stable_then_lio_handoff",
-                    "global_search_started": False,
-                }
-            except ProtocolError as exc:
-                if exc.code == "RELOCALIZATION_SUPERSEDED":
-                    raise
-                error_details = dict(exc.details or {})
-                rtk_verification = error_details.get("rtk_verification")
-                rejected_stage = {
-                    "stage": "rtk_fixed",
-                    "status": "rejected",
-                    "started_at": (
-                        (rtk_verification or {}).get("started_at")
-                        if isinstance(rtk_verification, dict)
-                        else rtk_stage_started_at
-                    ) or rtk_stage_started_at,
-                    "updated_at": now_iso(),
-                    "finished_at": now_iso(),
-                    "error_code": exc.code,
-                    "error_message": exc.message,
-                }
-                if isinstance(rtk_verification, dict):
-                    rejected_stage["rtk_verification"] = rtk_verification
-                stages.append(rejected_stage)
 
         seeds = []
         if manual_seed is not None:
@@ -3897,9 +3842,6 @@ class RosAdapter(Node):
             )[:12]:
                 seeds.append(("operator_seed", candidate))
         else:
-            trusted = self.latest_trusted_pose()
-            if trusted and all(trusted.get(field) is not None for field in ("x", "y", "yaw")):
-                seeds.append(("last_trusted", dict(trusted)))
             if origin and all(origin.get(field) is not None for field in ("x", "y", "yaw")):
                 for candidate in self._relocalization_candidates(
                     float(origin["x"]),
@@ -3908,6 +3850,9 @@ class RosAdapter(Node):
                     float(origin.get("yaw", 0.0)),
                 )[:12]:
                     seeds.append(("mapping_origin", candidate))
+            trusted = self.latest_trusted_pose()
+            if trusted and all(trusted.get(field) is not None for field in ("x", "y", "yaw")):
+                seeds.append(("last_trusted", dict(trusted)))
 
         deduplicated = []
         seen = set()
@@ -3937,7 +3882,7 @@ class RosAdapter(Node):
             "state": "running",
             "mode": "quick_then_global",
             "selected_stage": "quick_initialization",
-            "strategy": ["rtk_fixed", "last_trusted", "mapping_origin_local", "keyframe_global_match"],
+            "strategy": ["mapping_origin_local", "last_trusted", "keyframe_global_match"],
             "stages": stages + [quick_stage],
             "attempts": attempts,
             "candidate_count": len(attempts),

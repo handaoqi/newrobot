@@ -609,6 +609,7 @@ class CommandProcessor:
                         "candidate_waypoint_count": len(command.get("waypoints") or []),
                         "coordinate_mode": command.get("coordinate_mode"),
                         "scene_scope": command.get("scene_scope"),
+                        "localization_mode": command.get("localization_mode"),
                     }, envelope=envelope,
                 )
                 if callable(begin_operator):
@@ -628,8 +629,25 @@ class CommandProcessor:
                     }
                 if envelope.message_type == "nav.initial_pose":
                     if str(command.get("seed_source") or "") == "rtk":
-                        result_payload = self.localization_adapter.set_initial_pose_from_rtk(
-                            wait_seconds=float(command.get("wait_seconds", 30.0)),
+                        # Legacy clients may still send seed_source=rtk, but
+                        # RTK is now a secondary correction source.  Always
+                        # enter the NDT-first progressive pipeline so the
+                        # initial anchor and FAST-LIO handoff are verified
+                        # before any RTK/UKF correction is considered.
+                        try:
+                            origin = (
+                                self.map_activation_adapter.mapping_start_pose()
+                                if self.map_activation_adapter else None
+                            )
+                        except ProtocolError as exc:
+                            origin = {
+                                "unavailable_error_code": exc.code,
+                                "unavailable_error_message": exc.message,
+                            }
+                        result_payload = self.localization_adapter.progressive_relocalize(
+                            origin=origin,
+                            waypoints=list(command.get("waypoints") or []),
+                            wait_seconds=float(command.get("wait_seconds", 180.0)),
                         )
                     else:
                         pose = self._resolve_localization_seed(command)
@@ -687,6 +705,34 @@ class CommandProcessor:
                     else:
                         seed = self._resolve_localization_seed(command)
                         result_payload = self.localization_adapter.active_relocalize(seed)
+                # Every externally initiated localization command follows the
+                # same post-NDT correction contract.  This closes the gap for
+                # nav.relocalize/nav.initial_pose callers that do not go
+                # through TaskExecutor startup or self-healing.
+                correction = getattr(self.localization_adapter, "control_localization_correction", None)
+                if callable(correction) and isinstance(result_payload, dict):
+                    mode = str(command.get("localization_mode") or "ndt").strip().lower()
+                    if mode not in {"ndt", "rtk", "ukf"}:
+                        mode = "ndt"
+                    transaction_id = f"{envelope.message_type}:{getattr(envelope, 'command_id', '')}:secondary:{mode}"
+                    secondary = correction(transaction_id, mode, "start") or {}
+                    decision_reader = getattr(self.localization_adapter, "localization_decision", None)
+                    if secondary.get("accepted") and callable(decision_reader):
+                        deadline = time.monotonic() + 30.0
+                        while time.monotonic() < deadline:
+                            decision = decision_reader()
+                            one_shot = decision.get("one_shot_correction") if isinstance(decision, dict) else {}
+                            if isinstance(one_shot, dict) and str(one_shot.get("transaction_id") or "") == transaction_id:
+                                status = str(one_shot.get("status") or "")
+                                if status in {"completed", "failed", "cancelled", "rejected"}:
+                                    secondary = {**secondary, **one_shot}
+                                    break
+                            time.sleep(0.2)
+                    result_payload["secondary_correction"] = {
+                        **secondary,
+                        "mode": mode,
+                        "transaction_id": transaction_id,
+                    }
                 # Every localization snapshot must identify its map.  The
                 # route planner uses this identity to reject terminal results
                 # from a previously selected map.
@@ -843,6 +889,14 @@ class CommandProcessor:
             "shake_hand", "two_leg_stand",
         }:
             self.person_follow_controller.stop("manual_teleop_override")
+        assist_action = bool(command.get("assist", False))
+        if assist_action and not self.task_executor.has_active_task():
+            raise ProtocolError(
+                "MANUAL_ASSIST_REQUIRES_ACTIVE_TASK",
+                "manual assist actions require an active navigation task",
+            )
+        if assist_action:
+            self.safety.validate_manual_assist()
         if action == "takeover_enter":
             if bool(command.get("assist", False)):
                 if not self.task_executor.has_active_task():
@@ -875,26 +929,46 @@ class CommandProcessor:
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "stand_up", {"standing_up", "standing"}, {"stand_up_retrying"}
             )
-            self.safety.state.control_mode = "manual_takeover"
-            self._release_temporary_fusion_for_manual_control(action)
+            if assist_action:
+                self.safety.validate_manual_assist()
+                self.safety.state.control_mode = "manual_assist"
+                result_payload["mode"] = "manual_assist"
+            else:
+                self.safety.state.control_mode = "manual_takeover"
+                self._release_temporary_fusion_for_manual_control(action)
         elif action == "lie_down":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("lie_down")
             teleop_adapter.teleop_velocity(0.0, 0.0, 0.0)
             result_payload = teleop_adapter.remote_teleop_action("lie_down")
-            self.safety.state.control_mode = "autonomous"
+            if assist_action:
+                self.safety.validate_manual_assist()
+                self.safety.state.control_mode = "manual_assist"
+                result_payload["mode"] = "manual_assist"
+            else:
+                self.safety.state.control_mode = "autonomous"
         elif action == "shake_hand":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "shake_hand", {"greeting"}
             )
-            self.safety.state.control_mode = "manual_takeover"
-            self._release_temporary_fusion_for_manual_control(action)
+            if assist_action:
+                self.safety.validate_manual_assist()
+                self.safety.state.control_mode = "manual_assist"
+                result_payload["mode"] = "manual_assist"
+            else:
+                self.safety.state.control_mode = "manual_takeover"
+                self._release_temporary_fusion_for_manual_control(action)
         elif action == "two_leg_stand":
             result_payload = teleop_adapter.confirmed_remote_teleop_action(
                 "two_leg_stand", {"two_leg_standing"}
             )
-            self.safety.state.control_mode = "manual_takeover"
-            self._release_temporary_fusion_for_manual_control(action)
+            if assist_action:
+                self.safety.validate_manual_assist()
+                self.safety.state.control_mode = "manual_assist"
+                result_payload["mode"] = "manual_assist"
+            else:
+                self.safety.state.control_mode = "manual_takeover"
+                self._release_temporary_fusion_for_manual_control(action)
         elif action == "move_stop":
             if self.person_follow_controller:
                 self.person_follow_controller.stop("move_stop")

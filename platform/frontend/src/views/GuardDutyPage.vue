@@ -903,6 +903,7 @@ async function initializeLocalization() {
       mapVersion,
       sceneScope: mapData.value?.scene_scope || routeData.value?.scene_scope || 'indoor',
       coordinateMode: mapData.value?.coordinate_mode || '',
+      localizationMode: routeData.value?.waypoints?.[0]?.localization_mode || 'ndt',
       waypoints: routeData.value?.waypoints || [],
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => updateStoredAttemptSession(robot.id, event.command, event),
@@ -917,9 +918,7 @@ async function initializeLocalization() {
 
     if (localizationCommandVerified(command)) {
       localizationInitState.value = 'success'
-      localizationInitMessage.value = initialization.selectedSource === 'rtk_fixed'
-        ? 'RTK固定解、本地NDT验证、FAST-LIO连续定位与导航栈已确认'
-        : '建图原点/附近候选/航点或全局搜索已完成，FAST-LIO连续定位与导航栈已确认'
+      localizationInitMessage.value = 'NDT最优结果已提交，FAST-LIO + IMU已接管，并完成二次定位校正与导航栈确认'
       try {
         await refreshLocalizationStatus({ sync: false })
       } catch {
@@ -940,9 +939,7 @@ async function initializeLocalization() {
         throw new Error(latestCommand.error_message || latestCommand.error_code || '渐进定位初始化失败')
       }
       if (isCurrentCommand && latestCommand.status === 'succeeded') {
-        localizationInitMessage.value = initialization.selectedSource === 'rtk_fixed'
-          ? 'RTK固定解与本地NDT验证已完成，正在等待定位和导航栈同步'
-          : '原点航向/1米范围、航点及全局匹配已完成，正在等待定位收敛'
+        localizationInitMessage.value = 'NDT最优结果已提交，正在等待FAST-LIO + IMU接管及二次校正同步'
         if (navigationReadyForMap(latest, mapId, mapVersion)) {
           localizationInitState.value = 'success'
           localizationInitMessage.value = '已重新初始化到最优定位点，导航栈已就绪'

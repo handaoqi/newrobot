@@ -161,7 +161,8 @@ waypoint_speech:
   status_dir: /home/dogrobot/runtime/nx-edge/data/audio-status
   timeout_seconds: 120.0
   poll_interval_seconds: 0.2
-  block_navigation: false
+  enabled: true
+  block_navigation: true
 
 storage:
   sqlite_path: "/var/lib/roamerx-edge/edge.db"

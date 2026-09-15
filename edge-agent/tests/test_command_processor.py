@@ -852,7 +852,7 @@ def test_second_operator_localization_command_is_rejected_without_superseding_fi
     store.close()
 
 
-def test_nav_initial_pose_uses_fixed_rtk_seed(tmp_path):
+def test_nav_initial_pose_legacy_rtk_seed_uses_ndt_progressive_pipeline(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.initial_pose"
     raw["payload"].pop("task_execution_id", None)
@@ -880,9 +880,9 @@ def test_nav_initial_pose_uses_fixed_rtk_seed(tmp_path):
 
     _, result = processor.handle_command(raw)
 
-    assert navigation.rtk_initial_pose_requests == 1
-    assert result["payload"]["result"]["source"] == "rtk_fixed"
-    assert result["payload"]["result"]["wait_seconds"] == 12.0
+    assert navigation.rtk_initial_pose_requests == 0
+    assert len(navigation.progressive_relocalize_requests) == 1
+    assert result["payload"]["result"]["mode"] == "progressive_stationary_search"
     assert result["payload"]["result"]["navigation_start"]["action"] == "start"
     assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
     store.close()

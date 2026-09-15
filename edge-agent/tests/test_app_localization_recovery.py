@@ -120,7 +120,7 @@ class RtkNavigation:
 
     def active_relocalize(self, seed):
         self.relocalize_calls += 1
-        raise AssertionError("NDT recovery must not run when RTK is good")
+        return {"mode": "stationary_bounded_search", "accepted": True}
 
     def latest_trusted_pose(self):
         return {"x": 1.0, "y": 2.0, "yaw": 0.3}
@@ -133,7 +133,7 @@ class RtkNavigation:
         return None
 
 
-def test_recovery_uses_rtk_when_fixed_solution_is_good(monkeypatch):
+def test_recovery_uses_ndt_before_any_fixed_rtk_correction(monkeypatch):
     application = object.__new__(EdgeAgentApplication)
     application.navigation = RtkNavigation()
     application.task_executor = FakeTaskExecutor()
@@ -143,8 +143,8 @@ def test_recovery_uses_rtk_when_fixed_solution_is_good(monkeypatch):
 
     application._recover_task_localization()
 
-    assert application.navigation.rtk_calls == 1
-    assert application.navigation.relocalize_calls == 0
+    assert application.navigation.rtk_calls == 0
+    assert application.navigation.relocalize_calls >= 1
     assert application.navigation.motion_holds >= 1
     assert application.task_executor.recovered == 1
     assert application._localization_recovery_lock.acquire(blocking=False)
@@ -168,7 +168,7 @@ def test_recovery_skips_rtk_reseed_when_gps_pose_is_already_driving(monkeypatch)
     application._recover_task_localization()
 
     assert application.navigation.rtk_calls == 0
-    assert application.navigation.relocalize_calls == 0
+    assert application.navigation.relocalize_calls >= 1
     assert application.task_executor.recovered == 1
     assert application._localization_recovery_lock.acquire(blocking=False)
 
@@ -190,8 +190,8 @@ def test_large_lio_absolute_disagreement_forces_fixed_rtk_reseed(monkeypatch):
 
     application._recover_task_localization("lio_absolute_disagreement")
 
-    assert application.navigation.rtk_calls == 1
-    assert application.navigation.relocalize_calls == 0
+    assert application.navigation.rtk_calls == 0
+    assert application.navigation.relocalize_calls >= 1
     assert application.task_executor.recovered == 1
 
 

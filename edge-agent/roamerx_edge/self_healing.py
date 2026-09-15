@@ -96,11 +96,20 @@ def _rtk_float_within_ukf_gate(decision: dict) -> bool:
         return True
     drift = decision.get("rtk_drift")
     drift_xy = _finite_score(drift.get("xy_m")) if isinstance(drift, dict) else None
+    threshold = (
+        drift.get("ukf_float_max_residual_m")
+        if isinstance(drift, dict)
+        else decision.get("ukf_float_max_residual_m")
+    )
+    try:
+        threshold = float(threshold) if threshold is not None else 0.40
+    except (TypeError, ValueError):
+        threshold = 0.40
     return (
         decision.get("rtk_usable") is True
         and str(decision.get("rtk_quality") or "").lower() == "float"
         and drift_xy is not None
-        and drift_xy <= 0.20
+        and drift_xy <= threshold
     )
 
 

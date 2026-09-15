@@ -73,6 +73,11 @@ const TIMELINE_STAGE_META = {
   map_transfer: { title: '地图下发', detail: '确认目标地图已传输并应用到机器狗' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
   rtk_fixed: { title: 'RTK 固定解验证与定点 NDT', detail: '验证固定解后，在 RTK 定位点执行一次 NDT 交叉验证并提交锚点' },
+  fast_lio_imu_handoff: { title: 'FAST-LIO + IMU 主定位接管', detail: '确认新鲜 FAST-LIO + IMU 帧、锚点代数和连续主定位源' },
+  secondary_correction: { title: '二次定位校正', detail: 'NDT 最优提交后按场景和航点策略执行 RTK、UKF 或 NDT 校正' },
+  rtk_correction: { title: 'RTK 二次校正', detail: '仅合格固定解可作为绝对校正源；非 fixed 不阻塞任务' },
+  ukf_correction: { title: 'UKF 二次融合校正', detail: '按 NDT 与浮点 RTK 偏差门限决定是否加权融合' },
+  ndt_secondary_correction: { title: 'NDT 二次校正', detail: '使用高质量 NDT 更新 map→LIO 锚点，不改写 FAST-LIO 原始轨迹' },
   last_trusted: { title: '可信位姿候选', detail: '尝试最近一次可信定位位姿' },
   mapping_origin_bounded: { title: '建图原点及周边候选', detail: '原点、航向假设和 0.3/0.6/1.0 m 周边候选' },
   route_waypoints: { title: '手选点/路线航点候选', detail: '逐个验证手选点和路线航点' },
@@ -100,6 +105,11 @@ const TIMELINE_STAGE_ORDER = [
   'keyframe_global_match',
   'quick_initialization',
   'best_candidate_commit',
+  'fast_lio_imu_handoff',
+  'secondary_correction',
+  'rtk_correction',
+  'ukf_correction',
+  'ndt_secondary_correction',
   'navigation_start',
 ]
 
@@ -385,6 +395,8 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     rtkVerification,
+    handoff: raw.handoff || result.handoff || rtkVerification?.handoff || null,
+    secondaryCorrection: raw.secondary_correction || result.secondary_correction || null,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     rtkFixedCommitted: Boolean(raw.rtk_fixed_committed ?? result.rtk_fixed_committed),
     strategy: Array.isArray(raw.strategy)
@@ -549,6 +561,12 @@ function inferredStageStatus(session, stageKey, attempts, stageRecord) {
   if (attempts.some(attempt => ['verifying', 'started', 'running', 'executing', 'in_progress', 'committing'].includes(attempt.status))) return 'searching'
   if (stageRecord?.status && timelineStatusClass(stageRecord.status) !== 'waiting') return stageRecord.status
   if (stageRecord?.status) return stageRecord.status
+  if (stageKey === 'fast_lio_imu_handoff' && session?.handoff) {
+    return session.handoff.status || (session.handoff.handoff_state === 'accepted' ? 'accepted' : 'failed')
+  }
+  if (stageKey === 'secondary_correction' && session?.secondaryCorrection) {
+    return session.secondaryCorrection.status || 'searching'
+  }
   if (attempts.some(attempt => attempt.status === 'accepted')) return 'accepted'
   if (attempts.length && attempts.every(attempt => ['rejected', 'failed', 'skipped'].includes(attempt.status))) return 'rejected'
   const selectedStage = canonicalTimelineStage(session?.selectedStage)
@@ -752,7 +770,12 @@ export function localizationAttemptTimeline(session) {
   ;(session.attempts || []).forEach(attempt => addStageKey(attempt?.stage))
   if ((session.rtkVerification || session.rtkDrift) && !stageKeys.includes('rtk_fixed')) stageKeys.unshift('rtk_fixed')
   if (!stageKeys.length) stageKeys.push('mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match')
-
+  // The unified contract always exposes the handoff and secondary-correction
+  // gates, even when the backend has not emitted their first progress packet.
+  // This prevents the page from implying that NDT submission is the end of
+  // initialization.
+  addStageKey('fast_lio_imu_handoff')
+  addStageKey('secondary_correction')
   stageKeys.forEach(key => {
     const record = stageRecords.get(key)
     const attempts = stageAttemptsFor(session, key, record)

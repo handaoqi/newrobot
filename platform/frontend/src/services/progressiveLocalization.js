@@ -23,6 +23,7 @@ export function buildProgressiveLocalizationPayload({
   waypoints = [],
   sceneScope = 'indoor',
   coordinateMode = 'local_only',
+  localizationMode = '',
 }) {
   const normalizedWaypoints = waypoints.map(normalizeWaypoint)
   const waitSeconds = Math.min(
@@ -35,6 +36,10 @@ export function buildProgressiveLocalizationPayload({
     map_version: mapVersion,
     scene_scope: String(sceneScope || 'indoor').trim().toLowerCase(),
     coordinate_mode: String(coordinateMode || 'local_only').trim().toLowerCase(),
+    // The waypoint mode is a secondary-correction policy only.  Keeping it
+    // on the command lets Edge apply the same policy after the NDT anchor is
+    // committed, without allowing the UI to reorder initialization sources.
+    localization_mode: String(localizationMode || '').trim().toLowerCase(),
     waypoints: normalizedWaypoints,
     wait_seconds: waitSeconds,
   }
@@ -132,6 +137,7 @@ export async function initializeProgressiveLocalization({
   waypoints = [],
   sceneScope = 'indoor',
   coordinateMode = '',
+  localizationMode = '',
   onProgress = () => {},
   onCommand = () => {},
   dependencies = {},
@@ -159,53 +165,11 @@ export async function initializeProgressiveLocalization({
     })
   })()
 
-  let rtkAttempt = null
-  const rtkConfigured = shouldInitializeFromRtk({ sceneScope, coordinateMode })
-  const rtkSnapshot = rtkInitializationSnapshotState(activation.navigationStatus)
-  if (rtkConfigured && rtkSnapshot === 'not_fixed') {
-    rtkAttempt = { status: 'skipped', errorCode: 'RTK_NOT_FIXED' }
-    onProgress('RTK当前不是可用固定解，跳过RTK初始位姿，直接搜索建图原点、附近候选和航点')
-  }
-  if (rtkConfigured && rtkSnapshot !== 'not_fixed') {
-    onProgress(rtkSnapshot === 'fixed'
-      ? '室外地图已下发，正在验证RTK固定解并对定位位置执行定点NDT匹配'
-      : '室外地图已下发，状态同步中，由机器狗优先验证实时RTK固定解')
-    try {
-      const rtkPayload = {
-        seed_source: 'rtk',
-        map_id: mapId,
-        map_version: mapVersion,
-        wait_seconds: 30,
-        start_navigation: true,
-      }
-      const createdRtkCommand = await sendCommand(robotId, 'initial-pose', rtkPayload, { traceId })
-      const command = await waitCommand(robotId, createdRtkCommand, {
-        timeoutMs: 90_000,
-        onProgress: latest => {
-          onProgress(`RTK固定解与本地NDT验证 · ${latest.status || 'created'}`)
-          onCommand({ phase: 'localization', command: latest, showCandidates: true, source: 'rtk' })
-        },
-      })
-      onProgress('RTK固定解与本地NDT验证通过')
-      return {
-        activation,
-        payload: rtkPayload,
-        command,
-        selectedSource: 'rtk_fixed',
-        rtkAttempted: true,
-      }
-    } catch (error) {
-      const errorCode = commandErrorCode(error)
-      if (!RTK_FALLBACK_CODES.has(errorCode)) throw error
-      rtkAttempt = { status: 'failed', errorCode }
-      onProgress(`RTK固定解不可用、稳定性不足或FAST-LIO交接未完成（${errorCode}），转入渐进定位`)
-    }
-  }
-
   const payload = buildProgressiveLocalizationPayload({
     mapId, mapVersion, waypoints, sceneScope, coordinateMode,
+    localizationMode,
   })
-  onProgress('地图已下发，依次尝试建图原点、原点周边候选和路线航点，失败后进入全局搜索')
+  onProgress('地图已下发，先搜索建图原点及附近候选并提交最优 NDT，再由 FAST-LIO + IMU 接管，最后执行 RTK/UKF/NDT 二次校正')
   const createdCommand = await sendCommand(robotId, 'relocalize', payload, { traceId })
   const command = await waitCommand(robotId, createdCommand, {
     timeoutMs: progressiveLocalizationTimeoutMs(payload),
@@ -219,7 +183,7 @@ export async function initializeProgressiveLocalization({
     payload,
     command,
     selectedSource: 'progressive',
-    rtkAttempted: rtkAttempt?.status !== 'skipped',
-    rtkAttempt,
+    rtkAttempted: false,
+    rtkAttempt: null,
   }
 }
