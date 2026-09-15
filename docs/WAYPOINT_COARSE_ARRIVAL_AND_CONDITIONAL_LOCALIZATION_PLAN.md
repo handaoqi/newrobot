@@ -185,4 +185,4 @@ Nav2 细靠近速度是控制器目标上限，边界区限速和 Collision Moni
 - Edge目标套件241项通过；另有3项与本阶段无关的停稳证据旧断言失败，属于并行修改范围，未在本阶段改动。
 - 后端协议及消息处理48项通过，Django迁移一致性检查无待生成迁移。
 - 前端单元测试182项通过，Vite生产构建通过。
-- NX Edge 已部署并安全重启，当前发布目录为 `runtime/nx-edge/releases/c4a1b6c7fa33`；云端源码和运行时已同步，但 Docker 切换被 `roamerx-center-api.service` 旧服务活动状态门禁阻止，未强制停服。低速实机验收仍需留存 Nav2 参数读回、`/cmd_vel_raw` 与 `/cmd_vel` 速度证据。
+- NX Edge 已部署并安全重启，当前发布目录为 `runtime/nx-edge/releases/380d56cb99b2`；云端已按旧服务模式完成源码同步、数据库迁移和健康检查，5个旧平台服务均为 active。低速实机验收仍需留存 Nav2 参数读回、`/cmd_vel_raw` 与 `/cmd_vel` 速度证据。
