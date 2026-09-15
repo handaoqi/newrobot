@@ -58,6 +58,9 @@ PATROL_FINAL_APPROACH_M = 1.0
 OBSTACLE_RECOVERY_MAX_ATTEMPTS = 3
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
+# Outdoor MPPI can turn while cruising for sub-90° errors. A 76° in-place
+# teleop spin at point 1 hit PolygonRearStop and looked like orbiting.
+OUTDOOR_DEPARTURE_HEADING_SKIP_RAD = pi / 2  # 90 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
 # A waypoint explicitly marked require_yaw previously let RPP chase the final
 # orientation while still following the path.  Keep its original, stricter
@@ -2842,6 +2845,25 @@ class TaskExecutor:
     def _heading_error_rad(self, desired_yaw: float, current_yaw: float) -> float:
         return atan2(sin(desired_yaw - current_yaw), cos(desired_yaw - current_yaw))
 
+    def _pre_leg_heading_error_requires_spin(self, error_rad: float | None) -> bool:
+        """Whether a cruise leg should stop and teleop-spin before Nav2.
+
+        Indoor keeps the 10° absorb / larger-error spin. Outdoor only spins
+        for ~90°+ turns; smaller errors are left to MPPI while moving so the
+        dog does not pivot in place at a start click.
+        """
+        if error_rad is None:
+            return True
+        abs_error = abs(float(error_rad))
+        if abs_error <= DEPARTURE_HEADING_SKIP_RAD:
+            return False
+        if (
+            self._outdoor_navigation_profile()
+            and abs_error < OUTDOOR_DEPARTURE_HEADING_SKIP_RAD
+        ):
+            return False
+        return True
+
     def _maybe_face_travel_direction(self, target_index: int) -> bool:
         """Rotate in place toward the travel leg when the heading error is large."""
         if not self.context or self._is_docking_task():
@@ -2869,7 +2891,7 @@ class TaskExecutor:
             return False
         desired = atan2(dy, dx)
         error = self._heading_error_rad(desired, yaw)
-        if abs(error) <= DEPARTURE_HEADING_SKIP_RAD:
+        if not self._pre_leg_heading_error_requires_spin(error):
             return False
         current = waypoints[max(0, target_index - 1)] if target_index > 0 else waypoints[target_index]
         return self._start_departure_heading(
@@ -3016,8 +3038,19 @@ class TaskExecutor:
         require_yaw_stop = single and bool(waypoints[last_index].get("require_yaw", False))
         remaining = self._distance_to_waypoint(waypoints[last_index])
         already_close = remaining is not None and remaining <= PATROL_FINAL_APPROACH_M
+        # Already inside Friday's 0.50 m circle: do not enter the reverse-capable
+        # DiffDrive final profile that orbited the start click.
+        already_inside_coarse = (
+            remaining is not None
+            and self._outdoor_navigation_profile()
+            and self._should_skip_fine_patrol_reapproach(
+                waypoints[last_index], last_index, remaining
+            )
+        )
         initial_final_approach = (
-            (not self._is_docking_task()) and (require_yaw_stop or already_close)
+            (not self._is_docking_task())
+            and (require_yaw_stop or already_close)
+            and not already_inside_coarse
         )
         self._patrol_final_approach_applied = initial_final_approach
         self._bypass_active = False
@@ -3597,13 +3630,14 @@ class TaskExecutor:
             )
             return False
         rtk_dist = hypot(rtk_xy[0] - click[0], rtk_xy[1] - click[1])
-        if rtk_dist > xy_limit:
+        rtk_limit = self._outdoor_patrol_rtk_click_limit_m(waypoint, reached_index, xy_limit)
+        if rtk_dist > rtk_limit:
             LOGGER.warning(
                 "waypoint %d arrival rejected: RTK is %.2fm from click (limit %.2fm); "
                 "LIO-only arrival is not trusted",
                 reached_index,
                 rtk_dist,
-                xy_limit,
+                rtk_limit,
             )
             return False
         return True
@@ -4485,6 +4519,23 @@ class TaskExecutor:
         timer.daemon = True
         self._arrival_precision_recovery_timer = timer
         timer.start()
+
+    def _outdoor_patrol_rtk_click_limit_m(
+        self, waypoint: dict, reached_index: int, xy_limit: float
+    ) -> float:
+        """Normal outdoor patrol uses the 0.50 m coarse circle for RTK proof.
+
+        Fine 0.20 m RTK-to-click rejected a dog already on the start mark
+        (0.20 m), then skipped fine re-approach anyway. Precision, dock, and
+        yaw-stop clicks keep the tighter configured limit.
+        """
+        if self._is_docking_task():
+            return xy_limit
+        if self._arrival_policy(waypoint, reached_index) != "stop_and_confirm":
+            return xy_limit
+        if bool(waypoint.get("require_yaw", False)):
+            return xy_limit
+        return max(xy_limit, self.coarse_goal_tolerance_m)
 
     def _should_skip_fine_patrol_reapproach(
         self, waypoint: dict, reached_index: int, distance: float
@@ -6217,7 +6268,7 @@ class TaskExecutor:
                 yaw = None
             else:
                 error = self._heading_error_rad(desired, yaw)
-                if abs(error) <= DEPARTURE_HEADING_SKIP_RAD:
+                if not self._pre_leg_heading_error_requires_spin(error):
                     return False
         return self._start_departure_heading(
             desired_yaw=desired,

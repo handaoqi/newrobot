@@ -1408,6 +1408,16 @@ def test_arrival_within_tolerance_rejects_rtk_far_from_click(tmp_path):
     nav.localization_state["rtk_x"] = 10.15
     nav.localization_state["rtk_y"] = 10.1
     assert executor._arrival_within_tolerance(waypoint, 2) is True
+    # Field start at point 1: LIO on the click, RTK 0.25 m away. Fine 0.20 m
+    # used to reject then skip-fine anyway; coarse 0.50 m must accept now.
+    nav.localization_state["rtk_x"] = 10.25
+    nav.localization_state["rtk_y"] = 10.0
+    assert executor._arrival_within_tolerance(waypoint, 0) is True
+    nav.localization_state["rtk_x"] = 10.60
+    assert executor._arrival_within_tolerance(waypoint, 0) is False
+    precision = {"x": 10.0, "y": 10.0, "arrival_policy": "precision"}
+    nav.localization_state["rtk_x"] = 10.25
+    assert executor._arrival_within_tolerance(precision, 0) is False
     store.close()
 
 
@@ -1451,7 +1461,12 @@ def test_outdoor_ukf_and_ndt_arrival_do_not_override_selected_pose_with_raw_rtk(
     assert executor._arrival_within_tolerance(
         {**waypoint, "localization_mode": "ndt"}, 0
     ) is True
-    # RTK mode remains an absolute fixed-RTK click verification policy.
+    # RTK mode still requires a fixed-RTK click check. Normal patrol uses
+    # the 0.50 m coarse circle, so 0.34 m is on-click and 0.60 m is not.
+    assert executor._arrival_within_tolerance(
+        {**waypoint, "localization_mode": "rtk"}, 0
+    ) is True
+    nav.localization_state["rtk_x"] = 10.60
     assert executor._arrival_within_tolerance(
         {**waypoint, "localization_mode": "rtk"}, 0
     ) is False
@@ -2858,6 +2873,37 @@ def test_outdoor_arrival_faces_departure_heading(tmp_path):
     _await_departure_heading(executor)
     assert cruised == [1]
     assert any(abs(cmd[2]) > 0 for cmd in nav.teleop)
+    store.close()
+
+
+def test_outdoor_sub_90deg_departure_does_not_spin_in_place(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
+    )
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    envelope.payload["command"]["route_snapshot"]["map"] = dict(
+        envelope.payload["command"]["map"]
+    )
+    executor.start_task(envelope)
+    # Field log: 76° error at point 1 while facing waypoint 2.
+    # Travel to wp-2 from (1,2) is atan2(1,1) ≈ 0.785 rad.
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.785 + 1.326)
+    before_teleop = len(nav.teleop)
+    before_sent = len(nav.sent)
+    assert executor._dispatch_departure_heading(0) is False
+    assert executor._maybe_face_travel_direction(1) is False
+    assert executor._departure_heading_index is None
+    assert len(nav.teleop) == before_teleop
+    assert len(nav.sent) == before_sent
     store.close()
 
 
