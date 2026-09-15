@@ -1698,6 +1698,84 @@ def test_reapproach_above_one_point_five_metres_requires_localization_recovery(t
     store.close()
 
 
+def test_fine_reapproach_outside_coarse_circle_recovers_then_dispatches_once(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    events = []
+    recovery_requests = []
+    envelope = command("task.start")
+    waypoint = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
+    waypoint.update({"arrival_policy": "stop_and_confirm", "require_yaw": False})
+    envelope.payload["command"]["route_snapshot"]["waypoints"] = [waypoint]
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: events.append(args),
+        start_result_callback=lambda *args: None,
+        localization_recovery_callback=lambda reason: recovery_requests.append(reason),
+    )
+    executor.start_task(envelope)
+    nav.pose = SimpleNamespace(
+        x=float(waypoint["x"]) + 0.80,
+        y=float(waypoint["y"]),
+        yaw=0.0,
+    )
+    executor._arrival_correction_completed_index = 0
+    executor._arrival_retry_counts[0] = executor.arrival_reapproach_max_attempts
+
+    assert executor._reapproach_rejected_arrival(0) is True
+    assert executor.context.state == "paused"
+    assert executor.context.last_safe_hold_code == "ARRIVAL_REAPPROACH_COARSE_EXCEEDED"
+    assert executor.context.post_arrival_stage == "coarse_recovery_pending"
+    assert recovery_requests == []
+
+    recovery = executor.recover_task(
+        envelope.payload["task_execution_id"],
+        trigger_reason_code="ARRIVAL_REAPPROACH_COARSE_EXCEEDED",
+        recovery_episode_id="fine-outside-coarse",
+        attempt=1,
+    )
+    assert recovery["recovery_action"] == "precision_localization_recovery"
+    assert recovery["recovery_status"] == "in_progress"
+    assert recovery_requests == ["arrival_precision_recovery"]
+    assert executor.context.last_safe_hold_code == "ARRIVAL_REAPPROACH_COARSE_EXCEEDED"
+
+    before = len(nav.sent)
+    executor.on_localization_recovered()
+    assert len(nav.sent) == before + 1
+    assert nav.arrival_goal_tolerances[-1] == (0.50, 3.14)
+    assert executor.context.state == "running"
+    assert executor.context.post_arrival_stage == "coarse_reapproach"
+    assert executor.context.arrival_coarse_fallback_accepted is True
+    assert executor._arrival_reapproach_index is None
+
+    def outside_coarse(*_args):
+        executor._last_arrival_xy_stability_result = ArrivalStabilityResult(
+            stable=False,
+            reason="outside_tolerance",
+            consecutive_frames=0,
+            fresh_frames=3,
+            within_tolerance_frames=0,
+        )
+        return False
+
+    executor._arrival_xy_is_stable = outside_coarse
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert executor.context.state == "paused"
+    assert executor.context.last_safe_hold_code == "ARRIVAL_COARSE_REAPPROACH_EXHAUSTED"
+
+    exhausted = executor.recover_task(
+        envelope.payload["task_execution_id"],
+        trigger_reason_code="ARRIVAL_COARSE_REAPPROACH_EXHAUSTED",
+        recovery_episode_id="fine-outside-coarse",
+        attempt=2,
+    )
+    assert exhausted["recovery_status"] == "non_retryable"
+    assert len(nav.sent) == before + 1
+    executor.stop()
+    store.close()
+
+
 def test_normal_waypoint_accepts_fresh_coarse_pose_after_one_reapproach(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -3781,12 +3859,13 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
     store.close()
 
 
-def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
+def test_final_configured_heading_large_translation_recovers_after_bounded_adjustment(tmp_path):
     from math import pi
 
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     results = []
+    events = []
     envelope = command("task.start")
     final = dict(envelope.payload["command"]["route_snapshot"]["waypoints"][0])
     final["require_yaw"] = True
@@ -3795,7 +3874,7 @@ def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
     executor = TaskExecutor(
         store,
         nav,
-        event_callback=lambda *args: None,
+        event_callback=lambda *args: events.append(args),
         start_result_callback=lambda *args: results.append(args),
         arrival_adjust_timeout_seconds=0.01,
     )
@@ -3814,13 +3893,30 @@ def test_final_configured_heading_large_translation_enters_safe_hold(tmp_path):
     _await_departure_heading(executor)
 
     deadline = time.time() + 5.0
-    while executor.context.state == "running" and time.time() < deadline:
+    while (
+        executor.context.state == "running"
+        or executor._arrival_adjustment_thread is not None
+        and executor._arrival_adjustment_thread.is_alive()
+    ) and time.time() < deadline:
         time.sleep(0.02)
+    while not any(
+        event[0] == "task.safe_hold"
+        and event[1].get("reason_code") == "ARRIVAL_POST_YAW_COARSE_EXCEEDED"
+        for event in events
+    ) and time.time() < deadline:
+        time.sleep(0.01)
 
     assert executor.context.state == "paused"
     assert len(nav.sent) == 1
     assert executor.context.arrival_side_effects_started is False
     assert results == []
+    assert any(
+        event[0] == "task.safe_hold"
+        and event[1].get("reason_code") == "ARRIVAL_POST_YAW_COARSE_EXCEEDED"
+        for event in events
+    )
+    assert any(abs(vx) > 0.0 or abs(vy) > 0.0 for vx, vy, _ in nav.arrival_adjustments)
+    executor.stop()
     store.close()
 
 

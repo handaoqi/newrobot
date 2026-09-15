@@ -31,15 +31,15 @@
    - 室内：NDT 必须 `ndt_healthy`、`absolute_stable`、策略源就绪；连续样本的 NDT 地图位置都在目标 0.30 m 内。NDT 适配分数新增到航专用上限，初值建议 0.25。
    - RTK 和 NDT 均可用时，必须双源收敛；任何一源超过 0.30 m 都不可放行。
 4. 若绝对定位已收敛且位置误差 ≤ 0.30 m，连续确认后完成航点。
-5. 若绝对定位已收敛、误差在 (0.30, 0.45] m 内，按 0.10–0.15 m 步长向航点发 `NavigateToPose` 微目标；微目标的 Nav2 XY goal tolerance 必须临时收紧至 ≤ 0.10 m，避免现有 0.35 m 目标检查器直接报告成功而没有移动。每步结束回到第 2 步重新验收。
-6. 若误差 > 0.45 m、微调预算耗尽或短目标规划失败，停止并将当前航点交给正常 Nav2 重接近；仍失败时上报 `ARRIVAL_POSE_CONVERGENCE_FAILED`，进入现有 5 秒自愈流程。
+5. 首次绝对定位收敛后，普通点误差超过0.30 m时只执行一次0.30 m Nav2细靠近；细靠近后仍未达到0.30 m但在0.50 m内可降级验收。
+6. 细靠近后仍超过0.50 m时上报 `ARRIVAL_REAPPROACH_COARSE_EXCEEDED`，连续安全观察5秒后先精准定位恢复，再对原航点粗靠近一次；不再以0.45 m作为微调初始残差门禁，也不重置细靠近预算。
 7. 只有位置已通过 0.30 m 验收后才执行最终朝向调整；朝向完成后再次进行双源位置验收，避免转向时带来的位置漂移。
 
 ## 实现改动
 
 ### Edge 与导航接口
 
-- 新增 `arrival_micro_adjust_max_initial_error_m=0.45`、`arrival_micro_adjust_total_budget_m=0.60`、`arrival_micro_adjust_step_m=0.15`、`arrival_micro_adjust_max_steps=4`、`arrival_micro_adjust_timeout_seconds=30`、`arrival_final_tolerance_m=0.30`、`arrival_micro_goal_tolerance_m=0.10`、`arrival_ndt_max_fitness_score=0.45`。
+- `arrival_micro_adjust_max_initial_error_m=0.45`仅保留兼容诊断；转向后微调使用`arrival_micro_adjust_total_budget_m=0.60`、`arrival_micro_adjust_step_m=0.30`、`arrival_micro_adjust_max_steps=2`和`arrival_micro_adjust_timeout_seconds=30`，不再按初始残差预先拒绝。
 - 将现有连续 `arrival_adjust_velocity` 微调替换为带执行结果的 `navigate_to_pose` / Nav2 短目标接口；每一短目标前后验证边界、代价地图和停车状态。
 - 在任务上下文持久化微调会话：初始误差、累计路径、步数、每步 RTK/NDT 证据和失败原因；Edge 重启后不能重置预算。
 - 将 `final_waypoint_tolerance_m` 默认值调整为 0.30 m；删除普通航点通过 0.60 m 降级完成的路径。自愈只能恢复导航，不能绕过到航硬门槛。

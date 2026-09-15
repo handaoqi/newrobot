@@ -382,8 +382,8 @@ class TaskExecutor:
         arrival_adjust_safety_grace_seconds: float = 2.0,
         arrival_micro_adjust_mode: str = "cmd_vel",
         arrival_micro_adjust_max_initial_error_m: float = 0.45,
-        arrival_micro_adjust_total_budget_m: float = 0.30,
-        arrival_micro_adjust_step_m: float = 0.15,
+        arrival_micro_adjust_total_budget_m: float = 0.60,
+        arrival_micro_adjust_step_m: float = 0.30,
         arrival_micro_adjust_max_steps: int = 2,
         arrival_nav2_reapproach_max_error_m: float = 1.50,
         arrival_precision_recovery_retry_seconds: float = 5.0,
@@ -1506,6 +1506,11 @@ class TaskExecutor:
                 # Automatic RTK recovery often cancels Nav2 after the task has
                 # already been marked running again. Re-dispatch the pending
                 # goal instead of leaving the dog standing with no Nav2 action.
+                if self._coarse_reapproach_recovery_pending(resume_index):
+                    self._paused_for_localization = False
+                    self._paused_localization_reason = None
+                    self._resume_coarse_reapproach_after_recovery(resume_index)
+                    return
                 if self._post_arrival_active(resume_index):
                     self._paused_for_localization = False
                     self._paused_localization_reason = None
@@ -1537,6 +1542,13 @@ class TaskExecutor:
                 code="LOCALIZATION_RECOVERED",
                 message="localization is stable; resuming from the pending waypoint",
             )
+            if self._coarse_reapproach_recovery_pending(resume_index):
+                self.context.state = "running"
+                self.context.state_version += 1
+                self._persist()
+                self._emit("task.resumed")
+                self._resume_coarse_reapproach_after_recovery(resume_index)
+                return
             if self._post_arrival_active(resume_index):
                 self.context.state = "running"
                 self.context.state_version += 1
@@ -4029,6 +4041,64 @@ class TaskExecutor:
             )
         return True
 
+    def _coarse_reapproach_recovery_pending(self, waypoint_index: int) -> bool:
+        """Whether a >0.50 m arrival failure must recover before re-approach."""
+        return bool(
+            self.context
+            and self.context.last_safe_hold_code
+            in {
+                "ARRIVAL_POST_YAW_COARSE_EXCEEDED",
+                "ARRIVAL_REAPPROACH_COARSE_EXCEEDED",
+            }
+            and self._post_arrival_active(waypoint_index)
+        )
+
+    def _resume_coarse_reapproach_after_recovery(self, waypoint_index: int) -> bool:
+        """Dispatch one coarse goal after stationary precision recovery.
+
+        This path deliberately keeps the post-arrival coarse-fallback latch:
+        the next Nav2 result is checked against 0.50 m, so it cannot trigger
+        another automatic fine re-approach. A previously completed final yaw
+        is preserved; an ordinary fine-approach failure may run its normal
+        final-yaw stage after the coarse goal.
+        """
+        if not self.context or not self._coarse_reapproach_recovery_pending(waypoint_index):
+            return False
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if waypoint_index < 0 or waypoint_index >= len(waypoints):
+            return False
+        preserve_heading = (
+            self.context.last_safe_hold_code == "ARRIVAL_POST_YAW_COARSE_EXCEEDED"
+        )
+        self.context.last_safe_hold_code = ""
+        self.context.last_safe_hold_message = ""
+        self._cancel_arrival_adjustment(reset_state=True)
+        self._arrival_retry_counts.pop(waypoint_index, None)
+        self._arrival_reapproach_index = None
+        self.context.arrival_reapproach_waypoint_index = None
+        self.context.arrival_reapproach_attempts = 0
+        self.context.arrival_side_effects_started = False
+        self.context.arrival_coarse_fallback_accepted = True
+        self._arrival_correction_completed_index = waypoint_index
+        self._set_post_arrival_stage(waypoint_index, "coarse_reapproach")
+        self.context.current_waypoint_index = waypoint_index
+        self._navigation_prepared = False
+        self._clear_departure_heading(cancel_navigation=True)
+        if preserve_heading:
+            # _clear_departure_heading() also clears the arrival heading latch;
+            # restore it after cancelling any stale turn so the one coarse
+            # re-approach does not start a second final-yaw transaction.
+            self._arrival_heading_completed_index = waypoint_index
+        else:
+            self._arrival_heading_completed_index = None
+        self._persist()
+        LOGGER.info(
+            "dispatching one coarse re-approach after precision recovery for waypoint %d",
+            waypoint_index,
+        )
+        self._dispatch_navigation(waypoint_index, reapproach=False)
+        return True
+
     def _emit_arrival_stage(
         self, reached_index: int, stage: str, message: str
     ) -> None:
@@ -4093,17 +4163,11 @@ class TaskExecutor:
         xy_tolerance, _ = self._arrival_pose_tolerances(waypoint, reached_index)
         if distance <= xy_tolerance:
             return False
-        micro_adjust_max_residual = (
-            xy_tolerance + self.arrival_micro_adjust_total_budget_m
-        )
-        if distance > micro_adjust_max_residual:
-            LOGGER.warning(
-                "waypoint %d post-yaw XY residual %.3fm exceeds bounded micro-adjust limit %.3fm",
-                reached_index,
-                distance,
-                micro_adjust_max_residual,
-            )
-            return False
+        # The preceding Nav2 fine approach owns the ordinary 0.30 m business
+        # tolerance.  Once the final yaw has been completed, do not reject a
+        # larger residual before trying the two bounded heading-preserving
+        # translation segments.  The worker still enforces observed travel,
+        # segment count, timeout, fresh localization and scan clearance.
         # Do not reject a valid post-yaw residual solely because it is larger
         # than the legacy initial-error setting.  This controller is bounded
         # by *actual observed travel*, segment count, timeout, fresh
@@ -4355,10 +4419,11 @@ class TaskExecutor:
                         xy_tolerance, yaw_tolerance = self._arrival_pose_tolerances(
                             waypoint, reached_index
                         )
-                        # Drive a little inside the business acceptance radius.
-                        # Stopping exactly on a floating-point boundary often
-                        # makes the subsequent three-sample confirmation fail
-                        # after the velocity controller has already released.
+                        # A residual outside the ordinary 0.30 m circle still
+                        # needs a bounded translation command.  The prior
+                        # Nav2 fine approach owns the first 0.30 m acceptance,
+                        # while the final post-yaw gate may accept the result
+                        # in the 0.50 m coarse circle after these segments.
                         xy_control_tolerance = max(0.01, xy_tolerance - 0.02)
                         yaw_ok = yaw_tolerance is None or abs(yaw_error) <= yaw_tolerance
                         if distance <= xy_control_tolerance and yaw_ok:
@@ -4454,6 +4519,15 @@ class TaskExecutor:
                 self._set_post_arrival_stage(reached_index, "xy_adjustment_recheck")
                 self.on_navigation_result("succeeded", generation=generation)
                 return
+            if self._arrival_heading_completed_index == reached_index:
+                residual, residual_yaw = self._arrival_pose_errors(waypoint, reached_index)
+                if residual is not None and residual > self.coarse_goal_tolerance_m:
+                    self._emit_safe_hold(
+                        "ARRIVAL_POST_YAW_COARSE_EXCEEDED",
+                        "最终航向后两段 XY 微调已用尽，残差"
+                        f" {residual:.2f} 米仍超过 0.50 米，保持停车并重新定位",
+                    )
+                    return
             self._emit_safe_hold(
                 "ARRIVAL_POSE_CONVERGENCE_FAILED",
                 failure_message
@@ -4500,7 +4574,9 @@ class TaskExecutor:
         if timer is not None:
             timer.cancel()
 
-    def _hold_for_arrival_precision_recovery(self, message: str) -> None:
+    def _hold_for_arrival_precision_recovery(
+        self, message: str, *, safe_hold_code: str = "ARRIVAL_XY_UNVERIFIED"
+    ) -> None:
         """Keep a far off-click arrival stopped and re-request localization.
 
         Localization recovery itself may finish with a still-invalid map pose.
@@ -4511,7 +4587,7 @@ class TaskExecutor:
             return
         self._paused_for_localization = True
         self._paused_localization_reason = "absolute_required"
-        self._emit_safe_hold("ARRIVAL_XY_UNVERIFIED", message)
+        self._emit_safe_hold(safe_hold_code, message)
 
         def _retry() -> None:
             with self._lock:
@@ -4599,6 +4675,80 @@ class TaskExecutor:
         )
         return True
 
+    def _accept_post_yaw_coarse_arrival(
+        self, reached_index: int, waypoint: dict, distance: float, yaw_error: float | None
+    ) -> bool:
+        """Finish a yaw-preserving correction inside the coarse circle.
+
+        The strict 0.30 m radius is owned by the preceding Nav2 fine
+        approach.  A final in-place turn can introduce a bounded body drift;
+        after the two-segment correction, a fresh pose inside 0.50 m is
+        accepted for ordinary stop points while precision/dock points remain
+        strict.
+        """
+        if (
+            not self.context
+            or self._is_docking_task()
+            or self._arrival_policy(waypoint, reached_index) != "stop_and_confirm"
+            or self.context.post_arrival_stage
+            not in {"heading_aligned", "xy_adjusted", "xy_adjusting", "xy_adjustment_recheck"}
+            # Do not let the relaxed 0.50 m fallback bypass the first
+            # post-yaw segment.  The segment is still required whenever the
+            # final turn pushed the pose outside the 0.30 m fine circle; the
+            # relaxed radius is only an outcome after that work has started.
+            or (
+                self.context.arrival_micro_adjust_started_at is None
+                and int(self.context.arrival_micro_adjust_steps or 0) <= 0
+            )
+            or distance > self.coarse_goal_tolerance_m
+            or not self._localization_sample_fresh()
+        ):
+            return False
+        _, yaw_tolerance = self._arrival_pose_tolerances(waypoint, reached_index)
+        if yaw_tolerance is not None and (
+            yaw_error is None or abs(yaw_error) > yaw_tolerance
+        ):
+            return False
+        self._cancel_arrival_adjustment(reset_state=False)
+        self._reset_arrival_micro_adjustment()
+        retries = self._clear_arrival_reapproach_tracking(reached_index)
+        self._arrival_correction_completed_index = reached_index
+        self._arrival_heading_completed_index = reached_index
+        self.context.arrival_coarse_fallback_accepted = True
+        self._set_post_arrival_stage(reached_index, "post_arrival_ready")
+        self._emit_idempotent(
+            "task.arrival_degraded_accepted",
+            event_type_key="arrival_post_yaw_coarse_fallback",
+            waypoint_id=str(waypoint.get("waypoint_id") or reached_index),
+            code="ARRIVAL_POST_YAW_COARSE_ACCEPTED",
+            message=(
+                "最终航向后完成两段位置微调，当前位姿在 0.50 米粗到达半径内，按降级规则放行"
+            ),
+            extra={
+                "arrival_mode": "post_yaw_micro_adjust",
+                "distance_m": round(distance, 3),
+                "fine_tolerance_m": self.final_waypoint_tolerance_m,
+                "coarse_tolerance_m": self.coarse_goal_tolerance_m,
+                "micro_adjust_total_budget_m": self.arrival_micro_adjust_total_budget_m,
+                "reapproach_attempts": retries,
+            },
+        )
+        self._start_arrival_side_effects(
+            reached_index,
+            waypoint,
+            arrival_details={
+                "arrival_mode": "post_yaw_micro_adjust",
+                "localization_correction": "completed",
+                "distance_m": round(distance, 3),
+                "acceptance_tolerance_m": self.coarse_goal_tolerance_m,
+                "reapproach_attempts": retries,
+                "coarse_completed": True,
+            },
+        )
+        self._waypoint_localization_ready_index = reached_index
+        self._maybe_continue_after_waypoint(reached_index)
+        return True
+
     def _reapproach_rejected_arrival(
         self, reached_index: int, *, localization_recovered: bool = False
     ) -> bool:
@@ -4657,10 +4807,22 @@ class TaskExecutor:
                 retries,
             )
             self._clear_arrival_reapproach_tracking(reached_index)
-            self._emit_safe_hold(
-                "PHYSICAL_REAPPROACH_EXHAUSTED",
-                "航点重接近重试耗尽，进入安全保持",
-            )
+            if distance > self.coarse_goal_tolerance_m:
+                # A fine Nav2 re-approach that still ends outside the 0.50 m
+                # coarse circle needs the same stationary localization
+                # protection as a post-yaw micro-adjust failure. Keep the
+                # pending waypoint durable so recovery can dispatch exactly
+                # one coarse goal after precision localization.
+                self._set_post_arrival_stage(reached_index, "coarse_recovery_pending")
+                self._emit_safe_hold(
+                    "ARRIVAL_REAPPROACH_COARSE_EXCEEDED",
+                    "细靠近后航点残差仍超过 0.50 米，保持停车并重新定位",
+                )
+            else:
+                self._emit_safe_hold(
+                    "PHYSICAL_REAPPROACH_EXHAUSTED",
+                    "航点重接近重试耗尽，进入安全保持",
+                )
             return True
         self._arrival_retry_counts[reached_index] = retries + 1
         self._arrival_reapproach_index = reached_index
@@ -5302,12 +5464,29 @@ class TaskExecutor:
             code = str(
                 self.context.last_safe_hold_code or trigger_reason_code or "TASK_INTERRUPTED"
             )
+            if code == "ARRIVAL_COARSE_REAPPROACH_EXHAUSTED":
+                return {
+                    "final_task_state": "paused",
+                    "state_version": self.context.state_version,
+                    "resume_blocked": True,
+                    "reason_code": code,
+                    "reason_message": (
+                        self.context.last_safe_hold_message
+                        or "精准定位恢复后的单次粗靠近仍未通过验收，保持停车"
+                    ),
+                    "recovery_action": "safe_hold",
+                    "recovery_status": "non_retryable",
+                    "recovery_episode_id": recovery_episode_id,
+                    "attempt": int(attempt),
+                }
             if code in {
                 "ARRIVAL_POSE_CONVERGENCE_FAILED",
                 "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
                 "ARRIVAL_MICRO_ADJUST_UNAVAILABLE",
                 "ARRIVAL_MICRO_ADJUST_POSE_UNAVAILABLE",
                 "ARRIVAL_MICRO_ADJUST_RESIDUAL_EXCEEDED",
+                "ARRIVAL_POST_YAW_COARSE_EXCEEDED",
+                "ARRIVAL_REAPPROACH_COARSE_EXCEEDED",
             }:
                 index = (
                     self.context.post_arrival_waypoint_index
@@ -5318,6 +5497,38 @@ class TaskExecutor:
                 if index < 0 or index >= len(waypoints):
                     raise ProtocolError("TASK_CONTEXT_MISMATCH", "arrival waypoint is missing")
                 waypoint = waypoints[index]
+                if code in {
+                    "ARRIVAL_POST_YAW_COARSE_EXCEEDED",
+                    "ARRIVAL_REAPPROACH_COARSE_EXCEEDED",
+                }:
+                    # A post-yaw correction that remains outside the 0.50 m
+                    # coarse circle must refresh the absolute pose before a
+                    # single coarse re-approach. Do not redispatch directly
+                    # from a possibly drifted LIO pose.
+                    self._hold_for_arrival_precision_recovery(
+                        (
+                            "最终航向后 XY 残差仍超过 0.50 米，先执行精准定位恢复再粗靠近"
+                            if code == "ARRIVAL_POST_YAW_COARSE_EXCEEDED"
+                            else "细靠近后 XY 残差仍超过 0.50 米，先执行精准定位恢复再粗靠近"
+                        ),
+                        safe_hold_code=code,
+                    )
+                    return {
+                        "final_task_state": "paused",
+                        "state_version": self.context.state_version,
+                        "resume_blocked": True,
+                        "reason_code": "LOCALIZATION_RECOVERY_IN_PROGRESS",
+                        "reason_message": (
+                            "最终航向后 XY 残差超过 0.50 米，正在执行精准定位恢复"
+                            if code == "ARRIVAL_POST_YAW_COARSE_EXCEEDED"
+                            else "细靠近后 XY 残差超过 0.50 米，正在执行精准定位恢复"
+                        ),
+                        "recovery_action": "precision_localization_recovery",
+                        "recovery_status": "in_progress",
+                        "retry_after_seconds": 1,
+                        "recovery_episode_id": recovery_episode_id,
+                        "attempt": int(attempt),
+                    }
                 decision = self._localization_decision()
                 if not self._localization_sample_fresh(decision):
                     self._hold_for_arrival_precision_recovery(
@@ -5908,7 +6119,15 @@ class TaskExecutor:
                     post_arrival_active
                     and self.context.post_arrival_stage == "xy_adjustment_recheck"
                 )
-                if not post_arrival_active or requires_micro_recheck:
+                requires_coarse_reapproach_recheck = bool(
+                    post_arrival_active
+                    and self.context.post_arrival_stage == "coarse_reapproach"
+                )
+                if (
+                    not post_arrival_active
+                    or requires_micro_recheck
+                    or requires_coarse_reapproach_recheck
+                ):
                     # Position approach is deliberately before final yaw. A
                     # Nav2 re-approach invalidates both stage latches.
                     self._emit_arrival_stage(
@@ -5967,6 +6186,12 @@ class TaskExecutor:
                                 )
                                 return
                             self._set_post_arrival_stage(reached_index, "heading_aligned")
+                        elif requires_coarse_reapproach_recheck:
+                            self._emit_safe_hold(
+                                "ARRIVAL_COARSE_REAPPROACH_EXHAUSTED",
+                                "精准定位恢复后的单次粗靠近仍未进入 0.50 米范围，保持停车",
+                            )
+                            return
                         elif post_arrival_active:
                             self._emit_safe_hold(
                                 "ARRIVAL_POST_ADJUSTMENT_UNSTABLE",
@@ -6103,20 +6328,24 @@ class TaskExecutor:
                             "succeeded", generation=self._nav_goal_generation
                         )
                         return
-                    micro_adjust_limit = (
-                        xy_tolerance + self.arrival_micro_adjust_total_budget_m
-                    )
-                    if distance > micro_adjust_limit:
-                        self._emit_safe_hold(
-                            "ARRIVAL_MICRO_ADJUST_RESIDUAL_EXCEEDED",
-                            "最终航向后 XY 偏差"
-                            f" {distance:.2f} 米超过可微调上限"
-                            f" {micro_adjust_limit:.2f} 米，保持停车",
+                    if (
+                        use_arrival_heading
+                        and arrival_heading_completed
+                        and self._accept_post_yaw_coarse_arrival(
+                            reached_index, reached_waypoint, distance, yaw_error
                         )
+                    ):
                         return
                     if self._start_arrival_adjustment(reached_waypoint, reached_index):
                         return
                     if use_arrival_heading and arrival_heading_completed:
+                        if distance > self.coarse_goal_tolerance_m:
+                            self._emit_safe_hold(
+                                "ARRIVAL_POST_YAW_COARSE_EXCEEDED",
+                                "最终航向后 XY 偏差"
+                                f" {distance:.2f} 米超过 0.50 米，保持停车并重新定位",
+                            )
+                            return
                         LOGGER.warning(
                             "waypoint %d final pose outside combined tolerance: xy=%s yaw=%s",
                             reached_index,

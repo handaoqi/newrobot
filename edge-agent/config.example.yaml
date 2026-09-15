@@ -115,8 +115,11 @@ safety:
   # is diagnostic only and is not a start gate.
   arrival_micro_adjust_mode: cmd_vel
   arrival_micro_adjust_max_initial_error_m: 0.45
-  arrival_micro_adjust_total_budget_m: 0.30
-  arrival_micro_adjust_step_m: 0.15
+  # Final-yaw XY correction: two bounded 0.30 m segments (0.60 m total).
+  # The preceding Nav2 fine approach owns the 0.30 m business tolerance;
+  # post-yaw correction may finish inside the 0.50 m coarse circle.
+  arrival_micro_adjust_total_budget_m: 0.60
+  arrival_micro_adjust_step_m: 0.30
   arrival_micro_adjust_max_steps: 2
   # Above this residual, do stationary precision localization before moving.
   arrival_nav2_reapproach_max_error_m: 1.50

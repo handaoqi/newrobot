@@ -169,12 +169,15 @@ class SafetyConfig:
     arrival_adjust_scan_max_age_seconds: float = 0.50
     arrival_adjust_safety_grace_seconds: float = 2.0
     arrival_micro_adjust_mode: str = "cmd_vel"
-    # Compatibility/diagnostic value.  Arrival micro-adjustment is bounded by
-    # observed travel, steps and timeout rather than rejecting a valid initial
-    # XY residual before it can converge.
+    # Compatibility/diagnostic value.  Post-yaw correction does not reject an
+    # initial residual based on this legacy value; it is bounded by observed
+    # travel, segment count, timeout, fresh localization and clearance.
     arrival_micro_adjust_max_initial_error_m: float = 0.45
-    arrival_micro_adjust_total_budget_m: float = 0.30
-    arrival_micro_adjust_step_m: float = 0.15
+    # Two bounded 0.30 m segments are allowed after the final heading.  The
+    # ordinary 0.30 m business radius is enforced by the preceding fine
+    # approach; post-yaw correction may finish in the 0.50 m coarse circle.
+    arrival_micro_adjust_total_budget_m: float = 0.60
+    arrival_micro_adjust_step_m: float = 0.30
     arrival_micro_adjust_max_steps: int = 2
     # Above this corrected residual, a normal Nav2 re-approach is no longer
     # trusted; stationary precision localization must recover first.
