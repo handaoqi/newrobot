@@ -6092,16 +6092,25 @@ class RosAdapter(Node):
         if not odom_still:
             self._standstill_started_monotonic = None
             return False
-        # A fresh non-zero command is a safety veto; stale zero commands are
+        # A fresh non-zero command from either side of the control chain is a
+        # safety veto.  /cmd_vel_raw captures upstream motion intent while
+        # /cmd_vel captures the post-Collision-Monitor output; both must be
+        # quiet before odom can confirm standstill.  Stale zero commands are
         # allowed because Collision Monitor intentionally stops republishing.
-        actual_age = now - float(getattr(self, "_actual_velocity_updated_monotonic", 0.0) or 0.0)
-        command_planar = math.hypot(self._actual_forward_command, self._actual_lateral_command)
-        if actual_age <= 0.30 and (
-            command_planar > self.safety_config.stop_speed_threshold_mps
-            or abs(self._actual_turn_command) > angular_threshold
+        for forward, lateral, turn, updated in (
+            (self._raw_forward_command, self._raw_lateral_command,
+             self._raw_turn_command, self._raw_velocity_updated_monotonic),
+            (self._actual_forward_command, self._actual_lateral_command,
+             self._actual_turn_command, self._actual_velocity_updated_monotonic),
         ):
-            self._standstill_started_monotonic = None
-            return False
+            age = now - float(updated or 0.0)
+            command_planar = math.hypot(forward, lateral)
+            if age <= 0.30 and (
+                command_planar > self.safety_config.stop_speed_threshold_mps
+                or abs(turn) > angular_threshold
+            ):
+                self._standstill_started_monotonic = None
+                return False
         self._standstill_started_monotonic = self._standstill_started_monotonic or now
         return now - self._standstill_started_monotonic >= float(
             getattr(self.safety_config, "standstill_hold_time", 1.0)
