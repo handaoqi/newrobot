@@ -337,6 +337,8 @@ class TaskContext:
     # normal stopping waypoint. It keeps the accepted 0.50 m coarse radius
     # durable through final-yaw/post-processing and final task completion.
     arrival_coarse_fallback_accepted: bool = False
+    arrival_reapproach_waypoint_index: int | None = None
+    arrival_reapproach_attempts: int = 0
     arrival_micro_adjust_total_m: float = 0.0
     arrival_micro_adjust_steps: int = 0
     arrival_micro_adjust_started_at: float | None = None
@@ -365,9 +367,9 @@ class TaskExecutor:
         event_callback: Callable[[str, dict, str], None],
         start_result_callback: Callable[[str, str, dict, str, str], None],
         coarse_goal_tolerance_m: float = 0.50,
-        normal_arrival_tolerance_m: float = 0.20,
+        normal_arrival_tolerance_m: float = 0.30,
         precision_arrival_tolerance_m: float = 0.15,
-        arrival_reapproach_max_attempts: int = 3,
+        arrival_reapproach_max_attempts: int = 1,
         docking_goal_tolerance_m: float = 0.08,
         docking_goal_yaw_tolerance_rad: float = 0.0872665,
         arrival_adjust_max_distance_m: float = 0.50,
@@ -379,9 +381,9 @@ class TaskExecutor:
         arrival_adjust_safety_grace_seconds: float = 2.0,
         arrival_micro_adjust_mode: str = "cmd_vel",
         arrival_micro_adjust_max_initial_error_m: float = 0.45,
-        arrival_micro_adjust_total_budget_m: float = 0.60,
+        arrival_micro_adjust_total_budget_m: float = 0.30,
         arrival_micro_adjust_step_m: float = 0.15,
-        arrival_micro_adjust_max_steps: int = 4,
+        arrival_micro_adjust_max_steps: int = 2,
         arrival_nav2_reapproach_max_error_m: float = 1.50,
         arrival_precision_recovery_retry_seconds: float = 5.0,
         arrival_micro_goal_tolerance_m: float = 0.15,
@@ -566,10 +568,26 @@ class TaskExecutor:
         self._dwell_wait_stop: threading.Event | None = None
         self._dwell_wait_thread: threading.Thread | None = None
         self._waypoint_localization_ready_index: int | None = None
-        self._arrival_retry_counts: dict[int, int] = {}
-        self._arrival_reapproach_index: int | None = None
         raw = store.load_active_task_context()
         self.context = TaskContext(**raw) if raw else None
+        persisted_reapproach_index = (
+            int(self.context.arrival_reapproach_waypoint_index)
+            if self.context
+            and self.context.arrival_reapproach_waypoint_index is not None
+            else None
+        )
+        persisted_reapproach_attempts = (
+            max(0, int(self.context.arrival_reapproach_attempts))
+            if self.context
+            else 0
+        )
+        self._arrival_retry_counts: dict[int, int] = (
+            {persisted_reapproach_index: persisted_reapproach_attempts}
+            if persisted_reapproach_index is not None
+            and persisted_reapproach_attempts > 0
+            else {}
+        )
+        self._arrival_reapproach_index: int | None = persisted_reapproach_index
         if self.context and self.context.post_arrival_waypoint_index is not None:
             reached = int(self.context.post_arrival_waypoint_index)
             self._last_target_index = max(self._last_target_index, reached)
@@ -1775,6 +1793,8 @@ class TaskExecutor:
             self._waypoint_localization_ready_index = None
             self._arrival_retry_counts = {}
             self._arrival_reapproach_index = None
+            self.context.arrival_reapproach_waypoint_index = None
+            self.context.arrival_reapproach_attempts = 0
             self._arrival_correction_completed_index = None
             self._arrival_heading_completed_index = None
             self._arrival_convergence_attempts = {}
@@ -2834,6 +2854,18 @@ class TaskExecutor:
         # Face the travel direction before every cruise leg. Restart, obstacle
         # redispatch, and localization recovery all enter here and previously
         # skipped the post-arrival departure turn.
+        if (
+            self.context
+            and getattr(self.context, "arrival_reapproach_waypoint_index", None)
+            == index
+            and int(getattr(self.context, "arrival_reapproach_attempts", 0) or 0) > 0
+        ):
+            self._arrival_reapproach_index = index
+            self._arrival_retry_counts[index] = int(
+                getattr(self.context, "arrival_reapproach_attempts", 0) or 0
+            )
+            self._dispatch_navigation(index, reapproach=True)
+            return
         index = self._advance_past_colocated_waypoints(index)
         if self._maybe_face_travel_direction(index):
             return
@@ -3028,21 +3060,11 @@ class TaskExecutor:
         require_yaw_stop = single and bool(waypoints[last_index].get("require_yaw", False))
         remaining = self._distance_to_waypoint(waypoints[last_index])
         already_close = remaining is not None and remaining <= PATROL_FINAL_APPROACH_M
-        # Already inside Friday's 0.50 m circle: do not enter the reverse-capable
-        # DiffDrive final profile that orbited the start click.
-        already_inside_coarse = (
-            remaining is not None
-            and self._outdoor_navigation_profile()
-            and self._should_skip_fine_patrol_reapproach(
-                waypoints[last_index], last_index, remaining
-            )
-        )
         pass_through_goal = self._waypoint_is_pass_through(last_index)
         initial_final_approach = (
             (not self._is_docking_task())
             and not pass_through_goal
             and (require_yaw_stop or already_close)
-            and not already_inside_coarse
         )
         self._patrol_final_approach_applied = initial_final_approach
         self._bypass_active = False
@@ -3776,9 +3798,19 @@ class TaskExecutor:
             # docking sequence; only its final dock point gets the tight gate.
             return float("inf"), None
         if policy == "dock" and self._is_docking_task():
-            return self.docking_goal_tolerance_m, self.docking_goal_yaw_tolerance_rad
+            yaw_tolerance = (
+                self.docking_goal_yaw_tolerance_rad
+                if bool(waypoint.get("require_yaw", False))
+                else None
+            )
+            return self.docking_goal_tolerance_m, yaw_tolerance
         if policy == "precision":
-            return self.precision_arrival_tolerance_m, PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
+            yaw_tolerance = (
+                PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
+                if bool(waypoint.get("require_yaw", False))
+                else None
+            )
+            return self.precision_arrival_tolerance_m, yaw_tolerance
         yaw_tolerance = (
             ARRIVAL_HEADING_ALIGN_RAD if bool(waypoint.get("require_yaw", False)) else None
         )
@@ -3851,7 +3883,7 @@ class TaskExecutor:
         """Whether this stopping waypoint has exhausted fine re-approaches.
 
         The relaxed radius is deliberately scoped to the one waypoint that
-        consumed its three Nav2 fine re-approaches. It never applies to a
+        consumed its configured Nav2 fine re-approach. It never applies to a
         precision or docking policy, which cannot enter the fallback.
         """
         return bool(
@@ -4517,9 +4549,9 @@ class TaskExecutor:
     ) -> float:
         """Normal outdoor patrol uses the 0.50 m coarse circle for RTK proof.
 
-        Fine 0.20 m RTK-to-click rejected a dog already on the start mark
-        (0.20 m), then skipped fine re-approach anyway. Precision, dock, and
-        yaw-stop clicks keep the tighter configured limit.
+        A strict RTK-to-click check can reject a dog already inside the original
+        coarse circle. Precision, dock, and yaw-stop clicks keep the tighter
+        configured limit.
         """
         if self._is_docking_task():
             return xy_limit
@@ -4529,48 +4561,20 @@ class TaskExecutor:
             return xy_limit
         return max(xy_limit, self.coarse_goal_tolerance_m)
 
-    def _should_skip_fine_patrol_reapproach(
-        self, waypoint: dict, reached_index: int, distance: float
-    ) -> bool:
-        """Temporarily keep Friday's coarse-circle patrol start, not 8 cm/s fine re-approach.
-
-        Precision, docking, yaw-stop recoveries, and outdoor RTK off-click still
-        re-dispatch. Only a plain stop_and_confirm click already inside 0.50 m
-        continues the route.
-        """
-        if self._is_docking_task():
-            return False
-        if self._arrival_policy(waypoint, reached_index) != "stop_and_confirm":
-            return False
-        if bool(waypoint.get("require_yaw", False)):
-            return False
-        if distance > self.coarse_goal_tolerance_m:
-            return False
-        if not self._localization_sample_fresh():
-            return False
-        if self._outdoor_navigation_profile():
-            mode = (
-                waypoint_localization_mode(waypoint.get("localization_mode"))
-                if waypoint.get("localization_mode") is not None
-                else "rtk"
-            )
-            if mode == "rtk":
-                decision = self._localization_decision()
-                rtk_xy = self._rtk_xy_from_decision(decision)
-                click = _waypoint_xy(waypoint)
-                if rtk_xy is None or click is None:
-                    return False
-                rtk_dist = hypot(rtk_xy[0] - click[0], rtk_xy[1] - click[1])
-                if rtk_dist > self.coarse_goal_tolerance_m:
-                    return False
-        return True
+    def _clear_arrival_reapproach_tracking(self, reached_index: int) -> int:
+        """Clear both in-memory and durable fine re-approach state."""
+        retries = int(self._arrival_retry_counts.pop(reached_index, 0))
+        self._arrival_reapproach_index = None
+        if self.context:
+            self.context.arrival_reapproach_waypoint_index = None
+            self.context.arrival_reapproach_attempts = 0
+        return retries
 
     def _accept_coarse_patrol_arrival(
         self, reached_index: int, waypoint: dict, distance: float, *, retries: int
     ) -> bool:
         """Accept a normal patrol click inside the original 0.50 m Nav2 circle."""
-        self._arrival_retry_counts.pop(reached_index, None)
-        self._arrival_reapproach_index = None
+        self._clear_arrival_reapproach_tracking(reached_index)
         self._cancel_arrival_adjustment(reset_state=True)
         self._arrival_convergence_attempts.pop(reached_index, None)
         self._arrival_correction_completed_index = reached_index
@@ -4582,7 +4586,7 @@ class TaskExecutor:
             waypoint_id=str(waypoint.get("waypoint_id") or reached_index),
             code="ARRIVAL_FINE_REAPPROACH_EXHAUSTED",
             message=(
-                "普通巡检点已在 0.50 米粗到达半径内，跳过精细重靠近并放行"
+                "普通巡检点一次精细重靠近后仍在 0.50 米粗到达半径内，按降级规则放行"
             ),
             extra={
                 "distance_m": round(distance, 3),
@@ -4631,29 +4635,38 @@ class TaskExecutor:
                 "校正后航点残差超过 1.50 米，先执行精准定位恢复再重接近",
             )
             return True
-        if self._should_skip_fine_patrol_reapproach(waypoint, reached_index, distance):
-            LOGGER.warning(
-                "waypoint %d is %.2fm inside the 0.50 m coarse circle; skipping fine re-approach",
-                reached_index,
-                distance,
-            )
-            return self._accept_coarse_patrol_arrival(
-                reached_index, waypoint, distance, retries=retries
-            )
         if retries >= self.arrival_reapproach_max_attempts:
+            if (
+                retries > 0
+                and self._arrival_policy(waypoint, reached_index) == "stop_and_confirm"
+                and not self._is_docking_task()
+                and distance <= self.coarse_goal_tolerance_m
+                and self._localization_sample_fresh()
+                and self._arrival_correction_completed_index == reached_index
+            ):
+                LOGGER.warning(
+                    "waypoint %d remains %.2fm from click after one fine re-approach; accepting corrected coarse arrival",
+                    reached_index,
+                    distance,
+                )
+                return self._accept_coarse_patrol_arrival(
+                    reached_index, waypoint, distance, retries=retries
+                )
             LOGGER.warning(
                 "waypoint %d still off-click after %d re-approaches",
                 reached_index,
                 retries,
             )
-            self._arrival_retry_counts.pop(reached_index, None)
+            self._clear_arrival_reapproach_tracking(reached_index)
             self._emit_safe_hold(
                 "PHYSICAL_REAPPROACH_EXHAUSTED",
                 "航点重接近重试耗尽，进入安全保持",
             )
             return True
         self._arrival_retry_counts[reached_index] = retries + 1
-        self._arrival_reapproach_index = None
+        self._arrival_reapproach_index = reached_index
+        self.context.arrival_reapproach_waypoint_index = reached_index
+        self.context.arrival_reapproach_attempts = retries + 1
         self._cancel_arrival_adjustment(reset_state=True)
         self._arrival_convergence_attempts.pop(reached_index, None)
         LOGGER.warning(
@@ -4666,7 +4679,7 @@ class TaskExecutor:
         self.context.state = "running"
         self.context.state_version += 1
         self._persist()
-        self._send_from(reached_index)
+        self._dispatch_navigation(reached_index, reapproach=True)
         return True
 
     def _cancel_absolute_localization_resume_watch(self) -> None:
@@ -6149,7 +6162,7 @@ class TaskExecutor:
                 xy_tolerance, _ = self._arrival_pose_tolerances(
                     reached_waypoint, reached_index
                 )
-                retries = int(self._arrival_retry_counts.pop(reached_index, 0))
+                retries = self._clear_arrival_reapproach_tracking(reached_index)
                 self._start_arrival_side_effects(
                     reached_index,
                     reached_waypoint,
@@ -6283,7 +6296,7 @@ class TaskExecutor:
             self._active_correction_transaction_id = None
             self._active_correction_mode = None
             self._arrival_correction_completed_index = None
-            self._arrival_reapproach_index = None
+            self._clear_arrival_reapproach_tracking(reached_index)
             self._arrival_convergence_attempts.pop(reached_index, None)
             self._cancel_arrival_adjustment()
             if self._departure_heading_completed_index == reached_index:
@@ -6354,7 +6367,7 @@ class TaskExecutor:
                 self._goal_offset = 0
                 self._dispatched_count = 0
                 self._patrol_final_approach_applied = False
-                self._arrival_reapproach_index = None
+                self._clear_arrival_reapproach_tracking(reached_index)
                 self._persist()
                 self._emit("task.round_started", extra={"round_number": self.context.round_number, "loop_total": self.context.loop_total})
                 # A new loop round starts from the just-confirmed terminal
@@ -6738,8 +6751,7 @@ class TaskExecutor:
         *,
         distance_m: float,
     ) -> None:
-        retries = int(self._arrival_retry_counts.pop(reached_index, 0))
-        self._arrival_reapproach_index = None
+        retries = self._clear_arrival_reapproach_tracking(reached_index)
         self._set_post_arrival_stage(reached_index, "post_arrival_ready")
         self._emit_idempotent(
             "task.arrival_confirmed",
@@ -6829,19 +6841,19 @@ class TaskExecutor:
     def _set_navigation_arrival_tolerance(self, waypoint_index: int) -> None:
         setter = getattr(self.navigation, "set_arrival_goal_tolerance", None)
         if callable(setter):
-            # Patrol arrival heading is owned by Edge after XY arrival.  Keep
-            # Nav2's goal checker from rotating/holding on the target pose
-            # yaw while the controller should continue facing the next-leg
-            # direction.  Docking is the explicit exception: its contact
-            # pose remains a Nav2-owned precision goal.
+            waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
+            policy = self._arrival_policy(waypoint, waypoint_index)
             yaw_tolerance = 3.14
+            if bool(waypoint.get("require_yaw", False)):
+                yaw_tolerance = (
+                    self.docking_goal_yaw_tolerance_rad
+                    if policy == "dock" and self._is_docking_task()
+                    else PRECISION_ARRIVAL_YAW_TOLERANCE_RAD
+                )
             if self.context and self._arrival_reapproach_index == waypoint_index:
                 # Re-approach must not rotate toward the final waypoint yaw;
                 # that turn is performed only after corrected XY acceptance.
                 yaw_tolerance = 3.14
-                waypoint = self.context.route_snapshot["waypoints"][waypoint_index]
-                if self._arrival_policy(waypoint, waypoint_index) == "dock":
-                    yaw_tolerance = self.docking_goal_yaw_tolerance_rad
             try:
                 setter(
                     self._navigation_arrival_tolerance(waypoint_index),
@@ -6907,7 +6919,7 @@ class TaskExecutor:
                 detour_enabled = False
                 slowdown_enabled = False
             precision_goal = waypoint_index == final_index
-        require_yaw = bool(target.get("require_yaw", False)) or precision_goal
+        require_yaw = bool(target.get("require_yaw", False))
         arrival_policy = self._arrival_policy(target, waypoint_index)
         patrol_final = (
             (not self._is_docking_task())
@@ -6916,7 +6928,7 @@ class TaskExecutor:
         )
         final_approach = patrol_final or precision_goal
         if force_require_yaw is not None:
-            require_yaw = bool(force_require_yaw) or precision_goal
+            require_yaw = bool(force_require_yaw)
         # Do not ask RPP to solve the final orientation while it is still
         # tracking a path.  Patrol require_yaw is enforced immediately after
         # XY arrival by the direct, stationary teleop turn in
@@ -7390,7 +7402,7 @@ class TaskExecutor:
             )
         policy = self._arrival_policy(final_waypoint, len(waypoints) - 1)
         require_final_yaw = bool(final_waypoint.get("require_yaw", False))
-        if self._is_docking_task() or policy == "precision" or require_final_yaw:
+        if require_final_yaw:
             try:
                 yaw_error = abs(
                     atan2(

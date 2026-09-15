@@ -154,9 +154,9 @@ class SafetyConfig:
     # corrected poses remain in this coarse circle. Precision and dock points
     # always retain their stricter policy-specific tolerances below.
     coarse_goal_tolerance_m: float = 0.50
-    normal_arrival_tolerance_m: float = 0.20
+    normal_arrival_tolerance_m: float = 0.30
     precision_arrival_tolerance_m: float = 0.15
-    arrival_reapproach_max_attempts: int = 3
+    arrival_reapproach_max_attempts: int = 1
     docking_goal_tolerance_m: float = 0.08
     docking_goal_yaw_tolerance_rad: float = 0.0872665
     # Arrival correction is split into bounded segments.  The legacy
@@ -173,9 +173,9 @@ class SafetyConfig:
     # observed travel, steps and timeout rather than rejecting a valid initial
     # XY residual before it can converge.
     arrival_micro_adjust_max_initial_error_m: float = 0.45
-    arrival_micro_adjust_total_budget_m: float = 0.60
+    arrival_micro_adjust_total_budget_m: float = 0.30
     arrival_micro_adjust_step_m: float = 0.15
-    arrival_micro_adjust_max_steps: int = 4
+    arrival_micro_adjust_max_steps: int = 2
     # Above this corrected residual, a normal Nav2 re-approach is no longer
     # trusted; stationary precision localization must recover first.
     arrival_nav2_reapproach_max_error_m: float = 1.50

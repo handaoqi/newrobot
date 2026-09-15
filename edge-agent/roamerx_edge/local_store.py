@@ -56,6 +56,8 @@ class LocalStore:
                     post_arrival_stage TEXT NOT NULL DEFAULT '',
                     arrival_side_effects_started INTEGER NOT NULL DEFAULT 0,
                     arrival_coarse_fallback_accepted INTEGER NOT NULL DEFAULT 0,
+                    arrival_reapproach_waypoint_index INTEGER,
+                    arrival_reapproach_attempts INTEGER NOT NULL DEFAULT 0,
                     arrival_micro_adjust_total_m REAL NOT NULL DEFAULT 0,
                     arrival_micro_adjust_steps INTEGER NOT NULL DEFAULT 0,
                     arrival_micro_adjust_started_at REAL,
@@ -160,6 +162,14 @@ class LocalStore:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN arrival_coarse_fallback_accepted INTEGER NOT NULL DEFAULT 0"
                 )
+            if "arrival_reapproach_waypoint_index" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_reapproach_waypoint_index INTEGER"
+                )
+            if "arrival_reapproach_attempts" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE task_context ADD COLUMN arrival_reapproach_attempts INTEGER NOT NULL DEFAULT 0"
+                )
             if "arrival_micro_adjust_total_m" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE task_context ADD COLUMN arrival_micro_adjust_total_m REAL NOT NULL DEFAULT 0"
@@ -260,9 +270,10 @@ class LocalStore:
                     loop_execution, loop_session_id, continuous_rosbag,
                     post_arrival_waypoint_index, post_arrival_stage,
                     arrival_side_effects_started, arrival_coarse_fallback_accepted,
+                    arrival_reapproach_waypoint_index, arrival_reapproach_attempts,
                     arrival_micro_adjust_total_m, arrival_micro_adjust_steps,
                     arrival_micro_adjust_started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_execution_id) DO UPDATE SET
                     state=excluded.state,
                     state_version=excluded.state_version,
@@ -277,6 +288,8 @@ class LocalStore:
                     post_arrival_stage=excluded.post_arrival_stage,
                     arrival_side_effects_started=excluded.arrival_side_effects_started,
                     arrival_coarse_fallback_accepted=excluded.arrival_coarse_fallback_accepted,
+                    arrival_reapproach_waypoint_index=excluded.arrival_reapproach_waypoint_index,
+                    arrival_reapproach_attempts=excluded.arrival_reapproach_attempts,
                     arrival_micro_adjust_total_m=excluded.arrival_micro_adjust_total_m,
                     arrival_micro_adjust_steps=excluded.arrival_micro_adjust_steps,
                     arrival_micro_adjust_started_at=excluded.arrival_micro_adjust_started_at,
@@ -297,6 +310,8 @@ class LocalStore:
                     str(context.get("post_arrival_stage") or ""),
                     int(bool(context.get("arrival_side_effects_started", False))),
                     int(bool(context.get("arrival_coarse_fallback_accepted", False))),
+                    context.get("arrival_reapproach_waypoint_index"),
+                    max(0, int(context.get("arrival_reapproach_attempts") or 0)),
                     max(0.0, float(context.get("arrival_micro_adjust_total_m") or 0.0)),
                     max(0, int(context.get("arrival_micro_adjust_steps") or 0)),
                     context.get("arrival_micro_adjust_started_at"),
@@ -328,6 +343,8 @@ class LocalStore:
             "post_arrival_stage": str(row["post_arrival_stage"] or ""),
             "arrival_side_effects_started": bool(row["arrival_side_effects_started"]),
             "arrival_coarse_fallback_accepted": bool(row["arrival_coarse_fallback_accepted"]),
+            "arrival_reapproach_waypoint_index": row["arrival_reapproach_waypoint_index"],
+            "arrival_reapproach_attempts": int(row["arrival_reapproach_attempts"] or 0),
             "arrival_micro_adjust_total_m": float(row["arrival_micro_adjust_total_m"] or 0.0),
             "arrival_micro_adjust_steps": int(row["arrival_micro_adjust_steps"] or 0),
             "arrival_micro_adjust_started_at": row["arrival_micro_adjust_started_at"],

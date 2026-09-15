@@ -19,6 +19,8 @@ def test_sqlite_restart_recovery(tmp_path):
             "loop_execution": True,
             "loop_session_id": "63b66a16-1947-4be7-889b-d851a5f4ba20",
             "continuous_rosbag": True,
+            "arrival_reapproach_waypoint_index": 0,
+            "arrival_reapproach_attempts": 1,
         }
     )
     first.enqueue_outbox("topic", {"message_type": "task.progress"}, dedupe_key="event-1")
@@ -32,6 +34,8 @@ def test_sqlite_restart_recovery(tmp_path):
     assert restored["loop_execution"] is True
     assert restored["loop_session_id"] == "63b66a16-1947-4be7-889b-d851a5f4ba20"
     assert restored["continuous_rosbag"] is True
+    assert restored["arrival_reapproach_waypoint_index"] == 0
+    assert restored["arrival_reapproach_attempts"] == 1
     assert second.outbox_count() == 1
     second.close()
 
@@ -69,6 +73,8 @@ def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
             "post_arrival_stage": "xy_adjusting",
             "arrival_side_effects_started": True,
             "arrival_coarse_fallback_accepted": True,
+            "arrival_reapproach_waypoint_index": 0,
+            "arrival_reapproach_attempts": 1,
             "arrival_micro_adjust_total_m": 0.30,
             "arrival_micro_adjust_steps": 2,
             "arrival_micro_adjust_started_at": 1234.5,
@@ -81,6 +87,8 @@ def test_task_context_migration_and_post_arrival_state_persist(tmp_path):
     assert restored["post_arrival_stage"] == "xy_adjusting"
     assert restored["arrival_side_effects_started"] is True
     assert restored["arrival_coarse_fallback_accepted"] is True
+    assert restored["arrival_reapproach_waypoint_index"] == 0
+    assert restored["arrival_reapproach_attempts"] == 1
     assert restored["arrival_micro_adjust_total_m"] == 0.30
     assert restored["arrival_micro_adjust_steps"] == 2
     assert restored["arrival_micro_adjust_started_at"] == 1234.5

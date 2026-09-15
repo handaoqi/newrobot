@@ -53,14 +53,14 @@ def follow_path_patrol_params(
     Final approach slows down so the DiffDrive turning radius fits the
     0.35 m window.
     """
-    vx_max = (0.08 if reapproach else 0.15) if final_approach else float(
+    vx_max = 0.15 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
     )
     # Last-metre and reapproach are XY close-ups. Allowing reverse here lets
     # GoalCritic hunt the click (forward, back, forward) instead of settling.
     # Cruise still keeps vx_min=-0.12 so a blocked leg can reverse around a mark.
     vx_min = 0.0 if reapproach or final_approach else -0.12
-    wz_max = (0.25 if reapproach else 0.35) if final_approach else float(
+    wz_max = 0.35 if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).wz_rps
     )
     return {
@@ -5562,8 +5562,8 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
         elif use_rpp:
             params = {
-                "RPP.desired_linear_vel": (0.08 if reapproach else 0.18) if final_approach else speed_profile.vx_mps,
-                "RPP.min_linear_vel": 0.02 if reapproach else (0.03 if final_approach else 0.05),
+                "RPP.desired_linear_vel": 0.18 if final_approach else speed_profile.vx_mps,
+                "RPP.min_linear_vel": 0.03 if final_approach else 0.05,
                 "RPP.lookahead_dist": 0.40 if final_approach else 1.2,
                 "RPP.min_lookahead_dist": 0.25 if final_approach else 0.6,
                 "RPP.max_lookahead_dist": 0.8 if final_approach else 1.8,
@@ -5596,7 +5596,7 @@ class RosAdapter(Node):
                 LOGGER.warning("unable to apply RPP waypoint speed profile")
         elif use_ilqr:
             params = {
-                "ILQR.desired_linear_vel": (0.08 if reapproach else 0.14) if final_approach else speed_profile.vx_mps,
+                "ILQR.desired_linear_vel": 0.14 if final_approach else speed_profile.vx_mps,
                 "ILQR.max_angular_vel": 0.25 if final_approach else speed_profile.wz_rps,
             }
             self._boundary_base_velocity = {
@@ -5662,6 +5662,11 @@ class RosAdapter(Node):
 
         self._active_navigation_speed_profile = speed_profile
         self._active_navigation_final_approach = bool(final_approach)
+        self._active_navigation_reapproach_speed_mps = (
+            {"mppi": 0.15, "rpp": 0.18, "ilqr": 0.14}.get(normalized_local)
+            if reapproach
+            else None
+        )
         self._navigation_speed_last_limit_mps = None
         self._navigation_speed_last_update_monotonic = time.monotonic()
         # A new leg starts from its safe terminal speed. Feedback then raises
@@ -5692,7 +5697,12 @@ class RosAdapter(Node):
         decel = max(0.05, float(getattr(safety, "navigation_speed_decel_mps2", 1.0)))
         accel = max(0.05, float(getattr(safety, "navigation_speed_accel_mps2", 0.8)))
         interval = max(0.05, float(getattr(safety, "navigation_speed_update_seconds", 0.5)))
-        if getattr(self, "_active_navigation_final_approach", False):
+        reapproach_speed = getattr(
+            self, "_active_navigation_reapproach_speed_mps", None
+        )
+        if reapproach_speed is not None:
+            desired = float(reapproach_speed)
+        elif getattr(self, "_active_navigation_final_approach", False):
             desired = final_speed
         elif profile.level == "micro":
             # The established micro profile is a constant 0.30 m/s cap; only
@@ -5709,7 +5719,11 @@ class RosAdapter(Node):
         previous_at = getattr(self, "_navigation_speed_last_update_monotonic", now)
         elapsed = max(0.0, now - previous_at)
         if previous is None:
-            limited = desired if profile.level == "micro" else final_speed
+            limited = (
+                desired
+                if profile.level == "micro" or reapproach_speed is not None
+                else final_speed
+            )
         elif desired >= previous:
             limited = min(desired, previous + accel * elapsed)
         else:
@@ -5788,19 +5802,61 @@ class RosAdapter(Node):
     def set_arrival_goal_tolerance(
         self, tolerance_m: float, *, yaw_tolerance_rad: float = 0.25
     ) -> None:
-        """Set and verify the Nav2 XY radius for the next waypoint goal."""
+        """Set and read back the Nav2 radius for the next waypoint goal."""
         tolerance = max(0.01, float(tolerance_m))
-        self._set_remote_parameters(
+        expected = {
+            "general_goal_checker.xy_goal_tolerance": tolerance,
+            "general_goal_checker.required_yaw_goal_tolerance": max(
+                0.01, float(yaw_tolerance_rad)
+            ),
+        }
+        names = list(expected)
+        previous = self._get_remote_parameters(
             "/controller_server",
-            {
-                "general_goal_checker.xy_goal_tolerance": tolerance,
-                "general_goal_checker.required_yaw_goal_tolerance": max(
-                    0.01, float(yaw_tolerance_rad)
-                ),
-            },
+            names,
+            code="ARRIVAL_GOAL_TOLERANCE_READBACK_FAILED",
+            attempts=2,
+        )
+        self._set_remote_parameters(
+            "/controller_server", expected,
             code="ARRIVAL_GOAL_TOLERANCE_FAILED",
             attempts=4,
         )
+        actual = self._get_remote_parameters(
+            "/controller_server",
+            names,
+            code="ARRIVAL_GOAL_TOLERANCE_READBACK_FAILED",
+            attempts=3,
+        )
+        mismatches = {
+            name: {"expected": expected[name], "actual": actual.get(name)}
+            for name in names
+            if not isinstance(actual.get(name), (int, float))
+            or not math.isclose(
+                float(actual[name]), float(expected[name]), rel_tol=0.0, abs_tol=1e-6
+            )
+        }
+        if mismatches:
+            rollback = {
+                name: value
+                for name, value in previous.items()
+                if isinstance(value, (bool, int, float))
+            }
+            if len(rollback) == len(expected):
+                try:
+                    self._set_remote_parameters(
+                        "/controller_server",
+                        rollback,
+                        code="ARRIVAL_GOAL_TOLERANCE_ROLLBACK_FAILED",
+                        attempts=2,
+                    )
+                except ProtocolError:
+                    LOGGER.exception("failed to roll back Nav2 arrival tolerances")
+            raise ProtocolError(
+                "ARRIVAL_GOAL_TOLERANCE_READBACK_FAILED",
+                f"Nav2 arrival tolerance readback mismatch: {mismatches}",
+            )
+        self._last_arrival_goal_tolerance_readback = dict(actual)
 
     def set_arrival_micro_goal_profile(
         self, *, enabled: bool, tolerance_m: float = 0.15

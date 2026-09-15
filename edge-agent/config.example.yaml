@@ -99,14 +99,14 @@ safety:
   navigation_speed_final_mps: 0.15
   navigation_speed_update_seconds: 0.5
   # Every waypoint first reaches this Nav2 radius. A normal stopping waypoint
-  # is then stationary-corrected and retried at 0.20 m; after three attempts,
+  # is then stationary-corrected and retried once at 0.30 m; after that attempt,
   # a fresh corrected pose inside this 0.50 m circle may continue. Precision
   # and docking points never use this fallback; pass_through skips the
   # physical-arrival transaction.
   coarse_goal_tolerance_m: 0.50
-  normal_arrival_tolerance_m: 0.20
+  normal_arrival_tolerance_m: 0.30
   precision_arrival_tolerance_m: 0.15
-  arrival_reapproach_max_attempts: 3
+  arrival_reapproach_max_attempts: 1
   # Used only at the final docking contact waypoint.
   docking_goal_tolerance_m: 0.08
   docking_goal_yaw_tolerance_rad: 0.0872665
@@ -115,9 +115,9 @@ safety:
   # is diagnostic only and is not a start gate.
   arrival_micro_adjust_mode: cmd_vel
   arrival_micro_adjust_max_initial_error_m: 0.45
-  arrival_micro_adjust_total_budget_m: 0.60
+  arrival_micro_adjust_total_budget_m: 0.30
   arrival_micro_adjust_step_m: 0.15
-  arrival_micro_adjust_max_steps: 4
+  arrival_micro_adjust_max_steps: 2
   # Above this residual, do stationary precision localization before moving.
   arrival_nav2_reapproach_max_error_m: 1.50
   arrival_precision_recovery_retry_seconds: 5.0

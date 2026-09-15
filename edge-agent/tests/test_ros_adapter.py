@@ -1644,6 +1644,43 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     assert outdoor_final_with_obstacles["FollowPath.PreferForwardCritic.enabled"] is True
 
 
+@pytest.mark.parametrize(
+    ("controller", "parameter", "expected_speed"),
+    [
+        ("mppi", "FollowPath.vx_max", 0.15),
+        ("rpp", "RPP.desired_linear_vel", 0.18),
+        ("ilqr", "ILQR.desired_linear_vel", 0.14),
+    ],
+)
+def test_fine_reapproach_uses_controller_specific_nav2_speed(
+    monkeypatch, controller, parameter, expected_speed
+):
+    adapter = object.__new__(RosAdapter)
+    adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
+    monkeypatch.setattr(
+        "roamerx_edge.ros_adapter.Bool",
+        lambda: SimpleNamespace(data=False),
+    )
+    adapter._rtk_is_navigation_pose_source = lambda: False
+    adapter.set_safety_profile = lambda **kwargs: None
+    writes = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(
+        (node, dict(values))
+    )
+
+    adapter.set_waypoint_profile(
+        avoid_obstacles=True,
+        require_yaw=False,
+        final_approach=True,
+        reapproach=True,
+        local_controller=controller,
+    )
+
+    controller_write = next(values for node, values in writes if node == "/controller_server")
+    assert controller_write[parameter] == expected_speed
+    assert adapter._active_navigation_reapproach_speed_mps == expected_speed
+
+
 def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(monkeypatch):
     adapter = object.__new__(RosAdapter)
     adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
@@ -1902,6 +1939,19 @@ def test_disabling_goal_precision_does_not_raise_on_timeout(monkeypatch):
 def test_arrival_goal_tolerance_sets_xy_and_yaw_with_readback_path():
     adapter = object.__new__(RosAdapter)
     writes = []
+    reads = iter(
+        [
+            {
+                "general_goal_checker.xy_goal_tolerance": 0.25,
+                "general_goal_checker.required_yaw_goal_tolerance": 0.10,
+            },
+            {
+                "general_goal_checker.xy_goal_tolerance": 0.50,
+                "general_goal_checker.required_yaw_goal_tolerance": 0.25,
+            },
+        ]
+    )
+    adapter._get_remote_parameters = lambda node, names, **kwargs: next(reads)
     adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(
         (node, values, kwargs)
     )
@@ -1918,6 +1968,30 @@ def test_arrival_goal_tolerance_sets_xy_and_yaw_with_readback_path():
             {"code": "ARRIVAL_GOAL_TOLERANCE_FAILED", "attempts": 4},
         )
     ]
+    assert adapter._last_arrival_goal_tolerance_readback == {
+        "general_goal_checker.xy_goal_tolerance": 0.50,
+        "general_goal_checker.required_yaw_goal_tolerance": 0.25,
+    }
+
+
+def test_arrival_goal_tolerance_readback_mismatch_rolls_back_previous_values():
+    from roamerx_edge.protocol import ProtocolError
+
+    adapter = object.__new__(RosAdapter)
+    writes = []
+    previous = {
+        "general_goal_checker.xy_goal_tolerance": 0.25,
+        "general_goal_checker.required_yaw_goal_tolerance": 0.10,
+    }
+    reads = iter([previous, {**previous, "general_goal_checker.xy_goal_tolerance": 0.40}])
+    adapter._get_remote_parameters = lambda node, names, **kwargs: next(reads)
+    adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(dict(values))
+
+    with pytest.raises(ProtocolError) as raised:
+        adapter.set_arrival_goal_tolerance(0.50, yaw_tolerance_rad=0.25)
+
+    assert raised.value.code == "ARRIVAL_GOAL_TOLERANCE_READBACK_FAILED"
+    assert writes[-1] == previous
 
 
 def test_zero_timeout_ready_probe_still_waits_for_action_discovery():
