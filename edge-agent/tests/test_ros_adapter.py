@@ -1762,14 +1762,67 @@ def test_live_final_approach_skips_costmaps_and_retries_controller_once(monkeypa
         raise ProtocolError(code, f"{node_name} parameter request timed out")
 
     adapter._set_remote_parameters = _set
-    adapter.set_waypoint_profile(
-        avoid_obstacles=True, require_yaw=False, final_approach=True, live=True
-    )
+    with pytest.raises(ProtocolError):
+        adapter.set_waypoint_profile(
+            avoid_obstacles=True, require_yaw=False, final_approach=True, live=True
+        )
 
     assert order == [
         ("/controller_server", 2, order[0][2]),
     ]
     assert order[0][2]["FollowPath.vx_max"] == 0.15
+
+
+def test_terminal_mppi_profile_reads_back_goal_critic_and_forward_only(monkeypatch):
+    adapter = object.__new__(RosAdapter)
+    adapter._nav_service_callback_group = object()
+    adapter._goal_yaw_required_pub = SimpleNamespace(publish=lambda *_: None)
+    adapter._rtk_is_navigation_pose_source = lambda: False
+    monkeypatch.setattr(
+        "roamerx_edge.ros_adapter.Bool",
+        lambda: SimpleNamespace(data=False),
+    )
+    reads = []
+    writes = []
+    adapter._set_remote_parameters = lambda node, values, **kwargs: writes.append(
+        (node, dict(values))
+    )
+
+    def _get(node, names, **kwargs):
+        reads.append((node, list(names)))
+        return {
+            "FollowPath.GoalCritic.enabled": True,
+            "FollowPath.vx_min": 0.0,
+        }
+
+    adapter._get_remote_parameters = _get
+    adapter.set_waypoint_profile(
+        avoid_obstacles=True,
+        require_yaw=False,
+        final_approach=True,
+        local_controller="mppi",
+    )
+    assert writes[0][1]["FollowPath.GoalCritic.enabled"] is True
+    assert writes[0][1]["FollowPath.vx_min"] == 0.0
+    assert reads == [
+        (
+            "/controller_server",
+            ["FollowPath.GoalCritic.enabled", "FollowPath.vx_min"],
+        )
+    ]
+
+
+def test_terminal_mppi_profile_rejects_non_forward_readback():
+    from roamerx_edge.protocol import ProtocolError
+
+    adapter = object.__new__(RosAdapter)
+    adapter._nav_service_callback_group = object()
+    adapter._get_remote_parameters = lambda *args, **kwargs: {
+        "FollowPath.GoalCritic.enabled": False,
+        "FollowPath.vx_min": -0.12,
+    }
+    with pytest.raises(ProtocolError, match="GoalCritic"):
+        adapter._verify_mppi_terminal_profile()
 
 
 def test_planner_profile_restores_indoor_defaults_and_enables_outdoor_rtk():

@@ -5551,6 +5551,12 @@ class RosAdapter(Node):
                 params["FollowPath.vx_max"] = min(params["FollowPath.vx_max"], boundary_limit)
                 params["FollowPath.vx_min"] = -min(abs(params["FollowPath.vx_min"]), boundary_limit)
                 params["FollowPath.vy_max"] = min(params["FollowPath.vy_max"], boundary_limit)
+            # Terminal MPPI is a hard safety/settling mode, not a best-effort
+            # tuning hint.  Keep these two values authoritative even after a
+            # boundary cap or a stale cruise profile has been applied.
+            if final_approach:
+                params["FollowPath.GoalCritic.enabled"] = True
+                params["FollowPath.vx_min"] = 0.0
             try:
                 self._set_remote_parameters(
                     "/controller_server",
@@ -5558,9 +5564,16 @@ class RosAdapter(Node):
                     code="WAYPOINT_PROFILE_FAILED",
                     attempts=2 if live else 3,
                 )
+                if final_approach:
+                    self._verify_mppi_terminal_profile()
                 follow_applied = True
             except ProtocolError:
                 LOGGER.warning("unable to apply FollowPath waypoint speed profile")
+                # Continuing with the old cruise profile would re-enable
+                # reverse hunting exactly at the point where the robot must
+                # settle.  Let the caller enter its safe-hold path instead.
+                if final_approach:
+                    raise
         elif use_rpp:
             params = {
                 "RPP.desired_linear_vel": 0.18 if final_approach else speed_profile.vx_mps,
@@ -5674,6 +5687,37 @@ class RosAdapter(Node):
         # the cap with a bounded ramp; this avoids a parameter-write jump to
         # the remote-monitoring maximum.
         self.update_navigation_speed_envelope(0.0, force=True)
+
+    def _verify_mppi_terminal_profile(self) -> None:
+        """Confirm the two non-negotiable terminal MPPI parameters."""
+        getter = getattr(self, "_get_remote_parameters", None)
+        if (
+            not callable(getter)
+            or getattr(self, "_nav_service_callback_group", None) is None
+        ):
+            # Lightweight simulation adapters do not expose ROS parameter
+            # services; the write itself is still covered by their tests.
+            return
+        names = ["FollowPath.GoalCritic.enabled", "FollowPath.vx_min"]
+        actual = getter(
+            "/controller_server",
+            names,
+            code="WAYPOINT_PROFILE_READBACK_FAILED",
+            attempts=2,
+        )
+        if actual.get(names[0]) is not True:
+            raise ProtocolError(
+                "WAYPOINT_PROFILE_READBACK_FAILED",
+                f"terminal GoalCritic readback={actual.get(names[0])!r} expected=True",
+            )
+        value = actual.get(names[1])
+        if not isinstance(value, (int, float)) or not math.isclose(
+            float(value), 0.0, rel_tol=0.0, abs_tol=1e-6
+        ):
+            raise ProtocolError(
+                "WAYPOINT_PROFILE_READBACK_FAILED",
+                f"terminal vx_min readback={value!r} expected=0.0",
+            )
 
     def update_navigation_speed_envelope(
         self, distance_remaining_m: float | None, *, force: bool = False

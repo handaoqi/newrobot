@@ -5694,7 +5694,11 @@ class TaskExecutor:
                 self._apply_patrol_final_approach()
             except ProtocolError:
                 LOGGER.exception(
-                    "final-approach navigation profile failed; continuing the current goal"
+                    "final-approach navigation profile was not confirmed; entering safe hold"
+                )
+                self._emit_safe_hold(
+                    "FINAL_APPROACH_PROFILE_NOT_CONFIRMED",
+                    "终点控制参数未确认，禁止继续前进，已进入安全保持",
                 )
         with self._lock:
             if not self.context or self.context.state != "running":
