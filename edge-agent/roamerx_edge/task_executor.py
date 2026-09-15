@@ -57,10 +57,9 @@ PATROL_FINAL_APPROACH_M = 1.0
 # remains the final authority for every BehaviorServer velocity command.
 OBSTACLE_RECOVERY_MAX_ATTEMPTS = 3
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
+# Outdoor cruise has PathAlign off, so moderate errors must still spin here
+# or the dog drives the current heading instead of the next click.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
-# Outdoor MPPI can turn while cruising for sub-90° errors. A 76° in-place
-# teleop spin at point 1 hit PolygonRearStop and looked like orbiting.
-OUTDOOR_DEPARTURE_HEADING_SKIP_RAD = pi / 2  # 90 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
 # A waypoint explicitly marked require_yaw previously let RPP chase the final
 # orientation while still following the path.  Keep its original, stricter
@@ -2848,21 +2847,13 @@ class TaskExecutor:
     def _pre_leg_heading_error_requires_spin(self, error_rad: float | None) -> bool:
         """Whether a cruise leg should stop and teleop-spin before Nav2.
 
-        Indoor keeps the 10° absorb / larger-error spin. Outdoor only spins
-        for ~90°+ turns; smaller errors are left to MPPI while moving so the
-        dog does not pivot in place at a start click.
+        Indoor and outdoor use the same 10° absorb. Outdoor MPPI PathAlign is
+        off, so a skipped 74° start heading drives the current yaw instead of
+        the next click.
         """
         if error_rad is None:
             return True
-        abs_error = abs(float(error_rad))
-        if abs_error <= DEPARTURE_HEADING_SKIP_RAD:
-            return False
-        if (
-            self._outdoor_navigation_profile()
-            and abs_error < OUTDOOR_DEPARTURE_HEADING_SKIP_RAD
-        ):
-            return False
-        return True
+        return abs(float(error_rad)) > DEPARTURE_HEADING_SKIP_RAD
 
     def _maybe_face_travel_direction(self, target_index: int) -> bool:
         """Rotate in place toward the travel leg when the heading error is large."""

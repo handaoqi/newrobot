@@ -2876,7 +2876,7 @@ def test_outdoor_arrival_faces_departure_heading(tmp_path):
     store.close()
 
 
-def test_outdoor_sub_90deg_departure_does_not_spin_in_place(tmp_path):
+def test_outdoor_moderate_departure_spins_in_place_before_cruise(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -2897,13 +2897,21 @@ def test_outdoor_sub_90deg_departure_does_not_spin_in_place(tmp_path):
     # Field log: 76° error at point 1 while facing waypoint 2.
     # Travel to wp-2 from (1,2) is atan2(1,1) ≈ 0.785 rad.
     nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.785 + 1.326)
-    before_teleop = len(nav.teleop)
     before_sent = len(nav.sent)
-    assert executor._dispatch_departure_heading(0) is False
-    assert executor._maybe_face_travel_direction(1) is False
-    assert executor._departure_heading_index is None
-    assert len(nav.teleop) == before_teleop
+    assert executor._dispatch_departure_heading(0) is True
+    assert executor._departure_heading_mode == "teleop"
+    assert executor._departure_heading_index == 0
     assert len(nav.sent) == before_sent
+    executor._clear_departure_heading(cancel_navigation=True)
+    _await_departure_heading(executor)
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.785 + 1.326)
+    cruised = []
+    executor._dispatch_navigation = lambda index: cruised.append(index)
+    assert executor._maybe_face_travel_direction(1) is True
+    assert executor._departure_heading_mode == "teleop"
+    assert executor._departure_cruise_index == 1
+    _await_departure_heading(executor)
+    assert cruised == [1]
     store.close()
 
 
