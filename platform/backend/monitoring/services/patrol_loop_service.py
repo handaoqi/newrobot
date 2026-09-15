@@ -517,6 +517,75 @@ class PatrolLoopService:
             )
             cache.delete(cache_key)
 
+    @staticmethod
+    def _abs_finite(value) -> float | None:
+        try:
+            number = abs(float(value))
+        except (TypeError, ValueError):
+            return None
+        return number if isfinite(number) else None
+
+    @staticmethod
+    def _nonnegative_finite(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not isfinite(number) or number < 0.0:
+            return None
+        return number
+
+    @classmethod
+    def _localization_current(cls, localization: dict) -> bool:
+        localization = localization if isinstance(localization, dict) else {}
+        localization_age = cls._nonnegative_finite(localization.get("sample_age_seconds"))
+        localization_fresh_flag = localization.get("fresh")
+        if localization_fresh_flag is False:
+            return False
+        if localization_fresh_flag is True:
+            return (
+                localization_age is None
+                or localization_age <= cls.EDGE_ROS_STALE_SECONDS
+            )
+        return bool(
+            localization_age is not None
+            and localization_age <= cls.EDGE_ROS_STALE_SECONDS
+        )
+
+    @classmethod
+    def _commanding_motion(cls, navigation: dict) -> bool:
+        if navigation.get("requested_velocity_observed") is not True:
+            return False
+        requested_planar = cls._abs_finite(navigation.get("requested_planar_speed_mps"))
+        requested_turn = cls._abs_finite(navigation.get("requested_turn_speed_rps"))
+        if requested_planar is None or requested_turn is None:
+            return False
+        return (
+            requested_planar > cls.STOP_SPEED_MPS
+            or requested_turn > cls.STOP_TURN_RPS
+        )
+
+    @classmethod
+    def _idle_uncommanded_stop(
+        cls, navigation: dict, localization: dict
+    ) -> tuple[bool, str, str]:
+        """Collision Monitor stays silent until /cmd_vel_raw arrives.
+
+        After a stationary timeout it also stops repeating zeros.  An Edge
+        that has never seen either velocity topic is therefore idle, not
+        "unknown motion", as long as localization is still advancing and
+        Nav2 is not currently commanding speed.
+        """
+        if cls._commanding_motion(navigation):
+            return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
+        if not cls._localization_current(localization):
+            return (
+                False,
+                "EDGE_ROS_DATA_UNAVAILABLE",
+                "Edge 尚未收到实际速度观测，不能确认机器人已停车",
+            )
+        return True, "", ""
+
     @classmethod
     def _health(cls, session: PatrolLoopSession) -> tuple[bool, str, str]:
         safe, code, message = cls._observation_safety(session)
@@ -547,91 +616,41 @@ class PatrolLoopService:
         raw_payload = latest.raw_payload if isinstance(latest.raw_payload, dict) else {}
         navigation = raw_payload.get("navigation")
         navigation = navigation if isinstance(navigation, dict) else {}
+        localization = raw_payload.get("localization")
+        localization = localization if isinstance(localization, dict) else {}
         modern_velocity_contract = (
             navigation.get("observation_schema") == "roamerx.navigation-observation.v1"
             or "actual_velocity_observed" in navigation
         )
         if navigation.get("actual_velocity_observed") is False:
-            return (
-                False,
-                "EDGE_ROS_DATA_UNAVAILABLE",
-                "Edge 尚未收到实际速度观测，不能确认机器人已停车",
-            )
-        actual_planar = navigation.get("actual_planar_speed_mps")
-        actual_turn = navigation.get("actual_turn_speed_rps")
+            return cls._idle_uncommanded_stop(navigation, localization)
+        actual_planar = cls._abs_finite(navigation.get("actual_planar_speed_mps"))
+        actual_turn = cls._abs_finite(navigation.get("actual_turn_speed_rps"))
         if actual_planar is not None and actual_turn is not None:
-            try:
-                actual_planar = abs(float(actual_planar))
-                actual_turn = abs(float(actual_turn))
-            except (TypeError, ValueError):
-                actual_planar = actual_turn = None
-            if (
-                actual_planar is not None
-                and isfinite(actual_planar)
-                and isfinite(actual_turn)
-            ):
-                localization = raw_payload.get("localization")
-                localization = localization if isinstance(localization, dict) else {}
-                motion_age = navigation.get("actual_velocity_sample_age_seconds")
-                localization_age = localization.get("sample_age_seconds")
-                try:
-                    motion_age = float(motion_age) if motion_age is not None else None
-                except (TypeError, ValueError):
-                    motion_age = None
-                try:
-                    localization_age = (
-                        float(localization_age) if localization_age is not None else None
-                    )
-                except (TypeError, ValueError):
-                    localization_age = None
-                if motion_age is None or not isfinite(motion_age) or motion_age < 0.0:
-                    return (
-                        False,
-                        "EDGE_ROS_DATA_UNAVAILABLE",
-                        "Edge 实际速度观测缺少有效时间戳，不能确认机器人已停车",
-                    )
-                localization_fresh_flag = localization.get("fresh")
-                if localization_fresh_flag is False:
-                    localization_current = False
-                elif localization_fresh_flag is True:
-                    localization_current = (
-                        localization_age is None
-                        or (
-                            isfinite(localization_age)
-                            and 0.0 <= localization_age <= cls.EDGE_ROS_STALE_SECONDS
-                        )
-                    )
-                else:
-                    localization_current = bool(
-                        localization_age is not None
-                        and isfinite(localization_age)
-                        and 0.0 <= localization_age <= cls.EDGE_ROS_STALE_SECONDS
-                    )
-                # Collision Monitor may suppress repeated zero commands, so a
-                # stale *zero* alone is valid.  If its age and the localization
-                # age are both stale, however, Edge's ROS callback cache has
-                # stopped advancing.  Do not display that as robot movement.
-                if (
-                    motion_age > cls.EDGE_ROS_STALE_SECONDS
-                    and not localization_current
-                ):
-                    return (
-                        False,
-                        "EDGE_ROS_DATA_STALE",
-                        "Edge ROS 运动与定位观测已过期，等待 Edge 恢复数据更新",
-                    )
-                if (
-                    actual_planar > cls.STOP_SPEED_MPS
-                    or actual_turn > cls.STOP_TURN_RPS
-                ):
-                    return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
-                return True, "", ""
-        if modern_velocity_contract:
-            return (
-                False,
-                "EDGE_ROS_DATA_UNAVAILABLE",
-                "Edge 实际速度观测字段不完整，不能确认机器人已停车",
+            motion_age = cls._nonnegative_finite(
+                navigation.get("actual_velocity_sample_age_seconds")
             )
+            localization_current = cls._localization_current(localization)
+            if motion_age is None:
+                return cls._idle_uncommanded_stop(navigation, localization)
+            # Collision Monitor may suppress repeated zero commands, so a
+            # stale *zero* alone is valid.  If its age and the localization
+            # age are both stale, however, Edge's ROS callback cache has
+            # stopped advancing.  Do not display that as robot movement.
+            if motion_age > cls.EDGE_ROS_STALE_SECONDS and not localization_current:
+                return (
+                    False,
+                    "EDGE_ROS_DATA_STALE",
+                    "Edge ROS 运动与定位观测已过期，等待 Edge 恢复数据更新",
+                )
+            if (
+                actual_planar > cls.STOP_SPEED_MPS
+                or actual_turn > cls.STOP_TURN_RPS
+            ):
+                return False, "ROBOT_NOT_STOPPED", "尚未确认机器人停止"
+            return True, "", ""
+        if modern_velocity_contract:
+            return cls._idle_uncommanded_stop(navigation, localization)
         # Compatibility fallback for old Edge payloads that do not yet carry
         # Collision Monitor's actual /cmd_vel observation.
         if latest.speed_mps is None or abs(float(latest.speed_mps)) > cls.STOP_SPEED_MPS:

@@ -6057,7 +6057,10 @@ class RosAdapter(Node):
         if not command_zero:
             return False
         if self._actual_velocity_updated_monotonic <= 0.0:
-            return False
+            # Never seeing /cmd_vel is normal while Collision Monitor waits
+            # for the first /cmd_vel_raw.  Demand without actual output is
+            # still not a confirmed stop.
+            return float(getattr(self, "_raw_velocity_updated_monotonic", 0.0) or 0.0) <= 0.0
         # A stale zero is expected when Collision Monitor suppresses output;
         # only stale non-zero values are unsafe and rejected above.
         return True

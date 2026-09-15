@@ -12,6 +12,8 @@ def test_navigation_status_marks_uninitialized_velocity_cache_unobserved():
 
     assert result["observation_schema"] == "roamerx.navigation-observation.v1"
     assert result["actual_velocity_observed"] is False
+    assert result["requested_velocity_observed"] is False
+    assert result["cmd_vel_idle_uncommanded"] is True
 
 
 def test_navigation_status_marks_timestamped_velocity_cache_observed():
@@ -26,3 +28,4 @@ def test_navigation_status_marks_timestamped_velocity_cache_observed():
 
     assert result["actual_velocity_observed"] is True
     assert result["requested_velocity_observed"] is True
+    assert result["cmd_vel_idle_uncommanded"] is False

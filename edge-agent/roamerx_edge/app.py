@@ -60,11 +60,15 @@ def navigation_status_observation(snapshot: object) -> dict:
     """Attach an explicit presence contract to cached navigation telemetry."""
     navigation = dict(snapshot) if isinstance(snapshot, dict) else {}
     navigation["observation_schema"] = "roamerx.navigation-observation.v1"
-    navigation["actual_velocity_observed"] = (
-        navigation.get("actual_velocity_sample_age_seconds") is not None
-    )
-    navigation["requested_velocity_observed"] = (
-        navigation.get("requested_velocity_sample_age_seconds") is not None
+    actual_age = navigation.get("actual_velocity_sample_age_seconds")
+    requested_age = navigation.get("requested_velocity_sample_age_seconds")
+    navigation["actual_velocity_observed"] = actual_age is not None
+    navigation["requested_velocity_observed"] = requested_age is not None
+    # Collision Monitor does not publish /cmd_vel until /cmd_vel_raw arrives,
+    # then suppresses repeated zeros after a stationary timeout.  Empty
+    # caches therefore mean idle, not missing proof of motion.
+    navigation["cmd_vel_idle_uncommanded"] = (
+        actual_age is None and requested_age is None
     )
     return navigation
 
