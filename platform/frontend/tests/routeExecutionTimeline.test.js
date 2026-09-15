@@ -84,7 +84,7 @@ test('falls back to execution index and removes duplicated events', () => {
   assert.equal(timeline[0].title, '6号点目标已下发')
 })
 
-test('arrival confirmation shows correction mode, three retries and strict radius', () => {
+test('arrival confirmation shows correction mode, one reapproach and strict radius', () => {
   const timeline = buildTaskExecutionTimeline({
     state: 'running',
     route_snapshot: { waypoints: [{ map_point_number: 2 }] },
@@ -96,7 +96,7 @@ test('arrival confirmation shows correction mode, three retries and strict radiu
         localization_correction: 'skipped',
         distance_m: 0.29,
         acceptance_tolerance_m: 0.3,
-        reapproach_attempts: 3,
+        reapproach_attempts: 1,
         coarse_completed: false,
       }),
       event(9, 'task.waypoint_reached', 9, '2026-09-06T08:00:08+08:00', {
@@ -111,7 +111,61 @@ test('arrival confirmation shows correction mode, three retries and strict radiu
   assert.match(timeline[0].detail, /轻量到达（跳过定位校正）/)
   assert.match(timeline[0].detail, /偏差 0\.29m/)
   assert.match(timeline[0].detail, /验收半径 0\.30m/)
-  assert.match(timeline[0].detail, /追加靠近 3 次/)
+  assert.match(timeline[0].detail, /追加靠近 1 次/)
+})
+
+test('current coarse fallback after full correction is not labeled as a legacy strategy', () => {
+  const timeline = buildTaskExecutionTimeline({
+    state: 'running',
+    route_snapshot: { waypoints: [{ map_point_number: 4 }] },
+    events: [
+      event(8, 'task.arrival_degraded_accepted', 8, '2026-09-15T08:00:07+08:00', {
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 4, x: 4, y: 5 },
+        distance_m: 0.40,
+        fine_tolerance_m: 0.3,
+        coarse_tolerance_m: 0.5,
+        reapproach_attempts: 1,
+      }),
+      event(9, 'task.arrival_confirmed', 9, '2026-09-15T08:00:08+08:00', {
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 4, x: 4, y: 5 },
+        arrival_mode: 'full_correction',
+        localization_correction: 'completed',
+        distance_m: 0.40,
+        acceptance_tolerance_m: 0.5,
+        reapproach_attempts: 1,
+        coarse_completed: true,
+      }),
+    ],
+  })
+
+  assert.equal(timeline[0].title, '4号点一次细靠近后按 0.50m 放行')
+  assert.match(timeline[0].detail, /偏差 0\.40m/)
+  assert.match(timeline[0].detail, /追加靠近 1 次/)
+  assert.equal(timeline[1].title, '4号点验收完成（0.50m 降级完成）')
+  assert.match(timeline[1].detail, /完整定位校正/)
+  assert.match(timeline[1].detail, /一次细靠近后按 0\.50m 完成/)
+  assert.doesNotMatch(timeline[1].detail, /旧策略/)
+})
+
+test('legacy coarse completion without full correction keeps the historical marker', () => {
+  const timeline = buildTaskExecutionTimeline({
+    state: 'completed',
+    route_snapshot: { waypoints: [{ map_point_number: 2 }] },
+    events: [
+      event(8, 'task.arrival_confirmed', 8, '2026-09-06T08:00:08+08:00', {
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 2, x: 2, y: 3 },
+        distance_m: 0.41,
+        acceptance_tolerance_m: 0.5,
+        coarse_completed: true,
+      }),
+    ],
+  })
+
+  assert.equal(timeline[0].title, '2号点验收完成（粗范围完成）')
+  assert.match(timeline[0].detail, /旧策略：按 0\.50m 粗范围完成/)
 })
 
 test('separates Nav2 stop, one-second zero confirmation, and stationary correction', () => {

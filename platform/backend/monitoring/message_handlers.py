@@ -1063,6 +1063,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         "task.arrival_zero_timeout",
         "task.arrival_check",
         "task.arrival_confirmed",
+        "task.arrival_degraded_accepted",
         "task.arrival_correcting",
         "task.arrival_heading_aligning",
         "task.arrival_heading_aligned",
@@ -1071,6 +1072,29 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         "task.waypoint_degraded",
         "task.waypoint_postprocess_completed",
     }:
+        if envelope.message_type == "task.arrival_degraded_accepted":
+            TaskExecutionEvent.objects.get_or_create(
+                message_id=envelope.message_id,
+                defaults={
+                    "task_execution": execution,
+                    "state": execution.state,
+                    "state_version": int(
+                        payload.get("state_version") or execution.state_version
+                    ),
+                    "event_type": envelope.message_type,
+                    "occurred_at": _event_time(
+                        payload, "occurred_at", "reported_at"
+                    ),
+                    "reason_code": str(
+                        payload.get("reason_code")
+                        or "ARRIVAL_FINE_REAPPROACH_EXHAUSTED"
+                    ),
+                    "reason_message": str(
+                        payload.get("reason_message") or "普通航点按粗到达半径完成"
+                    ),
+                    "payload": payload,
+                },
+            )
         realtime_publisher.publish_task_event(
             str(execution.id),
             {"type": envelope.message_type.removeprefix("task."), "payload": payload},

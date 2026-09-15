@@ -4716,9 +4716,7 @@ async function handleDeleteRoute(route) {
 }
 
 .waypoint-arrival-hint span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .waypoint-delete-btn {

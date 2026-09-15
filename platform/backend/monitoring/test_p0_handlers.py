@@ -423,6 +423,7 @@ class MessageHandlerTests(TestCase):
                 "task.arrival_zero_timeout",
                 "task.arrival_check",
                 "task.arrival_confirmed",
+                "task.arrival_degraded_accepted",
                 "task.arrival_heading_aligning",
                 "task.arrival_heading_aligned",
                 "task.waypoint_postprocess_completed",
@@ -459,6 +460,7 @@ class MessageHandlerTests(TestCase):
                         "task.arrival_zero_timeout",
                         "task.arrival_check",
                         "task.arrival_confirmed",
+                        "task.arrival_degraded_accepted",
                         "task.arrival_heading_aligning",
                         "task.arrival_heading_aligned",
                         "task.waypoint_postprocess_completed",
@@ -472,6 +474,7 @@ class MessageHandlerTests(TestCase):
                 "task.arrival_zero_timeout",
                 "task.arrival_check",
                 "task.arrival_confirmed",
+                "task.arrival_degraded_accepted",
                 "task.arrival_heading_aligning",
                 "task.arrival_heading_aligned",
                 "task.waypoint_postprocess_completed",
@@ -486,15 +489,23 @@ class MessageHandlerTests(TestCase):
                     "task.arrival_zero_timeout",
                     "task.arrival_check",
                     "task.arrival_confirmed",
+                    "task.arrival_degraded_accepted",
                     "task.arrival_heading_aligning",
                     "task.arrival_heading_aligned",
                     "task.waypoint_postprocess_completed",
                 },
                 process_status="processed",
             ).count(),
-            9,
+            10,
         )
-        self.assertEqual(publish_task_event.call_count, 9)
+        self.assertEqual(publish_task_event.call_count, 10)
+        self.assertEqual(
+            TaskExecutionEvent.objects.filter(
+                task_execution=self.execution,
+                event_type="task.arrival_degraded_accepted",
+            ).count(),
+            1,
+        )
 
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(

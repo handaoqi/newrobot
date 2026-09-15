@@ -6829,7 +6829,12 @@ class TaskExecutor:
     def _set_navigation_arrival_tolerance(self, waypoint_index: int) -> None:
         setter = getattr(self.navigation, "set_arrival_goal_tolerance", None)
         if callable(setter):
-            yaw_tolerance = 0.25
+            # Patrol arrival heading is owned by Edge after XY arrival.  Keep
+            # Nav2's goal checker from rotating/holding on the target pose
+            # yaw while the controller should continue facing the next-leg
+            # direction.  Docking is the explicit exception: its contact
+            # pose remains a Nav2-owned precision goal.
+            yaw_tolerance = 3.14
             if self.context and self._arrival_reapproach_index == waypoint_index:
                 # Re-approach must not rotate toward the final waypoint yaw;
                 # that turn is performed only after corrected XY acceptance.

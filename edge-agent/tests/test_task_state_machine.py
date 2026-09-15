@@ -3646,6 +3646,9 @@ def test_patrol_require_yaw_directly_adjusts_large_turn_drift_after_reaching_xy(
     # Nav2 may finish the XY click while the body still faces away from the
     # requested yaw. Its profile must not ask RPP to weave toward that yaw.
     assert nav.waypoint_profiles[0] == (True, False, True)
+    # The goal checker must also ignore the final waypoint yaw; Edge performs
+    # the stationary turn only after XY arrival has been accepted.
+    assert nav.arrival_goal_tolerances[0][1] == 3.14
     nav.pose = SimpleNamespace(x=float(first["x"]), y=float(first["y"]), yaw=pi)
     original_teleop_velocity = nav.teleop_velocity
 

@@ -59,6 +59,7 @@ class ProtocolContractTests(SimpleTestCase):
             "task.arrival_zero_timeout",
             "task.arrival_check",
             "task.arrival_confirmed",
+            "task.arrival_degraded_accepted",
             "task.arrival_heading_aligning",
             "task.arrival_heading_aligned",
             "task.waypoint_postprocess_completed",

@@ -84,6 +84,18 @@ function eventWaypointLabel(event, execution) {
   return '未知航点'
 }
 
+function coarseArrivalCompletionText(payload) {
+  if (payload?.coarse_completed !== true) return ''
+  if (payload.arrival_mode === 'full_correction') return '一次细靠近后按 0.50m 完成'
+  return '旧策略：按 0.50m 粗范围完成'
+}
+
+function coarseArrivalTitleSuffix(payload) {
+  if (payload?.coarse_completed !== true) return ''
+  if (payload.arrival_mode === 'full_correction') return '（0.50m 降级完成）'
+  return '（粗范围完成）'
+}
+
 function eventDetail(event) {
   const payload = event?.payload || {}
   const target = coordinateText(payload.waypoint)
@@ -105,7 +117,8 @@ function eventDetail(event) {
   if (Number.isFinite(Number(payload.elapsed_seconds))) {
     arrival.push(`本阶段 ${Number(payload.elapsed_seconds).toFixed(1)}s`)
   }
-  if (payload.coarse_completed === true) arrival.push('旧策略：按 0.50m 粗范围完成')
+  const coarseText = coarseArrivalCompletionText(payload)
+  if (coarseText) arrival.push(coarseText)
   return [
     target ? `目标 ${target}` : '',
     robot ? `机器狗 ${robot}` : '',
@@ -163,8 +176,11 @@ function timelinePresentation(event, execution) {
     return { type: 'arrival', title: `${waypointLabel}已到达`, pointName: waypointLabel }
   }
   if (eventType === 'task.arrival_confirmed') {
-    const suffix = event?.payload?.coarse_completed === true ? '（粗范围完成）' : ''
+    const suffix = coarseArrivalTitleSuffix(event?.payload)
     return { type: 'arrival', title: `${waypointLabel}验收完成${suffix}`, pointName: waypointLabel }
+  }
+  if (eventType === 'task.arrival_degraded_accepted') {
+    return { type: 'arrival', title: `${waypointLabel}一次细靠近后按 0.50m 放行`, pointName: waypointLabel }
   }
   if (eventType === 'task.arrival_nav2_stopping') {
     return { type: 'pause', title: `${waypointLabel}等待 Nav2 停止`, pointName: waypointLabel }

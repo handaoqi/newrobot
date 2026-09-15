@@ -30,17 +30,17 @@ test('arrival-policy details include the matching coarse, fine, and micro-adjust
   ])
   assert.deepEqual(arrivalPolicyDetails('stop_and_confirm'), [
     '停车校正并确认后，执行后续事项。',
-    '粗到达0.50m；细靠近0.20m，最多3次。',
-    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+    '粗到达0.50m；细靠近0.30m，最多1次；一次后仍在0.50m内则放行。',
+    '勾选转向后：微调不超过0.15m/次，最多2次/0.30m/30s。',
   ])
   assert.deepEqual(arrivalPolicyDetails('precision'), [
-    '停车校正后，按严格位置和航向验收。',
-    '粗到达0.50m；细靠近0.15m，最多3次。',
-    '勾选转向后：微调0.15m/段，4段/0.60m/30s。',
+    '停车校正后，按严格位置和已设置的航向验收。',
+    '粗到达0.50m；细靠近0.15m，最多1次；失败则保持，不降级。',
+    '勾选转向后：微调不超过0.15m/次，最多2次/0.30m/30s。',
   ])
   assert.deepEqual(arrivalPolicyDetails('dock'), [
-    '停靠任务中：低速对接并严格确认位置、航向。',
-    '粗到达0.50m；对接到位0.08m、航向5度。',
+    '停靠任务中：低速对接并确认位置及已设置的航向。',
+    '粗到达0.50m；对接到位0.08m、航向5度；失败则保持，不降级。',
     '不使用通用转向微调。',
   ])
   assert.deepEqual(arrivalPolicyDetails('unknown'), arrivalPolicyDetails('stop_and_confirm'))

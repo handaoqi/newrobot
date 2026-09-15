@@ -1118,7 +1118,12 @@ class TaskExecutionEvent(BaseTimestampModel):
         constraints = [
             models.UniqueConstraint(
                 fields=["task_execution", "state_version"],
-                condition=~Q(event_type="task.obstacle_stage"),
+                condition=~Q(
+                    event_type__in=(
+                        "task.obstacle_stage",
+                        "task.arrival_degraded_accepted",
+                    )
+                ),
                 name="uniq_task_state_ver_non_obstacle",
             )
         ]
