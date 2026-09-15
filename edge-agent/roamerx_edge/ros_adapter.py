@@ -262,6 +262,12 @@ class RosAdapter(Node):
         self._service_clients_lock = threading.Lock()
         self._ros_executor_alive_provider: Callable[[], bool] | None = None
         self._latest_odometry = None
+        self._odom_linear_x = 0.0
+        self._odom_linear_y = 0.0
+        self._odom_angular_z = 0.0
+        self._odom_received_monotonic = 0.0
+        self._standstill_started_monotonic = None
+        self._lio_started_monotonic = time.monotonic()
         self._odometry_sequence = 0
         self._odometry_consumed_sequence = 0
         self._latest_scan = None
@@ -876,6 +882,19 @@ class RosAdapter(Node):
             )
 
     def _process_odometry(self, msg) -> None:
+        twist = getattr(getattr(msg, "twist", None), "twist", None)
+        linear = getattr(twist, "linear", None)
+        angular = getattr(twist, "angular", None)
+        try:
+            self._odom_linear_x = float(getattr(linear, "x"))
+            self._odom_linear_y = float(getattr(linear, "y"))
+            self._odom_angular_z = float(getattr(angular, "z"))
+            if all(math.isfinite(value) for value in (
+                self._odom_linear_x, self._odom_linear_y, self._odom_angular_z,
+            )):
+                self._odom_received_monotonic = time.monotonic()
+        except (AttributeError, TypeError, ValueError):
+            pass
         stamp = getattr(getattr(msg, "header", None), "stamp", None)
         stamp_seconds = 0.0
         if stamp is not None:
@@ -6035,7 +6054,11 @@ class RosAdapter(Node):
             stopped = self._is_stopped_from_velocity(time.monotonic())
             if stopped:
                 stable_since = stable_since or time.monotonic()
-                if time.monotonic() - stable_since >= self.safety_config.stop_confirmation_seconds:
+                hold_time = float(getattr(
+                    self.safety_config, "standstill_hold_time",
+                    self.safety_config.stop_confirmation_seconds,
+                ))
+                if time.monotonic() - stable_since >= max(0.0, hold_time):
                     return True
             else:
                 stable_since = None
@@ -6049,21 +6072,40 @@ class RosAdapter(Node):
         stationary timeout. A stale *zero* therefore remains valid, while a
         stale non-zero command is never accepted for recovery.
         """
-        planar_speed = math.hypot(self._actual_forward_command, self._actual_lateral_command)
-        command_zero = (
-            planar_speed <= self.safety_config.stop_speed_threshold_mps
-            and abs(self._actual_turn_command) <= 0.05
-        )
-        if not command_zero:
+        # Do not inspect odom until FAST-LIO has had time to publish a stable
+        # stream after startup.  This prevents zero/default odom from falsely
+        # confirming a stop during initialization.
+        data_delay = float(getattr(self.safety_config, "standstill_data_valid_delay", 1.2))
+        if now - float(getattr(self, "_lio_started_monotonic", now)) < max(0.0, data_delay):
             return False
-        if self._actual_velocity_updated_monotonic <= 0.0:
-            # Never seeing /cmd_vel is normal while Collision Monitor waits
-            # for the first /cmd_vel_raw.  Demand without actual output is
-            # still not a confirmed stop.
-            return float(getattr(self, "_raw_velocity_updated_monotonic", 0.0) or 0.0) <= 0.0
-        # A stale zero is expected when Collision Monitor suppresses output;
-        # only stale non-zero values are unsafe and rejected above.
-        return True
+        odom_received = float(getattr(self, "_odom_received_monotonic", 0.0) or 0.0)
+        if odom_received <= 0.0 or now - odom_received > 0.30:
+            return False
+        linear_threshold = float(getattr(
+            self.safety_config, "standstill_linear_speed_threshold", 0.03
+        ))
+        angular_threshold = float(getattr(
+            self.safety_config, "standstill_angular_speed_threshold", 0.025
+        ))
+        odom_planar = math.hypot(self._odom_linear_x, self._odom_linear_y)
+        odom_still = odom_planar <= linear_threshold and abs(self._odom_angular_z) <= angular_threshold
+        if not odom_still:
+            self._standstill_started_monotonic = None
+            return False
+        # A fresh non-zero command is a safety veto; stale zero commands are
+        # allowed because Collision Monitor intentionally stops republishing.
+        actual_age = now - float(getattr(self, "_actual_velocity_updated_monotonic", 0.0) or 0.0)
+        command_planar = math.hypot(self._actual_forward_command, self._actual_lateral_command)
+        if actual_age <= 0.30 and (
+            command_planar > self.safety_config.stop_speed_threshold_mps
+            or abs(self._actual_turn_command) > angular_threshold
+        ):
+            self._standstill_started_monotonic = None
+            return False
+        self._standstill_started_monotonic = self._standstill_started_monotonic or now
+        return now - self._standstill_started_monotonic >= float(
+            getattr(self.safety_config, "standstill_hold_time", 1.0)
+        )
 
 
 class RosRuntime:

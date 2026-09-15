@@ -81,6 +81,12 @@ class TelemetryConfig:
 
 @dataclass
 class SafetyConfig:
+    # Odom-based standstill detection.  The optional top-level ``standstill``
+    # YAML section is flattened into these fields by EdgeConfig.load().
+    standstill_linear_speed_threshold: float = 0.03
+    standstill_angular_speed_threshold: float = 0.025
+    standstill_hold_time: float = 1.0
+    standstill_data_valid_delay: float = 1.2
     stop_speed_threshold_mps: float = 0.03
     stop_confirmation_seconds: float = 1.0
     localization_stable_seconds: float = 3.0
@@ -510,6 +516,15 @@ class EdgeConfig:
         else:
             safety_raw.pop("final_waypoint_tolerance_m", None)
         safety_raw.pop("arrival_degraded_tolerance_m", None)
+        standstill_raw = dict(raw.get("standstill", {}))
+        if "linear_speed_threshold" in standstill_raw:
+            safety_raw["standstill_linear_speed_threshold"] = standstill_raw["linear_speed_threshold"]
+        if "angular_speed_threshold" in standstill_raw:
+            safety_raw["standstill_angular_speed_threshold"] = standstill_raw["angular_speed_threshold"]
+        if "standstill_hold_time" in standstill_raw:
+            safety_raw["standstill_hold_time"] = standstill_raw["standstill_hold_time"]
+        if "data_valid_delay" in standstill_raw:
+            safety_raw["standstill_data_valid_delay"] = standstill_raw["data_valid_delay"]
         return cls(
             robot=RobotConfig(**raw["robot"]),
             mqtt=MqttConfig(**raw["mqtt"]),

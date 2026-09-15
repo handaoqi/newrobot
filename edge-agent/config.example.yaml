@@ -32,6 +32,15 @@ ros_callback_optimization:
   scan_processing_rate_hz: 10
   scan_matching_full_detail_interval_seconds: 10
 
+standstill:
+  # Odom 速度低于阈值才可能判定为静止（四足机器狗可调）
+  linear_speed_threshold: 0.03
+  angular_speed_threshold: 0.025
+  # 必须连续满足该时长，过滤刚停下和瞬时抖动
+  standstill_hold_time: 1.0
+  # FAST-LIO 启动后先等待稳定 odom，再启用停车检测
+  data_valid_delay: 1.2
+
 telemetry:
   status_interval_seconds: 2
   heartbeat_interval_seconds: 10
