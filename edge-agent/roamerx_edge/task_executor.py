@@ -2861,6 +2861,8 @@ class TaskExecutor:
         waypoints = self.context.route_snapshot.get("waypoints") or []
         if target_index < 0 or target_index >= len(waypoints):
             return False
+        if self._waypoint_is_pass_through(target_index):
+            return False
         pose = self.navigation.latest_pose() if self.navigation else None
         if pose is None:
             return False
@@ -3035,8 +3037,10 @@ class TaskExecutor:
                 waypoints[last_index], last_index, remaining
             )
         )
+        pass_through_goal = self._waypoint_is_pass_through(last_index)
         initial_final_approach = (
             (not self._is_docking_task())
+            and not pass_through_goal
             and (require_yaw_stop or already_close)
             and not already_inside_coarse
         )
@@ -5569,7 +5573,11 @@ class TaskExecutor:
                     remaining = self._distance_to_waypoint(
                         self.context.route_snapshot["waypoints"][dispatched_final_index]
                     )
-                if remaining is not None and remaining <= PATROL_FINAL_APPROACH_M:
+                if (
+                    remaining is not None
+                    and remaining <= PATROL_FINAL_APPROACH_M
+                    and not self._waypoint_is_pass_through(dispatched_final_index)
+                ):
                     self._patrol_final_approach_applied = True
                     apply_final = True
             if milestone == "target_dispatched":
@@ -6225,6 +6233,8 @@ class TaskExecutor:
         next_index = reached_index + 1
         if next_index >= len(waypoints):
             return False
+        if self._waypoint_is_pass_through(reached_index):
+            return False
         current, target = waypoints[reached_index], waypoints[next_index]
         pose = self.navigation.latest_pose() if self.navigation else None
         if pose is not None:
@@ -6700,6 +6710,14 @@ class TaskExecutor:
             return "stop_and_confirm"
         return "stop_and_confirm"
 
+    def _waypoint_is_pass_through(self, waypoint_index: int) -> bool:
+        if not self.context:
+            return False
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if waypoint_index < 0 or waypoint_index >= len(waypoints):
+            return False
+        return self._arrival_policy(waypoints[waypoint_index], waypoint_index) == "pass_through"
+
     def _waypoint_requires_localization_correction(
         self, waypoint: dict, waypoint_index: int
     ) -> bool:
@@ -7023,6 +7041,9 @@ class TaskExecutor:
 
     def _apply_patrol_final_approach(self) -> None:
         """Slow the live FollowPath goal; do not touch costmaps or docking precision."""
+        dispatched_final_index = self._goal_offset + max(self._dispatched_count, 1) - 1
+        if self._waypoint_is_pass_through(dispatched_final_index):
+            return
         setter = getattr(self.navigation, "set_waypoint_profile", None)
         if not callable(setter):
             return

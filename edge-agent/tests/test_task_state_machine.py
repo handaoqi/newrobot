@@ -4864,6 +4864,72 @@ def test_pass_through_waypoints_use_travel_heading(tmp_path):
     store.close()
 
 
+def _pass_through_outdoor_start(nav):
+    envelope = command("task.start")
+    envelope.payload["command"]["map"].update(
+        {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"}
+    )
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "outdoor"
+    envelope.payload["command"]["route_snapshot"]["map"] = dict(
+        envelope.payload["command"]["map"]
+    )
+    for waypoint in envelope.payload["command"]["route_snapshot"]["waypoints"]:
+        waypoint["arrival_policy"] = "pass_through"
+    return envelope
+
+
+def test_pass_through_skips_last_metre_hunt_when_already_close(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # 0.6 m from wp-1: inside the 1 m last-metre window, outside the on-click skip.
+    nav.pose = SimpleNamespace(x=0.4, y=2.0, yaw=1.6)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(_pass_through_outdoor_start(nav))
+
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert nav.teleop == []
+    assert executor._departure_heading_index is None
+    assert executor._patrol_final_approach_applied is False
+    assert nav.waypoint_profiles[-1][2] is False
+
+    nav.feedback(0, 0.4)
+    assert executor._patrol_final_approach_applied is False
+    assert nav.waypoint_profiles[-1][2] is False
+    store.close()
+
+
+def test_pass_through_does_not_spin_before_or_after_the_click(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    # 1.5 m from wp-1 so a stop_and_confirm start would teleop-spin ~92°.
+    nav.pose = SimpleNamespace(x=-0.5, y=2.0, yaw=1.6)
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(_pass_through_outdoor_start(nav))
+
+    assert ids(nav.sent[0]) == ["wp-1"]
+    assert nav.teleop == []
+    assert executor._maybe_face_travel_direction(0) is False
+    assert executor._dispatch_departure_heading(0) is False
+
+    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=3.0)
+    nav.result("succeeded", "", {"missed_waypoints": []})
+    assert executor.context.current_waypoint_index == 1
+    assert ids(nav.sent[-1]) == ["wp-2"]
+    assert nav.teleop == []
+    assert executor._departure_heading_index is None
+    store.close()
+
+
 def test_straighten_pass_through_flattens_click_noise_but_keeps_real_turns():
     noisy_line = [
         {"waypoint_id": "a", "x": 0.0, "y": 0.0, "yaw": 0.0},
