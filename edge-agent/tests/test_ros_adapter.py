@@ -2341,63 +2341,156 @@ def test_global_plan_snapshot_exposes_fresh_points_and_stales_after_timeout():
     assert stale["points"] == []
 
 
-def test_stopped_accepts_stale_zero_after_collision_monitor_quiet_period():
+def _make_standstill_adapter(now=None):
+    now = time.monotonic() if now is None else float(now)
     adapter = object.__new__(RosAdapter)
     adapter.safety_config = SafetyConfig()
+    adapter._lio_started_monotonic = now - 10.0
+    adapter._odom_linear_x = 0.0
+    adapter._odom_linear_y = 0.0
+    adapter._odom_angular_z = 0.0
+    adapter._odom_received_monotonic = now
+    adapter._standstill_started_monotonic = now - 1.1
+    adapter._raw_forward_command = 0.0
+    adapter._raw_lateral_command = 0.0
+    adapter._raw_turn_command = 0.0
+    adapter._raw_velocity_updated_monotonic = 0.0
     adapter._actual_forward_command = 0.0
     adapter._actual_lateral_command = 0.0
     adapter._actual_turn_command = 0.0
-    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
+    adapter._actual_velocity_updated_monotonic = 0.0
+    return adapter
 
-    assert adapter._is_stopped_from_velocity(time.monotonic()) is True
+
+def test_stopped_accepts_stale_zero_after_collision_monitor_quiet_period():
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    adapter._actual_velocity_updated_monotonic = now - 10.0
+
+    assert adapter._is_stopped_from_velocity(now) is True
 
 
 def test_stopped_accepts_idle_when_collision_monitor_never_published():
-    adapter = object.__new__(RosAdapter)
-    adapter.safety_config = SafetyConfig()
-    adapter._actual_forward_command = 0.0
-    adapter._actual_lateral_command = 0.0
-    adapter._actual_turn_command = 0.0
-    adapter._actual_velocity_updated_monotonic = 0.0
-    adapter._raw_velocity_updated_monotonic = 0.0
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
 
-    assert adapter._is_stopped_from_velocity(time.monotonic()) is True
+    assert adapter._is_stopped_from_velocity(now) is True
 
 
-def test_stopped_rejects_uninitialized_actual_when_raw_command_seen():
-    adapter = object.__new__(RosAdapter)
-    adapter.safety_config = SafetyConfig()
-    adapter._actual_forward_command = 0.0
-    adapter._actual_lateral_command = 0.0
-    adapter._actual_turn_command = 0.0
-    adapter._actual_velocity_updated_monotonic = 0.0
-    adapter._raw_velocity_updated_monotonic = time.monotonic()
+@pytest.mark.parametrize("source", ["raw", "actual"])
+def test_stopped_rejects_each_stale_nonzero_command_until_that_source_is_zero(source):
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    setattr(adapter, f"_{source}_forward_command", 0.12)
+    setattr(adapter, f"_{source}_velocity_updated_monotonic", now - 10.0)
 
-    assert adapter._is_stopped_from_velocity(time.monotonic()) is False
+    assert adapter._is_stopped_from_velocity(now) is False
+    setattr(adapter, f"_{source}_forward_command", 0.0)
+    adapter._standstill_started_monotonic = now - 1.1
+    assert adapter._is_stopped_from_velocity(now) is True
 
 
-def test_stopped_rejects_nonzero_command_even_when_feedback_is_stale():
-    adapter = object.__new__(RosAdapter)
-    adapter.safety_config = SafetyConfig()
-    adapter._actual_forward_command = 0.12
-    adapter._actual_lateral_command = 0.0
-    adapter._actual_turn_command = 0.0
-    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
+def test_stopped_does_not_veto_commands_at_configured_deadband():
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    adapter._raw_forward_command = 0.03
+    adapter._actual_lateral_command = 0.03
+    adapter._actual_turn_command = 0.025
 
-    assert adapter._is_stopped_from_velocity(time.monotonic()) is False
+    assert adapter._is_stopped_from_velocity(now) is True
 
 
 def test_nonzero_command_clears_stopped_state():
-    adapter = object.__new__(RosAdapter)
-    adapter.safety_config = SafetyConfig()
-    adapter._actual_forward_command = 0.0
-    adapter._actual_lateral_command = 0.0
-    adapter._actual_turn_command = 0.0
-    adapter._actual_velocity_updated_monotonic = time.monotonic() - 10.0
-    assert adapter._is_stopped_from_velocity(time.monotonic()) is True
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    assert adapter._is_stopped_from_velocity(now) is True
 
     adapter._on_cmd_vel(SimpleNamespace(
         linear=SimpleNamespace(x=0.12, y=0.0),
         angular=SimpleNamespace(z=0.0),
     ))
     assert adapter._is_stopped_from_velocity(time.monotonic()) is False
+    assert adapter._standstill_started_monotonic is None
+
+
+def test_stopped_uses_one_continuous_hold_window():
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    adapter._standstill_started_monotonic = None
+
+    assert adapter._is_stopped_from_velocity(now) is False
+    adapter._odom_received_monotonic = now + 0.9
+    assert adapter._is_stopped_from_velocity(now + 0.9) is False
+    adapter._odom_received_monotonic = now + 1.01
+    assert adapter._is_stopped_from_velocity(now + 1.01) is True
+
+
+def test_stopped_resets_hold_for_lio_warmup_and_stale_odom():
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    adapter._lio_started_monotonic = now - 0.5
+
+    assert adapter._is_stopped_from_velocity(now) is False
+    assert adapter._standstill_started_monotonic is None
+
+    adapter._lio_started_monotonic = now - 10.0
+    adapter._standstill_started_monotonic = now - 1.1
+    adapter._odom_received_monotonic = now - 0.31
+    assert adapter._is_stopped_from_velocity(now) is False
+    assert adapter._standstill_started_monotonic is None
+
+
+def test_lio_odometry_callback_advances_standstill_without_telemetry_consumer(monkeypatch):
+    now = time.monotonic()
+    adapter = _make_standstill_adapter(now)
+    adapter._standstill_started_monotonic = now - 1.1
+    adapter._odometry_sequence = 0
+    adapter._odometry_consumed_sequence = 0
+    adapter._latest_odometry = None
+    adapter._callback_performance = SimpleNamespace(record=lambda *args, **kwargs: None)
+    adapter._callback_optimization_enabled = lambda: True
+    adapter._callback_metrics_enabled = lambda: False
+    msg = SimpleNamespace(
+        twist=SimpleNamespace(twist=SimpleNamespace(
+            linear=SimpleNamespace(x=0.01, y=0.02),
+            angular=SimpleNamespace(z=0.01),
+        )),
+    )
+
+    adapter._on_odometry(msg)
+
+    assert adapter._odom_linear_x == pytest.approx(0.01)
+    assert adapter._odom_linear_y == pytest.approx(0.02)
+    assert adapter._odom_angular_z == pytest.approx(0.01)
+    assert adapter._odometry_sequence == 1
+    assert adapter._odometry_consumed_sequence == 0
+
+
+def test_is_robot_stopped_does_not_add_a_second_hold_window():
+    adapter = object.__new__(RosAdapter)
+    adapter.safety_config = SafetyConfig()
+    adapter._is_stopped_from_velocity = lambda _now: True
+
+    started = time.monotonic()
+    assert adapter.is_robot_stopped(timeout_seconds=0.1) is True
+    assert time.monotonic() - started < 0.05
+
+
+def test_stop_motion_eagerly_clears_both_command_vetoes(monkeypatch):
+    adapter = _make_standstill_adapter()
+    adapter._raw_forward_command = 0.12
+    adapter._actual_turn_command = 0.20
+    adapter._standstill_started_monotonic = 1.0
+    raw_published = []
+    actual_published = []
+    adapter._arrival_adjust_cmd_vel_pub = SimpleNamespace(publish=raw_published.append)
+    adapter._cmd_vel_pub = SimpleNamespace(publish=actual_published.append)
+    monkeypatch.setattr(ros_adapter_module.time, "sleep", lambda _seconds: None)
+
+    adapter.stop_motion()
+
+    assert adapter._raw_forward_command == 0.0
+    assert adapter._actual_turn_command == 0.0
+    assert adapter._standstill_started_monotonic is None
+    assert len(raw_published) == 10
+    assert len(actual_published) == 10

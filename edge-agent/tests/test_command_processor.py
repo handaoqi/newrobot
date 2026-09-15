@@ -92,6 +92,9 @@ class FakeNavigation:
     def confirmed_remote_teleop_action(self, action, success_states, failure_states=None, timeout_seconds=4.0):
         return self.confirmed_teleop_action(action, success_states, failure_states, timeout_seconds)
 
+    def remote_teleop_action(self, action):
+        return self.teleop_action(action)
+
     def release_to_remote_control(self, timeout_seconds=3.0):
         self.teleop_actions.append("release_remote")
         return {
@@ -1113,6 +1116,79 @@ def test_manual_assist_uses_collision_monitored_pipeline_without_blocking_task(t
     assert result["payload"]["result"] == {
         "topic": "/cmd_vel_assist", "vx": 0.1, "vy": -0.1, "yaw_rate": 0.25, "mode": "manual_assist",
     }
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    ["teleop.stand_up", "teleop.lie_down", "teleop.shake_hand", "teleop.two_leg_stand"],
+)
+def test_manual_assist_discrete_actions_keep_navigation_control_mode(tmp_path, message_type):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = message_type
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"assist": True}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    executor.has_active_task = lambda: True
+    state = RuntimeSafetyState(
+        localization_status="normal", nav_ready=True, control_mode="manual_assist"
+    )
+    released_profiles = []
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        temporary_fusion_release_callback=released_profiles.append,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "succeeded"
+    assert result["payload"]["result"]["mode"] == "manual_assist"
+    assert state.control_mode == "manual_assist"
+    assert released_profiles == []
+    store.close()
+
+
+def test_manual_assist_action_is_rejected_after_navigation_task_finishes(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "teleop.move_velocity"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {"assist": True, "vx": 0.05}
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    executor = TaskExecutor(
+        store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+    )
+    executor.has_active_task = lambda: False
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(
+            SafetyConfig(),
+            RuntimeSafetyState(
+                localization_status="normal", nav_ready=True, control_mode="manual_assist"
+            ),
+        ),
+        task_executor=executor,
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    assert result["payload"]["status"] == "failed"
+    assert result["payload"]["error_code"] == "MANUAL_ASSIST_REQUIRES_ACTIVE_TASK"
+    assert navigation.teleop_velocities == []
     store.close()
 
 

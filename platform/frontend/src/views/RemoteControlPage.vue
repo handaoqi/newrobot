@@ -33,6 +33,9 @@ const selectedPersonTrackId = ref('')
 const followActive = ref(false)
 const followStatus = ref('等待选择人员')
 const personDetectionChanging = ref(false)
+const manualAssistActive = ref(false)
+let manualAssistTaskId = ''
+let manualAssistPromise = null
 
 const statusPoller = useAsyncPoller((signal) => refreshStatus({ signal }), { intervalMs: 1_000 })
 const personDetectionPoller = useAsyncPoller((signal) => refreshPersonDetections({ signal }), { intervalMs: 350 })
@@ -80,7 +83,12 @@ const status = computed(() => liveStatus.value?.status || {})
 const localizationQuality = computed(() => status.value?.localization_quality || {})
 const localizationDecision = computed(() => localizationQuality.value?.decision || {})
 const navigationStatus = computed(() => status.value?.navigation || {})
-const canControl = computed(() => !followActive.value && selectedRobot.value?.id && !commandSending.value)
+const canControl = computed(() => (
+  !followActive.value
+  && Boolean(selectedRobot.value?.id)
+  && Boolean(taskId.value)
+  && !commandSending.value
+))
 const motionControlState = computed(() => {
   const service = liveStatus.value?.status?.power_mode?.services?.controller_motion
   if (!service?.available) return '状态未知'
@@ -93,6 +101,12 @@ const selectedPerson = computed(() => personDetections.value.find((item) => item
 const personDetectionEnabled = computed(() => Boolean(personDetectionState.value?.enabled))
 const recentAlerts = computed(() => selectedRobot.value?.recent_events || [])
 const todayAlertCount = computed(() => Number(selectedRobot.value?.today_alerts || 0))
+
+const SHARED_CONTROL_ACTIONS = new Set([
+  'move_forward', 'move_backward', 'move_left', 'move_right',
+  'turn_left', 'turn_right', 'move_velocity', 'move_stop',
+  'speed_micro', 'speed_slow', 'speed_normal', 'speed_fast',
+])
 
 function showVideoNotice({ message, variant }) {
   showToast(message, variant ? { variant } : undefined)
@@ -226,6 +240,7 @@ function qualityValue(key) {
 async function dispatchRobotAction(action, payload = {}, source = 'remote_control') {
   const robot = selectedRobot.value
   if (!robot?.id) return false
+  if (SHARED_CONTROL_ACTIONS.has(action)) await ensureManualAssist()
   return sendRobotCommand(robot.id, {
     action,
     payload: {
@@ -233,6 +248,58 @@ async function dispatchRobotAction(action, payload = {}, source = 'remote_contro
       ...payload,
     },
   })
+}
+
+async function ensureManualAssist() {
+  const robot = selectedRobot.value
+  const executionId = taskId.value
+  if (!robot?.id || !executionId) {
+    throw new Error('当前没有运行中的导航任务，远程控制页仅支持人工辅助模式')
+  }
+  if (manualAssistActive.value && manualAssistTaskId === executionId) return
+  if (manualAssistPromise) return manualAssistPromise
+  manualAssistPromise = (async () => {
+    const command = await sendRobotCommand(robot.id, {
+      action: 'takeover_enter',
+      payload: {
+        assist: true,
+        source: 'remote_control_manual_assist_enter',
+        note: 'Enter bounded manual assist while Nav2 remains active.',
+      },
+    })
+    await waitForRobotCommand(command, '人工辅助模式', 12000)
+    manualAssistTaskId = executionId
+    manualAssistActive.value = true
+  })()
+  try {
+    await manualAssistPromise
+  } catch (error) {
+    manualAssistTaskId = ''
+    manualAssistActive.value = false
+    throw error
+  } finally {
+    manualAssistPromise = null
+  }
+}
+
+async function releaseManualAssist(source = 'remote_control_manual_assist_release') {
+  if (!manualAssistActive.value || !selectedRobot.value?.id) return
+  try {
+    const command = await sendRobotCommand(selectedRobot.value.id, {
+      action: 'takeover_exit',
+      payload: {
+        source,
+        passive: true,
+        note: 'Release shared manual assist and return navigation control.',
+      },
+    })
+    await waitForRobotCommand(command, '退出人工辅助模式', 12000)
+  } catch (error) {
+    commandFeedback.value = error.message || '退出人工辅助模式失败'
+  } finally {
+    manualAssistTaskId = ''
+    manualAssistActive.value = false
+  }
 }
 
 async function waitForRobotCommand(command, label, timeoutMs = 12000) {
@@ -385,7 +452,11 @@ async function sendDiscreteAction(action, label) {
   if (!selectedRobot.value?.id || commandSending.value) return
   commandSending.value = true
   try {
-    const command = await dispatchRobotAction(action, {}, 'remote_control_action')
+    const command = await dispatchRobotAction(
+      action,
+      { assist: Boolean(taskId.value) },
+      'remote_control_assist_action',
+    )
     await waitForRobotCommand(command, label)
     showToast(`${label}已确认`)
   } catch (error) {
@@ -420,6 +491,8 @@ async function emergencyStop() {
     await stopHoldAction()
     const command = await dispatchRobotAction('passive', { note: 'Enter damping/passive mode.' }, 'remote_control_damping')
     await waitForRobotCommand(command, '阻尼')
+    manualAssistTaskId = ''
+    manualAssistActive.value = false
     showToast('设备已进入阻尼')
   } catch (error) {
     commandFeedback.value = error.message || '阻尼失败'
@@ -484,6 +557,7 @@ async function chooseRobot(robotId) {
   robotLoadController = new AbortController()
   const { signal } = robotLoadController
   try {
+    await releaseManualAssist('remote_control_robot_switch')
     await stopHoldAction()
     await stopFollowing('已切换设备')
     if (personDetectionEnabled.value && selectedRobot.value?.id) {
@@ -600,10 +674,17 @@ onBeforeUnmount(async () => {
   alertEventSource = null
   await stopFollowing('页面关闭，跟随已停止')
   await stopHoldAction()
+  await releaseManualAssist('remote_control_page_unmount')
 })
 
 watch(liveSourceKey, () => {
   streamUnavailable.value = false
+})
+
+watch(taskId, (next, previous) => {
+  if (previous && next !== previous && manualAssistActive.value) {
+    void releaseManualAssist(next ? 'remote_control_task_switch' : 'remote_control_task_finished')
+  }
 })
 </script>
 
@@ -614,10 +695,10 @@ watch(liveSourceKey, () => {
         <div class="panel-head">
           <div>
             <h3>远程视频操控</h3>
-            <p>按住方向键持续移动，松开立即停止；键盘支持 W/A/S/D 和 Q/E。</p>
+            <p>人工辅助模式：导航保持运行，按住方向键短时辅助移动，松开立即停止。</p>
           </div>
-          <span class="remote-state ok">
-            遥控协议在线
+          <span :class="['remote-state', manualAssistActive ? 'ok' : 'warn']">
+            {{ manualAssistActive ? '人工辅助已接入' : (taskId ? '待进入人工辅助' : '无运行任务') }}
           </span>
         </div>
 
@@ -719,7 +800,7 @@ watch(liveSourceKey, () => {
                 :key="mode.id"
                 type="button"
                 :class="['speed-mode-button', { active: speedMode === mode.id }]"
-                :disabled="commandSending || !selectedRobot"
+                :disabled="commandSending || !canControl"
                 @click="setSpeedMode(mode.id)"
               >
                 {{ mode.label }}
@@ -729,10 +810,10 @@ watch(liveSourceKey, () => {
           </div>
           <div class="remote-actions remote-special-actions">
             <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="emergencyStop">阻尼</button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('two_leg_stand', '双腿站立')">
+            <button class="ghost-btn" type="button" :disabled="commandSending || !canControl" @click="sendDiscreteAction('two_leg_stand', '双腿站立')">
               双腿站立
             </button>
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('shake_hand', '打招呼')">
+            <button class="ghost-btn" type="button" :disabled="commandSending || !canControl" @click="sendDiscreteAction('shake_hand', '打招呼')">
               打招呼
             </button>
           </div>
@@ -742,10 +823,10 @@ watch(liveSourceKey, () => {
             <span class="remote-feedback">{{ motionControlState }}</span>
           </div>
           <div class="remote-actions">
-            <button class="ghost-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('stand_up', '起立')">
+            <button class="ghost-btn" type="button" :disabled="commandSending || !canControl" @click="sendDiscreteAction('stand_up', '起立')">
               起立
             </button>
-            <button class="danger-btn" type="button" :disabled="commandSending || !selectedRobot" @click="sendDiscreteAction('lie_down', '匍匐')">
+            <button class="danger-btn" type="button" :disabled="commandSending || !canControl" @click="sendDiscreteAction('lie_down', '匍匐')">
               匍匐
             </button>
           </div>
