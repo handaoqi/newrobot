@@ -57,8 +57,6 @@ PATROL_FINAL_APPROACH_M = 1.0
 # remains the final authority for every BehaviorServer velocity command.
 OBSTACLE_RECOVERY_MAX_ATTEMPTS = 3
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
-# Outdoor cruise has PathAlign off, so moderate errors must still spin here
-# or the dog drives the current heading instead of the next click.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
 # A waypoint explicitly marked require_yaw previously let RPP chase the final
@@ -2847,9 +2845,8 @@ class TaskExecutor:
     def _pre_leg_heading_error_requires_spin(self, error_rad: float | None) -> bool:
         """Whether a cruise leg should stop and teleop-spin before Nav2.
 
-        Indoor and outdoor use the same 10° absorb. Outdoor MPPI PathAlign is
-        off, so a skipped 74° start heading drives the current yaw instead of
-        the next click.
+        Indoor and outdoor use the same 10° absorb. Larger errors still turn
+        in place first so cruise starts already facing the next click.
         """
         if error_rad is None:
             return True

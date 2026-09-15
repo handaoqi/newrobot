@@ -1630,7 +1630,8 @@ def test_patrol_cruise_profile_does_not_hug_path_orientations():
     )
     assert outdoor_with_obstacles["FollowPath.CostCritic.enabled"] is True
     assert outdoor_with_obstacles["FollowPath.CostCritic.cost_weight"] == 8.0
-    assert outdoor_with_obstacles["FollowPath.PathAlignCritic.enabled"] is False
+    assert outdoor_with_obstacles["FollowPath.PathAlignCritic.enabled"] is True
+    assert outdoor_with_obstacles["FollowPath.PathAlignCritic.use_path_orientations"] is False
 
     outdoor_final_with_obstacles = follow_path_patrol_params(
         final_approach=True,
@@ -1665,6 +1666,7 @@ def test_outdoor_waypoint_profile_enables_local_detour_and_collision_monitor(mon
     assert calls[0][0] == "/controller_server"
     assert calls[0][1]["FollowPath.CostCritic.enabled"] is True
     assert calls[0][1]["FollowPath.CostCritic.cost_weight"] == 8.0
+    assert calls[0][1]["FollowPath.PathAlignCritic.enabled"] is True
     assert (
         "/local_costmap/local_costmap",
         {"obstacle_layer.enabled": True},

@@ -45,10 +45,13 @@ def follow_path_patrol_params(
 ) -> dict[str, bool | float]:
     """MPPI settings for a patrol goal.
 
-    Cruise must not hug a slightly jagged through-poses polyline: PathAlign plus
-    path orientations turns click noise into left/right steering. CostCritic is
-    only useful when the local obstacle layer is actually painting. Final
-    approach slows down so the DiffDrive turning radius fits the 0.35 m window.
+    Outdoor cruise uses PathAlign so FollowPath tracks the ThetaStar line
+    instead of walking an arc under PreferForward. Outdoor final approach
+    keeps PathAlign off so CostCritic can still go around the mark. Path
+    orientations stay off: click noise would otherwise steer left/right.
+    CostCritic is only useful when the local obstacle layer is painting.
+    Final approach slows down so the DiffDrive turning radius fits the
+    0.35 m window.
     """
     vx_max = (0.08 if reapproach else 0.15) if final_approach else float(
         (speed_profile or navigation_speed_profile("micro")).vx_mps
@@ -86,14 +89,16 @@ def follow_path_patrol_params(
         # rejection active, but use a lower gradient weight so MPPI makes one
         # deliberate detour instead of weaving along the RTK reference line.
         "FollowPath.CostCritic.cost_weight": 8.0 if outdoor else 18.0,
-        # Indoor local detours use a low-weight tangent pull to return smoothly
-        # after clearing an obstacle. Outdoor RTK keeps it off even on the last
-        # metre; PathAlign on a final outdoor click overrode CostCritic and
-        # drove the dog straight into the mark instead of around it.
+        # Indoor: tangent pull on the last metre and after a local detour.
+        # Outdoor cruise: same pull so the dog follows the planned line.
+        # Outdoor final click: leave it off; PathAlign used to override
+        # CostCritic and drive straight into the mark.
         "FollowPath.PathAlignCritic.enabled": bool(
             not require_yaw
-            and not outdoor
-            and (final_approach or local_obstacles)
+            and (
+                (not outdoor and (final_approach or local_obstacles))
+                or (outdoor and not final_approach)
+            )
         ),
         "FollowPath.PathAlignCritic.cost_weight": 4.0 if local_obstacles else 12.0,
         "FollowPath.PathAlignCritic.offset_from_furthest": 4,
