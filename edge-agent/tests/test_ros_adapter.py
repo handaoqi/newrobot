@@ -1226,6 +1226,63 @@ def test_progressive_relocalize_falls_back_to_keyframe_global_match():
     assert result["stages"][-1]["status"] == "accepted"
 
 
+def test_global_relocalize_reports_verified_fast_lio_handoff():
+    adapter = object.__new__(RosAdapter)
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._localization_sample_condition = threading.Condition()
+    adapter._localization_sample_sequence = 12
+    latest = SimpleNamespace(
+        localization_status="normal",
+        x=8.0,
+        y=9.0,
+        z=0.1,
+        yaw=1.0,
+    )
+    handoff_decision = {
+        "handoff_anchor_generation": 23,
+        "handoff_state": "ready",
+        "active_source": "lio_imu",
+        "lio_healthy": True,
+        "lio_anchored": True,
+        "absolute_stable": True,
+        "sample_age_seconds": 0.03,
+    }
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: latest)
+    adapter._localization_decision = lambda: {
+        **handoff_decision,
+        "handoff_anchor_generation": 22,
+    }
+    adapter._wait_for_fresh_normal_samples = lambda **_kwargs: latest
+    adapter._wait_for_lio_handoff = lambda **kwargs: (
+        latest,
+        handoff_decision,
+    ) if kwargs["after_generation"] == 22 else (None, {})
+    adapter._ros_executor_alive_provider = lambda: True
+
+    class GlobalClient:
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, _request):
+            future = Future()
+            future.set_result(SimpleNamespace(
+                success=True,
+                message="keyframe 42 verified by FastVGICP",
+            ))
+            return future
+
+    adapter._global_relocalize_client = GlobalClient()
+
+    result = adapter._global_relocalize_once(30.0, 7)
+
+    assert result["localization_status"] == "normal"
+    assert result["continuous_source"] == "lio_imu"
+    assert result["map_lio_anchor_generation"] == 23
+    assert result["handoff"]["status"] == "completed"
+    assert result["handoff"]["started_at"]
+    assert result["handoff"]["finished_at"] >= result["handoff"]["started_at"]
+
+
 def test_progressive_relocalize_reports_handoff_failure_without_false_ndt_rejection():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 16

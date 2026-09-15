@@ -365,6 +365,46 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
       || raw.rtk_stability
       || result.rtk_stability,
   )
+  const secondaryCorrection = raw.secondary_correction || result.secondary_correction || null
+  const explicitHandoff = raw.handoff
+    || result.handoff
+    || raw.handoff_diagnostics
+    || result.handoff_diagnostics
+    || rtkVerification?.handoff
+    || null
+  const acceptedSelectedStage = rawStages.find(record => (
+    canonicalTimelineStage(record?.stage) === canonicalTimelineStage(
+      raw.selected_stage || result.selected_stage,
+    )
+    && timelineStatusClass(record?.status) === 'done'
+  ))
+  const secondaryCompleted = timelineStatusClass(secondaryCorrection?.status) === 'done'
+  // Releases before the unified handoff contract omitted the handoff object
+  // on a successful global-search path. A completed secondary correction can
+  // only follow accepted initialization, so retain that causal evidence
+  // instead of leaving the preceding handoff stage permanently "waiting".
+  const handoff = explicitHandoff || (secondaryCompleted
+    ? {
+        status: 'completed',
+        conclusion_code: 'inferred_from_completed_secondary_correction',
+        conclusion: 'FAST-LIO + IMU handoff confirmed by completed secondary correction',
+        inferred: true,
+        started_at: firstTimestamp(
+          raw.best_candidate_commit_finished_at,
+          result.best_candidate_commit_finished_at,
+          acceptedSelectedStage?.finished_at,
+          acceptedSelectedStage?.finishedAt,
+          secondaryCorrection?.started_at,
+          secondaryCorrection?.startedAt,
+        ),
+        finished_at: firstTimestamp(
+          secondaryCorrection?.started_at,
+          secondaryCorrection?.startedAt,
+          secondaryCorrection?.finished_at,
+          secondaryCorrection?.finishedAt,
+        ),
+      }
+    : null)
   const phase = extras.phase
     || (String(command.command_type || extras.commandType || '') === 'map.activate' ? 'transfer' : 'localization')
   const showCandidates = extras.showCandidates !== false && phase !== 'transfer'
@@ -407,13 +447,8 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     rtkVerification,
-    handoff: raw.handoff
-      || result.handoff
-      || raw.handoff_diagnostics
-      || result.handoff_diagnostics
-      || rtkVerification?.handoff
-      || null,
-    secondaryCorrection: raw.secondary_correction || result.secondary_correction || null,
+    handoff,
+    secondaryCorrection,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     rtkFixedCommitted: Boolean(raw.rtk_fixed_committed ?? result.rtk_fixed_committed),
     strategy: Array.isArray(raw.strategy)
@@ -600,6 +635,9 @@ function timelineDetail(stageKey, status, attempts, session, stageRecord = null)
   const meta = TIMELINE_STAGE_META[stageKey] || { title: stageKey, detail: '' }
   if (stageKey === 'map_transfer' && session?.phase === 'transfer') {
     return status === 'done' ? '地图下发并应用完成' : '正在等待机器狗确认地图命令'
+  }
+  if (stageKey === 'fast_lio_imu_handoff' && session?.handoff?.inferred) {
+    return '兼容旧结果：后续二次定位校正已完成，确认 FAST-LIO + IMU 主定位接管已完成'
   }
   if (stageKey === 'rtk_fixed') {
     const verification = normalizeRtkVerification(stageRecord?.rtk_verification)
@@ -851,8 +889,13 @@ export function localizationAttemptTimeline(session) {
 
   // The RTK transaction commits its authoritative anchor inside rtk_fixed;
   // adding a second "提交最优 NDT" node misrepresents the cross-check as the
-  // source of the absolute pose.
-  if (!session.rtkFixedCommitted) {
+  // source of the absolute pose. The global matcher likewise applies its
+  // verified candidate inside keyframe_global_match, so it must not create a
+  // synthetic commit row that pushes the real handoff time to command end.
+  const selectedStageKey = canonicalTimelineStage(session.selectedStage)
+  const globalCandidateApplied = selectedStageKey === 'keyframe_global_match'
+    && timelineStatusClass(stageRecords.get('keyframe_global_match')?.status) === 'done'
+  if (!session.rtkFixedCommitted && !globalCandidateApplied) {
     const commitStatus = session.bestNdtCommitted || (commandDone && session.bestMatchPose)
       ? 'accepted'
       : (session.bestMatchPose ? 'searching' : 'waiting')

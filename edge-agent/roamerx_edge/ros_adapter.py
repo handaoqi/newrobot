@@ -3816,6 +3816,13 @@ class RosAdapter(Node):
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
                 "/localization/global_relocalize service is unavailable",
             )
+        handoff_before = self._localization_decision()
+        try:
+            handoff_generation_before = int(
+                handoff_before.get("handoff_anchor_generation") or 0
+            )
+        except (TypeError, ValueError):
+            handoff_generation_before = 0
         with self._localization_sample_condition:
             sample_sequence = self._localization_sample_sequence
         future = self._global_relocalize_client.call_async(Trigger.Request())
@@ -3832,6 +3839,7 @@ class RosAdapter(Node):
                 "GLOBAL_RELOCALIZATION_UNAVAILABLE",
                 response.message if response else "global relocalization returned no response",
             )
+        handoff_started_at = now_iso()
         latest = self._wait_for_fresh_normal_samples(
             after_sequence=sample_sequence,
             required_samples=3,
@@ -3843,6 +3851,51 @@ class RosAdapter(Node):
                 "GLOBAL_RELOCALIZATION_NOT_VERIFIED",
                 f"{response.message}; no verified 3-frame localization within {wait_seconds:.1f}s",
             )
+        # A normal localization frame only proves that the global matcher
+        # produced a pose.  Initialization is not complete until the new
+        # absolute anchor has advanced and ownership has returned to the
+        # continuous FAST-LIO + IMU source.
+        handoff_latest, handoff_decision = self._wait_for_lio_handoff(
+            after_generation=handoff_generation_before,
+            timeout_seconds=min(5.0, max(1.0, float(wait_seconds))),
+            generation=generation,
+        )
+        handoff_finished_at = now_iso()
+        handoff_ready = handoff_latest is not None and self._fast_lio_handoff_ready(
+            handoff_decision
+        )
+        handoff = {
+            **self._lio_handoff_diagnostics(handoff_decision, accepted=handoff_ready),
+            "status": "completed" if handoff_ready else "failed",
+            "conclusion_code": (
+                "lio_imu_handoff_verified" if handoff_ready
+                else "lio_imu_handoff_not_verified"
+            ),
+            "conclusion": (
+                "fresh FAST-LIO + IMU handoff verified" if handoff_ready
+                else "global pose was found but FAST-LIO + IMU handoff was not verified"
+            ),
+            "started_at": handoff_started_at,
+            "updated_at": handoff_finished_at,
+            "finished_at": handoff_finished_at,
+        }
+        if not handoff_ready:
+            raise ProtocolError(
+                "GLOBAL_RELOCALIZATION_HANDOFF_FAILED",
+                "global pose was found but FAST-LIO + IMU did not become the verified continuous source",
+                details={
+                    "localization_status": latest.localization_status,
+                    "localized_pose": {
+                        "x": latest.x,
+                        "y": latest.y,
+                        "z": latest.z,
+                        "yaw": latest.yaw,
+                    },
+                    "handoff": handoff,
+                    "localization_decision": handoff_decision,
+                },
+            )
+        latest = handoff_latest
         return {
             "mode": "global_position_yaw_search",
             "source": "scan_context_fastgicp_icp",
@@ -3856,6 +3909,9 @@ class RosAdapter(Node):
                 "z": latest.z,
                 "yaw": latest.yaw,
             },
+            "handoff": handoff,
+            "continuous_source": "lio_imu",
+            "map_lio_anchor_generation": handoff.get("anchor_generation"),
             "motion_commanded": False,
         }
 

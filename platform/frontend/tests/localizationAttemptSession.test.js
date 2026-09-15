@@ -427,6 +427,53 @@ test('handoff and secondary correction expose reported stage times with legacy f
   assert.equal(nestedHandoffStage.finishedAt, '2026-09-16T00:20:02.000Z')
 })
 
+test('legacy successful global match infers completed handoff from secondary correction', () => {
+  const session = localizationAttemptSessionFromCommand({
+    command_type: 'nav.relocalize',
+    status: 'succeeded',
+    started_at: '2026-09-15T16:44:52.000Z',
+    finished_at: '2026-09-15T16:46:14.500Z',
+    result_payload: {
+      localization_status: 'normal',
+      selected_stage: 'keyframe_global_match',
+      best_match_pose: { x: 0.34, y: -2.31, yaw: -0.14 },
+      stages: [{
+        stage: 'keyframe_global_match',
+        status: 'accepted',
+        started_at: '2026-09-15T16:46:02.000Z',
+        finished_at: '2026-09-15T16:46:14.020Z',
+      }],
+      localization_attempts: {
+        state: 'accepted',
+        selected_stage: 'keyframe_global_match',
+        best_match_pose: { x: 0.34, y: -2.31, yaw: -0.14 },
+        stages: [{
+          stage: 'keyframe_global_match',
+          status: 'accepted',
+          started_at: '2026-09-15T16:46:02.000Z',
+          finished_at: '2026-09-15T16:46:14.020Z',
+        }],
+      },
+      secondary_correction: {
+        status: 'completed',
+        mode: 'ndt',
+        started_at: '2026-09-15T16:46:14.028Z',
+        finished_at: '2026-09-15T16:46:14.433Z',
+      },
+    },
+  })
+
+  const handoff = localizationAttemptTimeline(session)
+    .find(item => item.key === 'fast_lio_imu_handoff')
+  const commit = localizationAttemptTimeline(session)
+    .find(item => item.key === 'best_candidate_commit')
+  assert.equal(handoff.status, 'done')
+  assert.equal(handoff.statusLabel, '已完成')
+  assert.equal(handoff.finishedAt, '2026-09-15T16:46:14.028Z')
+  assert.match(handoff.detail, /兼容旧结果/)
+  assert.equal(commit, undefined)
+})
+
 test('legacy terminal stages fall back to command timestamps', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-no-synthetic-times',
