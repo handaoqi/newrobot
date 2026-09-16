@@ -1150,7 +1150,7 @@ def test_trusted_rtk_search_seed_is_only_a_verified_ndt_hypothesis():
     }
 
 
-def test_progressive_relocalize_places_trusted_rtk_after_origin_before_route():
+def test_progressive_relocalize_checks_trusted_rtk_before_origin_search():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 14
     adapter._assert_localization_operation = lambda _generation: None
@@ -1160,12 +1160,31 @@ def test_progressive_relocalize_places_trusted_rtk_after_origin_before_route():
     adapter._last_trusted_pose = None
     adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
     adapter._report_localization_attempts = lambda _payload: None
-    attempts = []
+    calls = []
 
-    def fail_origin(_seed, _generation, **_kwargs):
+    def active_search(seed, _generation, **_kwargs):
+        calls.append(seed.get("source"))
+        if seed.get("source") == "trusted_rtk_fixed":
+            return {
+                "attempts": [{
+                    "index": 1,
+                    "candidate_number": 1,
+                    "candidate_label": "RTK固定解可信搜索点",
+                    "status": "accepted",
+                    "ndt_candidate": {
+                        "eligible": True,
+                        "matched_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                    },
+                }],
+                "best_ndt_candidate": {
+                    "eligible": True,
+                    "matched_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                },
+                "best_match_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+            }
         raise ProtocolError("ACTIVE_RELOCALIZATION_FAILED", "origin rejected", details={"attempts": []})
 
-    adapter._active_relocalize_once = fail_origin
+    adapter._active_relocalize_once = active_search
     adapter._begin_localization_attempt = lambda index, seed, extra=None: {
         "index": index, "seed_pose": dict(seed), **(extra or {}), "status": "searching",
     }
@@ -1193,7 +1212,8 @@ def test_progressive_relocalize_places_trusted_rtk_after_origin_before_route():
     )
 
     assert result["selected_stage"] == "trusted_rtk_fixed"
-    assert result["metadata"]["source"] == "trusted_rtk_fixed"
+    assert result["attempts"][0]["candidate_number"] == 1
+    assert calls == ["trusted_rtk_fixed"]
 
 
 def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order():

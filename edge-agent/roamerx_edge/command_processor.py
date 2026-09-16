@@ -657,6 +657,24 @@ class CommandProcessor:
             mode = "ndt"
         if mode not in {"ndt", "rtk", "ukf"}:
             mode = "ndt"
+        # map.activate/nav.start own a stationary initialization transaction.
+        # The localization node otherwise keeps the previous moving phase,
+        # so an explicit NDT correction remains in
+        # ``waiting_for_fresh_ndt_measurement`` and Edge eventually cancels
+        # it as a timeout even though Nav2 execution is already deactivated.
+        # Mark the correction phase stationary before requesting the one-shot
+        # source; this also enables the forced fresh-NDT scheduling path.
+        set_policy = getattr(self.localization_adapter, "set_localization_policy", None)
+        if callable(set_policy):
+            try:
+                set_policy(
+                    mode,
+                    "stationary",
+                    anchor_preference="ndt" if mode == "ndt" else "balanced",
+                )
+            except TypeError:
+                # Compatibility adapters expose only the original two fields.
+                set_policy(mode, "stationary")
         secondary = self._run_external_secondary_correction(
             envelope, mode, prefix="navigation_lifecycle"
         )

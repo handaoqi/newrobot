@@ -4399,8 +4399,23 @@ class RosAdapter(Node):
         stages = []
         strategy = ["mapping_origin_bounded", "route_waypoints", "keyframe_global_match"]
         origin_seed = None
+        trusted_seed_entry = None
         seeds = []
         all_attempts = []
+        trusted_seed_valid = isinstance(trusted_seed, dict) and all(
+            trusted_seed.get(field) is not None for field in ("x", "y", "yaw")
+        )
+        if trusted_seed_valid:
+            trusted_seed_entry = dict(trusted_seed)
+            trusted_seed_entry.setdefault("candidate_label", "RTK固定解可信搜索点")
+            strategy.insert(0, "trusted_rtk_fixed")
+            trusted_stage = {
+                "stage": "trusted_rtk_fixed",
+                "status": "searching",
+                "started_at": now_iso(),
+            }
+            trusted_stage["updated_at"] = trusted_stage["started_at"]
+            stages.append(trusted_stage)
         if origin and all(origin.get(field) is not None for field in ("x", "y", "yaw")):
             origin_seed = dict(origin)
             origin_stage = {
@@ -4430,25 +4445,15 @@ class RosAdapter(Node):
                 continue
             seeds.append(("route_waypoint", index, dict(raw)))
 
-        # A fixed RTK result narrows the search only after the map origin has
-        # had its full bounded search.  It is a normal NDT hypothesis, never a
-        # direct /initialpose commit.  Keep it ahead of route points so an
-        # outdoor/transition map can converge locally without scanning the
-        # whole route.
-        if isinstance(trusted_seed, dict) and all(
-            trusted_seed.get(field) is not None for field in ("x", "y", "yaw")
-        ):
-            seed = dict(trusted_seed)
-            seed.setdefault("candidate_label", "RTK固定解可信搜索点")
-            seeds.insert(0, ("trusted_rtk_fixed", None, seed))
-            strategy.insert(1, "trusted_rtk_fixed")
-
         session = {
             "state": "running",
             "mode": "progressive_stationary_search",
             "strategy": strategy,
-            "selected_stage": "mapping_origin_bounded" if origin_seed is not None else None,
-            "candidate_count": len(seeds) + (20 if origin_seed else 0),
+            "selected_stage": (
+                "trusted_rtk_fixed" if trusted_seed_entry
+                else ("mapping_origin_bounded" if origin_seed is not None else None)
+            ),
+            "candidate_count": len(seeds) + (20 if origin_seed else 0) + (1 if trusted_seed_entry else 0),
             "evaluated_candidate_count": 0,
             "stages": stages,
             "attempts": all_attempts,
@@ -4457,6 +4462,98 @@ class RosAdapter(Node):
             "live_pose": self._current_live_pose(),
         }
         self._report_localization_attempts(session)
+
+        def append_attempts_with_global_numbers(items: list[dict]) -> list[dict]:
+            """Merge a bounded sub-search while keeping one UI candidate index."""
+            offset = len(all_attempts)
+            normalized = []
+            for local_index, item in enumerate(items, start=1):
+                attempt = copy.deepcopy(item)
+                global_index = offset + local_index
+                attempt["index"] = global_index
+                attempt["candidate_number"] = global_index
+                normalized.append(attempt)
+            all_attempts.extend(normalized)
+            return normalized
+
+        # A verified fixed RTK pose is a trusted *search seed*, not a direct
+        # map pose.  Give it candidate #1 and run one exact-pose NDT check
+        # immediately.  If that check is rejected, retain its evidence and
+        # continue with the normal mapping-origin bounded search.
+        if trusted_seed_entry is not None:
+            trusted_stage = stages[0]
+            try:
+                trusted_result = self._active_relocalize_once({
+                    **trusted_seed_entry,
+                    "source": "trusted_rtk_fixed",
+                    "stage": "trusted_rtk_fixed",
+                    "stage_started_at": trusted_stage["started_at"],
+                    "max_attempts": 1,
+                    "wait_seconds": min(20.0, max(5.0, deadline - time.monotonic())),
+                    "candidate_wait_seconds": 5.0,
+                }, generation, persist_state=False)
+                trusted_attempts = append_attempts_with_global_numbers(
+                    list(trusted_result.get("attempts") or [])
+                )
+                trusted_stage.update({
+                    "status": "accepted",
+                    "updated_at": now_iso(),
+                    "finished_at": now_iso(),
+                    "attempts": trusted_attempts,
+                    "best_ndt_candidate": trusted_result.get("best_ndt_candidate"),
+                    "best_match_pose": trusted_result.get("best_match_pose"),
+                    "trusted_seed": dict(trusted_seed_entry),
+                })
+                if origin_seed is not None:
+                    origin_stage.update({
+                        "status": "skipped",
+                        "updated_at": now_iso(),
+                        "finished_at": now_iso(),
+                        "error_code": "TRUSTED_RTK_NDT_ACCEPTED",
+                        "error_message": "RTK可信种子已通过NDT确认，本轮不再重复搜索建图原点",
+                    })
+                payload = {
+                    **trusted_result,
+                    "mode": "progressive_stationary_search",
+                    "strategy": strategy,
+                    "selected_stage": "trusted_rtk_fixed",
+                    "selected_waypoint_index": None,
+                    "stages": stages,
+                    "trusted_rtk_seed": dict(trusted_seed_entry),
+                }
+                self._report_localization_attempts({**payload, "state": "accepted"})
+                return payload
+            except ProtocolError as exc:
+                if exc.code == "RELOCALIZATION_SUPERSEDED":
+                    raise
+                details = dict(exc.details or {})
+                trusted_attempts = append_attempts_with_global_numbers(
+                    list(details.get("attempts") or [])
+                )
+                trusted_stage.update({
+                    "status": "rejected",
+                    "updated_at": now_iso(),
+                    "finished_at": now_iso(),
+                    "error_code": exc.code,
+                    "error_message": (
+                        f"RTK可信种子候选 #1 未通过NDT验证（{exc.message}），"
+                        "继续搜索建图原点及周边候选"
+                    ),
+                    "attempts": trusted_attempts,
+                    "best_ndt_candidate": details.get("best_ndt_candidate"),
+                    "trusted_seed": dict(trusted_seed_entry),
+                })
+                session.update(
+                    attempts=all_attempts,
+                    stages=stages,
+                    state="running",
+                    selected_stage="mapping_origin_bounded" if origin_seed is not None else None,
+                    evaluated_candidate_count=self._evaluated_localization_attempt_count(all_attempts),
+                    best_ndt_candidate=details.get("best_ndt_candidate"),
+                    best_match_pose=details.get("best_match_pose"),
+                    trusted_rtk_seed=dict(trusted_seed_entry),
+                )
+                self._report_localization_attempts(session)
 
         # The mapping origin receives the complete stationary bounded search:
         # exact pose, eight yaw hypotheses, then 0.3/0.6/1.0 m XY rings.  Keep
@@ -4477,11 +4574,14 @@ class RosAdapter(Node):
                     "wait_seconds": origin_budget,
                     "candidate_wait_seconds": 5.0,
                 }, generation, persist_state=False)
+                origin_attempts = append_attempts_with_global_numbers(
+                    list(result.get("attempts") or [])
+                )
                 origin_stage.update({
                     "status": "accepted",
                     "updated_at": now_iso(),
                     "finished_at": now_iso(),
-                    "attempts": result.get("attempts", []),
+                    "attempts": origin_attempts,
                     "best_ndt_candidate": result.get("best_ndt_candidate"),
                     "best_match_pose": result.get("best_match_pose"),
                 })
@@ -4492,6 +4592,12 @@ class RosAdapter(Node):
                     "selected_stage": "mapping_origin_bounded",
                     "selected_waypoint_index": None,
                     "stages": stages,
+                    "attempts": all_attempts,
+                    "candidate_count": len(all_attempts),
+                    "best_candidate_index": (
+                        len(all_attempts) - len(origin_attempts) + int(result["best_candidate_index"])
+                        if result.get("best_candidate_index") is not None else None
+                    ),
                 }
                 self._report_localization_attempts({**payload, "state": "accepted"})
                 return payload
@@ -4499,14 +4605,19 @@ class RosAdapter(Node):
                 if exc.code == "RELOCALIZATION_SUPERSEDED":
                     raise
                 details = dict(exc.details or {})
-                origin_attempts = list(details.get("attempts") or [])
-                all_attempts.extend(origin_attempts)
+                origin_attempts = append_attempts_with_global_numbers(
+                    list(details.get("attempts") or [])
+                )
                 evaluated_count = self._evaluated_localization_attempt_count(origin_attempts)
                 skipped_count = sum(
                     1 for item in origin_attempts if item.get("status") == "skipped"
                 )
                 best_candidate = dict(details.get("best_ndt_candidate") or {})
-                winner_index = details.get("best_candidate_index")
+                local_winner_index = details.get("best_candidate_index")
+                winner_index = (
+                    len(all_attempts) - len(origin_attempts) + int(local_winner_index)
+                    if local_winner_index is not None else None
+                )
                 if exc.code == "RELOCALIZATION_HANDOFF_FAILED" and best_candidate.get("eligible"):
                     winner_label = f" #{winner_index}" if winner_index is not None else ""
                     origin_message = (
