@@ -9,7 +9,7 @@ import {
   fetchRobotCommand, fetchRobotPersonDetections, fetchRobotStatus, fetchRobots, fetchRouteDetail, reviewMapSceneSemantics,
   fetchMapSceneSemanticsStatus, fetchRouteSummaries, startRobotSceneSemantics,
   fetchCurrentMapSceneBuild, startMapSceneBuild, uploadMapSceneInput,
-  reviewMapSceneBuild,
+  reviewMapSceneBuild, fetchTaskExecutions,
 } from '../services/api'
 import { openLiveMessageSource, scanBagMessages } from '../services/rosStream'
 import {
@@ -24,9 +24,11 @@ const sourceMode = ref('live')
 const robots = ref([])
 const maps = ref([])
 const routes = ref([])
+const recentTaskExecutions = ref([])
 const selectedRobotId = ref('')
 const selectedMapId = ref('')
 const selectedRouteId = ref('')
+const selectedTaskExecutionId = ref('')
 const liveUrl = ref(localStorage.getItem(LIVE_URL_KEY) || `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/foxglove/ws`)
 const manifest = ref(null)
 const cloudBuffer = ref(null)
@@ -56,6 +58,8 @@ const personDetections = ref(null)
 const viewportStageRef = ref(null)
 const viewportFullscreen = ref(false)
 const loading = ref(true)
+const recentTaskExecutionsLoading = ref(false)
+const recentTaskExecutionsError = ref('')
 const sceneLoading = ref(false)
 const error = ref('')
 const connectionState = ref('idle')
@@ -84,6 +88,7 @@ const tfTree = createTfTree('map')
 const selectedRobot = computed(() => robots.value.find(item => String(item.id) === String(selectedRobotId.value)))
 const selectedMap = computed(() => maps.value.find(item => String(item.id) === String(selectedMapId.value)))
 const routeWaypoints = computed(() => selectedRoute.value?.waypoints || [])
+const recentTaskExecutionOptions = computed(() => recentTaskExecutions.value.filter(item => item.route && item.map_data))
 const status = computed(() => navigationStatus.value?.status || robotStatus.value?.status || {})
 const robotPose = computed(() => streamPose.value || ({ x: Number(status.value.x), y: Number(status.value.y), z: Number(status.value.z || 0), yaw: Number(status.value.yaw || 0) }))
 const processSteps = computed(() => localizationProcess(status.value))
@@ -224,6 +229,46 @@ async function loadCatalogs() {
   } finally {
     loading.value = false
   }
+}
+
+function taskExecutionStateLabel(state) {
+  return ({
+    created: '已创建', dispatching: '下发中', accepted: '已接受', running: '执行中',
+    pausing: '暂停中', paused: '已暂停', resuming: '继续中', cancelling: '终止中',
+    completed: '已完成', failed: '失败', cancelled: '已终止', timed_out: '超时',
+    interrupted: '待对账', rejected: '已拒绝',
+  }[state] || state || '未知')
+}
+
+function taskExecutionOptionText(execution) {
+  const date = new Date(execution.started_at || execution.created_at || '')
+  const occurredAt = Number.isNaN(date.getTime())
+    ? '时间未知'
+    : date.toLocaleString('zh-CN', { hour12: false })
+  return `${occurredAt} · ${execution.route_name || '未命名路线'} · ${taskExecutionStateLabel(execution.state)}`
+}
+
+async function loadRecentTaskExecutions() {
+  recentTaskExecutionsError.value = ''
+  recentTaskExecutions.value = []
+  if (!selectedRobotId.value) return
+  recentTaskExecutionsLoading.value = true
+  try {
+    const executions = await fetchTaskExecutions({ robot_id: selectedRobotId.value, limit: 10 })
+    recentTaskExecutions.value = Array.isArray(executions) ? executions : []
+  } catch (cause) {
+    recentTaskExecutionsError.value = cause.message || '最近任务加载失败'
+  } finally {
+    recentTaskExecutionsLoading.value = false
+  }
+}
+
+function selectRecentTaskExecution(executionId) {
+  selectedTaskExecutionId.value = String(executionId || '')
+  const execution = recentTaskExecutionOptions.value.find(item => String(item.id) === selectedTaskExecutionId.value)
+  if (!execution) return
+  if (execution.map_data) selectedMapId.value = String(execution.map_data)
+  if (execution.route) selectedRouteId.value = String(execution.route)
 }
 
 async function loadScene() {
@@ -588,16 +633,24 @@ watch(selectedMapId, () => {
   sceneUsePtv3.value = false
   loadScene()
   refreshSemanticStatus()
-  const matching = routes.value.find(item => String(item.map_data) === String(selectedMapId.value))
-  if (matching) selectedRouteId.value = String(matching.id)
+  const currentRoute = routes.value.find(item => String(item.id) === String(selectedRouteId.value))
+  if (!currentRoute || String(currentRoute.map_data) !== String(selectedMapId.value)) {
+    const matching = routes.value.find(item => String(item.map_data) === String(selectedMapId.value))
+    selectedRouteId.value = matching ? String(matching.id) : ''
+  }
 })
 watch(selectedRouteId, loadRoute)
-watch(selectedRobotId, () => { pollStatus(); if (sourceMode.value === 'live') connectLive() })
+watch(selectedRobotId, () => {
+  selectedTaskExecutionId.value = ''
+  loadRecentTaskExecutions()
+  pollStatus()
+  if (sourceMode.value === 'live') connectLive()
+})
 watch(bagTime, applyBagTime)
 
 onMounted(async () => {
   await loadCatalogs()
-  await Promise.all([loadScene(), loadRoute(), pollStatus()])
+  await Promise.all([loadScene(), loadRoute(), pollStatus(), loadRecentTaskExecutions()])
   connectLive()
   pollTimer = window.setInterval(pollStatus, 1000)
   document.addEventListener('fullscreenchange', syncViewportFullscreen)
@@ -632,6 +685,7 @@ onBeforeUnmount(() => {
       <label>机器人<select v-model="selectedRobotId"><option v-for="robot in robots" :key="robot.id" :value="String(robot.id)">{{ robot.code }} · {{ robot.name }}</option></select></label>
       <label>世界/场景地图<select v-model="selectedMapId"><option v-for="map in maps" :key="map.id" :value="String(map.id)">{{ map.active ? '● ' : '' }}{{ map.name }}</option></select></label>
       <label>巡检路线<select v-model="selectedRouteId"><option value="">不叠加路线</option><option v-for="route in routes.filter(item => String(item.map_data) === String(selectedMapId))" :key="route.id" :value="String(route.id)">{{ route.name }}</option></select></label>
+      <label class="recent-task-picker">最近 10 次任务<select :value="selectedTaskExecutionId" :disabled="recentTaskExecutionsLoading" @change="selectRecentTaskExecution($event.target.value)"><option value="">{{ recentTaskExecutionsLoading ? '正在加载任务记录…' : '选择任务并叠加路线' }}</option><option v-for="execution in recentTaskExecutionOptions" :key="execution.id" :value="String(execution.id)">{{ taskExecutionOptionText(execution) }}</option></select><small v-if="recentTaskExecutionsError" class="recent-task-error">{{ recentTaskExecutionsError }}</small><small v-else-if="!recentTaskExecutionsLoading && !recentTaskExecutionOptions.length" class="recent-task-empty">当前机器人暂无可叠加路线的任务记录</small></label>
       <div class="map-mode-picker" aria-label="地图模式"><span>地图模式</span><div class="map-mode-buttons"><button v-for="(label, mode) in SCENE_MAP_MODES" :key="mode" type="button" :class="{ active: mapMode === mode }" @click="selectMapMode(mode)">{{ label }}</button></div></div>
       <div class="runtime-state"><i :class="statusTone(connectionState)"></i><strong>{{ sourceLabel }}</strong><span>{{ sourceMode === 'live' ? `${dataAge}s 前` : sourceMode === 'bag' ? bagName || '未选文件' : '静态' }}</span></div>
     </section>
@@ -762,7 +816,7 @@ onBeforeUnmount(() => {
 .scene-head h2 { margin: 2px 0 0; font-size: 24px; }.scene-head p { margin: 5px 0 0; color: var(--muted); }.eyebrow { color: var(--cyan)!important; font-size: 11px; font-weight: 800; letter-spacing: .12em; }
 .source-tabs,.segmented { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-soft); }.source-tabs button,.segmented button { border: 0; border-radius: 8px; padding: 8px 11px; color: var(--muted); background: transparent; cursor: pointer; }.source-tabs button.active,.segmented button.active { color: #fff; background: #087aa0; }.segmented span { padding: 0 6px; color: var(--muted); font-size: 11px; }
 .error-banner { display: flex; justify-content: space-between; padding: 10px 13px; border: 1px solid #dc6060; border-radius: 10px; color: #ffb3b3; background: #351318; }.error-banner button { border: 0; color: inherit; background: transparent; font-size: 18px; }
-.control-bar { display: grid; grid-template-columns: repeat(3,minmax(150px,1fr)) minmax(280px,1.4fr) auto; gap: 10px; align-items: end; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }.control-bar label,.map-mode-picker { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }.control-bar select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--input-bg); }.map-mode-buttons { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }.map-mode-buttons button { flex: 1; min-width: 0; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; white-space: nowrap; }.map-mode-buttons button.active { color: #fff; background: #087aa0; }.runtime-state { display: grid; grid-template-columns: auto auto; gap: 2px 7px; align-items: center; min-width: 130px; }.runtime-state i { grid-row: 1 / 3; width: 9px; height: 9px; border-radius: 50%; background: #eab308; }.runtime-state i.ok { background: #22c55e; }.runtime-state i.bad { background: #ef4444; }.runtime-state span { color: var(--muted); font-size: 11px; }
+.control-bar { display: grid; grid-template-columns: repeat(4,minmax(150px,1fr)) minmax(280px,1.4fr) auto; gap: 10px; align-items: end; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }.control-bar label,.map-mode-picker { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }.control-bar select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--input-bg); }.recent-task-picker small { min-height: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }.recent-task-error { color: #ef4444; }.recent-task-empty { color: var(--muted); }.map-mode-buttons { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }.map-mode-buttons button { flex: 1; min-width: 0; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; white-space: nowrap; }.map-mode-buttons button.active { color: #fff; background: #087aa0; }.runtime-state { display: grid; grid-template-columns: auto auto; gap: 2px 7px; align-items: center; min-width: 130px; }.runtime-state i { grid-row: 1 / 3; width: 9px; height: 9px; border-radius: 50%; background: #eab308; }.runtime-state i.ok { background: #22c55e; }.runtime-state i.bad { background: #ef4444; }.runtime-state span { color: var(--muted); font-size: 11px; }
 .scene-workspace { display: grid; grid-template-columns: minmax(0,1.75fr) minmax(350px,.75fr); gap: 14px; min-height: min(720px,calc(100vh - 250px)); }.viewport-card,.diagnostic-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); }.viewport-card { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }.viewport-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }.mode-hint { color: var(--muted); font-size: 11px; }.render-stats { margin-left: auto; color: var(--muted); font: 11px ui-monospace,monospace; }.viewport-wrap { position: relative; min-height: 0; background: #07111f; }.viewport-wrap:fullscreen { width: 100vw; height: 100vh; background: #07111f; }.viewport-wrap:fullscreen .scene-viewport,.viewport-wrap:fullscreen .satellite-viewport { min-height: 100vh; border-radius: 0; }.scene-fullscreen-button { position: absolute; z-index: 5; top: 12px; left: 12px; padding: 6px 9px; border: 1px solid #4f7691; border-radius: 7px; color: #e0f2fe; background: rgba(5,15,28,.86); font-size: 11px; cursor: pointer; }.scene-fullscreen-button:hover { background: #0d5275; }.scene-loading { position: absolute; inset: 0; display: grid; place-content: center; color: #d9edff; background: rgba(4,12,23,.72); backdrop-filter: blur(4px); }.scene-legend { position: absolute; left: 12px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 10px; padding: 7px 9px; border: 1px solid #29415a; border-radius: 9px; color: #dbeafe; background: rgba(5,15,28,.82); font-size: 10px; pointer-events: none; }.scene-legend span { display: flex; gap: 5px; align-items: center; }.scene-legend i { width: 12px; height: 3px; }.scene-legend .robot { background:#22d3ee }.scene-legend .route { background:#38bdf8 }.scene-legend .cloud { background:#7dd3fc }.scene-legend .object { background:#f59e0b }
 .bag-timeline { display: grid; grid-template-columns: auto minmax(120px,1fr) auto auto; gap: 9px; align-items: center; padding: 9px 12px; border-top: 1px solid var(--line); font-size: 11px; }.bag-timeline input { width: 100%; }
 .diagnostic-card { display: grid; grid-template-rows: auto minmax(0,1fr); }.diagnostic-tabs { display: grid; grid-template-columns: repeat(4,1fr); border-bottom: 1px solid var(--line); }.diagnostic-tabs button { min-width: 0; padding: 12px 4px; border: 0; border-bottom: 2px solid transparent; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }.diagnostic-tabs button.active { color: var(--cyan); border-bottom-color: var(--cyan); background: var(--panel-soft); }.diagnostic-body { min-height: 0; padding: 14px; overflow: auto; }.diagnostic-body h3 { margin: 17px 0 8px; font-size: 13px; }.process-list { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }.process-step { display: grid; grid-template-columns: auto 1fr; gap: 2px 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.process-step i { grid-row: 1/3; width: 8px; height: 8px; margin-top: 3px; border-radius: 50%; background: #94a3b8; }.process-step span,.process-step strong { font-size: 10px; }.process-step strong { color: var(--muted); }.process-step.ok i{background:#22c55e}.process-step.active i{background:#38bdf8}.process-step.warning i{background:#ef4444}
