@@ -140,6 +140,132 @@ test('failed candidates retain score, inlier, convergence and a readable summary
   )
 })
 
+test('detailed candidate safety gate wins over a legacy generic quality-gate label', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-yaw-gate',
+    command_type: 'nav.relocalize',
+    status: 'failed',
+    result_payload: {
+      localization_attempts: {
+        state: 'failed',
+        attempts: [{
+          index: 5,
+          status: 'rejected',
+          reject_reason: 'quality_gate',
+          ndt_candidate: {
+            has_converged: true,
+            matching_error: 0.006,
+            inlier_fraction: 0.995,
+            reject_reason: 'seed_yaw_correction_exceeded',
+            quality_failures: ['seed_yaw_correction_exceeded'],
+          },
+        }],
+      },
+    },
+  })
+
+  assert.equal(session.attempts[0].rejectReason, 'seed_yaw_correction_exceeded')
+  assert.match(localizationAttemptFailureMessage(session), /航向修正超过安全门限/)
+})
+
+test('accepted backend localization remains visible when a later navigation action fails', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'cmd-localized-nav-failed',
+    command_type: 'nav.relocalize',
+    status: 'failed',
+    result_payload: {
+      localization_attempts: {
+        state: 'accepted',
+        attempts: [{
+          index: 11,
+          status: 'accepted',
+          accepted: true,
+          ndt_candidate: {
+            matching_error: 0.006568,
+            inlier_fraction: 0.9958,
+          },
+        }],
+      },
+    },
+  })
+
+  assert.match(
+    localizationAttemptFailureMessage(session, 'NAV_COMMAND_FAILED'),
+    /定位初始化已完成：候选 #11.*后续导航操作失败：NAV_COMMAND_FAILED/,
+  )
+})
+
+test('startup timeline keeps every localization and navigation admission gate in order', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'startup-chain',
+    command_type: 'task.start',
+    status: 'executing',
+    payload: { command: { scene_scope: 'outdoor' } },
+    result_payload: {
+      state: 'running',
+      selected_stage: 'navigation_execution_activate',
+      trusted_rtk_seed: { accepted: true, status: 'accepted' },
+      secondary_correction: { status: 'completed' },
+      final_localization_gate: {
+        accepted: true,
+        stable_frames: 3,
+        required_stable_frames: 3,
+        continuous_source: 'lio_imu',
+      },
+    },
+  })
+  const timeline = localizationAttemptTimeline(session)
+  const keys = timeline.map(item => item.key)
+  const expected = [
+    'navigation_prepare',
+    'fast_lio_readiness',
+    'trusted_rtk_fixed',
+    'mapping_origin_bounded',
+    'best_candidate_commit',
+    'fast_lio_imu_handoff',
+    'secondary_correction',
+    'final_localization_gate',
+    'navigation_execution_activate',
+    'navigation_start',
+  ]
+  expected.forEach(key => assert.ok(keys.includes(key), `missing ${key}`))
+  assert.ok(keys.indexOf('navigation_prepare') < keys.indexOf('fast_lio_readiness'))
+  assert.ok(keys.indexOf('fast_lio_readiness') < keys.indexOf('trusted_rtk_fixed'))
+  assert.ok(keys.indexOf('trusted_rtk_fixed') < keys.indexOf('mapping_origin_bounded'))
+  assert.equal(timeline.find(item => item.key === 'trusted_rtk_fixed').status, 'done')
+  assert.equal(timeline.find(item => item.key === 'final_localization_gate').status, 'done')
+})
+
+test('later NDT packets retain earlier reported startup gate evidence', () => {
+  const trustedSeed = localizationAttemptSessionFromCommand({
+    id: 'startup-progress',
+    command_type: 'task.start',
+    status: 'executing',
+    result_payload: {
+      state: 'running',
+      selected_stage: 'trusted_rtk_fixed',
+      trusted_rtk_seed: { accepted: true, status: 'accepted', reason: 'fixed_rtk_verified' },
+    },
+  })
+  const ndtProgress = localizationAttemptSessionFromCommand({
+    id: 'startup-progress',
+    command_type: 'task.start',
+    status: 'executing',
+    result_payload: {
+      localization_attempts: {
+        state: 'running',
+        selected_stage: 'mapping_origin_bounded',
+        stages: [{ stage: 'mapping_origin_bounded', status: 'searching' }],
+      },
+    },
+  }, { timelineHistory: localizationAttemptTimeline(trustedSeed) })
+
+  const trusted = localizationAttemptTimeline(ndtProgress)
+    .find(item => item.key === 'trusted_rtk_fixed')
+  assert.equal(trusted.status, 'done')
+  assert.match(trusted.detail, /fixed RTK 已作为 NDT 候选种子/)
+})
+
 test('new operations start from an empty session and accepted status uses a distinct class', () => {
   const session = emptyAttemptSession({ phase: 'localization', commandType: 'nav.relocalize' })
   assert.equal(session.attempts.length, 0)

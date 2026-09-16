@@ -38,6 +38,28 @@ const TERMINAL_STATE_PRESENTATION = {
   rejected: TERMINAL_EVENT_PRESENTATION['task.rejected'],
 }
 
+const NAVIGATION_STAGE_PRESENTATION = {
+  target_dispatch: '目标下发',
+  path_planning: '全局规划与路径平滑',
+  path_tracking: '路径跟踪',
+  stop_confirmation: '停车与零速确认',
+  localization_correction: '静止定位校正',
+  fine_approach: '校正后细靠近',
+  arrival_heading: '独立最终转向',
+  micro_adjustment: '保持航向微调',
+  arrival_acceptance: 'XY / 航向联合验收',
+  waypoint_actions: '航点动作',
+  waypoint_postprocess: '播报、驻留与后处理',
+  departure_heading: '对准下个航点',
+}
+
+const NAVIGATION_STAGE_STATUS_LABELS = {
+  active: '进行中',
+  completed: '完成',
+  failed: '失败',
+  skipped: '跳过',
+}
+
 function eventTimestamp(event) {
   const value = Date.parse(event?.occurred_at || event?.received_at || '')
   return Number.isFinite(value) ? value : 0
@@ -121,6 +143,35 @@ function eventDetail(event) {
   if (Number.isFinite(Number(payload.elapsed_seconds))) {
     arrival.push(`本阶段 ${Number(payload.elapsed_seconds).toFixed(1)}s`)
   }
+  const stageMetrics = payload.stage_metrics && typeof payload.stage_metrics === 'object'
+    ? payload.stage_metrics
+    : {}
+  if (Number.isFinite(Number(stageMetrics.distance_m))) {
+    arrival.push(`偏差 ${Number(stageMetrics.distance_m).toFixed(2)}m`)
+  }
+  if (Number.isFinite(Number(stageMetrics.acceptance_tolerance_m))) {
+    arrival.push(`验收半径 ${Number(stageMetrics.acceptance_tolerance_m).toFixed(2)}m`)
+  }
+  if (Number.isFinite(Number(stageMetrics.reapproach_attempts))) {
+    arrival.push(`追加靠近 ${Number(stageMetrics.reapproach_attempts)} 次`)
+  }
+  if (Number.isFinite(Number(stageMetrics.distance_remaining_m))) {
+    arrival.push(`剩余 ${Number(stageMetrics.distance_remaining_m).toFixed(2)}m`)
+  }
+  if (Number.isFinite(Number(stageMetrics.next_map_point_number))) {
+    arrival.push(`对准 ${Number(stageMetrics.next_map_point_number)} 号点`)
+  }
+  if (Number.isFinite(Number(stageMetrics.heading_error_deg))) {
+    arrival.push(`航向误差 ${Number(stageMetrics.heading_error_deg).toFixed(1)}度`)
+  }
+  if (Number.isFinite(Number(stageMetrics.action_count))) {
+    arrival.push(`动作 ${Number(stageMetrics.action_count)} 项`)
+  }
+  if (Number.isFinite(Number(stageMetrics.dwell_seconds)) && Number(stageMetrics.dwell_seconds) > 0) {
+    arrival.push(`驻留 ${Number(stageMetrics.dwell_seconds).toFixed(1)}s`)
+  }
+  if (stageMetrics.localization_mode) arrival.push(`校正 ${String(stageMetrics.localization_mode).toUpperCase()}`)
+  if (stageMetrics.speech_mode) arrival.push(`播报 ${stageMetrics.speech_mode}`)
   const coarseText = coarseArrivalCompletionText(payload)
   if (coarseText) arrival.push(coarseText)
   return [
@@ -241,6 +292,18 @@ function timelinePresentation(event, execution) {
   if (eventType === 'task.created') return { type: 'created', title: '任务执行已创建' }
   if (eventType === 'task.accepted') return { type: 'accepted', title: '机器狗已接受任务' }
   if (eventType === 'task.started') return { type: 'start', title: '任务执行开始' }
+  if (eventType === 'task.navigation_stage') {
+    const payload = event?.payload || {}
+    const stage = String(payload.navigation_stage || '')
+    const status = String(payload.stage_status || 'active')
+    const label = NAVIGATION_STAGE_PRESENTATION[stage] || stage || '导航阶段'
+    const statusLabel = NAVIGATION_STAGE_STATUS_LABELS[status] || status
+    return {
+      type: status === 'failed' ? 'error' : (status === 'active' ? 'diagnostic' : 'arrival'),
+      title: `${waypointLabel} · ${label}：${statusLabel}`,
+      pointName: waypointLabel,
+    }
+  }
   if (eventType === 'task.target_dispatched') {
     return { type: 'target', title: `${waypointLabel}目标已下发`, pointName: waypointLabel }
   }

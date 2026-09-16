@@ -1122,6 +1122,7 @@ class TaskExecutionEvent(BaseTimestampModel):
                     event_type__in=(
                         "task.obstacle_stage",
                         "task.arrival_degraded_accepted",
+                        "task.navigation_stage",
                     )
                 ),
                 name="uniq_task_state_ver_non_obstacle",

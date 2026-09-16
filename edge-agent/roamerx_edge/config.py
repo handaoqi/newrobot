@@ -93,7 +93,9 @@ class SafetyConfig:
     stop_confirmation_seconds: float = 1.0
     localization_stable_seconds: float = 3.0
     localization_loss_samples: int = 5
-    ndt_failure_score: float = 0.5
+    # One NDT admission threshold for initialization, relocalization and
+    # recovery.  Keep this aligned with the operator-facing 0.40 contract.
+    ndt_failure_score: float = 0.40
     ndt_failure_samples: int = 3
     # A candidate below this stricter score is already good enough to stop a
     # bounded initialization search.  The normal NDT health gate remains

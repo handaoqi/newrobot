@@ -16,14 +16,31 @@ if [ "${NAVIGATION_SENSOR_LOCK_HELD:-0}" != "1" ]; then
     env NAVIGATION_SENSOR_LOCK_HELD=1 "$0" "$@"
 fi
 
-"${SCRIPT_DIR}/ensure_mapping_sensors.sh"
-
 set +u
 source /opt/ros/humble/setup.bash
 source "${PROJECT_DIR}/install/setup.bash"
 set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
+
+# A loop round can prepare Nav2 again only a few seconds after the previous
+# round. The LiDAR, converter and filtered scan chain are resident processes
+# in that case; running the cold-start readiness probes again makes Zenoh DDS
+# discovery consume the full navigation wait budget. Require the complete
+# resident process chain before taking the fast path; the sensor health node
+# and Nav2 readiness checks remain the runtime data/health gate. Any missing
+# process falls back to the complete mapping-sensor check below.
+resident_sensor_chain_ready() {
+  pgrep -f 'livox_driver_node' >/dev/null 2>&1 || return 1
+  pgrep -f 'pointcloud_to_laserscan_node.*laser_scan_raw' >/dev/null 2>&1 || return 1
+  pgrep -f 'self_filter_scan.py' >/dev/null 2>&1 || return 1
+}
+
+if resident_sensor_chain_ready; then
+  echo "Navigation sensor process chain is resident; skipping cold-start probes."
+else
+  "${SCRIPT_DIR}/ensure_mapping_sensors.sh"
+fi
 
 # Restart an older converter instead of silently retaining its previous height
 # policy after a navigation-only restart.

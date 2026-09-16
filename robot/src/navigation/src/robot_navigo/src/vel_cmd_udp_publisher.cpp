@@ -1019,21 +1019,26 @@ class VelCmdUdpPublisher : public rclcpp::Node {
       return;
     }
 
-    const auto normalize_stick = [this](float value, double max_value) {
-      float stick = std::clamp(static_cast<float>(value / max_value), -1.0f, 1.0f);
-      // The robot ignores small virtual-stick values. Keep a deliberate UI
-      // direction above its dead zone while preserving an exact zero command.
-      // The dock-contact profile has its own much smaller floor so that Nav2
-      // can make a genuine low-speed pose correction.
-      const float min_stick = fine_control_ ? remote_fine_min_stick_ : remote_min_stick_;
-      if (std::fabs(stick) > 1e-4f && std::fabs(stick) < min_stick) {
-        stick = std::copysign(min_stick, stick);
-      }
-      return stick;
-    };
-    const float forward = normalize_stick(last_cmd_->linear.x, remote_full_scale_vx_);
-    const float lateral = normalize_stick(last_cmd_->linear.y, remote_full_scale_vy_);
-    const float yaw = normalize_stick(last_cmd_->angular.z, remote_full_scale_yaw_rate_);
+    // Browser teleop keeps the vendor full-scale mapping and lifts leftover
+    // stick out of the dead zone. Autonav must not: a 0.30 m/s / 0.35 rad/s
+    // FollowPath command is stick ~0.10 against 3.0 / 5.25, and lifting it
+    // to 0.55 made outdoor cruise spin instead of tracking ThetaStar.
+    const bool lift_to_min = manual_teleop_active_ || fine_control_;
+    const float min_stick =
+        fine_control_ ? remote_fine_min_stick_ : remote_min_stick_;
+    const double vx_scale =
+        lift_to_min ? remote_full_scale_vx_ : robot_navigo::kNavStickVxFullScale;
+    const double vy_scale =
+        lift_to_min ? remote_full_scale_vy_ : robot_navigo::kNavStickVyFullScale;
+    const double yaw_scale =
+        lift_to_min ? remote_full_scale_yaw_rate_
+                    : robot_navigo::kNavStickYawFullScale;
+    const float forward = robot_navigo::NormalizeRemoteStick(
+        last_cmd_->linear.x, vx_scale, min_stick, lift_to_min);
+    const float lateral = robot_navigo::NormalizeRemoteStick(
+        last_cmd_->linear.y, vy_scale, min_stick, lift_to_min);
+    const float yaw = robot_navigo::NormalizeRemoteStick(
+        last_cmd_->angular.z, yaw_scale, min_stick, lift_to_min);
 
     // XG virtual remote uses [forward, lateral, yaw, 0]. The prior ordering
     // swapped the lateral and yaw channels, so left/right shift became turn.

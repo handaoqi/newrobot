@@ -114,12 +114,12 @@ const TIMELINE_STAGE_ORDER = [
   'operator_initial_pose',
   'best_candidate_commit',
   'fast_lio_imu_handoff',
-  'final_localization_gate',
   'secondary_correction',
   'rtk_fixed',
   'rtk_correction',
   'ukf_correction',
   'ndt_secondary_correction',
+  'final_localization_gate',
   'navigation_execution_activate',
   'navigation_start',
 ]
@@ -305,6 +305,16 @@ function normalizeAttempt(attempt, index) {
     attempt?.candidate_number ?? attempt?.candidateNumber ?? attempt?.index,
   )
   const displayNumber = Number.isFinite(candidateNumber) ? candidateNumber : index + 1
+  const attemptRejectReason = attempt?.reject_reason || attempt?.rejectReason || ''
+  const candidateRejectReason = candidate.reject_reason
+    || (Array.isArray(candidate.quality_failures) ? candidate.quality_failures[0] : '')
+    || ''
+  // Older Edge progress frames flattened every detailed safety rejection to
+  // `quality_gate`.  Prefer the NDT candidate's causal gate when it exists:
+  // e.g. a 78° seed-yaw correction is not an NDT-score failure.
+  const rejectReason = attemptRejectReason === 'quality_gate' && candidateRejectReason
+    ? candidateRejectReason
+    : (attemptRejectReason || candidateRejectReason || attempt?.error_code || '')
   return {
     // Keep index for protocol compatibility; candidateNumber is the one
     // display identity shared by the map marker and the stage list.
@@ -326,11 +336,7 @@ function normalizeAttempt(attempt, index) {
     qualityFailures: Array.isArray(candidate.quality_failures ?? attempt?.quality_failures)
       ? [...(candidate.quality_failures ?? attempt?.quality_failures)]
       : [],
-    rejectReason: attempt?.reject_reason
-      || attempt?.rejectReason
-      || candidate.reject_reason
-      || attempt?.error_code
-      || '',
+    rejectReason,
     eligible: Boolean(attempt?.eligible || candidate.eligible),
     accepted: attempt?.accepted === true || attempt?.status === 'accepted',
     stage: attempt?.stage || '',
@@ -339,6 +345,35 @@ function normalizeAttempt(attempt, index) {
     startedAt: firstTimestamp(attempt?.started_at, attempt?.startedAt),
     finishedAt: firstTimestamp(attempt?.finished_at, attempt?.finishedAt),
   }
+}
+
+function stageStatusFromEvidence(value, fallback = 'waiting') {
+  if (!value || typeof value !== 'object') return fallback
+  if (value.accepted === true || value.verified === true) return 'accepted'
+  if (value.ready === true || value.navigation_allowed === true || value.active === true) return 'accepted'
+  const status = String(value.status || value.state || '').trim().toLowerCase()
+  if (['accepted', 'succeeded', 'completed', 'ready', 'passed'].includes(status)) return 'accepted'
+  if (['skipped', 'unavailable'].includes(status)) return 'skipped'
+  if (['failed', 'rejected', 'error', 'timed_out'].includes(status)) return 'failed'
+  return status || fallback
+}
+
+function usesNavigationLifecycleStartupChain(session) {
+  const commandType = String(session?.commandType || '').trim().toLowerCase()
+  if (['task.start', 'nav.start', 'nav.restart', 'nav.recover', 'map.activate'].includes(commandType)) {
+    return true
+  }
+  if (session?.initialNdtCommit || session?.finalLocalizationGate || session?.trustedRtkSeed) return true
+  const lifecycleStages = new Set([
+    'navigation_prepare',
+    'fast_lio_readiness',
+    'trusted_rtk_fixed',
+    'final_localization_gate',
+    'navigation_execution_activate',
+  ])
+  return (session?.stages || []).some(record => lifecycleStages.has(
+    canonicalTimelineStage(record?.stage),
+  ))
 }
 
 export function isAttemptSessionTerminal(session) {
@@ -357,10 +392,15 @@ export function withAttemptMarkerExpiry(session, now = Date.now()) {
 export function localizationAttemptSessionFromCommand(command, extras = {}) {
   if (!command) return null
   const result = commandResult(command)
+  const nestedLocalization = result.localization && typeof result.localization === 'object'
+    ? result.localization
+    : {}
   const mapIdentity = commandMapIdentity(command, result)
   const raw = result.localization_attempts && typeof result.localization_attempts === 'object'
     ? result.localization_attempts
-    : {}
+    : (nestedLocalization.localization_attempts && typeof nestedLocalization.localization_attempts === 'object'
+      ? nestedLocalization.localization_attempts
+      : {})
   const attemptSource = Array.isArray(raw.attempts)
     ? raw.attempts
     : (Array.isArray(result.attempts) ? result.attempts : [])
@@ -387,16 +427,30 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     })
   }
   const rtkStage = rawStages.find(record => canonicalTimelineStage(record?.stage) === 'rtk_fixed')
-  const trustedRtkSeed = raw.trusted_rtk_seed || result.trusted_rtk_seed || null
-  if (trustedRtkSeed && !displayStages.some(record => canonicalTimelineStage(record?.stage) === 'trusted_rtk_fixed')) {
-    displayStages.push({
+  const initialNdtCommit = result.initial_ndt_commit && typeof result.initial_ndt_commit === 'object'
+    ? result.initial_ndt_commit
+    : (nestedLocalization.initial_ndt_commit && typeof nestedLocalization.initial_ndt_commit === 'object'
+      ? nestedLocalization.initial_ndt_commit
+      : null)
+  const trustedRtkSeed = raw.trusted_rtk_seed
+    || result.trusted_rtk_seed
+    || nestedLocalization.trusted_rtk_seed
+    || initialNdtCommit?.trusted_rtk_seed
+    || null
+  if (trustedRtkSeed) {
+    const existingSeedStageIndex = displayStages.findIndex(
+      record => canonicalTimelineStage(record?.stage) === 'trusted_rtk_fixed',
+    )
+    const seedStage = {
       stage: 'trusted_rtk_fixed',
       status: trustedRtkSeed.status || (trustedRtkSeed.accepted ? 'accepted' : 'skipped'),
       started_at: firstTimestamp(trustedRtkSeed.started_at, command.started_at, command.issued_at),
       finished_at: firstTimestamp(trustedRtkSeed.finished_at, command.finished_at),
       message: trustedRtkSeed.reason || trustedRtkSeed.rtk_verification?.conclusion,
       rtk_verification: trustedRtkSeed.rtk_verification,
-    })
+    }
+    if (existingSeedStageIndex >= 0) displayStages[existingSeedStageIndex] = seedStage
+    else displayStages.push(seedStage)
   }
   const rtkVerification = normalizeRtkVerification(
     raw.rtk_verification
@@ -405,9 +459,17 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
       || raw.rtk_stability
       || result.rtk_stability,
   )
-  const secondaryCorrection = raw.secondary_correction || result.secondary_correction || null
+  const secondaryCorrection = raw.secondary_correction
+    || result.secondary_correction
+    || nestedLocalization.secondary_correction
+    || null
   const explicitHandoff = raw.handoff
     || result.handoff
+    || result.fast_lio_imu_handoff
+    || nestedLocalization.handoff
+    || nestedLocalization.fast_lio_imu_handoff
+    || initialNdtCommit?.handoff
+    || initialNdtCommit?.fast_lio_imu_handoff
     || raw.handoff_diagnostics
     || result.handoff_diagnostics
     || rtkVerification?.handoff
@@ -470,18 +532,16 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     ) || new Date().toISOString(),
     phase,
     showCandidates,
-    status: raw.state || command.status || '',
+    status: raw.state || result.state || nestedLocalization.state || command.status || '',
     livePose: finitePose(raw.live_pose) || finitePose(result.live_pose),
     attempts: attemptSource.map(normalizeAttempt),
     bestMatchPose,
     bestNdtCandidate: raw.best_ndt_candidate || result.best_ndt_candidate || null,
-    source: raw.selected_stage || raw.source || extras.source || '',
+    source: raw.selected_stage || result.selected_stage || nestedLocalization.selected_stage || raw.source || extras.source || '',
     startupProgress: result.startup_progress && typeof result.startup_progress === 'object'
       ? result.startup_progress
       : null,
-    initialNdtCommit: result.initial_ndt_commit && typeof result.initial_ndt_commit === 'object'
-      ? result.initial_ndt_commit
-      : null,
+    initialNdtCommit,
     earlyStopped: Boolean(raw.early_stopped ?? result.early_stopped),
     stopReason: raw.stop_reason || result.stop_reason || '',
     candidateCount: Number(raw.candidate_count ?? result.candidate_count ?? attemptSource.length),
@@ -496,6 +556,17 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     trustedRtkSeed,
     handoff,
     secondaryCorrection,
+    finalLocalizationGate: raw.final_localization_gate
+      || result.final_localization_gate
+      || nestedLocalization.final_localization_gate
+      || null,
+    sceneScope: String(
+      raw.scene_scope
+      || result.scene_scope
+      || command?.payload?.scene_scope
+      || command?.payload?.command?.scene_scope
+      || '',
+    ).trim().toLowerCase(),
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),
     rtkFixedCommitted: Boolean(raw.rtk_fixed_committed ?? result.rtk_fixed_committed),
     strategy: Array.isArray(raw.strategy)
@@ -578,6 +649,11 @@ export function emptyAttemptSession({ phase = 'localization', commandType = '', 
     activeCandidateStage: '',
     rtkDrift: null,
     rtkVerification: null,
+    trustedRtkSeed: null,
+    handoff: null,
+    secondaryCorrection: null,
+    finalLocalizationGate: null,
+    sceneScope: '',
     bestNdtCommitted: false,
     rtkFixedCommitted: false,
     optimalVerified: false,
@@ -665,10 +741,30 @@ function inferredStageStatus(session, stageKey, attempts, stageRecord) {
   if (stageKey === 'secondary_correction' && session?.secondaryCorrection) {
     return session.secondaryCorrection.status || 'searching'
   }
+  if (stageKey === 'final_localization_gate' && session?.finalLocalizationGate) {
+    return stageStatusFromEvidence(session.finalLocalizationGate, 'searching')
+  }
+  if (stageKey === 'trusted_rtk_fixed') {
+    if (session?.trustedRtkSeed) return stageStatusFromEvidence(session.trustedRtkSeed, 'searching')
+    if (session?.sceneScope === 'indoor') return 'skipped'
+  }
   if (attempts.some(attempt => attempt.status === 'accepted')) return 'accepted'
   if (attempts.length && attempts.every(attempt => ['rejected', 'failed', 'skipped'].includes(attempt.status))) return 'rejected'
   const selectedStage = canonicalTimelineStage(session?.selectedStage)
-  if (selectedStage === stageKey) return 'searching'
+  if (selectedStage === stageKey) {
+    return timelineStatusClass(session?.status) === 'failed' ? 'failed' : 'searching'
+  }
+  // The command progress protocol advances one canonical stage at a time.
+  // Once it has moved past a mandatory stage, that predecessor completed;
+  // retain explicit failures/skips above instead of leaving its row forever
+  // in "执行中" when the next packet arrives.
+  const selectedIndex = TIMELINE_STAGE_ORDER.indexOf(selectedStage)
+  const stageIndex = TIMELINE_STAGE_ORDER.indexOf(stageKey)
+  if (selectedIndex >= 0 && stageIndex >= 0 && selectedIndex > stageIndex) {
+    return stageKey === 'trusted_rtk_fixed' && !session?.trustedRtkSeed
+      ? 'skipped'
+      : 'accepted'
+  }
   if (!isAttemptSessionTerminal(session)) {
     const firstStage = canonicalTimelineStage((session?.strategy || [])[0] || 'mapping_origin_bounded')
     if (firstStage === stageKey) return 'searching'
@@ -688,6 +784,31 @@ function timelineDetail(stageKey, status, attempts, session, stageRecord = null)
     const verification = normalizeRtkVerification(stageRecord?.rtk_verification)
       || session?.rtkVerification
     return formatRtkVerificationSummary(verification)
+  }
+  if (stageKey === 'trusted_rtk_fixed') {
+    const seed = session?.trustedRtkSeed
+    if (!seed) return status === 'skipped'
+      ? '室内地图或无合格 fixed RTK，本轮不使用 RTK 搜索种子'
+      : meta.detail
+    const verification = normalizeRtkVerification(seed.rtk_verification)
+    const reason = seed.reason || verification?.conclusion || ''
+    return [
+      seed.accepted ? 'fixed RTK 已作为 NDT 候选种子' : 'fixed RTK 未作为搜索种子',
+      reason,
+    ].filter(Boolean).join(' · ')
+  }
+  if (stageKey === 'final_localization_gate') {
+    const gate = session?.finalLocalizationGate
+    if (!gate) return meta.detail
+    const frames = Number(gate.stable_frames ?? gate.normal_samples ?? 0)
+    const required = Number(gate.required_stable_frames ?? gate.required_samples ?? 3)
+    const source = gate.continuous_source || gate.active_source || session?.continuousSource || 'lio_imu'
+    const reason = gate.reason || gate.message || gate.failure_reason || ''
+    return [
+      `连续状态帧 ${frames}/${required}`,
+      `主源 ${source}`,
+      reason,
+    ].filter(Boolean).join(' · ')
   }
   if (stageKey === 'best_candidate_commit') {
     if (timelineStatusClass(status) === 'waiting') return meta.detail
@@ -897,6 +1018,13 @@ export function localizationAttemptTimeline(session) {
       status: timelineStatusClass(status),
       statusLabel: timelineStatusLabel(status, key),
       attempts,
+      reported: Boolean(record)
+        || attempts.length > 0
+        || (key === 'trusted_rtk_fixed' && Boolean(session.trustedRtkSeed))
+        || (key === 'fast_lio_imu_handoff' && Boolean(session.handoff))
+        || (key === 'secondary_correction' && Boolean(session.secondaryCorrection))
+        || (key === 'final_localization_gate' && Boolean(session.finalLocalizationGate))
+        || (key === 'navigation_start' && Boolean(session.navigationStart)),
       startedAt: times.startedAt,
       finishedAt: times.finishedAt,
     })
@@ -923,22 +1051,36 @@ export function localizationAttemptTimeline(session) {
     if (key && !stageRecords.has(key)) stageRecords.set(key, record)
   })
   const stageKeys = []
+  const isLifecycleStartup = usesNavigationLifecycleStartupChain(session)
   const addStageKey = value => {
     const key = canonicalTimelineStage(value)
     if (!key || key === 'map_transfer' || key === 'localization_bootstrap' || stageKeys.includes(key)) return
     if (TIMELINE_STAGE_META[key] || stageRecords.has(key)) stageKeys.push(key)
   }
+  // A navigation start always exposes every admission gate.  Direct/manual
+  // localization remains concise: it only shows the search stages it ran.
+  if (isLifecycleStartup) {
+    ;[
+      'navigation_prepare',
+      'fast_lio_readiness',
+      'trusted_rtk_fixed',
+      'mapping_origin_bounded',
+    ].forEach(addStageKey)
+  }
   ;(session.strategy || []).forEach(addStageKey)
   ;(session.stages || []).forEach(record => addStageKey(record?.stage))
   ;(session.attempts || []).forEach(attempt => addStageKey(attempt?.stage))
   if ((session.rtkVerification || session.rtkDrift) && !stageKeys.includes('rtk_fixed')) stageKeys.unshift('rtk_fixed')
-  if (!stageKeys.length) stageKeys.push('mapping_origin_bounded', 'route_waypoints', 'keyframe_global_match')
-  // The unified contract always exposes the handoff and secondary-correction
-  // gates, even when the backend has not emitted their first progress packet.
-  // This prevents the page from implying that NDT submission is the end of
-  // initialization.
+  if (!stageKeys.length) stageKeys.push('mapping_origin_bounded')
+  // Handoff and secondary correction remain visible after direct localization
+  // for compatibility.  The final admission/activation rows are specific to
+  // a lifecycle-managed navigation start.
   addStageKey('fast_lio_imu_handoff')
   addStageKey('secondary_correction')
+  if (isLifecycleStartup) {
+    addStageKey('final_localization_gate')
+    addStageKey('navigation_execution_activate')
+  }
   stageKeys.forEach(key => {
     const record = stageRecords.get(key)
     const attempts = stageAttemptsFor(session, key, record)
@@ -946,7 +1088,9 @@ export function localizationAttemptTimeline(session) {
       key,
       inferredStageStatus(session, key, attempts, record),
       attempts,
-      key === 'rtk_fixed' ? '' : (record?.error_message || record?.message || ''),
+      ['rtk_fixed', 'trusted_rtk_fixed', 'final_localization_gate'].includes(key)
+        ? ''
+        : (record?.error_message || record?.message || ''),
       record,
     )
   })
@@ -969,7 +1113,7 @@ export function localizationAttemptTimeline(session) {
   const shouldShowNavigation = session.commandType !== 'nav.initial_pose' || session.navigationStart
   if (shouldShowNavigation) {
     const navigationStatus = session.navigationStart
-      ? 'accepted'
+      ? stageStatusFromEvidence(session.navigationStart, 'searching')
       : (commandDone && session.status === 'accepted' ? 'searching' : 'waiting')
     add('navigation_start', navigationStatus)
   }
@@ -981,7 +1125,15 @@ function mergeTimelineHistory(session, currentTimeline) {
   const merged = history.map(step => ({ ...step }))
   currentTimeline.forEach(step => {
     const index = merged.findIndex(item => item.key === step.key)
-    if (index >= 0) merged[index] = step
+    if (index >= 0) {
+      const previous = merged[index]
+      // A progress packet normally reports one lifecycle checkpoint.  Keep
+      // a prior concrete checkpoint when this packet only renders the
+      // structural placeholder for that row; otherwise an accepted RTK seed
+      // or final gate would appear to regress on the following NDT packet.
+      if (!step.reported && previous?.reported) return
+      merged[index] = step
+    }
     else merged.push(step)
   })
   return merged.sort((left, right) => {
@@ -1022,6 +1174,19 @@ export function attemptRejectReasonLabel(reason) {
 export function localizationAttemptFailureMessage(session, fallback = '定位初始化失败') {
   if (!session) return fallback
   const attempts = Array.isArray(session.attempts) ? session.attempts : []
+  const backendAccepted = ['accepted', 'succeeded', 'completed'].includes(
+    String(session.status || '').trim().toLowerCase(),
+  )
+  const acceptedAttempt = attempts.find(attempt => attempt.accepted || attempt.status === 'accepted')
+  if (backendAccepted && acceptedAttempt) {
+    const score = acceptedAttempt.matchingError === null
+      ? 'NDT —'
+      : `NDT ${acceptedAttempt.matchingError.toFixed(3)}`
+    const inlier = acceptedAttempt.inlierFraction === null
+      ? '内点 —'
+      : `内点 ${(acceptedAttempt.inlierFraction * 100).toFixed(1)}%`
+    return `定位初始化已完成：候选 #${acceptedAttempt.candidateNumber} · ${score} · ${inlier}${fallback ? `；后续导航操作失败：${fallback}` : ''}`
+  }
   const measured = attempts.filter(attempt => (
     attempt.matchingError !== null
     || attempt.inlierFraction !== null

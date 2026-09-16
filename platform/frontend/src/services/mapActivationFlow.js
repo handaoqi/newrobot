@@ -107,7 +107,14 @@ export async function activateAndRelocalizeMap({
     }, { traceId })
     await waitForRobotCommand(robotId, startCommand, {
       timeoutMs: 180_000,
-      onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
+      onProgress: latest => {
+        onProgress(`导航栈启动：${latest.status || 'created'}`)
+        onCommand({
+          phase: 'localization',
+          command: latest,
+          showCandidates: true,
+        })
+      },
     })
     navigationStatus = await fetchRobotNavigationStatus(robotId)
     if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
@@ -161,10 +168,17 @@ export async function activateRouteMap({
       timeoutMs: 180_000,
       onProgress: latest => {
         onProgress(`地图下发：${latest.status || 'created'}`)
+        const result = latest?.result_payload || latest?.result || {}
+        const localizationStarted = Boolean(
+          result.localization
+          || result.localization_attempts
+          || result.selected_stage
+          || result.navigation_lifecycle,
+        )
         onCommand({
-          phase: latest?.result?.localization ? 'localization' : 'transfer',
+          phase: localizationStarted ? 'localization' : 'transfer',
           command: latest,
-          showCandidates: Boolean(latest?.result?.localization),
+          showCandidates: localizationStarted,
         })
       },
     })

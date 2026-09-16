@@ -1125,6 +1125,50 @@ def test_progressive_relocalization_starts_at_mapping_origin_then_receives_waypo
     store.close()
 
 
+def test_relocalization_keeps_accepted_localization_evidence_when_navigation_activation_fails(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "nav.relocalize"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "seed_source": "progressive",
+        "wait_seconds": 60.0,
+    }
+
+    class FailingStack(FakeNavigationStack):
+        def start(self, command=None):
+            raise ProtocolError(
+                "NAV_COMMAND_FAILED",
+                "controller lifecycle resume failed",
+                details={"action": "activate-execution", "stderr": "controller_server failed"},
+            )
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState()),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None,
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        localization_adapter=navigation,
+        map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=FailingStack(),
+    )
+
+    _, result = processor.handle_command(raw)
+
+    payload = result["payload"]
+    assert payload["status"] == "failed"
+    assert payload["error_code"] == "NAV_COMMAND_FAILED"
+    assert payload["result"]["localization_attempts"]["state"] == "accepted"
+    assert payload["result"]["navigation_start"]["error_code"] == "NAV_COMMAND_FAILED"
+    assert payload["result"]["navigation_start"]["details"]["action"] == "activate-execution"
+    store.close()
+
+
 def test_last_trusted_seed_never_falls_back_to_mapping_start(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     navigation = FakeNavigation()

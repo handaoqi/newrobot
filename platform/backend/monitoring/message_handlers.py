@@ -1085,6 +1085,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         )
         return {"state": execution.state, "state_version": execution.state_version, "audio_command_id": command.id if command else None}
     if envelope.message_type in {
+        "task.navigation_stage",
         "task.arrival_pending_settle",
         "task.arrival_nav2_stopping",
         "task.arrival_zero_confirming",
@@ -1101,7 +1102,7 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
         "task.waypoint_degraded",
         "task.waypoint_postprocess_completed",
     }:
-        if envelope.message_type == "task.arrival_degraded_accepted":
+        if envelope.message_type in {"task.navigation_stage", "task.arrival_degraded_accepted"}:
             TaskExecutionEvent.objects.get_or_create(
                 message_id=envelope.message_id,
                 defaults={
@@ -1116,10 +1117,19 @@ def _handle_task_event(envelope: MessageEnvelope, robot: Robot) -> dict:
                     ),
                     "reason_code": str(
                         payload.get("reason_code")
-                        or "ARRIVAL_FINE_REAPPROACH_EXHAUSTED"
+                        or (
+                            "ARRIVAL_FINE_REAPPROACH_EXHAUSTED"
+                            if envelope.message_type == "task.arrival_degraded_accepted"
+                            else ""
+                        )
                     ),
                     "reason_message": str(
-                        payload.get("reason_message") or "普通航点按粗到达半径完成"
+                        payload.get("reason_message")
+                        or (
+                            "普通航点按粗到达半径完成"
+                            if envelope.message_type == "task.arrival_degraded_accepted"
+                            else ""
+                        )
                     ),
                     "payload": payload,
                 },

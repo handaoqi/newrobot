@@ -150,7 +150,7 @@ def compact_self_healing_evidence(evidence: dict | None) -> dict:
 class FaultDiagnoser:
     """Pure decision matrix shared by automatic Edge and BT recovery paths."""
 
-    def __init__(self, *, ndt_failure_score: float = 0.5) -> None:
+    def __init__(self, *, ndt_failure_score: float = 0.40) -> None:
         self.ndt_failure_score = float(ndt_failure_score)
 
     def normalize_fault(self, requested: str, evidence: dict, scene_mode: str) -> str:
@@ -319,7 +319,7 @@ class SelfHealingCoordinator:
         *,
         store,
         event_callback: Callable[[str, dict, str], None] | None = None,
-        ndt_failure_score: float = 0.5,
+        ndt_failure_score: float = 0.40,
         rtk_required_samples: int = 3,
     ) -> None:
         self.store = store

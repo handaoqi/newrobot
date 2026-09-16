@@ -1286,7 +1286,7 @@ class EdgeAgentApplication:
         if coordinator is None:
             safety = getattr(getattr(self, "config", None), "safety", None)
             diagnoser = FaultDiagnoser(
-                ndt_failure_score=float(getattr(safety, "ndt_failure_score", 0.5))
+                ndt_failure_score=float(getattr(safety, "ndt_failure_score", 0.40))
             )
             return diagnoser.diagnose(
                 episode_id=episode_id or "legacy-untracked",

@@ -2332,18 +2332,43 @@ class TaskExecutor:
         return self._startup_rtk_already_aligned(decision)
 
     def initialize_before_navigation(self) -> dict:
-        self._wait_for_fast_lio_readiness()
+        readiness_started_at = now_iso()
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "fast_lio_readiness",
+            "stages": [{
+                "stage": "fast_lio_readiness",
+                "status": "searching",
+                "started_at": readiness_started_at,
+            }],
+        })
+        try:
+            readiness = self._wait_for_fast_lio_readiness()
+        except ProtocolError as exc:
+            self._raise_startup_stage_failure("fast_lio_readiness", readiness_started_at, exc)
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "fast_lio_readiness",
+            "fast_lio_readiness": readiness,
+            "stages": [{
+                "stage": "fast_lio_readiness",
+                "status": "accepted",
+                "started_at": readiness_started_at,
+                "finished_at": now_iso(),
+            }],
+        })
         result = self._initialize_before_navigation()
         if getattr(self, "_startup_localization_reused_stable", False):
             LOGGER.info(
                 "startup localization reused stable FAST-LIO+IMU pose; skipping fresh handoff acceptance"
             )
+            final_gate = self._wait_for_final_localization_gate_with_progress()
             return {
                 **dict(result or {}),
-                "final_localization_gate": self._wait_for_final_localization_gate(),
+                "final_localization_gate": final_gate,
                 "selected_stage": "final_localization_gate",
             }
-        final_gate = self._wait_for_final_localization_gate()
+        final_gate = self._wait_for_final_localization_gate_with_progress()
         accept_trusted = getattr(self.navigation, "accept_startup_trusted_pose", None)
         if callable(accept_trusted):
             accept_trusted()
@@ -2365,6 +2390,78 @@ class TaskExecutor:
             "final_localization_gate": final_gate,
             "selected_stage": "final_localization_gate",
         }
+
+    def _report_startup_localization_progress(self, payload: dict) -> None:
+        reporter = getattr(self.navigation, "report_localization_progress", None)
+        if not callable(reporter):
+            return
+        try:
+            reporter(payload)
+        except Exception:
+            LOGGER.exception("failed to publish startup localization progress")
+
+    def _wait_for_final_localization_gate_with_progress(self) -> dict:
+        started_at = now_iso()
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "final_localization_gate",
+            "stages": [{
+                "stage": "final_localization_gate",
+                "status": "searching",
+                "started_at": started_at,
+            }],
+        })
+        try:
+            final_gate = self._wait_for_final_localization_gate()
+        except ProtocolError as exc:
+            self._raise_startup_stage_failure("final_localization_gate", started_at, exc)
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "final_localization_gate",
+            "final_localization_gate": final_gate,
+            "stages": [{
+                "stage": "final_localization_gate",
+                "status": "accepted",
+                "started_at": started_at,
+                "finished_at": now_iso(),
+            }],
+        })
+        return final_gate
+
+    def _raise_startup_stage_failure(
+        self, stage: str, started_at: str, error: ProtocolError
+    ) -> None:
+        """Emit a terminal checkpoint before returning an initialization error."""
+        details = dict(error.details or {})
+        stage_payload = {
+            "state": "failed",
+            "selected_stage": stage,
+            "stages": [{
+                "stage": stage,
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": now_iso(),
+                "error_message": error.message,
+            }],
+        }
+        if stage == "final_localization_gate":
+            stage_payload["final_localization_gate"] = details.get("final_localization_gate") or {
+                "status": "failed", "reason": error.message,
+            }
+        if stage == "fast_lio_readiness":
+            stage_payload["fast_lio_readiness"] = details.get("fast_lio") or {
+                "status": "failed", "reason": error.message,
+            }
+        self._report_startup_localization_progress(stage_payload)
+        raise ProtocolError(
+            error.code,
+            error.message,
+            details={
+                **details,
+                "selected_stage": stage,
+                "localization_attempts": stage_payload,
+            },
+        ) from error
 
     def _wait_for_fast_lio_readiness(self, timeout_seconds: float = 90.0) -> dict:
         """Require local FAST-LIO evidence before attempting map NDT.
@@ -2421,12 +2518,22 @@ class TaskExecutor:
             if self.context else f"startup:secondary:{normalized}"
         )
         started_at = now_iso()
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "secondary_correction",
+            "stages": [{
+                "stage": "secondary_correction",
+                "status": "searching",
+                "started_at": started_at,
+            }],
+            "secondary_correction": {"mode": normalized, "status": "searching", "started_at": started_at},
+        })
         self._set_localization_policy({"localization_mode": normalized}, "stationary")
         if normalized == "rtk" and self._startup_rtk_already_aligned(self._localization_decision()):
             LOGGER.info(
                 "startup secondary rtk correction skipped; fixed RTK already aligned with live pose"
             )
-            return {
+            skipped = {
                 "accepted": True,
                 "status": "skipped",
                 "reason": "rtk_already_aligned",
@@ -2435,6 +2542,18 @@ class TaskExecutor:
                 "started_at": started_at,
                 "finished_at": now_iso(),
             }
+            self._report_startup_localization_progress({
+                "state": "running",
+                "selected_stage": "secondary_correction",
+                "secondary_correction": skipped,
+                "stages": [{
+                    "stage": "secondary_correction",
+                    "status": "skipped",
+                    "started_at": started_at,
+                    "finished_at": skipped["finished_at"],
+                }],
+            })
+            return skipped
         result = requester(transaction_id, normalized, "start") or {}
         result = {
             **result,
@@ -2446,7 +2565,19 @@ class TaskExecutor:
             # Compatibility adapters without a live correction service report
             # unavailable; the committed NDT pose remains usable in NDT mode.
             if normalized == "ndt" and str(result.get("status") or "") == "unavailable":
-                return {**result, "status": "skipped", "finished_at": now_iso()}
+                skipped = {**result, "status": "skipped", "finished_at": now_iso()}
+                self._report_startup_localization_progress({
+                    "state": "running",
+                    "selected_stage": "secondary_correction",
+                    "secondary_correction": skipped,
+                    "stages": [{
+                        "stage": "secondary_correction",
+                        "status": "skipped",
+                        "started_at": started_at,
+                        "finished_at": skipped["finished_at"],
+                    }],
+                })
+                return skipped
             raise ProtocolError(
                 "INITIALIZATION_CORRECTION_REJECTED",
                 str(result.get("message") or result.get("status") or "secondary correction rejected"),
@@ -2459,7 +2590,19 @@ class TaskExecutor:
             if isinstance(transaction, dict) and str(transaction.get("transaction_id") or "") == transaction_id:
                 status = str(transaction.get("status") or "")
                 if status == "completed":
-                    return {**result, **transaction, "finished_at": now_iso()}
+                    completed = {**result, **transaction, "finished_at": now_iso()}
+                    self._report_startup_localization_progress({
+                        "state": "running",
+                        "selected_stage": "secondary_correction",
+                        "secondary_correction": completed,
+                        "stages": [{
+                            "stage": "secondary_correction",
+                            "status": "accepted",
+                            "started_at": started_at,
+                            "finished_at": completed["finished_at"],
+                        }],
+                    })
+                    return completed
                 if status in {"failed", "cancelled", "rejected"}:
                     raise ProtocolError(
                         "INITIALIZATION_CORRECTION_FAILED",
@@ -2547,6 +2690,22 @@ class TaskExecutor:
                     "accepted" if trusted_seed else "skipped",
                     trusted_evidence.get("reason") or "verified",
                 )
+        trusted_stage = trusted_evidence or {
+            "status": "skipped",
+            "accepted": False,
+            "reason": "indoor_or_local_only",
+        }
+        self._report_startup_localization_progress({
+            "state": "running",
+            "selected_stage": "trusted_rtk_fixed",
+            "trusted_rtk_seed": trusted_stage,
+            "stages": [{
+                "stage": "trusted_rtk_fixed",
+                "status": "accepted" if trusted_stage.get("accepted") else "skipped",
+                "started_at": now_iso(),
+                "finished_at": now_iso(),
+            }],
+        })
         LOGGER.info(
             "startup localization running progressive search: mapping origin%s, %d route waypoint(s), global fallback",
             ", trusted fixed RTK seed" if trusted_seed else "",
@@ -2586,6 +2745,20 @@ class TaskExecutor:
                 "continuous_source": "lio_imu",
             }
         initial_ndt_commit = self._progressive_startup_relocalize(points)
+        handoff = initial_ndt_commit.get("handoff") if isinstance(initial_ndt_commit, dict) else None
+        if isinstance(handoff, dict):
+            self._report_startup_localization_progress({
+                "state": "running",
+                "selected_stage": "fast_lio_imu_handoff",
+                "fast_lio_imu_handoff": handoff,
+                "handoff": handoff,
+                "stages": [{
+                    "stage": "fast_lio_imu_handoff",
+                    "status": handoff.get("status") or "accepted",
+                    "started_at": handoff.get("started_at") or now_iso(),
+                    "finished_at": handoff.get("finished_at") or now_iso(),
+                }],
+            })
         first_index = min(
             max(0, self.context.current_waypoint_index),
             max(0, len(points) - 1),
@@ -2837,6 +3010,7 @@ class TaskExecutor:
         self, reached_index: int | None, cruise_index: int | None
     ) -> None:
         """Finish a successful in-place align and continue cruise or post-arrival."""
+        is_arrival_heading = self._departure_heading_is_arrival
         self._cancel_departure_heading_timeout()
         self._departure_heading_cancel.set()
         self._departure_heading_index = None
@@ -2845,6 +3019,16 @@ class TaskExecutor:
         self._departure_heading_is_arrival = False
         self._departure_heading_tolerance_rad = DEPARTURE_HEADING_ALIGN_RAD
         self._restore_navigation_profile()
+        if not is_arrival_heading and reached_index is not None:
+            self._emit_navigation_stage(
+                reached_index,
+                "departure_heading",
+                "completed",
+                "已对准下个航点，开始下发下一段路径",
+                metrics=self._departure_heading_stage_metrics(
+                    reached_index, cruise_index
+                ),
+            )
         if cruise_index is not None:
             LOGGER.info(
                 "pre-leg departure heading complete; cruising to waypoint %d",
@@ -2854,6 +3038,29 @@ class TaskExecutor:
             return
         if reached_index is not None:
             self._departure_heading_completed_index = reached_index
+
+    def _departure_heading_stage_metrics(
+        self,
+        reached_index: int,
+        cruise_index: int | None,
+        *,
+        desired_yaw: float | None = None,
+        error_rad: float | None = None,
+    ) -> dict:
+        """Evidence for the pre-leg turn, kept distinct from final yaw."""
+        target_index = cruise_index if cruise_index is not None else reached_index + 1
+        metrics: dict = {"next_waypoint_index": target_index}
+        waypoints = self.context.route_snapshot.get("waypoints") if self.context else []
+        if isinstance(waypoints, list) and 0 <= target_index < len(waypoints):
+            target = waypoints[target_index]
+            metrics["next_map_point_number"] = target.get(
+                "map_point_number", int(target.get("sequence", target_index)) + 1
+            )
+        if desired_yaw is not None:
+            metrics["desired_yaw_rad"] = round(float(desired_yaw), 4)
+        if error_rad is not None:
+            metrics["heading_error_deg"] = round(abs(float(error_rad)) * 180.0 / pi, 1)
+        return metrics
 
     def _use_teleop_departure_heading(self) -> bool:
         """Nav2 require_yaw weaves on 180deg turns; spin with teleop yaw instead."""
@@ -2900,19 +3107,34 @@ class TaskExecutor:
                 cancel_navigation=False,
             )
         if self._use_teleop_departure_heading():
-            return self._start_teleop_departure_heading(
+            started = self._start_teleop_departure_heading(
                 desired_yaw=desired_yaw,
                 reached_index=reached_index,
                 cruise_index=cruise_index,
                 error_rad=error_rad,
             )
-        return self._start_nav2_departure_heading(
-            desired_yaw=desired_yaw,
-            reached_index=reached_index,
-            cruise_index=cruise_index,
-            profile_waypoint=profile_waypoint,
-            error_rad=error_rad,
-        )
+        else:
+            started = self._start_nav2_departure_heading(
+                desired_yaw=desired_yaw,
+                reached_index=reached_index,
+                cruise_index=cruise_index,
+                profile_waypoint=profile_waypoint,
+                error_rad=error_rad,
+            )
+        if started:
+            self._emit_navigation_stage(
+                reached_index,
+                "departure_heading",
+                "active",
+                "当前点已验收，正在原地对准下个航点的行进方向",
+                metrics=self._departure_heading_stage_metrics(
+                    reached_index,
+                    cruise_index,
+                    desired_yaw=desired_yaw,
+                    error_rad=error_rad,
+                ),
+            )
+        return started
 
     def _start_nav2_departure_heading(
         self,
@@ -3626,6 +3848,22 @@ class TaskExecutor:
         # cruise-only online anchor gate is enabled for that first leg too.
         self._set_localization_policy(policy_waypoint, "moving")
         self._persist()
+        self._emit_navigation_stage(
+            index,
+            "target_dispatch",
+            "completed",
+            "Nav2 已接受当前航点目标，开始全局规划",
+            metrics={
+                "reapproach": reapproach,
+                "distance_remaining_m": remaining,
+            },
+        )
+        self._emit_navigation_stage(
+            index,
+            "path_planning",
+            "active",
+            "等待规划器、路径平滑器和控制器首次反馈",
+        )
         self._emit(
             "task.started",
             extra={
@@ -4491,6 +4729,17 @@ class TaskExecutor:
         if speech_configured and self._waypoint_speech_blocks_navigation(waypoint):
             self._clear_waypoint_speech_status(waypoint_index)
             self._start_waypoint_speech_wait(waypoint_index)
+        if speech_configured or float(waypoint.get("dwell_seconds") or 0.0) > 0.0:
+            self._emit_navigation_stage(
+                waypoint_index,
+                "waypoint_postprocess",
+                "active",
+                "正在执行航点播报、动作或驻留后处理",
+                metrics={
+                    "speech_mode": self._waypoint_speech_mode(waypoint),
+                    "dwell_seconds": float(waypoint.get("dwell_seconds") or 0.0),
+                },
+            )
         self.on_feedback(
             waypoint_index - self._goal_offset,
             0.0,
@@ -4621,6 +4870,17 @@ class TaskExecutor:
     def _emit_arrival_stage(
         self, reached_index: int, stage: str, message: str
     ) -> None:
+        navigation_stage = {
+            "position_approach": "fine_approach",
+            "heading_alignment": "arrival_heading",
+            "heading_preserving_adjustment": "micro_adjustment",
+            "heading_preserving_nav2_goal": "micro_adjustment",
+            "pose_verification": "arrival_acceptance",
+        }.get(stage)
+        if navigation_stage:
+            self._emit_navigation_stage(
+                reached_index, navigation_stage, "active", message,
+            )
         self._emit_idempotent(
             "task.recovery_active",
             event_type_key=f"arrival_{stage}",
@@ -4628,6 +4888,55 @@ class TaskExecutor:
             code="ARRIVAL_POSE_CONVERGENCE",
             message=message,
             extra={"arrival_stage": stage},
+        )
+
+    def _emit_navigation_stage(
+        self,
+        waypoint_index: int,
+        stage: str,
+        status: str,
+        message: str,
+        *,
+        metrics: dict | None = None,
+    ) -> None:
+        """Persist one observed navigation ownership boundary for the UI."""
+        if not self.context:
+            return
+        waypoints = self.context.route_snapshot.get("waypoints") or []
+        if waypoint_index < 0 or waypoint_index >= len(waypoints):
+            return
+        waypoint = waypoints[waypoint_index]
+        profile = self._active_leg_profile
+        extra = {
+            "navigation_stage": stage,
+            "stage_status": status,
+            "execution_waypoint_index": waypoint_index,
+            "waypoint": {
+                "waypoint_id": waypoint.get("waypoint_id"),
+                "map_point_number": waypoint.get(
+                    "map_point_number", int(waypoint.get("sequence", waypoint_index)) + 1
+                ),
+                "name": waypoint.get("name") or "",
+                "x": float(waypoint["x"]),
+                "y": float(waypoint["y"]),
+                "yaw": float(waypoint.get("yaw") or 0.0),
+            },
+            "modules": {
+                "global_planner": profile.global_planner_id if profile else None,
+                "local_controller": profile.local_controller_id if profile else None,
+                "smoother": profile.smoother_id if profile else None,
+                "goal_checker": profile.goal_checker_id if profile else None,
+                "localization_mode": profile.localization_mode if profile else None,
+            },
+        }
+        if metrics:
+            extra["stage_metrics"] = metrics
+        self._emit_idempotent(
+            "task.navigation_stage",
+            event_type_key=f"navigation_stage_{stage}_{status}",
+            waypoint_id=str(waypoint.get("waypoint_id") or waypoint_index),
+            message=message,
+            extra=extra,
         )
 
     def _cancel_arrival_adjustment(self, *, reset_state: bool = False) -> None:
@@ -6420,6 +6729,22 @@ class TaskExecutor:
                     speed_updater(speed_distance_remaining)
                 except Exception:
                     LOGGER.warning("navigation speed-envelope update failed", exc_info=True)
+        if milestone not in {"target_dispatched", "waypoint_reached", "arrival_confirmed"}:
+            with self._lock:
+                if self.context and self.context.state == "running":
+                    self._emit_navigation_stage(
+                        current_waypoint_index,
+                        "path_planning",
+                        "completed",
+                        "已收到控制器路径跟踪反馈，规划与路径平滑已生效",
+                    )
+                    self._emit_navigation_stage(
+                        current_waypoint_index,
+                        "path_tracking",
+                        "active",
+                        "正在沿平滑路径跟踪航点",
+                        metrics={"distance_remaining_m": distance_remaining_m},
+                    )
         if apply_final:
             try:
                 self._apply_patrol_final_approach()
@@ -6685,6 +7010,17 @@ class TaskExecutor:
                     self._emit_arrival_stage(
                         reached_index, "correction", "正在进行航点绝对定位校正"
                     )
+                    self._emit_navigation_stage(
+                        reached_index,
+                        "localization_correction",
+                        "active",
+                        "停车后开始航点绝对定位校正",
+                        metrics={
+                            "localization_mode": waypoint_localization_mode(
+                                reached_waypoint.get("localization_mode")
+                            ),
+                        },
+                    )
                     self._correction_generation += 1
                     self._correction_completed_at_mono = None
                     self._emit_idempotent(
@@ -6718,6 +7054,12 @@ class TaskExecutor:
                         return
                     self._correction_completed_at_mono = time.monotonic()
                     self._arrival_correction_completed_index = reached_index
+                    self._emit_navigation_stage(
+                        reached_index,
+                        "localization_correction",
+                        "completed",
+                        "航点绝对定位校正完成，开始读取校正后的位姿",
+                    )
 
                 post_arrival_active = self._post_arrival_active(reached_index)
                 requires_micro_recheck = bool(
@@ -7000,6 +7342,17 @@ class TaskExecutor:
                     reached_waypoint, reached_index
                 )
                 retries = self._clear_arrival_reapproach_tracking(reached_index)
+                self._emit_navigation_stage(
+                    reached_index,
+                    "arrival_acceptance",
+                    "completed",
+                    "校正后 XY 与最终航向验收通过",
+                    metrics={
+                        "distance_m": round(distance, 3) if distance is not None else None,
+                        "acceptance_tolerance_m": xy_tolerance,
+                        "reapproach_attempts": retries,
+                    },
+                )
                 self._start_arrival_side_effects(
                     reached_index,
                     reached_waypoint,
@@ -7301,6 +7654,13 @@ class TaskExecutor:
             waypoint_id=str(waypoint.get("waypoint_id") or waypoint_index),
             extra={"results": [result.__dict__ for result in results]},
         )
+        self._emit_navigation_stage(
+            waypoint_index,
+            "waypoint_actions",
+            "completed",
+            "航点动作执行完成",
+            metrics={"action_count": len(results)},
+        )
 
     def _strip_non_navigation_waypoint_actions(self, route: dict) -> None:
         """Drop speech/alert waypoint extras so navigation ignores them."""
@@ -7448,6 +7808,12 @@ class TaskExecutor:
                 or waypoint_index
             ),
             message="航点最终位置、航向与后处理已完成",
+        )
+        self._emit_navigation_stage(
+            waypoint_index,
+            "waypoint_postprocess",
+            "completed",
+            "航点动作、播报和驻留后处理完成，准备下发下一航点",
         )
         self._active_correction_transaction_id = None
         self._active_correction_mode = None
@@ -8203,6 +8569,18 @@ class TaskExecutor:
             "zero_confirmed": "零速已连续确认 1 秒，进入静止定位校正",
             "zero_timeout": "零速确认超时，禁止进入定位校正与到点验收",
         }
+        # Nav2 has returned a terminal success before the stop-confirmation
+        # transaction starts.  Close the controller tracking stage explicitly
+        # so the UI does not leave it displayed as "in progress" while the
+        # robot is already parked for localization correction.
+        if stage == "nav2_stopping":
+            self._emit_navigation_stage(
+                reached_index,
+                "path_tracking",
+                "completed",
+                "Nav2 已进入粗到达范围，结束本段路径跟踪",
+                metrics=details,
+            )
         self._emit_idempotent(
             f"task.arrival_{stage}",
             event_type_key=f"arrival_{stage}",
@@ -8214,6 +8592,16 @@ class TaskExecutor:
                 "execution_waypoint_index": reached_index,
                 **details,
             },
+        )
+        status = "failed" if stage == "zero_timeout" else (
+            "completed" if stage == "zero_confirmed" else "active"
+        )
+        self._emit_navigation_stage(
+            reached_index,
+            "stop_confirmation",
+            status,
+            messages[stage],
+            metrics=details,
         )
 
     def _final_pose_error(self) -> tuple[str, str] | None:

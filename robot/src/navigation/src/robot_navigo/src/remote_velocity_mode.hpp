@@ -1,10 +1,36 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 #include "zsibot_define.h"
 
 namespace robot_navigo {
+
+// Autonav micro caps from Edge navigation_speed.py, mapped onto the lowest
+// observed responsive virtual-remote stick (0.45). Dividing 0.30 m/s and
+// 0.525 rad/s by the 3.0 / 5.25 teleop ceiling left a ~0.10 stick that the
+// 0.55 floor then lifted into a spin.
+constexpr float kNavResponsiveStick = 0.45f;
+constexpr double kNavStickVxFullScale = 0.30 / 0.45;
+constexpr double kNavStickVyFullScale = 0.225 / 0.45;
+constexpr double kNavStickYawFullScale = 0.525 / 0.45;
+
+inline float NormalizeRemoteStick(float value, double max_value, float min_stick,
+                                  bool lift_to_min) {
+  if (!(max_value > 0.0) || !std::isfinite(max_value) || !std::isfinite(value)) {
+    return 0.0f;
+  }
+  float stick = std::clamp(static_cast<float>(value / max_value), -1.0f, 1.0f);
+  if (std::fabs(stick) <= 1e-4f) {
+    return 0.0f;
+  }
+  if (std::fabs(stick) < min_stick) {
+    return lift_to_min ? std::copysign(min_stick, stick) : stick;
+  }
+  return stick;
+}
 
 enum class RequestedPosture {
   kNone,

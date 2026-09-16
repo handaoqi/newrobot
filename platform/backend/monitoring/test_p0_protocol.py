@@ -53,6 +53,7 @@ class ProtocolContractTests(SimpleTestCase):
 
     def test_accepts_arrival_stage_events(self):
         for message_type in (
+            "task.navigation_stage",
             "task.arrival_nav2_stopping",
             "task.arrival_zero_confirming",
             "task.arrival_zero_confirmed",

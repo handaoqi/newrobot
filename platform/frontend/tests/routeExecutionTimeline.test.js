@@ -17,6 +17,53 @@ function event(id, eventType, stateVersion, occurredAt, payload = {}, extra = {}
   }
 }
 
+test('renders durable structured navigation stages with metrics', () => {
+  const timeline = buildTaskExecutionTimeline({
+    state: 'running',
+    created_at: '2026-09-16T08:00:00+08:00',
+    route_snapshot: { waypoints: [{ map_point_number: 7, x: 1, y: 2, yaw: 0 }] },
+    events: [
+      event(1, 'task.navigation_stage', 2, '2026-09-16T08:00:01+08:00', {
+        navigation_stage: 'path_planning',
+        stage_status: 'active',
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 7, x: 1, y: 2 },
+      }),
+      event(2, 'task.navigation_stage', 3, '2026-09-16T08:00:02+08:00', {
+        navigation_stage: 'path_tracking',
+        stage_status: 'active',
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 7, x: 1, y: 2 },
+        stage_metrics: { distance_remaining_m: 1.25 },
+      }),
+      event(3, 'task.navigation_stage', 4, '2026-09-16T08:00:03+08:00', {
+        navigation_stage: 'arrival_acceptance',
+        stage_status: 'completed',
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 7, x: 1, y: 2 },
+        stage_metrics: { distance_m: 0.12, acceptance_tolerance_m: 0.3, reapproach_attempts: 1 },
+      }),
+      event(4, 'task.navigation_stage', 5, '2026-09-16T08:00:04+08:00', {
+        navigation_stage: 'departure_heading',
+        stage_status: 'completed',
+        execution_waypoint_index: 0,
+        waypoint: { map_point_number: 7, x: 1, y: 2 },
+        stage_metrics: { next_map_point_number: 8, heading_error_deg: 96.5 },
+      }),
+    ],
+  })
+
+  assert.deepEqual(timeline.map(item => item.title), [
+    '7号点 · 全局规划与路径平滑：进行中',
+    '7号点 · 路径跟踪：进行中',
+    '7号点 · XY / 航向联合验收：完成',
+    '7号点 · 对准下个航点：完成',
+  ])
+  assert.match(timeline[1].detail, /剩余 1\.25m/)
+  assert.match(timeline[2].detail, /偏差 0\.12m.*验收半径 0\.30m.*追加靠近 1 次/)
+  assert.match(timeline[3].detail, /对准 8 号点.*航向误差 96\.5度/)
+})
+
 test('builds an ordered real preview timeline from durable task events', () => {
   const execution = {
     state: 'completed',

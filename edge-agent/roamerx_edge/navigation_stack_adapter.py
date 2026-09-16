@@ -461,5 +461,14 @@ class NavigationStackAdapter:
             "stderr": completed.stderr[-6000:],
         }
         if completed.returncode != 0:
-            raise ProtocolError("NAV_COMMAND_FAILED", payload["stderr"] or payload["stdout"])
+            # Keep the lifecycle action and its bounded script output in the
+            # terminal command result.  Without these details the platform
+            # can only show NAV_COMMAND_FAILED, which is insufficient to
+            # distinguish an activation failure from a prepare/deactivate
+            # failure during relocalization.
+            raise ProtocolError(
+                "NAV_COMMAND_FAILED",
+                payload["stderr"] or payload["stdout"],
+                details=payload,
+            )
         return payload

@@ -7,6 +7,10 @@ namespace {
 using robot_navigo::DecideRemoteVelocityDisposition;
 using robot_navigo::HasLiveMotionCommand;
 using robot_navigo::IsZeroPlanarVelocity;
+using robot_navigo::kNavResponsiveStick;
+using robot_navigo::kNavStickVxFullScale;
+using robot_navigo::kNavStickYawFullScale;
+using robot_navigo::NormalizeRemoteStick;
 using robot_navigo::RemoteVelocityDisposition;
 using robot_navigo::RequestedPosture;
 
@@ -53,6 +57,25 @@ TEST(RemoteVelocityMode, OrdinaryTeleopStillRequiresMoveMode) {
                 RequestedPosture::kStanding,
                 static_cast<int32_t>(zsibot::ControlMode::CM_MOVE_MODE)),
             RemoteVelocityDisposition::kSendMoveVelocity);
+}
+
+TEST(RemoteStick, ManualTeleopStillLiftsDeadZoneStick) {
+  EXPECT_FLOAT_EQ(NormalizeRemoteStick(0.30f, 3.0, 0.55f, true), 0.55f);
+  EXPECT_FLOAT_EQ(NormalizeRemoteStick(0.35f, 5.25, 0.55f, true), 0.55f);
+  EXPECT_FLOAT_EQ(NormalizeRemoteStick(0.0f, 5.25, 0.55f, true), 0.0f);
+}
+
+TEST(RemoteStick, AutonavMicroCommandsStayProportional) {
+  const float forward = NormalizeRemoteStick(
+      0.30f, kNavStickVxFullScale, 0.55f, false);
+  const float yaw = NormalizeRemoteStick(
+      0.35f, kNavStickYawFullScale, 0.55f, false);
+  EXPECT_NEAR(forward, kNavResponsiveStick, 1e-5);
+  EXPECT_GT(yaw, 0.25f);
+  EXPECT_LT(yaw, 0.55f);
+  EXPECT_NEAR(
+      NormalizeRemoteStick(0.05f, kNavStickYawFullScale, 0.55f, false),
+      0.05f / kNavStickYawFullScale, 1e-5);
 }
 
 TEST(RemoteVelocityMode, EmergencyStopAlwaysWins) {

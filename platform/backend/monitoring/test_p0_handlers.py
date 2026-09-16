@@ -529,6 +529,42 @@ class MessageHandlerTests(TestCase):
             1,
         )
 
+    def test_navigation_stages_are_persisted_without_consuming_task_state_version(self):
+        initial_state = self.execution.state
+        initial_version = self.execution.state_version
+        for sequence, (stage, status) in enumerate(
+            (("path_planning", "active"), ("path_tracking", "active")), start=80
+        ):
+            handle_mqtt_message(
+                "robots/rx-001/events/task",
+                self.envelope(
+                    "task.navigation_stage",
+                    {
+                        "task_execution_id": str(self.execution.id),
+                        "state": initial_state,
+                        "state_version": initial_version,
+                        "navigation_stage": stage,
+                        "stage_status": status,
+                        "execution_waypoint_index": 0,
+                    },
+                    sequence=sequence,
+                ),
+            )
+            if sequence == 80:
+                self.execution.refresh_from_db()
+                initial_state = self.execution.state
+                initial_version = self.execution.state_version
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.state, initial_state)
+        self.assertEqual(self.execution.state_version, initial_version)
+        self.assertEqual(
+            TaskExecutionEvent.objects.filter(
+                task_execution=self.execution,
+                event_type="task.navigation_stage",
+            ).count(),
+            2,
+        )
+
     def test_late_pause_failure_does_not_overwrite_resume(self):
         TaskExecutionService.transition(
             self.execution,

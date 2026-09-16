@@ -233,6 +233,22 @@ class CommandProcessor:
                 # Initialization can actively relocalize and may take up to 90s.
                 # Persist and publish the acceptance first so an Edge restart in
                 # that window cannot leave the center stuck in `dispatching`.
+                prepared_at = now_iso()
+                self._emit_command_progress(
+                    envelope,
+                    started_at,
+                    {
+                        "state": "running",
+                        "selected_stage": "navigation_prepare",
+                        "stages": [{
+                            "stage": "navigation_prepare",
+                            "status": "accepted",
+                            "started_at": started_at,
+                            "finished_at": prepared_at,
+                        }],
+                        "navigation_lifecycle": {"status": "prepared"},
+                    },
+                )
                 set_progress = getattr(
                     self.localization_adapter, "set_attempt_progress_callback", None
                 )
@@ -506,13 +522,41 @@ class CommandProcessor:
         """
         if self.localization_adapter is None:
             raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
-        self._wait_for_command_fast_lio_readiness()
+        lio_readiness = self._wait_for_command_fast_lio_readiness()
+        self._emit_command_progress(
+            envelope,
+            now_iso(),
+            {
+                "state": "running",
+                "selected_stage": "fast_lio_readiness",
+                "fast_lio_readiness": lio_readiness,
+            },
+        )
         origin = self._command_mapping_origin()
         waypoints = list(command.get("waypoints") or [])
         route = command.get("route_snapshot") if isinstance(command.get("route_snapshot"), dict) else {}
         if not waypoints:
             waypoints = list(route.get("waypoints") or [])
         trusted_seed, trusted_evidence = self._trusted_rtk_seed_for_command(command)
+        trusted_stage = trusted_evidence or {
+            "status": "skipped",
+            "accepted": False,
+            "reason": (
+                "indoor_or_local_only"
+                if not self._command_scene_uses_rtk_seed(command)
+                else "fixed_rtk_not_accepted"
+            ),
+        }
+        self._emit_command_progress(
+            envelope,
+            now_iso(),
+            {
+                "state": "running",
+                "selected_stage": "trusted_rtk_fixed",
+                "trusted_rtk_seed": trusted_stage,
+                "scene_scope": command.get("scene_scope"),
+            },
+        )
         progressive = getattr(self.localization_adapter, "progressive_relocalize", None)
         if not callable(progressive):
             raise ProtocolError("PROGRESSIVE_RELOCALIZATION_UNAVAILABLE", "NDT progressive relocalization is unavailable")
@@ -528,7 +572,28 @@ class CommandProcessor:
         secondary = self._run_external_secondary_correction(
             envelope, mode, prefix="navigation_lifecycle"
         )
+        self._emit_command_progress(
+            envelope,
+            now_iso(),
+            {
+                "state": "running",
+                "selected_stage": "secondary_correction",
+                "secondary_correction": secondary,
+                "trusted_rtk_seed": trusted_evidence,
+            },
+        )
         final_gate = self._wait_for_command_final_localization_gate()
+        self._emit_command_progress(
+            envelope,
+            now_iso(),
+            {
+                "state": "running",
+                "selected_stage": "final_localization_gate",
+                "secondary_correction": secondary,
+                "final_localization_gate": final_gate,
+                "trusted_rtk_seed": trusted_evidence,
+            },
+        )
         return {
             "initial_ndt_commit": initial_ndt_commit,
             "secondary_correction": secondary,
@@ -1108,13 +1173,52 @@ class CommandProcessor:
                     and str(command.get("seed_source") or "")
                     in {"progressive", "quick_then_global"}
                 )
-                should_start_navigation = localization_bootstrap is not None or bool(
-                    command.get("start_navigation", progressive_initialization)
+                # An operator-triggered relocalization is a recovery
+                # transaction, not a pose-only probe.  Once NDT, FAST-LIO
+                # handoff and the secondary correction complete, always
+                # reactivate the prepared execution group.  Previously the
+                # common case (an already-present /initialpose subscriber)
+                # defaulted to False here, leaving Nav2 configured/inactive
+                # and showing "navigation stack not ready" after a successful
+                # localization result.
+                should_start_navigation = (
+                    (envelope.message_type == "nav.relocalize" and self.navigation_stack_adapter is not None)
+                    or localization_bootstrap is not None
+                    or bool(command.get("start_navigation", progressive_initialization))
                 )
                 if should_start_navigation:
                     result_payload = dict(result_payload or {})
                     navigation_started_at = now_iso()
-                    navigation_start = self._start_navigation_after_localization()
+                    try:
+                        navigation_start = self._start_navigation_after_localization()
+                    except ProtocolError as exc:
+                        # The NDT/LIO transaction may already be accepted
+                        # when the independent Nav2 execution activation
+                        # fails.  Preserve that completed localization result
+                        # in the terminal command rather than replacing it
+                        # with an opaque NAV_COMMAND_FAILED.
+                        localization_snapshot = result_payload.get("localization_attempts")
+                        if not isinstance(localization_snapshot, dict):
+                            localization_snapshot = {
+                                **result_payload,
+                                "state": "accepted",
+                            }
+                        raise ProtocolError(
+                            exc.code,
+                            exc.message,
+                            details={
+                                **result_payload,
+                                "localization_attempts": localization_snapshot,
+                                "navigation_start": {
+                                    "status": "failed",
+                                    "started_at": navigation_started_at,
+                                    "finished_at": now_iso(),
+                                    "error_code": exc.code,
+                                    "error_message": exc.message,
+                                    "details": dict(exc.details or {}),
+                                },
+                            },
+                        ) from exc
                     result_payload["navigation_start"] = {
                         **navigation_start,
                         "started_at": navigation_start.get("started_at") or navigation_started_at,

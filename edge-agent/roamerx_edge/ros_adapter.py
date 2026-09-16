@@ -1269,6 +1269,18 @@ class RosAdapter(Node):
     def set_attempt_progress_callback(self, callback: Callable | None) -> None:
         self._attempt_progress_cb = callback
 
+    def report_localization_progress(self, payload: dict) -> None:
+        """Publish an Edge-owned localization lifecycle checkpoint.
+
+        NDT search publishes its own detailed candidate snapshots.  Task
+        startup owns the surrounding FAST-LIO, RTK-seed, correction and final
+        admission gates, so it uses this narrow public bridge instead of
+        reaching into the adapter's private callback state.
+        """
+        if not isinstance(payload, dict):
+            return
+        self._report_localization_attempts(payload, persist=False)
+
     def set_recovery_lease_callbacks(
         self,
         acquire_callback: Callable,
@@ -5084,7 +5096,16 @@ class RosAdapter(Node):
             attempt["status"] = "rejected"
             attempt["eligible"] = False
             attempt["accepted"] = False
-            attempt.setdefault("reject_reason", "quality_gate")
+            # Preserve the causal gate from the NDT observation.  A generic
+            # `quality_gate` loses essential safety evidence (for example a
+            # matched yaw outside the seed-correction envelope) and caused
+            # the UI to present a good score/inlier pair as an NDT failure.
+            attempt.setdefault(
+                "reject_reason",
+                candidate.get("reject_reason")
+                or next(iter(candidate.get("quality_failures") or []), None)
+                or "quality_gate",
+            )
         return attempt
 
     def _select_ranked_attempt(self, attempts: list[dict]) -> dict | None:

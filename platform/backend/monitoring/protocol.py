@@ -87,6 +87,7 @@ UPLINK_MESSAGE_TYPES = {
     "command.progress",
     "command.result",
     "task.progress",
+    "task.navigation_stage",
     "task.round_started",
     "task.obstacle_speech",
     "task.obstacle_stage",
