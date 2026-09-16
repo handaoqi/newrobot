@@ -3676,7 +3676,9 @@ async function handleDeleteRoute(route) {
               </div>
             </div>
 
-            <aside class="drill-timeline-panel route-timeline-column" :class="{ open: drillTimelineOpen }">
+          </div>
+
+          <aside class="drill-timeline-panel route-timeline-column" :class="{ open: drillTimelineOpen }">
               <div class="drill-timeline-header">
                 <div>
                   <span>演练记录</span>
@@ -3742,8 +3744,7 @@ async function handleDeleteRoute(route) {
                   </div>
                 </article>
               </div>
-            </aside>
-          </div>
+          </aside>
 
           <div class="panel-section route-step-panel route-step-4">
             <div class="route-step-content route-select-content">
@@ -4483,7 +4484,7 @@ async function handleDeleteRoute(route) {
 .route-waypoint-column {
   display: flex;
   grid-column: 4;
-  grid-row: 2 / span 2;
+  grid-row: 2;
   min-width: 0;
   min-height: 0;
   flex-direction: column;
@@ -5673,6 +5674,15 @@ async function handleDeleteRoute(route) {
 .drill-timeline-panel.open {
   min-height: 280px;
   max-height: none;
+}
+
+/* Keep the execution timeline on the same grid row as the map/task
+   keyframe panels.  This makes their top edges align on desktop instead of
+   letting the timeline inherit the waypoint column's flex flow. */
+.drill-timeline-panel.route-timeline-column {
+  grid-column: 4;
+  grid-row: 3;
+  align-self: start;
 }
 
 .drill-timeline-actions {
