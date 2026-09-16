@@ -1171,8 +1171,12 @@ def test_progressive_relocalize_checks_trusted_rtk_before_origin_search():
                     "candidate_number": 1,
                     "candidate_label": "RTK固定解可信搜索点",
                     "status": "accepted",
+                    "matching_error": 0.006,
+                    "inlier_fraction": 0.995,
                     "ndt_candidate": {
                         "eligible": True,
+                        "matching_error": 0.006,
+                        "inlier_fraction": 0.995,
                         "matched_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
                     },
                 }],
@@ -1213,6 +1217,11 @@ def test_progressive_relocalize_checks_trusted_rtk_before_origin_search():
 
     assert result["selected_stage"] == "trusted_rtk_fixed"
     assert result["attempts"][0]["candidate_number"] == 1
+    assert result["trusted_rtk_ndt_confirmation"]["candidate_number"] == 1
+    assert result["trusted_rtk_ndt_confirmation"]["ndt_score"] == 0.006
+    assert result["trusted_rtk_ndt_confirmation"]["matched_pose"] == {
+        "x": 1.0, "y": 1.0, "yaw": 0.0,
+    }
     assert calls == ["trusted_rtk_fixed"]
 
 

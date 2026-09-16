@@ -792,6 +792,21 @@ function timelineDetail(stageKey, status, attempts, session, stageRecord = null)
       : meta.detail
     const verification = normalizeRtkVerification(seed.rtk_verification)
     const reason = seed.reason || verification?.conclusion || ''
+    const confirmation = seed.ndt_confirmation || stageRecord?.ndt_confirmation || null
+    if (seed.accepted && confirmation?.confirmed) {
+      const candidateNumber = confirmation.candidate_number ?? 1
+      const score = formatAttemptMetric(
+        confirmation.ndt_score ?? confirmation.matching_error,
+      )
+      const pose = formatAttemptPose(
+        confirmation.matched_pose || seed.confirmed_pose,
+      )
+      return [
+        `fixed RTK 已经 NDT 确认 · 候选 #${candidateNumber}`,
+        `NDT ${score}`,
+        `定位结果 ${pose}`,
+      ].join(' · ')
+    }
     return [
       seed.accepted ? 'fixed RTK 已作为 NDT 候选种子' : 'fixed RTK 未作为搜索种子',
       reason,

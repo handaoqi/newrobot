@@ -4495,6 +4495,41 @@ class RosAdapter(Node):
                 trusted_attempts = append_attempts_with_global_numbers(
                     list(trusted_result.get("attempts") or [])
                 )
+                trusted_attempt = trusted_attempts[0] if trusted_attempts else {}
+                trusted_ndt = dict(trusted_attempt.get("ndt_candidate") or {})
+                trusted_best_ndt = dict(trusted_result.get("best_ndt_candidate") or {})
+                for key, value in trusted_best_ndt.items():
+                    trusted_ndt.setdefault(key, value)
+                trusted_ndt.update({
+                    key: value for key, value in {
+                        "matching_error": trusted_attempt.get("matching_error"),
+                        "inlier_fraction": trusted_attempt.get("inlier_fraction"),
+                        "has_converged": trusted_attempt.get("has_converged"),
+                        "stable_frames": trusted_attempt.get("stable_frames"),
+                    }.items() if value is not None and key not in trusted_ndt
+                })
+                trusted_score = trusted_ndt.get("matching_error")
+                if trusted_score is None:
+                    trusted_score = trusted_ndt.get("ndt_score")
+                trusted_pose = (
+                    trusted_attempt.get("matched_pose")
+                    or trusted_ndt.get("matched_pose")
+                    or trusted_result.get("best_match_pose")
+                    or self._pose_payload(trusted_seed_entry)
+                )
+                trusted_confirmation = {
+                    "confirmed": True,
+                    "candidate_number": trusted_attempt.get("candidate_number", 1),
+                    "candidate_label": trusted_attempt.get(
+                        "candidate_label", trusted_seed_entry.get("candidate_label")
+                    ),
+                    "ndt_score": trusted_score,
+                    "matching_error": trusted_score,
+                    "inlier_fraction": trusted_ndt.get("inlier_fraction"),
+                    "has_converged": trusted_ndt.get("has_converged"),
+                    "stable_frames": trusted_ndt.get("stable_frames"),
+                    "matched_pose": trusted_pose,
+                }
                 trusted_stage.update({
                     "status": "accepted",
                     "updated_at": now_iso(),
@@ -4503,6 +4538,10 @@ class RosAdapter(Node):
                     "best_ndt_candidate": trusted_result.get("best_ndt_candidate"),
                     "best_match_pose": trusted_result.get("best_match_pose"),
                     "trusted_seed": dict(trusted_seed_entry),
+                    "ndt_confirmation": trusted_confirmation,
+                    "candidate_number": trusted_confirmation["candidate_number"],
+                    "ndt_score": trusted_confirmation["ndt_score"],
+                    "confirmed_pose": trusted_confirmation["matched_pose"],
                 })
                 if origin_seed is not None:
                     origin_stage.update({
@@ -4519,7 +4558,14 @@ class RosAdapter(Node):
                     "selected_stage": "trusted_rtk_fixed",
                     "selected_waypoint_index": None,
                     "stages": stages,
-                    "trusted_rtk_seed": dict(trusted_seed_entry),
+                    "trusted_rtk_seed": {
+                        **dict(trusted_seed_entry),
+                        "ndt_confirmation": trusted_confirmation,
+                        "candidate_number": trusted_confirmation["candidate_number"],
+                        "ndt_score": trusted_confirmation["ndt_score"],
+                        "confirmed_pose": trusted_confirmation["matched_pose"],
+                    },
+                    "trusted_rtk_ndt_confirmation": trusted_confirmation,
                 }
                 self._report_localization_attempts({**payload, "state": "accepted"})
                 return payload
