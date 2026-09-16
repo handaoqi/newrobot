@@ -520,7 +520,7 @@ class CommandProcessor:
     def _command_scene_uses_rtk_seed(command: dict) -> bool:
         scene = str(command.get("scene_scope") or "").lower()
         coordinate = str(command.get("coordinate_mode") or "").lower()
-        return scene in {"outdoor", "transition"} and coordinate != "local_only"
+        return scene in {"outdoor", "transition"} and coordinate == "rtk_fixed"
 
     def _trusted_rtk_seed_for_command(self, command: dict) -> tuple[dict | None, dict | None]:
         """Bounded fixed-RTK evidence for an outdoor NDT candidate list."""
@@ -587,7 +587,39 @@ class CommandProcessor:
             trusted_seed=trusted_seed,
             wait_seconds=float(command.get("wait_seconds", 180.0)),
         ) or {}
-        mode = str(command.get("localization_mode") or "ndt").strip().lower()
+        raw_mode = str(command.get("localization_mode") or "").strip().lower()
+        if not raw_mode and command.get("map_activation_requires_waypoint_mode"):
+            secondary = {
+                "status": "skipped",
+                "reason": "first_waypoint_localization_mode_unavailable",
+                "message": "地图已完成 NDT/LIO 初始化，但未提供首航点定位校正配置",
+                "mode": None,
+            }
+            self._emit_command_progress(
+                envelope,
+                now_iso(),
+                {
+                    "state": "running",
+                    "selected_stage": "secondary_correction",
+                    "secondary_correction": secondary,
+                    "trusted_rtk_seed": trusted_evidence,
+                },
+            )
+            final_gate = self._wait_for_command_final_localization_gate()
+            return {
+                "initial_ndt_commit": initial_ndt_commit,
+                "secondary_correction": secondary,
+                "final_localization_gate": final_gate,
+                "continuous_source": "lio_imu",
+                "trusted_rtk_seed": trusted_evidence,
+                "selected_stage": "final_localization_gate",
+            }
+        mode = raw_mode or "ndt"
+        # rtk_ndt describes a map capability, not a waypoint correction mode.
+        # A map activation without a first waypoint mode is explicitly
+        # reported above instead of silently converting it to RTK.
+        if mode == "rtk_ndt":
+            mode = "ndt"
         if mode not in {"ndt", "rtk", "ukf"}:
             mode = "ndt"
         secondary = self._run_external_secondary_correction(
@@ -1796,19 +1828,30 @@ class CommandProcessor:
                 result_payload["localization_reset_required"] = True
             else:
                 active_map = result_payload.get("current_map") or {}
+                # The activated package is authoritative for the map scene
+                # contract. A stale/missing cloud field must not turn an
+                # outdoor RTK-fixed map into indoor/local_only behavior.
+                active_scene = str(active_map.get("scene_scope") or "").strip().lower()
+                active_coordinate = str(active_map.get("coordinate_mode") or "").strip().lower()
+                requested_scene = str(command.get("scene_scope") or "").strip().lower()
+                requested_coordinate = str(command.get("coordinate_mode") or "").strip().lower()
+                effective_scene = active_scene
+                effective_coordinate = active_coordinate
+                # A route explicitly selecting outdoor/transition is allowed
+                # to supply the scene for older RTK-fixed packages whose
+                # manifest only recorded the coordinate mode. Never let an
+                # outdoor request override an active local_only package.
+                if requested_scene in {"outdoor", "transition"} and active_coordinate == "rtk_fixed":
+                    effective_scene = requested_scene
+                if effective_coordinate not in {"rtk_fixed", "local_only"}:
+                    effective_coordinate = requested_coordinate
                 localization_command = {
                     **command,
-                    "scene_scope": str(
-                        command.get("scene_scope")
-                        or active_map.get("scene_scope")
-                        or "indoor"
-                    ).lower(),
-                    "coordinate_mode": str(
-                        command.get("coordinate_mode")
-                        or active_map.get("coordinate_mode")
-                        or "local_only"
-                    ).lower(),
-                    "localization_mode": str(command.get("localization_mode") or "ndt").lower(),
+                    "scene_scope": (effective_scene or requested_scene or "indoor").lower(),
+                    "coordinate_mode": (effective_coordinate or requested_coordinate or "local_only").lower(),
+                    # This is the first-waypoint policy only. The map's
+                    # map_localization_mode (e.g. rtk_ndt) is never used here.
+                    "localization_mode": str(command.get("localization_mode") or "").lower(),
                     "waypoints": list(command.get("waypoints") or []),
                 }
                 set_progress = getattr(

@@ -249,6 +249,33 @@ class MapActivationPayloadTests(TestCase):
         self.assertEqual(payload["local_map_dir"], "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/filter_variants/candidate")
         self.assertEqual(payload["local_image_path"], "/home/dogrobot/runtime/nx-edge/data/jszr/map/source/filter_variants/candidate/map.pgm")
 
+    def test_route_context_overrides_map_capability_without_leaking_rtk_ndt_as_waypoint_mode(self):
+        robot = Robot.objects.create(code="rx-map-route-context", name="RX Route Context", location="park", area="park")
+        map_data = MapData.objects.create(
+            name="outdoor-map",
+            robot=robot,
+            localization_mode="rtk_ndt",
+            scene_scope="outdoor",
+            coordinate_mode="rtk_fixed",
+        )
+        request = APIRequestFactory().post(
+            "/",
+            {
+                "scene_scope": "outdoor",
+                "coordinate_mode": "rtk_fixed",
+                "localization_mode": "ukf",
+                "waypoints": [{"id": "wp-1", "localization_mode": "ukf"}],
+            },
+        )
+
+        payload = _map_activation_payload(map_data, request)
+
+        self.assertEqual(payload["scene_scope"], "outdoor")
+        self.assertEqual(payload["coordinate_mode"], "rtk_fixed")
+        self.assertEqual(payload["map_localization_mode"], "rtk_ndt")
+        self.assertEqual(payload["localization_mode"], "ukf")
+        self.assertTrue(payload["map_activation_requires_waypoint_mode"])
+
 
 class ManualMapCleanupTests(TestCase):
     def setUp(self):

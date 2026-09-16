@@ -80,7 +80,18 @@ export async function activateAndRelocalizeMap({
   onCommand = () => {},
   traceId = '',
 }) {
-  const activation = await activateRouteMap({ mapId, robotId, mapVersion, onProgress, onCommand, traceId })
+  const activation = await activateRouteMap({
+    mapId,
+    robotId,
+    mapVersion,
+    sceneScope,
+    coordinateMode,
+    localizationMode,
+    waypoints,
+    onProgress,
+    onCommand,
+    traceId,
+  })
   let navigationStatus = activation.navigationStatus
 
   if (navigationReadyForMap(navigationStatus, mapId, mapVersion)) {
@@ -140,6 +151,10 @@ export async function activateRouteMap({
   mapId,
   robotId,
   mapVersion = expectedLegacyMapVersion(mapId),
+  sceneScope = '',
+  coordinateMode = '',
+  localizationMode = '',
+  waypoints = [],
   onProgress = () => {},
   onCommand = () => {},
   traceId = '',
@@ -158,7 +173,13 @@ export async function activateRouteMap({
       throw new Error('机器人正在执行任务，不能切换到新路线地图')
     }
     onProgress('正在下发地图到机器狗')
-    const activation = await setActiveMap(mapId, { traceId })
+    const activation = await setActiveMap(mapId, {
+      traceId,
+      sceneScope,
+      coordinateMode,
+      localizationMode: localizationMode || waypoints[0]?.localization_mode || '',
+      waypoints,
+    })
     if (activation.robot && String(activation.robot) !== String(robotId)) {
       throw new Error('路线地图绑定的机器狗与任务机器狗不一致')
     }

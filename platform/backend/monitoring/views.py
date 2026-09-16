@@ -8,6 +8,7 @@ import time
 import uuid
 import zipfile
 import yaml
+from collections.abc import Mapping
 from datetime import datetime, time as datetime_time, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -453,7 +454,7 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         local_image_path = f"{local_map_dir}/map.pgm"
     map_version = f"legacy-mapdata-{map_data.id}"
     edit_metadata = map_data.edit_metadata if isinstance(map_data.edit_metadata, dict) else {}
-    return {
+    payload = {
         "map_id": str(map_data.id),
         "map_version": map_version,
         "map_name": map_data.name,
@@ -475,9 +476,40 @@ def _map_activation_payload(map_data: MapData, request) -> dict:
         "map_manifest": description.get("map_manifest", {}) if isinstance(description, dict) else {},
         "coordinate_mode": map_data.coordinate_mode,
         "scene_scope": map_data.scene_scope,
-        "localization_mode": map_data.localization_mode,
+        # Keep the map capability separate from the route's first-waypoint
+        # correction mode. Edge must never interpret rtk_ndt as a waypoint
+        # correction policy.
+        "map_localization_mode": map_data.localization_mode,
         "origin_status": map_data.origin_status,
     }
+    # Map capability and waypoint correction policy are different contracts.
+    # When a route is activating a map, carry only the first waypoint's
+    # correction mode into Edge; the map's rtk_ndt capability remains the
+    # trusted-seed decision and must not become the waypoint mode.
+    request_data = getattr(request, "data", None)
+    if not isinstance(request_data, Mapping):
+        request_data = getattr(request, "POST", None)
+    if not isinstance(request_data, Mapping):
+        request_data = {}
+    waypoints = request_data.get("waypoints")
+    if isinstance(waypoints, list) and waypoints:
+        payload["waypoints"] = waypoints
+    request_scene = request_data.get("scene_scope")
+    request_coordinate = request_data.get("coordinate_mode")
+    if request_scene:
+        payload["scene_scope"] = str(request_scene).strip().lower()
+    if request_coordinate:
+        payload["coordinate_mode"] = str(request_coordinate).strip().lower()
+    first_mode = request_data.get("localization_mode")
+    if not first_mode and isinstance(waypoints, list) and waypoints:
+        first = waypoints[0] if isinstance(waypoints[0], dict) else {}
+        first_mode = first.get("localization_mode")
+    if first_mode:
+        payload["localization_mode"] = str(first_mode).strip().lower()
+    else:
+        payload["localization_mode"] = ""
+    payload["map_activation_requires_waypoint_mode"] = True
+    return payload
 
 
 def _file_sha256(path: str) -> str:
@@ -5397,6 +5429,7 @@ class PatrolTaskExecuteView(APIView):
                     "record_rosbag": record_rosbag,
                     "loop_execution": loop_execution,
                 },
+                trace_id=_request_trace_id(request),
                 execution_source="guard_duty" if loop_execution else "task_center",
             )
         except TaskStateError as exc:

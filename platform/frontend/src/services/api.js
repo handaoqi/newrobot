@@ -318,6 +318,7 @@ export async function executePatrolTask(taskId, {
   loopExecution = false,
   loopSessionId = null,
   roundNumber = 1,
+  traceId = '',
 } = {}) {
   const payload = {
     loop_execution: loopExecution,
@@ -328,6 +329,7 @@ export async function executePatrolTask(taskId, {
   return request(`/patrol-tasks/${taskId}/execute/`, {
     method: 'POST',
     body: JSON.stringify(payload),
+    traceId,
   })
 }
 
@@ -738,9 +740,22 @@ export async function downloadMap(mapId) {
   return response.blob()
 }
 
-export async function setActiveMap(mapId, { traceId } = {}) {
+export async function setActiveMap(mapId, {
+  traceId,
+  sceneScope,
+  coordinateMode,
+  localizationMode,
+  waypoints,
+} = {}) {
+  const body = {}
+  if (sceneScope) body.scene_scope = sceneScope
+  if (coordinateMode) body.coordinate_mode = coordinateMode
+  if (localizationMode) body.localization_mode = localizationMode
+  if (Array.isArray(waypoints) && waypoints.length) body.waypoints = waypoints
   const result = await request(`/maps/${mapId}/set_active/`, {
-    method: 'POST', traceId,
+    method: 'POST',
+    traceId,
+    ...(Object.keys(body).length ? { body: JSON.stringify(body) } : {}),
   })
   listCache.invalidate('maps-summary')
   return result
