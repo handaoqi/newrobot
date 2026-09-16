@@ -22,7 +22,6 @@ import {
   fetchTaskExecution,
   fetchTaskTrajectory,
   sendRecordedAudioCommand,
-  sendRobotNavigationCommand,
   sendPatrolLoopSessionAction,
   sendTaskExecutionAction,
   sendTextToSpeechCommand,
@@ -54,7 +53,7 @@ import {
   isLowBatteryTaskError,
   lowBatteryGuardMessage,
 } from '../utils/guardDutyLowBattery'
-import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
+import { activateAndRelocalizeMap } from '../services/mapActivationFlow'
 import {
   DEFAULT_LOOP_REST_SECONDS,
   ensureGuardDutyLoopNavigationReady,
@@ -64,10 +63,6 @@ import {
   waitForGuardDutyLoopRepair,
 } from '../services/guardDutyLoopNavRepair'
 import { expectedLegacyMapVersion, navigationReadyForMap, navigationUnreadinessReason } from '../services/mapActivationState'
-import {
-  initializeProgressiveLocalization,
-  localizationCommandVerified,
-} from '../services/progressiveLocalization'
 import {
   LOCALIZATION_ATTEMPT_COMMAND_TYPES,
   beginStoredAttemptSession,
@@ -897,7 +892,7 @@ async function initializeLocalization() {
       mapData.value = await fetchMapDetail(mapId)
     }
     const mapVersion = expectedLegacyMapVersion(mapId)
-    const initialization = await initializeProgressiveLocalization({
+    const initialization = await activateAndRelocalizeMap({
       mapId,
       robotId: robot.id,
       mapVersion,
@@ -907,18 +902,18 @@ async function initializeLocalization() {
       waypoints: routeData.value?.waypoints || [],
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => updateStoredAttemptSession(robot.id, event.command, event),
-      dependencies: {
-        activateRouteMap,
-        sendRobotNavigationCommand,
-        waitForRobotCommand,
-      },
     })
-    navigationStatus.value = initialization.activation.navigationStatus
-    const command = initialization.command
-
-    if (localizationCommandVerified(command)) {
+    navigationStatus.value = initialization.navigationStatus
+    const command = initialization.activationCommand
+    if (command) {
+      updateStoredAttemptSession(robot.id, command, {
+        phase: 'localization',
+        showCandidates: true,
+      })
+    }
+    if (navigationReadyForMap(navigationStatus.value, mapId, mapVersion)) {
       localizationInitState.value = 'success'
-      localizationInitMessage.value = 'NDT最优结果已提交，FAST-LIO + IMU已接管，并完成二次定位校正与导航栈确认'
+      localizationInitMessage.value = '地图激活已完成：NDT最优结果已提交，FAST-LIO + IMU已接管，并完成二次定位校正与导航栈确认'
       try {
         await refreshLocalizationStatus({ sync: false })
       } catch {
@@ -928,28 +923,8 @@ async function initializeLocalization() {
       showToast('定位初始化成功')
       return
     }
-
-    for (let attempt = 0; attempt < 25 && runId === localizationRunId; attempt += 1) {
-      await sleep(3000)
-      const latest = await refreshLocalizationStatus({ sync: false })
-      if (!latest) continue
-      const latestCommand = latest.command
-      const isCurrentCommand = String(latestCommand?.id || '') === String(command.id || '')
-      if (isCurrentCommand && failedCommandStatuses.has(latestCommand.status)) {
-        throw new Error(latestCommand.error_message || latestCommand.error_code || '渐进定位初始化失败')
-      }
-      if (isCurrentCommand && latestCommand.status === 'succeeded') {
-        localizationInitMessage.value = 'NDT最优结果已提交，正在等待FAST-LIO + IMU接管及二次校正同步'
-        if (navigationReadyForMap(latest, mapId, mapVersion)) {
-          localizationInitState.value = 'success'
-          localizationInitMessage.value = '已重新初始化到最优定位点，导航栈已就绪'
-          showToast('定位初始化成功')
-          return
-        }
-      }
-    }
     if (runId !== localizationRunId) return
-    throw new Error('初始化超时，未检测到定位收敛或导航栈就绪')
+    throw new Error('地图激活已完成，但定位或导航栈尚未就绪')
   } catch (error) {
     if (runId !== localizationRunId) return
     if (error?.command) {

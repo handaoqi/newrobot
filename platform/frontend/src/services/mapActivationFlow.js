@@ -168,6 +168,7 @@ export async function activateRouteMap({
   }
   const currentMap = navigationMapIdentity(navigationStatus)
   const mapMatches = currentMap.mapId === String(mapId) && currentMap.mapVersion === String(mapVersion)
+  let activationCommand = null
   if (!mapMatches) {
     if (activeTaskExecutionId(navigationStatus)) {
       throw new Error('机器人正在执行任务，不能切换到新路线地图')
@@ -185,7 +186,7 @@ export async function activateRouteMap({
     }
     const command = activation.activation_command
     if (!command) throw new Error('地图未绑定机器狗，无法下发设备切换命令')
-    await waitForRobotCommand(robotId, command, {
+    activationCommand = await waitForRobotCommand(robotId, command, {
       timeoutMs: 180_000,
       onProgress: latest => {
         onProgress(`地图下发：${latest.status || 'created'}`)
@@ -207,5 +208,5 @@ export async function activateRouteMap({
 
   navigationStatus = await fetchRobotNavigationStatus(robotId)
   onProgress(mapMatches ? '目标地图已在机器狗上' : '路线地图下发完成')
-  return { changed: !mapMatches, navigationStatus }
+  return { changed: !mapMatches, navigationStatus, activationCommand }
 }

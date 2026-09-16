@@ -59,7 +59,7 @@ import {
   localizationRecoveryLabel,
 } from '../services/taskMapState'
 import { activateAndRelocalizeMap, activateRouteMap, waitForRobotCommand } from '../services/mapActivationFlow'
-import { expectedLegacyMapVersion } from '../services/mapActivationState'
+import { expectedLegacyMapVersion, navigationReadyForMap } from '../services/mapActivationState'
 import {
   initializeProgressiveLocalization,
   localizationCommandVerified,
@@ -2363,7 +2363,7 @@ async function initializeLocalization() {
   beginLocalizationAttemptSession({ phase: 'transfer', commandType: 'map.activate' })
   navError.value = ''
   try {
-    const initialization = await initializeProgressiveLocalization({
+    const initialization = await activateAndRelocalizeMap({
       mapId: selectedMap.value?.id,
       robotId,
       mapVersion: selectedMapVersion(),
@@ -2376,18 +2376,15 @@ async function initializeLocalization() {
       }),
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
-      dependencies: {
-        activateRouteMap,
-        sendRobotNavigationCommand,
-        waitForRobotCommand,
-      },
       traceId,
     })
-    applyLocalizationAttemptCommand(initialization.command, { phase: 'localization', showCandidates: true })
-    navStatus.value = initialization.activation.navigationStatus
-    const completedLocalization = initialization.command
-    const outcome = applyInitialPoseOutcome(completedLocalization)
-    if (localizationCommandVerified(completedLocalization)) {
+    if (initialization.activationCommand) {
+      applyLocalizationAttemptCommand(initialization.activationCommand, { phase: 'localization', showCandidates: true })
+    }
+    navStatus.value = initialization.navigationStatus
+    const completedLocalization = initialization.activationCommand
+    const outcome = completedLocalization ? applyInitialPoseOutcome(completedLocalization) : null
+    if (navigationReadyForMap(initialization.navigationStatus, selectedMap.value?.id, selectedMapVersion())) {
       // The Edge command only succeeds after its own absolute-pose and
       // FAST-LIO handoff checks.  Status replication can arrive later than
       // the command result, so it must not keep this page at
@@ -2404,7 +2401,7 @@ async function initializeLocalization() {
       return
     }
     localizationInitState.value = 'waiting_convergence'
-    localizationInitMessage.value = initialPoseOutcomeMessage('命令已完成，等待定位状态同步', outcome)
+    localizationInitMessage.value = initialPoseOutcomeMessage('地图激活命令已完成，等待定位状态同步', outcome)
     for (let index = 0; index < 35; index += 1) {
       await sleep(2000)
       await refreshNavigationStatus()
@@ -2461,6 +2458,27 @@ async function activeRelocalize() {
       onProgress: message => { localizationInitMessage.value = message },
       onCommand: event => applyLocalizationAttemptCommand(event.command, event),
     })
+    // A changed map is fully localized by map.activate itself.  Do not start
+    // a second nav.relocalize transaction against the same map switch.  Keep
+    // nav.relocalize below for an explicit same-map active-relocalization.
+    if (activation.changed && activation.activationCommand) {
+      applyLocalizationAttemptCommand(activation.activationCommand, {
+        phase: 'localization',
+        showCandidates: true,
+      })
+      navStatus.value = activation.navigationStatus
+      if (navigationReadyForMap(activation.navigationStatus, selectedMap.value?.id, selectedMapVersion())) {
+        localizationInitState.value = 'done'
+        localizationInitMessage.value = '地图激活已完成，已复用其定位结果，无需重复发送 nav.relocalize'
+        try {
+          await refreshNavigationStatus()
+        } catch {
+          // The activation command is authoritative while telemetry catches up.
+        }
+        return
+      }
+      throw new Error('地图激活已完成，但定位或导航栈尚未就绪')
+    }
     const initialization = await initializeProgressiveLocalization({
       mapId: selectedMap.value?.id,
       robotId,
