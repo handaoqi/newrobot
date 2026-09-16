@@ -63,8 +63,8 @@ class FakeNavigation:
         self.global_relocalize_requests.append(wait_seconds)
         return {"mode": "global_position_yaw_search", "motion_commanded": False}
 
-    def progressive_relocalize(self, *, origin, waypoints, wait_seconds=180.0):
-        request = {"origin": origin, "waypoints": waypoints, "wait_seconds": wait_seconds}
+    def progressive_relocalize(self, *, origin, waypoints, trusted_seed=None, wait_seconds=180.0):
+        request = {"origin": origin, "waypoints": waypoints, "trusted_seed": trusted_seed, "wait_seconds": wait_seconds}
         self.progressive_relocalize_requests.append(request)
         return {
             "mode": "progressive_stationary_search",
@@ -1783,4 +1783,44 @@ def test_nav_start_fails_when_nav2_does_not_become_ready(tmp_path):
     assert result["payload"]["status"] == "failed"
     assert result["payload"]["error_code"] == "NAV_STACK_NOT_READY"
     assert state.nav_ready is False
+    store.close()
+
+
+def test_nav_start_uses_prepared_ndt_first_lifecycle_when_ros_adapter_is_available(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    navigation.lio_readiness = lambda **_kwargs: {"ready": True, "state": "ready"}
+    navigation.wait_until_prepared = lambda **_kwargs: True
+    navigation.wait_for_final_localization_gate = lambda **_kwargs: {"accepted": True}
+    calls = []
+
+    class Stack:
+        def prepare(self, command=None):
+            calls.append(("prepare", command))
+            return {"action": "prepare", "returncode": 0}
+
+        def activate_execution(self):
+            calls.append(("activate_execution",))
+            return {"action": "activate_execution", "returncode": 0}
+
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), RuntimeSafetyState(nav_ready=False)),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        navigation_stack_adapter=Stack(),
+        localization_adapter=navigation,
+        map_activation_adapter=FakeMapActivation(),
+    )
+
+    _, result = processor.handle_command(_nav_command("nav.start"))
+
+    assert result["payload"]["status"] == "succeeded"
+    assert calls == [("prepare", {"reason": "nav.start"}), ("activate_execution",)]
+    assert navigation.progressive_relocalize_requests[0]["origin"]["source"] == "mapping_start"
+    assert result["payload"]["result"]["navigation_allowed"] is True
     store.close()

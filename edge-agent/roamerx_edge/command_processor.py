@@ -34,6 +34,7 @@ STARTUP_STAGE_LABELS = {
     "navigation_execution_activate": "激活导航执行组",
     "secondary_correction": "执行二次定位校正",
     "rtk_fixed": "验证 RTK 固定解",
+    "trusted_rtk_fixed": "使用 RTK 固定解缩小 NDT 搜索范围",
     "rtk_correction": "执行 RTK 定位校正",
     "ukf_correction": "执行 UKF 融合校正",
     "ndt_secondary_correction": "执行 NDT 二次校正",
@@ -429,6 +430,166 @@ class CommandProcessor:
             raise ProtocolError("NAV_STACK_NOT_READY", message)
         self.safety.state.nav_ready = True
 
+    def _wait_for_command_fast_lio_readiness(self, timeout_seconds: float = 90.0) -> dict:
+        """Read the same local FAST-LIO gate used by task startup.
+
+        Direct ``nav.start/restart/recover`` commands used to bypass task
+        initialization entirely.  Keep optional legacy adapters compatible,
+        but require production ROS adapters to provide three fresh, stopped
+        local frames before any NDT seed is evaluated.
+        """
+        readiness = getattr(self.localization_adapter, "lio_readiness", None)
+        if not callable(readiness):
+            return {"status": "unavailable", "reason": "adapter_compatibility"}
+        stopped = getattr(self.localization_adapter, "is_robot_stopped", None)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        last = {}
+        while time.monotonic() < deadline:
+            last = readiness(max_age_seconds=0.50, required_frames=3) or {}
+            if bool(last.get("ready")) and (not callable(stopped) or bool(stopped())):
+                return {**last, "status": "ready"}
+            time.sleep(0.2)
+        raise ProtocolError(
+            "FAST_LIO_NOT_READY",
+            "FAST-LIO + IMU did not provide three fresh local odometry frames while stopped",
+            details={"fast_lio": last},
+        )
+
+    def _wait_for_command_final_localization_gate(self, timeout_seconds: float = 15.0) -> dict:
+        waiter = getattr(self.localization_adapter, "wait_for_final_localization_gate", None)
+        if not callable(waiter):
+            return {"status": "unavailable", "reason": "adapter_compatibility"}
+        result = waiter(timeout_seconds=timeout_seconds, required_samples=3) or {}
+        if bool(result.get("accepted")):
+            return {**result, "status": "accepted"}
+        raise ProtocolError(
+            "FINAL_LOCALIZATION_GATE_FAILED",
+            "NDT correction completed but FAST-LIO final acceptance evidence is incomplete",
+            details={"final_localization_gate": result},
+        )
+
+    def _command_mapping_origin(self) -> dict | None:
+        if self.map_activation_adapter is None:
+            return None
+        try:
+            return self.map_activation_adapter.mapping_start_pose()
+        except ProtocolError as exc:
+            return {
+                "unavailable_error_code": exc.code,
+                "unavailable_error_message": exc.message,
+            }
+
+    @staticmethod
+    def _command_scene_uses_rtk_seed(command: dict) -> bool:
+        scene = str(command.get("scene_scope") or "").lower()
+        coordinate = str(command.get("coordinate_mode") or "").lower()
+        return scene in {"outdoor", "transition"} and coordinate != "local_only"
+
+    def _trusted_rtk_seed_for_command(self, command: dict) -> tuple[dict | None, dict | None]:
+        """Bounded fixed-RTK evidence for an outdoor NDT candidate list."""
+        if not self._command_scene_uses_rtk_seed(command):
+            return None, None
+        seed_reader = getattr(self.localization_adapter, "trusted_rtk_search_seed", None)
+        if not callable(seed_reader):
+            return None, None
+        evidence = seed_reader(timeout_seconds=0.8) or {}
+        if bool(evidence.get("accepted")) and isinstance(evidence.get("seed_pose"), dict):
+            return dict(evidence["seed_pose"]), evidence
+        return None, evidence
+
+    def _run_navigation_command_localization(self, envelope: MessageEnvelope, command: dict) -> dict:
+        """NDT-first initialization for direct navigation lifecycle commands.
+
+        There is intentionally no RTK-direct branch here: a verified fixed
+        RTK may be supplied as a candidate to NDT, then the normal NDT commit,
+        LIO handoff, optional secondary correction and final gate still apply.
+        """
+        if self.localization_adapter is None:
+            raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
+        self._wait_for_command_fast_lio_readiness()
+        origin = self._command_mapping_origin()
+        waypoints = list(command.get("waypoints") or [])
+        route = command.get("route_snapshot") if isinstance(command.get("route_snapshot"), dict) else {}
+        if not waypoints:
+            waypoints = list(route.get("waypoints") or [])
+        trusted_seed, trusted_evidence = self._trusted_rtk_seed_for_command(command)
+        progressive = getattr(self.localization_adapter, "progressive_relocalize", None)
+        if not callable(progressive):
+            raise ProtocolError("PROGRESSIVE_RELOCALIZATION_UNAVAILABLE", "NDT progressive relocalization is unavailable")
+        initial_ndt_commit = progressive(
+            origin=origin,
+            waypoints=waypoints,
+            trusted_seed=trusted_seed,
+            wait_seconds=float(command.get("wait_seconds", 180.0)),
+        ) or {}
+        mode = str(command.get("localization_mode") or "ndt").strip().lower()
+        if mode not in {"ndt", "rtk", "ukf"}:
+            mode = "ndt"
+        secondary = self._run_external_secondary_correction(
+            envelope, mode, prefix="navigation_lifecycle"
+        )
+        final_gate = self._wait_for_command_final_localization_gate()
+        return {
+            "initial_ndt_commit": initial_ndt_commit,
+            "secondary_correction": secondary,
+            "final_localization_gate": final_gate,
+            "continuous_source": "lio_imu",
+            "trusted_rtk_seed": trusted_evidence,
+            "selected_stage": "final_localization_gate",
+        }
+
+    def _run_external_secondary_correction(
+        self, envelope: MessageEnvelope, mode: str, *, prefix: str
+    ) -> dict:
+        """Run and verify the stationary post-NDT correction transaction."""
+        correction = getattr(self.localization_adapter, "control_localization_correction", None)
+        if not callable(correction):
+            return {"status": "skipped", "reason": "interface_unavailable", "mode": mode}
+        transaction_id = f"{prefix}:{envelope.message_id}:secondary:{mode}"
+        secondary = correction(transaction_id, mode, "start") or {}
+        secondary = {**secondary, "mode": mode, "transaction_id": transaction_id, "started_at": now_iso()}
+        if not secondary.get("accepted"):
+            if mode == "ndt" and str(secondary.get("status") or "") == "unavailable":
+                return {**secondary, "status": "skipped", "finished_at": now_iso()}
+            raise ProtocolError(
+                "LOCALIZATION_SECONDARY_CORRECTION_REJECTED",
+                str(secondary.get("message") or secondary.get("status") or "secondary correction rejected"),
+                details={"secondary_correction": secondary},
+            )
+        decision_reader = getattr(self.localization_adapter, "localization_decision", None)
+        if not callable(decision_reader):
+            raise ProtocolError(
+                "LOCALIZATION_SECONDARY_CORRECTION_UNVERIFIABLE",
+                "secondary correction was accepted but no decision reader is available",
+                details={"secondary_correction": secondary},
+            )
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            decision = decision_reader() or {}
+            one_shot = decision.get("one_shot_correction") if isinstance(decision, dict) else {}
+            if isinstance(one_shot, dict) and str(one_shot.get("transaction_id") or "") == transaction_id:
+                status = str(one_shot.get("status") or "")
+                completed = {**secondary, **one_shot, "finished_at": now_iso()}
+                if status == "completed":
+                    return completed
+                if status in {"failed", "cancelled", "rejected"}:
+                    raise ProtocolError(
+                        "LOCALIZATION_SECONDARY_CORRECTION_FAILED",
+                        str(completed.get("reason") or f"secondary {mode} correction failed"),
+                        details={"secondary_correction": completed},
+                    )
+            time.sleep(0.2)
+        try:
+            correction(transaction_id, mode, "cancel")
+        except Exception:
+            LOGGER.exception("failed to cancel timed-out secondary correction %s", transaction_id)
+        timed_out = {**secondary, "status": "timed_out", "finished_at": now_iso()}
+        raise ProtocolError(
+            "LOCALIZATION_SECONDARY_CORRECTION_TIMEOUT",
+            f"secondary {mode} correction timed out",
+            details={"secondary_correction": timed_out},
+        )
+
     def _wait_for_initial_pose_subscriber(self, timeout_seconds: float) -> bool:
         """Probe the concrete localization seed receiver when the adapter supports it."""
         wait_for_subscriber = getattr(
@@ -803,11 +964,15 @@ class CommandProcessor:
                             key: pose[key] for key in ("x", "y", "z", "yaw")
                             if pose.get(key) is not None
                         })
+                    trusted_seed, trusted_evidence = self._trusted_rtk_seed_for_command(command)
                     result_payload = self.localization_adapter.progressive_relocalize(
                         origin=origin,
                         waypoints=waypoints,
+                        trusted_seed=trusted_seed,
                         wait_seconds=float(command.get("wait_seconds", 180.0)),
                     )
+                    if trusted_evidence is not None and isinstance(result_payload, dict):
+                        result_payload["trusted_rtk_seed"] = trusted_evidence
                 else:
                     seed_source = str(command.get("seed_source") or "last_trusted")
                     if seed_source == "progressive":
@@ -821,11 +986,15 @@ class CommandProcessor:
                                 "unavailable_error_code": exc.code,
                                 "unavailable_error_message": exc.message,
                             }
+                        trusted_seed, trusted_evidence = self._trusted_rtk_seed_for_command(command)
                         result_payload = self.localization_adapter.progressive_relocalize(
                             origin=origin,
                             waypoints=list(command.get("waypoints") or []),
+                            trusted_seed=trusted_seed,
                             wait_seconds=float(command.get("wait_seconds", 180.0)),
                         )
+                        if trusted_evidence is not None and isinstance(result_payload, dict):
+                            result_payload["trusted_rtk_seed"] = trusted_evidence
                     elif seed_source in {"global", "quick_then_global"}:
                         try:
                             origin = (
@@ -986,25 +1155,61 @@ class CommandProcessor:
             try:
                 if not self.navigation_stack_adapter:
                     raise ProtocolError("NAVIGATION_STACK_UNAVAILABLE", "navigation stack adapter is not configured")
-                if envelope.message_type == "nav.start":
-                    result_payload = self.navigation_stack_adapter.start(command)
-                    self._await_navigation_stack_ready(
-                        timeout_seconds=45.0,
-                        message="Nav2 did not become ready after nav.start",
-                    )
-                elif envelope.message_type == "nav.restart":
-                    result_payload = self.navigation_stack_adapter.restart(command)
-                    self._await_navigation_stack_ready(
-                        timeout_seconds=45.0,
-                        message="Nav2 did not become ready after nav.restart",
-                    )
-                elif envelope.message_type == "nav.recover":
-                    result_payload = self.navigation_stack_adapter.recover(command)
-                    self._await_navigation_stack_ready(
-                        timeout_seconds=45.0,
-                        message="Nav2 did not become ready after nav.recover",
-                    )
+                if envelope.message_type in {"nav.start", "nav.restart", "nav.recover"}:
+                    prepare = getattr(self.navigation_stack_adapter, "prepare", None)
+                    # Older optional adapters retain the historical stack-only
+                    # command.  Production uses prepare→NDT→handoff→activate
+                    # so these three entry points cannot bypass localization.
+                    if not callable(prepare) or self.localization_adapter is None:
+                        fallback = getattr(
+                            self.navigation_stack_adapter,
+                            "start" if envelope.message_type == "nav.start" else envelope.message_type.split(".", 1)[1],
+                        )
+                        result_payload = fallback(command)
+                        self._await_navigation_stack_ready(
+                            timeout_seconds=45.0,
+                            message=f"Nav2 did not become ready after {envelope.message_type}",
+                        )
+                    else:
+                        if envelope.message_type in {"nav.restart", "nav.recover"}:
+                            readiness = getattr(self.localization_adapter, "lio_readiness", None)
+                            local_readiness = (readiness() or {}) if callable(readiness) else {}
+                            local_ready = bool(local_readiness.get("ready")) if callable(readiness) else True
+                            if not local_ready:
+                                restart_lio = getattr(self.navigation_stack_adapter, "restart_localization", None)
+                                if callable(restart_lio):
+                                    restart_lio()
+                        stack_prepare = prepare({"reason": envelope.message_type})
+                        wait_prepared = getattr(self.localization_adapter, "wait_until_prepared", None)
+                        if callable(wait_prepared) and not wait_prepared(timeout_seconds=45.0):
+                            raise ProtocolError(
+                                "NAV_STACK_PREPARE_FAILED",
+                                "navigation map/safety group did not become prepared",
+                            )
+                        self.safety.state.nav_ready = False
+                        localization = self._run_navigation_command_localization(envelope, command)
+                        activate = getattr(self.navigation_stack_adapter, "activate_execution", None)
+                        if not callable(activate):
+                            raise ProtocolError(
+                                "NAVIGATION_EXECUTION_UNAVAILABLE",
+                                "prepared navigation stack cannot activate its execution group",
+                            )
+                        activation = activate()
+                        self._await_navigation_stack_ready(
+                            timeout_seconds=45.0,
+                            message=f"Nav2 did not become ready after {envelope.message_type}",
+                        )
+                        result_payload = {
+                            "action": envelope.message_type,
+                            "stack_prepare": stack_prepare,
+                            "localization": localization,
+                            "execution_activation": activation,
+                            "navigation_allowed": True,
+                        }
                 elif envelope.message_type == "nav.stop":
+                    deactivate = getattr(self.navigation_stack_adapter, "deactivate_execution", None)
+                    if callable(deactivate):
+                        deactivate()
                     result_payload = self.navigation_stack_adapter.stop(command)
                     self.safety.state.nav_ready = False
                 else:

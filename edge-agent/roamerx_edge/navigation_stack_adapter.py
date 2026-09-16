@@ -331,6 +331,7 @@ class NavigationStackAdapter:
     def _looks_prepared(stdout: str) -> bool:
         return all(token in stdout for token in (
             "localization_node", "navigo_container", "/map_server", "/collision_monitor",
+            "execution: configured_inactive",
         ))
 
     @staticmethod

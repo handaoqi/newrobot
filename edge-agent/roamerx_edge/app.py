@@ -1539,6 +1539,24 @@ class EdgeAgentApplication:
             self.telemetry.on_localization_recovery(None)
         except Exception:
             LOGGER.exception("failed to clear localization recovery state")
+        # Recovery deliberately kept the Nav2 execution group inactive while
+        # NDT committed and FAST-LIO took over.  Do not redispatch the pending
+        # leg until the group is active again; a failed activation leaves the
+        # task paused rather than producing a stale action callback.
+        paused_getter = getattr(self.task_executor, "is_paused_for_localization", None)
+        if callable(paused_getter) and paused_getter():
+            activate_execution = getattr(
+                self.navigation_stack_adapter, "activate_execution", None
+            )
+            if callable(activate_execution):
+                try:
+                    activate_execution()
+                    ready = getattr(self.navigation, "wait_until_ready", None)
+                    if callable(ready) and not ready(timeout_seconds=45.0):
+                        raise RuntimeError("navigation execution group did not become ready")
+                except Exception:
+                    LOGGER.exception("navigation execution activation failed after localization recovery")
+                    return
         self.task_executor.on_localization_recovered()
 
     def _restore_fusion_when_absolute_recovers(
@@ -1989,9 +2007,90 @@ class EdgeAgentApplication:
                     return
                 first_cycle = False
                 cycle += 1
+                # A loss transaction always takes the execution group down
+                # before touching the map->LIO anchor.  It is safe to call on
+                # every retry; the adapter treats an already-inactive group
+                # as a successful no-op.
+                deactivate_execution = getattr(
+                    self.navigation_stack_adapter, "deactivate_execution", None
+                )
+                if callable(deactivate_execution):
+                    deactivate_execution()
                 primary_seed = self._localization_recovery_seed()
                 waypoint_seeds = self._localization_waypoint_seeds()
                 recovery_policy = self._current_recovery_localization_policy()
+                progressive = getattr(self.navigation, "progressive_relocalize", None)
+                # Production recovery uses the same complete NDT ordering as
+                # cold startup: mapping origin and its bounded neighborhood,
+                # an optional verified fixed-RTK *candidate*, route points,
+                # then keyframe/global matching.  Legacy test/simulation
+                # adapters without this API retain the bounded-seed fallback
+                # below.
+                if callable(progressive):
+                    try:
+                        origin = self.map_activation_adapter.mapping_start_pose()
+                    except ProtocolError as exc:
+                        origin = {
+                            "unavailable_error_code": exc.code,
+                            "unavailable_error_message": exc.message,
+                        }
+                    except Exception as exc:
+                        origin = {
+                            "unavailable_error_code": "MAPPING_START_POSE_INVALID",
+                            "unavailable_error_message": str(exc),
+                        }
+                    route = (
+                        self.task_executor.context.route_snapshot.get("waypoints", [])
+                        if self.task_executor.context else []
+                    )
+                    trusted_seed = None
+                    seed_reader = getattr(self.navigation, "trusted_rtk_search_seed", None)
+                    if (
+                        recovery_policy.get("scene_scope") in {"outdoor", "transition"}
+                        and recovery_policy.get("coordinate_mode") != "local_only"
+                        and callable(seed_reader)
+                    ):
+                        trusted = seed_reader(timeout_seconds=0.8) or {}
+                        if bool(trusted.get("accepted")) and isinstance(trusted.get("seed_pose"), dict):
+                            trusted_seed = dict(trusted["seed_pose"])
+                    local_action = self._begin_self_heal_action(
+                        level=1, action_type="progressive_ndt_relocalize"
+                    )
+                    try:
+                        self._hold_motion_for_relocalize()
+                        progressive(
+                            origin=origin,
+                            waypoints=list(route),
+                            trusted_seed=trusted_seed,
+                            wait_seconds=180.0,
+                        )
+                        if not self._apply_recovery_secondary_correction(
+                            recovery_policy, recovery_generation, cycle
+                        ):
+                            raise RuntimeError(
+                                f"secondary {recovery_policy['mode']} correction failed"
+                            )
+                        final_gate = getattr(self.navigation, "wait_for_final_localization_gate", None)
+                        if callable(final_gate) and not bool(
+                            (final_gate(timeout_seconds=15.0, required_samples=3) or {}).get("accepted")
+                        ):
+                            raise RuntimeError("final localization gate did not accept recovery")
+                        self._finish_self_heal_action(
+                            local_action, success=True, reason="progressive_ndt_relocalization_accepted"
+                        )
+                        self._handle_task_localization_recovered(
+                            recovery_reason="progressive_ndt_handoff_secondary_correction_completed"
+                        )
+                        return
+                    except Exception as exc:
+                        self._finish_self_heal_action(
+                            local_action,
+                            success=False,
+                            reason=str(getattr(exc, "code", "") or exc),
+                        )
+                        if getattr(exc, "code", "") == "RELOCALIZATION_SUPERSEDED":
+                            return
+                        LOGGER.warning("progressive NDT recovery cycle %d failed: %s", cycle, exc)
                 seeds = []
                 seen_seeds = set()
                 # The pending waypoint is the most relevant map hypothesis;

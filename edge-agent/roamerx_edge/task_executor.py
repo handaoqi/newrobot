@@ -2531,13 +2531,38 @@ class TaskExecutor:
             except (KeyError, TypeError, ValueError):
                 LOGGER.warning("skipping invalid route waypoint in startup progressive search")
 
+        trusted_seed = None
+        trusted_evidence = None
+        # RTK may shrink an outdoor/transition NDT search, but it is never a
+        # pose-commit shortcut.  Indoor maps deliberately do not read or wait
+        # for RTK at this point.
+        if self._outdoor_navigation_profile():
+            seed_reader = getattr(self.navigation, "trusted_rtk_search_seed", None)
+            if callable(seed_reader):
+                trusted_evidence = seed_reader(timeout_seconds=0.8) or {}
+                if bool(trusted_evidence.get("accepted")) and isinstance(trusted_evidence.get("seed_pose"), dict):
+                    trusted_seed = dict(trusted_evidence["seed_pose"])
+                LOGGER.info(
+                    "startup RTK trusted search seed: %s (%s)",
+                    "accepted" if trusted_seed else "skipped",
+                    trusted_evidence.get("reason") or "verified",
+                )
         LOGGER.info(
-            "startup localization running progressive search: mapping origin, %d route waypoint(s), global fallback",
+            "startup localization running progressive search: mapping origin%s, %d route waypoint(s), global fallback",
+            ", trusted fixed RTK seed" if trusted_seed else "",
             len(waypoints),
         )
-        return dict(
-            relocalize(origin=origin, waypoints=waypoints, wait_seconds=180.0) or {}
+        result = dict(
+            relocalize(
+                origin=origin,
+                waypoints=waypoints,
+                trusted_seed=trusted_seed,
+                wait_seconds=180.0,
+            ) or {}
         )
+        if trusted_evidence is not None:
+            result["trusted_rtk_seed"] = trusted_evidence
+        return result
 
     def _initialize_before_navigation(self) -> dict:
         """Require a verified absolute pose before the first Nav2 goal."""

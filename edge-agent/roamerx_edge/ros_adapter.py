@@ -1193,6 +1193,11 @@ class RosAdapter(Node):
             self._localization_status_samples.append(
                 (self._localization_sample_sequence, status)
             )
+            # Keep diagnostic/test-only adapters that construct RosAdapter
+            # without __init__ compatible with the final-gate evidence list.
+            # Normal production construction always creates this in __init__.
+            if not hasattr(self, "_localization_status_sample_times"):
+                self._localization_status_sample_times = []
             self._localization_status_sample_times.append(
                 (self._localization_sample_sequence, status, time.monotonic())
             )
@@ -3399,6 +3404,30 @@ class RosAdapter(Node):
             "candidate_label": "RTK固定解定位点",
         }
 
+    def trusted_rtk_search_seed(self, *, timeout_seconds: float = 0.8) -> dict:
+        """Return a bounded, verified RTK hypothesis for NDT search only.
+
+        This deliberately starts *before* progressive NDT and returns within a
+        short fixed observation window.  It never publishes an initial pose,
+        changes the map/LIO anchor, or makes RTK an initialization success.
+        Float, stale, invalid-heading and unstable observations therefore
+        become explicit skipped evidence instead of a blocking RTK branch.
+        """
+        generation = self._start_localization_operation("rtk_trusted_search_seed")
+        verification = self._wait_for_verified_fixed_rtk(
+            timeout_seconds=max(0.0, float(timeout_seconds)),
+            generation=generation,
+        )
+        pose = self._rtk_pose_from_verification(verification) if verification.get("verified") else None
+        return {
+            "accepted": pose is not None,
+            "status": "accepted" if pose is not None else "skipped",
+            "source": "trusted_rtk_fixed",
+            "seed_pose": pose,
+            "rtk_verification": verification,
+            "reason": None if pose is not None else verification.get("conclusion_code"),
+        }
+
     def _rtk_still_fixed_for_commit(self) -> bool:
         decision = self._localization_decision()
         return bool(
@@ -4314,6 +4343,7 @@ class RosAdapter(Node):
         *,
         origin: dict | None,
         waypoints: list[dict],
+        trusted_seed: dict | None = None,
         wait_seconds: float = 180.0,
     ) -> dict:
         """Always reinitialize through origin, route points, then global matching.
@@ -4358,6 +4388,19 @@ class RosAdapter(Node):
             ):
                 continue
             seeds.append(("route_waypoint", index, dict(raw)))
+
+        # A fixed RTK result narrows the search only after the map origin has
+        # had its full bounded search.  It is a normal NDT hypothesis, never a
+        # direct /initialpose commit.  Keep it ahead of route points so an
+        # outdoor/transition map can converge locally without scanning the
+        # whole route.
+        if isinstance(trusted_seed, dict) and all(
+            trusted_seed.get(field) is not None for field in ("x", "y", "yaw")
+        ):
+            seed = dict(trusted_seed)
+            seed.setdefault("candidate_label", "RTK固定解可信搜索点")
+            seeds.insert(0, ("trusted_rtk_fixed", None, seed))
+            strategy.insert(1, "trusted_rtk_fixed")
 
         session = {
             "state": "running",

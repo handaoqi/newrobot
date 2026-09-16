@@ -87,6 +87,19 @@ usage() {
   echo "  COMMUNICATION_TYPE=${COMMUNICATION_TYPE}"
 }
 
+# Keep this list in the same order as navigation_launch.py.  The safety group
+# is started by its own lifecycle manager; these are deliberately configured
+# but left inactive while Edge collects the stationary LIO/NDT evidence.
+EXECUTION_LIFECYCLE_NODES=(
+  /controller_server
+  /planner_server
+  /smoother_server
+  /behavior_server
+  /velocity_optimizer
+  /bt_navigator
+  /waypoint_follower
+)
+
 kill_pattern() {
   local pattern="$1"
   local pids
@@ -114,6 +127,55 @@ is_localization_running() {
 is_navigation_running() {
   pgrep -f "ros2 launch robot_navigo navigation_bringup.launch.py" >/dev/null 2>&1 || \
     pgrep -f "component_container_isolated.*navigo_container" >/dev/null 2>&1
+}
+
+execution_lifecycle_manager_available() {
+  ros2 service type /lifecycle_manager_execution/manage_nodes 2>/dev/null | \
+    grep -q 'nav2_msgs/srv/ManageLifecycleNodes'
+}
+
+lifecycle_state() {
+  ros2 lifecycle get "$1" 2>/dev/null || true
+}
+
+wait_for_execution_lifecycle_manager() {
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if execution_lifecycle_manager_available; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: execution Lifecycle Manager did not appear." >&2
+  return 1
+}
+
+configure_execution_lifecycle() {
+  local node state
+  # A resident stack may have been active before a new prepare transaction.
+  # Pause it before inspecting individual nodes so no controller remains able
+  # to emit a command while localization is being established.
+  if ! manage_execution_lifecycle deactivate; then
+    # An all-unconfigured manager rejects PAUSE on some Nav2 versions.  The
+    # state checks below are authoritative in that case.
+    echo "Execution group was not active; continuing with configure checks."
+  fi
+  for node in "${EXECUTION_LIFECYCLE_NODES[@]}"; do
+    state="$(lifecycle_state "${node}")"
+    if echo "${state}" | grep -q 'active \[3\]'; then
+      timeout 12 ros2 lifecycle set "${node}" deactivate >/dev/null
+      state="$(lifecycle_state "${node}")"
+    fi
+    if echo "${state}" | grep -q 'unconfigured \[1\]'; then
+      timeout 20 ros2 lifecycle set "${node}" configure >/dev/null
+      state="$(lifecycle_state "${node}")"
+    fi
+    if ! echo "${state}" | grep -q 'inactive \[2\]'; then
+      echo "ERROR: ${node} was not configured/inactive (state=${state:-unavailable})." >&2
+      return 1
+    fi
+  done
+  echo "Execution Lifecycle group configured and inactive."
 }
 
 is_rtk_running() {
@@ -382,11 +444,20 @@ prepare_stack() {
     wait_for_localization_process
     load_pcd_map
   fi
+  if is_navigation_running && ! execution_lifecycle_manager_available; then
+    # This is a legacy single-manager launch.  Retain FAST-LIO/localization,
+    # but replace Nav2 so the split safety/execution lifecycle contract is
+    # actually present rather than claiming a prepared stack falsely.
+    echo "Replacing legacy Nav2 launch without execution Lifecycle Manager..."
+    stop_navigation
+  fi
   if ! is_navigation_running; then
     echo "Preparing Nav2 map/safety Lifecycle group (execution inactive)..."
     setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' use_official_ukf:='${USE_OFFICIAL_UKF}' map:='${MAP_YAML}' autostart:=false" \
       >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
   fi
+  wait_for_execution_lifecycle_manager
+  configure_execution_lifecycle
   echo "Navigation prepared; waiting for localization before execution activation."
 }
 
@@ -394,7 +465,10 @@ manage_execution_lifecycle() {
   local operation="$1"
   local command
   case "${operation}" in
-    activate) command=0 ;;
+    # prepare configures every execution node first.  RESUME performs only the
+    # inactive -> active transition; STARTUP would configure/activate in one
+    # step and reintroduce the localization race this split avoids.
+    activate) command=2 ;;
     deactivate) command=1 ;;
     *) echo "ERROR: invalid execution lifecycle operation: ${operation}" >&2; return 2 ;;
   esac
@@ -447,6 +521,18 @@ status_stack() {
   fi
   if echo "${collision}" | grep -q 'active \[3\]'; then
     echo "/collision_monitor"
+  fi
+  local execution_inactive=true
+  local node node_state
+  for node in "${EXECUTION_LIFECYCLE_NODES[@]}"; do
+    node_state="$(lifecycle_state "${node}")"
+    if ! echo "${node_state}" | grep -q 'inactive \[2\]'; then
+      execution_inactive=false
+      break
+    fi
+  done
+  if [ "${execution_inactive}" = "true" ]; then
+    echo "execution: configured_inactive"
   fi
   echo "/cmd_vel"
   echo "status: ${status:-unavailable}"

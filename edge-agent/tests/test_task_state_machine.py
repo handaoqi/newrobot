@@ -205,10 +205,11 @@ class FakeNavigation:
     def localization_decision(self):
         return dict(self.localization_state)
 
-    def progressive_relocalize(self, *, origin, waypoints, wait_seconds=180.0):
+    def progressive_relocalize(self, *, origin, waypoints, trusted_seed=None, wait_seconds=180.0):
         request = {
             "origin": dict(origin or {}),
             "waypoints": [dict(point) for point in waypoints],
+            "trusted_seed": dict(trusted_seed or {}),
             "wait_seconds": float(wait_seconds),
         }
         self.progressive_relocalize_requests.append(request)
@@ -2661,10 +2662,11 @@ def test_outdoor_ndt_handoff_failure_keeps_task_stopped(tmp_path):
         "rtk_heading_usable": True,
     }
 
-    def progressive_relocalize(*, origin, waypoints, wait_seconds=180.0):
+    def progressive_relocalize(*, origin, waypoints, trusted_seed=None, wait_seconds=180.0):
         nav.progressive_relocalize_requests.append({
             "origin": dict(origin or {}),
             "waypoints": [dict(point) for point in waypoints],
+            "trusted_seed": dict(trusted_seed or {}),
             "wait_seconds": float(wait_seconds),
         })
         raise ProtocolError(

@@ -1130,6 +1130,72 @@ def test_active_relocalize_executes_the_one_meter_candidates():
     assert exc.value.details["timed_out"] is False
 
 
+def test_trusted_rtk_search_seed_is_only_a_verified_ndt_hypothesis():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda source: 42
+    verification = {
+        "verified": True,
+        "conclusion_code": "fixed_rtk_verified",
+        "last_sample": {"map_x": 1.2, "map_y": -3.4, "map_yaw": 0.5},
+    }
+    adapter._wait_for_verified_fixed_rtk = lambda **_kwargs: dict(verification)
+
+    result = adapter.trusted_rtk_search_seed(timeout_seconds=0.1)
+
+    assert result["accepted"] is True
+    assert result["source"] == "trusted_rtk_fixed"
+    assert result["seed_pose"] == {
+        "x": 1.2, "y": -3.4, "z": 0.0, "yaw": 0.5,
+        "candidate_label": "RTK固定解定位点",
+    }
+
+
+def test_progressive_relocalize_places_trusted_rtk_after_origin_before_route():
+    adapter = object.__new__(RosAdapter)
+    adapter._start_localization_operation = lambda _source: 14
+    adapter._assert_localization_operation = lambda _generation: None
+    adapter._persist_relocalization_state = lambda _payload: None
+    adapter._trusted_pose_cb = None
+    adapter._last_trusted_pose_report_monotonic = 0.0
+    adapter._last_trusted_pose = None
+    adapter.telemetry = SimpleNamespace(latest_pose=lambda: None)
+    adapter._report_localization_attempts = lambda _payload: None
+    attempts = []
+
+    def fail_origin(_seed, _generation, **_kwargs):
+        raise ProtocolError("ACTIVE_RELOCALIZATION_FAILED", "origin rejected", details={"attempts": []})
+
+    adapter._active_relocalize_once = fail_origin
+    adapter._begin_localization_attempt = lambda index, seed, extra=None: {
+        "index": index, "seed_pose": dict(seed), **(extra or {}), "status": "searching",
+    }
+    adapter._probe_localization_seed = lambda seed, _generation, **kwargs: {
+        "ndt_candidate": {"eligible": seed.get("candidate_label") == "RTK固定解可信搜索点", "matched_pose": dict(seed)},
+        "status": "accepted", **kwargs.get("extra", {}),
+    }
+    adapter._finish_localization_attempt = lambda attempt, started: {**started, **attempt}
+    adapter._select_ranked_attempt = lambda values: next(
+        (value for value in values if (value.get("ndt_candidate") or {}).get("eligible")), None
+    )
+    adapter._mark_out_ranked_attempts = lambda *_args: None
+    adapter._commit_best_relocalization_candidate = lambda _generation, metadata, candidate, _attempts: {
+        "best_ndt_candidate": candidate, "metadata": metadata,
+    }
+    adapter._current_live_pose = lambda: None
+    adapter._evaluated_localization_attempt_count = lambda values: len(values)
+    adapter._best_diagnostic_candidate = lambda _values: None
+
+    result = adapter.progressive_relocalize(
+        origin={"x": 0.0, "y": 0.0, "yaw": 0.0},
+        trusted_seed={"x": 1.0, "y": 1.0, "yaw": 0.0},
+        waypoints=[{"x": 2.0, "y": 2.0, "yaw": 0.0}],
+        wait_seconds=90.0,
+    )
+
+    assert result["selected_stage"] == "trusted_rtk_fixed"
+    assert result["metadata"]["source"] == "trusted_rtk_fixed"
+
+
 def test_progressive_relocalize_runs_bounded_origin_then_each_waypoint_in_order():
     adapter = object.__new__(RosAdapter)
     adapter._start_localization_operation = lambda _source: 13
