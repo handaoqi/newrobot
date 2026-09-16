@@ -181,6 +181,11 @@ ROBOT_TELEMETRY_WEEKLY_CLEANUP_MAX_DAYS = max(
 ROBOT_TELEMETRY_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS = max(
     30, int(os.getenv("ROBOT_TELEMETRY_WEEKLY_CLEANUP_TIME_BUDGET_SECONDS", "600"))
 )
+# Task trajectory rows contain compact NDT/RTK evidence for the task-keyframe
+# view.  They are useful for recent diagnosis only; never remove an active
+# execution while it can still be resumed or reconciled.
+TASK_KEYFRAME_RETENTION_DAYS = max(1, int(os.getenv("TASK_KEYFRAME_RETENTION_DAYS", "14")))
+TASK_KEYFRAME_CLEANUP_BATCH_SIZE = max(1, int(os.getenv("TASK_KEYFRAME_CLEANUP_BATCH_SIZE", "2000")))
 SYSTEM_LOG_DEBUG_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_DEBUG_RETENTION_DAYS", "7"))
 SYSTEM_LOG_INFO_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_INFO_RETENTION_DAYS", "30"))
 SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS = int(os.getenv("SYSTEM_LOG_WARNING_ERROR_RETENTION_DAYS", "180"))

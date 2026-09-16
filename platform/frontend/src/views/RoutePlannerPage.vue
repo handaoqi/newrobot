@@ -202,6 +202,9 @@ const globalPlanPoints = computed(() => {
 const keyframePanelOpen = ref(false)
 const keyframePage = ref(1)
 const selectedKeyframeIndex = ref(null)
+const taskKeyframePanelOpen = ref(false)
+const taskKeyframePage = ref(1)
+const selectedTaskKeyframeIndex = ref(null)
 const lastPoseSampleKey = ref('')
 const drillRunning = ref(false)
 const drillPosition = ref(null)
@@ -662,6 +665,8 @@ async function handleMapSelect(map) {
   clearInspectedMapPoints()
   selectedKeyframeIndex.value = null
   keyframePage.value = 1
+  selectedTaskKeyframeIndex.value = null
+  taskKeyframePage.value = 1
   mapZoom.value = 1
   routeForm.value = {
     name: '',
@@ -1046,11 +1051,31 @@ const mapImageLayerStyle = computed(() => {
 })
 
 const keyframePageData = computed(() => paginateKeyframes(mappingTrace.value, keyframePage.value, KEYFRAME_PAGE_SIZE))
+const taskKeyframeSamples = computed(() => taskMapTrajectory.value
+  .filter(point => point?.keyframe && typeof point.keyframe === 'object')
+  .map((point, index) => ({
+    index: point.seq ?? index,
+    stamp: Date.parse(point.sampled_at || '') / 1000,
+    slam: point.keyframe.slam || { x: point.x, y: point.y, yaw: point.yaw },
+    rtk: point.keyframe.rtk || { reason: 'not_recorded' },
+  })))
+const taskKeyframePageData = computed(() => paginateKeyframes(
+  taskKeyframeSamples.value,
+  taskKeyframePage.value,
+  KEYFRAME_PAGE_SIZE,
+))
 
 function changeKeyframePage(delta) {
   keyframePage.value = Math.min(
     keyframePageData.value.pageCount,
     Math.max(1, keyframePageData.value.page + delta),
+  )
+}
+
+function changeTaskKeyframePage(delta) {
+  taskKeyframePage.value = Math.min(
+    taskKeyframePageData.value.pageCount,
+    Math.max(1, taskKeyframePageData.value.page + delta),
   )
 }
 
@@ -1062,6 +1087,23 @@ async function selectKeyframe(sample, rowIndex) {
   inspectedMapPoint.value = {
     point: normalizeStoredWaypoint({ x: Number(slam.x), y: Number(slam.y), yaw: Number(slam.yaw || 0) }),
     sample: { ...sample, index: selectedKeyframeIndex.value, distance_m: 0 },
+  }
+  mapClickMode.value = 'inspect'
+  inspectPoseStep.value = 'complete'
+  inspectedHeadingTarget.value = null
+  mapInteractionError.value = ''
+  await nextTick()
+  centerMapOnPoint(slam)
+}
+
+async function selectTaskKeyframe(sample, rowIndex) {
+  const slam = sample?.slam
+  if (!Number.isFinite(Number(slam?.x)) || !Number.isFinite(Number(slam?.y))) return
+  const absoluteIndex = taskKeyframePageData.value.start + rowIndex
+  selectedTaskKeyframeIndex.value = sample.index ?? absoluteIndex
+  inspectedMapPoint.value = {
+    point: normalizeStoredWaypoint({ x: Number(slam.x), y: Number(slam.y), yaw: Number(slam.yaw || 0) }),
+    sample: { ...sample, index: selectedTaskKeyframeIndex.value, distance_m: 0 },
   }
   mapClickMode.value = 'inspect'
   inspectPoseStep.value = 'complete'
@@ -1814,14 +1856,16 @@ function poseText(pose) {
 function rtkPoseText(rtk) {
   const pose = poseText(rtk)
   if (pose === '无记录') return rtk?.reason === 'not_recorded' ? '旧地图无记录' : '无有效记录'
-  const quality = { 2: '固定解', 1: '浮点解', 0: '单点解' }[Number(rtk.status)] || '状态未知'
+  const qualityKey = String(rtk?.quality ?? rtk?.status ?? '').toLowerCase()
+  const quality = { 2: '固定解', 1: '浮点解', 0: '单点解', fixed: '固定解', float: '浮点解', standalone: '单点解' }[qualityKey] || '状态未知'
   const precision = Number.isFinite(Number(rtk.horizontal_std_m)) ? ` / 精度 ${Number(rtk.horizontal_std_m).toFixed(2)}m` : ''
   return `${pose} / ${quality}${precision}`
 }
 
 function mappingSampleTime(sample) {
-  const stamp = Number(sample?.stamp)
-  if (!Number.isFinite(stamp) || stamp <= 0) return '旧地图无时间记录'
+  const rawStamp = sample?.stamp ?? sample?.sampled_at
+  const stamp = typeof rawStamp === 'string' ? Date.parse(rawStamp) / 1000 : Number(rawStamp)
+  if (!Number.isFinite(stamp) || stamp <= 0) return '无时间记录'
   return new Date(stamp * 1000).toLocaleString()
 }
 
@@ -1976,6 +2020,9 @@ async function refreshTaskMapExecution({ preferredExecutionId = '', forceOpen = 
     if (loadSequence !== taskExecutionLoadSequence) return
     taskMapExecution.value = detail
     taskMapTrajectory.value = track.points || []
+    taskKeyframePage.value = 1
+    selectedTaskKeyframeIndex.value = null
+    restoreAttemptSessionFromTaskExecution(detail)
     const executionMatchesRoute = !detail?.route
       || !routeId
       || String(detail.route) === String(routeId)
@@ -2198,6 +2245,40 @@ function restoreAttemptSessionFromStatus() {
     localizationAttemptSession.value = withAttemptMarkerExpiry(stored)
     scheduleAttemptMarkerRefresh(localizationAttemptSession.value)
   }
+}
+
+function restoreAttemptSessionFromTaskExecution(execution) {
+  if (!execution || navCommandBusy.value) return
+  const liveCommand = navStatus.value?.localization_command
+  const liveType = String(liveCommand?.command_type || '')
+  const liveStatus = String(liveCommand?.status || '').toLowerCase()
+  if (
+    ['nav.initial_pose', 'nav.relocalize'].includes(liveType)
+    && !['succeeded', 'failed', 'cancelled', 'rejected', 'timed_out', 'expired'].includes(liveStatus)
+  ) return
+  const routeMap = execution.route_snapshot?.map
+  if (!routeMap || String(routeMap.map_id || '') !== String(selectedMap.value?.id || '')) return
+  const command = (execution.commands || []).find(item => item.command_type === 'task.start')
+  if (!command) return
+  let result = command.result_payload && typeof command.result_payload === 'object'
+    ? command.result_payload
+    : {}
+  if (!result.localization_attempts) {
+    const events = [...(command.events || [])]
+      .filter(event => event.event_type === 'progress' && event.payload?.result?.localization_attempts)
+      .sort((left, right) => String(left.event_at || '').localeCompare(String(right.event_at || '')))
+    const latest = events[events.length - 1]
+    if (latest?.payload?.result) result = latest.payload.result
+  }
+  if (!result.localization_attempts && !Array.isArray(result.attempts)) return
+  applyLocalizationAttemptCommand({
+    ...command,
+    result_payload: result,
+    payload: { route_snapshot: { map: routeMap } },
+  }, {
+    phase: 'localization',
+    showCandidates: true,
+  })
 }
 
 function relocalizationHeadingStyle(marker) {
@@ -4287,6 +4368,42 @@ async function handleDeleteRoute(route) {
                 <button type="button" class="btn btn-sm" :disabled="keyframePageData.page <= 1" @click="changeKeyframePage(-1)">上一页</button>
                 <span>{{ keyframePageData.page }} / {{ keyframePageData.pageCount }}</span>
                 <button type="button" class="btn btn-sm" :disabled="keyframePageData.page >= keyframePageData.pageCount" @click="changeKeyframePage(1)">下一页</button>
+              </div>
+            </template>
+          </div>
+        </section>
+        <section v-if="selectedMap?.thumbnail_url" class="keyframe-panel route-keyframe-row" :class="{ open: taskKeyframePanelOpen }">
+          <button type="button" class="keyframe-panel-toggle" @click="taskKeyframePanelOpen = !taskKeyframePanelOpen">
+            <span>任务关键帧（{{ taskKeyframeSamples.length }}）</span>
+            <strong>{{ taskKeyframePanelOpen ? '收起' : '展开' }}</strong>
+          </button>
+          <div v-if="taskKeyframePanelOpen" class="keyframe-panel-body">
+            <div v-if="taskExecutionHistoryLoading && !taskMapExecution" class="keyframe-empty">正在加载最近任务关键帧</div>
+            <div v-else-if="!taskMapExecution" class="keyframe-empty">当前路线暂无任务执行记录</div>
+            <div v-else-if="!taskKeyframeSamples.length" class="keyframe-empty">旧任务未采集 NDT/RTK 关键帧</div>
+            <template v-else>
+              <div class="keyframe-table-scroll">
+                <table class="keyframe-table">
+                  <thead><tr><th>序号</th><th>采样时间</th><th>NDT x / y / yaw</th><th>RTK x / y / yaw / 状态</th></tr></thead>
+                  <tbody>
+                    <tr
+                      v-for="(sample, rowIndex) in taskKeyframePageData.rows"
+                      :key="`task-${sample.index ?? taskKeyframePageData.start + rowIndex}`"
+                      :class="{ selected: selectedTaskKeyframeIndex === (sample.index ?? taskKeyframePageData.start + rowIndex) }"
+                      @click="selectTaskKeyframe(sample, rowIndex)"
+                    >
+                      <td>{{ sample.index ?? taskKeyframePageData.start + rowIndex + 1 }}</td>
+                      <td>{{ mappingSampleTime(sample) }}</td>
+                      <td>{{ poseText(sample.slam) }}</td>
+                      <td>{{ rtkPoseText(sample.rtk) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="keyframe-pagination">
+                <button type="button" class="btn btn-sm" :disabled="taskKeyframePageData.page <= 1" @click="changeTaskKeyframePage(-1)">上一页</button>
+                <span>{{ taskKeyframePageData.page }} / {{ taskKeyframePageData.pageCount }}</span>
+                <button type="button" class="btn btn-sm" :disabled="taskKeyframePageData.page >= taskKeyframePageData.pageCount" @click="changeTaskKeyframePage(1)">下一页</button>
               </div>
             </template>
           </div>

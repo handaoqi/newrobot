@@ -11,6 +11,7 @@ from monitoring.services.retention_service import (
     InboundMessageRetentionService,
     RobotTelemetryRetentionService,
     SystemLogRetentionService,
+    TaskKeyframeRetentionService,
     weekly_cleanup_due,
 )
 from monitoring.services.schedule_service import ScheduleService
@@ -89,6 +90,12 @@ class Command(BaseCommand):
                 )
         except Exception:
             LOGGER.exception("robot telemetry retention scan failed")
+        try:
+            task_keyframe_result = TaskKeyframeRetentionService.prune_once(now=now)
+            if task_keyframe_result.deleted:
+                LOGGER.info("pruned completed task keyframes/trajectory rows: %s", task_keyframe_result.deleted)
+        except Exception:
+            LOGGER.exception("task keyframe retention scan failed")
         try:
             deleted = purge_expired_bicycle_detection_tests(now=now)
             if deleted:

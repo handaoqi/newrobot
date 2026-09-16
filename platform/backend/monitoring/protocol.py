@@ -395,6 +395,9 @@ def _validate_trajectory_batch(payload: dict[str, Any]) -> None:
         for coordinate in ("x", "y", "yaw"):
             if isinstance(point.get(coordinate), bool) or not isinstance(point.get(coordinate), (int, float)):
                 raise ProtocolError("INVALID_MESSAGE", f"trajectory {coordinate} must be numeric")
+        keyframe = point.get("keyframe")
+        if keyframe is not None and not isinstance(keyframe, dict):
+            raise ProtocolError("INVALID_MESSAGE", "trajectory keyframe must be an object")
     if sequences != list(range(sequences[0], sequences[0] + len(sequences))):
         raise ProtocolError("INVALID_MESSAGE", "trajectory seq must be contiguous")
     if payload.get("first_seq") != sequences[0] or payload.get("last_seq") != sequences[-1]:

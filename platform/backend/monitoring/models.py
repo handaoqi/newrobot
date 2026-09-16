@@ -1584,6 +1584,7 @@ class TrajectoryPoint(models.Model):
     yaw = models.DecimalField(max_digits=10, decimal_places=5)
     speed_mps = models.DecimalField(max_digits=10, decimal_places=5, null=True, blank=True)
     localization_status = models.CharField(max_length=24)
+    keyframe = models.JSONField(default=dict, blank=True)
     batch_id = models.UUIDField()
 
     class Meta:

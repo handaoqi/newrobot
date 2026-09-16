@@ -1311,6 +1311,7 @@ def _handle_trajectory(
                 yaw=point["yaw"],
                 speed_mps=point.get("speed_mps"),
                 localization_status=point["localization_status"],
+                keyframe=point.get("keyframe") if isinstance(point.get("keyframe"), dict) else {},
                 batch_id=batch_id,
             )
             for point in payload["points"]

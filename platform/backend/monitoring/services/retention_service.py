@@ -12,7 +12,14 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from ..models import InboundMessage, RobotTelemetry, RobotTelemetryDailySummary, SystemLog
+from ..models import (
+    InboundMessage,
+    RobotTelemetry,
+    RobotTelemetryDailySummary,
+    SystemLog,
+    TaskExecution,
+    TrajectoryPoint,
+)
 from .sqlite_retry import checkpoint_sqlite_wal, with_sqlite_lock_retry
 
 
@@ -497,3 +504,52 @@ class SystemLogRetentionService:
             deleted = with_sqlite_lock_retry(delete_batch, label="system log retention")
             counts.append(deleted)
         return SystemLogPruneResult(*counts)
+
+
+@dataclass(frozen=True)
+class TaskKeyframePruneResult:
+    deleted: int = 0
+
+
+class TaskKeyframeRetentionService:
+    """Bound recent task-position/keyframe diagnostics without touching active tasks."""
+
+    @classmethod
+    def prune_once(
+        cls,
+        *,
+        now=None,
+        retention_days: int | None = None,
+        batch_size: int | None = None,
+        dry_run: bool = False,
+    ) -> TaskKeyframePruneResult:
+        now = now or timezone.now()
+        retention_days = max(
+            1,
+            int(
+                retention_days
+                if retention_days is not None
+                else getattr(settings, "TASK_KEYFRAME_RETENTION_DAYS", 14)
+            ),
+        )
+        batch_size = max(
+            1,
+            int(
+                batch_size
+                if batch_size is not None
+                else getattr(settings, "TASK_KEYFRAME_CLEANUP_BATCH_SIZE", 2_000)
+            ),
+        )
+        eligible = TrajectoryPoint.objects.filter(
+            sampled_at__lt=now - timedelta(days=retention_days),
+        ).exclude(task_execution__state__in=TaskExecution.ACTIVE_STATES).order_by("sampled_at")
+        if dry_run:
+            return TaskKeyframePruneResult(deleted=eligible.count())
+
+        def delete_batch():
+            with transaction.atomic():
+                ids = list(eligible.values_list("id", flat=True)[:batch_size])
+                deleted, _ = TrajectoryPoint.objects.filter(id__in=ids).delete() if ids else (0, {})
+                return TaskKeyframePruneResult(deleted=deleted)
+
+        return with_sqlite_lock_retry(delete_batch, label="task keyframe retention")

@@ -31,7 +31,15 @@ class TrajectoryBuffer:
         self._last_flush = time.monotonic()
         self._lock = threading.RLock()
 
-    def sample(self, execution_id: str, map_id: str, map_version: str, pose: PoseSnapshot) -> dict | None:
+    def sample(
+        self,
+        execution_id: str,
+        map_id: str,
+        map_version: str,
+        pose: PoseSnapshot,
+        *,
+        keyframe: dict | None = None,
+    ) -> dict | None:
         with self._lock:
             if self._points and (
                 self._execution_id != execution_id
@@ -42,17 +50,18 @@ class TrajectoryBuffer:
             self._execution_id = execution_id
             self._map_id = map_id
             self._map_version = map_version
-            self._points.append(
-                {
-                    "seq": self.store.next_trajectory_seq(execution_id),
-                    "sampled_at": pose.sampled_at,
-                    "x": pose.x,
-                    "y": pose.y,
-                    "yaw": pose.yaw,
-                    "speed_mps": pose.speed_mps,
-                    "localization_status": pose.localization_status,
-                }
-            )
+            point = {
+                "seq": self.store.next_trajectory_seq(execution_id),
+                "sampled_at": pose.sampled_at,
+                "x": pose.x,
+                "y": pose.y,
+                "yaw": pose.yaw,
+                "speed_mps": pose.speed_mps,
+                "localization_status": pose.localization_status,
+            }
+            if isinstance(keyframe, dict):
+                point["keyframe"] = keyframe
+            self._points.append(point)
             if len(self._points) >= self.batch_size or time.monotonic() - self._last_flush >= self.flush_seconds:
                 return self._flush_locked()
             return None

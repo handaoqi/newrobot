@@ -143,3 +143,31 @@ def test_flush_active_emits_partial_terminal_batch(tmp_path):
     assert terminal["payload"]["points"][0]["x"] == 1.0
     assert buffer.flush_active() is None
     store.close()
+
+
+def test_keyframe_is_carried_with_trajectory_sample(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    buffer = TrajectoryBuffer(
+        robot_id="rx-001",
+        session_id="session",
+        store=store,
+        batch_size=1,
+        flush_seconds=60,
+    )
+
+    message = buffer.sample(
+        "execution-a",
+        "map-a",
+        "v1",
+        pose(1.0, 2.0),
+        keyframe={
+            "slam": {"x": 1.0, "y": 2.0, "yaw": 0.0},
+            "rtk": {"quality": "fixed", "x": 1.1, "y": 2.1, "yaw": 0.0},
+            "task": {"state": "accepted", "waypoint_index": 0},
+        },
+    )
+
+    point = message["payload"]["points"][0]
+    assert point["keyframe"]["rtk"]["quality"] == "fixed"
+    assert point["keyframe"]["task"]["state"] == "accepted"
+    store.close()

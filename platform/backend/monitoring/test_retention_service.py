@@ -9,12 +9,24 @@ from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 
 from .message_handlers import _telemetry_audit_payload
-from .models import InboundMessage, Robot, RobotTelemetry, RobotTelemetryDailySummary, SystemLog
+from .models import (
+    InboundMessage,
+    MapData,
+    PatrolRoute,
+    PatrolTask,
+    Robot,
+    RobotTelemetry,
+    RobotTelemetryDailySummary,
+    SystemLog,
+    TaskExecution,
+    TrajectoryPoint,
+)
 from .protocol import parse_message
 from .services.retention_service import (
     InboundMessageRetentionService,
     RobotTelemetryRetentionService,
     SystemLogRetentionService,
+    TaskKeyframeRetentionService,
     weekly_cleanup_due,
 )
 
@@ -211,6 +223,57 @@ class RobotTelemetryRetentionTests(TestCase):
         self.assertEqual(result.details_deleted, 1)
         self.assertEqual(RobotTelemetry.objects.count(), 1)
         self.assertFalse(RobotTelemetryDailySummary.objects.exists())
+
+
+@override_settings(TASK_KEYFRAME_RETENTION_DAYS=14, TASK_KEYFRAME_CLEANUP_BATCH_SIZE=2)
+class TaskKeyframeRetentionTests(TestCase):
+    def setUp(self):
+        self.robot = Robot.objects.create(code="task-kf-rx", name="Task keyframe RX")
+        self.map_data = MapData.objects.create(name="task keyframe map", robot=self.robot)
+        self.route = PatrolRoute.objects.create(name="task keyframe route", map_data=self.map_data, robot=self.robot)
+        self.now = timezone.now()
+
+    def execution(self, *, state: str):
+        task = PatrolTask.objects.create(
+            name=f"task keyframe {state}",
+            robot=self.robot,
+            route=self.route,
+            route_name=self.route.name,
+            scheduled_start=self.now,
+            scheduled_end=self.now + timezone.timedelta(hours=1),
+        )
+        return TaskExecution.objects.create(task=task, robot=self.robot, route=self.route, map_data=self.map_data, state=state)
+
+    def point(self, execution, *, seq: int, age_days: int):
+        return TrajectoryPoint.objects.create(
+            robot=self.robot,
+            task_execution=execution,
+            seq=seq,
+            sampled_at=self.now - timezone.timedelta(days=age_days),
+            x=Decimal("1.0"), y=Decimal("2.0"), yaw=Decimal("0.0"),
+            speed_mps=Decimal("0.0"), localization_status="normal", batch_id=uuid.uuid4(),
+            keyframe={"ndt": {"matching_error": 0.01}},
+        )
+
+    def test_prunes_old_completed_rows_but_keeps_recent_and_active_execution(self):
+        old_completed = self.point(self.execution(state="completed"), seq=0, age_days=15)
+        active = self.point(self.execution(state="running"), seq=0, age_days=15)
+        recent = self.point(self.execution(state="failed"), seq=0, age_days=13)
+
+        result = TaskKeyframeRetentionService.prune_once(now=self.now)
+
+        self.assertEqual(result.deleted, 1)
+        self.assertFalse(TrajectoryPoint.objects.filter(pk=old_completed.pk).exists())
+        self.assertTrue(TrajectoryPoint.objects.filter(pk=active.pk).exists())
+        self.assertTrue(TrajectoryPoint.objects.filter(pk=recent.pk).exists())
+
+    def test_dry_run_does_not_delete_rows(self):
+        old = self.point(self.execution(state="failed"), seq=0, age_days=15)
+
+        result = TaskKeyframeRetentionService.prune_once(now=self.now, dry_run=True)
+
+        self.assertEqual(result.deleted, 1)
+        self.assertTrue(TrajectoryPoint.objects.filter(pk=old.pk).exists())
 
 
 @override_settings(

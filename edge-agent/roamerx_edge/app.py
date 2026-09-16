@@ -682,18 +682,63 @@ class EdgeAgentApplication:
                 if context and context.state in self.task_executor.TERMINAL_STATES:
                     self.trajectory.flush_active()
                     continue
-                if not context or context.state != "running" or not pose:
+                if not context or not pose:
                     continue
                 message = self.trajectory.sample(
                     context.task_execution_id,
                     self.config.robot.current_map_id,
                     self.config.robot.current_map_version,
                     pose,
+                    keyframe=self._task_keyframe_snapshot(context, pose),
                 )
                 if message:
                     self.mqtt.replay_outbox()
             except Exception:
                 LOGGER.exception("failed to sample trajectory")
+
+    @staticmethod
+    def _task_keyframe_number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value == value and abs(value) != float("inf") else None
+
+    def _task_keyframe_snapshot(self, context, pose) -> dict:
+        """Compact NDT/RTK evidence for a task frame, not a telemetry clone."""
+        diagnostics = self.telemetry.localization_diagnostics() or {}
+        quality = diagnostics.get("quality") if isinstance(diagnostics.get("quality"), dict) else {}
+        decision = diagnostics.get("decision") if isinstance(diagnostics.get("decision"), dict) else {}
+        raw_rtk = diagnostics.get("raw_rtk") if isinstance(diagnostics.get("raw_rtk"), dict) else {}
+        time_diagnostics = diagnostics.get("time_diagnostics")
+        time_diagnostics = time_diagnostics if isinstance(time_diagnostics, dict) else {}
+        rtk_time = time_diagnostics.get("rtk", {})
+        if not isinstance(rtk_time, dict):
+            rtk_time = {}
+        heading = raw_rtk.get("heading") if isinstance(raw_rtk.get("heading"), dict) else {}
+        number = self._task_keyframe_number
+        return {
+            "slam": {"x": pose.x, "y": pose.y, "yaw": pose.yaw},
+            "ndt": {
+                "has_converged": quality.get("has_converged"),
+                "matching_error": number(quality.get("matching_error")),
+                "inlier_fraction": number(quality.get("inlier_fraction")),
+            },
+            "rtk": {
+                "x": number(decision.get("rtk_x")),
+                "y": number(decision.get("rtk_y")),
+                "yaw": number(decision.get("rtk_yaw")),
+                "quality": decision.get("rtk_quality") or raw_rtk.get("quality"),
+                "horizontal_std_m": number(raw_rtk.get("horizontal_std_m")),
+                "sample_age_seconds": number(rtk_time.get("sample_age_seconds", raw_rtk.get("sample_age_seconds"))),
+                "heading_deg": number(heading.get("heading_deg")),
+            },
+            "task": {
+                "state": context.state,
+                "waypoint_index": context.current_waypoint_index,
+                "active_source": decision.get("active_source"),
+            },
+        }
 
     def _log_flush_loop(self) -> None:
         while not self.stop_event.wait(1.0):

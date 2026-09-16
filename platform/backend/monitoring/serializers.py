@@ -1789,6 +1789,7 @@ class TrajectoryPointSerializer(serializers.ModelSerializer):
             "yaw",
             "speed_mps",
             "localization_status",
+            "keyframe",
             "batch_id",
         ]
 

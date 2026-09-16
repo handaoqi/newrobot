@@ -1019,7 +1019,7 @@ class MessageHandlerTests(TestCase):
             "first_seq": 0,
             "last_seq": 1,
             "points": [
-                {"seq": 0, "sampled_at": timezone.now().isoformat(), "x": 1.0, "y": 2.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal"},
+                {"seq": 0, "sampled_at": timezone.now().isoformat(), "x": 1.0, "y": 2.0, "yaw": 0.0, "speed_mps": 0.2, "localization_status": "normal", "keyframe": {"slam": {"x": 1.0, "y": 2.0, "yaw": 0.0}, "rtk": {"quality": "fixed"}}},
                 {"seq": 1, "sampled_at": timezone.now().isoformat(), "x": 1.1, "y": 2.1, "yaw": 0.1, "speed_mps": 0.2, "localization_status": "normal"},
             ],
         }
@@ -1027,6 +1027,7 @@ class MessageHandlerTests(TestCase):
         duplicate = self.envelope("trajectory.batch", payload, sequence=2)
         handle_mqtt_message("robots/rx-001/telemetry/trajectory", duplicate)
         self.assertEqual(TrajectoryPoint.objects.count(), 2)
+        self.assertEqual(TrajectoryPoint.objects.order_by("seq").first().keyframe["rtk"]["quality"], "fixed")
 
     def test_loop_trajectory_batches_accumulate_once_across_rounds(self):
         loop_id = uuid.uuid4()
