@@ -141,6 +141,39 @@ lifecycle_state() {
   timeout 5 ros2 lifecycle get "$1" 2>/dev/null || true
 }
 
+# ``status`` is an observational preflight, not a lifecycle transition.  Do
+# not spend its whole outer 20 s budget on serial ROS CLI discovery.  The
+# action paths above deliberately keep their longer per-node checks.
+STATUS_LIFECYCLE_QUERY_TIMEOUT_SECONDS="${NAV_STATUS_LIFECYCLE_QUERY_TIMEOUT_SECONDS:-3}"
+STATUS_LIFECYCLE_QUERY_PARALLELISM="${NAV_STATUS_LIFECYCLE_QUERY_PARALLELISM:-4}"
+
+status_lifecycle_state() {
+  timeout "${STATUS_LIFECYCLE_QUERY_TIMEOUT_SECONDS}" ros2 lifecycle get "$1" 2>/dev/null || true
+}
+
+collect_status_lifecycle_states() {
+  local output_dir="$1"
+  shift
+  local node key pid
+  local -a pids=()
+  for node in "$@"; do
+    key="${node#/}"
+    (status_lifecycle_state "${node}" > "${output_dir}/${key}") &
+    pids+=("$!")
+    # A bounded worker batch avoids amplifying a transient Zenoh/DDS
+    # discovery problem by spawning every ROS CLI process at once.
+    if (( ${#pids[@]} >= STATUS_LIFECYCLE_QUERY_PARALLELISM )); then
+      for pid in "${pids[@]}"; do
+        wait "${pid}" || true
+      done
+      pids=()
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || true
+  done
+}
+
 wait_for_execution_lifecycle_manager() {
   local deadline=$((SECONDS + 30))
   while (( SECONDS < deadline )); do
@@ -480,26 +513,47 @@ manage_execution_lifecycle() {
 }
 
 status_stack() {
+  local status_dir
+  status_dir="$(mktemp -d /tmp/roamerx-nav-status.XXXXXX)"
+  local localization_pid cmd_vel_pid
+  # These independent probes run alongside lifecycle discovery.  Both are
+  # explicitly bounded so the outer Edge status timeout cannot truncate the
+  # compact Ready-check section below.
+  (timeout 3 "${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true) \
+    > "${status_dir}/localization" &
+  localization_pid="$!"
+  (timeout 2 ros2 topic info /cmd_vel -v 2>/dev/null || true) \
+    > "${status_dir}/cmd_vel" &
+  cmd_vel_pid="$!"
+
   echo "Processes:"
   pgrep -af "ros2 launch localization localization.launch.py|ros2 launch robot_navigo navigation_bringup.launch.py|localization_node|navigo_container|vel_cmd_udp_pub|mode_status_pub" || true
   echo
   echo "Lifecycle:"
   local planner controller bt waypoint map_server collision
-  planner="$(lifecycle_state /planner_server)"
-  controller="$(lifecycle_state /controller_server)"
-  bt="$(lifecycle_state /bt_navigator)"
-  waypoint="$(lifecycle_state /waypoint_follower)"
-  map_server="$(lifecycle_state /map_server)"
-  collision="$(lifecycle_state /collision_monitor)"
+  # Query every unique lifecycle node once.  The former implementation first
+  # queried six nodes, then queried the seven execution nodes again, which
+  # could exceed 60 s while Edge only grants status 20 s.
+  collect_status_lifecycle_states "${status_dir}" \
+    /controller_server /planner_server /smoother_server /behavior_server \
+    /velocity_optimizer /bt_navigator /waypoint_follower /map_server /collision_monitor
+  planner="$(< "${status_dir}/planner_server")"
+  controller="$(< "${status_dir}/controller_server")"
+  bt="$(< "${status_dir}/bt_navigator")"
+  waypoint="$(< "${status_dir}/waypoint_follower")"
+  map_server="$(< "${status_dir}/map_server")"
+  collision="$(< "${status_dir}/collision_monitor")"
   printf '%s\n' "${planner}" "${controller}" "${bt}" "${waypoint}" "${map_server}" "${collision}"
   echo
   echo "Localization:"
   local status
-  status="$("${SCRIPT_DIR}/read_localization_status.py" --timeout 3 2>/dev/null || true)"
+  wait "${localization_pid}" || true
+  status="$(< "${status_dir}/localization")"
   echo "status: ${status:-unavailable}"
   echo
   echo "cmd_vel:"
-  ros2 topic info /cmd_vel -v 2>/dev/null | sed -n '1,20p' || true
+  wait "${cmd_vel_pid}" || true
+  sed -n '1,20p' "${status_dir}/cmd_vel" || true
   echo
   # Repeat compact tokens at the end. Edge truncates status stdout to the last
   # 6000 characters, and the verbose /cmd_vel dump would otherwise hide them.
@@ -528,7 +582,7 @@ status_stack() {
   local execution_inactive=true
   local node node_state
   for node in "${EXECUTION_LIFECYCLE_NODES[@]}"; do
-    node_state="$(lifecycle_state "${node}")"
+    node_state="$(< "${status_dir}/${node#/}")"
     if ! echo "${node_state}" | grep -q 'inactive \[2\]'; then
       execution_inactive=false
       break
@@ -539,6 +593,7 @@ status_stack() {
   fi
   echo "/cmd_vel"
   echo "status: ${status:-unavailable}"
+  rm -rf "${status_dir}"
 }
 
 MODE="${1:-start}"

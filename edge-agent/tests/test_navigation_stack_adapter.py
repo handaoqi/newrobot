@@ -177,6 +177,39 @@ def test_start_is_already_ready_only_when_localization_is_valid(tmp_path, monkey
     assert runs == []
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected_action"),
+    [
+        ("start", "start"),
+        ("prepare", "prepare"),
+        ("activate_execution", "activate-execution"),
+    ],
+)
+def test_lifecycle_operation_continues_when_status_preflight_times_out(
+    tmp_path, monkeypatch, operation, expected_action
+):
+    """A slow read-only status probe must not reject a usable stack action."""
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    preflight = ProtocolError("NAV_COMMAND_FAILED", "status probe timed out")
+    monkeypatch.setattr(adapter, "status", lambda: (_ for _ in ()).throw(preflight))
+    calls = []
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda action, *, timeout_seconds: calls.append((action, timeout_seconds))
+        or {"action": action, "returncode": 0, "stdout": ""},
+    )
+
+    result = getattr(adapter, operation)()
+
+    assert result["action"] == expected_action
+    assert calls == [(expected_action, {
+        "start": 180,
+        "prepare": 90,
+        "activate-execution": 45,
+    }[expected_action])]
+
+
 def test_looks_ready_reads_tokens_after_verbose_cmd_vel_dump():
     adapter = NavigationStackAdapter(NavigationStackConfig(script_path="/tmp/nav.sh"))
     verbose = "cmd_vel:\n" + ("Node name: ecal2ros2\n" * 200)

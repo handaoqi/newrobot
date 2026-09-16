@@ -52,9 +52,24 @@ class NavigationStackAdapter:
             self._run("status", timeout_seconds=min(self.config.command_timeout_seconds, 20))
         )
 
+    def _best_effort_preflight_status(self) -> dict | None:
+        """Return a reusable-stack snapshot without making it an admission gate.
+
+        ``status`` invokes several ROS lifecycle CLI calls.  During Zenoh/DDS
+        discovery recovery one of those calls can consume the short status
+        budget even though the real lifecycle action is available.  The
+        snapshot is only an optimization for the already-ready/already-
+        prepared paths: proceeding with the bounded real action is both more
+        authoritative and safer than rejecting a completed localization.
+        """
+        try:
+            return self.status()
+        except ProtocolError:
+            return None
+
     def start(self, command: dict | None = None) -> dict:
-        status_payload = self.status()
-        if status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
+        status_payload = self._best_effort_preflight_status()
+        if status_payload and status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
             status_payload["action"] = "start"
             status_payload["recovery"] = "already_ready"
             return status_payload
@@ -62,8 +77,8 @@ class NavigationStackAdapter:
 
     def prepare(self, command: dict | None = None) -> dict:
         """Start localization and Nav2's map/safety group without controllers."""
-        status_payload = self.status()
-        if status_payload.get("returncode") == 0 and self._looks_prepared(status_payload.get("stdout", "")):
+        status_payload = self._best_effort_preflight_status()
+        if status_payload and status_payload.get("returncode") == 0 and self._looks_prepared(status_payload.get("stdout", "")):
             status_payload["action"] = "prepare"
             status_payload["recovery"] = "already_prepared"
             return status_payload
@@ -73,8 +88,8 @@ class NavigationStackAdapter:
         )
 
     def activate_execution(self) -> dict:
-        status_payload = self.status()
-        if status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
+        status_payload = self._best_effort_preflight_status()
+        if status_payload and status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
             status_payload["action"] = "activate_execution"
             status_payload["recovery"] = "already_active"
             return status_payload
