@@ -3940,7 +3940,7 @@ async function handleDeleteRoute(route) {
             </small>
             <div v-if="localizationAttemptSession" class="localization-attempt-card">
               <button type="button" class="localization-attempt-toggle" @click="localizationAttemptCardOpen = !localizationAttemptCardOpen">
-                <strong>定位尝试过程</strong>
+                <strong>任务启动和定位尝试过程</strong>
                 <span>{{ localizationAttemptSession.phase === 'transfer' ? '地图下发中' : (localizationAttemptSession.status || localizationInitState) }}</span>
                 <small>{{ localizationAttemptCardOpen ? '收起' : '展开' }}</small>
               </button>
