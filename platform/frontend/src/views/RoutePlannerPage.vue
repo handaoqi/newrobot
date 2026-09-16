@@ -118,6 +118,21 @@ const mapFrameOrigin = computed(() => mapOriginDisplay.value?.map || { x: 0, y: 
 const occupancyGridOrigin = computed(() => mapOriginDisplay.value?.occupancy_grid || null)
 const rtkEnuOrigin = computed(() => mapOriginDisplay.value?.rtk_enu || null)
 const selectedRoute = ref(null)
+const recentTaskRoutes = computed(() => [...routes.value]
+  .sort((left, right) => {
+    const executionDelta = new Date(right.latest_execution?.created_at || 0).getTime()
+      - new Date(left.latest_execution?.created_at || 0).getTime()
+    if (executionDelta) return executionDelta
+    return new Date(right.updated_at || right.created_at || 0).getTime()
+      - new Date(left.updated_at || left.created_at || 0).getTime()
+  })
+  .slice(0, 10))
+const routePickerOptions = computed(() => {
+  const selectedId = String(selectedRoute.value?.id || '')
+  const selected = selectedId ? routes.value.find(route => String(route.id) === selectedId) : null
+  const recent = recentTaskRoutes.value.filter(route => String(route.id) !== selectedId)
+  return selected ? [selected, ...recent].slice(0, 10) : recent
+})
 const waypoints = ref([])
 const waypointNames = ref([])
 const showRouteDialog = ref(false)
@@ -3749,8 +3764,8 @@ async function handleDeleteRoute(route) {
           <div class="panel-section route-step-panel route-step-4">
             <div class="route-step-content route-select-content">
               <select class="route-selector" :value="selectedRoute?.id || NEW_ROUTE_SELECTION" @change="handleRouteSelect($event.target.value)">
-                <option :value="NEW_ROUTE_SELECTION">新建或选择已保存线路</option>
-                <option v-for="route in routes" :key="route.id" :value="route.id">
+                <option :value="NEW_ROUTE_SELECTION">新建或选择最近任务路线</option>
+                <option v-for="route in routePickerOptions" :key="route.id" :value="route.id">
                   {{ route.name }}（{{ route.waypoint_count }} 个途经点）{{ routeExecutionOptionText(route) }}
                 </option>
               </select>
@@ -3758,14 +3773,14 @@ async function handleDeleteRoute(route) {
                 上次执行：{{ formatExecutionCreatedAt(selectedRoute.latest_execution?.created_at) }}
               </small>
               <button type="button" class="route-list-toggle" @click="toggleRouteList">
-                {{ routeListOpen ? '收起路线列表' : '展开路线列表' }}
+                {{ routeListOpen ? '收起最近任务路线' : '展开最近任务路线（10条）' }}
               </button>
             <div v-if="routeListOpen" class="route-list">
-              <div v-if="routes.length === 0" class="empty-hint">暂无保存的路线</div>
-              <div v-for="route in routes" :key="route.id" class="route-item" :class="{ active: selectedRoute?.id === route.id }">
+              <div v-if="!routePickerOptions.length" class="empty-hint">暂无保存的路线</div>
+              <div v-for="route in routePickerOptions" :key="route.id" class="route-item" :class="{ active: selectedRoute?.id === route.id }">
                 <div @click="handleLoadRoute(route)">
                   <strong>{{ route.name }}</strong>
-                  <small>{{ route.waypoint_count }} 个途经点</small>
+                  <small>{{ route.waypoint_count }} 个途经点 · {{ routeExecutionOptionText(route).replace(/^ · /, '') }}</small>
                 </div>
                 <button class="btn btn-sm btn-danger" @click="handleDeleteRoute(route)">删除</button>
               </div>

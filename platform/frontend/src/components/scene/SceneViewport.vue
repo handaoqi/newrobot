@@ -463,6 +463,7 @@ function clearPressedKeys() {
 function moveCamera(deltaSeconds) {
   if (!activeCamera || !pressedKeys.size) return
   const direction = new THREE.Vector3()
+  let rotating = false
   if (props.mode === '3d') {
     const forward = new THREE.Vector3()
     activeCamera.getWorldDirection(forward)
@@ -470,26 +471,39 @@ function moveCamera(deltaSeconds) {
     if (forward.lengthSq() < 1e-6) forward.set(1, 0, 0)
     else forward.normalize()
     const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1)).normalize()
-    if (pressedKeys.has('w') || pressedKeys.has('arrowup')) direction.add(forward)
-    if (pressedKeys.has('s') || pressedKeys.has('arrowdown')) direction.sub(forward)
-    if (pressedKeys.has('d') || pressedKeys.has('arrowright')) direction.add(right)
-    if (pressedKeys.has('a') || pressedKeys.has('arrowleft')) direction.sub(right)
+    if (pressedKeys.has('w')) direction.add(forward)
+    if (pressedKeys.has('s')) direction.sub(forward)
+    if (pressedKeys.has('d')) direction.add(right)
+    if (pressedKeys.has('a')) direction.sub(right)
     if (pressedKeys.has('e')) direction.z += 1
     if (pressedKeys.has('q')) direction.z -= 1
+    const yaw = (pressedKeys.has('arrowleft') ? 1 : 0) - (pressedKeys.has('arrowright') ? 1 : 0)
+    const pitch = (pressedKeys.has('arrowdown') ? 1 : 0) - (pressedKeys.has('arrowup') ? 1 : 0)
+    if (yaw || pitch) {
+      const orbit = new THREE.Spherical().setFromVector3(activeCamera.position.clone().sub(controls.target))
+      const rotationSpeed = 1.15 * (pressedKeys.has('shift') ? 1.8 : 1)
+      orbit.theta += yaw * rotationSpeed * Math.min(deltaSeconds, 0.08)
+      orbit.phi = Math.max(0.08, Math.min(Math.PI - 0.08, orbit.phi + pitch * rotationSpeed * Math.min(deltaSeconds, 0.08)))
+      activeCamera.position.copy(controls.target).add(new THREE.Vector3().setFromSpherical(orbit))
+      activeCamera.lookAt(controls.target)
+      rotating = true
+    }
   } else {
     if (pressedKeys.has('arrowright')) direction.x += 1
     if (pressedKeys.has('arrowleft')) direction.x -= 1
     if (pressedKeys.has('arrowup')) direction.y += 1
     if (pressedKeys.has('arrowdown')) direction.y -= 1
   }
-  if (direction.lengthSq() < 1e-6) return
+  if (direction.lengthSq() < 1e-6 && !rotating) return
   if (props.mode === '3d' && props.cameraPreset !== 'overview') emit('camera-preset-change', 'overview')
-  direction.normalize()
-  const { radius } = centerAndRadius()
-  const speed = Math.max(1.5, radius * 0.32) * (pressedKeys.has('shift') ? 3 : 1)
-  const offset = direction.multiplyScalar(speed * Math.min(deltaSeconds, 0.08))
-  activeCamera.position.add(offset)
-  controls.target.add(offset)
+  if (direction.lengthSq() > 1e-6) {
+    direction.normalize()
+    const { radius } = centerAndRadius()
+    const speed = Math.max(1.5, radius * 0.32) * (pressedKeys.has('shift') ? 3 : 1)
+    const offset = direction.multiplyScalar(speed * Math.min(deltaSeconds, 0.08))
+    activeCamera.position.add(offset)
+    controls.target.add(offset)
+  }
   controls.update()
 }
 

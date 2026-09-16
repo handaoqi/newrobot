@@ -641,7 +641,7 @@ onBeforeUnmount(() => {
         <div class="viewport-toolbar">
           <div v-if="mapMode !== 'satellite'" class="segmented"><button :class="{ active: viewMode === '2d' }" @click="viewMode = '2d'">2D</button><button :class="{ active: viewMode === '3d' }" @click="viewMode = '3d'">3D</button><span>滚轮/双指自动切换</span></div>
           <div v-if="mapMode !== 'satellite'" class="segmented"><button v-for="item in [['overview','俯视'],['follow','跟随'],['dog','机器狗视角']]" :key="item[0]" :class="{ active: cameraPreset === item[0] }" @click="selectCamera(item[0])">{{ item[1] }}</button></div>
-          <span v-if="viewMode === '3d' && mapMode !== 'satellite'" class="mode-hint">3D：左键旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 或方向键平移 · Q/E 升降 · Shift 加速</span>
+          <span v-if="viewMode === '3d' && mapMode !== 'satellite'" class="mode-hint">3D：左键旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 平移 · Q/E 升降 · 方向键旋转 · Shift 加速</span>
           <span v-else-if="mapMode !== 'satellite'" class="mode-hint">2D：左键/右键拖动平移 · 滚轮缩放 · 方向键平移</span>
           <span v-else class="mode-hint">卫星图：左键拖动平移 · 滚轮或＋/－缩放 · 方向键平移</span>
           <span v-if="mapMode === 'street-block'" class="mode-hint">点云识别 → GLB静态资产拼接 · 实时目标</span>
