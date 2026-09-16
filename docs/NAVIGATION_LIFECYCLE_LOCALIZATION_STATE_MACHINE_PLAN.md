@@ -27,10 +27,10 @@ prepare节点与地图安全组
 ## 当前实施进度（2026-09-16）
 
 - 已完成：FAST-LIO状态发布与Edge订阅、连续本地里程计证据、NDT后二次校正的最终放行门。
-- 已完成（代码）：Nav2地图/安全组与执行组分离；`prepare` 显式配置执行节点为 inactive，任务启动采用 `prepare → 定位 → activate_execution → Action验收`。
+- 已完成（代码与无运动验收）：Nav2地图/安全组与执行组分离；`prepare` 显式配置执行节点为 inactive，任务启动采用 `prepare → 定位 → activate_execution → Action验收`。现场已完成10轮无目标 activate/deactivate，7个执行节点最终均为 inactive，安全组保持 active；激活失败回滚由定向测试覆盖。
 - 已完成（代码）：人工初始位姿、主动重定位、自动定位丢失恢复、`nav.start/restart/recover`、地图激活及分地图切换进入 NDT 优先事务；RTK fixed仅作为室外/过渡搜索候选。
-- 已完成（代码）：路径规划定位时间线补入 prepare、FAST-LIO 收敛、RTK可信种子、最终放行和执行组激活；地图激活前端不再重复触发定位。
-- 已验证：`mapping` 目标构建成功；本轮Edge定向测试及全量测试 631 项、地图激活闭环定向测试 52 项、前端 183 项测试和生产构建通过。现场联合验收仍待执行。
+- 已完成（代码）：路径规划定位时间线补入 prepare、FAST-LIO 收敛、RTK可信种子、最终放行和执行组激活；新增独立 Lifecycle、执行组与导航放行状态卡；地图激活前端不再重复触发定位。
+- 已验证：`mapping` 目标构建成功；本轮Edge定向测试及全量测试 634 项、地图激活闭环定向测试 52 项、前端 183 项测试和生产构建通过。现场联合验收仍待执行。
 
 ## 阶段一：FAST-LIO2状态与Edge订阅
 

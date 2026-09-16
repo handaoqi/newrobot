@@ -634,6 +634,15 @@ class EdgeAgentApplication:
                 mapping_status["odometry"] = dict((snapshot.get("sensors") or {}).get("odometry") or {})
                 snapshot["current_map"] = self._current_map_payload()
                 snapshot["map_set"] = self.map_set_coordinator.status()
+                lifecycle_snapshot = getattr(
+                    self.navigation_stack_adapter, "lifecycle_snapshot", None
+                )
+                lifecycle = lifecycle_snapshot() if callable(lifecycle_snapshot) else {}
+                lifecycle = dict(lifecycle) if isinstance(lifecycle, dict) else {}
+                lifecycle["navigation_allowed"] = bool(
+                    self.safety_state.nav_ready and lifecycle.get("execution_active") is True
+                )
+                snapshot["navigation_lifecycle"] = lifecycle
                 snapshot["mapping"] = mapping_status
                 obstacle_snapshot = getattr(self.navigation, "obstacle_monitor_snapshot", None)
                 navigation = obstacle_snapshot() if callable(obstacle_snapshot) else {}

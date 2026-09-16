@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import NavigationStackConfig
@@ -13,9 +14,43 @@ class NavigationStackAdapter:
 
     def __init__(self, config: NavigationStackConfig) -> None:
         self.config = config
+        self._lifecycle_snapshot = {
+            "stack_prepared": False,
+            "execution_active": False,
+            "execution_state": "unknown",
+            "updated_at": None,
+        }
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+    def lifecycle_snapshot(self) -> dict:
+        """Return cached lifecycle evidence without a blocking ROS CLI probe."""
+        return dict(self._lifecycle_snapshot)
+
+    def _record_lifecycle(self, payload: dict, *, state: str | None = None) -> dict:
+        stdout = str(payload.get("stdout") or "")
+        prepared = self._looks_prepared(stdout)
+        active = self._looks_ready(stdout)
+        if state == "configured_inactive":
+            prepared, active = True, False
+        elif state == "active":
+            prepared, active = True, True
+        elif state == "stopped":
+            prepared, active = False, False
+        self._lifecycle_snapshot = {
+            "stack_prepared": prepared,
+            "execution_active": active,
+            "execution_state": state or ("active" if active else "configured_inactive" if prepared else "unknown"),
+            "updated_at": self._now_iso(),
+        }
+        return payload
 
     def status(self) -> dict:
-        return self._run("status", timeout_seconds=min(self.config.command_timeout_seconds, 20))
+        return self._record_lifecycle(
+            self._run("status", timeout_seconds=min(self.config.command_timeout_seconds, 20))
+        )
 
     def start(self, command: dict | None = None) -> dict:
         status_payload = self.status()
@@ -32,7 +67,10 @@ class NavigationStackAdapter:
             status_payload["action"] = "prepare"
             status_payload["recovery"] = "already_prepared"
             return status_payload
-        return self._run("prepare", timeout_seconds=max(self.config.command_timeout_seconds, 90))
+        return self._record_lifecycle(
+            self._run("prepare", timeout_seconds=max(self.config.command_timeout_seconds, 90)),
+            state="configured_inactive",
+        )
 
     def activate_execution(self) -> dict:
         status_payload = self.status()
@@ -40,10 +78,42 @@ class NavigationStackAdapter:
             status_payload["action"] = "activate_execution"
             status_payload["recovery"] = "already_active"
             return status_payload
-        return self._run("activate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 45))
+        try:
+            return self._record_lifecycle(
+                self._run("activate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 45)),
+                state="active",
+            )
+        except ProtocolError as exc:
+            # A partial lifecycle resume must never leave one controller active
+            # after the admission gate has failed. Pause is safe and
+            # idempotent; preserve both the original activation failure and
+            # the rollback evidence for the operator timeline.
+            rollback = None
+            try:
+                rollback = self._run(
+                    "deactivate-execution",
+                    timeout_seconds=max(self.config.command_timeout_seconds, 30),
+                )
+                self._record_lifecycle(rollback, state="configured_inactive")
+            except Exception as rollback_exc:
+                rollback = {"error": str(rollback_exc)}
+                self._lifecycle_snapshot = {
+                    **self._lifecycle_snapshot,
+                    "execution_active": False,
+                    "execution_state": "rollback_failed",
+                    "updated_at": self._now_iso(),
+                }
+            raise ProtocolError(
+                "NAVIGATION_EXECUTION_ACTIVATION_FAILED",
+                exc.message,
+                details={"activation": exc.details, "rollback": rollback},
+            ) from exc
 
     def deactivate_execution(self) -> dict:
-        return self._run("deactivate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 30))
+        return self._record_lifecycle(
+            self._run("deactivate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 30)),
+            state="configured_inactive",
+        )
 
     def reconcile(self) -> dict:
         """Report the resident stack's lifecycle state without changing it."""
@@ -76,7 +146,9 @@ class NavigationStackAdapter:
         return restart_payload
 
     def stop(self, command: dict | None = None) -> dict:
-        return self._run("stop", timeout_seconds=self.config.command_timeout_seconds)
+        return self._record_lifecycle(
+            self._run("stop", timeout_seconds=self.config.command_timeout_seconds), state="stopped"
+        )
 
     def shutdown(self) -> dict:
         """Explicit lifecycle teardown alias for callers that require it."""

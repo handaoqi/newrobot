@@ -3076,6 +3076,7 @@ function localizationDebugRows() {
   const rtk = telemetry.rtk
   const rawRtk = telemetry.rawRtk
   const timeDiagnostics = telemetry.timeDiagnostics
+  const lifecycle = status.navigation_lifecycle || {}
   const imu = sensors.imu
   const odometry = sensors.odometry
   const qualityFresh = quality && !localizationQualityStale(quality)
@@ -3141,6 +3142,9 @@ function localizationDebugRows() {
     ['综合 · 预测误差', qualityFresh ? predictionErrorText(quality) : '—'],
     ['质量时间', quality ? formatDateTimeWithAge(quality.sampled_at) : '—'],
     ['初始化状态', localizationInitMessage.value || localizationInitState.value],
+    ['Lifecycle准备态', lifecycle.stack_prepared === true ? '已准备' : lifecycle.stack_prepared === false ? '未准备' : '未上报'],
+    ['执行组状态', lifecycle.execution_state || '未上报'],
+    ['导航放行', lifecycle.navigation_allowed === true ? '允许' : '未允许'],
     ['导航栈', status.nav_ready ? 'ready' : 'not ready'],
     ['ROS', status.ros_ready ? 'ready' : 'not ready'],
     ['连接', navStatus.value?.connection_status || 'unknown'],
@@ -3172,6 +3176,7 @@ function stateMachineSteps() {
   const localizationStatus = status.localization_status || navStatus.value?.localization_status || 'unknown'
   const connection = navStatus.value?.connection_status || 'unknown'
   const command = navStatus.value?.command
+  const lifecycle = status.navigation_lifecycle || {}
   const taskId = status.task_execution_id
   const ndtError = Number(quality?.matching_error)
   const inlier = Number(quality?.inlier_fraction)
@@ -3261,8 +3266,17 @@ function stateMachineSteps() {
       key: 'nav',
       title: '导航栈',
       value: status.nav_ready ? 'ready' : 'not ready',
-      detail: commandText(command),
+      detail: `放行 ${lifecycle.navigation_allowed === true ? '允许' : '未允许'} · ${commandText(command)}`,
       state: status.nav_ready ? 'ok' : 'warn',
+    },
+    {
+      key: 'lifecycle',
+      title: 'Nav2 生命周期',
+      value: lifecycle.execution_state || '未上报',
+      detail: `安全组 ${lifecycle.stack_prepared === true ? '已准备' : lifecycle.stack_prepared === false ? '未准备' : '未知'} · 执行组 ${lifecycle.execution_active === true ? 'active' : 'inactive'} · ${lifecycle.updated_at ? formatDateTimeWithAge(lifecycle.updated_at) : '等待 Edge 上报'}`,
+      state: lifecycle.execution_active === true
+        ? (lifecycle.navigation_allowed === true ? 'ok' : 'warn')
+        : (lifecycle.stack_prepared === true ? 'idle' : 'warn'),
     },
     {
       key: 'task',

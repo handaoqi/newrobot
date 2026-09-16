@@ -220,3 +220,52 @@ def test_timeout_output_is_decoded_before_building_protocol_error(tmp_path, monk
     assert captured.value.code == "NAV_COMMAND_FAILED"
     assert captured.value.message == "sensor lock timed out"
     json.dumps({"error_message": captured.value.message})
+
+
+def test_execution_activation_failure_rolls_back_to_configured_inactive(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    monkeypatch.setattr(adapter, "status", lambda: {"returncode": 0, "stdout": ""})
+    calls = []
+
+    def run(action, *, timeout_seconds):
+        calls.append(action)
+        if action == "activate-execution":
+            raise ProtocolError("NAV_COMMAND_FAILED", "controller lifecycle resume failed")
+        assert action == "deactivate-execution"
+        return {"action": action, "returncode": 0, "stdout": ""}
+
+    monkeypatch.setattr(adapter, "_run", run)
+
+    with pytest.raises(ProtocolError) as captured:
+        adapter.activate_execution()
+
+    assert captured.value.code == "NAVIGATION_EXECUTION_ACTIVATION_FAILED"
+    assert calls == ["activate-execution", "deactivate-execution"]
+    assert captured.value.details["rollback"]["action"] == "deactivate-execution"
+    assert adapter.lifecycle_snapshot()["execution_state"] == "configured_inactive"
+    assert adapter.lifecycle_snapshot()["execution_active"] is False
+
+
+def test_ten_no_goal_lifecycle_cycles_leave_execution_inactive(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    monkeypatch.setattr(adapter, "status", lambda: {"returncode": 0, "stdout": ""})
+    actions = []
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda action, *, timeout_seconds: actions.append(action)
+        or {"action": action, "returncode": 0, "stdout": ""},
+    )
+
+    for _ in range(10):
+        adapter.prepare()
+        adapter.activate_execution()
+        adapter.deactivate_execution()
+        snapshot = adapter.lifecycle_snapshot()
+        assert snapshot["stack_prepared"] is True
+        assert snapshot["execution_active"] is False
+        assert snapshot["execution_state"] == "configured_inactive"
+
+    assert actions.count("prepare") == 10
+    assert actions.count("activate-execution") == 10
+    assert actions.count("deactivate-execution") == 10
