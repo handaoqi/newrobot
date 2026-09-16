@@ -3579,16 +3579,31 @@ class TaskExecutor:
         self._patrol_final_approach_applied = initial_final_approach
         self._bypass_active = False
         self._leg_generation += 1
-        self._apply_navigation_profile(
-            index,
-            force_final=(
-                (initial_final_approach or reapproach)
-                if not self._is_docking_task() else None
-            ),
-            force_require_yaw=(False if reapproach else require_yaw_stop),
-            reapproach=reapproach,
-        )
-        self._set_navigation_arrival_tolerance(index)
+        try:
+            self._apply_navigation_profile(
+                index,
+                force_final=(
+                    (initial_final_approach or reapproach)
+                    if not self._is_docking_task() else None
+                ),
+                force_require_yaw=(False if reapproach else require_yaw_stop),
+                reapproach=reapproach,
+            )
+            self._set_navigation_arrival_tolerance(index)
+        except ProtocolError as exc:
+            # A Nav2 restart can make the parameter service disappear for a
+            # few seconds after the action server becomes visible.  Do not
+            # let that transient profile write escape an arrival callback and
+            # strand the task in ``resuming`` with no goal in flight.  No
+            # motion command has been sent at this point; keep the robot
+            # stopped and retry through the bounded dispatch retry path.
+            LOGGER.warning(
+                "Nav2 waypoint %d profile is temporarily unavailable (%s); retrying dispatch",
+                index,
+                exc,
+            )
+            self._schedule_nav_dispatch_retry(index)
+            return
         # The reached point owns both its departure correction and the
         # following leg. Before any point has been reached, the first target
         # owns the initial leg.

@@ -1691,6 +1691,47 @@ def test_reapproach_rejected_arrival_redispatches_same_waypoint(tmp_path):
     store.close()
 
 
+def test_reapproach_retries_when_nav2_goal_parameter_service_is_temporarily_down(
+    tmp_path, monkeypatch
+):
+    """A post-restart parameter cooldown must not strand an arrival callback."""
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.start_task(command("task.start"))
+    before = len(nav.sent)
+    retries = []
+
+    monkeypatch.setattr(
+        executor,
+        "_set_navigation_arrival_tolerance",
+        lambda _index: (_ for _ in ()).throw(
+            ProtocolError(
+                "ARRIVAL_GOAL_TOLERANCE_FAILED",
+                "/controller_server parameter service recently unavailable",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        executor,
+        "_schedule_nav_dispatch_retry",
+        lambda index: retries.append(index),
+    )
+
+    executor._dispatch_navigation(0, reapproach=True)
+
+    assert retries == [0]
+    assert len(nav.sent) == before
+    assert executor.context.state == "running"
+    executor.stop()
+    store.close()
+
+
 def test_normal_patrol_runs_one_fine_reapproach_before_coarse_fallback(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
