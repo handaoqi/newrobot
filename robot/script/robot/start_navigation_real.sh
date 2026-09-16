@@ -135,7 +135,10 @@ execution_lifecycle_manager_available() {
 }
 
 lifecycle_state() {
-  ros2 lifecycle get "$1" 2>/dev/null || true
+  # A stale DDS discovery entry must not make the status/prepare health path
+  # hang indefinitely.  Callers treat an empty response as unavailable and
+  # fail closed rather than mistaking it for an inactive execution node.
+  timeout 5 ros2 lifecycle get "$1" 2>/dev/null || true
 }
 
 wait_for_execution_lifecycle_manager() {
@@ -482,12 +485,12 @@ status_stack() {
   echo
   echo "Lifecycle:"
   local planner controller bt waypoint map_server collision
-  planner="$(ros2 lifecycle get /planner_server 2>/dev/null || true)"
-  controller="$(ros2 lifecycle get /controller_server 2>/dev/null || true)"
-  bt="$(ros2 lifecycle get /bt_navigator 2>/dev/null || true)"
-  waypoint="$(ros2 lifecycle get /waypoint_follower 2>/dev/null || true)"
-  map_server="$(ros2 lifecycle get /map_server 2>/dev/null || true)"
-  collision="$(ros2 lifecycle get /collision_monitor 2>/dev/null || true)"
+  planner="$(lifecycle_state /planner_server)"
+  controller="$(lifecycle_state /controller_server)"
+  bt="$(lifecycle_state /bt_navigator)"
+  waypoint="$(lifecycle_state /waypoint_follower)"
+  map_server="$(lifecycle_state /map_server)"
+  collision="$(lifecycle_state /collision_monitor)"
   printf '%s\n' "${planner}" "${controller}" "${bt}" "${waypoint}" "${map_server}" "${collision}"
   echo
   echo "Localization:"
