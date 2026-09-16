@@ -1605,6 +1605,24 @@ def test_task_startup_handoff_requires_fast_lio_imu_after_absolute_correction():
     assert adapter._fast_lio_handoff_ready() is False
 
 
+def test_handoff_accepts_fresh_lio_frames_when_decision_freshness_is_temporarily_stale():
+    adapter = object.__new__(RosAdapter)
+    adapter.telemetry = FakeTelemetry({
+        "active_source": "lio_imu",
+        "absolute_stable": True,
+        "lio_healthy": False,
+        "lio_anchored": True,
+        "handoff_state": "ready",
+        "lio_motion_anomaly": False,
+    })
+    adapter.lio_readiness = lambda **_kwargs: {"ready": True, "fresh_frames": 3}
+
+    assert adapter._fast_lio_handoff_ready() is True
+    diagnostics = adapter._lio_handoff_diagnostics(adapter._localization_decision(), accepted=True)
+    assert diagnostics["effective_lio_healthy"] is True
+    assert diagnostics["live_lio_readiness"]["fresh_frames"] == 3
+
+
 def test_localization_policy_preserves_ukf_mode():
     published = []
     adapter = object.__new__(RosAdapter)

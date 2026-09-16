@@ -1679,9 +1679,24 @@ class RosAdapter(Node):
         # prerequisite for FAST-LIO to resume as the continuous pose source;
         # indoor NDT maps commonly report it false after the one-shot
         # correction has completed.
+        lio_healthy = decision.get("lio_healthy") is True
+        # During a heavy NDT callback the localization decision can briefly
+        # report lio_healthy=false because its lidar-stamp freshness check
+        # lags, while the independent /odom/lio_odom stream is still fresh.
+        # Use that retained frame evidence as the handoff proof; a reported
+        # motion anomaly remains a hard rejection.
+        if not lio_healthy and decision.get("lio_motion_anomaly") is not True:
+            readiness = getattr(self, "lio_readiness", None)
+            if callable(readiness):
+                try:
+                    lio_healthy = bool(
+                        (readiness(max_age_seconds=0.50, required_frames=3) or {}).get("ready")
+                    )
+                except Exception:
+                    lio_healthy = False
         return bool(
             decision.get("active_source") == "lio_imu"
-            and decision.get("lio_healthy") is True
+            and lio_healthy
             and decision.get("lio_anchored") is True
             and decision.get("absolute_stable") is True
             and str(decision.get("handoff_state") or "ready") == "ready"
@@ -3463,13 +3478,25 @@ class RosAdapter(Node):
             executor_alive = bool(provider()) if callable(provider) else None
         except Exception:
             executor_alive = False
+        live_lio = None
+        readiness = getattr(self, "lio_readiness", None)
+        if callable(readiness):
+            try:
+                live_lio = readiness(max_age_seconds=0.50, required_frames=3)
+            except Exception:
+                live_lio = None
+        effective_lio_healthy = decision.get("lio_healthy") is True or bool(
+            isinstance(live_lio, dict)
+            and live_lio.get("ready")
+            and decision.get("lio_motion_anomaly") is not True
+        )
         reason = ""
         if not accepted:
             if executor_alive is False:
                 reason = "ros_executor_not_alive"
             elif decision.get("active_source") != "lio_imu":
                 reason = "active_source_not_lio_imu"
-            elif decision.get("lio_healthy") is not True:
+            elif not effective_lio_healthy:
                 reason = "lio_not_healthy"
             elif decision.get("lio_anchored") is not True:
                 reason = "lio_anchor_not_ready"
@@ -3486,6 +3513,8 @@ class RosAdapter(Node):
             "active_source": decision.get("active_source"),
             "handoff_state": decision.get("handoff_state"),
             "lio_healthy": decision.get("lio_healthy"),
+            "live_lio_readiness": live_lio,
+            "effective_lio_healthy": effective_lio_healthy,
             "lio_anchored": decision.get("lio_anchored"),
             "absolute_stable": decision.get("absolute_stable"),
             "handoff_failure_reason": reason,
@@ -3513,7 +3542,7 @@ class RosAdapter(Node):
                 handoff_generation > after_generation
                 and decision.get("handoff_state") == "ready"
                 and decision.get("active_source") == "lio_imu"
-                and decision.get("lio_healthy") is True
+                and self._fast_lio_handoff_ready(decision)
                 and decision.get("lio_anchored") is True
                 and decision.get("absolute_stable") is True
             )
