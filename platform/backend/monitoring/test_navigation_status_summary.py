@@ -64,6 +64,11 @@ class NavigationStatusSummaryTests(TestCase):
             command_type="nav.initial_pose",
             status="succeeded",
             expires_at=now + timedelta(hours=1),
+            payload={
+                "map_id": "151",
+                "map_version": "legacy-mapdata-151",
+                "unrelated_operator_data": "must-not-be-exposed",
+            },
             result_payload={"attempts": "x" * 40_000},
         )
 
@@ -76,6 +81,13 @@ class NavigationStatusSummaryTests(TestCase):
         self.assertEqual(full.status_code, 200)
         self.assertEqual(summary.status_code, 200)
         self.assertIn("result_payload", full.data["localization_command"])
+        self.assertEqual(
+            full.data["localization_command"]["payload"],
+            {"map_id": "151", "map_version": "legacy-mapdata-151"},
+        )
+        self.assertNotIn(
+            "unrelated_operator_data", full.data["localization_command"]["payload"]
+        )
         self.assertIsNone(summary.data["localization_command"])
 
         status = summary.data["status"]

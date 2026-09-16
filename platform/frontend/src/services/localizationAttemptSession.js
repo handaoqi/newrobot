@@ -476,6 +476,12 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     bestMatchPose,
     bestNdtCandidate: raw.best_ndt_candidate || result.best_ndt_candidate || null,
     source: raw.selected_stage || raw.source || extras.source || '',
+    startupProgress: result.startup_progress && typeof result.startup_progress === 'object'
+      ? result.startup_progress
+      : null,
+    initialNdtCommit: result.initial_ndt_commit && typeof result.initial_ndt_commit === 'object'
+      ? result.initial_ndt_commit
+      : null,
     earlyStopped: Boolean(raw.early_stopped ?? result.early_stopped),
     stopReason: raw.stop_reason || result.stop_reason || '',
     candidateCount: Number(raw.candidate_count ?? result.candidate_count ?? attemptSource.length),

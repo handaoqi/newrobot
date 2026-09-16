@@ -78,6 +78,31 @@ test('command progress snapshots keep candidate order and hide transfer-phase ma
   assert.equal(shouldShowAttemptMarkers(transfer), false)
 })
 
+test('task-start localization reuse retains startup evidence without inventing NDT candidates', () => {
+  const session = localizationAttemptSessionFromCommand({
+    id: 'task-start-reused-localization',
+    command_type: 'task.start',
+    status: 'succeeded',
+    payload: { route_snapshot: { map: { map_id: '151', map_version: 'legacy-mapdata-151' } } },
+    result_payload: {
+      state: 'accepted',
+      selected_stage: 'navigation_start',
+      initial_ndt_commit: { status: 'reused', reason: 'stable_same_map_pose' },
+      secondary_correction: { status: 'skipped', reason: 'stable_pose_reused' },
+      startup_progress: { current_action: '首航点已下发，Nav2 开始执行' },
+      navigation_start: { status: 'accepted' },
+    },
+  }, { phase: 'localization', showCandidates: true })
+
+  assert.equal(session.mapId, '151')
+  assert.equal(session.mapVersion, 'legacy-mapdata-151')
+  assert.equal(session.attempts.length, 0)
+  assert.equal(session.initialNdtCommit.status, 'reused')
+  assert.equal(session.startupProgress.current_action, '首航点已下发，Nav2 开始执行')
+  assert.equal(session.secondaryCorrection.status, 'skipped')
+  assert.equal(localizationAttemptTimeline(session).at(-1).key, 'navigation_start')
+})
+
 test('failed candidates retain score, inlier, convergence and a readable summary', () => {
   const session = localizationAttemptSessionFromCommand({
     id: 'cmd-failed',

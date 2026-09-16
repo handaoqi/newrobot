@@ -3898,6 +3898,36 @@ class RobotNavigationStatusView(APIView):
             }
             if include_result:
                 payload["result_payload"] = item.result_payload or {}
+                # The route planner restores a completed operator localization
+                # attempt only when it can prove that the command belongs to
+                # the selected map.  Do not expose the full command payload
+                # in this lightweight status response; retain just the map
+                # identity submitted by every nav.initial_pose/nav.relocalize
+                # command (including Guard Duty initialization).
+                command_payload = item.payload if isinstance(item.payload, dict) else {}
+                route_snapshot = command_payload.get("route_snapshot")
+                route_map = (
+                    route_snapshot.get("map")
+                    if isinstance(route_snapshot, dict)
+                    and isinstance(route_snapshot.get("map"), dict)
+                    else {}
+                )
+                map_payload = command_payload.get("map")
+                map_payload = map_payload if isinstance(map_payload, dict) else {}
+                map_id = (
+                    command_payload.get("map_id")
+                    or map_payload.get("map_id")
+                    or route_map.get("map_id")
+                )
+                map_version = (
+                    command_payload.get("map_version")
+                    or map_payload.get("map_version")
+                    or route_map.get("map_version")
+                )
+                payload["payload"] = {
+                    "map_id": map_id,
+                    "map_version": map_version,
+                }
             return payload
 
         return Response(

@@ -2204,6 +2204,13 @@ function applyLocalizationAttemptCommand(command, extras = {}) {
 function localizationAttemptProgressText(session) {
   const candidateCount = Number(session?.candidateCount || 0)
   const evaluated = Number(session?.evaluatedCandidateCount || 0)
+  if (session?.commandType === 'task.start') {
+    if (session?.initialNdtCommit?.status === 'reused') {
+      return '任务启动定位：已复用当前地图的稳定定位，无需重新搜索 NDT 候选'
+    }
+    const action = String(session?.startupProgress?.current_action || '').trim()
+    if (action) return `任务启动定位：${action}`
+  }
   const activeAttempt = (session?.attempts || []).find(attempt => (
     ['verifying', 'started', 'running', 'executing', 'in_progress'].includes(attempt.status)
   ))
@@ -2285,7 +2292,19 @@ function restoreAttemptSessionFromTaskExecution(execution) {
     const latest = events[events.length - 1]
     if (latest?.payload?.result) result = latest.payload.result
   }
-  if (!result.localization_attempts && !Array.isArray(result.attempts)) return
+  // A task started from the task list can legitimately reuse a verified
+  // same-map localization.  In that case Edge reports the startup phases
+  // (and the `initial_ndt_commit: reused` evidence) without a candidate
+  // array.  Keep that command visible in the route planner instead of
+  // incorrectly treating it as an unrelated task with no localization data.
+  const isTaskStartup = command.command_type === 'task.start'
+  const hasStartupLocalizationEvidence = isTaskStartup && Boolean(
+    result.selected_stage
+    || result.startup_progress
+    || result.initial_ndt_commit
+    || result.secondary_correction
+  )
+  if (!result.localization_attempts && !Array.isArray(result.attempts) && !hasStartupLocalizationEvidence) return
   applyLocalizationAttemptCommand({
     ...command,
     result_payload: result,

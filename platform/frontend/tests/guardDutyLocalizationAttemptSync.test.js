@@ -49,3 +49,13 @@ test('route planner retains stages synchronized by guard duty when detailed stat
   assert.match(handler, /const timelineHistory = previousSession/)
   assert.match(handler, /timelineHistory,/)
 })
+
+test('route planner keeps task-start localization evidence when stable localization is reused', () => {
+  const handler = routePlannerSource.match(
+    /function restoreAttemptSessionFromTaskExecution\(execution\) \{([\s\S]*?)\n\}\n\nfunction relocalizationHeadingStyle/,
+  )?.[1] || ''
+
+  assert.match(handler, /const isTaskStartup = command\.command_type === 'task\.start'/)
+  assert.match(handler, /hasStartupLocalizationEvidence/)
+  assert.match(handler, /result\.initial_ndt_commit/)
+})
