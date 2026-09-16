@@ -10,8 +10,6 @@ import {
   navigationReadyForMap,
 } from './mapActivationState.js'
 import {
-  initializeProgressiveLocalization,
-  localizationCommandVerified,
 } from './progressiveLocalization.js'
 
 const TERMINAL_COMMAND_STATES = new Set([
@@ -25,11 +23,6 @@ const TERMINAL_COMMAND_STATES = new Set([
 
 function sleep(milliseconds) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds))
-}
-
-function localizationNormal(payload = {}) {
-  const status = payload.status || {}
-  return (status.localization_status || payload.localization_status) === 'normal'
 }
 
 function navigationStackReady(payload = {}) {
@@ -98,11 +91,19 @@ export async function activateAndRelocalizeMap({
     throw new Error('机器人正在执行任务，路线已保存，但不能切换地图、重定位或重启导航栈')
   }
 
-  if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {
-    onProgress('定位已就绪，正在启动导航栈')
+  // New Edge releases complete a changed map's stationary NDT/LIO flow
+  // inside map.activate. For an already-selected map, nav.start owns that
+  // same backend flow. The browser only renders progress; it must never send
+  // a second progressive localization command against the same transaction.
+  if (!activation.changed && !navigationStackReady(navigationStatus)) {
+    onProgress('地图已选择，正在由 Edge 统一初始化定位与导航')
     const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
       map_id: String(mapId),
       map_version: mapVersion,
+      scene_scope: sceneScope,
+      coordinate_mode: coordinateMode,
+      localization_mode: localizationMode || 'ndt',
+      waypoints,
     }, { traceId })
     await waitForRobotCommand(robotId, startCommand, {
       timeoutMs: 180_000,
@@ -113,48 +114,6 @@ export async function activateAndRelocalizeMap({
       onProgress('地图、定位与导航均已就绪')
       return { ...activation, navigationStatus }
     }
-  }
-
-  onProgress('地图已应用，正在按统一流程搜索定位候选')
-  const initialization = await initializeProgressiveLocalization({
-    mapId,
-    robotId,
-    mapVersion,
-    sceneScope,
-    coordinateMode,
-    localizationMode,
-    waypoints,
-    onProgress,
-    onCommand,
-    traceId,
-    existingActivation: activation,
-    dependencies: {
-      activateRouteMap,
-      sendRobotNavigationCommand,
-      waitForRobotCommand,
-    },
-  })
-
-  // A successful Edge localization command is emitted only after the
-  // selected source has passed its own handoff contract and Nav2 readiness
-  // has been checked.  Do not turn delayed status replication into a second,
-  // contradictory UI convergence timeout.
-  const commandVerified = localizationCommandVerified(initialization.command)
-  navigationStatus = await fetchRobotNavigationStatus(robotId)
-  if (commandVerified) {
-    onProgress('定位命令已验证完成，等待遥测状态同步')
-    return { ...activation, navigationStatus, initialization }
-  }
-  if (localizationNormal(navigationStatus) && !navigationStackReady(navigationStatus)) {
-    onProgress('定位已恢复，正在启动导航栈')
-    const startCommand = await sendRobotNavigationCommand(robotId, 'start', {
-      map_id: String(mapId),
-      map_version: mapVersion,
-    }, { traceId })
-    await waitForRobotCommand(robotId, startCommand, {
-      timeoutMs: 180_000,
-      onProgress: latest => onProgress(`导航栈启动：${latest.status || 'created'}`),
-    })
   }
 
   const deadline = Date.now() + 60_000
@@ -164,10 +123,10 @@ export async function activateAndRelocalizeMap({
       onProgress('地图、定位与导航均已就绪')
       return { ...activation, navigationStatus }
     }
-    onProgress('重定位命令已完成，正在等待定位稳定')
+    onProgress('地图定位已完成，正在等待遥测状态同步')
     await sleep(2_000)
   }
-  throw new Error('地图已下发，但定位未在限定时间内恢复 normal；请到路径规划页面手动设置初始定位')
+  throw new Error('地图激活已完成，但导航状态未在限定时间内同步；请检查 Edge 定位结果')
 }
 
 export async function activateRouteMap({
@@ -202,7 +161,11 @@ export async function activateRouteMap({
       timeoutMs: 180_000,
       onProgress: latest => {
         onProgress(`地图下发：${latest.status || 'created'}`)
-        onCommand({ phase: 'transfer', command: latest, showCandidates: false })
+        onCommand({
+          phase: latest?.result?.localization ? 'localization' : 'transfer',
+          command: latest,
+          showCandidates: Boolean(latest?.result?.localization),
+        })
       },
     })
   }

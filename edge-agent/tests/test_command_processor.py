@@ -1603,6 +1603,58 @@ def test_map_activation_succeeds_when_reload_is_deferred_after_mapping(tmp_path)
     store.close()
 
 
+def test_map_activation_completes_backend_localization_before_reporting_ready(tmp_path):
+    raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
+    raw["message_type"] = "map.activate"
+    raw["payload"].pop("task_execution_id", None)
+    raw["payload"]["command"] = {
+        "map_id": "95", "map_version": "selected-map", "scene_scope": "indoor",
+    }
+    store = LocalStore(str(tmp_path / "edge.db"))
+    navigation = FakeNavigation()
+    navigation.lio_readiness = lambda **_kwargs: {"ready": True, "state": "ready"}
+    navigation.wait_until_prepared = lambda **_kwargs: True
+    navigation.wait_for_final_localization_gate = lambda **_kwargs: {"accepted": True}
+    calls = []
+
+    class Stack(FakeNavigationStack):
+        def deactivate_execution(self):
+            calls.append("deactivate")
+            return {"action": "deactivate_execution"}
+
+        def prepare(self, command=None):
+            calls.append(("prepare", command))
+            return {"action": "prepare"}
+
+        def activate_execution(self):
+            calls.append("activate")
+            return {"action": "activate_execution"}
+
+    state = RuntimeSafetyState(localization_status="normal", nav_ready=True)
+    processor = CommandProcessor(
+        robot_id="rx-001",
+        store=store,
+        safety=SafetyPolicy(SafetyConfig(), state),
+        task_executor=TaskExecutor(
+            store, navigation, event_callback=lambda *args: None, start_result_callback=lambda *args: None
+        ),
+        publish_ack=lambda *args: None,
+        publish_result=lambda *args: None,
+        map_activation_adapter=FakeMapActivation(),
+        navigation_stack_adapter=Stack(),
+        localization_adapter=navigation,
+    )
+
+    _, result = processor.handle_command(raw)
+
+    payload = result["payload"]["result"]
+    assert payload["localization_reset_required"] is False
+    assert payload["navigation_allowed"] is True
+    assert payload["localization"]["final_localization_gate"]["status"] == "accepted"
+    assert calls == ["deactivate", ("prepare", {"reason": "map.activate"}), "activate"]
+    store.close()
+
+
 def test_map_optimize_uses_resolved_source_without_reloading_navigation(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "map.optimize"

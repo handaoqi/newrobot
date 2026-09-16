@@ -75,6 +75,7 @@ const TIMELINE_STAGE_META = {
   fast_lio_readiness: { title: 'FAST-LIO 局部收敛', detail: '确认 IMU、iKD-tree 与连续新鲜本地里程计，尚未要求地图定位 status=3' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
   rtk_fixed: { title: 'RTK 二次校正验证', detail: '最优 NDT 已提交并由 FAST-LIO + IMU 接管后，再验证固定解并更新锚点' },
+  trusted_rtk_fixed: { title: 'RTK 固定解可信搜索种子', detail: '仅缩小室外/过渡场景 NDT 候选范围，不直接提交为初始位姿' },
   fast_lio_imu_handoff: { title: 'FAST-LIO + IMU 主定位接管', detail: '确认新鲜 FAST-LIO + IMU 帧、锚点代数和连续主定位源' },
   final_localization_gate: { title: '最终定位放行', detail: '连续 3 帧新鲜 status=3、LIO 锚点与二次校正终态均通过' },
   navigation_execution_activate: { title: '激活导航执行组', detail: '定位通过后激活规划、控制、行为树、平滑与航点执行节点' },
@@ -104,6 +105,7 @@ const TIMELINE_STAGE_ORDER = [
   'navigation_prepare',
   'fast_lio_readiness',
   'localization_bootstrap',
+  'trusted_rtk_fixed',
   'last_trusted',
   'mapping_origin_bounded',
   'route_waypoints',
@@ -385,6 +387,17 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     })
   }
   const rtkStage = rawStages.find(record => canonicalTimelineStage(record?.stage) === 'rtk_fixed')
+  const trustedRtkSeed = raw.trusted_rtk_seed || result.trusted_rtk_seed || null
+  if (trustedRtkSeed && !displayStages.some(record => canonicalTimelineStage(record?.stage) === 'trusted_rtk_fixed')) {
+    displayStages.push({
+      stage: 'trusted_rtk_fixed',
+      status: trustedRtkSeed.status || (trustedRtkSeed.accepted ? 'accepted' : 'skipped'),
+      started_at: firstTimestamp(trustedRtkSeed.started_at, command.started_at, command.issued_at),
+      finished_at: firstTimestamp(trustedRtkSeed.finished_at, command.finished_at),
+      message: trustedRtkSeed.reason || trustedRtkSeed.rtk_verification?.conclusion,
+      rtk_verification: trustedRtkSeed.rtk_verification,
+    })
+  }
   const rtkVerification = normalizeRtkVerification(
     raw.rtk_verification
       || result.rtk_verification
@@ -474,6 +487,7 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
     activeCandidateStage: raw.active_candidate_stage || result.active_candidate_stage || '',
     rtkDrift: raw.rtk_drift || result.rtk_drift || null,
     rtkVerification,
+    trustedRtkSeed,
     handoff,
     secondaryCorrection,
     bestNdtCommitted: Boolean(raw.best_ndt_committed ?? result.best_ndt_committed),

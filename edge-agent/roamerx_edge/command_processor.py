@@ -1641,6 +1641,10 @@ class CommandProcessor:
                 self.navigation_boundary.activate_map(command.get("map_id"), command.get("map_version"))
             if not self.navigation_stack_adapter:
                 raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")
+            deactivate = getattr(self.navigation_stack_adapter, "deactivate_execution", None)
+            if callable(deactivate):
+                deactivate()
+            self.safety.state.nav_ready = False
             active_files = result_payload["current_map"]["active_files"]
             reload_if_running = getattr(self.navigation_stack_adapter, "reload_map_if_running", None)
             if callable(reload_if_running):
@@ -1656,12 +1660,101 @@ class CommandProcessor:
             boundary_reloader = getattr(self.navigation_stack_adapter, "reload_boundary_filter", None)
             if not result_payload["map_reload"].get("deferred") and callable(boundary_reloader):
                 result_payload["boundary_filter_reload"] = boundary_reloader()
-            # A map-local pose cannot be carried across maps.  The map is
-            # loaded now, but a fresh map-specific initial pose is required
-            # before task admission can consider localization usable.
+            # A map-local pose cannot be carried across maps.  Production map
+            # activation owns the complete map-specific localization flow; a
+            # legacy adapter without ROS localization support retains the old
+            # explicit-reseed result for backwards compatibility.
             self.safety.state.localization_status = "initializing"
             self.safety.state.localization_normal_since_monotonic = 0.0
-            result_payload["localization_reset_required"] = True
+            prepare = getattr(self.navigation_stack_adapter, "prepare", None)
+            if not callable(prepare) or self.localization_adapter is None:
+                result_payload["localization_reset_required"] = True
+            else:
+                active_map = result_payload.get("current_map") or {}
+                localization_command = {
+                    **command,
+                    "scene_scope": str(
+                        command.get("scene_scope")
+                        or active_map.get("scene_scope")
+                        or "indoor"
+                    ).lower(),
+                    "coordinate_mode": str(
+                        command.get("coordinate_mode")
+                        or active_map.get("coordinate_mode")
+                        or "local_only"
+                    ).lower(),
+                    "localization_mode": str(command.get("localization_mode") or "ndt").lower(),
+                    "waypoints": list(command.get("waypoints") or []),
+                }
+                set_progress = getattr(
+                    self.localization_adapter, "set_attempt_progress_callback", None
+                )
+                if callable(set_progress):
+                    set_progress(
+                        lambda payload: self._emit_command_progress(
+                            envelope, started_at, payload
+                        )
+                    )
+                try:
+                    self._emit_command_progress(
+                        envelope,
+                        started_at,
+                        {
+                            "state": "running",
+                            "selected_stage": "navigation_prepare",
+                            "navigation_lifecycle": {"status": "preparing"},
+                        },
+                    )
+                    prepared = prepare({"reason": "map.activate"})
+                    wait_prepared = getattr(self.localization_adapter, "wait_until_prepared", None)
+                    if callable(wait_prepared) and not wait_prepared(timeout_seconds=45.0):
+                        raise ProtocolError(
+                            "NAV_STACK_PREPARE_FAILED",
+                            "navigation map/safety group did not become prepared after map activation",
+                        )
+                    self._emit_command_progress(
+                        envelope,
+                        started_at,
+                        {"state": "running", "selected_stage": "fast_lio_readiness"},
+                    )
+                    localization = self._run_navigation_command_localization(
+                        envelope, localization_command
+                    )
+                    self._emit_command_progress(
+                        envelope,
+                        started_at,
+                        {
+                            **localization,
+                            "state": "running",
+                            "selected_stage": "navigation_execution_activate",
+                        },
+                    )
+                    activation = getattr(self.navigation_stack_adapter, "activate_execution", None)
+                    if not callable(activation):
+                        raise ProtocolError(
+                            "NAVIGATION_EXECUTION_UNAVAILABLE",
+                            "prepared navigation stack cannot activate its execution group",
+                        )
+                    result_payload["navigation_prepare"] = prepared
+                    result_payload["localization"] = localization
+                    result_payload["execution_activation"] = activation()
+                    self._await_navigation_stack_ready(
+                        timeout_seconds=45.0,
+                        message="navigation execution group did not become ready after map activation",
+                    )
+                    result_payload["localization_reset_required"] = False
+                    result_payload["navigation_allowed"] = True
+                except Exception:
+                    if callable(deactivate):
+                        try:
+                            deactivate()
+                        except Exception:
+                            LOGGER.exception("failed to deactivate execution group after map activation failure")
+                    self.safety.state.nav_ready = False
+                    raise
+                finally:
+                    if callable(set_progress):
+                        set_progress(None)
         elif envelope.message_type == "map.optimize":
             if not self.mapping_adapter:
                 raise ProtocolError("MAPPING_UNAVAILABLE", "mapping adapter is not configured")

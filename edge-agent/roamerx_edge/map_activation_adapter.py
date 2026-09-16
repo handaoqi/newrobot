@@ -180,6 +180,7 @@ class MapActivationAdapter:
             local_state = "mixed_files"
             local_error = "active map files point to different source directories"
 
+        constraints = self.active_constraints()
         status = {
             "map_id": self.config.robot.current_map_id,
             "map_version": self.config.robot.current_map_version,
@@ -192,10 +193,61 @@ class MapActivationAdapter:
             "local_state": local_state,
             "applied_at": self.applied_at,
             "last_activation_error": local_error,
+            "scene_scope": constraints.get("scene_scope", "indoor"),
+            "coordinate_mode": constraints.get("coordinate_mode", "local_only"),
+            "map_constraints": constraints,
         }
+        status.update(self.active_constraints())
         self.safety_state.current_map_local_state = local_state
         self.safety_state.current_map_error = local_error
         return status
+
+    def active_constraints(self) -> dict:
+        """Read active-map localization constraints for Edge-side orchestration.
+
+        The cloud activation command need not duplicate map-manifest metadata.
+        Keeping it beside the switched files makes map.activate, task startup
+        and direct relocalization use the same scene decision.
+        """
+        manifest = load_map_manifest(self.map_dir)
+        gnss_origin = {}
+        gnss_path = self.map_dir / "gnss_origin.yaml"
+        if gnss_path.exists():
+            try:
+                loaded = yaml.safe_load(gnss_path.read_text(encoding="utf-8")) or {}
+                if isinstance(loaded, dict):
+                    gnss_origin = loaded
+            except (OSError, yaml.YAMLError):
+                pass
+        return constraints_from_manifest(
+            manifest if isinstance(manifest, dict) else {}, gnss_origin=gnss_origin
+        )
+
+    def active_constraints(self) -> dict:
+        """Expose the activated map's scene contract to lifecycle callers.
+
+        A cloud ``map.activate`` command contains identifiers, not necessarily
+        scene metadata.  Deriving it from the selected local package prevents
+        an outdoor map from silently taking the indoor/no-RTK path.
+        """
+        source_dir = self.map_dir / "current"
+        manifest = load_map_manifest(source_dir)
+        gnss_origin = {}
+        gnss_path = source_dir / "gnss_origin.yaml"
+        if gnss_path.exists():
+            try:
+                gnss_origin = yaml.safe_load(gnss_path.read_text(encoding="utf-8")) or {}
+            except (OSError, yaml.YAMLError):
+                gnss_origin = {}
+        constraints = constraints_from_manifest(
+            manifest,
+            gnss_origin=gnss_origin if isinstance(gnss_origin, dict) else {},
+        )
+        return {
+            "scene_scope": constraints.get("scene_scope") or "indoor",
+            "coordinate_mode": constraints.get("coordinate_mode") or "local_only",
+            "map_constraints": constraints,
+        }
 
     def mapping_start_pose(self) -> dict:
         """Read the first recorded map trajectory pose for cold-start localization."""
