@@ -58,6 +58,11 @@ PATROL_FINAL_APPROACH_M = 1.0
 OBSTACLE_RECOVERY_MAX_ATTEMPTS = 3
 # Graded departure turn: <10° absorb, 10–60° controlled spin, >60° in-place.
 DEPARTURE_HEADING_SKIP_RAD = 0.175  # ~10 deg
+# Outdoor cruise already has PathAlign on the ThetaStar line. A 56–76°
+# in-place teleop spin cancels Nav2 and looks like circling instead of
+# going to the next click. Keep a 90° floor so a reverse-leg 180° still
+# turns in place; outdoor vx_min is 0 so Nav2 cannot reverse around it.
+OUTDOOR_DEPARTURE_HEADING_SKIP_RAD = pi / 2  # 90 deg
 DEPARTURE_HEADING_ALIGN_RAD = 0.175  # ~10 deg
 # A waypoint explicitly marked require_yaw previously let RPP chase the final
 # orientation while still following the path.  Keep its original, stricter
@@ -2892,12 +2897,17 @@ class TaskExecutor:
     def _pre_leg_heading_error_requires_spin(self, error_rad: float | None) -> bool:
         """Whether a cruise leg should stop and teleop-spin before Nav2.
 
-        Indoor and outdoor use the same 10° absorb. Larger errors still turn
-        in place first so cruise starts already facing the next click.
+        Indoor absorbs <10°. Outdoor lets FollowPath turn in motion below 90°
+        so a fixed-RTK patrol starts the planned line instead of spinning.
         """
         if error_rad is None:
             return True
-        return abs(float(error_rad)) > DEPARTURE_HEADING_SKIP_RAD
+        skip = (
+            OUTDOOR_DEPARTURE_HEADING_SKIP_RAD
+            if self._outdoor_navigation_profile()
+            else DEPARTURE_HEADING_SKIP_RAD
+        )
+        return abs(float(error_rad)) > skip
 
     def _maybe_face_travel_direction(self, target_index: int) -> bool:
         """Rotate in place toward the travel leg when the heading error is large."""
@@ -3167,9 +3177,14 @@ class TaskExecutor:
         ).strip().lower()
         if anchor_preference not in {"ndt", "rtk", "balanced"}:
             anchor_preference = "balanced"
+        # Outdoor RTK clicks already chose GPS as the correction source.
+        # Platform snapshots still serialize rtk_primary_allowed=false by
+        # default, which left FAST-LIO driving and RTK only nudging it.
+        # That residual is what sent the dog in circles instead of along
+        # the Nav2 line. localization_mode=rtk on an outdoor map is the
+        # opt-in; UKF/NDT clicks keep LIO continuous.
         rtk_primary_allowed = (
-            bool(waypoint.get("rtk_primary_allowed", False))
-            and mode == "rtk"
+            mode == "rtk"
             and phase == "moving"
             and self._outdoor_navigation_profile()
         )

@@ -1386,6 +1386,72 @@ def test_moving_policy_enables_online_anchor_only_for_normal_running_leg(tmp_pat
     store.close()
 
 
+def test_outdoor_rtk_moving_policy_enables_gps_primary(tmp_path):
+    class PolicyNavigation(FakeNavigation):
+        def __init__(self):
+            super().__init__()
+            self.full_localization_policies = []
+
+        def set_localization_policy(
+            self,
+            source,
+            phase,
+            anchor_preference="balanced",
+            rtk_primary_allowed=False,
+            online_anchor_correction_allowed=False,
+        ):
+            self.full_localization_policies.append(
+                (
+                    source,
+                    phase,
+                    anchor_preference,
+                    rtk_primary_allowed,
+                    online_anchor_correction_allowed,
+                )
+            )
+
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = PolicyNavigation()
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+    )
+    executor.context = type(
+        "Ctx",
+        (),
+        {
+            "state": "running",
+            "task_type": "patrol",
+            "route_snapshot": {
+                "scene_scope": "outdoor",
+                "map": {"coordinate_mode": "rtk_fixed", "scene_scope": "outdoor"},
+                "waypoints": [{"x": 1.0, "y": 2.0, "localization_mode": "rtk"}],
+            },
+        },
+    )()
+
+    # Planner snapshots still send rtk_primary_allowed=false. Outdoor RTK
+    # clicks must still let GPS drive the continuous pose.
+    executor._set_localization_policy(
+        {
+            "localization_mode": "rtk",
+            "rtk_primary_allowed": False,
+            "localization_anchor_preference": "balanced",
+        },
+        "moving",
+    )
+    assert nav.full_localization_policies[-1] == ("rtk", "moving", "balanced", True, True)
+
+    executor._set_localization_policy(
+        {"localization_mode": "ukf", "rtk_primary_allowed": False},
+        "moving",
+    )
+    assert nav.full_localization_policies[-1] == ("ukf", "moving", "balanced", False, True)
+    store.close()
+
+
 def test_arrival_within_tolerance_rejects_rtk_far_from_click(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
@@ -3049,7 +3115,7 @@ def test_outdoor_arrival_faces_departure_heading(tmp_path):
     store.close()
 
 
-def test_outdoor_moderate_departure_spins_in_place_before_cruise(tmp_path):
+def test_outdoor_moderate_departure_cruises_without_spin(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
     executor = TaskExecutor(
@@ -3067,24 +3133,21 @@ def test_outdoor_moderate_departure_spins_in_place_before_cruise(tmp_path):
         envelope.payload["command"]["map"]
     )
     executor.start_task(envelope)
-    # Field log: 76° error at point 1 while facing waypoint 2.
-    # Travel to wp-2 from (1,2) is atan2(1,1) ≈ 0.785 rad.
+    # Field log: 56–76° error at point 1 while the next click is north.
+    # Outdoor FollowPath should start the ThetaStar line instead of
+    # cancelling Nav2 for an in-place teleop spin.
     nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.785 + 1.326)
     before_sent = len(nav.sent)
-    assert executor._dispatch_departure_heading(0) is True
-    assert executor._departure_heading_mode == "teleop"
-    assert executor._departure_heading_index == 0
+    before_teleop = len(nav.teleop)
+    assert executor._dispatch_departure_heading(0) is False
+    assert executor._departure_heading_index is None
     assert len(nav.sent) == before_sent
-    executor._clear_departure_heading(cancel_navigation=True)
-    _await_departure_heading(executor)
-    nav.pose = SimpleNamespace(x=1.0, y=2.0, yaw=0.785 + 1.326)
+    assert len(nav.teleop) == before_teleop
     cruised = []
     executor._dispatch_navigation = lambda index: cruised.append(index)
-    assert executor._maybe_face_travel_direction(1) is True
-    assert executor._departure_heading_mode == "teleop"
-    assert executor._departure_cruise_index == 1
-    _await_departure_heading(executor)
-    assert cruised == [1]
+    assert executor._maybe_face_travel_direction(1) is False
+    assert executor._departure_heading_index is None
+    assert cruised == []
     store.close()
 
 
