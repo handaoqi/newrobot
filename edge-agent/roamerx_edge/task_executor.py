@@ -2653,11 +2653,16 @@ class TaskExecutor:
                 transaction_id,
             )
         timed_out = {**result, "status": "timed_out", "finished_at": now_iso()}
-        raise ProtocolError(
-            "INITIALIZATION_CORRECTION_TIMEOUT",
-            f"secondary {normalized} correction timed out",
-            details={"secondary_correction": timed_out},
-        )
+        # Secondary correction is optional after a verified NDT/LIO anchor.
+        # Preserve timeout evidence, but do not restart initialization when
+        # LIO anchor smoothing cannot finish.
+        return {
+            **timed_out,
+            "status": "skipped",
+            "reason": "secondary_correction_timeout_continue_lio",
+            "fallback_source": "lio_imu",
+            "non_blocking": True,
+        }
 
     def _progressive_startup_relocalize(self, points: list[dict]) -> dict:
         """Run the cold-start search in its fixed, map-scoped order.

@@ -755,11 +755,16 @@ class CommandProcessor:
         except Exception:
             LOGGER.exception("failed to cancel timed-out secondary correction %s", transaction_id)
         timed_out = {**secondary, "status": "timed_out", "finished_at": now_iso()}
-        raise ProtocolError(
-            "LOCALIZATION_SECONDARY_CORRECTION_TIMEOUT",
-            f"secondary {mode} correction timed out",
-            details={"secondary_correction": timed_out},
-        )
+        # Acceptance only means the correction transaction was queued.  If
+        # LIO anchor smoothing cannot finish, keep the verified NDT/LIO pose
+        # and continue instead of restarting the whole map search.
+        return {
+            **timed_out,
+            "status": "skipped",
+            "reason": "secondary_correction_timeout_continue_lio",
+            "fallback_source": "lio_imu",
+            "non_blocking": True,
+        }
 
     def _wait_for_initial_pose_subscriber(self, timeout_seconds: float) -> bool:
         """Probe the concrete localization seed receiver when the adapter supports it."""
@@ -1245,13 +1250,14 @@ class CommandProcessor:
                                     "failed to cancel timed-out secondary correction %s",
                                     transaction_id,
                                 )
-                            secondary.update({"status": "timed_out", "finished_at": now_iso()})
-                            raise ProtocolError(
-                                "LOCALIZATION_SECONDARY_CORRECTION_TIMEOUT",
-                                f"secondary {mode} correction timed out",
-                                details={"secondary_correction": secondary},
-                            )
-                        if str(secondary.get("status") or "") != "completed":
+                            secondary.update({
+                                "status": "skipped",
+                                "reason": "secondary_correction_timeout_continue_lio",
+                                "fallback_source": "lio_imu",
+                                "non_blocking": True,
+                                "finished_at": now_iso(),
+                            })
+                        if str(secondary.get("status") or "") not in {"completed", "skipped"}:
                             raise ProtocolError(
                                 "LOCALIZATION_SECONDARY_CORRECTION_FAILED",
                                 str(secondary.get("reason") or f"secondary {mode} correction failed"),
