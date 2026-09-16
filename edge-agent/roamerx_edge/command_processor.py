@@ -516,15 +516,45 @@ class CommandProcessor:
                 "unavailable_error_message": exc.message,
             }
 
-    @staticmethod
-    def _command_scene_uses_rtk_seed(command: dict) -> bool:
-        scene = str(command.get("scene_scope") or "").lower()
-        coordinate = str(command.get("coordinate_mode") or "").lower()
+    def _effective_command_localization_scope(self, command: dict) -> tuple[str, str]:
+        """Resolve scene/coordinates from the active map for all relocalize entries."""
+        scene = str(command.get("scene_scope") or "").strip().lower()
+        coordinate = str(command.get("coordinate_mode") or "").strip().lower()
+        adapter = self.map_activation_adapter
+        reader = getattr(adapter, "status", None) if adapter is not None else None
+        if not callable(reader):
+            return scene, coordinate
+        try:
+            active = reader() or {}
+        except Exception:
+            return scene, coordinate
+        if not isinstance(active, dict):
+            return scene, coordinate
+        command_map_id = str(command.get("map_id") or "").strip()
+        active_map_id = str(active.get("map_id") or "").strip()
+        if command_map_id and active_map_id and command_map_id != active_map_id:
+            return scene, coordinate
+        constraints = active.get("map_constraints") if isinstance(active.get("map_constraints"), dict) else {}
+        active_coordinate = str(
+            active.get("coordinate_mode") or constraints.get("coordinate_mode") or ""
+        ).strip().lower()
+        active_scene = str(
+            active.get("scene_scope") or constraints.get("scene_scope") or ""
+        ).strip().lower()
+        if active_coordinate in {"rtk_fixed", "local_only"}:
+            coordinate = active_coordinate
+        if active_scene in {"indoor", "transition", "outdoor"}:
+            scene = active_scene
+        return scene, coordinate
+
+    def _command_scene_uses_rtk_seed(self, command: dict) -> bool:
+        scene, coordinate = self._effective_command_localization_scope(command)
         return scene in {"outdoor", "transition"} and coordinate == "rtk_fixed"
 
     def _trusted_rtk_seed_for_command(self, command: dict) -> tuple[dict | None, dict | None]:
         """Bounded fixed-RTK evidence for an outdoor NDT candidate list."""
-        if not self._command_scene_uses_rtk_seed(command):
+        scene, coordinate = self._effective_command_localization_scope(command)
+        if not (scene in {"outdoor", "transition"} and coordinate == "rtk_fixed"):
             return None, None
         seed_reader = getattr(self.localization_adapter, "trusted_rtk_search_seed", None)
         if not callable(seed_reader):
@@ -558,6 +588,11 @@ class CommandProcessor:
         route = command.get("route_snapshot") if isinstance(command.get("route_snapshot"), dict) else {}
         if not waypoints:
             waypoints = list(route.get("waypoints") or [])
+        effective_scene, effective_coordinate = self._effective_command_localization_scope(command)
+        if effective_scene:
+            command = {**command, "scene_scope": effective_scene}
+        if effective_coordinate:
+            command = {**command, "coordinate_mode": effective_coordinate}
         trusted_seed, trusted_evidence = self._trusted_rtk_seed_for_command(command)
         trusted_stage = trusted_evidence or {
             "status": "skipped",
