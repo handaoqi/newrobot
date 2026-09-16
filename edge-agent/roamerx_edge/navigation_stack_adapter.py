@@ -14,6 +14,12 @@ class NavigationStackAdapter:
 
     def __init__(self, config: NavigationStackConfig) -> None:
         self.config = config
+        # ``prepare`` has authoritative evidence that the execution group is
+        # configured/inactive.  Re-running the verbose status probe immediately
+        # before activation only adds DDS/ROS CLI discovery latency.  Consume
+        # this one-shot hint in ``activate_execution`` and fall back to the
+        # probe whenever the lifecycle state is unknown.
+        self._activation_preflight_skippable = False
         self._lifecycle_snapshot = {
             "stack_prepared": False,
             "execution_active": False,
@@ -81,23 +87,37 @@ class NavigationStackAdapter:
         if status_payload and status_payload.get("returncode") == 0 and self._looks_prepared(status_payload.get("stdout", "")):
             status_payload["action"] = "prepare"
             status_payload["recovery"] = "already_prepared"
+            self._activation_preflight_skippable = True
             return status_payload
-        return self._record_lifecycle(
+        result = self._record_lifecycle(
             self._run("prepare", timeout_seconds=max(self.config.command_timeout_seconds, 90)),
             state="configured_inactive",
         )
+        self._activation_preflight_skippable = True
+        return result
 
     def activate_execution(self) -> dict:
-        status_payload = self._best_effort_preflight_status()
-        if status_payload and status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
-            status_payload["action"] = "activate_execution"
-            status_payload["recovery"] = "already_active"
-            return status_payload
+        skip_preflight = self._activation_preflight_skippable
+        self._activation_preflight_skippable = False
+        preflight_started = datetime.now(timezone.utc)
+        status_payload = None
+        if not skip_preflight:
+            status_payload = self._best_effort_preflight_status()
+            if status_payload and status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
+                status_payload["action"] = "activate_execution"
+                status_payload["recovery"] = "already_active"
+                status_payload["preflight_skipped"] = False
+                return status_payload
         try:
-            return self._record_lifecycle(
+            result = self._record_lifecycle(
                 self._run("activate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 45)),
                 state="active",
             )
+            result["preflight_skipped"] = skip_preflight
+            result["activation_elapsed_seconds"] = round(
+                (datetime.now(timezone.utc) - preflight_started).total_seconds(), 3
+            )
+            return result
         except ProtocolError as exc:
             # A partial lifecycle resume must never leave one controller active
             # after the admission gate has failed. Pause is safe and
@@ -434,6 +454,7 @@ class NavigationStackAdapter:
         script = Path(self.config.script_path).expanduser()
         if not script.exists():
             raise ProtocolError("NAV_SCRIPT_MISSING", f"navigation script not found: {script}")
+        started_at = datetime.now(timezone.utc)
         try:
             completed = subprocess.run(
                 [str(script), action],
@@ -459,6 +480,9 @@ class NavigationStackAdapter:
             "returncode": completed.returncode,
             "stdout": completed.stdout[-6000:],
             "stderr": completed.stderr[-6000:],
+            "elapsed_seconds": round(
+                (datetime.now(timezone.utc) - started_at).total_seconds(), 3
+            ),
         }
         if completed.returncode != 0:
             # Keep the lifecycle action and its bounded script output in the

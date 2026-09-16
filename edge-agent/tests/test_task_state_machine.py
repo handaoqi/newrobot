@@ -661,11 +661,11 @@ def test_task_starts_from_nearest_waypoint_and_reports_earlier_points_complete(t
 
     assert executor.context.current_waypoint_index == 1
     assert ids(nav.sent[0]) == ["wp-2"]
-    assert events[0][0] == "task.started"
-    assert events[0][1]["initial_waypoint_index"] == 1
-    assert events[1][0] == "task.progress"
-    assert events[1][1]["completed_waypoints"] == 1
-    navigation = events[1][1]["navigation_progress"]
+    started_event = next(event for event in events if event[0] == "task.started")
+    assert started_event[1]["initial_waypoint_index"] == 1
+    progress_event = next(event for event in events if event[0] == "task.progress")
+    assert progress_event[1]["completed_waypoints"] == 1
+    navigation = progress_event[1]["navigation_progress"]
     assert navigation["phase"] == "target_dispatched"
     assert navigation["waypoint"]["map_point_number"] == 2
     assert navigation["progress"] == {

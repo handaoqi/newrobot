@@ -547,7 +547,7 @@ def test_task_progress_version_follows_start_ack_version(tmp_path):
     navigation.result_cb("succeeded", "", {"missed_waypoints": []})
 
     assert acks[0]["payload"]["edge_state_version"] == 2
-    assert events[0][0] == "task.started"
+    assert any(event[0] == "task.started" for event in events)
     assert events[0][1]["state_version"] == 3
     assert events[-1][0] == "task.completed"
     assert events[-1][1]["state_version"] > acks[0]["payload"]["edge_state_version"]

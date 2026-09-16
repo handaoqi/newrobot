@@ -279,7 +279,19 @@ class CommandProcessor:
                          "selected_stage": "navigation_execution_activate",
                          "navigation_lifecycle": {"status": "activating"}},
                     )
-                    self._activate_navigation_execution_for_task()
+                    activation_evidence = self._activate_navigation_execution_for_task()
+                    self._emit_command_progress(
+                        envelope, started_at,
+                        {
+                            **initialization_result,
+                            "state": "running",
+                            "selected_stage": "navigation_execution_activate",
+                            "navigation_lifecycle": {
+                                "status": "active",
+                                **dict(activation_evidence or {}),
+                            },
+                        },
+                    )
                     validate_admission = getattr(self.safety, "validate_navigation_admission", None)
                     if callable(validate_admission):
                         validate_admission()
@@ -429,16 +441,25 @@ class CommandProcessor:
             raise ProtocolError("NAV_STACK_PREPARE_FAILED", "navigation map/safety group did not become prepared")
         self.safety.state.nav_ready = False
 
-    def _activate_navigation_execution_for_task(self) -> None:
+    def _activate_navigation_execution_for_task(self) -> dict:
         if not self.navigation_stack_adapter:
-            return
+            return {}
+        started_at = time.monotonic()
         activate = getattr(self.navigation_stack_adapter, "activate_execution", None)
+        activation = {}
         if callable(activate):
-            activate()
+            activation = activate() or {}
+        activation_finished_at = time.monotonic()
         self._await_navigation_stack_ready(
             timeout_seconds=45.0,
             message="navigation execution group did not become ready after localization",
         )
+        return {
+            "activation": activation,
+            "activation_seconds": round(activation_finished_at - started_at, 3),
+            "ready_check_seconds": round(time.monotonic() - activation_finished_at, 3),
+            "total_seconds": round(time.monotonic() - started_at, 3),
+        }
 
     def _await_navigation_stack_ready(self, timeout_seconds: float, message: str) -> None:
         wait_until_ready = getattr(self.task_executor.navigation, "wait_until_ready", None)

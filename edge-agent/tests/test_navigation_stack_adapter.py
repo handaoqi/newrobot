@@ -279,6 +279,30 @@ def test_execution_activation_failure_rolls_back_to_configured_inactive(tmp_path
     assert adapter.lifecycle_snapshot()["execution_active"] is False
 
 
+def test_prepare_allows_next_activation_to_skip_duplicate_status_probe(tmp_path, monkeypatch):
+    adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
+    status_calls = []
+    run_calls = []
+
+    def status():
+        status_calls.append(True)
+        return {"returncode": 0, "stdout": ""}
+
+    def run(action, *, timeout_seconds):
+        run_calls.append(action)
+        return {"action": action, "returncode": 0, "stdout": ""}
+
+    monkeypatch.setattr(adapter, "status", status)
+    monkeypatch.setattr(adapter, "_run", run)
+
+    adapter.prepare()
+    activation = adapter.activate_execution()
+
+    assert activation["preflight_skipped"] is True
+    assert status_calls == [True]
+    assert run_calls == ["prepare", "activate-execution"]
+
+
 def test_ten_no_goal_lifecycle_cycles_leave_execution_inactive(tmp_path, monkeypatch):
     adapter = NavigationStackAdapter(NavigationStackConfig(script_path=str(tmp_path / "nav.sh")))
     monkeypatch.setattr(adapter, "status", lambda: {"returncode": 0, "stdout": ""})

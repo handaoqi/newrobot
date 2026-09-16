@@ -2325,11 +2325,40 @@ class TaskExecutor:
         return True
 
     def _startup_can_reuse_current_pose(self, decision: dict) -> bool:
+        if not self._startup_map_matches_current_route():
+            return False
+        if not self._localization_sample_fresh(decision):
+            return False
         if not self._startup_localization_already_ready(decision):
             return False
         if not self._outdoor_navigation_profile():
             return True
         return self._startup_rtk_already_aligned(decision)
+
+    def _startup_map_matches_current_route(self) -> bool:
+        """Reject stable-pose reuse when the selected map identity changed.
+
+        The map-set coordinator may already have loaded the correct submap,
+        but the top-level route map is still the authoritative task contract.
+        Older injected adapters do not expose safety map identity, so they keep
+        the historical behavior when that evidence is unavailable.
+        """
+        if not self.context:
+            return False
+        route_map = self.context.route_snapshot.get("map") or {}
+        required_id = str(route_map.get("map_id") or "").strip()
+        required_version = str(route_map.get("map_version") or "").strip()
+        if not required_id and not required_version:
+            return True
+        safety_state = getattr(self.map_activation_adapter, "safety_state", None)
+        if safety_state is None:
+            return True
+        current_id = str(getattr(safety_state, "current_map_id", "") or "").strip()
+        current_version = str(getattr(safety_state, "current_map_version", "") or "").strip()
+        return (
+            (not required_id or current_id == required_id)
+            and (not required_version or current_version == required_version)
+        )
 
     def initialize_before_navigation(self) -> dict:
         readiness_started_at = now_iso()
@@ -2743,6 +2772,13 @@ class TaskExecutor:
                 "initial_ndt_commit": {"status": "reused", "reason": "stable_same_map_pose"},
                 "secondary_correction": {"status": "skipped", "reason": "stable_pose_reused"},
                 "continuous_source": "lio_imu",
+                "localization_reuse": {
+                    "status": "accepted",
+                    "reason": "stable_same_map_pose",
+                    "map_id": (self.context.route_snapshot.get("map") or {}).get("map_id"),
+                    "map_version": (self.context.route_snapshot.get("map") or {}).get("map_version"),
+                    "sample_fresh": True,
+                },
             }
         initial_ndt_commit = self._progressive_startup_relocalize(points)
         handoff = initial_ndt_commit.get("handoff") if isinstance(initial_ndt_commit, dict) else None
