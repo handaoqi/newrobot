@@ -27,7 +27,7 @@ const props = defineProps({
   mapMode: { type: String, default: 'scene' },
   cameraPreset: { type: String, default: 'overview' },
 })
-const emit = defineEmits(['mode-change', 'stats', 'error', 'asset-inference'])
+const emit = defineEmits(['mode-change', 'camera-preset-change', 'stats', 'error', 'asset-inference'])
 
 const host = ref(null)
 const zoom = ref(props.mode === '3d' ? 0.75 : 0.25)
@@ -40,7 +40,10 @@ let controls
 let resizeObserver
 let animationFrame
 let lastStatsAt = performance.now()
+let lastFrameAt = performance.now()
 let renderedFrames = 0
+let grid = null
+const pressedKeys = new Set()
 const groups = {}
 const assetLoader = new GLTFLoader()
 const assetModelCache = new Map()
@@ -56,8 +59,10 @@ let mounted = false
 function bounds() {
   const value = props.manifest?.bounds || {}
   return {
-    minX: Number(value.min_x || -10), maxX: Number(value.max_x || 10),
-    minY: Number(value.min_y || -10), maxY: Number(value.max_y || 10),
+    minX: Number.isFinite(Number(value.min_x)) ? Number(value.min_x) : -10,
+    maxX: Number.isFinite(Number(value.max_x)) ? Number(value.max_x) : 10,
+    minY: Number.isFinite(Number(value.min_y)) ? Number(value.min_y) : -10,
+    maxY: Number.isFinite(Number(value.max_y)) ? Number(value.max_y) : 10,
   }
 }
 
@@ -65,6 +70,35 @@ function centerAndRadius() {
   const box = bounds()
   const center = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, 0)
   return { center, radius: Math.max(5, Math.hypot(box.maxX - box.minX, box.maxY - box.minY) / 2) }
+}
+
+function gridSpec() {
+  const box = bounds()
+  const span = Math.max(10, box.maxX - box.minX, box.maxY - box.minY)
+  const spacing = span <= 60 ? 1 : span <= 160 ? 2 : span <= 400 ? 5 : 10
+  const size = Math.ceil(span / spacing) * spacing
+  return {
+    size,
+    divisions: Math.max(1, Math.round(size / spacing)),
+    centerX: (box.minX + box.maxX) / 2,
+    centerY: (box.minY + box.maxY) / 2,
+  }
+}
+
+function updateGrid() {
+  if (!scene) return
+  if (grid) {
+    scene.remove(grid)
+    grid.traverse(disposeNode)
+  }
+  const spec = gridSpec()
+  grid = new THREE.GridHelper(spec.size, spec.divisions, '#284c68', '#173044')
+  grid.name = 'map-grid'
+  grid.rotation.x = Math.PI / 2
+  // Keep the reference grid just below the occupancy texture, so it covers
+  // the complete map without flickering through the map plane.
+  grid.position.set(spec.centerX, spec.centerY, -0.06)
+  scene.add(grid)
 }
 
 function disposeNode(node) {
@@ -396,6 +430,63 @@ function resize() {
   orthographic.updateProjectionMatrix()
 }
 
+function viewportHasKeyboardFocus() {
+  return document.activeElement === host.value
+}
+
+function editableTarget(target) {
+  return target instanceof HTMLElement && (
+    ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(target.tagName)
+    || target.isContentEditable
+  )
+}
+
+function onKeyDown(event) {
+  if (props.mode !== '3d' || !viewportHasKeyboardFocus() || editableTarget(event.target)) return
+  const key = event.key.toLowerCase()
+  if (!['w', 'a', 's', 'd', 'q', 'e', 'shift'].includes(key)) return
+  pressedKeys.add(key)
+  event.preventDefault()
+}
+
+function onKeyUp(event) {
+  pressedKeys.delete(event.key.toLowerCase())
+}
+
+function clearPressedKeys() {
+  pressedKeys.clear()
+}
+
+function moveCamera(deltaSeconds) {
+  if (props.mode !== '3d' || !activeCamera || !pressedKeys.size) return
+  const forward = new THREE.Vector3()
+  activeCamera.getWorldDirection(forward)
+  forward.z = 0
+  if (forward.lengthSq() < 1e-6) forward.set(1, 0, 0)
+  else forward.normalize()
+  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1)).normalize()
+  const direction = new THREE.Vector3()
+  if (pressedKeys.has('w')) direction.add(forward)
+  if (pressedKeys.has('s')) direction.sub(forward)
+  if (pressedKeys.has('d')) direction.add(right)
+  if (pressedKeys.has('a')) direction.sub(right)
+  if (pressedKeys.has('e')) direction.z += 1
+  if (pressedKeys.has('q')) direction.z -= 1
+  if (direction.lengthSq() < 1e-6) return
+  if (props.cameraPreset !== 'overview') emit('camera-preset-change', 'overview')
+  direction.normalize()
+  const { radius } = centerAndRadius()
+  const speed = Math.max(1.5, radius * 0.32) * (pressedKeys.has('shift') ? 3 : 1)
+  const offset = direction.multiplyScalar(speed * Math.min(deltaSeconds, 0.08))
+  activeCamera.position.add(offset)
+  controls.target.add(offset)
+  controls.update()
+}
+
+function focusViewport() {
+  host.value?.focus({ preventScroll: true })
+}
+
 function onWheel(event) {
   zoom.value = nextSemanticZoom(zoom.value, event.deltaY)
   const next = semanticZoomMode(props.mode, zoom.value)
@@ -404,6 +495,8 @@ function onWheel(event) {
 
 function animate(now) {
   animationFrame = requestAnimationFrame(animate)
+  moveCamera((now - lastFrameAt) / 1000)
+  lastFrameAt = now
   controls?.update()
   renderer?.render(scene, activeCamera)
   renderedFrames += 1
@@ -427,6 +520,10 @@ onMounted(() => {
   renderer.outputColorSpace = THREE.SRGBColorSpace
   host.value.appendChild(renderer.domElement)
   controls = new OrbitControls(activeCamera, renderer.domElement)
+  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY
+  controls.mouseButtons.RIGHT = THREE.MOUSE.PAN
+  controls.enableKeys = false
   controls.enableDamping = true
   controls.dampingFactor = .12
   controls.screenSpacePanning = true
@@ -437,17 +534,18 @@ onMounted(() => {
   for (const name of ['occupancy', 'globalCloud', 'localCloud', 'obstacles', 'route', 'trail', 'corrections', 'boundary', 'robot', 'staticAssets', 'streetBlock', 'dynamicObjects']) {
     groups[name] = new THREE.Group(); groups[name].name = name; scene.add(groups[name])
   }
-  const grid = new THREE.GridHelper(60, 60, '#284c68', '#173044')
-  grid.rotation.x = Math.PI / 2
-  scene.add(grid)
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(host.value)
   host.value.addEventListener('wheel', onWheel, { passive: true })
-  updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateStaticAssets(); void updateDynamicAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
+  host.value.addEventListener('pointerdown', focusViewport)
+  window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('keyup', onKeyUp)
+  window.addEventListener('blur', clearPressedKeys)
+  updateGrid(); updateOccupancy(); updateCloudBuffer(); updateLiveCloud(); updateObstacles(); updateRoute(); updateTrail(); updateCorrection(); updateBoundary(); void updateStaticAssets(); void updateDynamicAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateVisibility(); setCamera(); resize()
   animationFrame = requestAnimationFrame(animate)
 })
 
-watch(() => props.manifest, () => { updateOccupancy(); void updateStaticAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
+watch(() => props.manifest, () => { updateGrid(); updateOccupancy(); void updateStaticAssets(); void updateStreetBlock(); void loadAssetCatalog(); updateBoundary(); setCamera(); resize() }, { deep: true })
 watch(() => props.cloudBuffer, updateCloudBuffer)
 watch(() => props.liveCloud, updateLiveCloud)
 watch(() => props.obstacles, updateObstacles)
@@ -469,9 +567,14 @@ onBeforeUnmount(() => {
   staticRenderToken += 1
   dynamicRenderToken += 1
   streetBlockRenderToken += 1
+  clearPressedKeys()
   cancelAnimationFrame(animationFrame)
   resizeObserver?.disconnect()
   host.value?.removeEventListener('wheel', onWheel)
+  host.value?.removeEventListener('pointerdown', focusViewport)
+  window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('keyup', onKeyUp)
+  window.removeEventListener('blur', clearPressedKeys)
   controls?.dispose()
   scene?.traverse(disposeNode)
   renderer?.dispose()
@@ -481,7 +584,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="host" class="scene-viewport" role="img" aria-label="机器狗二维三维场景视图"></div>
+  <div ref="host" class="scene-viewport" role="application" tabindex="0" aria-label="机器狗二维三维场景视图；3D模式可使用鼠标和键盘漫游"></div>
 </template>
 
 <style scoped>

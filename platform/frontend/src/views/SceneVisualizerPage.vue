@@ -619,12 +619,13 @@ onBeforeUnmount(() => {
         <div class="viewport-toolbar">
           <div v-if="mapMode !== 'satellite'" class="segmented"><button :class="{ active: viewMode === '2d' }" @click="viewMode = '2d'">2D</button><button :class="{ active: viewMode === '3d' }" @click="viewMode = '3d'">3D</button><span>滚轮/双指自动切换</span></div>
           <div v-if="mapMode !== 'satellite'" class="segmented"><button v-for="item in [['overview','俯视'],['follow','跟随'],['dog','机器狗视角']]" :key="item[0]" :class="{ active: cameraPreset === item[0] }" @click="selectCamera(item[0])">{{ item[1] }}</button></div>
+          <span v-if="viewMode === '3d' && mapMode !== 'satellite'" class="mode-hint">点入视图后：左键旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 平移 · Q/E 升降 · Shift 加速</span>
           <span v-if="mapMode === 'street-block'" class="mode-hint">点云识别 → GLB静态资产拼接 · 实时目标</span>
           <span v-else-if="mapMode === 'satellite'" class="mode-hint">高德卫星来源</span>
           <span class="render-stats">{{ renderStats.fps }} FPS · {{ renderStats.points.toLocaleString() }} 点</span>
         </div>
         <div class="viewport-wrap">
-          <SceneViewport v-if="mapMode !== 'satellite'" :manifest="manifest" :cloud-buffer="cloudBuffer" :live-cloud="liveCloud" :obstacles="obstacles" :trail="trail" :correction="correction" :robot-pose="robotPose" :waypoints="routeWaypoints" :static-assets="viewportStaticAssets" :dynamic-objects="dynamicObjects" :layers="layers" :mode="viewMode" :map-mode="mapMode" :camera-preset="cameraPreset" @mode-change="viewMode = $event" @stats="renderStats = $event" @error="error = $event" @asset-inference="handleAssetInference" />
+          <SceneViewport v-if="mapMode !== 'satellite'" :manifest="manifest" :cloud-buffer="cloudBuffer" :live-cloud="liveCloud" :obstacles="obstacles" :trail="trail" :correction="correction" :robot-pose="robotPose" :waypoints="routeWaypoints" :static-assets="viewportStaticAssets" :dynamic-objects="dynamicObjects" :layers="layers" :mode="viewMode" :map-mode="mapMode" :camera-preset="cameraPreset" @mode-change="viewMode = $event" @camera-preset-change="cameraPreset = $event" @stats="renderStats = $event" @error="error = $event" @asset-inference="handleAssetInference" />
           <AmapSatelliteViewport v-else :geo-reference="manifest?.geo_reference" :robot-pose="robotPose" :trail="trail" :waypoints="routeWaypoints" />
           <div v-if="loading || sceneLoading" class="scene-loading">{{ loading ? '正在加载设备与地图…' : '正在生成/加载三维点云预览…' }}</div>
           <div class="scene-legend"><span><i class="robot"></i>机器狗</span><span><i class="route"></i>规划路线</span><span><i class="cloud"></i>局部点云</span><span><i class="object"></i>{{ mapMode === 'street-block' ? '街区静态/实时资产' : '识别资产' }}</span></div>
