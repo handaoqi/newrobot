@@ -4331,7 +4331,8 @@ async function handleDeleteRoute(route) {
           </div>
 
         </div>
-        <section v-if="selectedMap?.thumbnail_url" class="keyframe-panel route-keyframe-row mapping-keyframe-row" :class="{ open: keyframePanelOpen }">
+        <div v-if="selectedMap?.thumbnail_url" class="route-keyframe-stack">
+        <section class="keyframe-panel" :class="{ open: keyframePanelOpen }">
           <button type="button" class="keyframe-panel-toggle" @click="keyframePanelOpen = !keyframePanelOpen">
             <span>建图关键帧（{{ mappingTrace.length }}）</span>
             <strong>{{ keyframePanelOpen ? '收起' : '展开' }}</strong>
@@ -4373,7 +4374,7 @@ async function handleDeleteRoute(route) {
             </template>
           </div>
         </section>
-        <section v-if="selectedMap?.thumbnail_url" class="keyframe-panel route-keyframe-row task-keyframe-row" :class="{ open: taskKeyframePanelOpen }">
+        <section class="keyframe-panel" :class="{ open: taskKeyframePanelOpen }">
           <button type="button" class="keyframe-panel-toggle" @click="taskKeyframePanelOpen = !taskKeyframePanelOpen">
             <span>任务关键帧（{{ taskKeyframeSamples.length }}）</span>
             <strong>{{ taskKeyframePanelOpen ? '收起' : '展开' }}</strong>
@@ -4409,6 +4410,7 @@ async function handleDeleteRoute(route) {
             </template>
           </div>
         </section>
+        </div>
       </div>
     </section>
     <SystemLogPanel :robot-id="selectedRobot?.id" :map-id="selectedMap?.id" @locate="locateSystemLog" />
@@ -6238,8 +6240,14 @@ async function handleDeleteRoute(route) {
   align-self: start;
 }
 
-.mapping-keyframe-row { grid-row: 3; }
-.task-keyframe-row { grid-row: 4; }
+.route-keyframe-stack {
+  display: grid;
+  grid-column: 1 / span 3;
+  grid-row: 3;
+  min-width: 0;
+  align-self: start;
+  gap: 0.45rem;
+}
 
 .keyframe-panel-toggle {
   display: flex;
@@ -6877,7 +6885,8 @@ async function handleDeleteRoute(route) {
     .route-step-5,
     .map-preview-area,
     .route-timeline-column,
-    .route-keyframe-row {
+    .route-keyframe-row,
+    .route-keyframe-stack {
     grid-column: 1;
     grid-row: auto;
   }
@@ -6887,10 +6896,9 @@ async function handleDeleteRoute(route) {
   .route-drill-panel { grid-row: 3; }
   .map-preview-area { grid-row: 4; }
   .route-step-3 { grid-row: 5; }
-  .mapping-keyframe-row { grid-row: 6; }
-  .task-keyframe-row { grid-row: 7; }
-  .route-timeline-column { grid-row: 8; }
-  .route-step-5 { grid-row: 9; }
+  .route-keyframe-stack { grid-row: 6; }
+  .route-timeline-column { grid-row: 7; }
+  .route-step-5 { grid-row: 8; }
 
   .route-step-3 {
     min-height: 0;
