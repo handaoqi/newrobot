@@ -47,6 +47,10 @@ const latestCommand = computed(() => {
   const commands = execution.value?.commands || []
   return commands[commands.length - 1] || null
 })
+const startupCommands = computed(() => {
+  const commands = execution.value?.startup_commands
+  return Array.isArray(commands) && commands.length ? commands : (execution.value?.commands || [])
+})
 const failureInfo = computed(() => buildFailureInfo())
 const failedWaypointIndexes = computed(() => failureInfo.value.waypointIndexes)
 const localizationLossMarkers = computed(() => buildLocalizationLossMarkers(
@@ -250,6 +254,13 @@ function commandResult(command = latestCommand.value) {
   } catch {
     return {}
   }
+}
+
+function commandIssuedAt(command = {}) {
+  const value = command.issued_at || command.created_at
+  if (!value) return '时间未上报'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('zh-CN', { hour12: false })
 }
 
 function parseWaypointIndexes(text = '') {
@@ -602,9 +613,10 @@ onBeforeUnmount(() => {
 
       <div class="panel detail-panel">
         <h3>命令生命周期</h3>
-        <article v-for="command in execution.commands" :key="command.id" class="task-card">
+        <article v-for="command in startupCommands" :key="command.id" class="task-card">
           <strong>{{ command.command_type }}</strong>
           <span>{{ command.status }} · {{ command.error_code || command.ack_reason_code || 'OK' }}</span>
+          <small>下发时间：{{ commandIssuedAt(command) }}</small>
           <small v-if="command.error_message">{{ command.error_message }}</small>
         </article>
       </div>

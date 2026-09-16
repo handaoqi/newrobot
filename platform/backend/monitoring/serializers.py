@@ -1643,6 +1643,7 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
     map_name = serializers.CharField(source="map_data.name", read_only=True, allow_null=True)
     events = TaskExecutionEventSerializer(many=True, read_only=True)
     commands = RemoteCommandSerializer(many=True, read_only=True)
+    startup_commands = serializers.SerializerMethodField()
     execution_source = serializers.SerializerMethodField()
     execution_source_label = serializers.SerializerMethodField()
 
@@ -1683,10 +1684,28 @@ class TaskExecutionSerializer(serializers.ModelSerializer):
             "updated_at",
             "events",
             "commands",
+            "startup_commands",
         ]
 
     def get_execution_source(self, obj):
         return _task_execution_source(obj)[0]
+
+    def get_startup_commands(self, obj):
+        """Expose map/nav/task commands joined by the immediate-start trace.
+
+        Map activation and navigation startup precede creation of the task
+        execution, so they cannot use its foreign key.  The shared trace ID is
+        the durable ownership link and preserves each command's issued_at time
+        for the execution-detail startup timeline.
+        """
+        start = obj.commands.filter(command_type="task.start").order_by("issued_at").first()
+        if start is None:
+            return []
+        commands = RemoteCommand.objects.filter(
+            robot_id=obj.robot_id,
+            trace_id=start.trace_id,
+        ).order_by("issued_at")
+        return RemoteCommandSerializer(commands, many=True, context=self.context).data
 
     def get_execution_source_label(self, obj):
         return _task_execution_source(obj)[1]

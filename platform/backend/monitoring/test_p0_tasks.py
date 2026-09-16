@@ -582,6 +582,23 @@ class TaskExecutionTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_task_execute_keeps_shared_trace_and_returns_timestamped_startup_commands(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        trace_id = str(uuid.uuid4())
+        response = client.post(
+            f"/api/patrol-tasks/{self.task.id}/execute/",
+            {},
+            format="json",
+            HTTP_X_TRACE_ID=trace_id,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        command = RemoteCommand.objects.get(task_execution_id=response.data["id"], command_type="task.start")
+        self.assertEqual(str(command.trace_id), trace_id)
+        self.assertEqual([item["id"] for item in response.data["startup_commands"]], [str(command.id)])
+        self.assertIsNotNone(response.data["startup_commands"][0]["issued_at"])
+
     def test_route_api_execute_creates_quick_task_and_command(self):
         client = APIClient()
         client.force_authenticate(self.user)

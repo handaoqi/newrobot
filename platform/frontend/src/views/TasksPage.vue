@@ -6,8 +6,10 @@ import {
   createPatrolTask,
   deletePatrolTask,
   executePatrolTask,
+  fetchMapDetail,
   fetchPatrolTasks,
   fetchRobots,
+  fetchRouteDetail,
   fetchRouteSummaries,
   updatePatrolTask,
 } from '../services/api'
@@ -23,6 +25,7 @@ const error = ref('')
 const savingRecordTaskId = ref(null)
 const executingTaskId = ref(null)
 const executionProgress = ref('')
+const executionStartupSteps = ref([])
 const form = ref({ name: '', robot: '', route: '', description: '', enabled: true, record_rosbag: false })
 
 const routeOptions = computed(() => {
@@ -98,22 +101,43 @@ async function createTask() {
 async function execute(task) {
   error.value = ''
   executingTaskId.value = task.id
+  executionStartupSteps.value = []
   const batteryPercent = resolveBatteryPercent(null, robots.value.find(robot => String(robot.id) === String(task.robot)))
   if (isLowBatteryBlocked(batteryPercent)) {
     error.value = lowBatteryGuardMessage(batteryPercent)
     executingTaskId.value = null
     return
   }
-  executionProgress.value = '正在检查机器狗地图'
+  const traceId = newTaskTraceId()
+  recordStartupStep('启动请求已创建', { issued_at: new Date().toISOString(), status: 'created' })
+  executionProgress.value = '正在读取任务路线和地图配置'
   try {
+    if (!task.route || !task.map_id) throw new Error('任务未绑定完整路线或地图，无法立即执行')
+    const [route, map] = await Promise.all([
+      fetchRouteDetail(task.route),
+      fetchMapDetail(task.map_id),
+    ])
+    if (String(route.robot) !== String(task.robot) || String(route.map_data) !== String(task.map_id)) {
+      throw new Error('任务、路线和地图绑定不一致，请刷新任务列表后重试')
+    }
     await activateAndRelocalizeMap({
-      mapId: task.map_id,
+      mapId: route.map_data,
       robotId: task.robot,
-      waypoints: task.route_snapshot?.waypoints || task.waypoints || [],
+      sceneScope: map.scene_scope || route.scene_scope || 'indoor',
+      coordinateMode: map.coordinate_mode || 'local_only',
+      localizationMode: route.waypoints?.[0]?.localization_mode || map.localization_mode || 'ndt',
+      waypoints: route.waypoints || [],
+      traceId,
       onProgress: message => { executionProgress.value = message },
+      onCommand: event => recordStartupStep(startupStepLabel(event.phase, event.command), event.command),
     })
     executionProgress.value = '地图与定位已就绪，正在下发巡检任务'
-    const execution = await executePatrolTask(task.id)
+    const execution = await executePatrolTask(task.id, {
+      recordRosbag: Boolean(task.effective_record_rosbag),
+      traceId,
+    })
+    const startCommand = (execution.commands || []).find(command => command.command_type === 'task.start')
+    if (startCommand) recordStartupStep('巡检任务已下发', startCommand)
     router.push(`/dashboard/task-executions/${execution.id}`)
   } catch (exc) {
     error.value = exc.message
@@ -121,6 +145,43 @@ async function execute(task) {
     executingTaskId.value = null
     executionProgress.value = ''
   }
+}
+
+function newTaskTraceId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  const hex = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0')
+  return `${hex()}-${hex().slice(0, 4)}-4${hex().slice(1, 4)}-8${hex().slice(1, 4)}-${hex()}${hex().slice(0, 4)}`
+}
+
+function startupStepLabel(phase, command = {}) {
+  if (phase === 'transfer') return '地图下发命令'
+  if (phase === 'localization') return String(command.command_type || '').includes('nav.start')
+    ? '导航栈与定位启动命令'
+    : '定位初始化命令'
+  return command.command_type || '启动命令'
+}
+
+function recordStartupStep(label, command = {}) {
+  const issuedAt = command.issued_at || command.created_at || new Date().toISOString()
+  const commandId = String(command.id || `${label}:${issuedAt}`)
+  const existing = executionStartupSteps.value.find(item => item.commandId === commandId)
+  if (existing) {
+    existing.status = command.status || existing.status
+    existing.issuedAt = command.issued_at || existing.issuedAt
+    return
+  }
+  executionStartupSteps.value.push({
+    commandId,
+    label,
+    status: command.status || 'created',
+    issuedAt,
+  })
+}
+
+function formatCommandTime(value) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '时间未上报'
+  return date.toLocaleTimeString('zh-CN', { hour12: false })
 }
 
 async function setTaskRecording(task, event) {
@@ -213,6 +274,13 @@ onMounted(load)
 
     <section class="panel detail-panel">
       <p v-if="executionProgress" class="muted-note execution-progress">{{ executionProgress }}</p>
+      <ol v-if="executingTaskId !== null && executionStartupSteps.length" class="startup-command-steps">
+        <li v-for="step in executionStartupSteps" :key="step.commandId">
+          <strong>{{ step.label }}</strong>
+          <span>{{ step.status }}</span>
+          <time>{{ formatCommandTime(step.issuedAt) }}</time>
+        </li>
+      </ol>
       <div class="task-list">
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div>
@@ -260,6 +328,29 @@ onMounted(load)
 .form-record-toggle {
   grid-column: 1 / -1;
 }
+
+.startup-command-steps {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.startup-command-steps li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.startup-command-steps strong { color: var(--text); }
+.startup-command-steps time { font-variant-numeric: tabular-nums; }
 
 .diagnostic-record-toggle input {
   width: 18px;
