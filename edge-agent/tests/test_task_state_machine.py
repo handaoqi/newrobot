@@ -5538,6 +5538,7 @@ def test_navigation_missed_waypoints_fails_task(tmp_path):
     assert executor.context.state == "failed"
     assert results[0][1] == "failed"
     assert results[0][3] == "NAVIGATION_MISSED_WAYPOINTS"
+    assert "map points:" in results[0][4]
     store.close()
 
 

@@ -6986,9 +6986,21 @@ class TaskExecutor:
                 missed = list((details or {}).get("missed_waypoints") or [])
                 if missed:
                     absolute_missed = [index + self._goal_offset for index in missed]
+                    waypoint_labels = []
+                    for index in absolute_missed:
+                        if 0 <= index < len(self.context.route_snapshot.get("waypoints", [])):
+                            waypoint = self.context.route_snapshot["waypoints"][index]
+                            map_point = waypoint.get("map_point_number", index + 1)
+                            waypoint_labels.append(
+                                f"{map_point}@({float(waypoint.get('x', 0.0)):.3f},"
+                                f"{float(waypoint.get('y', 0.0)):.3f})"
+                            )
+                        else:
+                            waypoint_labels.append(str(index))
+                    detail_suffix = f" (map points: {', '.join(waypoint_labels)})"
                     self._fail(
                         "NAVIGATION_MISSED_WAYPOINTS",
-                        f"Nav2 reported missed waypoints: {absolute_missed}",
+                        f"Nav2 reported missed waypoints: {absolute_missed}{detail_suffix}",
                     )
                     return
                 departure_heading_completed = self._departure_heading_index is not None
