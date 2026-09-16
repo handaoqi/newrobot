@@ -8287,10 +8287,54 @@ class TaskExecutor:
         if self._is_docking_task():
             self._apply_docking_profile(waypoint_index)
 
+    def _effective_navigation_map_info(self) -> dict:
+        """Return route map metadata reconciled with the activated map package.
+
+        Older route snapshots may contain indoor/local_only defaults even when
+        the selected map package has an RTK-fixed origin.  During task startup
+        the activated package is authoritative, provided it is the same map;
+        this keeps RTK trusted-seed selection consistent with map activation.
+        """
+        if not self.context:
+            return {}
+        route_snapshot = self.context.route_snapshot or {}
+        route_map = dict(route_snapshot.get("map") or {})
+        adapter = self.map_activation_adapter
+        status_reader = getattr(adapter, "status", None) if adapter is not None else None
+        if not callable(status_reader):
+            return route_map
+        try:
+            active = status_reader() or {}
+        except Exception:
+            LOGGER.debug("unable to read active map constraints during task startup", exc_info=True)
+            return route_map
+        if not isinstance(active, dict):
+            return route_map
+        route_map_id = str(route_map.get("map_id") or "").strip()
+        active_map_id = str(active.get("map_id") or "").strip()
+        if route_map_id and active_map_id and route_map_id != active_map_id:
+            return route_map
+        active_constraints = active.get("map_constraints")
+        if not isinstance(active_constraints, dict):
+            active_constraints = {}
+        active_coordinate = str(
+            active.get("coordinate_mode") or active_constraints.get("coordinate_mode") or ""
+        ).strip().lower()
+        active_scene = str(
+            active.get("scene_scope") or active_constraints.get("scene_scope") or ""
+        ).strip().lower()
+        if active_coordinate in {"rtk_fixed", "local_only"}:
+            route_map["coordinate_mode"] = active_coordinate
+        if active_scene in {"indoor", "transition", "outdoor"}:
+            route_map["scene_scope"] = active_scene
+        if active_constraints.get("localization_mode"):
+            route_map["map_localization_mode"] = active_constraints["localization_mode"]
+        return route_map
+
     def _outdoor_navigation_profile(self) -> bool:
         if not self.context:
             return False
-        map_info = self.context.route_snapshot.get("map") or {}
+        map_info = self._effective_navigation_map_info()
         scene_scope = str(
             map_info.get("scene_scope")
             or self.context.route_snapshot.get("scene_scope")

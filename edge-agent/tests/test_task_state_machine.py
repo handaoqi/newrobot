@@ -2648,6 +2648,45 @@ def test_outdoor_fixed_rtk_stability_failure_uses_mapping_origin_progressive_sea
     store.close()
 
 
+def test_startup_profile_uses_active_rtk_fixed_map_when_route_snapshot_is_legacy_indoor(tmp_path):
+    store = LocalStore(str(tmp_path / "edge.db"))
+    nav = FakeNavigation()
+    mapping = SimpleNamespace(
+        mapping_start_pose=lambda: {"x": 8.0, "y": 9.0, "z": 0.0, "yaw": 0.4},
+        status=lambda: {
+            "map_id": "outdoor-a",
+            "coordinate_mode": "rtk_fixed",
+            "scene_scope": "outdoor",
+            "map_constraints": {
+                "coordinate_mode": "rtk_fixed",
+                "scene_scope": "outdoor",
+                "localization_mode": "rtk_ndt",
+            },
+        },
+    )
+    executor = TaskExecutor(
+        store,
+        nav,
+        event_callback=lambda *args: None,
+        start_result_callback=lambda *args: None,
+        map_activation_adapter=mapping,
+    )
+    envelope = command("task.start")
+    envelope.payload["command"]["route_snapshot"]["map"] = {
+        "map_id": "outdoor-a",
+        "map_version": "v1",
+        "coordinate_mode": "local_only",
+        "scene_scope": "indoor",
+    }
+    envelope.payload["command"]["route_snapshot"]["scene_scope"] = "indoor"
+    executor.prepare_task_start(envelope)
+
+    assert executor._outdoor_navigation_profile() is True
+    assert executor._effective_navigation_map_info()["coordinate_mode"] == "rtk_fixed"
+    assert executor._effective_navigation_map_info()["scene_scope"] == "outdoor"
+    store.close()
+
+
 def test_outdoor_rtk_heading_conflict_uses_mapping_origin_progressive_search(tmp_path):
     store = LocalStore(str(tmp_path / "edge.db"))
     nav = FakeNavigation()
