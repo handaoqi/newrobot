@@ -25,6 +25,37 @@ class NavigationStackAdapter:
             return status_payload
         return self._run("start", timeout_seconds=max(self.config.command_timeout_seconds, 180))
 
+    def prepare(self, command: dict | None = None) -> dict:
+        """Start localization and Nav2's map/safety group without controllers."""
+        status_payload = self.status()
+        if status_payload.get("returncode") == 0 and self._looks_prepared(status_payload.get("stdout", "")):
+            status_payload["action"] = "prepare"
+            status_payload["recovery"] = "already_prepared"
+            return status_payload
+        return self._run("prepare", timeout_seconds=max(self.config.command_timeout_seconds, 90))
+
+    def activate_execution(self) -> dict:
+        status_payload = self.status()
+        if status_payload.get("returncode") == 0 and self._looks_ready(status_payload.get("stdout", "")):
+            status_payload["action"] = "activate_execution"
+            status_payload["recovery"] = "already_active"
+            return status_payload
+        return self._run("activate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 45))
+
+    def deactivate_execution(self) -> dict:
+        return self._run("deactivate-execution", timeout_seconds=max(self.config.command_timeout_seconds, 30))
+
+    def reconcile(self) -> dict:
+        """Report the resident stack's lifecycle state without changing it."""
+        status_payload = self.status()
+        stdout = str(status_payload.get("stdout") or "")
+        return {
+            **status_payload,
+            "action": "reconcile",
+            "stack_prepared": self._looks_prepared(stdout),
+            "execution_active": self._looks_ready(stdout),
+        }
+
     def restart(self, command: dict | None = None) -> dict:
         return self._run("restart", timeout_seconds=max(self.config.command_timeout_seconds, 180))
 
@@ -46,6 +77,10 @@ class NavigationStackAdapter:
 
     def stop(self, command: dict | None = None) -> dict:
         return self._run("stop", timeout_seconds=self.config.command_timeout_seconds)
+
+    def shutdown(self) -> dict:
+        """Explicit lifecycle teardown alias for callers that require it."""
+        return self.stop({"reason": "shutdown"})
 
     def switch_map(self) -> dict:
         """Reload localization and Nav2 after map symlinks changed."""
@@ -291,6 +326,12 @@ class NavigationStackAdapter:
             "status: 3",
         )
         return all(token in stdout for token in required)
+
+    @staticmethod
+    def _looks_prepared(stdout: str) -> bool:
+        return all(token in stdout for token in (
+            "localization_node", "navigo_container", "/map_server", "/collision_monitor",
+        ))
 
     @staticmethod
     def _decode_subprocess_output(value: str | bytes | None) -> str:

@@ -2444,25 +2444,20 @@ private:
     if (observation.heading_usable) {
       drift_yaw = pose_estimator->quat().angularDistance(observation.orientation);
     }
-    // Self-stable fixed RTK trusts dual-antenna heading the same way it trusts
-    // XY. The normal 30 deg gate still protects against heading flicker while
-    // the RTK stream is not yet self-stable.
-    const bool yaw_trusted = localization::rtkHeadingTrustedForCorrection(
-      observation.heading_usable, drift_yaw, lio_max_correction_yaw_rad_,
-      trust_rtk);
+    // Stopped waypoint correction may use a trusted dual-antenna heading.
+    // Cruise keeps FAST-LIO/IMU yaw and only nudges XY; a 12 deg residual
+    // is inside the 30 deg gate but still yanks a live Nav2 goal.
+    const bool yaw_trusted =
+      localization::rtkHeadingAllowedForCorrection(motion_phase_ == "moving") &&
+      localization::rtkHeadingTrustedForCorrection(
+        observation.heading_usable, drift_yaw, lio_max_correction_yaw_rad_,
+        trust_rtk);
     if (observation.heading_usable && !yaw_trusted) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "RTK heading residual %.1fdeg exceeds %.1fdeg; discarding yaw, XY-only "
-        "(rtk_self_stable=no)",
+        "RTK heading residual %.1fdeg not trusted; discarding yaw, XY-only "
+        "(rtk_self_stable=%s)",
         drift_yaw * 180.0 / M_PI,
-        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
-    } else if (observation.heading_usable && trust_rtk &&
-               drift_yaw > lio_max_correction_yaw_rad_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "RTK heading residual %.1fdeg exceeds %.1fdeg; trusting yaw because "
-        "fixed RTK is self_stable",
-        drift_yaw * 180.0 / M_PI,
-        lio_max_correction_yaw_rad_ * 180.0 / M_PI);
+        trust_rtk ? "yes" : "no");
     }
     const bool drifted = force_correction || drift_xy >= lio_drift_xy_m_ ||
       (yaw_trusted && drift_yaw >= lio_drift_yaw_rad_);
@@ -2657,7 +2652,8 @@ private:
     candidate.yaw = std::atan2(
       observation.orientation.toRotationMatrix()(1, 0),
       observation.orientation.toRotationMatrix()(0, 0));
-    candidate.yaw_valid = observation.heading_usable;
+    candidate.yaw_valid = observation.heading_usable &&
+      localization::rtkHeadingAllowedForCorrection(motion_phase_ == "moving");
     candidate.horizontal_variance = noise.horizontal_variance;
     candidate.orientation_variance = noise.orientation_variance;
     candidate.residual_xy =
@@ -3198,14 +3194,22 @@ private:
     updateRtkPrimaryLatch(
       latch_state,
       RtkPrimaryLatchConfig{rtk_primary_promote_samples_, rtk_primary_demote_samples_},
-      rtkGoodForNavigation(observation));
+      rtkGoodForNavigation(observation),
+      motion_phase_ == "moving");
     rtk_auto_primary_latched_ = latch_state.latched;
     rtk_auto_primary_good_frames_ = latch_state.good_frames;
     rtk_auto_primary_bad_frames_ = latch_state.bad_frames;
     if (!was_latched && rtk_auto_primary_latched_) {
       RCLCPP_INFO(get_logger(),
-        "Outdoor RTK is fixed with a valid heading; GPS is the navigation pose (FAST-LIO/NDT paused)");
+        "Outdoor RTK is fixed with a valid heading; GPS may drive XY while NDT stays a map-consistency check");
       return;
+    }
+    if (!was_latched && !rtk_auto_primary_latched_ &&
+        rtk_auto_primary_good_frames_ >= rtk_primary_promote_samples_ &&
+        motion_phase_ == "moving") {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "RTK primary evidence is ready; waiting to stop before switching the live Nav2 pose source");
     }
     if (was_latched && !rtk_auto_primary_latched_) {
       suppressLioMotionAnomalyForRtkHandoff("RTK primary demoted");
@@ -3371,17 +3375,30 @@ private:
     const float rtk_yaw = std::atan2(
       observation.orientation.toRotationMatrix()(1, 0),
       observation.orientation.toRotationMatrix()(0, 0));
-    const float injected_yaw = observation.heading_usable
-      ? slewRtkYaw(rtk_yaw) : rtk_yaw;
+    const float current_yaw = currentEstimatorYaw();
+    const float drift_yaw = std::fabs(std::atan2(
+      std::sin(rtk_yaw - current_yaw),
+      std::cos(rtk_yaw - current_yaw)));
+    const bool inject_heading =
+      localization::rtkHeadingAllowedForCorrection(motion_phase_ == "moving") &&
+      localization::rtkHeadingTrustedForCorrection(
+        observation.heading_usable, drift_yaw, lio_max_correction_yaw_rad_, false);
+    if (observation.heading_usable && !inject_heading) {
+      rtk_yaw_slew_initialized_ = false;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "RTK primary heading residual %.1fdeg; GPS XY only, keeping current yaw",
+        drift_yaw * 180.0 / M_PI);
+    }
+    const float injected_yaw = inject_heading ? slewRtkYaw(rtk_yaw) : current_yaw;
     const float horizontal_variance = static_cast<float>(std::max(
       observation.horizontal_std_m * observation.horizontal_std_m, 0.20 * 0.20));
     const float vertical_variance = gnss_use_elevation_ ? horizontal_variance : 1.0f;
-    const float heading_variance = observation.heading_usable
+    const float heading_variance = inject_heading
       ? static_cast<float>(std::max(
           observation.heading_std_rad * observation.heading_std_rad, 0.035 * 0.035))
       : 1.0e6f;
     pose_estimator->inject_rtk_xy_yaw(
-      position, observation.heading_usable, injected_yaw, !gnss_use_elevation_,
+      position, inject_heading, injected_yaw, !gnss_use_elevation_,
       horizontal_variance, vertical_variance, heading_variance);
     last_rtk_primary_applied_stamp_ns_ = observation.stamp_ns;
     is_init_success_ = true;
@@ -3390,7 +3407,7 @@ private:
     last_rtk_map_position_ = position;
     last_rtk_map_yaw_ = rtk_yaw;
     rtk_position_fused_this_frame_ = true;
-    if (observation.heading_usable) {
+    if (inject_heading) {
       last_rtk_heading_fused_stamp_ns_ = observation.heading_stamp_ns;
       rtk_heading_fused_this_frame_ = true;
     }
@@ -3399,6 +3416,7 @@ private:
 
   bool applyRtkHeadingObservation(const RtkObservation& observation) {
     if (!pose_estimator || !observation.heading_usable ||
+        !localization::rtkHeadingAllowedForCorrection(motion_phase_ == "moving") ||
         observation.heading_stamp_ns <= 0 ||
         observation.heading_stamp_ns == last_rtk_heading_fused_stamp_ns_) {
       return false;
@@ -3411,6 +3429,17 @@ private:
     const float rtk_yaw = std::atan2(
       observation.orientation.toRotationMatrix()(1, 0),
       observation.orientation.toRotationMatrix()(0, 0));
+    const float current_yaw = currentEstimatorYaw();
+    const float drift_yaw = std::fabs(std::atan2(
+      std::sin(rtk_yaw - current_yaw),
+      std::cos(rtk_yaw - current_yaw)));
+    if (!localization::rtkHeadingTrustedForCorrection(
+          true, drift_yaw, lio_max_correction_yaw_rad_, false)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "RTK heading residual %.1fdeg; skipping heading-only inject",
+        drift_yaw * 180.0 / M_PI);
+      return false;
+    }
     const Eigen::Quaternionf heading_orientation =
       Eigen::AngleAxisf(rtk_yaw, Eigen::Vector3f::UnitZ()) *
       Eigen::AngleAxisf(current_rpy.y(), Eigen::Vector3f::UnitY()) *
@@ -4026,9 +4055,45 @@ private:
     return true;
   }
 
-  bool resetPoseEstimatorFromFixedRtk(const char* reason) {
-    if (!seedPositionFromGnss(get_clock()->now(), reason, true, true)) {
+  bool shouldPreserveVehicleYaw() const {
+    if (!pose_estimator) {
       return false;
+    }
+    if (preserved_vehicle_yaw_valid_) {
+      return true;
+    }
+    return is_init_success_ || has_valid_pose_history_ || localization_state_ >= 2;
+  }
+
+  Eigen::Quaternionf vehicleYawToPreserve() const {
+    if (pose_estimator &&
+        (is_init_success_ || has_valid_pose_history_ || localization_state_ >= 2)) {
+      return pose_estimator->quat();
+    }
+    return preserved_vehicle_yaw_;
+  }
+
+  void rememberVehicleYawForReload() {
+    if (!pose_estimator || !use_gnss_fusion_ || !gnss_map_origin_loaded_) {
+      preserved_vehicle_yaw_valid_ = false;
+      return;
+    }
+    if (!(is_init_success_ || has_valid_pose_history_ || localization_state_ >= 2)) {
+      return;
+    }
+    preserved_vehicle_yaw_ = pose_estimator->quat();
+    preserved_vehicle_yaw_valid_ = true;
+  }
+
+  bool resetPoseEstimatorFromFixedRtk(const char* reason) {
+    const bool preserve_yaw = shouldPreserveVehicleYaw();
+    const Eigen::Quaternionf preserved_yaw = preserve_yaw
+      ? vehicleYawToPreserve() : last_init_quat_;
+    if (!seedPositionFromGnss(get_clock()->now(), reason, true, !preserve_yaw)) {
+      return false;
+    }
+    if (preserve_yaw) {
+      last_init_quat_ = preserved_yaw;
     }
     advanceGlobalRelocalizationGeneration(reason);
     pose_estimator = createPoseEstimator(last_init_pos_, last_init_quat_);
@@ -4067,8 +4132,9 @@ private:
       localization_state_ = 2;
       initialization_verified_ = true;
       initialization_state_ = "localized";
-      // Align the continuous LIO map←odom bridge to the RTK XY+yaw seed now so
-      // the next LIO frame does not reintroduce a large yaw residual.
+      // GPS XY is the seed. Dual-antenna yaw is not written into UKF when a
+      // trusted vehicle heading already exists, so LIO/IMU keep pointing the
+      // body the same way after this reset.
       reanchorLioToUkf();
       beginLioHandoff("rtk_fixed");
       const float seeded_yaw = yawFromRotation(last_init_quat_.toRotationMatrix());
@@ -4077,7 +4143,7 @@ private:
         "x=%.3f y=%.3f yaw=%.1fdeg heading=%s lio_anchor=%s",
         prefer_fixed_rtk_ ? "absolute seed pending RTK-primary promotion" : "absolute seed (LIO remains continuous)",
         reason, last_init_pos_.x(), last_init_pos_.y(), seeded_yaw * 180.0 / M_PI,
-        rtk.heading_usable ? "rtk" : "missing",
+        preserve_yaw ? "preserved" : (rtk.heading_usable ? "rtk" : "missing"),
         lio_anchor_valid_.load() ? "aligned" : "pending");
       return true;
     }
@@ -4451,24 +4517,10 @@ private:
     // above the calibration is known good, so push the gyro bias in exactly once.
     // Safe here because this callback holds pose_estimator_mutex; imu_callback does not.
     seedImuBiasesOnce();
-    // Use the previous frame's RTK-primary latch so this callback can skip
-    // cloud conversion before the expensive PCL work. Promotion/demotion still
-    // runs later in the same callback from the latest RTK sample.
-    const bool skip_lidar_matching = rtkPrimaryShouldDrive(
-      source_arbiter_enable_, bridge_active_, rtk_auto_primary_latched_);
-    if (skip_lidar_matching != lidar_matching_paused_for_rtk_) {
-      lidar_matching_paused_for_rtk_ = skip_lidar_matching;
-      if (skip_lidar_matching) {
-        resetLidarOdometryState();
-        RCLCPP_INFO(get_logger(),
-          "Outdoor RTK is good for navigation; pausing NDT, VGICP, lidar-odometry, and cloud conversion until RTK drops");
-      } else {
-        RCLCPP_INFO(get_logger(),
-          "RTK is no longer good for navigation; resuming NDT matching from the current RTK pose");
-      }
-    }
-    if (!skip_lidar_matching &&
-        (!global_map_points_ptr_ || global_map_points_ptr_->empty())) {
+    // Fixed RTK never pauses cloud conversion or NDT. The previous-frame
+    // GPS latch used to skip matching here and left Nav2 without a lidar
+    // consistency check after a live goal started.
+    if (!global_map_points_ptr_ || global_map_points_ptr_->empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5.0, "Radar CallBack Waiting for Globalmap Input!!");
       pubDefaultLocalizationOdom(points_msg->header.stamp);
       return;
@@ -4479,14 +4531,12 @@ private:
       return;
     }
 
-    const builtin_interfaces::msg::Time stamp = skip_lidar_matching
-      ? static_cast<builtin_interfaces::msg::Time>(get_clock()->now())
-      : points_msg->header.stamp;
+    const builtin_interfaces::msg::Time stamp = points_msg->header.stamp;
     ++ndt_frame_counter_;
     const bool lio_fresh_for_schedule = enable_lio_primary_ && is_init_success_ &&
       lioOdomFresh(rclcpp::Time(stamp));
     const bool lidar_odometry_required = enable_lidar_odometry_prediction_ &&
-      !(lio_fresh_for_schedule && !rtk_auto_primary_latched_);
+      !lio_fresh_for_schedule;
     PointCloudScheduleConfig schedule_config;
     schedule_config.initialization_stride = initialization_ndt_stride_;
     schedule_config.stationary_stride = stationary_ndt_stride_;
@@ -4495,8 +4545,8 @@ private:
     schedule_config.recovery_max_rate_hz = recovery_ndt_max_rate_hz_;
     PointCloudScheduleInput schedule_input;
     schedule_input.initialized = is_init_success_;
-    schedule_input.lidar_matching_paused = skip_lidar_matching;
-    schedule_input.rtk_primary = skip_lidar_matching;
+    schedule_input.lidar_matching_paused = false;
+    schedule_input.rtk_primary = rtk_auto_primary_latched_;
     const std::int64_t schedule_now_ns = steadyNowNanoseconds();
     schedule_input.global_relocalization_requested =
       use_global_localization_init_ && gl_once_gate_ && global_localization_ptr_ &&
@@ -4748,7 +4798,7 @@ private:
       imu_data.clear();
     }
 
-    if (!skip_lidar_matching && lidar_odometry_required && pose_estimator) {
+    if (lidar_odometry_required && pose_estimator) {
       const auto lidar_odom_start = SteadyClock::now();
       pose_estimator->enable_lidar_odometry_prediction();
       updateLidarOdometryPrediction(raw_points_ptr_, rclcpp::Time(stamp));
@@ -4846,7 +4896,7 @@ private:
     // LiDAR frame while stationary or during initialization.
     // NDT remains the low-rate map-consistency observation even when RTK is
     // fixed. RTK never pauses FAST-LIO or suppresses this independent check.
-    const bool run_ndt = work_decision.run_ndt && !rtk_primary;
+    const bool run_ndt = work_decision.run_ndt;
     perf.run_ndt = run_ndt;
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
     std::optional<PoseEstimator::MatchResult> current_match_result;
@@ -4983,8 +5033,7 @@ private:
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "Localization source=%s match=%s score=%.3f ndt=%.3f vgicp=%.3f rtk=%s bridge=%.2fm",
         active_source_.c_str(),
-        skip_lidar_matching ? "rtk_paused"
-          : (pose_estimator ? pose_estimator->GetMatchState().method_.c_str() : "none"),
+        pose_estimator ? pose_estimator->GetMatchState().method_.c_str() : "none",
         last_ndt_score_,
         pose_estimator ? pose_estimator->GetMatchState().ndt_score_ : last_ndt_score_,
         pose_estimator ? pose_estimator->GetMatchState().refine_score_ : -1.0f,
@@ -6756,6 +6805,7 @@ private:
     }
 
     void Reset() {
+        rememberVehicleYawForReload();
         advanceGlobalRelocalizationGeneration("map reset", map_relocalization_settle_s_);
         is_init_success_ = false;
         localization_state_ = 0; 
@@ -6774,7 +6824,10 @@ private:
         relocalization_best_source_ = "map_origin";
         relocalization_best_score_ = -1.0;
         const bool seeded_from_rtk = seedPositionFromGnss(
-          get_clock()->now(), "map initialization", true, true);
+          get_clock()->now(), "map initialization", true, !preserved_vehicle_yaw_valid_);
+        if (preserved_vehicle_yaw_valid_) {
+          last_init_quat_ = preserved_vehicle_yaw_;
+        }
         global_search_required_ = scan_context_effective_runtime_mode_ != "disabled" &&
           !seeded_from_rtk;
         resetInitializationValidation(
@@ -6874,6 +6927,8 @@ private:
   bool gnss_auto_recovery_enable_ = true;
   double gnss_auto_recovery_retry_seconds_ = 5.0;
   bool gnss_use_heading_ = false;
+  bool preserved_vehicle_yaw_valid_ = false;
+  Eigen::Quaternionf preserved_vehicle_yaw_ = Eigen::Quaternionf::Identity();
   double gnss_heading_offset_param_rad_ = 0.0;
   double gnss_heading_offset_rad_ = 0.0;
   double gnss_heading_max_std_deg_ = 5.0;
@@ -6909,7 +6964,6 @@ private:
   int rtk_auto_primary_good_frames_ = 0;
   int rtk_auto_primary_bad_frames_ = 0;
   bool rtk_auto_primary_latched_ = false;
-  bool lidar_matching_paused_for_rtk_ = false;
   std::string preferred_source_ = "ndt";
   CorrectionPolicyMode preferred_correction_mode_ = CorrectionPolicyMode::ndt;
   std::string ukf_anchor_preference_ = "balanced";

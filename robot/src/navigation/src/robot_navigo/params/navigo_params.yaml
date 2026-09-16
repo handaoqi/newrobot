@@ -308,7 +308,10 @@ controller_server:
       # fallback in the same range so idle Nav2 is not more aggressive.
       wz_std: 0.04
       vx_max: 0.30
-      vx_min: -0.12
+      # Forward-only until Edge writes a profile. Outdoor GPS cruise stays 0
+      # so a heading disagreement cannot reverse down the route. Indoor cruise
+      # still gets vx_min=-0.12 from Edge.
+      vx_min: 0.0
       vy_max: 0.5
       wz_max: 0.35
       ax_max: 1.0

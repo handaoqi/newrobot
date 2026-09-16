@@ -75,6 +75,9 @@ class TelemetryCollector:
         self._pose_sampled_monotonic = 0.0
         self._localization_quality: LocalizationQualitySnapshot | None = None
         self._localization_decision: dict = {}
+        # Retained FAST-LIO readiness is separate from map localization.
+        # It is evidence for the initialization gate, not a navigation source.
+        self._lio_odometry_status: dict = {}
         # Progress of an in-flight localization recovery. Empty when not recovering.
         self._localization_recovery: dict = {}
         # Latest lidar-IMU vs 3588-IMU comparison. Monitoring only.
@@ -304,6 +307,15 @@ class TelemetryCollector:
         with self._lock:
             return dict(self._localization_decision)
 
+    def on_lio_odometry_status(self, payload: dict | None) -> None:
+        with self._lock:
+            self._lio_odometry_status = dict(payload or {})
+            self._state_version += 1
+
+    def lio_odometry_status(self) -> dict:
+        with self._lock:
+            return dict(self._lio_odometry_status)
+
     def on_localization_recovery(self, payload: dict | None) -> None:
         """Record recovery progress so a stuck recovery is visible from the platform.
 
@@ -485,6 +497,7 @@ class TelemetryCollector:
                         "prediction_errors": quality.prediction_errors,
                     } if quality else None,
                     "decision": dict(self._localization_decision),
+                    "lio_odometry": dict(self._lio_odometry_status) or None,
                     "recovery": dict(self._localization_recovery) or None,
                     "imu_cross_check": dict(self._imu_cross_check) or None,
                     "raw_rtk": dict(self._raw_rtk) if self._raw_rtk else None,

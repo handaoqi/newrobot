@@ -138,6 +138,8 @@ UKF 航点校正按以下顺序处理：固定 RTK 合格时优先 RTK；无固�
 
 ## 统一三场景定位初始化与重定位流程（2026-09-15 合并方案）
 
+> 实施状态：定位事务内核已完成。FAST-LIO2 收敛门、Nav2 Lifecycle、最终 `status=3` 联合放行门和路径规划页双时间线，统一转入 [统一定位、FAST-LIO2 收敛、Nav2 Lifecycle 与路径规划页状态机合并计划](NAVIGATION_LIFECYCLE_LOCALIZATION_STATE_MACHINE_PLAN.md) 跟踪，本文不再维护重复的待实施清单。
+
 ### 当前检查结论
 
 现有实现的初始化、地图下发、主动重定位和定位丢失恢复尚未完全统一：

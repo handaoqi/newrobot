@@ -71,9 +71,13 @@ const RTK_VERIFICATION_REASON_LABELS = {
 
 const TIMELINE_STAGE_META = {
   map_transfer: { title: '地图下发', detail: '确认目标地图已传输并应用到机器狗' },
+  navigation_prepare: { title: '准备导航安全组', detail: '配置地图、过滤器和 Collision Monitor；执行组保持未激活' },
+  fast_lio_readiness: { title: 'FAST-LIO 局部收敛', detail: '确认 IMU、iKD-tree 与连续新鲜本地里程计，尚未要求地图定位 status=3' },
   localization_bootstrap: { title: '定位节点准备', detail: '准备 /initialpose 接收器和定位服务' },
   rtk_fixed: { title: 'RTK 二次校正验证', detail: '最优 NDT 已提交并由 FAST-LIO + IMU 接管后，再验证固定解并更新锚点' },
   fast_lio_imu_handoff: { title: 'FAST-LIO + IMU 主定位接管', detail: '确认新鲜 FAST-LIO + IMU 帧、锚点代数和连续主定位源' },
+  final_localization_gate: { title: '最终定位放行', detail: '连续 3 帧新鲜 status=3、LIO 锚点与二次校正终态均通过' },
+  navigation_execution_activate: { title: '激活导航执行组', detail: '定位通过后激活规划、控制、行为树、平滑与航点执行节点' },
   secondary_correction: { title: '二次定位校正', detail: 'NDT 最优提交后按场景和航点策略执行 RTK、UKF 或 NDT 校正' },
   rtk_correction: { title: 'RTK 二次校正', detail: '仅合格固定解可作为绝对校正源；非 fixed 不阻塞任务' },
   ukf_correction: { title: 'UKF 二次融合校正', detail: '按 NDT 与浮点 RTK 偏差门限决定是否加权融合' },
@@ -97,6 +101,8 @@ const TIMELINE_STAGE_ALIASES = {
 
 const TIMELINE_STAGE_ORDER = [
   'map_transfer',
+  'navigation_prepare',
+  'fast_lio_readiness',
   'localization_bootstrap',
   'last_trusted',
   'mapping_origin_bounded',
@@ -106,11 +112,13 @@ const TIMELINE_STAGE_ORDER = [
   'operator_initial_pose',
   'best_candidate_commit',
   'fast_lio_imu_handoff',
+  'final_localization_gate',
   'secondary_correction',
   'rtk_fixed',
   'rtk_correction',
   'ukf_correction',
   'ndt_secondary_correction',
+  'navigation_execution_activate',
   'navigation_start',
 ]
 
@@ -357,6 +365,25 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
   const rawStages = Array.isArray(raw.stages)
     ? raw.stages
     : (Array.isArray(result.stages) ? result.stages : [])
+  const selectedLifecycleStage = canonicalTimelineStage(
+    raw.selected_stage || result.selected_stage,
+  )
+  // Task-start progress packets report one current lifecycle stage rather
+  // than a complete NDT attempt array. Preserve that evidence so the route
+  // planner can show prepare/LIO/final-gate/execution activation live.
+  const displayStages = [...rawStages]
+  if (
+    selectedLifecycleStage
+    && TIMELINE_STAGE_META[selectedLifecycleStage]
+    && !displayStages.some(record => canonicalTimelineStage(record?.stage) === selectedLifecycleStage)
+  ) {
+    displayStages.push({
+      stage: selectedLifecycleStage,
+      status: raw.state || result.state || command.status || 'running',
+      started_at: firstTimestamp(command.started_at, command.issued_at),
+      updated_at: firstTimestamp(command.updated_at, command.finished_at),
+    })
+  }
   const rtkStage = rawStages.find(record => canonicalTimelineStage(record?.stage) === 'rtk_fixed')
   const rtkVerification = normalizeRtkVerification(
     raw.rtk_verification
@@ -458,15 +485,13 @@ export function localizationAttemptSessionFromCommand(command, extras = {}) {
         : (extras.source === 'rtk'
           ? ['rtk_fixed']
           : (command.command_type === 'nav.initial_pose' ? ['operator_initial_pose'] : []))),
-    stages: Array.isArray(raw.stages)
-      ? raw.stages
-      : (Array.isArray(result.stages)
-        ? result.stages
-        : (extras.source === 'rtk'
+    stages: displayStages.length
+      ? displayStages
+      : (extras.source === 'rtk'
           ? [{ stage: 'rtk_fixed', status: command.status || 'searching' }]
           : (command.command_type === 'nav.initial_pose'
             ? [{ stage: 'operator_initial_pose', status: command.status || 'searching' }]
-            : []))),
+            : [])),
     localizationBootstrap: result.localization_bootstrap || raw.localization_bootstrap || null,
     navigationStart: result.navigation_start || raw.navigation_start || null,
     bestCandidateCommitStartedAt: firstTimestamp(
@@ -805,7 +830,24 @@ function orderedTimelineTimes(session, timeline) {
     let startedMillis = timestampMillis(startedAt)
     let finishedMillis = timestampMillis(finishedAt)
 
-    if (startedMillis !== null && cursor !== null && startedMillis < cursor) {
+    // Direct relocalization has no independent map-transfer packet. Its
+    // compatibility row receives an observation timestamp, which can be much
+    // newer than the reported NDT/handoff evidence. Do not let that synthetic
+    // prerequisite move real stage timestamps forward.
+    const nonBlockingSynthetic = (
+      (step.key === 'map_transfer' && session?.phase !== 'transfer')
+      || (step.key === 'localization_bootstrap' && !session?.localizationBootstrap)
+      // nav.initial_pose legacy payloads synthesize this row from the command
+      // type.  A synthesized terminal row has no independent timestamps and
+      // must not move the reported RTK/NDT handoff evidence forward.
+      || (step.key === 'operator_initial_pose' && !(session?.stages || []).some(
+        record => (
+          canonicalTimelineStage(record?.stage) === 'operator_initial_pose'
+          && firstTimestamp(record?.started_at, record?.startedAt, record?.finished_at, record?.finishedAt)
+        )
+      ))
+    )
+    if (!nonBlockingSynthetic && startedMillis !== null && cursor !== null && startedMillis < cursor) {
       startedMillis = cursor
       startedAt = new Date(startedMillis).toISOString()
     }
@@ -813,8 +855,10 @@ function orderedTimelineTimes(session, timeline) {
       finishedMillis = startedMillis
       finishedAt = new Date(finishedMillis).toISOString()
     }
-    if (finishedMillis !== null) cursor = finishedMillis
-    else if (startedMillis !== null) cursor = Math.max(cursor ?? startedMillis, startedMillis)
+    if (!nonBlockingSynthetic) {
+      if (finishedMillis !== null) cursor = finishedMillis
+      else if (startedMillis !== null) cursor = Math.max(cursor ?? startedMillis, startedMillis)
+    }
 
     return { ...step, startedAt, finishedAt }
   })

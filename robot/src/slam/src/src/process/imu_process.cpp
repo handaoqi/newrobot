@@ -79,6 +79,8 @@ void ImuProcess::reset()
     cov_gyr      = robot::slam::Zero3d;
     cov_bias_gyr = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
     cov_bias_acc = robot::slam::Vec3d(0.0001, 0.0001, 0.0001);
+    ++init_reset_count_;
+    init_reset_reason_ = "external_reset";
 }
 
 void ImuProcess::set_gyr_cov(const robot::slam::Vec3d& scaler)
@@ -318,16 +320,21 @@ void ImuProcess::Process(
                           << " gyro_var=" << max_gyro_variance << std::endl;
                 b_first_frame_ = true;
                 init_iter_num = 1;
+                ++init_reset_count_;
+                init_reset_reason_ = "motion_variance";
                 return;
             }
             if (mean_acc.norm() < 1e-3)
             {
                 b_first_frame_ = true;
                 init_iter_num = 1;
+                ++init_reset_count_;
+                init_reset_reason_ = "invalid_gravity";
                 return;
             }
             cov_acc *= pow(robot::slam::G_m_s2 / mean_acc.norm(), 2);
             imu_need_init_ = false;
+            init_reset_reason_.clear();
 
             cov_acc = cov_acc_scale;
             cov_gyr = cov_gyr_scale;

@@ -181,6 +181,7 @@ class EdgeAgentApplication:
             stop_confirmation_seconds=config.safety.stop_confirmation_seconds,
             map_set_coordinator=self.map_set_coordinator,
             map_activation_adapter=self.map_activation_adapter,
+            navigation_stack_adapter=self.navigation_stack_adapter,
             obstacle_speech=config.obstacle_speech,
             waypoint_speech=config.waypoint_speech,
             rosbag_recorder=self.navigation_rosbag,

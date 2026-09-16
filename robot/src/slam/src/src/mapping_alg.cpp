@@ -623,6 +623,11 @@ namespace robot::slam
             "/slam/global_optimization_status", rclcpp::QoS(1).transient_local());
         pubDivergenceEvent_ = this->create_publisher<std_msgs::msg::String>(
             "/slam/divergence_event", rclcpp::QoS(1).transient_local());
+        // A compact retained readiness record is consumed by Edge before any
+        // map-localization decision.  It exposes only observation evidence;
+        // publishing it must never alter the FAST-LIO state, map or trajectory.
+        pubLioOdometryStatus_ = this->create_publisher<std_msgs::msg::String>(
+            "/lio_odometry/status", rclcpp::QoS(1).reliable().transient_local());
         tf_broadcaster_         = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         if (!odometry_only_)
@@ -2588,7 +2593,9 @@ namespace robot::slam
             lio_odom.header.frame_id = "lio_odom";
             lio_odom.child_frame_id = "base_link";
             pubLioOdom_->publish(lio_odom);
+            ++lio_odometry_sequence_;
         }
+        publishLioOdometryStatus();
 
         if (!odometry_only_ && tf_br)
         {
@@ -2605,6 +2612,57 @@ namespace robot::slam
             trans.transform.rotation.z    = odomAftMapped.pose.pose.orientation.z;
             tf_br->sendTransform(trans);
         }
+    }
+
+    void MappingAlg::publishLioOdometryStatus()
+    {
+        if (!pubLioOdometryStatus_ || !p_imu)
+            return;
+
+        std::string state = "ready";
+        if (slam_diverged_)
+            state = "failed";
+        else if (slam_health_state_ == "degraded")
+            state = "degraded";
+        else if (!p_imu->initialization_ready())
+            state = "initializing_imu";
+        else if (ikdtree.Root_Node == nullptr)
+            state = "building_local_map";
+        else if (!slam_pose_ready_)
+            state = "stabilizing_odometry";
+
+        const auto finite_or_null = [](double value) {
+            return std::isfinite(value) ? std::to_string(value) : std::string("null");
+        };
+        std_msgs::msg::String msg;
+        std::ostringstream payload;
+        payload << "{\"format\":\"roamerx.lio-odometry-status.v1\""
+                << ",\"state\":\"" << state << "\""
+                << ",\"stamp_unix\":" << std::fixed << std::setprecision(3)
+                << this->get_clock()->now().seconds()
+                << ",\"imu\":{\"initialized\":"
+                << (p_imu->initialization_ready() ? "true" : "false")
+                << ",\"samples\":" << p_imu->initialization_samples()
+                << ",\"required_samples\":" << p_imu->initialization_required_samples()
+                << ",\"acc_variance\":" << finite_or_null(p_imu->initialization_acc_variance())
+                << ",\"acc_variance_limit\":" << p_imu->initialization_max_acc_variance()
+                << ",\"gyro_variance\":" << finite_or_null(p_imu->initialization_gyro_variance())
+                << ",\"gyro_variance_limit\":" << p_imu->initialization_max_gyro_variance()
+                << ",\"reset_count\":" << p_imu->initialization_reset_count()
+                << ",\"reset_reason\":\""
+                << jsonEscape(p_imu->initialization_reset_reason()) << "\"}"
+                << ",\"local_map\":{\"ikdtree_ready\":"
+                << (ikdtree.Root_Node != nullptr ? "true" : "false")
+                << ",\"slam_pose_ready\":" << (slam_pose_ready_ ? "true" : "false") << "}"
+                << ",\"odometry\":{\"sequence\":" << lio_odometry_sequence_
+                << ",\"stamp\":" << finite_or_null(lidar_end_time) << "}"
+                << ",\"health\":{\"state\":\"" << jsonEscape(slam_health_state_)
+                << "\",\"reason\":\""
+                << jsonEscape(!slam_health_error_code_.empty()
+                    ? slam_health_error_code_ : slam_health_warning_)
+                << "\"}}";
+        msg.data = payload.str();
+        pubLioOdometryStatus_->publish(msg);
     }
 
     void MappingAlg::publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -2911,6 +2969,10 @@ namespace robot::slam
 
     void MappingAlg::map_publish_callback()
     {
+        // Publish readiness even before the first valid odometry frame. This
+        // makes IMU-motion and empty-cloud initialization failures observable
+        // instead of leaving Edge with a permanently stale retained message.
+        publishLioOdometryStatus();
         if (map_pub_en)
             pubMapPoints(pubLaserCloudMap_);
     }

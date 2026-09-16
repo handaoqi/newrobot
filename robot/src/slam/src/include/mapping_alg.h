@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <csignal>
 #include <ctime>
 #include <iomanip>
@@ -267,6 +268,8 @@ namespace robot::slam
 
         void writeSaveProgress(const std::string& stage, double progress_percent, const std::string& error = "") const;
 
+        void publishLioOdometryStatus();
+
         void pubBodyPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body);
 
         void pubMapPoints(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap);
@@ -495,6 +498,7 @@ namespace robot::slam
         std::string                        lio_odometry_topic_ = "/odom/lio_odom";
         bool                               mapping_capture_enabled_ = false;
         bool                               slam_pose_ready_ = false;
+        std::uint64_t                      lio_odometry_sequence_ = 0;
         double                             keyframe_min_distance_m_ = 0.8;
         double                             keyframe_min_yaw_rad_ = 0.35;
         double                             keyframe_max_interval_s_ = 2.0;
@@ -603,6 +607,7 @@ namespace robot::slam
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr              pubGlobalOptimizedPath_;
         rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubGlobalOptimizationStatus_;
         rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubDivergenceEvent_;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             pubLioOdometryStatus_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         sub_imu_ptr_;
         rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr   sub_gnss_ptr_;
         rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       sub_enu_odom_ptr_;

@@ -671,7 +671,7 @@ def test_expired_command_is_rejected(tmp_path):
     store.close()
 
 
-def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
+def test_nav_initial_pose_uses_origin_first_ndt_pipeline(tmp_path):
     raw = json.loads((Path(__file__).parent / "fixtures" / "task_start.json").read_text())
     raw["message_type"] = "nav.initial_pose"
     raw["payload"].pop("task_execution_id", None)
@@ -696,10 +696,10 @@ def test_nav_initial_pose_is_dispatched_to_navigation_adapter(tmp_path):
         localization_adapter=navigation,
     )
     _, result = processor.handle_command(raw)
-    assert navigation.initial_pose["x"] == 1.0
-    assert navigation.initial_pose["require_absolute"] is True
+    assert navigation.initial_pose is None
+    assert navigation.progressive_relocalize_requests[0]["waypoints"][0]["x"] == 1.0
     assert result["payload"]["status"] == "succeeded"
-    assert results[0]["payload"]["result"]["topic"] == "/initialpose"
+    assert results[0]["payload"]["result"]["mode"] == "progressive_stationary_search"
     assert navigation.operator_localization_events == ["begin", "end"]
     store.close()
 
@@ -792,7 +792,7 @@ def test_nav_initial_pose_bootstraps_cold_localization_before_starting_nav2(tmp_
     payload = result["payload"]["result"]
     assert result["payload"]["status"] == "succeeded"
     assert stack.restart_localization_calls == 1
-    assert navigation.initial_pose["x"] == 1.0
+    assert navigation.progressive_relocalize_requests[0]["waypoints"][0]["x"] == 1.0
     assert stack.start_calls == [{"reason": "initial_pose_bootstrap"}]
     assert payload["localization_bootstrap"]["action"] == "restart-localization"
     assert payload["navigation_start"]["action"] == "start"
@@ -828,7 +828,7 @@ def test_nav_initial_pose_bypasses_stack_management_lock(tmp_path):
         processor._navigation_command_lock.release()
 
     assert result["payload"]["status"] == "succeeded"
-    assert navigation.initial_pose["x"] == 1.0
+    assert navigation.progressive_relocalize_requests[0]["waypoints"][0]["x"] == 1.0
     store.close()
 
 

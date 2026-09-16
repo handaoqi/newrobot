@@ -68,20 +68,22 @@ class SafetyPolicy:
         has_active_task: bool,
         *,
         allow_manual_takeover_release: bool = False,
+        require_localization: bool = True,
+        require_navigation_ready: bool = True,
     ) -> None:
         if has_active_task:
             raise ProtocolError("ROBOT_BUSY", "another motion task is active")
         smart_initialize = bool((envelope.payload.get("command") or {}).get("smart_initialize", True))
-        if self.state.localization_status != "normal" and not smart_initialize:
+        if require_localization and self.state.localization_status != "normal" and not smart_initialize:
             raise ProtocolError("LOCALIZATION_NOT_READY", self.state.localization_status)
         stable_for = time.monotonic() - self.state.localization_normal_since_monotonic
-        if stable_for < self.config.localization_stable_seconds:
+        if require_localization and stable_for < self.config.localization_stable_seconds:
             raise ProtocolError(
                 "LOCALIZATION_NOT_STABLE",
                 f"normal for {max(0.0, stable_for):.1f}s; "
                 f"requires {self.config.localization_stable_seconds:.1f}s",
             )
-        if not self.state.nav_ready:
+        if require_navigation_ready and not self.state.nav_ready:
             raise ProtocolError("NAV_STACK_NOT_READY", "FollowWaypoints action server is unavailable")
         if self.state.emergency_stop:
             raise ProtocolError("EMERGENCY_STOP_ACTIVE", "emergency stop is active")
@@ -115,6 +117,22 @@ class SafetyPolicy:
             return
         if (required_map.get("map_id") != self.state.current_map_id or required_map.get("map_version") != self.state.current_map_version):
             raise ProtocolError("MAP_VERSION_MISMATCH", "current map does not match task")
+
+    def validate_navigation_admission(self) -> None:
+        """Final post-localization check; task context may already be accepted."""
+        if self.state.localization_status != "normal":
+            raise ProtocolError("LOCALIZATION_NOT_READY", self.state.localization_status)
+        stable_for = time.monotonic() - self.state.localization_normal_since_monotonic
+        if stable_for < self.config.localization_stable_seconds:
+            raise ProtocolError(
+                "LOCALIZATION_NOT_STABLE",
+                f"normal for {max(0.0, stable_for):.1f}s; "
+                f"requires {self.config.localization_stable_seconds:.1f}s",
+            )
+        if not self.state.nav_ready:
+            raise ProtocolError("NAV_STACK_NOT_READY", "FollowWaypoints action server is unavailable")
+        if self.state.emergency_stop:
+            raise ProtocolError("EMERGENCY_STOP_ACTIVE", "emergency stop is active")
 
     def validate_manual_assist(self) -> None:
         """Allow bounded assist only while all hard safety interlocks are clear."""

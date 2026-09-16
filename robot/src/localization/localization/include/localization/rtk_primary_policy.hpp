@@ -40,39 +40,60 @@ inline bool rtkPrimaryShouldDrive(
   return source_arbiter_enable && !bridge_active && latched;
 }
 
-// Self-stable fixed RTK may correct LIO yaw even when the residual exceeds the
-// normal max_correction_yaw gate. Without this, XY-only corrections leave a
-// permanent yaw death spiral once LIO and dual-antenna heading disagree by
-// more than ~30 deg.
+// Dual-antenna heading ~180 deg from the current pose is a frame/offset
+// error, not LIO drift. GPS may still drive XY; yaw stays on LIO/IMU so
+// FollowPath walks the route forward instead of reversing toward a goal
+// that looks like it is behind the robot.
+inline bool rtkHeadingIsFlip(float drift_yaw_rad) {
+  return std::isfinite(drift_yaw_rad) &&
+    drift_yaw_rad > static_cast<float>(M_PI / 2.0);
+}
+
+// Dual-antenna yaw may only nudge the vehicle heading inside the LIO gate.
+// Self-stable fixed RTK is allowed to drive GPS XY; it is not a reason to
+// replace lidar/IMU yaw with a 60-90 deg antenna residual. A flip past 90
+// deg is never trusted.
 inline bool rtkHeadingTrustedForCorrection(
     bool heading_usable,
     float drift_yaw_rad,
     float max_correction_yaw_rad,
-    bool rtk_self_stable) {
-  if (!heading_usable) {
+    bool /*rtk_self_stable*/) {
+  if (!heading_usable || !std::isfinite(drift_yaw_rad) || rtkHeadingIsFlip(drift_yaw_rad)) {
     return false;
-  }
-  if (rtk_self_stable) {
-    return true;
   }
   // angularDistance is non-negative; NaN comparisons fail closed.
   return drift_yaw_rad <= max_correction_yaw_rad;
 }
 
+// Cruise keeps FAST-LIO/IMU yaw. A ~12 deg dual-antenna residual is inside
+// both the 30 deg correction gate and the 90 deg flip gate, but it is enough
+// to yank a live Nav2 goal off the planned line. Stopped waypoint correction
+// may still use a trusted RTK heading.
+inline bool rtkHeadingAllowedForCorrection(bool moving) {
+  return !moving;
+}
+
 // Latch GPS as the continuous navigation source only while fixed RTK and a
 // valid dual-antenna heading are sustained. FAST-LIO remains the continuous
 // source when heading flickers; RTK XY still corrects as an auxiliary.
+// Do not promote while cruising: a live Nav2 goal must be cancelled, the
+// pose jump checked, and the controller reset before a new source may drive
+// odometry. Demote still happens immediately so a dead GPS stream cannot
+// keep publishing.
 inline void updateRtkPrimaryLatch(
     RtkPrimaryLatchState& state,
     const RtkPrimaryLatchConfig& config,
-    bool rtk_good_for_primary_drive) {
+    bool rtk_good_for_primary_drive,
+    bool moving = false) {
   const int promote_samples = std::max(1, config.promote_samples);
   const int demote_samples = std::max(1, config.demote_samples);
   if (rtk_good_for_primary_drive) {
     state.bad_frames = 0;
     state.good_frames = std::min(state.good_frames + 1, promote_samples);
     if (!state.latched && state.good_frames >= promote_samples) {
-      state.latched = true;
+      if (!moving) {
+        state.latched = true;
+      }
     }
     return;
   }

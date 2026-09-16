@@ -77,9 +77,50 @@ TEST(RtkPrimaryPolicy, HeadingTrustedWithinGateWithoutSelfStable) {
   EXPECT_FALSE(rtkHeadingTrustedForCorrection(false, 0.1f, 0.52f, false));
 }
 
-TEST(RtkPrimaryPolicy, SelfStableTrustsLargeHeadingResidual) {
-  EXPECT_TRUE(rtkHeadingTrustedForCorrection(true, 1.57f, 0.52f, true));
-  EXPECT_FALSE(rtkHeadingTrustedForCorrection(false, 1.57f, 0.52f, true));
+TEST(RtkPrimaryPolicy, SelfStableDoesNotBypassYawGate) {
+  EXPECT_TRUE(rtkHeadingTrustedForCorrection(true, 0.20f, 0.52f, true));
+  EXPECT_FALSE(rtkHeadingTrustedForCorrection(true, 1.05f, 0.52f, true));
+  EXPECT_FALSE(rtkHeadingTrustedForCorrection(false, 0.20f, 0.52f, true));
+}
+
+TEST(RtkPrimaryPolicy, SelfStableDoesNotTrustHeadingFlip) {
+  EXPECT_TRUE(rtkHeadingIsFlip(3.14f));
+  EXPECT_FALSE(rtkHeadingIsFlip(1.05f));
+  EXPECT_FALSE(rtkHeadingTrustedForCorrection(true, 3.14f, 0.52f, true));
+  EXPECT_FALSE(rtkHeadingTrustedForCorrection(true, 2.0f, 0.52f, true));
+}
+
+TEST(RtkPrimaryPolicy, CruiseDoesNotTakeDualAntennaHeading) {
+  EXPECT_TRUE(rtkHeadingAllowedForCorrection(false));
+  EXPECT_FALSE(rtkHeadingAllowedForCorrection(true));
+  EXPECT_TRUE(rtkHeadingTrustedForCorrection(true, 0.21f, 0.52f, true));
+  EXPECT_FALSE(
+    rtkHeadingAllowedForCorrection(true) &&
+    rtkHeadingTrustedForCorrection(true, 0.21f, 0.52f, true));
+}
+
+TEST(RtkPrimaryPolicy, DoesNotPromoteWhileMoving) {
+  RtkPrimaryLatchState state;
+  const RtkPrimaryLatchConfig config{2, 3};
+  updateRtkPrimaryLatch(state, config, true, true);
+  updateRtkPrimaryLatch(state, config, true, true);
+  EXPECT_FALSE(state.latched);
+  EXPECT_EQ(state.good_frames, 2);
+  updateRtkPrimaryLatch(state, config, true, false);
+  EXPECT_TRUE(state.latched);
+}
+
+TEST(RtkPrimaryPolicy, DemotesWhileMovingWhenGpsDrops) {
+  RtkPrimaryLatchState state;
+  const RtkPrimaryLatchConfig config{2, 3};
+  updateRtkPrimaryLatch(state, config, true, false);
+  updateRtkPrimaryLatch(state, config, true, false);
+  ASSERT_TRUE(state.latched);
+  updateRtkPrimaryLatch(state, config, false, true);
+  updateRtkPrimaryLatch(state, config, false, true);
+  EXPECT_TRUE(state.latched);
+  updateRtkPrimaryLatch(state, config, false, true);
+  EXPECT_FALSE(state.latched);
 }
 }  // namespace
 }  // namespace localization

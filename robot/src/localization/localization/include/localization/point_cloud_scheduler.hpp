@@ -92,14 +92,14 @@ inline PointCloudWorkDecision decidePointCloudWork(
   const bool stable_correction_suppressed = input.lio_primary_enabled && input.lio_stable &&
     input.correction_suppressed;
   const bool force_ndt_match = input.force_ndt_match &&
-    !input.lidar_matching_paused && !input.rtk_primary;
+    !input.lidar_matching_paused;
   decision.run_ndt = force_ndt_match || (!input.lidar_matching_paused &&
-    !input.rtk_primary && !stable_correction_suppressed && cadence_due);
+    !stable_correction_suppressed && cadence_due);
   decision.needs_heavy_cloud = !input.lidar_matching_paused &&
     (decision.run_ndt || input.global_relocalization_requested ||
       input.lidar_odometry_required);
-  if (input.lidar_matching_paused || input.rtk_primary) {
-    decision.reason = "rtk_primary_paused";
+  if (input.lidar_matching_paused) {
+    decision.reason = "lidar_matching_paused";
   } else if (force_ndt_match) {
     decision.reason = "waypoint_correction_match";
   } else if (stable_correction_suppressed) {

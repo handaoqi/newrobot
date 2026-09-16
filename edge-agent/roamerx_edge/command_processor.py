@@ -16,6 +16,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 STARTUP_STAGE_LABELS = {
+    "navigation_prepare": "准备地图、安全与碰撞监控",
+    "fast_lio_readiness": "等待 FAST-LIO + IMU 局部收敛",
     "map_transfer": "应用任务地图",
     "localization_bootstrap": "准备定位节点",
     "last_trusted": "验证可信位姿",
@@ -28,6 +30,8 @@ STARTUP_STAGE_LABELS = {
     "operator_initial_pose": "验证手选初始位姿",
     "best_candidate_commit": "提交最优定位结果",
     "fast_lio_imu_handoff": "确认 FAST-LIO + IMU 接管",
+    "final_localization_gate": "验收连续定位与锚点证据",
+    "navigation_execution_activate": "激活导航执行组",
     "secondary_correction": "执行二次定位校正",
     "rtk_fixed": "验证 RTK 固定解",
     "rtk_correction": "执行 RTK 定位校正",
@@ -179,7 +183,6 @@ class CommandProcessor:
                     # localization checks; validating the old patrol map first
                     # rejects every legitimate cross-map docking task.
                     self._prepare_docking_map(envelope.payload["command"])
-                self.safety.wait_until_localization_stable()
                 if self.navigation_boundary:
                     self.navigation_boundary.validate_route(envelope.payload["command"]["route_snapshot"])
                 route_snapshot = envelope.payload["command"]["route_snapshot"]
@@ -204,6 +207,12 @@ class CommandProcessor:
                     envelope,
                     self.task_executor.has_active_task(),
                     allow_manual_takeover_release=True,
+                    require_localization=not bool(
+                        (envelope.payload.get("command") or {}).get("smart_initialize", True)
+                    ),
+                    require_navigation_ready=not bool(
+                        (envelope.payload.get("command") or {}).get("smart_initialize", True)
+                    ),
                 )
                 self._release_manual_control_for_task()
                 # The acknowledgement must carry the same task version sequence
@@ -234,10 +243,29 @@ class CommandProcessor:
                                 envelope, started_at, payload
                             )
                         )
+                    self._emit_command_progress(
+                        envelope, started_at,
+                        {
+                            "state": "running",
+                            "selected_stage": "fast_lio_readiness",
+                            "navigation_lifecycle": {"status": "prepared"},
+                        },
+                    )
                     if bool((envelope.payload.get("command") or {}).get("smart_initialize", True)):
                         initialization_result = dict(
                             self.task_executor.initialize_before_navigation() or {}
                         )
+                    self.safety.wait_until_localization_stable()
+                    self._emit_command_progress(
+                        envelope, started_at,
+                        {**initialization_result, "state": "running",
+                         "selected_stage": "navigation_execution_activate",
+                         "navigation_lifecycle": {"status": "activating"}},
+                    )
+                    self._activate_navigation_execution_for_task()
+                    validate_admission = getattr(self.safety, "validate_navigation_admission", None)
+                    if callable(validate_admission):
+                        validate_admission()
                 finally:
                     if callable(set_progress):
                         set_progress(None)
@@ -372,12 +400,27 @@ class CommandProcessor:
         route adds latency and resets useful state, but a task should still be
         able to recover when the resident stack was stopped or crashed.
         """
-        if self.safety.state.nav_ready or not self.navigation_stack_adapter:
+        if not self.navigation_stack_adapter:
             return
-        self.navigation_stack_adapter.start({"reason": "task_start"})
+        prepare = getattr(self.navigation_stack_adapter, "prepare", None)
+        if callable(prepare):
+            prepare({"reason": "task_start"})
+        elif not self.safety.state.nav_ready:
+            self.navigation_stack_adapter.start({"reason": "task_start"})
+        wait_until_prepared = getattr(self.task_executor.navigation, "wait_until_prepared", None)
+        if callable(wait_until_prepared) and not wait_until_prepared(timeout_seconds=45.0):
+            raise ProtocolError("NAV_STACK_PREPARE_FAILED", "navigation map/safety group did not become prepared")
+        self.safety.state.nav_ready = False
+
+    def _activate_navigation_execution_for_task(self) -> None:
+        if not self.navigation_stack_adapter:
+            return
+        activate = getattr(self.navigation_stack_adapter, "activate_execution", None)
+        if callable(activate):
+            activate()
         self._await_navigation_stack_ready(
             timeout_seconds=45.0,
-            message="navigation stack did not become ready for task start",
+            message="navigation execution group did not become ready after localization",
         )
 
     def _await_navigation_stack_ready(self, timeout_seconds: float, message: str) -> None:
@@ -448,14 +491,51 @@ class CommandProcessor:
         if not self._navigation_command_lock.acquire(blocking=True, timeout=45.0):
             raise ProtocolError("NAV_COMMAND_BUSY", "another navigation command is still running")
         try:
-            result = self.navigation_stack_adapter.start({"reason": "initial_pose_bootstrap"})
-            self._await_navigation_stack_ready(
-                timeout_seconds=45.0,
-                message="Nav2 did not become ready after localization initialization",
-            )
+            prepare = getattr(self.navigation_stack_adapter, "prepare", None)
+            if callable(prepare):
+                result = prepare({"reason": "initial_pose_bootstrap"})
+                self._activate_navigation_execution_for_task()
+            else:
+                result = self.navigation_stack_adapter.start({"reason": "initial_pose_bootstrap"})
+                self._await_navigation_stack_ready(
+                    timeout_seconds=45.0,
+                    message="Nav2 did not become ready after localization initialization",
+                )
             return {**result, "ready": True}
         finally:
             self._navigation_command_lock.release()
+
+    def _pause_active_task_for_operator_localization(self) -> dict | None:
+        """Pause only a running task; preserve a deliberate operator pause.
+
+        The saved waypoint index belongs to TaskExecutor and is restored only
+        after the new localization has passed the final LIO gate.  A failure
+        leaves the task safely paused with Nav2 execution inactive.
+        """
+        context = getattr(self.task_executor, "context", None)
+        if context is None or str(getattr(context, "state", "")) != "running":
+            return None
+        execution_id = str(getattr(context, "task_execution_id", "") or "")
+        if not execution_id:
+            return None
+        paused = self.task_executor.pause_task(execution_id)
+        deactivate = getattr(self.navigation_stack_adapter, "deactivate_execution", None)
+        if callable(deactivate):
+            deactivate()
+        self.safety.state.nav_ready = False
+        return {
+            "execution_id": execution_id,
+            "resume_index": int(paused.get("resume_from_waypoint_index", 0)),
+            "paused": paused,
+        }
+
+    def _resume_task_after_operator_localization(self, transaction: dict | None) -> dict | None:
+        if not transaction:
+            return None
+        self._activate_navigation_execution_for_task()
+        return self.task_executor.resume_task(
+            transaction["execution_id"], int(transaction["resume_index"])
+        )
 
     def _prepare_docking_map(self, command: dict) -> None:
         if not self.map_activation_adapter or not self.navigation_stack_adapter:
@@ -667,6 +747,7 @@ class CommandProcessor:
                 None,
             )
             operator_scope_started = False
+            task_pause_transaction = None
             set_progress = getattr(
                 self.localization_adapter, "set_attempt_progress_callback", None
             )
@@ -686,6 +767,7 @@ class CommandProcessor:
                 if callable(begin_operator):
                     begin_operator()
                     operator_scope_started = True
+                task_pause_transaction = self._pause_active_task_for_operator_localization()
                 if callable(set_progress):
                     set_progress(
                         lambda payload: self._emit_command_progress(envelope, started_at, payload)
@@ -699,35 +781,33 @@ class CommandProcessor:
                         "finished_at": localization_bootstrap.get("finished_at") or now_iso(),
                     }
                 if envelope.message_type == "nav.initial_pose":
-                    if str(command.get("seed_source") or "") == "rtk":
-                        # Legacy clients may still send seed_source=rtk, but
-                        # RTK is now a secondary correction source.  Always
-                        # enter the NDT-first progressive pipeline so the
-                        # initial anchor and FAST-LIO handoff are verified
-                        # before any RTK/UKF correction is considered.
-                        try:
-                            origin = (
-                                self.map_activation_adapter.mapping_start_pose()
-                                if self.map_activation_adapter else None
-                            )
-                        except ProtocolError as exc:
-                            origin = {
-                                "unavailable_error_code": exc.code,
-                                "unavailable_error_message": exc.message,
-                            }
-                        result_payload = self.localization_adapter.progressive_relocalize(
-                            origin=origin,
-                            waypoints=list(command.get("waypoints") or []),
-                            wait_seconds=float(command.get("wait_seconds", 180.0)),
+                    # A hand-selected pose and the legacy ``seed_source=rtk``
+                    # are hypotheses, never a direct map anchor.  Run the
+                    # common NDT order (mapping origin → supplied candidate →
+                    # global fallback); RTK remains a secondary correction
+                    # after the best NDT result has handed off to FAST-LIO.
+                    try:
+                        origin = (
+                            self.map_activation_adapter.mapping_start_pose()
+                            if self.map_activation_adapter else None
                         )
-                    else:
+                    except ProtocolError as exc:
+                        origin = {
+                            "unavailable_error_code": exc.code,
+                            "unavailable_error_message": exc.message,
+                        }
+                    waypoints = list(command.get("waypoints") or [])
+                    if str(command.get("seed_source") or "") != "rtk":
                         pose = self._resolve_localization_seed(command)
-                        pose.setdefault("wait_seconds", 30.0)
-                        # Initialization is complete only after the verified NDT
-                        # match has handed ownership to an absolute pose source.
-                        # A transient status=3 frame must not acknowledge the UI.
-                        pose.setdefault("require_absolute", True)
-                        result_payload = self.localization_adapter.set_initial_pose(pose)
+                        waypoints.insert(0, {
+                            key: pose[key] for key in ("x", "y", "z", "yaw")
+                            if pose.get(key) is not None
+                        })
+                    result_payload = self.localization_adapter.progressive_relocalize(
+                        origin=origin,
+                        waypoints=waypoints,
+                        wait_seconds=float(command.get("wait_seconds", 180.0)),
+                    )
                 else:
                     seed_source = str(command.get("seed_source") or "last_trusted")
                     if seed_source == "progressive":
@@ -877,6 +957,11 @@ class CommandProcessor:
                     # is rendering the live command snapshot keeps the
                     # navigation stage at "待执行" despite Nav2 being ready.
                     self._emit_command_progress(envelope, started_at, result_payload)
+                task_resume = self._resume_task_after_operator_localization(
+                    task_pause_transaction
+                )
+                if task_resume is not None:
+                    result_payload["task_resume"] = task_resume
                 self._structured(
                     "DEBUG", "relocalization" if envelope.message_type == "nav.relocalize" else "localization",
                     f"{envelope.message_type}.output", "定位算法输出",

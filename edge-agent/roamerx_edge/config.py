@@ -34,6 +34,8 @@ class RosConfig:
     localization_topic: str = "/localization_info"
     scan_matching_status_topic: str = "/status"
     odometry_topic: str = "/odom/localization_odom"
+    lio_odometry_topic: str = "/odom/lio_odom"
+    lio_status_topic: str = "/lio_odometry/status"
     battery_topic: str = ""
     follow_waypoints_action: str = "/follow_waypoints"
     navigate_through_poses_action: str = "/navigate_through_poses"

@@ -52,13 +52,22 @@ class MapSetCoordinator:
         return segments
 
     def activate(self, segment: RouteSegment) -> dict:
+        """Apply one submap without tearing down the whole navigation stack.
+
+        The caller owns the stationary NDT transaction between this method and
+        ``activate_execution``. Keeping the execution group inactive prevents
+        a stale controller/BT goal from moving against the newly loaded map.
+        """
         self.switch_state = "switching"
         self.next_submap_id = segment.submap_id
         local_map_dir = str(segment.submap.get("local_map_dir") or "")
         if not local_map_dir:
             raise ProtocolError("MAP_SET_SOURCE_MISSING", f"submap {segment.submap_id} has no local map directory")
         try:
-            self.map_activation.activate(
+            deactivate = getattr(self.navigation_stack, "deactivate_execution", None)
+            if callable(deactivate):
+                deactivate()
+            activation = self.map_activation.activate(
                 {
                     "map_id": str(segment.submap["map_id"]),
                     "map_version": str(segment.submap.get("map_version") or ""),
@@ -66,7 +75,20 @@ class MapSetCoordinator:
                     "local_map_dir": local_map_dir,
                 }
             )
-            self.navigation_stack.switch_map()
+            active_files = (activation.get("current_map") or {}).get("active_files") or {}
+            reload_map = getattr(self.navigation_stack, "reload_map_if_running", None)
+            if callable(reload_map) and active_files.get("map.pcd") and active_files.get("map.yaml"):
+                reload_map(active_files["map.pcd"], active_files["map.yaml"])
+                reload_filter = getattr(self.navigation_stack, "reload_boundary_filter", None)
+                if callable(reload_filter):
+                    reload_filter()
+            else:
+                # Compatibility fallback for older edge deployments. The
+                # current adapter always exposes the lifecycle-safe path.
+                self.navigation_stack.switch_map()
+            prepare = getattr(self.navigation_stack, "prepare", None)
+            if callable(prepare):
+                prepare({"reason": "map_set_transition"})
         except Exception as exc:
             self.switch_state = "failed"
             self.failure_reason = str(exc)
@@ -76,6 +98,10 @@ class MapSetCoordinator:
         self.switch_state = "ready"
         self.failure_reason = ""
         return self.status()
+
+    def activate_execution(self) -> dict | None:
+        activate = getattr(self.navigation_stack, "activate_execution", None)
+        return activate() if callable(activate) else None
 
     def status(self) -> dict:
         return {

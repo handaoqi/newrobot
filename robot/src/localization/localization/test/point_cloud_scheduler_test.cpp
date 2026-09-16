@@ -53,7 +53,7 @@ TEST(PointCloudScheduler, RelocalizationAndLidarOdometryForceHeavyCloud) {
   EXPECT_TRUE(decidePointCloudWork(config, input).needs_heavy_cloud);
 }
 
-TEST(PointCloudScheduler, PausedRtkPrimarySkipsAllCloudWork) {
+TEST(PointCloudScheduler, LidarMatchingPauseStillSkipsCloudWork) {
   PointCloudScheduleConfig config;
   PointCloudScheduleInput input;
   input.initialized = true;
@@ -69,6 +69,22 @@ TEST(PointCloudScheduler, PausedRtkPrimarySkipsAllCloudWork) {
   const auto decision = decidePointCloudWork(config, input);
   EXPECT_FALSE(decision.run_ndt);
   EXPECT_FALSE(decision.needs_heavy_cloud);
+}
+
+TEST(PointCloudScheduler, RtkPrimaryKeepsLowRateNdt) {
+  PointCloudScheduleConfig config;
+  PointCloudScheduleInput input;
+  input.initialized = true;
+  input.lio_primary_enabled = true;
+  input.lio_stable = true;
+  input.now_ns = 1000000000LL;
+  input.frame_index = 5;
+  input.rtk_primary = true;
+
+  const auto decision = decidePointCloudWork(config, input);
+  EXPECT_TRUE(decision.run_ndt);
+  EXPECT_TRUE(decision.needs_heavy_cloud);
+  EXPECT_NE(decision.reason, "rtk_primary_paused");
 }
 
 TEST(PointCloudScheduler, NdtPrimaryKeepsLegacyStationaryRate) {

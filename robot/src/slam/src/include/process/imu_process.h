@@ -11,6 +11,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <string>
 #include "so3_math.h"
 #include "common.h"
 #include <pcl/common/transforms.h>
@@ -42,6 +43,12 @@ public:
     bool                          initialization_ready() const { return !imu_need_init_; }
     int                           initialization_samples() const { return init_iter_num; }
     int                           initialization_required_samples() const { return init_sample_count_; }
+    double                        initialization_acc_variance() const { return cov_acc.maxCoeff(); }
+    double                        initialization_gyro_variance() const { return cov_gyr.maxCoeff(); }
+    double                        initialization_max_acc_variance() const { return init_max_acc_variance_; }
+    double                        initialization_max_gyro_variance() const { return init_max_gyro_variance_; }
+    int                           initialization_reset_count() const { return init_reset_count_; }
+    const std::string&            initialization_reset_reason() const { return init_reset_reason_; }
     double                       acceleration_scale() const { return acceleration_scale_.load(); }
     Eigen::Matrix<double, 12, 12> Q;
     void                          Process(
@@ -79,5 +86,7 @@ private:
     int                              init_sample_count_ = 600;
     double                           init_max_acc_variance_ = 0.5;
     double                           init_max_gyro_variance_ = 0.05;
+    int                              init_reset_count_ = 0;
+    std::string                      init_reset_reason_ = "startup";
     std::atomic<double>              acceleration_scale_ { robot::slam::G_m_s2 };
 };

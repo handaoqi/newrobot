@@ -18,6 +18,29 @@ class FakeNavigationStack:
         self.switches += 1
 
 
+class LifecycleNavigationStack(FakeNavigationStack):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def deactivate_execution(self):
+        self.calls.append("deactivate")
+
+    def reload_map_if_running(self, pcd_path, yaml_path):
+        self.calls.append(("reload", pcd_path, yaml_path))
+        return {"deferred": False}
+
+    def reload_boundary_filter(self):
+        self.calls.append("boundary")
+
+    def prepare(self, command):
+        self.calls.append(("prepare", command["reason"]))
+
+    def activate_execution(self):
+        self.calls.append("activate")
+        return {"action": "activate_execution"}
+
+
 def _route_snapshot():
     return {
         "waypoints": [
@@ -53,3 +76,26 @@ def test_activate_switches_local_map_then_navigation_stack():
     assert activation.commands[0]["local_map_dir"] == "/maps/1"
     assert navigation_stack.switches == 1
     assert status["current_submap_id"] == "submap_001"
+
+
+def test_activate_uses_lifecycle_safe_reload_when_available():
+    class Activation(FakeActivation):
+        def activate(self, command):
+            super().activate(command)
+            return {"current_map": {"active_files": {
+                "map.pcd": "/maps/1/map.pcd", "map.yaml": "/maps/1/map.yaml",
+            }}}
+
+    navigation_stack = LifecycleNavigationStack()
+    coordinator = MapSetCoordinator(Activation(), navigation_stack)
+    coordinator.activate(coordinator.build_segments(_route_snapshot())[0])
+
+    assert navigation_stack.switches == 0
+    assert navigation_stack.calls == [
+        "deactivate",
+        ("reload", "/maps/1/map.pcd", "/maps/1/map.yaml"),
+        "boundary",
+        ("prepare", "map_set_transition"),
+    ]
+    coordinator.activate_execution()
+    assert navigation_stack.calls[-1] == "activate"

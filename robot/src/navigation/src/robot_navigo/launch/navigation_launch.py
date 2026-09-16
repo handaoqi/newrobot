@@ -27,16 +27,21 @@ def generate_launch_description():
     container_name = LaunchConfiguration('container_name')
     container_name_full = (namespace, '/', container_name)
 
-    lifecycle_nodes = [
+    # Map/filter/collision nodes must remain available while Edge is doing a
+    # stationary NDT relocalization.  Controllers and BT actions stay
+    # inactive until that transaction has passed its final FAST-LIO gate.
+    safety_lifecycle_nodes = [
         'map_server',
         'filter_mask_server',
         'costmap_filter_info_server',
+        'collision_monitor',
+    ]
+    execution_lifecycle_nodes = [
         'controller_server',
         'planner_server',
         'smoother_server',
         'behavior_server',
         'velocity_optimizer',
-        'collision_monitor',
         'bt_navigator',
         'waypoint_follower',
     ]
@@ -260,12 +265,24 @@ def generate_launch_description():
             Node(
                 package='nav2_lifecycle_manager',
                 executable='lifecycle_manager',
-                name='lifecycle_manager_navigation',
+                name='lifecycle_manager_safety',
+                output='screen',
+                arguments=['--ros-args', '--log-level', log_level],
+                parameters=[{
+                    'autostart': True,
+                    'node_names': safety_lifecycle_nodes,
+                    'bond_timeout': 4.0,
+                }],
+            ),
+            Node(
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_execution',
                 output='screen',
                 arguments=['--ros-args', '--log-level', log_level],
                 parameters=[{
                     'autostart': autostart,
-                    'node_names': lifecycle_nodes,
+                    'node_names': execution_lifecycle_nodes,
                     'bond_timeout': 4.0,
                 }],
             ),
@@ -363,10 +380,20 @@ def generate_launch_description():
                     ComposableNode(
                         package='nav2_lifecycle_manager',
                         plugin='nav2_lifecycle_manager::LifecycleManager',
-                        name='lifecycle_manager_navigation',
+                        name='lifecycle_manager_safety',
+                        parameters=[{
+                            'autostart': True,
+                            'node_names': safety_lifecycle_nodes,
+                            'bond_timeout': 4.0,
+                        }],
+                    ),
+                    ComposableNode(
+                        package='nav2_lifecycle_manager',
+                        plugin='nav2_lifecycle_manager::LifecycleManager',
+                        name='lifecycle_manager_execution',
                         parameters=[{
                             'autostart': autostart,
-                            'node_names': lifecycle_nodes,
+                            'node_names': execution_lifecycle_nodes,
                             'bond_timeout': 4.0,
                         }],
                     ),

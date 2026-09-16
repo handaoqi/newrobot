@@ -282,6 +282,9 @@ class RosAdapter(Node):
         self._lio_started_monotonic = time.monotonic()
         self._odometry_sequence = 0
         self._odometry_consumed_sequence = 0
+        self._lio_odometry_samples = deque(maxlen=12)
+        self._lio_odometry_status: dict = {}
+        self._lio_status_received_monotonic = 0.0
         self._latest_scan = None
         self._latest_scan_received_monotonic = 0.0
         self._scan_sequence = 0
@@ -301,6 +304,7 @@ class RosAdapter(Node):
         self._localization_sample_sequence = 0
         self._localization_decision_sequence = 0
         self._localization_status_samples = deque(maxlen=100)
+        self._localization_status_sample_times = deque(maxlen=100)
         # A localization operation owns a monotonically increasing generation.
         # Starting an operator request invalidates an older automatic search so
         # the old worker can no longer overwrite the newly selected pose while
@@ -389,6 +393,13 @@ class RosAdapter(Node):
             callback_group=self._safety_callback_group,
         )
         self.create_subscription(
+            Odometry,
+            ros_config.lio_odometry_topic,
+            self._on_lio_odometry,
+            20,
+            callback_group=self._safety_callback_group,
+        )
+        self.create_subscription(
             Twist, ros_config.cmd_vel_raw_topic, self._on_cmd_vel_raw, 10,
             callback_group=self._safety_callback_group,
         )
@@ -402,6 +413,12 @@ class RosAdapter(Node):
         )
         self.create_subscription(String, "/sensor_health", self._on_sensor_health, 2)
         self.create_subscription(String, "/localization/decision", self._on_localization_decision, 10)
+        self.create_subscription(
+            String, ros_config.lio_status_topic, self._on_lio_odometry_status,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE),
+            callback_group=self._safety_callback_group,
+        )
         self.create_subscription(String, "/planner/performance", self._on_planner_performance, 10)
         self.create_subscription(String, "/mppi/performance", self._on_mppi_performance, 10)
         self.create_subscription(String, "/collision_monitor/state", self._on_collision_state, 10)
@@ -666,6 +683,67 @@ class RosAdapter(Node):
             daemon=True,
             name="lio-localization-fault-handler",
         ).start()
+
+    def _on_lio_odometry_status(self, msg) -> None:
+        payload = self._diagnostic_payload(msg)
+        if payload is None:
+            LOGGER.warning("invalid /lio_odometry/status payload")
+            return
+        self._lio_odometry_status = dict(payload)
+        self._lio_status_received_monotonic = time.monotonic()
+        self.telemetry.on_lio_odometry_status(payload)
+        with self._localization_sample_condition:
+            self._localization_sample_sequence += 1
+            self._localization_sample_condition.notify_all()
+
+    def _on_lio_odometry(self, msg) -> None:
+        stamp = getattr(getattr(msg, "header", None), "stamp", None)
+        try:
+            stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        except (AttributeError, TypeError, ValueError):
+            stamp_ns = 0
+        received = time.monotonic()
+        self._lio_odometry_samples.append({
+            "stamp_ns": stamp_ns,
+            "received_monotonic": received,
+        })
+        with self._localization_sample_condition:
+            self._localization_sample_sequence += 1
+            self._localization_sample_condition.notify_all()
+
+    def lio_readiness(self, *, max_age_seconds: float = 0.50, required_frames: int = 3) -> dict:
+        """Return the non-map readiness evidence for the FAST-LIO gate.
+
+        The retained status reports IMU/iKD-tree health, while the separate
+        odometry samples prove that the live continuous source is still
+        producing increasing frames.  This deliberately does not inspect
+        ``/localization_info.status`` because NDT has not necessarily run yet.
+        """
+        now = time.monotonic()
+        status = dict(self._lio_odometry_status)
+        frames = list(self._lio_odometry_samples)[-max(1, int(required_frames)):]
+        fresh = len(frames) >= max(1, int(required_frames)) and all(
+            now - float(frame["received_monotonic"]) <= max_age_seconds
+            for frame in frames
+        )
+        stamps = [int(frame["stamp_ns"]) for frame in frames]
+        monotonic_stamps = all(
+            current > previous for previous, current in zip(stamps, stamps[1:])
+        ) and all(stamp > 0 for stamp in stamps)
+        state = str(status.get("state") or "unknown")
+        ready = state == "ready" and fresh and monotonic_stamps
+        return {
+            "ready": ready,
+            "state": state,
+            "status_age_seconds": (
+                round(now - self._lio_status_received_monotonic, 3)
+                if self._lio_status_received_monotonic else None
+            ),
+            "required_frames": int(required_frames),
+            "fresh_frames": len(frames) if fresh else 0,
+            "monotonic_stamps": monotonic_stamps,
+            "status": status or None,
+        }
 
     def set_log_context_provider(self, provider: Callable | None) -> None:
         self._log_context_provider = provider
@@ -1114,6 +1192,9 @@ class RosAdapter(Node):
             self._localization_sample_sequence += 1
             self._localization_status_samples.append(
                 (self._localization_sample_sequence, status)
+            )
+            self._localization_status_sample_times.append(
+                (self._localization_sample_sequence, status, time.monotonic())
             )
             self._localization_sample_condition.notify_all()
         if status != 3:
@@ -1586,7 +1667,56 @@ class RosAdapter(Node):
             and decision.get("lio_healthy") is True
             and decision.get("lio_anchored") is True
             and decision.get("absolute_stable") is True
+            and str(decision.get("handoff_state") or "ready") == "ready"
+            and decision.get("lio_motion_anomaly") is not True
         )
+
+    def wait_for_final_localization_gate(
+        self, timeout_seconds: float = 15.0, required_samples: int = 3,
+        max_age_seconds: float = 0.50,
+    ) -> dict:
+        """Wait for the complete NDT-commit→LIO handoff acceptance evidence.
+
+        This is deliberately stricter than the legacy single status=3 gate.
+        It is called after a stationary secondary correction and before any
+        Nav2 action is admitted.
+        """
+        required = max(1, int(required_samples))
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        last = {}
+        with self._localization_sample_condition:
+            while True:
+                decision = self._localization_decision()
+                samples = list(self._localization_status_sample_times)[-required:]
+                now = time.monotonic()
+                fresh_normal = (
+                    len(samples) == required
+                    and all(status == 3 and now - received <= max_age_seconds
+                            for _sequence, status, received in samples)
+                )
+                source = str(decision.get("active_source") or "")
+                continuous = str(decision.get("continuous_source") or source)
+                source_ready = source == "lio_imu" and continuous == "lio_imu"
+                handoff_ready = self._fast_lio_handoff_ready(decision)
+                lio = self.lio_readiness(
+                    max_age_seconds=max_age_seconds, required_frames=required
+                )
+                last = {
+                    "accepted": bool(fresh_normal and source_ready and handoff_ready and lio["ready"]),
+                    "fresh_status_3_frames": len(samples) if fresh_normal else 0,
+                    "required_status_3_frames": required,
+                    "active_source": source or None,
+                    "continuous_source": continuous or None,
+                    "handoff_ready": handoff_ready,
+                    "fast_lio": lio,
+                    "localization_decision": decision,
+                }
+                if last["accepted"]:
+                    return last
+                remaining = deadline - now
+                if remaining <= 0.0:
+                    return last
+                self._localization_sample_condition.wait(timeout=min(0.20, remaining))
 
     def _on_cmd_vel_raw(self, msg) -> None:
         self._raw_forward_command = float(msg.linear.x)
@@ -1923,6 +2053,17 @@ class RosAdapter(Node):
         """Serialize Nav2 discovery probes made by background threads."""
         with self._nav_ready_probe_lock:
             return self._wait_until_ready_probe(timeout_seconds)
+
+    def wait_until_prepared(self, timeout_seconds: float = 10.0) -> bool:
+        """Map/filter/collision availability before localization is complete."""
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        required_nodes = ("/map_server", "/collision_monitor")
+        while True:
+            if all(self._lifecycle_node_is_active(name) for name in required_nodes):
+                return True
+            if timeout_seconds <= 0.0 or time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
 
     def _wait_until_ready_probe(self, timeout_seconds: float) -> bool:
         """Wait for Nav2's action server *and* all required lifecycle nodes.

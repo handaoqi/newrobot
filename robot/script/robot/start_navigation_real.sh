@@ -76,7 +76,7 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-24}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|restart-localization|ensure-localization-odom|stop-localization|status|load-map|full-stop}"
+  echo "Usage: $0 {start|prepare|activate-execution|deactivate-execution|stop|restart|restart-localization|ensure-localization-odom|stop-localization|status|load-map|full-stop}"
   echo
   echo "Env:"
   echo "  PROJECT_DIR=${PROJECT_DIR}"
@@ -363,17 +363,58 @@ start_stack() {
   echo "  ${LOG_DIR}/navigation.log"
 }
 
+prepare_stack() {
+  # Prepare is intentionally not a navigation start: it leaves the execution
+  # Lifecycle manager inactive, so planner/controller/BT cannot command the
+  # dog while Edge waits for FAST-LIO and NDT evidence.
+  WAIT_SECONDS="${NAV_SENSOR_WAIT_SECONDS:-25}" "${SCRIPT_DIR}/ensure_navigation_sensors.sh"
+  if ! is_rtk_running; then
+    ensure_rtk
+  fi
+  if [ ! -f "${MAP_YAML}" ] || [ ! -f "${PCD_MAP}" ]; then
+    echo "ERROR: map assets are unavailable (yaml=${MAP_YAML}, pcd=${PCD_MAP})" >&2
+    return 1
+  fi
+  if ! is_localization_node_alive; then
+    echo "Starting localization for prepared navigation..."
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch localization localization.launch.py" \
+      >"${LOG_DIR}/localization.log" 2>&1 < /dev/null &
+    wait_for_localization_process
+    load_pcd_map
+  fi
+  if ! is_navigation_running; then
+    echo "Preparing Nav2 map/safety Lifecycle group (execution inactive)..."
+    setsid bash -lc "source /opt/ros/humble/setup.bash && source '${PROJECT_DIR}/install/setup.bash' && export ROS_DOMAIN_ID='${ROS_DOMAIN_ID}' RMW_IMPLEMENTATION='${RMW_IMPLEMENTATION}' && exec ros2 launch robot_navigo navigation_bringup.launch.py platform:='${PLATFORM}' mc_controller_type:='${MC_CONTROLLER_TYPE}' communication_type:='${COMMUNICATION_TYPE}' use_official_ukf:='${USE_OFFICIAL_UKF}' map:='${MAP_YAML}' autostart:=false" \
+      >"${LOG_DIR}/navigation.log" 2>&1 < /dev/null &
+  fi
+  echo "Navigation prepared; waiting for localization before execution activation."
+}
+
+manage_execution_lifecycle() {
+  local operation="$1"
+  local command
+  case "${operation}" in
+    activate) command=0 ;;
+    deactivate) command=1 ;;
+    *) echo "ERROR: invalid execution lifecycle operation: ${operation}" >&2; return 2 ;;
+  esac
+  timeout 15 ros2 service call /lifecycle_manager_execution/manage_nodes \
+    nav2_msgs/srv/ManageLifecycleNodes "{command: ${command}}"
+}
+
 status_stack() {
   echo "Processes:"
   pgrep -af "ros2 launch localization localization.launch.py|ros2 launch robot_navigo navigation_bringup.launch.py|localization_node|navigo_container|vel_cmd_udp_pub|mode_status_pub" || true
   echo
   echo "Lifecycle:"
-  local planner controller bt waypoint
+  local planner controller bt waypoint map_server collision
   planner="$(ros2 lifecycle get /planner_server 2>/dev/null || true)"
   controller="$(ros2 lifecycle get /controller_server 2>/dev/null || true)"
   bt="$(ros2 lifecycle get /bt_navigator 2>/dev/null || true)"
   waypoint="$(ros2 lifecycle get /waypoint_follower 2>/dev/null || true)"
-  printf '%s\n' "${planner}" "${controller}" "${bt}" "${waypoint}"
+  map_server="$(ros2 lifecycle get /map_server 2>/dev/null || true)"
+  collision="$(ros2 lifecycle get /collision_monitor 2>/dev/null || true)"
+  printf '%s\n' "${planner}" "${controller}" "${bt}" "${waypoint}" "${map_server}" "${collision}"
   echo
   echo "Localization:"
   local status
@@ -401,6 +442,12 @@ status_stack() {
   if echo "${waypoint}" | grep -q 'active \[3\]'; then
     echo "/follow_waypoints"
   fi
+  if echo "${map_server}" | grep -q 'active \[3\]'; then
+    echo "/map_server"
+  fi
+  if echo "${collision}" | grep -q 'active \[3\]'; then
+    echo "/collision_monitor"
+  fi
   echo "/cmd_vel"
   echo "status: ${status:-unavailable}"
 }
@@ -409,6 +456,15 @@ MODE="${1:-start}"
 case "${MODE}" in
   start)
     start_stack
+    ;;
+  prepare)
+    prepare_stack
+    ;;
+  activate-execution)
+    manage_execution_lifecycle activate
+    ;;
+  deactivate-execution)
+    manage_execution_lifecycle deactivate
     ;;
   stop)
     stop_navigation
