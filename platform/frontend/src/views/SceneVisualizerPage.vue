@@ -53,6 +53,8 @@ const robotStatus = ref(null)
 const navigationStatus = ref(null)
 const selectedRoute = ref(null)
 const personDetections = ref(null)
+const viewportStageRef = ref(null)
+const viewportFullscreen = ref(false)
 const loading = ref(true)
 const sceneLoading = ref(false)
 const error = ref('')
@@ -476,6 +478,24 @@ function selectCamera(preset) {
   if (preset === 'dog') viewMode.value = '3d'
 }
 
+function syncViewportFullscreen() {
+  viewportFullscreen.value = document.fullscreenElement === viewportStageRef.value
+}
+
+async function toggleViewportFullscreen() {
+  const target = viewportStageRef.value
+  if (!target) return
+  try {
+    if (document.fullscreenElement === target) await document.exitFullscreen()
+    else {
+      if (document.fullscreenElement) await document.exitFullscreen()
+      await target.requestFullscreen()
+    }
+  } catch (cause) {
+    error.value = cause.message || '无法切换场景全屏显示'
+  }
+}
+
 function selectMapMode(mode) {
   mapMode.value = mode
   if (mode === 'satellite') {
@@ -580,6 +600,7 @@ onMounted(async () => {
   await Promise.all([loadScene(), loadRoute(), pollStatus()])
   connectLive()
   pollTimer = window.setInterval(pollStatus, 1000)
+  document.addEventListener('fullscreenchange', syncViewportFullscreen)
 })
 
 onBeforeUnmount(() => {
@@ -588,6 +609,7 @@ onBeforeUnmount(() => {
   if (pollTimer) window.clearInterval(pollTimer)
   if (semanticTimer) window.clearInterval(semanticTimer)
   if (sceneBuildTimer) window.clearInterval(sceneBuildTimer)
+  document.removeEventListener('fullscreenchange', syncViewportFullscreen)
 })
 </script>
 
@@ -619,14 +641,17 @@ onBeforeUnmount(() => {
         <div class="viewport-toolbar">
           <div v-if="mapMode !== 'satellite'" class="segmented"><button :class="{ active: viewMode === '2d' }" @click="viewMode = '2d'">2D</button><button :class="{ active: viewMode === '3d' }" @click="viewMode = '3d'">3D</button><span>滚轮/双指自动切换</span></div>
           <div v-if="mapMode !== 'satellite'" class="segmented"><button v-for="item in [['overview','俯视'],['follow','跟随'],['dog','机器狗视角']]" :key="item[0]" :class="{ active: cameraPreset === item[0] }" @click="selectCamera(item[0])">{{ item[1] }}</button></div>
-          <span v-if="viewMode === '3d' && mapMode !== 'satellite'" class="mode-hint">点入视图后：左键旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 平移 · Q/E 升降 · Shift 加速</span>
+          <span v-if="viewMode === '3d' && mapMode !== 'satellite'" class="mode-hint">3D：左键旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 或方向键平移 · Q/E 升降 · Shift 加速</span>
+          <span v-else-if="mapMode !== 'satellite'" class="mode-hint">2D：左键/右键拖动平移 · 滚轮缩放 · 方向键平移</span>
+          <span v-else class="mode-hint">卫星图：左键拖动平移 · 滚轮或＋/－缩放 · 方向键平移</span>
           <span v-if="mapMode === 'street-block'" class="mode-hint">点云识别 → GLB静态资产拼接 · 实时目标</span>
           <span v-else-if="mapMode === 'satellite'" class="mode-hint">高德卫星来源</span>
           <span class="render-stats">{{ renderStats.fps }} FPS · {{ renderStats.points.toLocaleString() }} 点</span>
         </div>
-        <div class="viewport-wrap">
+        <div ref="viewportStageRef" class="viewport-wrap" :class="{ fullscreen: viewportFullscreen }">
           <SceneViewport v-if="mapMode !== 'satellite'" :manifest="manifest" :cloud-buffer="cloudBuffer" :live-cloud="liveCloud" :obstacles="obstacles" :trail="trail" :correction="correction" :robot-pose="robotPose" :waypoints="routeWaypoints" :static-assets="viewportStaticAssets" :dynamic-objects="dynamicObjects" :layers="layers" :mode="viewMode" :map-mode="mapMode" :camera-preset="cameraPreset" @mode-change="viewMode = $event" @camera-preset-change="cameraPreset = $event" @stats="renderStats = $event" @error="error = $event" @asset-inference="handleAssetInference" />
           <AmapSatelliteViewport v-else :geo-reference="manifest?.geo_reference" :robot-pose="robotPose" :trail="trail" :waypoints="routeWaypoints" />
+          <button type="button" class="scene-fullscreen-button" :title="viewportFullscreen ? '退出全屏（也可按 Esc）' : '全屏查看场景'" @click="toggleViewportFullscreen">{{ viewportFullscreen ? '退出全屏' : '全屏' }}</button>
           <div v-if="loading || sceneLoading" class="scene-loading">{{ loading ? '正在加载设备与地图…' : '正在生成/加载三维点云预览…' }}</div>
           <div class="scene-legend"><span><i class="robot"></i>机器狗</span><span><i class="route"></i>规划路线</span><span><i class="cloud"></i>局部点云</span><span><i class="object"></i>{{ mapMode === 'street-block' ? '街区静态/实时资产' : '识别资产' }}</span></div>
         </div>
@@ -738,7 +763,7 @@ onBeforeUnmount(() => {
 .source-tabs,.segmented { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-soft); }.source-tabs button,.segmented button { border: 0; border-radius: 8px; padding: 8px 11px; color: var(--muted); background: transparent; cursor: pointer; }.source-tabs button.active,.segmented button.active { color: #fff; background: #087aa0; }.segmented span { padding: 0 6px; color: var(--muted); font-size: 11px; }
 .error-banner { display: flex; justify-content: space-between; padding: 10px 13px; border: 1px solid #dc6060; border-radius: 10px; color: #ffb3b3; background: #351318; }.error-banner button { border: 0; color: inherit; background: transparent; font-size: 18px; }
 .control-bar { display: grid; grid-template-columns: repeat(3,minmax(150px,1fr)) minmax(280px,1.4fr) auto; gap: 10px; align-items: end; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }.control-bar label,.map-mode-picker { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }.control-bar select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--input-bg); }.map-mode-buttons { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }.map-mode-buttons button { flex: 1; min-width: 0; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; white-space: nowrap; }.map-mode-buttons button.active { color: #fff; background: #087aa0; }.runtime-state { display: grid; grid-template-columns: auto auto; gap: 2px 7px; align-items: center; min-width: 130px; }.runtime-state i { grid-row: 1 / 3; width: 9px; height: 9px; border-radius: 50%; background: #eab308; }.runtime-state i.ok { background: #22c55e; }.runtime-state i.bad { background: #ef4444; }.runtime-state span { color: var(--muted); font-size: 11px; }
-.scene-workspace { display: grid; grid-template-columns: minmax(0,1.75fr) minmax(350px,.75fr); gap: 14px; min-height: min(720px,calc(100vh - 250px)); }.viewport-card,.diagnostic-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); }.viewport-card { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }.viewport-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }.mode-hint { color: var(--muted); font-size: 11px; }.render-stats { margin-left: auto; color: var(--muted); font: 11px ui-monospace,monospace; }.viewport-wrap { position: relative; min-height: 0; background: #07111f; }.scene-loading { position: absolute; inset: 0; display: grid; place-content: center; color: #d9edff; background: rgba(4,12,23,.72); backdrop-filter: blur(4px); }.scene-legend { position: absolute; left: 12px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 10px; padding: 7px 9px; border: 1px solid #29415a; border-radius: 9px; color: #dbeafe; background: rgba(5,15,28,.82); font-size: 10px; pointer-events: none; }.scene-legend span { display: flex; gap: 5px; align-items: center; }.scene-legend i { width: 12px; height: 3px; }.scene-legend .robot { background:#22d3ee }.scene-legend .route { background:#38bdf8 }.scene-legend .cloud { background:#7dd3fc }.scene-legend .object { background:#f59e0b }
+.scene-workspace { display: grid; grid-template-columns: minmax(0,1.75fr) minmax(350px,.75fr); gap: 14px; min-height: min(720px,calc(100vh - 250px)); }.viewport-card,.diagnostic-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--panel); }.viewport-card { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }.viewport-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }.mode-hint { color: var(--muted); font-size: 11px; }.render-stats { margin-left: auto; color: var(--muted); font: 11px ui-monospace,monospace; }.viewport-wrap { position: relative; min-height: 0; background: #07111f; }.viewport-wrap:fullscreen { width: 100vw; height: 100vh; background: #07111f; }.viewport-wrap:fullscreen .scene-viewport,.viewport-wrap:fullscreen .satellite-viewport { min-height: 100vh; border-radius: 0; }.scene-fullscreen-button { position: absolute; z-index: 5; top: 12px; left: 12px; padding: 6px 9px; border: 1px solid #4f7691; border-radius: 7px; color: #e0f2fe; background: rgba(5,15,28,.86); font-size: 11px; cursor: pointer; }.scene-fullscreen-button:hover { background: #0d5275; }.scene-loading { position: absolute; inset: 0; display: grid; place-content: center; color: #d9edff; background: rgba(4,12,23,.72); backdrop-filter: blur(4px); }.scene-legend { position: absolute; left: 12px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 10px; padding: 7px 9px; border: 1px solid #29415a; border-radius: 9px; color: #dbeafe; background: rgba(5,15,28,.82); font-size: 10px; pointer-events: none; }.scene-legend span { display: flex; gap: 5px; align-items: center; }.scene-legend i { width: 12px; height: 3px; }.scene-legend .robot { background:#22d3ee }.scene-legend .route { background:#38bdf8 }.scene-legend .cloud { background:#7dd3fc }.scene-legend .object { background:#f59e0b }
 .bag-timeline { display: grid; grid-template-columns: auto minmax(120px,1fr) auto auto; gap: 9px; align-items: center; padding: 9px 12px; border-top: 1px solid var(--line); font-size: 11px; }.bag-timeline input { width: 100%; }
 .diagnostic-card { display: grid; grid-template-rows: auto minmax(0,1fr); }.diagnostic-tabs { display: grid; grid-template-columns: repeat(4,1fr); border-bottom: 1px solid var(--line); }.diagnostic-tabs button { min-width: 0; padding: 12px 4px; border: 0; border-bottom: 2px solid transparent; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }.diagnostic-tabs button.active { color: var(--cyan); border-bottom-color: var(--cyan); background: var(--panel-soft); }.diagnostic-body { min-height: 0; padding: 14px; overflow: auto; }.diagnostic-body h3 { margin: 17px 0 8px; font-size: 13px; }.process-list { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }.process-step { display: grid; grid-template-columns: auto 1fr; gap: 2px 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.process-step i { grid-row: 1/3; width: 8px; height: 8px; margin-top: 3px; border-radius: 50%; background: #94a3b8; }.process-step span,.process-step strong { font-size: 10px; }.process-step strong { color: var(--muted); }.process-step.ok i{background:#22c55e}.process-step.active i{background:#38bdf8}.process-step.warning i{background:#ef4444}
 .metric-list { margin: 0; }.metric-list div { display: grid; grid-template-columns: minmax(110px,.8fr) minmax(0,1.2fr); gap: 10px; padding: 7px 2px; border-bottom: 1px solid var(--line); font-size: 11px; }.metric-list dt { color: var(--muted); }.metric-list dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-family: ui-monospace,monospace; }.ok{color:#22c55e!important}.warn{color:#eab308!important}.bad{color:#ef4444!important}.fusion-flow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; padding: 9px; border: 1px solid #245b72; border-radius: 9px; background: rgba(8,122,160,.09); font-size: 10px; }.fusion-flow span,.fusion-flow strong { padding: 5px; border-radius: 6px; background: var(--panel-soft); }.fusion-flow b { color: var(--cyan); }.readonly-note { padding: 8px 10px; border-left: 3px solid #38bdf8; color: var(--muted); background: var(--panel-soft); font-size: 11px; }.waypoint-list { display: grid; gap: 7px; }.waypoint-list article { padding: 8px; border: 1px solid var(--line); border-radius: 8px; }.waypoint-list header { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 7px; font-size: 11px; }.waypoint-list header b { display:grid;place-content:center;width:20px;height:20px;border-radius:50%;color:#fff;background:#087aa0 }.waypoint-list header span { color: var(--muted); font-family:ui-monospace,monospace }.waypoint-list article>div { display:flex;flex-wrap:wrap;gap:5px;margin-top:7px }.waypoint-list article>div span { padding:3px 5px;border-radius:5px;color:var(--muted);background:var(--panel-soft);font-size:9px }

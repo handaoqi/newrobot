@@ -148,6 +148,7 @@ function zoomTo(nextZoom, anchorX = viewport.width / 2, anchorY = viewport.heigh
 
 function pointerDown(event) {
   if (state.value !== 'ready') return
+  host.value?.focus({ preventScroll: true })
   drag.active = true
   drag.x = event.clientX
   drag.y = event.clientY
@@ -174,6 +175,28 @@ function wheel(event) {
   event.preventDefault()
   const bounds = host.value.getBoundingClientRect()
   zoomTo(zoom.value + (event.deltaY < 0 ? 1 : -1), event.clientX - bounds.left, event.clientY - bounds.top)
+}
+
+function panByKeyboard(key) {
+  if (state.value !== 'ready' || !centerPixels.value) return
+  const distance = Math.max(80, Math.min(viewport.width, viewport.height) * 0.18)
+  const offset = { x: 0, y: 0 }
+  if (key === 'arrowleft') offset.x = -distance
+  else if (key === 'arrowright') offset.x = distance
+  else if (key === 'arrowup') offset.y = -distance
+  else if (key === 'arrowdown') offset.y = distance
+  else return
+  centerPixels.value = normalizedCenter({
+    x: centerPixels.value.x + offset.x,
+    y: centerPixels.value.y + offset.y,
+  })
+}
+
+function keyDown(event) {
+  const key = event.key.toLowerCase()
+  if (!['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key)) return
+  panByKeyboard(key)
+  event.preventDefault()
 }
 
 function initialize() {
@@ -224,12 +247,15 @@ onBeforeUnmount(() => {
     ref="host"
     class="satellite-viewport"
     role="application"
+    tabindex="0"
     aria-label="卫星地图"
     @pointerdown="pointerDown"
     @pointermove="pointerMove"
     @pointerup="pointerUp"
     @pointercancel="pointerUp"
     @wheel="wheel"
+    @keydown="keyDown"
+    @contextmenu.prevent
   >
     <div class="tile-layer" :class="{ dragging: drag.active }">
       <img

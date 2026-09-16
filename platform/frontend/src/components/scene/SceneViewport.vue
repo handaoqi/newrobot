@@ -442,9 +442,12 @@ function editableTarget(target) {
 }
 
 function onKeyDown(event) {
-  if (props.mode !== '3d' || !viewportHasKeyboardFocus() || editableTarget(event.target)) return
+  if (!viewportHasKeyboardFocus() || editableTarget(event.target)) return
   const key = event.key.toLowerCase()
-  if (!['w', 'a', 's', 'd', 'q', 'e', 'shift'].includes(key)) return
+  const supported = props.mode === '3d'
+    ? ['w', 'a', 's', 'd', 'q', 'e', 'shift', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright']
+    : ['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift']
+  if (!supported.includes(key)) return
   pressedKeys.add(key)
   event.preventDefault()
 }
@@ -458,22 +461,29 @@ function clearPressedKeys() {
 }
 
 function moveCamera(deltaSeconds) {
-  if (props.mode !== '3d' || !activeCamera || !pressedKeys.size) return
-  const forward = new THREE.Vector3()
-  activeCamera.getWorldDirection(forward)
-  forward.z = 0
-  if (forward.lengthSq() < 1e-6) forward.set(1, 0, 0)
-  else forward.normalize()
-  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1)).normalize()
+  if (!activeCamera || !pressedKeys.size) return
   const direction = new THREE.Vector3()
-  if (pressedKeys.has('w')) direction.add(forward)
-  if (pressedKeys.has('s')) direction.sub(forward)
-  if (pressedKeys.has('d')) direction.add(right)
-  if (pressedKeys.has('a')) direction.sub(right)
-  if (pressedKeys.has('e')) direction.z += 1
-  if (pressedKeys.has('q')) direction.z -= 1
+  if (props.mode === '3d') {
+    const forward = new THREE.Vector3()
+    activeCamera.getWorldDirection(forward)
+    forward.z = 0
+    if (forward.lengthSq() < 1e-6) forward.set(1, 0, 0)
+    else forward.normalize()
+    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1)).normalize()
+    if (pressedKeys.has('w') || pressedKeys.has('arrowup')) direction.add(forward)
+    if (pressedKeys.has('s') || pressedKeys.has('arrowdown')) direction.sub(forward)
+    if (pressedKeys.has('d') || pressedKeys.has('arrowright')) direction.add(right)
+    if (pressedKeys.has('a') || pressedKeys.has('arrowleft')) direction.sub(right)
+    if (pressedKeys.has('e')) direction.z += 1
+    if (pressedKeys.has('q')) direction.z -= 1
+  } else {
+    if (pressedKeys.has('arrowright')) direction.x += 1
+    if (pressedKeys.has('arrowleft')) direction.x -= 1
+    if (pressedKeys.has('arrowup')) direction.y += 1
+    if (pressedKeys.has('arrowdown')) direction.y -= 1
+  }
   if (direction.lengthSq() < 1e-6) return
-  if (props.cameraPreset !== 'overview') emit('camera-preset-change', 'overview')
+  if (props.mode === '3d' && props.cameraPreset !== 'overview') emit('camera-preset-change', 'overview')
   direction.normalize()
   const { radius } = centerAndRadius()
   const speed = Math.max(1.5, radius * 0.32) * (pressedKeys.has('shift') ? 3 : 1)
@@ -485,6 +495,13 @@ function moveCamera(deltaSeconds) {
 
 function focusViewport() {
   host.value?.focus({ preventScroll: true })
+}
+
+function updateMouseControls() {
+  if (!controls) return
+  controls.mouseButtons.LEFT = props.mode === '3d' ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY
+  controls.mouseButtons.RIGHT = THREE.MOUSE.PAN
 }
 
 function onWheel(event) {
@@ -520,9 +537,7 @@ onMounted(() => {
   renderer.outputColorSpace = THREE.SRGBColorSpace
   host.value.appendChild(renderer.domElement)
   controls = new OrbitControls(activeCamera, renderer.domElement)
-  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE
-  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY
-  controls.mouseButtons.RIGHT = THREE.MOUSE.PAN
+  updateMouseControls()
   controls.enableKeys = false
   controls.enableDamping = true
   controls.dampingFactor = .12
@@ -559,6 +574,7 @@ watch(() => props.mapMode, updateVisibility)
 watch(() => props.layers, updateVisibility, { deep: true })
 watch(() => [props.mode, props.cameraPreset], () => {
   zoom.value = props.mode === '3d' ? Math.max(zoom.value, .56) : Math.min(zoom.value, .44)
+  updateMouseControls()
   setCamera()
 })
 
