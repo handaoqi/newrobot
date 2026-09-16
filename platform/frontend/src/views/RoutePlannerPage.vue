@@ -125,13 +125,12 @@ const recentTaskRoutes = computed(() => [...routes.value]
     if (executionDelta) return executionDelta
     return new Date(right.updated_at || right.created_at || 0).getTime()
       - new Date(left.updated_at || left.created_at || 0).getTime()
-  })
-  .slice(0, 10))
+  }))
 const routePickerOptions = computed(() => {
   const selectedId = String(selectedRoute.value?.id || '')
   const selected = selectedId ? routes.value.find(route => String(route.id) === selectedId) : null
   const recent = recentTaskRoutes.value.filter(route => String(route.id) !== selectedId)
-  return selected ? [selected, ...recent].slice(0, 10) : recent
+  return selected ? [selected, ...recent] : recent
 })
 const waypoints = ref([])
 const waypointNames = ref([])
@@ -3806,7 +3805,7 @@ async function handleDeleteRoute(route) {
                 上次执行：{{ formatExecutionCreatedAt(selectedRoute.latest_execution?.created_at) }}
               </small>
               <button type="button" class="route-list-toggle" @click="toggleRouteList">
-                {{ routeListOpen ? '收起最近任务路线' : '展开最近任务路线（10条）' }}
+                {{ routeListOpen ? '收起最近任务路线' : '展开最近任务路线' }}
               </button>
             <div v-if="routeListOpen" class="route-list">
               <div v-if="!routePickerOptions.length" class="empty-hint">暂无保存的路线</div>
