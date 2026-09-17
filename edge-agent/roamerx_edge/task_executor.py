@@ -7003,6 +7003,14 @@ class TaskExecutor:
                         else:
                             waypoint_labels.append(str(index))
                     detail_suffix = f" (map points: {', '.join(waypoint_labels)})"
+                    nav2_reason = str((details or {}).get("nav2_progress_status") or "").strip()
+                    if nav2_reason:
+                        detail_suffix += f"; Nav2 progress: {nav2_reason}"
+                    controller_readback = str(
+                        (details or {}).get("controller_selector_readback") or ""
+                    ).strip()
+                    if controller_readback:
+                        detail_suffix += f"; controller: {controller_readback}"
                     self._fail(
                         "NAVIGATION_MISSED_WAYPOINTS",
                         f"Nav2 reported missed waypoints: {absolute_missed}{detail_suffix}",

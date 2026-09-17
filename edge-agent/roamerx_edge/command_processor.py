@@ -573,6 +573,12 @@ class CommandProcessor:
         """
         if self.localization_adapter is None:
             raise ProtocolError("LOCALIZATION_UNAVAILABLE", "localization adapter is not configured")
+        # Lifecycle deactivation alone does not clear a previously published
+        # velocity command.  Explicitly zero both the raw and filtered command
+        # paths before any stationary localization search or correction.
+        stop_motion = getattr(self.localization_adapter, "stop_motion", None)
+        if callable(stop_motion):
+            stop_motion()
         lio_readiness = self._wait_for_command_fast_lio_readiness()
         self._emit_command_progress(
             envelope,
@@ -622,7 +628,15 @@ class CommandProcessor:
             trusted_seed=trusted_seed,
             wait_seconds=float(command.get("wait_seconds", 180.0)),
         ) or {}
-        raw_mode = str(command.get("localization_mode") or "").strip().lower()
+        waypoint_mode = ""
+        if waypoints and isinstance(waypoints[0], dict):
+            waypoint_mode = str(waypoints[0].get("localization_mode") or "").strip().lower()
+        # map.activate carries the first-waypoint policy explicitly in the
+        # command, but older/cloud-created commands may only include the
+        # waypoint list. Prefer that route policy before falling back to NDT;
+        # the map capability label (for example rtk_ndt) is not a waypoint
+        # correction mode.
+        raw_mode = str(command.get("localization_mode") or waypoint_mode).strip().lower()
         if not raw_mode and command.get("map_activation_requires_waypoint_mode"):
             secondary = {
                 "status": "skipped",
@@ -1858,8 +1872,15 @@ class CommandProcessor:
             if not self.navigation_stack_adapter:
                 raise ProtocolError("MAP_RELOAD_UNAVAILABLE", "navigation stack adapter is not configured")
             deactivate = getattr(self.navigation_stack_adapter, "deactivate_execution", None)
-            if callable(deactivate):
-                deactivate()
+            try:
+                if callable(deactivate):
+                    deactivate()
+            finally:
+                # map.activate owns a stationary localization transaction;
+                # deactivating Nav2 is not itself a physical stop guarantee.
+                stop_motion = getattr(self.localization_adapter, "stop_motion", None)
+                if callable(stop_motion):
+                    stop_motion()
             self.safety.state.nav_ready = False
             active_files = result_payload["current_map"]["active_files"]
             reload_if_running = getattr(self.navigation_stack_adapter, "reload_map_if_running", None)

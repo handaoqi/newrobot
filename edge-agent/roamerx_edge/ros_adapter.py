@@ -358,6 +358,11 @@ class RosAdapter(Node):
         self._nav_ready_probe_lock = threading.Lock()
         self._active_local_controller: str | None = None
         self._active_global_controller: str | None = None
+        self._controller_selector_readback: str | None = None
+        self._controller_selector_readback_monotonic = 0.0
+        self._controller_selector_condition = threading.Condition()
+        self._nav2_progress_status = ""
+        self._nav2_progress_status_monotonic = 0.0
         # Skip identical Nav2 parameter writes across consecutive waypoints.
         self._remote_param_cache: dict[str, dict[str, bool | int | float]] = {}
         # Nodes whose set_parameters service recently timed out stay skipped so
@@ -422,6 +427,8 @@ class RosAdapter(Node):
         self.create_subscription(String, "/planner/performance", self._on_planner_performance, 10)
         self.create_subscription(String, "/mppi/performance", self._on_mppi_performance, 10)
         self.create_subscription(String, "/collision_monitor/state", self._on_collision_state, 10)
+        self.create_subscription(String, "/controller_selector/active", self._on_controller_selector_readback, 10)
+        self.create_subscription(String, "/navigation/progress_status", self._on_nav2_progress_status, 10)
         self.create_subscription(
             PoseStamped,
             "/localization/scan_match_pose",
@@ -628,6 +635,21 @@ class RosAdapter(Node):
             points.append({"x": float(position.x), "y": float(position.y)})
         self._global_plan_points = points
         self._global_plan_updated_monotonic = time.monotonic()
+
+    def _on_controller_selector_readback(self, msg) -> None:
+        with self._controller_selector_condition:
+            self._controller_selector_readback = str(msg.data or "")
+            self._controller_selector_readback_monotonic = time.monotonic()
+            self._controller_selector_condition.notify_all()
+
+    def _on_nav2_progress_status(self, msg) -> None:
+        self._nav2_progress_status = str(msg.data or "")
+        self._nav2_progress_status_monotonic = time.monotonic()
+
+    def _latest_nav2_progress_status(self) -> str:
+        if time.monotonic() - self._nav2_progress_status_monotonic > 15.0:
+            return ""
+        return self._nav2_progress_status
 
     def _on_robot_motion_state(self, msg) -> None:
         with self._robot_motion_condition:
@@ -2272,11 +2294,22 @@ class RosAdapter(Node):
             missed_waypoints = self._extract_missed_waypoints(result)
             # action_msgs/GoalStatus: SUCCEEDED=4, CANCELED=5, ABORTED=6
             mapped = "succeeded" if status == 4 else "cancelled" if status == 5 else "failed"
+            nav2_progress_status = self._latest_nav2_progress_status()
             if callback:
                 callback(
                     mapped,
-                    "" if mapped != "failed" else f"goal_status={status}",
-                    {"goal_status": status, "missed_waypoints": missed_waypoints},
+                    "" if mapped != "failed" else (
+                        f"goal_status={status}"
+                        + (f"; nav2_progress={nav2_progress_status}" if nav2_progress_status else "")
+                    ),
+                    {
+                        "goal_status": status,
+                        "missed_waypoints": missed_waypoints,
+                        "nav2_progress_status": nav2_progress_status,
+                        "controller_selector_readback": getattr(
+                            self, "_controller_selector_readback", None
+                        ),
+                    },
                 )
         except Exception as exc:
             LOGGER.exception("navigation result callback failed")
@@ -5732,14 +5765,37 @@ class RosAdapter(Node):
 
     def set_local_controller(self, mode: str) -> None:
         normalized = normalize_local_controller(mode)
-        if normalized == getattr(self, "_active_local_controller", None):
-            return
         plugin_id = local_controller_plugin_id(normalized)
+        if (
+            normalized == getattr(self, "_active_local_controller", None)
+            and getattr(self, "_controller_selector_readback", None) == plugin_id
+        ):
+            return
         publisher = getattr(self, "_controller_selector_pub", None)
         if publisher is not None:
             self._publish_nav_selector(publisher, plugin_id)
+        deadline = time.monotonic() + 0.5
+        condition = getattr(self, "_controller_selector_condition", None)
+        # Older navigation stacks may not expose the active selector topic.
+        # Keep the selector write compatible with them, but once a readback
+        # has been observed, every subsequent switch is verified synchronously.
+        if condition is not None and getattr(self, "_controller_selector_readback_monotonic", 0.0) > 0:
+            with condition:
+                while getattr(self, "_controller_selector_readback", None) != plugin_id:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProtocolError(
+                            "LOCAL_CONTROLLER_READBACK_FAILED",
+                            f"expected {plugin_id}, readback={getattr(self, '_controller_selector_readback', None)}",
+                        )
+                    condition.wait(timeout=remaining)
         self._active_local_controller = normalized
-        LOGGER.info("local controller set to %s (%s)", normalized, plugin_id)
+        LOGGER.info(
+            "local controller set to %s (%s), readback=%s",
+            normalized,
+            plugin_id,
+            getattr(self, "_controller_selector_readback", None),
+        )
 
     def set_global_controller(self, mode: str) -> None:
         normalized = normalize_global_controller(mode)

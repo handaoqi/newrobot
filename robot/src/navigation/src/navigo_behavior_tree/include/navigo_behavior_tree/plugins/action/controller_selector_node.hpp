@@ -84,6 +84,7 @@ private:
   void callbackControllerSelect(const std_msgs::msg::String::SharedPtr msg);
 
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr controller_selector_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr active_controller_pub_;
 
   std::string last_selected_controller_;
 
@@ -92,6 +93,8 @@ private:
   rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
 
   std::string topic_name_;
+
+  void publishActiveController();
 };
 
 }  // namespace navigo_behavior_tree

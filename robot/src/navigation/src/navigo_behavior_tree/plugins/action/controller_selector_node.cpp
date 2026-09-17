@@ -50,6 +50,8 @@ ControllerSelector::ControllerSelector(
     qos,
     std::bind(&ControllerSelector::callbackControllerSelect, this, _1),
     sub_option);
+  active_controller_pub_ = node_->create_publisher<std_msgs::msg::String>(
+    topic_name_ + "/active", qos);
 }
 
 BT::NodeStatus ControllerSelector::tick()
@@ -71,6 +73,8 @@ BT::NodeStatus ControllerSelector::tick()
     }
   }
 
+  publishActiveController();
+
   setOutput("selected_controller", last_selected_controller_);
 
   return BT::NodeStatus::SUCCESS;
@@ -80,6 +84,17 @@ void
 ControllerSelector::callbackControllerSelect(const std_msgs::msg::String::SharedPtr msg)
 {
   last_selected_controller_ = msg->data;
+  publishActiveController();
+}
+
+void ControllerSelector::publishActiveController()
+{
+  if (!active_controller_pub_ || last_selected_controller_.empty()) {
+    return;
+  }
+  std_msgs::msg::String message;
+  message.data = last_selected_controller_;
+  active_controller_pub_->publish(message);
 }
 
 }  // namespace navigo_behavior_tree

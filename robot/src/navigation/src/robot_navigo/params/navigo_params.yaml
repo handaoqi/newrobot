@@ -276,6 +276,12 @@ controller_server:
       # Fail FollowPath soon enough that BT Backup/replan runs before Edge
       # reverse. Collision Monitor can zero speed while the goal is still active.
       movement_time_allowance: 8.0
+      # Rotation is progress even when XY is intentionally unchanged. Keep
+      # stalled translation detection at 8 s, but allow heading alignment to
+      # settle for up to 30 s on the quadruped platform.
+      rotation_progress_enabled: true
+      rotation_yaw_threshold: 0.03
+      rotation_time_allowance: 30.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "navigo_path_controller::SimpleGoalChecker"

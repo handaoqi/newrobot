@@ -17,6 +17,8 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <sstream>
+#include "angles/angles.h"
 #include "navigo_core/exceptions.hpp"
 #include "nav_2d_utils/conversions.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -42,11 +44,23 @@ void SimpleProgressChecker::initialize(
     node, plugin_name + ".required_movement_radius", rclcpp::ParameterValue(0.5));
   navigo_util::declare_parameter_if_not_declared(
     node, plugin_name + ".movement_time_allowance", rclcpp::ParameterValue(10.0));
+  navigo_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".rotation_time_allowance", rclcpp::ParameterValue(30.0));
+  navigo_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".rotation_yaw_threshold", rclcpp::ParameterValue(0.03));
+  navigo_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".rotation_progress_enabled", rclcpp::ParameterValue(true));
   // Scale is set to 0 by default, so if it was not set otherwise, set to 0
   node->get_parameter_or(plugin_name + ".required_movement_radius", radius_, 0.5);
   double time_allowance_param = 0.0;
   node->get_parameter_or(plugin_name + ".movement_time_allowance", time_allowance_param, 10.0);
   time_allowance_ = rclcpp::Duration::from_seconds(time_allowance_param);
+  double rotation_time_param = 30.0;
+  node->get_parameter_or(plugin_name + ".rotation_time_allowance", rotation_time_param, 30.0);
+  rotation_time_allowance_ = rclcpp::Duration::from_seconds(rotation_time_param);
+  node->get_parameter_or(plugin_name + ".rotation_yaw_threshold", rotation_yaw_threshold_, 0.03);
+  node->get_parameter_or(plugin_name + ".rotation_progress_enabled", rotation_progress_enabled_, true);
+  status_pub_ = node->create_publisher<std_msgs::msg::String>("/navigation/progress_status", 10);
 
   // Add callback for dynamic parameters
   dyn_params_handler_ = node->add_on_set_parameters_callback(
@@ -60,23 +74,78 @@ bool SimpleProgressChecker::check(geometry_msgs::msg::PoseStamped & current_pose
   geometry_msgs::msg::Pose2D current_pose2d;
   current_pose2d = nav_2d_utils::poseToPose2D(current_pose.pose);
 
-  if ((!baseline_pose_set_) || (isRobotMovedEnough(current_pose2d))) {
+  const auto now = clock_->now();
+  if (!baseline_pose_set_) {
     resetBaselinePose(current_pose2d);
+    if (status_pub_) {
+      std_msgs::msg::String status;
+      status.data = "baseline_initialized";
+      status_pub_->publish(status);
+    }
     return true;
   }
-  return !((clock_->now() - baseline_time_) > time_allowance_);
+  if (isRobotMovedEnough(current_pose2d)) {
+    resetBaselinePose(current_pose2d);
+    if (status_pub_) {
+      std_msgs::msg::String status;
+      status.data = "translation_progress";
+      status_pub_->publish(status);
+    }
+    return true;
+  }
+  if (rotation_progress_enabled_ && isRobotRotating(current_pose2d, now)) {
+    if (status_pub_) {
+      std_msgs::msg::String status;
+      std::ostringstream stream;
+      stream << "rotation_progress;rotation_timeout_s=" << rotation_time_allowance_.seconds();
+      status.data = stream.str();
+      status_pub_->publish(status);
+    }
+    return true;
+  }
+
+  const auto allowance = rotation_active_ ? rotation_time_allowance_ : time_allowance_;
+  const auto start_time = rotation_active_ ? last_rotation_time_ : baseline_time_;
+  const bool within_allowance = !((now - start_time) > allowance);
+  if (status_pub_) {
+    std_msgs::msg::String status;
+    std::ostringstream stream;
+    stream << (within_allowance ? "waiting_for_progress" : "no_translation_or_rotation_progress")
+           << ";rotation_active=" << (rotation_active_ ? "true" : "false")
+           << ";timeout_s=" << allowance.seconds();
+    status.data = stream.str();
+    status_pub_->publish(status);
+  }
+  return within_allowance;
 }
 
 void SimpleProgressChecker::reset()
 {
   baseline_pose_set_ = false;
+  rotation_active_ = false;
+  last_rotation_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 }
 
 void SimpleProgressChecker::resetBaselinePose(const geometry_msgs::msg::Pose2D & pose)
 {
   baseline_pose_ = pose;
   baseline_time_ = clock_->now();
+  last_yaw_ = pose.theta;
+  rotation_active_ = false;
   baseline_pose_set_ = true;
+}
+
+bool SimpleProgressChecker::isRobotRotating(
+  const geometry_msgs::msg::Pose2D & pose, const rclcpp::Time & now)
+{
+  const double yaw_delta = std::abs(angles::shortest_angular_distance(last_yaw_, pose.theta));
+  last_yaw_ = pose.theta;
+  if (yaw_delta < std::max(0.001, rotation_yaw_threshold_)) {
+    return false;
+  }
+  rotation_active_ = true;
+  last_rotation_time_ = now;
+  return true;
 }
 
 bool SimpleProgressChecker::isRobotMovedEnough(const geometry_msgs::msg::Pose2D & pose)
@@ -107,7 +176,14 @@ SimpleProgressChecker::dynamicParametersCallback(std::vector<rclcpp::Parameter> 
         radius_ = parameter.as_double();
       } else if (name == plugin_name_ + ".movement_time_allowance") {
         time_allowance_ = rclcpp::Duration::from_seconds(parameter.as_double());
+      } else if (name == plugin_name_ + ".rotation_time_allowance") {
+        rotation_time_allowance_ = rclcpp::Duration::from_seconds(parameter.as_double());
+      } else if (name == plugin_name_ + ".rotation_yaw_threshold") {
+        rotation_yaw_threshold_ = parameter.as_double();
       }
+    } else if (type == ParameterType::PARAMETER_BOOL &&
+      name == plugin_name_ + ".rotation_progress_enabled") {
+      rotation_progress_enabled_ = parameter.as_bool();
     }
   }
   result.successful = true;

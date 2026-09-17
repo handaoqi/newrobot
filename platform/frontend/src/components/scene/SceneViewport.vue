@@ -55,6 +55,8 @@ let staticRenderToken = 0
 let dynamicRenderToken = 0
 let streetBlockRenderToken = 0
 let mounted = false
+let manualCameraControl = false
+let preserveCameraOnPresetChange = false
 
 function bounds() {
   const value = props.manifest?.bounds || {}
@@ -460,6 +462,22 @@ function clearPressedKeys() {
   pressedKeys.clear()
 }
 
+function orbitCamera(yawDelta, pitchDelta) {
+  if (!activeCamera || !controls) return
+  const orbit = new THREE.Spherical().setFromVector3(activeCamera.position.clone().sub(controls.target))
+  orbit.theta += yawDelta
+  orbit.phi = Math.max(0.08, Math.min(Math.PI - 0.08, orbit.phi + pitchDelta))
+  activeCamera.position.copy(controls.target).add(new THREE.Vector3().setFromSpherical(orbit))
+  activeCamera.lookAt(controls.target)
+}
+
+function takeManualCameraControl() {
+  if (props.cameraPreset === 'overview') return
+  manualCameraControl = true
+  preserveCameraOnPresetChange = true
+  emit('camera-preset-change', 'overview')
+}
+
 function moveCamera(deltaSeconds) {
   if (!activeCamera || !pressedKeys.size) return
   const direction = new THREE.Vector3()
@@ -480,12 +498,12 @@ function moveCamera(deltaSeconds) {
     const yaw = (pressedKeys.has('arrowleft') ? 1 : 0) - (pressedKeys.has('arrowright') ? 1 : 0)
     const pitch = (pressedKeys.has('arrowdown') ? 1 : 0) - (pressedKeys.has('arrowup') ? 1 : 0)
     if (yaw || pitch) {
-      const orbit = new THREE.Spherical().setFromVector3(activeCamera.position.clone().sub(controls.target))
       const rotationSpeed = 1.15 * (pressedKeys.has('shift') ? 1.8 : 1)
-      orbit.theta += yaw * rotationSpeed * Math.min(deltaSeconds, 0.08)
-      orbit.phi = Math.max(0.08, Math.min(Math.PI - 0.08, orbit.phi + pitch * rotationSpeed * Math.min(deltaSeconds, 0.08)))
-      activeCamera.position.copy(controls.target).add(new THREE.Vector3().setFromSpherical(orbit))
-      activeCamera.lookAt(controls.target)
+      takeManualCameraControl()
+      orbitCamera(
+        yaw * rotationSpeed * Math.min(deltaSeconds, 0.08),
+        pitch * rotationSpeed * Math.min(deltaSeconds, 0.08),
+      )
       rotating = true
     }
   } else {
@@ -495,7 +513,7 @@ function moveCamera(deltaSeconds) {
     if (pressedKeys.has('arrowdown')) direction.y -= 1
   }
   if (direction.lengthSq() < 1e-6 && !rotating) return
-  if (props.mode === '3d' && props.cameraPreset !== 'overview') emit('camera-preset-change', 'overview')
+  if (props.mode === '3d' && props.cameraPreset !== 'overview' && direction.lengthSq() > 1e-6) takeManualCameraControl()
   if (direction.lengthSq() > 1e-6) {
     direction.normalize()
     const { radius } = centerAndRadius()
@@ -567,6 +585,7 @@ onMounted(() => {
   resizeObserver.observe(host.value)
   host.value.addEventListener('wheel', onWheel, { passive: true })
   host.value.addEventListener('pointerdown', focusViewport)
+  host.value.addEventListener('pointerenter', focusViewport)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', clearPressedKeys)
@@ -580,7 +599,7 @@ watch(() => props.liveCloud, updateLiveCloud)
 watch(() => props.obstacles, updateObstacles)
 watch(() => props.trail, updateTrail, { deep: true })
 watch(() => props.correction, updateCorrection, { deep: true })
-watch(() => props.robotPose, () => { updateRobot(); if (['dog', 'follow'].includes(props.cameraPreset)) setCamera() }, { deep: true })
+watch(() => props.robotPose, () => { updateRobot(); if (!manualCameraControl && ['dog', 'follow'].includes(props.cameraPreset)) setCamera() }, { deep: true })
 watch(() => props.waypoints, updateRoute, { deep: true })
 watch(() => props.staticAssets, () => { void updateStaticAssets() }, { deep: true })
 watch(() => props.dynamicObjects, () => { void updateDynamicAssets() }, { deep: true })
@@ -589,6 +608,12 @@ watch(() => props.layers, updateVisibility, { deep: true })
 watch(() => [props.mode, props.cameraPreset], () => {
   zoom.value = props.mode === '3d' ? Math.max(zoom.value, .56) : Math.min(zoom.value, .44)
   updateMouseControls()
+  if (preserveCameraOnPresetChange && props.mode === '3d') {
+    preserveCameraOnPresetChange = false
+    controls?.update()
+    return
+  }
+  manualCameraControl = props.cameraPreset === 'overview' ? false : manualCameraControl
   setCamera()
 })
 
@@ -602,6 +627,7 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect()
   host.value?.removeEventListener('wheel', onWheel)
   host.value?.removeEventListener('pointerdown', focusViewport)
+  host.value?.removeEventListener('pointerenter', focusViewport)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('blur', clearPressedKeys)

@@ -22,6 +22,7 @@
 #include "navigo_core/progress_checker.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/pose2_d.hpp"
+#include "std_msgs/msg/string.hpp"
 
 namespace navigo_path_controller
 {
@@ -47,6 +48,7 @@ protected:
    * @return true, if movement is greater than radius_, or false
    */
   bool isRobotMovedEnough(const geometry_msgs::msg::Pose2D & pose);
+  bool isRobotRotating(const geometry_msgs::msg::Pose2D & pose, const rclcpp::Time & now);
   /**
    * @brief Resets baseline pose with the current pose of the robot
    * @param pose Current pose of the robot
@@ -61,14 +63,21 @@ protected:
 
   double radius_;
   rclcpp::Duration time_allowance_{0, 0};
+  rclcpp::Duration rotation_time_allowance_{0, 0};
+  double rotation_yaw_threshold_{0.03};
+  bool rotation_progress_enabled_{true};
 
   geometry_msgs::msg::Pose2D baseline_pose_;
   rclcpp::Time baseline_time_;
+  rclcpp::Time last_rotation_time_;
+  double last_yaw_{0.0};
+  bool rotation_active_{false};
 
   bool baseline_pose_set_{false};
   // Dynamic parameters handler
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
   std::string plugin_name_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
   /**
    * @brief Callback executed when a paramter change is detected
